@@ -41,6 +41,7 @@ impl Waku {
         {
             return;
         }
+        self.expand_sidebar_path_to_session(session_id);
         self.reveal_sidebar_session(session_id);
         let needs_hydration = self
             .state

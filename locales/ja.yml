@@ -242,21 +242,12 @@ common.rename: 名前を変更
 
 session.new_task: 新規タスク
 
-sidebar.today: 今日
 sidebar.search: 検索
 sidebar.options: サイドバーオプション
-sidebar.grouping: グループ化
-sidebar.grouping_project: プロジェクト
-sidebar.grouping_updated: 更新日
 sidebar.ordering: 並び順
 sidebar.ordering_newest: 新しい順
 sidebar.ordering_oldest: 古い順
 sidebar.show_more: もっと見る
-sidebar.yesterday: 昨日
-sidebar.this_week: 今週
-sidebar.this_month: 今月
-sidebar.this_year: 今年
-sidebar.more: さらに前
 sidebar.working: 作業中 · %{elapsed}
 sidebar.just_now: たった今
 sidebar.minutes_ago: "%{count} 分前"

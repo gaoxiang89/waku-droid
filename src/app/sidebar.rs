@@ -1,4 +1,3 @@
-use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
 use gpui::{KeyBinding, actions};
 
 use super::*;
@@ -18,84 +17,30 @@ pub fn init(cx: &mut App) {
     )]);
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum SessionDateGroup {
-    Today,
-    Yesterday,
-    ThisWeek,
-    ThisMonth,
-    ThisYear,
-    More,
-}
-
-impl SessionDateGroup {
-    const ALL: [Self; 6] = [
-        Self::Today,
-        Self::Yesterday,
-        Self::ThisWeek,
-        Self::ThisMonth,
-        Self::ThisYear,
-        Self::More,
-    ];
-
-    fn index(self) -> usize {
-        match self {
-            Self::Today => 0,
-            Self::Yesterday => 1,
-            Self::ThisWeek => 2,
-            Self::ThisMonth => 3,
-            Self::ThisYear => 4,
-            Self::More => 5,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Today => tr!("sidebar.today"),
-            Self::Yesterday => tr!("sidebar.yesterday"),
-            Self::ThisWeek => tr!("sidebar.this_week"),
-            Self::ThisMonth => tr!("sidebar.this_month"),
-            Self::ThisYear => tr!("sidebar.this_year"),
-            Self::More => tr!("sidebar.more"),
-        }
-    }
-}
-
-/// Stable identity for a collapsible sidebar section. Keeping both variants in
-/// one set preserves each view's disclosure state when the user switches
-/// between Project and Updated grouping.
+/// Stable identity for a collapsible sidebar section under a host row.
+/// `Projectless` is scoped to one host: its payload is the first member
+/// session's projectless workspace id, which is unique per host.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum SidebarGroup {
-    Updated(SessionDateGroup),
     Project(Uuid),
-    Projectless,
-    HostProjectless(Uuid),
+    Projectless(Uuid),
 }
 
 impl SidebarGroup {
     fn element_key(self) -> SharedString {
         match self {
-            Self::Updated(group) => format!("updated-{}", group.index()).into(),
             Self::Project(project_id) => format!("project-{project_id}").into(),
-            Self::Projectless => "projectless".into(),
-            Self::HostProjectless(index) => format!("projectless-host-{index}").into(),
+            Self::Projectless(workspace_id) => {
+                format!("projectless-{workspace_id}").into()
+            }
         }
     }
 
     fn mix_fingerprint(self, fingerprint: u64) -> u64 {
         match self {
-            Self::Updated(group) => mix(fingerprint, group.index() as u64 + 1),
             Self::Project(project_id) => mix_uuid(mix(fingerprint, 0x100), project_id),
-            Self::Projectless => mix(fingerprint, 0x200),
-            Self::HostProjectless(id) => mix_uuid(mix(fingerprint, 0x300), id),
+            Self::Projectless(workspace_id) => mix_uuid(mix(fingerprint, 0x300), workspace_id),
         }
-    }
-}
-
-fn sidebar_grouping_label(grouping: SidebarGrouping) -> String {
-    match grouping {
-        SidebarGrouping::Project => tr!("sidebar.grouping_project"),
-        SidebarGrouping::Updated => tr!("sidebar.grouping_updated"),
     }
 }
 
@@ -104,42 +49,6 @@ fn sidebar_ordering_label(ordering: SidebarOrdering) -> String {
         SidebarOrdering::Newest => tr!("sidebar.ordering_newest"),
         SidebarOrdering::Oldest => tr!("sidebar.ordering_oldest"),
     }
-}
-
-fn session_date_group(timestamp: u64, today: NaiveDate) -> SessionDateGroup {
-    let session_date = i64::try_from(timestamp)
-        .ok()
-        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
-        .map(|timestamp| timestamp.with_timezone(&Local).date_naive())
-        .unwrap_or(today);
-    session_date_group_for_dates(session_date, today)
-}
-
-fn session_date_group_for_dates(session_date: NaiveDate, today: NaiveDate) -> SessionDateGroup {
-    if session_date >= today {
-        return SessionDateGroup::Today;
-    }
-
-    if today.pred_opt() == Some(session_date) {
-        return SessionDateGroup::Yesterday;
-    }
-
-    let week_start = today
-        .checked_sub_days(Days::new(today.weekday().num_days_from_monday().into()))
-        .unwrap_or(today);
-    if session_date >= week_start {
-        return SessionDateGroup::ThisWeek;
-    }
-
-    if session_date.year() == today.year() && session_date.month() == today.month() {
-        return SessionDateGroup::ThisMonth;
-    }
-
-    if session_date.year() == today.year() {
-        return SessionDateGroup::ThisYear;
-    }
-
-    SessionDateGroup::More
 }
 
 fn session_group_header(theme: &Theme) -> Div {
@@ -269,9 +178,13 @@ fn project_sidebar_groups(
 ) -> Vec<(SidebarGroup, Vec<Uuid>)> {
     let mut groups: Vec<(SidebarGroup, Vec<Uuid>)> = Vec::new();
     let mut indexes = HashMap::new();
+    let mut projectless_workspace_id = None;
     let mut projectless_sessions = Vec::new();
     for session in sessions {
         if projectless_project_ids.contains(&session.project_id) {
+            // One projectless group per host, keyed by the first member's
+            // workspace id so hosts beside each other cannot collide.
+            projectless_workspace_id.get_or_insert(session.project_id);
             projectless_sessions.push(session.id);
             continue;
         }
@@ -282,8 +195,8 @@ fn project_sidebar_groups(
         });
         groups[index].1.push(session.id);
     }
-    if !projectless_sessions.is_empty() {
-        groups.push((SidebarGroup::Projectless, projectless_sessions));
+    if let Some(workspace_id) = projectless_workspace_id {
+        groups.push((SidebarGroup::Projectless(workspace_id), projectless_sessions));
     }
     groups
 }
@@ -343,7 +256,7 @@ pub(super) enum SidebarRow {
     /// Opens the window-wide command palette and scrolls with history.
     Search,
     Host(usize),
-    /// Group header; the first row also carries the sidebar actions.
+    /// Workspace group header.
     Header(SidebarGroup),
     /// A started session.
     Session(Uuid),
@@ -603,7 +516,6 @@ impl Waku {
         let menu = self.menu_handle("sidebar-options", cx);
         let menu_open = menu.is_open();
         let weak = cx.entity().downgrade();
-        let grouping = self.state.sidebar_grouping;
         let ordering = self.state.sidebar_ordering;
         let options = dropdown_menu(
             div()
@@ -625,54 +537,29 @@ impl Waku {
             &menu,
             MenuAlign::BelowLeft,
             move |_| {
-                let grouping_weak = weak.clone();
                 let ordering_weak = weak.clone();
-                vec![
-                    MenuItem::submenu_with_value(
-                        tr!("sidebar.grouping"),
-                        sidebar_grouping_label(grouping),
-                        move |_| {
-                            let project_weak = grouping_weak.clone();
-                            let updated_weak = grouping_weak.clone();
-                            vec![
-                                MenuItem::new(tr!("sidebar.grouping_project"), move |_, cx| {
-                                    let _ = project_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_grouping(SidebarGrouping::Project, cx);
-                                    });
-                                })
-                                .selected(grouping == SidebarGrouping::Project),
-                                MenuItem::new(tr!("sidebar.grouping_updated"), move |_, cx| {
-                                    let _ = updated_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_grouping(SidebarGrouping::Updated, cx);
-                                    });
-                                })
-                                .selected(grouping == SidebarGrouping::Updated),
-                            ]
-                        },
-                    ),
-                    MenuItem::submenu_with_value(
-                        tr!("sidebar.ordering"),
-                        sidebar_ordering_label(ordering),
-                        move |_| {
-                            let newest_weak = ordering_weak.clone();
-                            let oldest_weak = ordering_weak.clone();
-                            vec![
-                                MenuItem::new(tr!("sidebar.ordering_newest"), move |_, cx| {
-                                    let _ = newest_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_ordering(SidebarOrdering::Newest, cx);
-                                    });
-                                })
-                                .selected(ordering == SidebarOrdering::Newest),
-                                MenuItem::new(tr!("sidebar.ordering_oldest"), move |_, cx| {
-                                    let _ = oldest_weak.update(cx, |this, cx| {
-                                        this.set_sidebar_ordering(SidebarOrdering::Oldest, cx);
-                                    });
-                                })
-                                .selected(ordering == SidebarOrdering::Oldest),
-                            ]
-                        },
-                    ),
-                ]
+                vec![MenuItem::submenu_with_value(
+                    tr!("sidebar.ordering"),
+                    sidebar_ordering_label(ordering),
+                    move |_| {
+                        let newest_weak = ordering_weak.clone();
+                        let oldest_weak = ordering_weak.clone();
+                        vec![
+                            MenuItem::new(tr!("sidebar.ordering_newest"), move |_, cx| {
+                                let _ = newest_weak.update(cx, |this, cx| {
+                                    this.set_sidebar_ordering(SidebarOrdering::Newest, cx);
+                                });
+                            })
+                            .selected(ordering == SidebarOrdering::Newest),
+                            MenuItem::new(tr!("sidebar.ordering_oldest"), move |_, cx| {
+                                let _ = oldest_weak.update(cx, |this, cx| {
+                                    this.set_sidebar_ordering(SidebarOrdering::Oldest, cx);
+                                });
+                            })
+                            .selected(ordering == SidebarOrdering::Oldest),
+                        ]
+                    },
+                )]
             },
         );
         let add_project = div()
@@ -794,9 +681,7 @@ impl Waku {
             .flex()
             .items_center()
             .child(div().flex_1().min_w_0().child(search))
-            .when(self.hosts.hosts.len() > 1, |row| {
-                row.child(self.render_sidebar_header_actions(cx))
-            })
+            .child(self.render_sidebar_header_actions(cx))
     }
 
     fn start_available_update(&mut self, cx: &mut Context<Self>) {
@@ -1023,10 +908,6 @@ impl Waku {
     /// The render path only computes an allocation-free source fingerprint;
     /// collection building and daemon requests happen once when that moves.
     fn ensure_sidebar_branch_labels(&self, cx: &mut Context<Self>) {
-        if self.state.sidebar_grouping != SidebarGrouping::Project {
-            return;
-        }
-
         let mut fingerprint = 0xb4a7_c4e5_51de_ba11;
         for session in &self.state.sessions {
             if session.has_started() && matches!(&session.workspace, SessionWorkspace::Local) {
@@ -1142,7 +1023,7 @@ impl Waku {
             .panel_resize_drag
             .is_some_and(|drag| drag.target == PanelResizeTarget::Sidebar);
 
-        let rows = self.sidebar_rows_cached(Local::now().date_naive(), unix_time());
+        let rows = self.sidebar_rows_cached(unix_time());
         self.sync_sidebar_rows(&rows);
         // Restored selection exists before ListState knows the viewport size.
         // Retry after the first layout so nearest-edge alignment has a height.
@@ -1231,10 +1112,47 @@ impl Waku {
             .child(self.render_sidebar_footer(cx))
     }
 
+    /// Un-collapse the host row and workspace group that own a session, so a
+    /// selection made outside the sidebar (palette, task switcher) can still
+    /// reveal its row in the host → workspace → session tree.
+    pub(super) fn expand_sidebar_path_to_session(&mut self, session_id: Uuid) {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let mut changed = self
+            .collapsed_hosts
+            .remove(&self.hosts.ownership.session(session_id));
+        let group = match self
+            .state
+            .projects
+            .iter()
+            .find(|project| project.id == session.project_id)
+        {
+            Some(project)
+                if sidebar_project_is_projectless(
+                    project,
+                    &crate::projectless::workspace_roots(),
+                ) =>
+            {
+                SidebarGroup::Projectless(session.project_id)
+            }
+            _ => SidebarGroup::Project(session.project_id),
+        };
+        changed |= self.sidebar_collapsed_groups.remove(&group);
+        if changed {
+            self.sidebar_rows_fingerprint.set(None);
+        }
+    }
+
     /// Keep a newly selected task visible without disturbing the sidebar when
     /// its row is already fully inside the viewport.
     pub(super) fn reveal_sidebar_session(&self, session_id: Uuid) {
-        let rows = self.sidebar_rows_cached(Local::now().date_naive(), unix_time());
+        let rows = self.sidebar_rows_cached(unix_time());
         self.sync_sidebar_rows(&rows);
         if let Some(index) = sidebar_session_row_index(&rows, session_id) {
             reveal_sidebar_list_row(&self.sidebar_list_state, &rows, index);
@@ -1245,21 +1163,13 @@ impl Waku {
     ///
     /// The sidebar re-renders at pulse cadence whenever one of its session
     /// rows shows a working spinner, and rebuilding the snapshot sorts every
-    /// started session and runs calendar math per session — far too much per
-    /// tick for values that move at most once per stream commit. The
-    /// fingerprint is an allocation-free scan of exactly what
-    /// [`Self::sidebar_rows`] reads: started sessions with their project and
-    /// recency, the presentation preferences, the collapsed-group set, and
-    /// today's date and the moving project-recency boundary.
-    fn sidebar_rows_cached(&self, today: NaiveDate, now: u64) -> Rc<Vec<SidebarRow>> {
-        let mut fingerprint = mix(0x51de_ba5e_5eed_c0de, today.num_days_from_ce() as u64);
-        fingerprint = mix(
-            fingerprint,
-            match self.state.sidebar_grouping {
-                SidebarGrouping::Project => 1,
-                SidebarGrouping::Updated => 2,
-            },
-        );
+    /// started session — far too much per tick for values that move at most
+    /// once per stream commit. The fingerprint is an allocation-free scan of
+    /// exactly what [`Self::sidebar_rows`] reads: started sessions with their
+    /// project and recency, the ordering preference, the collapsed-group set,
+    /// and the moving project-recency boundary.
+    fn sidebar_rows_cached(&self, now: u64) -> Rc<Vec<SidebarRow>> {
+        let mut fingerprint = 0x51de_ba5e_5eed_c0de;
         fingerprint = mix(
             fingerprint,
             match self.state.sidebar_ordering {
@@ -1282,32 +1192,28 @@ impl Waku {
             fingerprint = mix_uuid(fingerprint, session.id);
             fingerprint = mix_uuid(fingerprint, session.project_id);
             fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
-            if self.state.sidebar_grouping == SidebarGrouping::Project {
-                fingerprint = mix(
-                    fingerprint,
-                    u64::from(
-                        sidebar_session_timestamp(session)
-                            >= now.saturating_sub(SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS),
-                    ),
-                );
-            }
-        }
-        if self.state.sidebar_grouping == SidebarGrouping::Project {
-            for project in &self.state.projects {
-                fingerprint = mix_uuid(fingerprint, project.id);
-            }
-            // A map has no stable iteration order; combine order-independently.
-            let revealed =
-                self.sidebar_project_reveal_counts
-                    .iter()
-                    .fold(0u64, |combined, (group, count)| {
-                        combined.wrapping_add(group.mix_fingerprint(*count as u64))
-                    });
             fingerprint = mix(
-                mix(fingerprint, self.sidebar_project_reveal_counts.len() as u64),
-                revealed,
+                fingerprint,
+                u64::from(
+                    sidebar_session_timestamp(session)
+                        >= now.saturating_sub(SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS),
+                ),
             );
         }
+        for project in &self.state.projects {
+            fingerprint = mix_uuid(fingerprint, project.id);
+        }
+        // A map has no stable iteration order; combine order-independently.
+        let revealed = self
+            .sidebar_project_reveal_counts
+            .iter()
+            .fold(0u64, |combined, (group, count)| {
+                combined.wrapping_add(group.mix_fingerprint(*count as u64))
+            });
+        fingerprint = mix(
+            mix(fingerprint, self.sidebar_project_reveal_counts.len() as u64),
+            revealed,
+        );
         // A set has no stable iteration order; combine order-independently.
         let collapsed = self
             .sidebar_collapsed_groups
@@ -1320,15 +1226,17 @@ impl Waku {
             collapsed,
         );
         if self.sidebar_rows_fingerprint.get() != Some(fingerprint) {
-            *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(self.sidebar_rows(today, now));
+            *self.sidebar_rows_snapshot.borrow_mut() = Rc::new(self.sidebar_rows(now));
             self.sidebar_rows_fingerprint.set(Some(fingerprint));
         }
         self.sidebar_rows_snapshot.borrow().clone()
     }
 
-    /// Snapshot the session history as a flat list of lightweight rows under
-    /// the current grouping and ordering preferences.
-    fn sidebar_rows(&self, today: NaiveDate, now: u64) -> Vec<SidebarRow> {
+    /// Snapshot the session history as a flat list of lightweight rows in the
+    /// fixed host → workspace → session hierarchy. Every connected host —
+    /// including a lone local one — contributes a host row, then its workspace
+    /// groups in first-seen order with that host's projectless sessions last.
+    fn sidebar_rows(&self, now: u64) -> Vec<SidebarRow> {
         let mut sorted_sessions = self
             .state
             .sessions
@@ -1337,176 +1245,68 @@ impl Waku {
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
+        let recent_cutoff = now.saturating_sub(SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS);
+        let session_timestamps = sorted_sessions
+            .iter()
+            .map(|session| (session.id, sidebar_session_timestamp(session)))
+            .collect::<HashMap<_, _>>();
+        let projectless_roots = crate::projectless::workspace_roots();
+        let projectless_project_ids = self
+            .state
+            .projects
+            .iter()
+            .filter(|project| sidebar_project_is_projectless(project, &projectless_roots))
+            .map(|project| project.id)
+            .collect::<HashSet<_>>();
+
         let mut rows = vec![SidebarRow::Search];
-        let multi_host = self.hosts.hosts.len() > 1;
-        if multi_host && self.state.sidebar_grouping == SidebarGrouping::Updated {
-            rows.extend((0..self.hosts.hosts.len()).map(SidebarRow::Host));
-            sorted_sessions.retain(|session| {
-                !self
-                    .collapsed_hosts
-                    .contains(&self.hosts.ownership.session(session.id))
-            });
-        }
-        match self.state.sidebar_grouping {
-            SidebarGrouping::Updated => {
-                let mut grouped_sessions: [Vec<Uuid>; 6] = std::array::from_fn(|_| Vec::new());
-                for session in sorted_sessions {
-                    grouped_sessions
-                        [session_date_group(sidebar_session_timestamp(session), today).index()]
-                    .push(session.id);
+        for (index, host) in self.hosts.hosts.iter().enumerate() {
+            rows.push(SidebarRow::Host(index));
+            if self.collapsed_hosts.contains(&host.key) {
+                continue;
+            }
+            let sessions = sorted_sessions
+                .iter()
+                .copied()
+                .filter(|session| self.hosts.ownership.session(session.id) == host.key)
+                .collect::<Vec<_>>();
+            let mut groups = project_sidebar_groups(&sessions, &projectless_project_ids);
+            for project in &self.state.projects {
+                if self.hosts.ownership.project(project.id) == host.key
+                    && !projectless_project_ids.contains(&project.id)
+                    && !groups
+                        .iter()
+                        .any(|(group, _)| *group == SidebarGroup::Project(project.id))
+                {
+                    groups.push((SidebarGroup::Project(project.id), Vec::new()));
                 }
-                let mut groups = SessionDateGroup::ALL;
-                if self.state.sidebar_ordering == SidebarOrdering::Oldest {
-                    groups.reverse();
-                }
-                for date_group in groups {
-                    let group = SidebarGroup::Updated(date_group);
+            }
+            for (group, sessions) in groups {
+                let revealed = self
+                    .sidebar_project_reveal_counts
+                    .get(&group)
+                    .copied()
+                    .unwrap_or_default();
+                let (visible, show_more) = visible_project_sessions(
+                    &sessions,
+                    &session_timestamps,
+                    recent_cutoff,
+                    revealed,
+                );
+                if visible.is_empty() {
+                    // A workspace with no visible sessions still shows its
+                    // header so the hierarchy and its actions stay reachable.
+                    rows.push(SidebarRow::Header(group));
+                } else {
                     append_sidebar_group_rows(
                         &mut rows,
                         group,
-                        &grouped_sessions[date_group.index()],
+                        &visible,
                         self.sidebar_collapsed_groups.contains(&group),
-                        false,
+                        show_more,
                     );
                 }
             }
-            SidebarGrouping::Project => {
-                let recent_cutoff = now.saturating_sub(SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS);
-                let session_timestamps = sorted_sessions
-                    .iter()
-                    .map(|session| (session.id, sidebar_session_timestamp(session)))
-                    .collect::<HashMap<_, _>>();
-                let projectless_roots = crate::projectless::workspace_roots();
-                let projectless_project_ids = self
-                    .state
-                    .projects
-                    .iter()
-                    .filter(|project| sidebar_project_is_projectless(project, &projectless_roots))
-                    .map(|project| project.id)
-                    .collect::<HashSet<_>>();
-                let mut host_groups = Vec::new();
-                if multi_host {
-                    for (index, host) in self.hosts.hosts.iter().enumerate() {
-                        host_groups.push((None, vec![SidebarRow::Host(index)]));
-                        if self.collapsed_hosts.contains(&host.key) {
-                            continue;
-                        }
-                        let sessions = sorted_sessions
-                            .iter()
-                            .copied()
-                            .filter(|session| self.hosts.ownership.session(session.id) == host.key)
-                            .collect::<Vec<_>>();
-                        let mut groups =
-                            project_sidebar_groups(&sessions, &projectless_project_ids);
-                        for project in &self.state.projects {
-                            if self.hosts.ownership.project(project.id) == host.key
-                                && !projectless_project_ids.contains(&project.id)
-                                && !groups
-                                    .iter()
-                                    .any(|(group, _)| *group == SidebarGroup::Project(project.id))
-                            {
-                                groups.push((SidebarGroup::Project(project.id), Vec::new()));
-                            }
-                        }
-                        for (group, sessions) in groups {
-                            let group = if group == SidebarGroup::Projectless {
-                                SidebarGroup::HostProjectless(
-                                    sessions
-                                        .first()
-                                        .and_then(|id| {
-                                            self.state
-                                                .sessions
-                                                .iter()
-                                                .find(|session| session.id == *id)
-                                        })
-                                        .map(|session| session.project_id)
-                                        .expect("projectless groups contain sessions"),
-                                )
-                            } else {
-                                group
-                            };
-                            host_groups.push((
-                                Some(group),
-                                sessions.into_iter().map(SidebarRow::Session).collect(),
-                            ));
-                        }
-                    }
-                } else {
-                    for (group, sessions) in
-                        project_sidebar_groups(&sorted_sessions, &projectless_project_ids)
-                    {
-                        host_groups.push((
-                            Some(group),
-                            sessions.into_iter().map(SidebarRow::Session).collect(),
-                        ));
-                    }
-                }
-                for (group, items) in host_groups {
-                    let Some(group) = group else {
-                        rows.extend(items);
-                        continue;
-                    };
-                    let sessions = items
-                        .into_iter()
-                        .filter_map(|row| {
-                            if let SidebarRow::Session(id) = row {
-                                Some(id)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let revealed = self
-                        .sidebar_project_reveal_counts
-                        .get(&group)
-                        .copied()
-                        .unwrap_or_default();
-                    let (visible, show_more) = visible_project_sessions(
-                        &sessions,
-                        &session_timestamps,
-                        recent_cutoff,
-                        revealed,
-                    );
-                    if visible.is_empty() && multi_host {
-                        rows.push(SidebarRow::Header(group));
-                    } else {
-                        append_sidebar_group_rows(
-                            &mut rows,
-                            group,
-                            &visible,
-                            self.sidebar_collapsed_groups.contains(&group),
-                            show_more,
-                        );
-                    }
-                }
-            }
-        }
-        if rows.len() == 1 {
-            // Keep the header actions visible while there is no history.
-            let group = match self.state.sidebar_grouping {
-                SidebarGrouping::Updated => SidebarGroup::Updated(SessionDateGroup::Today),
-                SidebarGrouping::Project => {
-                    let projectless_roots = crate::projectless::workspace_roots();
-                    self.state
-                        .selected_project
-                        .and_then(|project_id| {
-                            self.state
-                                .projects
-                                .iter()
-                                .find(|project| project.id == project_id)
-                        })
-                        .or_else(|| self.state.projects.first())
-                        .map(|project| {
-                            if sidebar_project_is_projectless(project, &projectless_roots) {
-                                SidebarGroup::Projectless
-                            } else {
-                                SidebarGroup::Project(project.id)
-                            }
-                        })
-                        .unwrap_or(SidebarGroup::Projectless)
-                }
-            };
-            rows.push(SidebarRow::Header(group));
         }
         rows
     }
@@ -1552,7 +1352,7 @@ impl Waku {
                 let has_expanded_children = rows.get(index + 1).is_some_and(|row| {
                     matches!(row, SidebarRow::Session(_) | SidebarRow::ShowMore(_))
                 });
-                self.render_sidebar_group_header(group, index == 1, has_expanded_children, cx)
+                self.render_sidebar_group_header(group, has_expanded_children, cx)
                     .into_any_element()
             }
             SidebarRow::Session(session_id) => self
@@ -1571,7 +1371,6 @@ impl Waku {
     fn render_sidebar_group_header(
         &self,
         group: SidebarGroup,
-        first: bool,
         has_expanded_children: bool,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1585,17 +1384,12 @@ impl Waku {
             .entry(group)
             .or_insert_with(|| cx.focus_handle())
             .clone();
-        let show_folder_icon = matches!(
-            group,
-            SidebarGroup::Project(_) | SidebarGroup::Projectless | SidebarGroup::HostProjectless(_)
-        );
         let folder_icon = if collapsed {
             "icons/folder.svg"
         } else {
             "icons/folder-open.svg"
         };
         let label = match group {
-            SidebarGroup::Updated(group) => group.label(),
             SidebarGroup::Project(project_id) => self
                 .state
                 .projects
@@ -1603,19 +1397,9 @@ impl Waku {
                 .find(|project| project.id == project_id)
                 .map(Project::display_name)
                 .unwrap_or_else(|| tr!("project.no_project_name")),
-            SidebarGroup::Projectless | SidebarGroup::HostProjectless(_) => {
-                tr!("project.no_project_name")
-            }
+            SidebarGroup::Projectless(_) => tr!("project.no_project_name"),
         };
-        let updated_chevron = matches!(group, SidebarGroup::Updated(_)).then(|| {
-            icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
-                .when(collapsed, |icon| {
-                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.75)))
-                })
-                .invisible()
-                .group_hover(group_name.clone(), |icon| icon.visible())
-        });
-        let compose = show_folder_icon.then(|| {
+        let compose = {
             let compose_focus = self
                 .sidebar_group_compose_focuses
                 .borrow_mut()
@@ -1670,7 +1454,7 @@ impl Waku {
                             }
                         })),
                 )
-        });
+        };
 
         let header = session_group_header(&theme)
             .id(SharedString::from(format!(
@@ -1696,25 +1480,19 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .when(show_folder_icon, |element| {
-                        element.child(icon(folder_icon, 14.0, theme.text_secondary))
-                    })
+                    .child(icon(folder_icon, 14.0, theme.text_secondary))
                     .child(
                         div()
                             .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(2.0))
-                            .child(div().min_w_0().truncate().child(label))
-                            .when_some(updated_chevron, |element, chevron| element.child(chevron)),
+                            .child(div().min_w_0().truncate().child(label)),
                     )
                     .child(div().flex_1()),
             )
-            .when_some(compose, |element, compose| element.child(compose))
-            .when(first, |element| {
-                element.child(self.render_sidebar_header_actions(cx))
-            })
-            .when(show_folder_icon && has_expanded_children, |element| {
+            .child(compose)
+            .when(has_expanded_children, |element| {
                 element.child(
                     div()
                         .absolute()
@@ -1761,14 +1539,12 @@ impl Waku {
         self.settings_page = None;
         match group {
             SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
-            SidebarGroup::Projectless => self.create_projectless_session(cx),
-            SidebarGroup::HostProjectless(project_id) => {
+            SidebarGroup::Projectless(project_id) => {
                 self.create_projectless_session_on_host(
                     self.hosts.ownership.project(project_id),
                     cx,
                 );
             }
-            SidebarGroup::Updated(_) => return,
         }
         let focus = self.composer_focus(cx);
         window.focus(&focus, cx);
@@ -1843,7 +1619,7 @@ impl Waku {
 
     pub(super) fn collapse_all_sidebar_groups(&mut self, cx: &mut Context<Self>) {
         let groups = self
-            .sidebar_rows_cached(Local::now().date_naive(), unix_time())
+            .sidebar_rows_cached(unix_time())
             .iter()
             .filter_map(|row| match row {
                 SidebarRow::Header(group) => Some(*group),
@@ -1877,27 +1653,6 @@ impl Waku {
             self.sidebar_rows_fingerprint.set(None);
             cx.notify();
         }
-    }
-
-    pub(super) fn set_sidebar_grouping(
-        &mut self,
-        grouping: SidebarGrouping,
-        cx: &mut Context<Self>,
-    ) {
-        if self.state.sidebar_grouping == grouping {
-            return;
-        }
-        self.state.sidebar_grouping = grouping;
-        self.sidebar_rows_fingerprint.set(None);
-        self.sidebar_branch_scan_fingerprint.set(None);
-        self.sidebar_branch_scan_generation
-            .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));
-        self.sidebar_list_state.scroll_to(ListOffset {
-            item_ix: 0,
-            offset_in_item: Pixels::ZERO,
-        });
-        self.save();
-        cx.notify();
     }
 
     fn set_sidebar_ordering(&mut self, ordering: SidebarOrdering, cx: &mut Context<Self>) {
@@ -2002,39 +1757,22 @@ impl Waku {
             .projects
             .iter()
             .find(|project| project.id == session.project_id);
-        let grouped_by_project = self.state.sidebar_grouping == SidebarGrouping::Project;
-        let left_padding = if grouped_by_project {
-            SIDEBAR_GROUP_CHILD_PADDING
-        } else {
-            8.0
-        };
-        let detail_label = if grouped_by_project {
-            persisted_sidebar_branch_label(&session.workspace)
-                .map(|branch| SharedString::from(branch.to_owned()))
-                .or_else(|| {
-                    if !matches!(&session.workspace, SessionWorkspace::Local) {
-                        return None;
-                    }
-                    project.and_then(|project| {
-                        self.sidebar_branch_labels
-                            .borrow()
-                            .get(&project.id)
-                            .cloned()
-                    })
+        let left_padding = SIDEBAR_GROUP_CHILD_PADDING;
+        let detail_label = persisted_sidebar_branch_label(&session.workspace)
+            .map(|branch| SharedString::from(branch.to_owned()))
+            .or_else(|| {
+                if !matches!(&session.workspace, SessionWorkspace::Local) {
+                    return None;
+                }
+                project.and_then(|project| {
+                    self.sidebar_branch_labels
+                        .borrow()
+                        .get(&project.id)
+                        .cloned()
                 })
-        } else {
-            Some(SharedString::from(
-                project
-                    .map(Project::display_name)
-                    .unwrap_or_else(|| tr!("sidebar.unknown_project")),
-            ))
-        };
+            });
         let has_detail_label = detail_label.is_some();
-        let detail_icon = if grouped_by_project {
-            "icons/git-branch.svg"
-        } else {
-            "icons/folder.svg"
-        };
+        let detail_icon = "icons/git-branch.svg";
         let rename_input =
             (self.session_rename == Some(session_id)).then(|| self.session_rename_input.clone());
         let renaming = rename_input.is_some();
@@ -2136,7 +1874,7 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .text_size(sp(if grouped_by_project { 12.5 } else { 13.0 }))
+                    .text_size(sp(12.5))
                     .line_height(sp(15.0))
                     .when_some(detail_label, |element, label| {
                         element
@@ -2226,17 +1964,15 @@ impl Waku {
             .w_full()
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)
-            .when(grouped_by_project, |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(SIDEBAR_GROUP_GUIDE_X))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(1.0))
-                        .bg(theme.border),
-                )
-            })
+            .child(
+                div()
+                    .absolute()
+                    .left(px(SIDEBAR_GROUP_GUIDE_X))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(theme.border),
+            )
             .into_any_element()
     }
 
@@ -2567,37 +2303,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn groups_sessions_by_calendar_period() {
-        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
-        let cases = [
-            ((2026, 8, 12), SessionDateGroup::Today),
-            ((2026, 8, 11), SessionDateGroup::Yesterday),
-            ((2026, 8, 10), SessionDateGroup::ThisWeek),
-            ((2026, 8, 1), SessionDateGroup::ThisMonth),
-            ((2026, 1, 1), SessionDateGroup::ThisYear),
-            ((2025, 12, 31), SessionDateGroup::More),
-        ];
-
-        for ((year, month, day), expected) in cases {
-            let session_date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
-            assert_eq!(session_date_group_for_dates(session_date, today), expected);
-        }
-    }
-
-    #[test]
-    fn future_sessions_stay_in_today() {
-        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
-        let tomorrow = NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
-        assert_eq!(
-            session_date_group_for_dates(tomorrow, today),
-            SessionDateGroup::Today
-        );
-    }
-
-    #[test]
     fn collapsed_sidebar_group_keeps_only_its_header_and_spacer() {
         let sessions = [Uuid::from_u128(1), Uuid::from_u128(2)];
-        let group = SidebarGroup::Updated(SessionDateGroup::Today);
+        let group = SidebarGroup::Project(Uuid::from_u128(42));
         let mut expanded = Vec::new();
         append_sidebar_group_rows(&mut expanded, group, &sessions, false, false);
         assert_eq!(
@@ -2748,7 +2456,7 @@ mod tests {
             vec![
                 (SidebarGroup::Project(ordinary_project), vec![ordinary.id]),
                 (
-                    SidebarGroup::Projectless,
+                    SidebarGroup::Projectless(first_projectless_project),
                     vec![first_projectless.id, second_projectless.id]
                 ),
             ]
@@ -2817,7 +2525,7 @@ mod tests {
     #[test]
     fn selected_session_uses_nearest_bottom_edge_for_an_unmeasured_lower_row() {
         let target = Uuid::from_u128(31);
-        let group = SidebarGroup::Updated(SessionDateGroup::Today);
+        let group = SidebarGroup::Project(Uuid::from_u128(42));
         let mut rows = vec![SidebarRow::Search, SidebarRow::Header(group)];
         rows.extend((1..=40).map(|id| SidebarRow::Session(Uuid::from_u128(id))));
         rows.push(SidebarRow::GroupSpacer);

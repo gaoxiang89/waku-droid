@@ -174,57 +174,46 @@ impl Waku {
             .entry(key.clone())
             .or_insert_with(|| [cx.focus_handle(), cx.focus_handle()])
             .clone();
-        let menu = self.menu_handle(format!("host-menu-{index}"), cx);
-        let weak = cx.entity().downgrade();
-        let menu_key = key.clone();
-        let options = dropdown_menu(
-            div()
-                .id(SharedString::from(format!("host-options-{index}")))
-                .size(px(26.0))
-                .rounded(px(5.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .hover(|style| style.bg(theme.overlay))
-                .focus_visible(|style| style.border_1().border_color(theme.accent))
-                .child(icon("icons/ellipsis.svg", 14.0, theme.text_secondary)),
-            SharedString::from(format!("host-options-menu-{index}")),
-            &menu,
-            MenuAlign::BelowRight,
-            move |_| {
-                let projects = weak.clone();
-                let recent = weak.clone();
-                let mut items = vec![
-                    MenuItem::new(tr!("sidebar.grouping_project"), move |_, cx| {
-                        let _ = projects.update(cx, |this, cx| {
-                            this.set_sidebar_grouping(SidebarGrouping::Project, cx)
-                        });
-                    }),
-                    MenuItem::new(tr!("sidebar.grouping_updated"), move |_, cx| {
-                        let _ = recent.update(cx, |this, cx| {
-                            this.set_sidebar_grouping(SidebarGrouping::Updated, cx)
-                        });
-                    }),
-                ];
-                if let HostKey::Connection(id) = &menu_key {
+        // Only remote hosts have a menu: disconnect and remove target a saved
+        // connection, which the local host is not.
+        let options = if let HostKey::Connection(id) = &key {
+            let menu = self.menu_handle(format!("host-menu-{index}"), cx);
+            let weak = cx.entity().downgrade();
+            let menu_key = key.clone();
+            let menu_id = id.clone();
+            Some(dropdown_menu(
+                div()
+                    .id(SharedString::from(format!("host-options-{index}")))
+                    .size(px(26.0))
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|style| style.bg(theme.overlay))
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .child(icon("icons/ellipsis.svg", 14.0, theme.text_secondary)),
+                SharedString::from(format!("host-options-menu-{index}")),
+                &menu,
+                MenuAlign::BelowRight,
+                move |_| {
                     let disconnect = weak.clone();
                     let disconnect_key = menu_key.clone();
-                    items.push(MenuItem::new(
-                        tr!("connections.disconnect"),
-                        move |_, cx| {
+                    let remove = weak.clone();
+                    let id = menu_id.clone();
+                    vec![
+                        MenuItem::new(tr!("connections.disconnect"), move |_, cx| {
                             let _ = disconnect
                                 .update(cx, |this, cx| this.disconnect_host(&disconnect_key, cx));
-                        },
-                    ));
-                    let remove = weak.clone();
-                    let id = id.clone();
-                    items.push(MenuItem::new(tr!("connections.remove"), move |_, cx| {
-                        let _ = remove.update(cx, |this, cx| this.remove_connection(&id, cx));
-                    }));
-                }
-                items
-            },
-        );
+                        }),
+                        MenuItem::new(tr!("connections.remove"), move |_, cx| {
+                            let _ = remove.update(cx, |this, cx| this.remove_connection(&id, cx));
+                        }),
+                    ]
+                },
+            ))
+        } else {
+            None
+        };
         let add_key = key.clone();
         let add_key_down = key.clone();
         let add = div()
@@ -305,7 +294,7 @@ impl Waku {
                 )
             })
             .child(add)
-            .child(options)
+            .when_some(options, |row, options| row.child(options))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.collapsed_hosts.remove(&click_key) {
                     this.collapsed_hosts.insert(click_key.clone());
