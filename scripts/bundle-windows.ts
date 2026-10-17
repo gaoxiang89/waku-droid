@@ -34,20 +34,27 @@ interface CargoMetadata {
   packages: { name: string; version: string }[];
 }
 
-/** Inno Setup's compiler, however it was installed. */
+/** Inno Setup's compiler, however it was installed: on `PATH`, per-machine
+ *  under Program Files, or per-user under `%LOCALAPPDATA%\Programs`, which is
+ *  where `winget install JRSoftware.InnoSetup` puts it without elevation. */
 function findInnoSetupCompiler(): string {
   const onPath = Bun.which("ISCC.exe") ?? Bun.which("iscc");
   if (onPath) return onPath;
+  const localPrograms = process.env.LOCALAPPDATA
+    ? join(process.env.LOCALAPPDATA, "Programs")
+    : undefined;
   for (const base of [
     process.env.ProgramFiles,
     process.env["ProgramFiles(x86)"],
+    localPrograms,
   ]) {
     if (!base) continue;
     const candidate = join(base, "Inno Setup 6", "ISCC.exe");
     if (existsSync(candidate)) return candidate;
   }
   throw new Error(
-    "ISCC.exe was not found. Install Inno Setup 6 (choco install innosetup).",
+    "ISCC.exe was not found. Install Inno Setup 6: " +
+      "`winget install --id JRSoftware.InnoSetup` or `choco install innosetup`.",
   );
 }
 
@@ -80,8 +87,11 @@ function findSigntool(): string {
 }
 
 /** Linux daemons for WSL and SSH hosts, which this Windows build cannot
- *  compile. Release CI provides them; a local package without them still
- *  works but cannot connect to those hosts. */
+ *  compile. Release CI stages both; a local package usually carries only the
+ *  one its WSL distribution needs and then cannot reach Linux hosts of the
+ *  other architecture. A missing architecture is therefore a warning, not a
+ *  failure — CI cannot stage a partial set anyway, because one failed matrix
+ *  leg skips every packaging job. */
 const remoteDaemonNames = [
   "waku-daemon-linux-x86_64",
   "waku-daemon-linux-aarch64",
@@ -95,13 +105,25 @@ async function stageRemoteDaemons(destination: string): Promise<void> {
     );
     return;
   }
+  const directory = resolve(source);
+  if (!existsSync(directory)) {
+    throw new Error(`WAKU_REMOTE_DAEMONS_DIR does not exist: ${directory}`);
+  }
   await mkdir(destination, { recursive: true });
+  const missing: string[] = [];
   for (const name of remoteDaemonNames) {
-    const file = join(resolve(source), name);
+    const file = join(directory, name);
     if (!existsSync(file)) {
-      throw new Error(`WAKU_REMOTE_DAEMONS_DIR has no ${name}: ${file}`);
+      missing.push(name);
+      continue;
     }
     await copyFile(file, join(destination, name));
+  }
+  if (missing.length > 0) {
+    console.warn(
+      `WAKU_REMOTE_DAEMONS_DIR has no ${missing.join(", ")}; ` +
+        "this package cannot connect to those Linux hosts.",
+    );
   }
 }
 

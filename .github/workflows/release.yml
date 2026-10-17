@@ -186,6 +186,9 @@ jobs:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
+          # Both legs must land: the packaging scripts warn (rather than fail)
+          # on an architecture they cannot find, for local builds' sake.
+          if-no-files-found: error
 
       - name: Bundle
         env:
@@ -256,6 +259,9 @@ jobs:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
+          # Both legs must land: the packaging scripts warn (rather than fail)
+          # on an architecture they cannot find, for local builds' sake.
+          if-no-files-found: error
 
       - name: Bundle
         env:
@@ -311,6 +317,9 @@ jobs:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
+          # Both legs must land: the packaging scripts warn (rather than fail)
+          # on an architecture they cannot find, for local builds' sake.
+          if-no-files-found: error
 
       - name: Bundle
         env:
@@ -370,6 +379,9 @@ jobs:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
+          # Both legs must land: the packaging scripts warn (rather than fail)
+          # on an architecture they cannot find, for local builds' sake.
+          if-no-files-found: error
 
       - name: Bundle
         env:
@@ -449,6 +461,9 @@ jobs:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
+          # Both legs must land: the packaging scripts warn (rather than fail)
+          # on an architecture they cannot find, for local builds' sake.
+          if-no-files-found: error
 
       - name: Release
         env:

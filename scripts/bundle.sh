@@ -188,12 +188,14 @@ done
 # WSL and SSH hosts run a Linux daemon this Mac cannot compile. Release CI
 # provides both architectures; a local bundle without them cannot connect to
 # Linux hosts.
+# A local build usually stages only this machine's architecture, so a missing
+# one is a warning: CI always stages both.
 if [ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]; then
   mkdir -p "$contents/Resources/remote"
   for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
     if [ ! -f "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" ]; then
-      echo "WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon" >&2
-      exit 1
+      echo "warning: WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon; Linux hosts of that architecture cannot be reached." >&2
+      continue
     fi
     cp "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" "$contents/Resources/remote/$remote_daemon"
     chmod 755 "$contents/Resources/remote/$remote_daemon"

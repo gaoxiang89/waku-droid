@@ -70,8 +70,10 @@ For a target such as Linux x86_64 the desktop looks, in order, for:
 Release CI builds statically linked `*-unknown-linux-musl` daemons for
 x86_64 and aarch64 (the `remote-daemon` job) and every desktop package
 carries both, so the daemon never depends on the host's glibc. The bundle
-scripts stage them from `WAKU_REMOTE_DAEMONS_DIR`; a local package built
-without it still works but cannot connect to Linux hosts of another platform.
+scripts stage whatever `WAKU_REMOTE_DAEMONS_DIR` holds, and warn about an
+architecture it does not hold rather than failing — a local package can
+carry just the one your WSL distribution needs. Building one by hand: see
+Development below.
 
 ## Using it
 
