@@ -140,7 +140,12 @@ them from the remote login shell's `PATH`.
 
 On Windows, `bun ./scripts/dev.ts` also builds a Linux daemon inside WSL
 after every daemon build and copies it to `target/remote-dev/`, where debug
-builds find it without any environment variable. The WSL distribution needs
+builds find it without any environment variable. The build targets
+`*-unknown-linux-musl` first — the same static daemon release packages
+carry, so it also runs on SSH hosts whose glibc is older than the WSL
+distribution's — and falls back to the distribution's glibc-linked build
+when no musl toolchain is available (`sudo apt-get install musl-tools`
+provides one; WSL connections run either build). The WSL distribution needs
 a Rust toolchain (`~/.cargo/env` is sourced). It uses the default
 distribution; set `WAKU_DEV_WSL_DISTRO` to pick another, or
 `WAKU_DEV_SKIP_WSL_DAEMON=1` to skip it. The build runs beside the watcher,
@@ -151,8 +156,9 @@ Without the watcher, build it by hand:
 
 ```sh
 # in WSL
-CARGO_TARGET_DIR=$HOME/.cache/waku-target cargo build -p waku-daemon
-cp ~/.cache/waku-target/debug/waku-daemon /mnt/c/path/to/waku/target/remote-dev/waku-daemon-linux-x86_64
+rustup target add x86_64-unknown-linux-musl
+CARGO_TARGET_DIR=$HOME/.cache/waku-target cargo build -p waku-daemon --target x86_64-unknown-linux-musl
+cp ~/.cache/waku-target/x86_64-unknown-linux-musl/debug/waku-daemon /mnt/c/path/to/waku/target/remote-dev/waku-daemon-linux-x86_64
 ```
 
 ```sh

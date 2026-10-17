@@ -165,6 +165,27 @@ fn stderr_text(connection: &Connection, stderr: &[u8]) -> String {
     }
 }
 
+/// Rewrite the install script's machine markers into sentences, so a failed
+/// connection says why the uploaded daemon could not run — a loader error
+/// such as a too-old glibc — instead of reducing it to a fingerprint
+/// mismatch.
+fn explain_install_stderr(stderr: &str) -> String {
+    const RUN_MARKER: &str = "daemon_failed_to_run\t";
+    const MISMATCH_MARKER: &str = "fingerprint_mismatch\t";
+    stderr
+        .split_inclusive('\n')
+        .map(|line| {
+            if let Some(reason) = line.strip_prefix(RUN_MARKER) {
+                format!("the uploaded daemon could not run: {reason}")
+            } else if let Some(detail) = line.strip_prefix(MISMATCH_MARKER) {
+                format!("the uploaded daemon did not match this build: {detail}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
+}
+
 /// A daemon build for one remote target.
 #[derive(Clone, Debug)]
 pub struct Artifact {
@@ -298,11 +319,16 @@ fn install_script(fingerprint: &str, force: bool, source: InstallSource) -> Stri
         "set -e; dst=\"$HOME/{REMOTE_DIRECTORY}/{DAEMON_NAME}\"; expected=\"{fingerprint}\"; force={force}; \
          actual=$(\"$dst\" --fingerprint 2>/dev/null || true); \
          if [ \"$force\" = \"false\" ] && [ \"$actual\" = \"$expected\" ]; then printf 'ready\\n'; exit 0; fi; \
-         mkdir -p \"$(dirname \"$dst\")\"; chmod 700 \"$(dirname \"$dst\")\"; tmp=\"$dst.tmp.$$\"; trap 'rm -f \"$tmp\"' EXIT; \
+         mkdir -p \"$(dirname \"$dst\")\"; chmod 700 \"$(dirname \"$dst\")\"; tmp=\"$dst.tmp.$$\"; err=\"$tmp.err\"; \
+         trap 'rm -f \"$tmp\" \"$err\"' EXIT; \
          {fetch}; chmod 700 \"$tmp\"; \
-         actual=$(\"$tmp\" --fingerprint 2>/dev/null || true); \
-         [ \"$actual\" = \"$expected\" ] || {{ printf 'fingerprint_mismatch\\n' >&2; exit 43; }}; \
-         mv -f \"$tmp\" \"$dst\"; trap - EXIT; printf 'installed\\n'"
+         actual=$(\"$tmp\" --fingerprint 2>\"$err\" || true); \
+         if [ -z \"$actual\" ] && [ -s \"$err\" ]; then \
+             reason=$(tr '\\n' ' ' < \"$err\" | cut -c1-400); \
+             printf 'daemon_failed_to_run\\t%s\\n' \"$reason\" >&2; exit 43; \
+         fi; \
+         [ \"$actual\" = \"$expected\" ] || {{ printf 'fingerprint_mismatch\\texpected %s, got %s\\n' \"$expected\" \"${{actual:-no output}}\" >&2; exit 43; }}; \
+         mv -f \"$tmp\" \"$dst\"; rm -f \"$err\"; trap - EXIT; printf 'installed\\n'"
     )
 }
 
@@ -338,7 +364,7 @@ fn deploy_wsl(distro: &str, artifact: &Artifact, force: bool) -> anyhow::Result<
             "{}",
             with_detail(
                 &format!("could not install waku-daemon in WSL {distro}"),
-                wsl::decode_wsl_text(&output.stderr).trim(),
+                explain_install_stderr(&wsl::decode_wsl_text(&output.stderr)).trim(),
             )
         ),
     }
@@ -372,7 +398,10 @@ fn deploy_ssh(
     let failure = |child: &mut std::process::Child, message: &str| {
         let _ = child.kill();
         let _ = child.wait();
-        anyhow!("{}", with_detail(message, &stderr.text()))
+        anyhow!(
+            "{}",
+            with_detail(message, &explain_install_stderr(&stderr.text()))
+        )
     };
 
     let status_line = match lines.recv_timeout(SSH_STATUS_TIMEOUT) {
@@ -387,7 +416,7 @@ fn deploy_ssh(
                 "{}",
                 with_detail(
                     &format!("could not prepare the daemon on {}", connection.name),
-                    &stderr.text()
+                    &explain_install_stderr(&stderr.text())
                 )
             ));
         }
@@ -436,7 +465,10 @@ fn deploy_ssh(
     }
     Err(anyhow!(
         "{}",
-        with_detail("could not install waku-daemon", &stderr.text())
+        with_detail(
+            "could not install waku-daemon",
+            &explain_install_stderr(&stderr.text())
+        )
     ))
 }
 
@@ -495,5 +527,35 @@ mod tests {
             assert!(script.contains("expected=\"0123456789abcdef\""));
         }
         assert!(install_script("x", false, InstallSource::Stdin).contains("printf 'upload\\n'"));
+    }
+
+    #[test]
+    fn install_scripts_report_why_a_daemon_cannot_run() {
+        let script = install_script("0123456789abcdef", false, InstallSource::Stdin);
+        // A binary that cannot execute — an old glibc host, say — must surface
+        // the loader's message rather than being reported as a mismatch.
+        let cannot_run = script.find("daemon_failed_to_run").unwrap();
+        let mismatch = script.find("fingerprint_mismatch").unwrap();
+        assert!(cannot_run < mismatch);
+        assert!(script.contains("2>\"$err\""));
+        assert!(script.contains("trap 'rm -f \"$tmp\" \"$err\"' EXIT"));
+    }
+
+    #[test]
+    fn install_markers_are_explained_in_errors() {
+        assert_eq!(
+            explain_install_stderr(
+                "daemon_failed_to_run\t/tmp/x: /lib/libc.so.6: version `GLIBC_2.38' not found\n"
+            ),
+            "the uploaded daemon could not run: /tmp/x: /lib/libc.so.6: version `GLIBC_2.38' not found\n"
+        );
+        assert_eq!(
+            explain_install_stderr("fingerprint_mismatch\texpected abc, got no output\n"),
+            "the uploaded daemon did not match this build: expected abc, got no output\n"
+        );
+        assert_eq!(
+            explain_install_stderr("Permission denied\n"),
+            "Permission denied\n"
+        );
     }
 }

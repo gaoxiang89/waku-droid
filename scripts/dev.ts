@@ -355,11 +355,15 @@ async function buildDaemon(): Promise<boolean> {
 
 // WSL connections install a Linux daemon, which a Windows cargo cannot
 // produce. Build it inside WSL into target/remote-dev, where debug builds look
-// for it. This runs beside the watcher so a slow or missing WSL never holds up
-// a relaunch.
+// for it. The build targets musl first, like release packages, so the same
+// daemon also runs on SSH hosts whose glibc is older than the WSL
+// distribution's; without a musl toolchain it falls back to a glibc-linked
+// binary, which WSL itself still runs. This runs beside the watcher so a slow
+// or missing WSL never holds up a relaunch.
 let wslDaemonBuild: Promise<void> | undefined;
 let wslDaemonBuildQueued = false;
 let wslDaemonWarningShown = false;
+let wslDaemonGlibcWarningShown = false;
 
 function scheduleWslDaemonBuild(): void {
   if (!isWindows || process.env.WAKU_DEV_SKIP_WSL_DAEMON === "1") return;
@@ -390,10 +394,19 @@ async function buildWslDaemon(): Promise<void> {
     'output_dir=$(wslpath -u "$2")',
     'export CARGO_TARGET_DIR="$HOME/.cache/waku-target"',
     'cd "$source_dir"',
-    "cargo build --package waku-daemon --bin waku-daemon",
+    'triple="$(uname -m)-unknown-linux-musl"',
+    'command -v rustup >/dev/null && rustup target add "$triple" >/dev/null 2>&1 || true',
+    'if cargo build --package waku-daemon --bin waku-daemon --target "$triple" 2>/tmp/waku-dev-musl.log; then',
+    '  built="$CARGO_TARGET_DIR/$triple/debug/waku-daemon"; echo musl',
+    "else",
+    '  echo "musl build failed; tail of /tmp/waku-dev-musl.log follows" >&2',
+    "tail -n 15 /tmp/waku-dev-musl.log >&2 || true",
+    '  cargo build --package waku-daemon --bin waku-daemon',
+    '  built="$CARGO_TARGET_DIR/debug/waku-daemon"; echo gnu',
+    "fi",
     'output="$output_dir/waku-daemon-linux-$(uname -m)"',
     'mkdir -p "$output_dir"',
-    'cp "$CARGO_TARGET_DIR/debug/waku-daemon" "$output.tmp.$$"',
+    'cp "$built" "$output.tmp.$$"',
     'mv -f "$output.tmp.$$" "$output"',
   ].join("; ");
   const distro = process.env.WAKU_DEV_WSL_DISTRO;
@@ -405,7 +418,17 @@ async function buildWslDaemon(): Promise<void> {
       .quiet()
       .nothrow();
   if (result.exitCode === 0) {
+    const flavor = result.stdout.trim().split("\n").pop();
     console.log(`[waku-dev] WSL daemon ready in ${outputDirectory}.`);
+    if (flavor === "gnu" && !wslDaemonGlibcWarningShown) {
+      wslDaemonGlibcWarningShown = true;
+      console.warn(
+        "[waku-dev] The WSL daemon fell back to a glibc-linked build; it will " +
+          "not run on SSH hosts with an older glibc. Install the musl toolchain " +
+          "in the WSL distribution (e.g. `sudo apt-get install musl-tools`) to " +
+          "build the static daemon releases carry.",
+      );
+    }
     return;
   }
   // A machine without WSL fails on every rebuild; say so once.
