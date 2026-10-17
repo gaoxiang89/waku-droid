@@ -30,9 +30,7 @@ impl SidebarGroup {
     fn element_key(self) -> SharedString {
         match self {
             Self::Project(project_id) => format!("project-{project_id}").into(),
-            Self::Projectless(workspace_id) => {
-                format!("projectless-{workspace_id}").into()
-            }
+            Self::Projectless(workspace_id) => format!("projectless-{workspace_id}").into(),
         }
     }
 
@@ -54,7 +52,8 @@ fn sidebar_ordering_label(ordering: SidebarOrdering) -> String {
 fn session_group_header(theme: &Theme) -> Div {
     div()
         .h(px(SIDEBAR_GROUP_HEADER_HEIGHT))
-        .px(px(8.0))
+        .pl(px(SIDEBAR_GROUP_HEADER_INDENT))
+        .pr(px(8.0))
         .flex()
         .items_center()
         .text_size(sp(13.0))
@@ -116,18 +115,35 @@ fn updater_button_available_content(
 
 /// Height of a session card plus the separation reserved beneath it in the
 /// virtualized sidebar list. Keep the gap inside the list row so measured and
-/// estimated heights stay identical for off-screen sessions.
-const SIDEBAR_SESSION_CARD_HEIGHT: f32 = 51.0;
+/// estimated heights stay identical for off-screen sessions. A session on its
+/// own worktree adds a second line for that branch; every other session is a
+/// single line because it shares the branch its project header already shows.
+const SIDEBAR_SESSION_CARD_HEIGHT: f32 = 32.0;
+const SIDEBAR_SESSION_DETAIL_CARD_HEIGHT: f32 = 51.0;
 const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
+const SIDEBAR_SESSION_DETAIL_ROW_HEIGHT: f32 =
+    SIDEBAR_SESSION_DETAIL_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
 const SIDEBAR_SEARCH_BOTTOM_GAP: f32 = 10.0;
+/// Host rows are section titles; every host after the first is preceded by a
+/// hairline divider inside this gap.
+pub(super) const SIDEBAR_HOST_ROW_HEIGHT: f32 = 36.0;
+pub(super) const SIDEBAR_HOST_DIVIDER_GAP: f32 = 12.0;
 const SIDEBAR_GROUP_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_GROUP_HEADER_BOTTOM_GAP: f32 = 2.0;
 const SIDEBAR_SHOW_MORE_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_GROUP_SPACER_HEIGHT: f32 = 10.0;
-const SIDEBAR_GROUP_GUIDE_X: f32 = 15.0;
-const SIDEBAR_GROUP_CHILD_PADDING: f32 = 28.0;
+/// Indents a workspace header so its folder icon lines up with the host icon
+/// above it (host row padding + chevron + gap).
+const SIDEBAR_GROUP_HEADER_INDENT: f32 = 22.0;
+/// The guide runs through the centre of the 14px folder icon.
+const SIDEBAR_GROUP_GUIDE_X: f32 = SIDEBAR_GROUP_HEADER_INDENT + 7.0;
+/// Session cards start right of the guide so their hover and selection fill
+/// never covers it.
+const SIDEBAR_SESSION_CARD_INSET: f32 = SIDEBAR_GROUP_GUIDE_X + 6.0;
+/// Child text lines up with the workspace name (folder icon + gap).
+const SIDEBAR_GROUP_CHILD_PADDING: f32 = SIDEBAR_GROUP_HEADER_INDENT + 14.0 + 5.0;
 const SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
 const SIDEBAR_PROJECT_REVEAL_BATCH: usize = 30;
 
@@ -196,7 +212,10 @@ fn project_sidebar_groups(
         groups[index].1.push(session.id);
     }
     if let Some(workspace_id) = projectless_workspace_id {
-        groups.push((SidebarGroup::Projectless(workspace_id), projectless_sessions));
+        groups.push((
+            SidebarGroup::Projectless(workspace_id),
+            projectless_sessions,
+        ));
     }
     groups
 }
@@ -271,11 +290,17 @@ fn sidebar_session_row_index(rows: &[SidebarRow], session_id: Uuid) -> Option<us
         .position(|row| *row == SidebarRow::Session(session_id))
 }
 
-fn sidebar_row_height(row: SidebarRow) -> Pixels {
+/// Fixed height of a sidebar row. `session_has_detail` reports whether a
+/// session card carries the second (worktree branch) line.
+fn sidebar_row_height(row: SidebarRow, session_has_detail: impl Fn(Uuid) -> bool) -> Pixels {
     px(match row {
-        SidebarRow::Host(_) => 36.0,
+        SidebarRow::Host(0) => SIDEBAR_HOST_ROW_HEIGHT,
+        SidebarRow::Host(_) => SIDEBAR_HOST_DIVIDER_GAP + SIDEBAR_HOST_ROW_HEIGHT,
         SidebarRow::Search => SIDEBAR_ACTION_ROW_HEIGHT + SIDEBAR_SEARCH_BOTTOM_GAP,
         SidebarRow::Header(_) => SIDEBAR_GROUP_HEADER_HEIGHT + SIDEBAR_GROUP_HEADER_BOTTOM_GAP,
+        SidebarRow::Session(session_id) if session_has_detail(session_id) => {
+            SIDEBAR_SESSION_DETAIL_ROW_HEIGHT
+        }
         SidebarRow::Session(_) => SIDEBAR_SESSION_ROW_HEIGHT,
         SidebarRow::ShowMore(_) => SIDEBAR_SHOW_MORE_ROW_HEIGHT,
         SidebarRow::GroupSpacer => SIDEBAR_GROUP_SPACER_HEIGHT,
@@ -286,12 +311,13 @@ fn sidebar_bottom_aligned_offset(
     rows: &[SidebarRow],
     target: usize,
     viewport_height: Pixels,
+    session_has_detail: impl Fn(Uuid) -> bool,
 ) -> ListOffset {
     let mut item_ix = target;
-    let mut height = sidebar_row_height(rows[target]);
+    let mut height = sidebar_row_height(rows[target], &session_has_detail);
     while item_ix > 0 && height < viewport_height {
         item_ix -= 1;
-        height += sidebar_row_height(rows[item_ix]);
+        height += sidebar_row_height(rows[item_ix], &session_has_detail);
     }
     ListOffset {
         item_ix,
@@ -299,7 +325,12 @@ fn sidebar_bottom_aligned_offset(
     }
 }
 
-fn reveal_sidebar_list_row(list: &ListState, rows: &[SidebarRow], index: usize) {
+fn reveal_sidebar_list_row(
+    list: &ListState,
+    rows: &[SidebarRow],
+    index: usize,
+    session_has_detail: impl Fn(Uuid) -> bool,
+) {
     let viewport = list.viewport_bounds();
     if viewport.size.height <= Pixels::ZERO {
         return;
@@ -322,6 +353,7 @@ fn reveal_sidebar_list_row(list: &ListState, rows: &[SidebarRow], index: usize) 
             rows,
             index,
             viewport.size.height,
+            session_has_detail,
         ));
     }
 }
@@ -1155,8 +1187,19 @@ impl Waku {
         let rows = self.sidebar_rows_cached(unix_time());
         self.sync_sidebar_rows(&rows);
         if let Some(index) = sidebar_session_row_index(&rows, session_id) {
-            reveal_sidebar_list_row(&self.sidebar_list_state, &rows, index);
+            reveal_sidebar_list_row(&self.sidebar_list_state, &rows, index, |id| {
+                self.sidebar_session_has_detail(id)
+            });
         }
+    }
+
+    /// Whether a session card shows the second, worktree-branch line.
+    fn sidebar_session_has_detail(&self, session_id: Uuid) -> bool {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| persisted_sidebar_branch_label(&session.workspace).is_some())
     }
 
     /// The sidebar row snapshot, rebuilt only when its inputs move.
@@ -1399,6 +1442,29 @@ impl Waku {
                 .unwrap_or_else(|| tr!("project.no_project_name")),
             SidebarGroup::Projectless(_) => tr!("project.no_project_name"),
         };
+        // The project's checked-out branch is shown once here instead of on
+        // every session that shares it.
+        let branch = match group {
+            SidebarGroup::Project(project_id) => self
+                .sidebar_branch_labels
+                .borrow()
+                .get(&project_id)
+                .cloned(),
+            SidebarGroup::Projectless(_) => None,
+        };
+        let empty = match group {
+            SidebarGroup::Project(project_id) => !self
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.project_id == project_id && session.has_started()),
+            SidebarGroup::Projectless(_) => false,
+        };
+        let label_color = if empty {
+            theme.text_tertiary
+        } else {
+            theme.text_secondary
+        };
         let compose = {
             let compose_focus = self
                 .sidebar_group_compose_focuses
@@ -1480,16 +1546,29 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .child(icon(folder_icon, 14.0, theme.text_secondary))
+                    .child(icon(folder_icon, 14.0, label_color))
                     .child(
                         div()
                             .min_w_0()
                             .flex()
                             .items_center()
                             .gap(px(2.0))
+                            .text_color(label_color)
                             .child(div().min_w_0().truncate().child(label)),
                     )
-                    .child(div().flex_1()),
+                    .child(div().flex_1())
+                    .when_some(branch, |element, branch| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(96.0))
+                                .truncate()
+                                .text_size(sp(12.0))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(theme.text_ghost)
+                                .child(branch),
+                        )
+                    }),
             )
             .child(compose)
             .when(has_expanded_children, |element| {
@@ -1752,27 +1831,23 @@ impl Waku {
             session.status,
             SessionStatus::Connecting | SessionStatus::Working
         );
-        let project = self
-            .state
-            .projects
-            .iter()
-            .find(|project| project.id == session.project_id);
-        let left_padding = SIDEBAR_GROUP_CHILD_PADDING;
+        let left_padding = SIDEBAR_GROUP_CHILD_PADDING - SIDEBAR_SESSION_CARD_INSET;
+        // Only a session on its own worktree names a branch; local sessions
+        // share the one on their project header.
         let detail_label = persisted_sidebar_branch_label(&session.workspace)
-            .map(|branch| SharedString::from(branch.to_owned()))
-            .or_else(|| {
-                if !matches!(&session.workspace, SessionWorkspace::Local) {
-                    return None;
-                }
-                project.and_then(|project| {
-                    self.sidebar_branch_labels
-                        .borrow()
-                        .get(&project.id)
-                        .cloned()
-                })
-            });
-        let has_detail_label = detail_label.is_some();
+            .map(|branch| SharedString::from(branch.to_owned()));
         let detail_icon = "icons/git-branch.svg";
+        let status_dot = matches!(
+            session.status,
+            SessionStatus::Waiting | SessionStatus::Failed
+        )
+        .then(|| {
+            div()
+                .flex_none()
+                .size(px(6.0))
+                .rounded_full()
+                .bg(status_color(&theme, session.status))
+        });
         let rename_input =
             (self.session_rename == Some(session_id)).then(|| self.session_rename_input.clone());
         let renaming = rename_input.is_some();
@@ -1854,41 +1929,7 @@ impl Waku {
                             status_color(&theme, session.status),
                         ))
                     })
-                    .when(session.status == SessionStatus::Waiting, |element| {
-                        element.child(icon(
-                            "icons/alert.svg",
-                            12.0,
-                            status_color(&theme, session.status),
-                        ))
-                    })
-                    .when(session.status == SessionStatus::Failed, |element| {
-                        element.child(icon(
-                            "icons/x.svg",
-                            12.0,
-                            status_color(&theme, session.status),
-                        ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .text_size(sp(12.5))
-                    .line_height(sp(15.0))
-                    .when_some(detail_label, |element, label| {
-                        element
-                            .child(icon(detail_icon, 12.5, theme.text_tertiary))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.text_tertiary)
-                                    .child(label),
-                            )
-                    })
-                    .when(!has_detail_label, |element| element.child(div().flex_1()))
+                    .when_some(status_dot, |element, dot| element.child(dot))
                     .when_some(
                         session_time_label(session, unix_time()),
                         |element, label| {
@@ -1906,6 +1947,25 @@ impl Waku {
                         },
                     ),
             )
+            .when_some(detail_label, |element, label| {
+                element.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(15.0))
+                        .child(icon(detail_icon, 12.5, theme.text_tertiary))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_tertiary)
+                                .child(label),
+                        ),
+                )
+            })
             .when(!renaming, |element| {
                 element
                     .track_focus(&row_focus)
@@ -1962,6 +2022,7 @@ impl Waku {
         div()
             .relative()
             .w_full()
+            .pl(px(SIDEBAR_SESSION_CARD_INSET))
             .pb(px(SIDEBAR_SESSION_ROW_GAP))
             .child(row)
             .child(
@@ -2531,7 +2592,7 @@ mod tests {
         rows.push(SidebarRow::GroupSpacer);
 
         let index = sidebar_session_row_index(&rows, target).unwrap();
-        let offset = sidebar_bottom_aligned_offset(&rows, index, px(400.0));
+        let offset = sidebar_bottom_aligned_offset(&rows, index, px(400.0), |_| true);
 
         assert_eq!(index, 32);
         assert_eq!(offset.item_ix, 25);
@@ -2539,7 +2600,7 @@ mod tests {
         let visible_height = rows[offset.item_ix..=index]
             .iter()
             .copied()
-            .map(sidebar_row_height)
+            .map(|row| sidebar_row_height(row, |_| true))
             .fold(Pixels::ZERO, |height, row| height + row)
             - offset.offset_in_item;
         assert_eq!(visible_height, px(400.0));

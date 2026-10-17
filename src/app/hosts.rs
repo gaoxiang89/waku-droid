@@ -1,3 +1,4 @@
+use super::sidebar::{SIDEBAR_HOST_DIVIDER_GAP, SIDEBAR_HOST_ROW_HEIGHT};
 use super::*;
 use waku_client::hosts::HostKey;
 
@@ -176,8 +177,11 @@ impl Waku {
             .clone();
         // Only remote hosts have a menu: disconnect and remove target a saved
         // connection, which the local host is not.
+        // Row actions stay out of the way until the row is hovered or focused.
+        let row_group = SharedString::from(format!("sidebar-host-row-{index}"));
         let options = if let HostKey::Connection(id) = &key {
             let menu = self.menu_handle(format!("host-menu-{index}"), cx);
+            let menu_open = menu.is_open();
             let weak = cx.entity().downgrade();
             let menu_key = key.clone();
             let menu_id = id.clone();
@@ -189,8 +193,10 @@ impl Waku {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .opacity(if menu_open { 1.0 } else { 0.0 })
+                    .group_hover(row_group.clone(), |style| style.opacity(1.0))
                     .hover(|style| style.bg(theme.overlay))
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .focus_visible(|style| style.opacity(1.0).border_1().border_color(theme.accent))
                     .child(icon("icons/ellipsis.svg", 14.0, theme.text_secondary)),
                 SharedString::from(format!("host-options-menu-{index}")),
                 &menu,
@@ -226,8 +232,10 @@ impl Waku {
             .flex()
             .items_center()
             .justify_center()
+            .opacity(0.0)
+            .group_hover(row_group.clone(), |style| style.opacity(1.0))
             .hover(|style| style.bg(theme.overlay))
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .focus_visible(|style| style.opacity(1.0).border_1().border_color(theme.accent))
             .tooltip(Tooltip::text(tr!("project.add_project")))
             .child(icon("icons/plus.svg", 14.0, theme.text_secondary))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -242,13 +250,14 @@ impl Waku {
                 }
             }));
         let click_key = key.clone();
-        div()
+        let row = div()
             .id(SharedString::from(format!("sidebar-host-{index}")))
+            .group(row_group)
             .track_focus(&focuses[0])
             .tab_group()
             .tab_index(0)
             .tab_stop(true)
-            .h(px(36.0))
+            .h(px(SIDEBAR_HOST_ROW_HEIGHT))
             .w_full()
             .px(px(4.0))
             .rounded(px(6.0))
@@ -274,14 +283,15 @@ impl Waku {
                     "icons/server.svg"
                 },
                 14.0,
-                theme.text_secondary,
+                theme.text_tertiary,
             ))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(sp(12.5))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(sp(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_tertiary)
                     .truncate()
                     .child(name),
             )
@@ -318,7 +328,25 @@ impl Waku {
                 }
                 cx.stop_propagation();
                 cx.notify();
-            }))
+            }));
+        if index == 0 {
+            return row.into_any_element();
+        }
+        // Later hosts sit below a hairline so each machine reads as its own
+        // section rather than another workspace.
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(SIDEBAR_HOST_DIVIDER_GAP))
+                    .px(px(4.0))
+                    .flex()
+                    .items_center()
+                    .child(div().w_full().h(px(1.0)).bg(theme.border)),
+            )
+            .child(row)
             .into_any_element()
     }
     pub(super) fn reconnect_saved_hosts(&mut self, cx: &mut Context<Self>) {
