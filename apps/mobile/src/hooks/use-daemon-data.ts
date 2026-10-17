@@ -26,6 +26,7 @@ const PROVIDERS: ProviderKind[] = [
   'openCode',
   'grok',
   'kimi',
+  'droid',
   'deepSeek',
   'fx',
   'ohMyPi',
@@ -127,6 +128,7 @@ export function useAllProviderModels(providers: ProviderKind[]) {
     id,
     label: providerLabel(id),
     models: queries[index]?.data?.models ?? [],
+    discoveryError: queries[index]?.data?.discovery_error ?? null,
     isPending: queries[index]?.isPending ?? true,
   }));
 }

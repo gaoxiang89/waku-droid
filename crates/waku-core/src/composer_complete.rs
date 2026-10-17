@@ -136,7 +136,7 @@ pub fn discover_slash_commands(
 ) -> Vec<SlashCommand> {
     let cli_commands = match binary_override {
         Some(binary) => crate::command_env::resolve_binary_override(binary),
-        None => crate::command_env::find_executable(provider.command()),
+        None => crate::model::default_provider_executable(provider),
     }
     .as_deref()
     .and_then(|binary| crate::slash_command_catalog::discover(provider, binary, project_root))
@@ -316,6 +316,18 @@ fn assemble_slash_commands(
         ProviderKind::Amp => {
             if let Some(home) = home.as_deref() {
                 scan_skill_files(provider, &home.join(".config/agents/skills"), &mut commands);
+            }
+        }
+        // Factory Droid reads `.factory/skills` in addition to the shared
+        // `.agents/skills` tree scanned for every provider.
+        ProviderKind::Droid => {
+            scan_skill_files(
+                provider,
+                &project_root.join(".factory/skills"),
+                &mut commands,
+            );
+            if let Some(home) = home.as_deref() {
+                scan_skill_files(provider, &home.join(".factory/skills"), &mut commands);
             }
         }
         // Harness commands are session-scoped and reported live by the Host,
@@ -1420,6 +1432,7 @@ mod tests {
             (ProviderKind::OpenCode, ".opencode/skills"),
             (ProviderKind::Pi, ".pi/skills"),
             (ProviderKind::OhMyPi, ".omp/skills"),
+            (ProviderKind::Droid, ".factory/skills"),
         ] {
             let skill_dir = root.join(dir).join("native-skill");
             std::fs::create_dir_all(&skill_dir).unwrap();

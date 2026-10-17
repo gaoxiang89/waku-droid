@@ -84,6 +84,7 @@ title near when the provider writes it, and long enough to survive a slow start.
 | Oh My Pi | Oh My Pi | NDJSON stream | connect, `session_info_update` | [pi.rs:472](../crates/waku-core/src/driver/pi.rs#L472), [pi.rs:1214](../crates/waku-core/src/driver/pi.rs#L1214) |
 | DeepSeek | Harness | stream + projections | `session/title`, projection replay | [deepseek.rs:782](../crates/waku-core/src/driver/deepseek.rs#L782), [deepseek.rs:1139](../crates/waku-core/src/driver/deepseek.rs#L1139) |
 | Kimi Code | Kimi (placeholder) | ACP stream | `session_info_update` | [acp.rs:1305](../crates/waku-core/src/driver/acp.rs#L1305) |
+| Factory Droid | Droid, when it sends one | ACP stream | `session_info_update` | same ACP handler as Kimi |
 | Cursor CLI | — | — | — | none; fallback only |
 
 ### Claude Code

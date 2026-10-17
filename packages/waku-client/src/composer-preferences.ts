@@ -38,6 +38,7 @@ const PROVIDERS = new Set<ProviderKind>([
   'openCode',
   'grok',
   'kimi',
+  'droid',
   'ohMyPi',
   'pi',
 ])

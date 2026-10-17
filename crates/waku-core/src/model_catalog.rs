@@ -1,5 +1,6 @@
 //! Provider model and agent-preset discovery.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -7,7 +8,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{ClientCapabilities, Implementation, InitializeRequest};
+use agent_client_protocol::schema::v1::{
+    ClientCapabilities, Implementation, InitializeRequest, NewSessionRequest, SessionConfigKind,
+    SessionConfigOption, SessionConfigSelectOptions, SetSessionConfigOptionRequest,
+};
 use agent_client_protocol::{Agent, Client, ConnectionTo, UntypedMessage};
 use serde_json::{Map, Value, json};
 
@@ -20,6 +24,10 @@ const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// resources and model catalog, which can outlast a live request's budget.
 const PI_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CURSOR_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const DROID_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
+/// Selecting a model answers in roughly 100-200 ms, so this covers a catalog
+/// of about a hundred models while leaving the overall timeout room to spare.
+const DROID_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
 
 pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
     match provider {
@@ -97,7 +105,9 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
         // configured LLM providers. A fabricated fallback would make
         // unavailable models look selectable.
-        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => Vec::new(),
+        ProviderKind::Droid | ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => {
+            Vec::new()
+        }
     }
 }
 
@@ -125,6 +135,19 @@ pub fn discover_catalog(
     provider: ProviderKind,
     binary: &Path,
 ) -> (Vec<ProviderModel>, Vec<ProviderAgentPreset>) {
+    let (models, presets, _) = discover_catalog_reporting(provider, binary);
+    (models, presets)
+}
+
+/// [`discover_catalog`], plus why live discovery failed when the provider
+/// can say. Only Droid reports a reason today: its discovery fails outright on
+/// a rejected login or `FACTORY_API_KEY`, which otherwise looks exactly like
+/// a provider with no models.
+pub fn discover_catalog_reporting(
+    provider: ProviderKind,
+    binary: &Path,
+) -> (Vec<ProviderModel>, Vec<ProviderAgentPreset>, Option<String>) {
+    let mut discovery_error = None;
     let (discovered, discovered_presets) = match provider {
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
@@ -137,6 +160,13 @@ pub fn discover_catalog(
         ProviderKind::OpenCode => crate::opencode_session::discover_catalog(binary),
         ProviderKind::Grok => (discover_grok_models(binary), None),
         ProviderKind::Kimi => (discover_kimi_models(binary), None),
+        ProviderKind::Droid => match discover_droid_models(binary) {
+            Ok(models) => (models, None),
+            Err(error) => {
+                discovery_error = Some(error);
+                (Vec::new(), None)
+            }
+        },
         ProviderKind::Pi => (discover_pi_models(binary, PiDialect::Pi), None),
         ProviderKind::OhMyPi => (discover_pi_models(binary, PiDialect::OhMyPi), None),
     };
@@ -150,7 +180,7 @@ pub fn discover_catalog(
         models
     };
     let presets = discovered_presets.unwrap_or_else(|| fallback_agent_presets(provider));
-    (models, presets)
+    (models, presets, discovery_error)
 }
 
 /// Where a provider's last discovered catalog is cached. Debug builds keep it
@@ -908,6 +938,191 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
         .collect()
 }
 
+/// Factory Droid advertises its account catalog on `session/new` as the
+/// `model` config option. There is no separate models command, and an
+/// invented fallback would name a route the account cannot use.
+///
+/// `reasoning_effort` lists only the selected model's levels, and they differ
+/// per model, so discovery selects each model in the throwaway session and
+/// records the levels Droid answers with. Selecting a model there leaves the
+/// user's Droid defaults untouched.
+fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
+    let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
+    let agent = crate::driver::catalog_agent(ProviderKind::Droid, binary, &cwd)
+        .map_err(|error| error.to_string())?;
+    let request = Client
+        .builder()
+        .name("waku-droid-model-discovery")
+        .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+            connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new().terminal(false))
+                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
+            let response = connection
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let options = response.config_options.unwrap_or_default();
+            let mut efforts = DroidModelEfforts::new();
+            if let Some(model_option) = droid_config_option(&options, "model") {
+                if let Some(current) = droid_select_current(model_option) {
+                    efforts.insert(current.to_owned(), droid_effort_choices(&options));
+                }
+                let probe_until = Instant::now() + DROID_EFFORT_PROBE_BUDGET;
+                for (id, _) in droid_select_choices(model_option) {
+                    if Instant::now() >= probe_until {
+                        break;
+                    }
+                    if id.is_empty() || efforts.contains_key(&id) {
+                        continue;
+                    }
+                    if let Ok(updated) = connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            response.session_id.clone(),
+                            model_option.id.clone(),
+                            id.as_str(),
+                        ))
+                        .block_task()
+                        .await
+                    {
+                        efforts.insert(id, droid_effort_choices(&updated.config_options));
+                    }
+                }
+            }
+            Ok((options, efforts))
+        });
+    let (options, efforts) = smol::block_on(smol::future::race(
+        async move { request.await.map_err(|error| droid_discovery_error(&error)) },
+        async move {
+            smol::Timer::after(DROID_ACP_DISCOVERY_TIMEOUT).await;
+            Err(format!(
+                "Droid did not answer within {} seconds",
+                DROID_ACP_DISCOVERY_TIMEOUT.as_secs()
+            ))
+        },
+    ))?;
+    Ok(droid_models_from_config(&options, &efforts))
+}
+
+/// The ACP error's own message, with its detail when Droid sent one. The
+/// SDK's `Display` adds JSON-RPC framing that means nothing in a picker.
+fn droid_discovery_error(error: &agent_client_protocol::Error) -> String {
+    let message = error.message.trim();
+    match error.data.as_ref() {
+        Some(serde_json::Value::String(detail)) if !detail.trim().is_empty() => {
+            format!("{message}: {}", detail.trim())
+        }
+        _ => message.to_owned(),
+    }
+}
+
+/// Reasoning choices and the current choice, keyed by model id. A model that
+/// is absent was not probed in time and offers no effort picker.
+type DroidModelEfforts = HashMap<String, Option<DroidEffortChoices>>;
+
+/// `(id, label)` pairs for every level, then the selected level.
+type DroidEffortChoices = (Vec<(String, String)>, Option<String>);
+
+fn droid_effort_choices(options: &[SessionConfigOption]) -> Option<DroidEffortChoices> {
+    droid_config_option(options, "reasoning_effort").map(|option| {
+        (
+            droid_select_choices(option),
+            droid_select_current(option).map(str::to_owned),
+        )
+    })
+}
+
+fn droid_models_from_config(
+    options: &[SessionConfigOption],
+    efforts: &DroidModelEfforts,
+) -> Vec<ProviderModel> {
+    let Some(model_option) = droid_config_option(options, "model") else {
+        return Vec::new();
+    };
+    let current_model = droid_select_current(model_option);
+    let mut models = Vec::new();
+    for (id, name) in droid_select_choices(model_option) {
+        if id.is_empty() || models.iter().any(|model: &ProviderModel| model.id == id) {
+            continue;
+        }
+        let is_default = current_model == Some(id.as_str());
+        let label = if name.trim().is_empty() {
+            display_name_from_slug(&id)
+        } else {
+            name
+        };
+        let mut model = ProviderModel::new(id, label);
+        if is_default {
+            model = model.default();
+        }
+        if let Some(Some((choices, current))) = efforts.get(&model.id) {
+            let effort_options: Vec<_> = choices
+                .iter()
+                .filter(|(effort_id, _)| !effort_id.is_empty())
+                .map(|(effort_id, effort_name)| {
+                    let label = if effort_name.trim().is_empty() {
+                        reasoning_effort_label(effort_id)
+                    } else {
+                        effort_name.clone()
+                    };
+                    ProviderModelOption::new(effort_id.clone(), label)
+                })
+                .collect();
+            // A single level, such as Auto's `none`, is not a choice.
+            if effort_options.len() > 1 {
+                let default = current
+                    .as_deref()
+                    .filter(|effort| effort_options.iter().any(|option| option.id == *effort))
+                    .map(str::to_owned)
+                    .or_else(|| effort_options.first().map(|option| option.id.clone()));
+                if let Some(default) = default {
+                    model = model.reasoning(effort_options, default);
+                }
+            }
+        }
+        models.push(model);
+    }
+    models
+}
+
+fn droid_config_option<'a>(
+    options: &'a [SessionConfigOption],
+    id: &str,
+) -> Option<&'a SessionConfigOption> {
+    options
+        .iter()
+        .find(|option| option.id.to_string().eq_ignore_ascii_case(id))
+}
+
+fn droid_select_current(option: &SessionConfigOption) -> Option<&str> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    Some(select.current_value.0.as_ref())
+}
+
+fn droid_select_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return Vec::new();
+    };
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|option| (option.value.0.to_string(), option.name.clone()))
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|option| (option.value.0.to_string(), option.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Kimi Code resolves models through its own provider config, which covers the
 /// managed Kimi plan as well as any registry the user imported. `--json` is the
 /// catalog itself; it omits the configured default, so the human-readable
@@ -1591,7 +1806,115 @@ fn deduplicate(models: Vec<ProviderModel>) -> Vec<ProviderModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::SessionConfigSelectOption;
 
+    fn droid_effort_option(current: &str, levels: &[&str]) -> SessionConfigOption {
+        SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning",
+            current.to_owned(),
+            levels
+                .iter()
+                .map(|level| SessionConfigSelectOption::new(level.to_string(), level.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn droid_catalog_keeps_each_models_own_reasoning_levels() {
+        let options = [
+            SessionConfigOption::select(
+                "autonomy_level",
+                "Autonomy",
+                "normal",
+                vec![
+                    SessionConfigSelectOption::new("normal", "Auto (Off)"),
+                    SessionConfigSelectOption::new("auto-high", "Auto (High)"),
+                ],
+            ),
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "glm-5.3-flash",
+                vec![
+                    SessionConfigSelectOption::new("glm-5.3-flash", "GLM 5.3 Flash"),
+                    SessionConfigSelectOption::new("gpt-6-sol", "GPT-6 Sol"),
+                    SessionConfigSelectOption::new("auto", "Auto"),
+                    SessionConfigSelectOption::new("unprobed", "Unprobed"),
+                ],
+            ),
+            droid_effort_option("high", &["low", "high", "max"]),
+        ];
+        let efforts: DroidModelEfforts = [
+            (
+                "glm-5.3-flash",
+                droid_effort_option("high", &["low", "high", "max"]),
+            ),
+            (
+                "gpt-6-sol",
+                droid_effort_option("medium", &["none", "low", "medium", "high"]),
+            ),
+            ("auto", droid_effort_option("none", &["none"])),
+        ]
+        .into_iter()
+        .map(|(model, option)| (model.to_owned(), droid_effort_choices(&[option])))
+        .collect();
+
+        let models = droid_models_from_config(&options, &efforts);
+        let levels = |index: usize| {
+            models[index]
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(models.len(), 4);
+        assert!(models[0].is_default);
+        assert_eq!(models[0].id, "glm-5.3-flash");
+        assert_eq!(models[0].name, "GLM 5.3 Flash");
+        assert_eq!(levels(0), ["low", "high", "max"]);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert!(!models[1].is_default);
+        assert_eq!(levels(1), ["none", "low", "medium", "high"]);
+        assert_eq!(
+            models[1].default_reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(models[2].id, "auto");
+        assert!(models[2].reasoning_efforts.is_empty());
+        assert_eq!(models[3].id, "unprobed");
+        assert!(models[3].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an installed, authenticated droid"]
+    fn droid_discovery_reads_each_models_reasoning_levels() {
+        // `WAKU_DROID_BINARY` exercises a wrapper such as a dk key-injection
+        // shim the way a provider binary override would.
+        let binary = std::env::var("WAKU_DROID_BINARY")
+            .ok()
+            .and_then(|spec| crate::command_env::resolve_binary_override(&spec))
+            .or_else(|| crate::command_env::find_executable("droid"))
+            .expect("droid is not installed");
+        let models = discover_droid_models(&binary).expect("droid discovery failed");
+        assert!(models.iter().any(|model| model.is_default));
+        let level_sets: std::collections::HashSet<Vec<&str>> = models
+            .iter()
+            .filter(|model| !model.reasoning_efforts.is_empty())
+            .map(|model| {
+                model
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.id.as_str())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            level_sets.len() > 1,
+            "every Droid model reported the same reasoning levels"
+        );
+    }
     #[cfg(unix)]
     fn write_fake_model_cli(name: &str, contents: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;

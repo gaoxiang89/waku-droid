@@ -1161,15 +1161,24 @@ impl Waku {
                             if pending_discoveries.contains(&provider)
                     ) {
                         tr!("models.loading")
+                    } else if let ModelPickerTab::Provider(provider) = selected_tab
+                        && let Some(error) = probes
+                            .iter()
+                            .find(|probe| probe.provider == provider)
+                            .and_then(|probe| probe.discovery_error.as_deref())
+                    {
+                        tr!("models.discovery_failed", error = error)
                     } else {
                         tr!("models.none_reported")
                     };
                     rows = rows.child(
                         div()
                             .h_full()
+                            .px(px(16.0))
                             .flex()
                             .items_center()
                             .justify_center()
+                            .text_center()
                             .text_size(sp(12.5))
                             .text_color(theme.text_ghost)
                             .child(label),

@@ -347,6 +347,21 @@ fn agent_arguments(
             }
             return args;
         }
+        // Default `droid exec` is read-only. Omitting `--auto` keeps the
+        // commit subject from editing the tree.
+        ProviderKind::Droid => {
+            push(&mut args, "exec");
+            push(&mut args, "--output-format");
+            push(&mut args, "text");
+            if let Some(model) = model {
+                push(&mut args, "--model");
+                push(&mut args, model);
+            }
+            if let Some(effort) = reasoning_effort {
+                push(&mut args, "--reasoning-effort");
+                push(&mut args, effort);
+            }
+        }
         // Oh My Pi rejects unknown flags outright, so it gets its own list
         // rather than Pi's: context files are `--no-rules`, and it has no
         // prompt-template or project-trust switch to turn off.
@@ -806,6 +821,14 @@ mod tests {
                     assert!(has_pair(&args, "--prompt", prompt));
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has_pair(&args, "--model", "model"));
+                }
+                ProviderKind::Droid => {
+                    assert_eq!(args.first().and_then(|arg| arg.to_str()), Some("exec"));
+                    assert!(has_pair(&args, "--output-format", "text"));
+                    assert!(has_pair(&args, "--model", "model"));
+                    assert!(has_pair(&args, "--reasoning-effort", "low"));
+                    assert!(!has(&args, "--auto"));
+                    assert_eq!(args.last().and_then(|arg| arg.to_str()), Some(prompt));
                 }
             }
         }

@@ -48,6 +48,8 @@ pub mod opencode_service;
 pub mod opencode_session;
 pub mod persistence;
 pub mod pi_session;
+#[cfg(windows)]
+mod process_tree;
 pub mod projectless;
 pub mod settings;
 pub mod skills;

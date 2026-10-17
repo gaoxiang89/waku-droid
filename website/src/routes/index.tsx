@@ -51,6 +51,7 @@ const PROVIDERS = [
   { slug: 'grok', label: 'Grok' },
   { slug: 'pi', label: 'Pi' },
   { slug: 'kimi', label: 'Kimi' },
+  { slug: 'droid', label: 'Droid' },
 ]
 
 const FEATURES = [
@@ -93,7 +94,7 @@ const FAQ = [
   },
   {
     q: 'Do I need new API keys?',
-    a: 'No. Waku detects amp, claude, codex, cursor-agent, opencode, grok, pi, and kimi on your machine and drives them directly — your existing logins, plans, and rate limits apply unchanged.',
+    a: 'No. Waku detects amp, claude, codex, cursor-agent, opencode, grok, pi, kimi, and droid on your machine and drives them directly — your existing logins, plans, and rate limits apply unchanged.',
   },
   {
     q: 'Where does my data live?',

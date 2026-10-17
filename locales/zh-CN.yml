@@ -81,7 +81,7 @@ settings.daemon: 守护进程
 settings.computer_use: 电脑操作
 settings.general_keywords: 通用 本地 项目 对话 隐私 匿名 使用数据 分析 分享 更新 自动 版本 数学 公式 表达式 math latex
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
-settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi
+settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills: 技能
 settings.skills_keywords: 技能 技能库 智能体 禁用 启用 删除 claude codex cursor opencode pi amp 共享
 settings.usage_keywords: 用量 令牌 费用 支出 缓存 每日 图表 模型 明细 历史 claude codex
@@ -463,6 +463,7 @@ models.none_found: 未找到模型
 models.favorite_hint: 为模型加星标即可固定在这里
 models.loading: 正在加载模型…
 models.none_reported: 此服务商未提供任何模型
+models.discovery_failed: 无法加载模型：%{error}
 models.no_providers: 无可用服务商
 models.no_providers_title: 没有可用的服务商
 models.no_providers_description: 请安装一个智能体 CLI，或在服务商设置中重新启用。
@@ -684,6 +685,7 @@ errors.switch_provider_model: "无法切换 %{provider} 模型：%{error}"
 errors.change_provider_thinking: "无法更改 %{provider} 的思考强度：%{error}"
 errors.open_provider_session: "无法打开 %{provider} 会话：%{error}"
 errors.select_model: "无法选择模型：%{error}"
+errors.set_session_option: "无法更改会话设置：%{error}"
 errors.read_provider_event_stream: "无法读取 %{provider} 事件流：%{error}"
 errors.answer_provider_permission: "无法响应 %{provider} 的权限请求：%{error}"
 errors.answer_provider_question: "无法回答 %{provider} 的问题：%{error}"

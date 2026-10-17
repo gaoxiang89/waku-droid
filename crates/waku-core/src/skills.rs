@@ -95,6 +95,10 @@ pub fn user_skill_locations() -> Vec<SkillLocation> {
         SkillSource::Provider(ProviderKind::Amp),
         home_join(".config/agents/skills"),
     );
+    push(
+        SkillSource::Provider(ProviderKind::Droid),
+        home_join(".factory/skills"),
+    );
     locations
 }
 
@@ -118,6 +122,10 @@ pub fn project_skill_locations(project_root: &Path, project_name: &str) -> Vec<S
         (SkillSource::Provider(ProviderKind::Fx), "skills"),
         (SkillSource::Provider(ProviderKind::Pi), ".pi/skills"),
         (SkillSource::Provider(ProviderKind::OhMyPi), ".omp/skills"),
+        (
+            SkillSource::Provider(ProviderKind::Droid),
+            ".factory/skills",
+        ),
     ]
     .into_iter()
     .map(|(source, suffix)| SkillLocation {

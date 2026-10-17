@@ -1930,6 +1930,7 @@ fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
         path: Some(std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
         models: vec![ProviderModel::new(model, model)],
         agent_presets: Vec::new(),
+        discovery_error: None,
     };
     let probes = [
         probe(ProviderKind::Claude, "claude-sonnet-5"),
@@ -2019,6 +2020,7 @@ fn tab_cycle_walks_favorites_then_usable_providers_in_rail_order() {
         path: installed.then(|| std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
         models: vec![ProviderModel::new("model", "model")],
         agent_presets: Vec::new(),
+        discovery_error: None,
     };
     let probes = [
         probe(ProviderKind::Claude, true),
@@ -2067,6 +2069,7 @@ fn the_picker_is_empty_only_once_detection_has_answered() {
         path: installed.then(|| std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
         models: vec![ProviderModel::new("model", "model")],
         agent_presets: Vec::new(),
+        discovery_error: None,
     };
     // What every probe looks like before detection answers: seeded with a
     // fallback catalog and not yet installed.
@@ -2114,6 +2117,7 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         path: installed.then(|| std::path::PathBuf::from(format!("/bin/{}", provider.id()))),
         models: vec![ProviderModel::new("model", "model")],
         agent_presets: Vec::new(),
+        discovery_error: None,
     };
     let probes = [
         probe(ProviderKind::Claude, true),

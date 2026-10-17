@@ -85,7 +85,7 @@ settings.daemon: デーモン
 settings.computer_use: コンピュータ操作
 settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー 分析 テレメトリ 匿名 共有 アップデート 自動 バージョン 数学 数式 math latex
 settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ
-settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 claude codex cursor opencode amp grok pi
+settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills: スキル
 settings.skills_keywords: スキル ライブラリ エージェント 無効 有効 削除 claude codex cursor opencode pi amp 共有
 settings.usage_keywords: 使用状況 トークン コスト 支出 キャッシュ 日別 グラフ モデル 内訳 履歴 claude codex
@@ -488,6 +488,7 @@ models.none_found: モデルが見つかりません
 models.favorite_hint: モデルにスターを付けると、ここに固定できます
 models.loading: モデルを読み込み中…
 models.none_reported: このプロバイダーにモデルがありません
+models.discovery_failed: モデルを読み込めませんでした：%{error}
 models.no_providers: プロバイダーなし
 models.no_providers_title: 利用できるプロバイダーがありません
 models.no_providers_description: エージェント CLI をインストールするか、プロバイダー設定で再度有効にしてください。
@@ -719,6 +720,7 @@ errors.switch_provider_model: "%{provider} のモデルを切り替えられま�
 errors.change_provider_thinking: "%{provider} の思考レベルを変更できませんでした：%{error}"
 errors.open_provider_session: "%{provider} のセッションを開けませんでした：%{error}"
 errors.select_model: "モデルを選択できませんでした：%{error}"
+errors.set_session_option: "セッション設定を変更できませんでした：%{error}"
 errors.read_provider_event_stream: "%{provider} のイベントストリームを読み取れませんでした：%{error}"
 errors.answer_provider_permission: "%{provider} の権限リクエストに回答できませんでした：%{error}"
 errors.answer_provider_question: "%{provider} の質問に回答できませんでした：%{error}"

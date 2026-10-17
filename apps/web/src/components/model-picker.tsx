@@ -215,14 +215,16 @@ export function ModelPicker({
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-[9px]" ref={list}>
               {!rows.length && (
-                <div className="grid h-full place-items-center text-[11.5px] text-[var(--text-ghost)]">
-                  {t(query
-                    ? 'models.none_found'
-                    : tab === 'favorites'
-                      ? 'models.favorite_hint'
-                      : probes.isFetching
-                        ? 'models.loading'
-                        : 'models.none_reported')}
+                <div className="grid h-full place-items-center px-4 text-center text-[11.5px] text-[var(--text-ghost)]">
+                  {(() => {
+                    if (query) return t('models.none_found')
+                    if (tab === 'favorites') return t('models.favorite_hint')
+                    if (probes.isFetching) return t('models.loading')
+                    const error = probeMap[tab]?.discovery_error
+                    return error
+                      ? t('models.discovery_failed', { error })
+                      : t('models.none_reported')
+                  })()}
                 </div>
               )}
               {rows.map((row, index) => {

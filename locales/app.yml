@@ -167,7 +167,7 @@ settings.general_keywords:
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
-  en: providers agents models cli version install detect claude codex cursor opencode amp grok pi
+  en: providers agents models cli version install detect claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills:
   en: Skills
 settings.skills_keywords:
@@ -948,6 +948,8 @@ models.loading:
   en: Loading models…
 models.none_reported:
   en: No models reported by this provider
+models.discovery_failed:
+  en: "Couldn't load models: %{error}"
 models.no_providers:
   en: No providers
 models.no_providers_title:
@@ -1401,6 +1403,8 @@ errors.open_provider_session:
   en: "Could not open a %{provider} session: %{error}"
 errors.select_model:
   en: "Could not select the model: %{error}"
+errors.set_session_option:
+  en: "Could not change the session setting: %{error}"
 errors.read_provider_event_stream:
   en: "Could not read the %{provider} event stream: %{error}"
 errors.answer_provider_permission:

@@ -173,6 +173,7 @@ export function providerLabel(provider: ProviderKind): string {
     openCode: 'OpenCode',
     grok: 'Grok',
     kimi: 'Kimi',
+    droid: 'Droid',
     ohMyPi: 'Oh My Pi',
     pi: 'Pi',
   };

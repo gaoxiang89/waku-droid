@@ -3,4 +3,9 @@ import type { ProviderAgentPreset } from "./ProviderAgentPreset";
 import type { ProviderKind } from "./ProviderKind";
 import type { ProviderModel } from "./ProviderModel";
 
-export type ProviderProbe = { provider: ProviderKind, installed: boolean, path: string | null, models: Array<ProviderModel>, agent_presets: Array<ProviderAgentPreset>, };
+export type ProviderProbe = { provider: ProviderKind, installed: boolean, path: string | null, models: Array<ProviderModel>, agent_presets: Array<ProviderAgentPreset>,
+/**
+ * Why the last live model discovery failed, such as a rejected API key.
+ * Clients show it when the picker would otherwise just be empty.
+ */
+discovery_error?: string | null, };

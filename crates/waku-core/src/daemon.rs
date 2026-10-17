@@ -519,7 +519,7 @@ impl Backend for WakuBackend {
                     ProviderKind::Codex => {
                         crate::codex_session::list_provider_sessions(&binary, limit)?
                     }
-                    ProviderKind::Cursor | ProviderKind::Fx => {
+                    ProviderKind::Cursor | ProviderKind::Droid | ProviderKind::Fx => {
                         crate::acp_session::list_provider_sessions(provider, &binary, &[], limit)?
                     }
                     ProviderKind::OpenCode => {
@@ -594,6 +594,7 @@ impl Backend for WakuBackend {
                         )?
                     }
                     ProviderResumeCursor::Cursor { session_id, .. }
+                    | ProviderResumeCursor::Droid { session_id }
                     | ProviderResumeCursor::Fx { session_id }
                     | ProviderResumeCursor::Grok { session_id }
                     | ProviderResumeCursor::Kimi { session_id } => {
@@ -1282,7 +1283,7 @@ impl WakuBackend {
             }
             // Unreachable through the UI, which hides branching for providers
             // that answer `supports_conversation_fork` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot branch a conversation at a turn",
                     source.provider.display_name()
@@ -1483,7 +1484,7 @@ impl WakuBackend {
             )),
             // Unreachable through the UI, which hides rewinding for providers
             // that answer `supports_conversation_rollback` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot rewind a conversation to a turn",
                     source.provider.display_name()

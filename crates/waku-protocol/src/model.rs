@@ -16,6 +16,8 @@ pub enum ProviderKind {
     Codex,
     Cursor,
     DeepSeek,
+    /// Factory's coding agent. It speaks ACP from `droid exec --output-format acp-daemon`.
+    Droid,
     Fx,
     /// OpenCode 2 shipped as its own `opencode2` provider while it was in beta.
     /// Its release took over the `opencode` command, so those sessions now
@@ -29,12 +31,13 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Amp,
         Self::Claude,
         Self::Codex,
         Self::Cursor,
         Self::DeepSeek,
+        Self::Droid,
         Self::Fx,
         Self::OpenCode,
         Self::Grok,
@@ -50,6 +53,7 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::DeepSeek => "deepseek",
+            Self::Droid => "droid",
             Self::Fx => "fx",
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
@@ -66,6 +70,7 @@ impl ProviderKind {
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor CLI",
             Self::DeepSeek => "DeepSeek Harness",
+            Self::Droid => "Factory Droid",
             Self::Fx => "Fx",
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok Build",
@@ -82,6 +87,7 @@ impl ProviderKind {
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
             Self::DeepSeek => "DeepSeek",
+            Self::Droid => "Droid",
             Self::Fx => "Fx",
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok",
@@ -100,6 +106,7 @@ impl ProviderKind {
             // shared by other CLIs. The backward-compatible alias is unambiguous.
             Self::Cursor => "cursor-agent",
             Self::DeepSeek => "dsh",
+            Self::Droid => "droid",
             Self::Fx => "fx",
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
@@ -109,11 +116,12 @@ impl ProviderKind {
         }
     }
 
-    /// Kimi Code and Fx are deliberately absent from this list and from
-    /// [`Self::supports_conversation_fork`]. Kimi's ACP `session/fork` copies a
-    /// whole session and takes no turn count, while Fx exposes no turn-aware
-    /// fork or truncation method. Neither can reproduce Waku's "drop the last N
-    /// turns" semantics without corrupting history.
+    /// Kimi Code, Fx, and Factory Droid are deliberately absent from this list
+    /// and from [`Self::supports_conversation_fork`]. Kimi's ACP `session/fork`
+    /// copies a whole session and takes no turn count, Fx exposes no turn-aware
+    /// fork or truncation method, and Droid's ACP session has not been shown to
+    /// accept a turn boundary either. None of them can reproduce Waku's "drop
+    /// the last N turns" semantics without corrupting history.
     pub fn supports_conversation_rollback(self) -> bool {
         matches!(
             self,
@@ -155,6 +163,7 @@ impl ProviderKind {
                 | Self::OpenCode
                 | Self::Grok
                 | Self::Kimi
+                | Self::Droid
                 | Self::OhMyPi
                 | Self::Pi
         )
@@ -198,6 +207,9 @@ pub enum ProviderResumeCursor {
     DeepSeek {
         session_id: String,
     },
+    Droid {
+        session_id: String,
+    },
     Fx {
         session_id: String,
     },
@@ -236,6 +248,7 @@ impl ProviderResumeCursor {
                 fork_context: None,
             },
             ProviderKind::DeepSeek => Self::DeepSeek { session_id: id },
+            ProviderKind::Droid => Self::Droid { session_id: id },
             ProviderKind::Fx => Self::Fx { session_id: id },
             ProviderKind::OpenCode => Self::OpenCode {
                 session_id: id,
@@ -261,6 +274,7 @@ impl ProviderResumeCursor {
             Self::Codex { .. } => ProviderKind::Codex,
             Self::Cursor { .. } => ProviderKind::Cursor,
             Self::DeepSeek { .. } => ProviderKind::DeepSeek,
+            Self::Droid { .. } => ProviderKind::Droid,
             Self::Fx { .. } => ProviderKind::Fx,
             Self::OpenCode { .. } => ProviderKind::OpenCode,
             Self::Grok { .. } => ProviderKind::Grok,
@@ -276,6 +290,7 @@ impl ProviderResumeCursor {
             Self::Claude { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::DeepSeek { session_id }
+            | Self::Droid { session_id }
             | Self::Fx { session_id }
             | Self::OpenCode { session_id, .. }
             | Self::Grok { session_id }
@@ -546,6 +561,10 @@ pub struct ProviderProbe {
     pub models: Vec<ProviderModel>,
     #[serde(default)]
     pub agent_presets: Vec<ProviderAgentPreset>,
+    /// Why the last live model discovery failed, such as a rejected API key.
+    /// Clients show it when the picker would otherwise just be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
 }
 
 impl ProviderProbe {
@@ -4142,6 +4161,7 @@ mod tests {
         assert_eq!(ProviderKind::Codex.command(), "codex");
         assert_eq!(ProviderKind::Cursor.command(), "cursor-agent");
         assert_eq!(ProviderKind::DeepSeek.command(), "dsh");
+        assert_eq!(ProviderKind::Droid.command(), "droid");
         assert_eq!(ProviderKind::Fx.command(), "fx");
         assert_eq!(ProviderKind::OpenCode.id(), "opencode");
         assert_eq!(ProviderKind::OpenCode.command(), "opencode");
@@ -4164,7 +4184,7 @@ mod tests {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
         }
-        for provider in [ProviderKind::Fx, ProviderKind::Kimi] {
+        for provider in [ProviderKind::Fx, ProviderKind::Kimi, ProviderKind::Droid] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
         }
@@ -4180,6 +4200,7 @@ mod tests {
         assert!(ProviderKind::Fx.supports_model_discovery());
         assert!(ProviderKind::OpenCode.supports_model_discovery());
         assert!(ProviderKind::Grok.supports_model_discovery());
+        assert!(ProviderKind::Droid.supports_model_discovery());
         assert!(ProviderKind::Pi.supports_model_discovery());
     }
 
@@ -4248,7 +4269,7 @@ mod tests {
 
     #[test]
     fn all_contains_every_provider_kind() {
-        assert_eq!(ProviderKind::ALL.len(), 11);
+        assert_eq!(ProviderKind::ALL.len(), 12);
         let ids: std::collections::HashSet<_> =
             ProviderKind::ALL.iter().map(|kind| kind.id()).collect();
         assert_eq!(

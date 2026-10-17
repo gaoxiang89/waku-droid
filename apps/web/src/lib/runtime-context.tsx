@@ -1451,6 +1451,7 @@ function providerName(provider: AgentSession['provider']) {
       openCode: 'OpenCode',
       grok: 'Grok',
       kimi: 'Kimi',
+      droid: 'Factory Droid',
       ohMyPi: 'Oh My Pi',
       pi: 'Pi',
     } as const

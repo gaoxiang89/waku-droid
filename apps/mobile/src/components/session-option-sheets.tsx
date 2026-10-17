@@ -118,7 +118,9 @@ export function ModelSheet({
             <Text style={[styles.note, { color: theme.textTertiary }]}>
               {search.trim()
                 ? 'No models match your search.'
-                : 'This agent doesn’t expose a model list; it will use its own default.'}
+                : probe.data?.discovery_error
+                  ? `Couldn’t load models: ${probe.data.discovery_error}`
+                  : 'This agent doesn’t expose a model list; it will use its own default.'}
             </Text>
           )}
         />
@@ -395,7 +397,9 @@ export function ModelPickerSheet({
                   <Text style={[styles.note, { color: theme.textTertiary }]}>
                     {search.trim()
                       ? 'No models match your search.'
-                      : 'This agent doesn’t expose a model list; it will use its own default.'}
+                      : entry?.discoveryError
+                        ? `Couldn’t load models: ${entry.discoveryError}`
+                        : 'This agent doesn’t expose a model list; it will use its own default.'}
                   </Text>
                 )}
               />

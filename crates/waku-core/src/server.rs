@@ -732,7 +732,29 @@ fn handle_connection(
                 }
                 Ok(ClientMessage::Hello { .. }) => {}
                 Err(error) => {
-                    eprintln!("waku-daemon ignored invalid message: {error}");
+                    eprintln!("waku-daemon could not parse a client message: {error}");
+                    // A request the daemon cannot parse — most often a newer
+                    // client naming a provider or command it predates — still
+                    // carries a request id its sender is waiting on. Answer it
+                    // instead of dropping it, so the client reports the
+                    // mismatch instead of waiting on a response that never
+                    // comes. Messages without a recoverable id are still only
+                    // logged.
+                    if let Some(request_id) = unparsed_request_id(text.as_ref()) {
+                        write_json(
+                            &mut socket,
+                            &ServerMessage::Response {
+                                request_id,
+                                outcome: ResponseOutcome::Error {
+                                    error: RpcError {
+                                        message: format!(
+                                            "the daemon could not parse this request: {error}"
+                                        ),
+                                    },
+                                },
+                            },
+                        )?;
+                    }
                 }
             },
             Ok(Message::Close(_)) => break,
@@ -1079,6 +1101,18 @@ fn read_client_message(socket: &mut WebSocket<TcpStream>) -> anyhow::Result<Clie
     }
 }
 
+/// Best-effort request id from a message that failed to deserialize, so the
+/// failure can still be answered. Only the envelope's id field is read; the
+/// message is by definition not a shape this daemon knows.
+fn unparsed_request_id(text: &str) -> Option<Uuid> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("requestId")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
     socket: &mut WebSocket<S>,
     value: &T,
@@ -1231,6 +1265,89 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err());
         backend.0.store(false, Ordering::Release);
         assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    /// A request the daemon cannot parse — a desktop newer than the daemon
+    /// naming a provider it predates — must be answered with an error rather
+    /// than dropped, or the client waits on a response that never comes.
+    #[test]
+    fn an_unparseable_request_is_answered_instead_of_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(BusyBackend(AtomicBool::new(false))),
+                server_shutdown,
+                ServerOptions::default(),
+            )
+            .unwrap();
+        });
+
+        let (mut socket, _) = tungstenite::client::connect(format!("ws://{address}/v1")).unwrap();
+        write_json(
+            &mut socket,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                token: "secret".into(),
+                client_id: Uuid::new_v4(),
+                resume_from: Vec::new(),
+            },
+        )
+        .unwrap();
+        let request_id = Uuid::new_v4();
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "request",
+                    "requestId": request_id,
+                    "sessionId": Uuid::new_v4(),
+                    "runtimeId": Uuid::new_v4(),
+                    "command": {
+                        "type": "probeProvider",
+                        "provider": "nosuchprovider",
+                        "binaryOverride": null,
+                        "discoverModels": false,
+                        "probeVersion": false,
+                    },
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "the daemon never answered");
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let Ok(message) = serde_json::from_str::<ServerMessage>(text.as_ref()) else {
+                        continue;
+                    };
+                    let ServerMessage::Response {
+                        request_id: answered,
+                        outcome,
+                    } = message
+                    else {
+                        continue;
+                    };
+                    assert_eq!(answered, request_id);
+                    let ResponseOutcome::Error { error } = outcome else {
+                        panic!("an unparseable request produced {outcome:?}");
+                    };
+                    assert!(error.message.contains("nosuchprovider"));
+                    break;
+                }
+                Ok(Message::Ping(_)) => {
+                    socket.flush().unwrap();
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the daemon connection failed: {error}"),
+            }
+        }
     }
 
     #[test]

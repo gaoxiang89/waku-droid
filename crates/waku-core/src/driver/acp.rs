@@ -97,6 +97,15 @@ fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow:
             args: vec!["acp".into()],
             env: Vec::new(),
         }),
+        // Registry manifest `factory-droid`: native ACP, with auto-update held
+        // off so a session is not restarted out from under the client.
+        ProviderKind::Droid => Ok(AcpLaunch {
+            args: vec!["exec".into(), "--output-format".into(), "acp-daemon".into()],
+            env: vec![
+                ("DROID_DISABLE_AUTO_UPDATE".into(), "true".into()),
+                ("FACTORY_DROID_AUTO_UPDATE_ENABLED".into(), "false".into()),
+            ],
+        }),
         _ => Err(anyhow!(
             "{} does not speak the Agent Client Protocol",
             provider.display_name()
@@ -198,10 +207,114 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
-            supports_steer: provider != ProviderKind::Fx,
+            // Both reject a second `session/prompt` while one is running.
+            supports_steer: !matches!(provider, ProviderKind::Fx | ProviderKind::Droid),
             mode,
             computer_use,
         })
+    }
+}
+
+/// An ACP agent process. On Windows the SDK can only kill the direct child,
+/// so the whole process tree is tied to a kill-on-close job instead — a
+/// wrapper such as a `.cmd` key-injection shim would otherwise leave the real
+/// agent running after the session ends.
+pub(crate) struct ProviderAgent {
+    agent: AcpAgent,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    stderr_lines: Arc<Mutex<Vec<String>>>,
+}
+
+fn record_stderr_line(lines: &Mutex<Vec<String>>, line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let mut lines = lines.lock();
+    if lines.len() == 128 {
+        lines.remove(0);
+    }
+    lines.push(line.to_owned());
+}
+
+impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
+    #[cfg(not(windows))]
+    async fn connect_to(
+        self,
+        client: impl agent_client_protocol::ConnectTo<Agent>,
+    ) -> agent_client_protocol::Result<()> {
+        agent_client_protocol::ConnectTo::<Client>::connect_to(self.agent, client).await
+    }
+
+    #[cfg(windows)]
+    async fn connect_to(
+        self,
+        client: impl agent_client_protocol::ConnectTo<Agent>,
+    ) -> agent_client_protocol::Result<()> {
+        use agent_client_protocol::util::internal_error;
+        use smol::io::AsyncBufReadExt as _;
+        use smol::stream::StreamExt as _;
+
+        const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
+        enum First {
+            Protocol(agent_client_protocol::Result<()>),
+            Exited(std::io::Result<std::process::ExitStatus>),
+        }
+
+        let (stdin, stdout, stderr, mut child) = self.agent.spawn_process()?;
+        let job = match crate::process_tree::KillOnCloseJob::adopt(child.id()) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                record_stderr_line(
+                    &self.stderr_lines,
+                    &format!("waku: could not contain the agent process tree: {error}"),
+                );
+                None
+            }
+        };
+
+        let stderr_lines = self.stderr_lines.clone();
+        let drain_stderr = async move {
+            let mut lines = smol::io::BufReader::new(stderr).lines();
+            while let Some(Ok(line)) = lines.next().await {
+                record_stderr_line(&stderr_lines, &line);
+            }
+            std::future::pending::<First>().await
+        };
+        let mut protocol = Box::pin(agent_client_protocol::ConnectTo::<Client>::connect_to(
+            agent_client_protocol::ByteStreams::new(stdin, stdout),
+            client,
+        ));
+
+        let first = smol::future::or(
+            smol::future::or(async { First::Protocol((&mut protocol).await) }, async {
+                First::Exited(child.status().await)
+            }),
+            drain_stderr,
+        )
+        .await;
+        let result = match first {
+            First::Protocol(result) => result,
+            // Let the protocol finish routing what the agent wrote before it
+            // exited, as the SDK's own launcher does.
+            First::Exited(Ok(status)) if status.success() => {
+                smol::future::or(&mut protocol, async {
+                    smol::Timer::after(SHUTDOWN_GRACE_PERIOD).await;
+                    Ok(())
+                })
+                .await
+            }
+            First::Exited(Ok(status)) => {
+                Err(internal_error(format!("Process exited with {status}")))
+            }
+            First::Exited(Err(error)) => Err(internal_error(format!(
+                "Failed to wait for process: {error}"
+            ))),
+        };
+        drop(protocol);
+        let _ = child.kill();
+        drop(job);
+        result
     }
 }
 
@@ -211,7 +324,7 @@ fn sdk_agent(
     mut launch: AcpLaunch,
     computer_use: Option<&super::support::HeadlessComputerUseConfig>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
-) -> anyhow::Result<AcpAgent> {
+) -> anyhow::Result<ProviderAgent> {
     let binary = binary
         .to_str()
         .ok_or_else(|| anyhow!("the ACP executable path is not valid UTF-8"))?;
@@ -247,19 +360,17 @@ fn sdk_agent(
         args.extend(launch.args);
         ("/usr/bin/env", args)
     };
-    let config = AcpAgentConfig::new(program)
-        .args(args)
-        .envs(environment);
-    Ok(AcpAgent::new(config).with_debug(move |line, direction| {
-        if direction != LineDirection::Stderr || line.trim().is_empty() {
-            return;
+    let config = AcpAgentConfig::new(program).args(args).envs(environment);
+    let debug_lines = stderr_lines.clone();
+    let agent = AcpAgent::new(config).with_debug(move |line, direction| {
+        if direction == LineDirection::Stderr {
+            record_stderr_line(&debug_lines, line);
         }
-        let mut lines = stderr_lines.lock();
-        if lines.len() == 128 {
-            lines.remove(0);
-        }
-        lines.push(line.to_owned());
-    }))
+    });
+    Ok(ProviderAgent {
+        agent,
+        stderr_lines,
+    })
 }
 
 /// Builds a short-lived ACP process for session discovery or history replay.
@@ -272,7 +383,7 @@ pub(crate) fn catalog_agent(
     provider: ProviderKind,
     binary: &Path,
     cwd: &Path,
-) -> anyhow::Result<AcpAgent> {
+) -> anyhow::Result<ProviderAgent> {
     let launch = launch_for(provider, None)?;
     sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
 }
@@ -345,7 +456,7 @@ type PendingPromptRequests = Arc<Mutex<PendingPrompts>>;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_sdk_connection(
-    agent: AcpAgent,
+    agent: ProviderAgent,
     provider: ProviderKind,
     cwd: std::path::PathBuf,
     mode: RuntimeMode,
@@ -424,6 +535,7 @@ async fn run_sdk_connection(
                         request,
                         responder,
                         auto_approve,
+                        provider == ProviderKind::Droid,
                         &pending_permissions,
                         &events,
                     )
@@ -506,7 +618,7 @@ async fn run_sdk_connection(
                 )
                 .block_task()
                 .await?;
-            let (session_id, modes, config_options) = establish_session(
+            let (session_id, modes, mut config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
@@ -524,6 +636,18 @@ async fn run_sdk_connection(
                     .block_task()
                     .await;
             }
+            if provider == ProviderKind::Droid
+                && let Some(updated) = apply_droid_autonomy(
+                    &connection,
+                    &session_id,
+                    config_options.as_deref(),
+                    mode,
+                    &events,
+                )
+                .await
+            {
+                config_options = Some(updated);
+            }
             let native_session_id = session_id.to_string();
             let _ = events.send(DriverEvent::Connected {
                 provider_cursor: Some(ProviderResumeCursor::from_session_id(
@@ -536,11 +660,11 @@ async fn run_sdk_connection(
             let mut current_effort = reasoning_effort;
             let mut current_tier = service_tier;
             let mut current_window = context_window;
-            apply_model(
+            sync_session_model(
                 &connection,
                 provider,
                 &session_id,
-                config_options.as_deref(),
+                &mut config_options,
                 current_model.as_deref(),
                 current_effort.as_deref(),
                 current_tier.as_deref(),
@@ -657,11 +781,11 @@ async fn run_sdk_connection(
                             current_effort = options.reasoning_effort;
                             current_tier = options.service_tier;
                             current_window = options.context_window;
-                            apply_model(
+                            sync_session_model(
                                 &connection,
                                 provider,
                                 &session_id,
-                                config_options.as_deref(),
+                                &mut config_options,
                                 current_model.as_deref(),
                                 current_effort.as_deref(),
                                 current_tier.as_deref(),
@@ -1118,6 +1242,185 @@ fn fx_model_provider_switch<'a>(
     (session_config_current_value(provider) != Some("gateway")
         && session_config_select_values(provider).contains(&"gateway"))
     .then_some((provider, "gateway"))
+}
+
+/// Factory Droid's `autonomy_level` selector, whose values match its ACP mode
+/// ids. Supervised is `normal`, which auto-approves only reads, so every other
+/// permission request reaches the user. The other modes pre-authorize work at
+/// the matching risk tier; `auto-high` keeps Droid's own command blocks.
+/// The selector must always be written: an unset session inherits the user's
+/// CLI default, which may already be `auto-high`.
+fn droid_autonomy_level(mode: RuntimeMode) -> &'static str {
+    match mode {
+        RuntimeMode::Ask => "normal",
+        RuntimeMode::AutoAcceptEdits => "auto-low",
+        RuntimeMode::Auto => "auto-medium",
+        RuntimeMode::FullAccess => "auto-high",
+    }
+}
+
+fn config_option_by_id<'a>(
+    options: &'a [SessionConfigOption],
+    id: &str,
+) -> Option<&'a SessionConfigOption> {
+    options
+        .iter()
+        .find(|option| option.id.to_string().eq_ignore_ascii_case(id))
+}
+
+async fn apply_droid_autonomy(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    config_options: Option<&[SessionConfigOption]>,
+    mode: RuntimeMode,
+    events: &DriverEventSender,
+) -> Option<Vec<SessionConfigOption>> {
+    let desired = droid_autonomy_level(mode);
+    let Some(option) =
+        config_options.and_then(|options| config_option_by_id(options, "autonomy_level"))
+    else {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.set_session_option",
+            error = "Factory Droid did not advertise its autonomy setting"
+        )));
+        return None;
+    };
+    if !session_config_select_values(option).contains(&desired) {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.set_session_option",
+            error = format!("Factory Droid did not advertise autonomy level {desired}")
+        )));
+        return None;
+    }
+    if session_config_current_value(option) == Some(desired) {
+        return None;
+    }
+    match connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            option.id.clone(),
+            desired,
+        ))
+        .block_task()
+        .await
+    {
+        Ok(response) => Some(response.config_options),
+        Err(error) => {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.set_session_option",
+                error = error
+            )));
+            None
+        }
+    }
+}
+
+async fn apply_droid_model(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    config_options: Option<&[SessionConfigOption]>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    events: &DriverEventSender,
+) -> Option<Vec<SessionConfigOption>> {
+    let model = model?;
+    let mut options = config_options.unwrap_or_default().to_vec();
+    let Some(option) = config_option_by_id(&options, "model").cloned() else {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.select_model",
+            error = "Factory Droid did not advertise its model configuration"
+        )));
+        return None;
+    };
+    if !session_config_select_values(&option).contains(&model) {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.select_model",
+            error = format!("Factory Droid did not advertise model {model}")
+        )));
+        return None;
+    }
+    if session_config_current_value(&option) != Some(model) {
+        match connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.id.clone(),
+                model,
+            ))
+            .block_task()
+            .await
+        {
+            Ok(response) => options = response.config_options,
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return None;
+            }
+        }
+    }
+    if let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty())
+        && let Some(option) = config_option_by_id(&options, "reasoning_effort")
+        && session_config_select_values(option).contains(&effort)
+        && session_config_current_value(option) != Some(effort)
+    {
+        let config_id = option.id.clone();
+        // Effort is optional. A rejected value must not discard the model the
+        // session already accepted.
+        if let Ok(response) = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                config_id,
+                effort,
+            ))
+            .block_task()
+            .await
+        {
+            options = response.config_options;
+        }
+    }
+    Some(options)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_session_model(
+    connection: &ConnectionTo<Agent>,
+    provider: ProviderKind,
+    session_id: &SessionId,
+    config_options: &mut Option<Vec<SessionConfigOption>>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    context_window: Option<&str>,
+    events: &DriverEventSender,
+) {
+    if provider == ProviderKind::Droid {
+        if let Some(updated) = apply_droid_model(
+            connection,
+            session_id,
+            config_options.as_deref(),
+            model,
+            reasoning_effort,
+            events,
+        )
+        .await
+        {
+            *config_options = Some(updated);
+        }
+        return;
+    }
+    apply_model(
+        connection,
+        provider,
+        session_id,
+        config_options.as_deref(),
+        model,
+        reasoning_effort,
+        service_tier,
+        context_window,
+        events,
+    )
+    .await;
 }
 
 fn set_model_params(
@@ -1719,10 +2022,34 @@ fn xai_user_input_response(params: &Value, submitted: &[UserInputAnswer]) -> Val
     response
 }
 
+/// Droid's "always" answer also raises the session's autonomy level, which
+/// would drift the session away from the selected access mode.
+fn auto_permission_choice(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    prefer_allow_once: bool,
+) -> Option<&agent_client_protocol::schema::v1::PermissionOption> {
+    let (first, second) = if prefer_allow_once {
+        (
+            PermissionOptionKind::AllowOnce,
+            PermissionOptionKind::AllowAlways,
+        )
+    } else {
+        (
+            PermissionOptionKind::AllowAlways,
+            PermissionOptionKind::AllowOnce,
+        )
+    };
+    options
+        .iter()
+        .find(|option| option.kind == first)
+        .or_else(|| options.iter().find(|option| option.kind == second))
+}
+
 fn handle_permission_request(
     request: RequestPermissionRequest,
     responder: PermissionResponder,
     auto_approve: bool,
+    prefer_allow_once: bool,
     pending: &PendingPermissions,
     events: &impl DriverEventSink,
 ) -> agent_client_protocol::Result<()> {
@@ -1742,17 +2069,7 @@ fn handle_permission_request(
         .collect::<Vec<_>>();
 
     if auto_approve {
-        let choice = request
-            .options
-            .iter()
-            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
-            .or_else(|| {
-                request
-                    .options
-                    .iter()
-                    .find(|option| option.kind == PermissionOptionKind::AllowOnce)
-            });
-        return match choice {
+        return match auto_permission_choice(&request.options, prefer_allow_once) {
             Some(choice) => responder.respond(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     choice.option_id.clone(),
@@ -2255,6 +2572,53 @@ mod tests {
         let launch = launch_for(ProviderKind::Fx, None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn droid_launches_the_registry_acp_daemon() {
+        let launch = launch_for(ProviderKind::Droid, None).unwrap();
+        assert_eq!(launch.args, ["exec", "--output-format", "acp-daemon"]);
+        assert!(
+            launch
+                .env
+                .contains(&("DROID_DISABLE_AUTO_UPDATE".into(), "true".into()))
+        );
+        assert!(
+            launch
+                .env
+                .contains(&("FACTORY_DROID_AUTO_UPDATE_ENABLED".into(), "false".into()))
+        );
+    }
+
+    #[test]
+    fn droid_auto_approval_answers_once_without_raising_autonomy() {
+        use agent_client_protocol::schema::v1::PermissionOption as AcpPermissionOption;
+        let options = [
+            AcpPermissionOption::new("proceed_once", "Allow", PermissionOptionKind::AllowOnce),
+            AcpPermissionOption::new(
+                "proceed_always",
+                "Allow & auto-run low risk commands",
+                PermissionOptionKind::AllowAlways,
+            ),
+            AcpPermissionOption::new("cancel", "No, cancel", PermissionOptionKind::RejectOnce),
+        ];
+        let id = |prefer_once| {
+            auto_permission_choice(&options, prefer_once).map(|option| option.option_id.to_string())
+        };
+        assert_eq!(id(true).as_deref(), Some("proceed_once"));
+        assert_eq!(id(false).as_deref(), Some("proceed_always"));
+        assert!(auto_permission_choice(&options[2..], true).is_none());
+    }
+
+    #[test]
+    fn droid_autonomy_follows_the_access_mode() {
+        assert_eq!(droid_autonomy_level(RuntimeMode::Ask), "normal");
+        assert_eq!(
+            droid_autonomy_level(RuntimeMode::AutoAcceptEdits),
+            "auto-low"
+        );
+        assert_eq!(droid_autonomy_level(RuntimeMode::Auto), "auto-medium");
+        assert_eq!(droid_autonomy_level(RuntimeMode::FullAccess), "auto-high");
     }
 
     #[test]
@@ -2802,5 +3166,62 @@ mod tests {
                 "the turn failed without naming a reason"
             ),
         }
+    }
+
+    /// Factory Droid's ACP daemon must accept a session and settle a turn.
+    /// Autonomy `auto-high` is Full access; the test does not pass
+    /// `--skip-permissions-unsafe`.
+    #[test]
+    #[ignore = "requires an installed, authenticated droid"]
+    fn droid_acp_daemon_finishes_a_real_turn() {
+        let binary = crate::command_env::find_executable("droid").expect("droid is not installed");
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Droid,
+            DriverStartOptions {
+                binary,
+                cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                mode: RuntimeMode::FullAccess,
+                model: None,
+                reasoning_effort: None,
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: None,
+            },
+            events,
+        )
+        .expect("the ACP session should open");
+
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Droid { .. }),
+                } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        driver.prompt("Reply exactly OK.".into());
+
+        let mut produced_text = false;
+        let mut finished = None;
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
+            match event {
+                DriverEvent::TextDelta(text) => produced_text |= !text.is_empty(),
+                DriverEvent::TurnFinished { success, .. } => {
+                    finished = Some(success);
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        assert!(produced_text, "the Droid turn produced no text");
+        assert_eq!(finished, Some(true));
     }
 }

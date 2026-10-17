@@ -1,13 +1,42 @@
 //! Daemon-only provider discovery layered over shared protocol models.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub use waku_protocol::model::*;
+
+/// dk's launcher for clients that cannot call its `droid` shell alias or
+/// PowerShell function: it injects the current dk key and runs the real CLI.
+const DROID_DK_SHIM: &str = "droid-dk";
+
+/// The executable for `provider` when the user has not set an override.
+///
+/// Droid prefers dk's shim when both it and the real CLI are installed, so a
+/// dk user gets the same key in Waku as in their terminal. Setting the
+/// override to `droid` opts back out.
+pub fn default_provider_executable(provider: ProviderKind) -> Option<PathBuf> {
+    let executable = crate::command_env::find_executable(provider.command());
+    if provider == ProviderKind::Droid
+        && executable.is_some()
+        && let Some(shim) = droid_dk_shim()
+    {
+        return Some(shim.to_path_buf());
+    }
+    executable
+}
+
+/// Looked up once per daemon run: installing or removing dk mid-run is rare,
+/// and a restart picks it up.
+fn droid_dk_shim() -> Option<&'static Path> {
+    static SHIM: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SHIM.get_or_init(|| crate::command_env::find_executable(DROID_DK_SHIM))
+        .as_deref()
+}
 
 pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> ProviderProbe {
     let path = match binary_override {
         Some(binary) => crate::command_env::resolve_binary_override(binary),
-        None => crate::command_env::find_executable(provider.command()),
+        None => default_provider_executable(provider),
     };
     ProviderProbe {
         provider,
@@ -15,6 +44,7 @@ pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> 
         path,
         models: crate::model_catalog::fallback_models(provider),
         agent_presets: crate::model_catalog::fallback_agent_presets(provider),
+        discovery_error: None,
     }
 }
 
@@ -48,9 +78,11 @@ pub fn discover_provider_models(mut probe: ProviderProbe) -> ProviderProbe {
     if probe.provider.supports_model_discovery()
         && let Some(path) = probe.path.as_deref()
     {
-        let (models, agent_presets) = crate::model_catalog::discover_catalog(probe.provider, path);
+        let (models, agent_presets, discovery_error) =
+            crate::model_catalog::discover_catalog_reporting(probe.provider, path);
         probe.models = models;
         probe.agent_presets = agent_presets;
+        probe.discovery_error = discovery_error;
     }
     probe
 }
@@ -82,6 +114,7 @@ mod tests {
             path: Some("/usr/bin/codex".into()),
             models: crate::model_catalog::fallback_models(ProviderKind::Codex),
             agent_presets: Vec::new(),
+            discovery_error: None,
         };
         let cached = vec![ProviderModel::new("cached-model", "Cached model").default()];
 
