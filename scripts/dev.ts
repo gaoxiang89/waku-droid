@@ -620,20 +620,23 @@ building = true;
 const initialAppRevision = appChangeRevision;
 const initialBuildSucceeded = await build("app");
 building = false;
-if (!initialBuildSucceeded) {
-  closeWatchers();
-  process.exit(1);
-}
-
-if (appChangeRevision === initialAppRevision) {
+if (initialBuildSucceeded && appChangeRevision === initialAppRevision) {
   await stopApp();
   await prepareHyprlandLaunch();
   if (!stopping) app = launchApp();
-} else {
+} else if (initialBuildSucceeded) {
   console.log(
     "[waku-dev] Changes arrived during the initial build; waiting to rebuild.",
   );
   if (queuedBuild !== undefined) void drainBuildQueue();
+} else {
+  // A work-in-progress tree that does not compile still deserves a watcher:
+  // exiting here would force a manual restart after the first fix. Watchers
+  // are already running, so the next edit retries the build.
+  console.log(
+    "[waku-dev] Initial build failed; the watcher is waiting. " +
+      "Fix the errors and save to build and launch Waku.",
+  );
 }
 
 console.log(
