@@ -561,7 +561,17 @@ async function drainBuildQueue(): Promise<void> {
       queuedBuild = undefined;
       const buildAppRevision = appChangeRevision;
       const buildDaemonRevision = daemonChangeRevision;
-      if (!(await build(target)) || stopping) continue;
+      // Windows refuses to replace a running executable, so the app has to
+      // close before cargo can relink it. A failed link leaves the previous
+      // binary in place, so it can come back up below.
+      if (isWindows && target === "app") await stopApp();
+      if (!(await build(target)) || stopping) {
+        if (isWindows && target === "app" && !stopping && app === undefined) {
+          console.log("[waku-dev] Relaunching the previous binary.");
+          app = launchApp();
+        }
+        continue;
+      }
 
       if (target === "daemon") {
         if (daemonChangeRevision === buildDaemonRevision) {
