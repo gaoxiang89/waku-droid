@@ -5,10 +5,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
+use waku_daemon::bridge;
+use waku_protocol::bridge::{BRIDGE_SUBCOMMAND, BridgeState, FINGERPRINT_FLAG};
 use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
-    let arguments = Arguments::parse(std::env::args().skip(1))?;
+    let mut raw_arguments = std::env::args().skip(1).peekable();
+    match raw_arguments.peek().map(String::as_str) {
+        Some(FINGERPRINT_FLAG) => {
+            println!("{}", bridge::own_fingerprint()?);
+            return Ok(());
+        }
+        Some(BRIDGE_SUBCOMMAND) => {
+            raw_arguments.next();
+            return bridge::run(raw_arguments);
+        }
+        _ => {}
+    }
+    let arguments = Arguments::parse(raw_arguments)?;
     let token =
         std::env::var(DAEMON_TOKEN_ENV).context("Waku daemon authentication token is missing")?;
     // The bearer capability belongs only to this server process. Remove it
@@ -26,6 +40,18 @@ fn main() -> anyhow::Result<()> {
     };
     println!("{}", serde_json::to_string(&ready)?);
     std::io::stdout().flush()?;
+    if let Some(state_file) = &arguments.state_file {
+        bridge::write_state(
+            state_file,
+            &BridgeState {
+                address: ready.address.clone(),
+                token: token.clone(),
+                pid: ready.pid,
+                protocol_version: PROTOCOL_VERSION,
+                fingerprint: bridge::own_fingerprint()?,
+            },
+        )?;
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Some(parent_pid) = arguments.parent_pid {
@@ -58,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some(),
+            idle_exit: arguments.idle_exit,
         },
     )
 }
@@ -76,6 +103,8 @@ struct Arguments {
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
+    state_file: Option<std::path::PathBuf>,
+    idle_exit: Option<Duration>,
 }
 
 impl Arguments {
@@ -84,6 +113,8 @@ impl Arguments {
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
+        let mut state_file = None;
+        let mut idle_exit = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -111,9 +142,25 @@ impl Arguments {
                 "--allow-non-loopback" => {
                     allow_non_loopback = true;
                 }
+                "--state-file" => {
+                    state_file = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--state-file requires a path"))?
+                            .into(),
+                    );
+                }
+                "--idle-exit-secs" => {
+                    let seconds: u64 = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--idle-exit-secs requires a number"))?
+                        .parse()
+                        .context("--idle-exit-secs is not a valid number")?;
+                    idle_exit = Some(Duration::from_secs(seconds));
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {0} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--state-file PATH] [--idle-exit-secs N]\n       {0} bridge [--state-dir DIR]\n       {0} --fingerprint",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -126,6 +173,8 @@ impl Arguments {
             parent_pid,
             allowed_origins,
             allow_non_loopback,
+            state_file,
+            idle_exit,
         })
     }
 }

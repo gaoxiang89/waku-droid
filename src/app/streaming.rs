@@ -559,7 +559,8 @@ impl Waku {
                     .find(|session| session.id == session_id)
                     .map(|session| session.provider)
                 {
-                    self.plan_usage.insert(provider, usage);
+                    self.plan_usage
+                        .insert((self.hosts.ownership.session(session_id), provider), usage);
                 }
             }
             DriverEvent::GoalUpdated(goal) => {
@@ -623,7 +624,8 @@ impl Waku {
                     .map(|session| session.provider)
                     .filter(|provider| usage_meter::PLAN_USAGE_PROVIDERS.contains(provider))
                 {
-                    self.plan_usage_stale.insert(provider);
+                    self.plan_usage_stale
+                        .insert((self.hosts.ownership.session(session_id), provider));
                 }
                 if self
                     .state

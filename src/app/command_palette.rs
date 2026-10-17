@@ -623,7 +623,7 @@ impl Waku {
             return;
         };
         let search = self
-            .store
+            .hosts
             .session_message_search(query.clone(), MESSAGE_SEARCH_LIMIT);
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -844,6 +844,12 @@ impl Waku {
                 "settings.daemon",
                 "icons/server.svg",
                 "settings preferences daemon server remote web network origin token port",
+            ),
+            (
+                SettingsPage::Connections,
+                "settings.connections",
+                "icons/globe.svg",
+                "settings preferences connections remote wsl ssh host window",
             ),
             (
                 SettingsPage::ComputerUse,
@@ -1322,6 +1328,7 @@ impl Waku {
         provider: Option<ProviderKind>,
         cx: &mut Context<Self>,
     ) {
+        let host = self.selected_host_key();
         let provider = provider.unwrap_or_else(|| self.default_resume_provider());
         self.command_palette.view = CommandPaletteView::Resume;
         self.command_palette.resume_provider = provider;
@@ -1342,12 +1349,13 @@ impl Waku {
         cx.notify();
 
         let fetch = self
-            .store
+            .selected_store()
             .provider_sessions(provider, PROVIDER_SESSION_CATALOG_LIMIT);
         cx.spawn(async move |waku, cx| {
             let result = cx.background_executor().spawn(async move { fetch() }).await;
             let _ = waku.update(cx, |waku, cx| {
-                if !waku.command_palette.open
+                if waku.selected_host_key() != host
+                    || !waku.command_palette.open
                     || waku.command_palette.provider_session_generation != generation
                     || waku.command_palette.resume_provider != provider
                 {
@@ -1381,15 +1389,17 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let host = self.selected_host_key();
         if let Some(session_id) = self
             .state
             .sessions
             .iter()
             .find(|session| {
-                session
-                    .provider_cursor
-                    .as_ref()
-                    .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
+                self.hosts.ownership.session(session.id) == host
+                    && session
+                        .provider_cursor
+                        .as_ref()
+                        .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
             })
             .map(|session| session.id)
         {
@@ -1401,16 +1411,17 @@ impl Waku {
             return;
         }
 
-        let project_id = if let Some(project) = self
-            .state
-            .projects
-            .iter()
-            .find(|project| project.path == summary.cwd)
-        {
+        let project_id = if let Some(project) = self.state.projects.iter().find(|project| {
+            project.path == summary.cwd && self.hosts.ownership.project(project.id) == host
+        }) {
             project.id
         } else {
             let project = Project::from_path(summary.cwd.clone());
             let project_id = project.id;
+            self.hosts
+                .ownership
+                .projects
+                .insert(project_id, host.clone());
             self.state.projects.push(project);
             self.analytics.track(crate::analytics::Event::ProjectAdded);
             project_id
@@ -1438,6 +1449,10 @@ impl Waku {
         session.messages = history.messages;
         session.turns = history.turns;
         let session_id = session.id;
+        self.hosts
+            .ownership
+            .sessions
+            .insert(session_id, host.clone());
         self.state.push_session(session);
 
         self.close_command_palette(window, cx);
@@ -1453,6 +1468,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let host = self.selected_host_key();
         if self.command_palette.provider_session_import.is_some() {
             return;
         }
@@ -1461,10 +1477,11 @@ impl Waku {
             .sessions
             .iter()
             .find(|session| {
-                session
-                    .provider_cursor
-                    .as_ref()
-                    .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
+                self.hosts.ownership.session(session.id) == host
+                    && session
+                        .provider_cursor
+                        .as_ref()
+                        .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
             })
             .map(|session| session.id)
         {
@@ -1485,7 +1502,7 @@ impl Waku {
         let generation = self.command_palette.provider_session_generation;
         let cursor = summary.cursor.clone();
         let fetch = self
-            .store
+            .selected_store()
             .provider_session_history(cursor.clone(), summary.cwd.clone());
         let window_handle = window.window_handle();
         cx.notify();
@@ -1493,7 +1510,8 @@ impl Waku {
         cx.spawn(async move |waku, cx| {
             let result = cx.background_executor().spawn(async move { fetch() }).await;
             let update = waku.update(cx, |waku, cx| {
-                if !waku.command_palette.open
+                if waku.selected_host_key() != host
+                    || !waku.command_palette.open
                     || waku.command_palette.view != CommandPaletteView::Resume
                     || waku.command_palette.provider_session_generation != generation
                     || waku
@@ -1521,7 +1539,8 @@ impl Waku {
             };
             let _ = window_handle.update(cx, |_, window, cx| {
                 let _ = waku.update(cx, |waku, cx| {
-                    if waku.command_palette.open
+                    if waku.selected_host_key() == host
+                        && waku.command_palette.open
                         && waku.command_palette.view == CommandPaletteView::Resume
                         && waku.command_palette.provider_session_generation == generation
                     {

@@ -903,6 +903,19 @@ pub struct StateStore {
     desktop_files: bool,
 }
 
+/// Environment override for the daemon's data directory.
+pub const DATA_DIRECTORY_ENV: &str = "WAKU_DATA_DIR";
+
+/// `WAKU_DATA_DIR`, when set. A debug daemon a bridge starts on WSL or SSH
+/// needs it: the checkout path compiled into a debug build can be the very
+/// directory the Windows host uses, shared through `/mnt/c`, and two daemons
+/// must never open one database.
+pub fn data_directory_override() -> Option<PathBuf> {
+    std::env::var_os(DATA_DIRECTORY_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 impl StateStore {
     /// Where the database lives.
     ///
@@ -911,6 +924,9 @@ impl StateStore {
     /// thrown away by deleting one directory. Release builds use the usual
     /// per-user application support directory.
     pub fn default_path() -> PathBuf {
+        if let Some(directory) = data_directory_override() {
+            return directory.join("app.db");
+        }
         if cfg!(debug_assertions) {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()

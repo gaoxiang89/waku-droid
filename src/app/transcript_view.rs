@@ -1076,7 +1076,8 @@ impl Waku {
             .collect::<Vec<_>>();
         self.checkpoint_ref_prefetch
             .set(Some((session_id, generation)));
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace =
+            waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
         cx.spawn(async move |this, cx| {
             let existing = cx
                 .background_executor()
@@ -1291,7 +1292,7 @@ impl Waku {
                             )
                         })
                         .collect();
-                    let attachments_can_reveal = !self.daemon.is_remote();
+                    let attachments_can_reveal = !self.selected_daemon().is_remote();
                     let menu = self.menu_handle(format!("message-{}", message.id), cx);
                     let user_message_viewport = (message.role == MessageRole::User).then(|| {
                         self.user_message_viewports

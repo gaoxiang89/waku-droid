@@ -40,16 +40,24 @@ impl Waku {
         // usage panel still owes the account meters. Without this the panel
         // would show its loading skeleton forever: fetchable provider, no
         // snapshot, and no fetch ever allowed to start.
+        let host = self.selected_host_key();
+        let Some(owner) = self.hosts.get(&host) else {
+            return;
+        };
+        let host_generation = owner.generation;
         let selected_provider = self.selected_session().map(|session| session.provider);
         for provider in PLAN_USAGE_PROVIDERS {
-            if self.plan_usage_pending.contains(&provider)
+            if self.plan_usage_pending.contains(&(host.clone(), provider))
                 || (!self.provider_enabled(provider) && selected_provider != Some(provider))
             {
                 continue;
             }
-            let interval = if self.plan_usage_error.contains_key(&provider) {
+            let interval = if self
+                .plan_usage_error
+                .contains_key(&(host.clone(), provider))
+            {
                 PLAN_USAGE_RETRY
-            } else if self.plan_usage_stale.contains(&provider) {
+            } else if self.plan_usage_stale.contains(&(host.clone(), provider)) {
                 PLAN_USAGE_REFRESH_STALE
             } else if provider == ProviderKind::Grok {
                 PLAN_USAGE_REFRESH_GROK
@@ -58,24 +66,37 @@ impl Waku {
             };
             if self
                 .plan_usage_checked_at
-                .get(&provider)
+                .get(&(host.clone(), provider))
                 .is_some_and(|checked| checked.elapsed() < interval)
             {
                 continue;
             }
-            self.plan_usage_pending.insert(provider);
+            self.plan_usage_pending.insert((host.clone(), provider));
             let tx = self.plan_usage_tx.clone();
             let event_wake = self.event_wake_tx.clone();
-            let claude_version = self
-                .provider_versions
-                .get(&ProviderKind::Claude)
-                .cloned()
-                .flatten();
+            let claude_version = if host == waku_client::hosts::HostKey::Local {
+                self.provider_versions
+                    .get(&ProviderKind::Claude)
+                    .cloned()
+                    .flatten()
+            } else {
+                None
+            };
             let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
-            let daemon = self.daemon.client();
+            let daemon = self.selected_daemon().clone();
+            let request_host = host.clone();
             cx.background_executor()
                 .spawn(async move {
-                    let result = match daemon.request(
+                    let binary_override = if request_host == waku_client::hosts::HostKey::Local {
+                        binary_override
+                    } else {
+                        daemon
+                            .settings()
+                            .provider_binary_overrides
+                            .get(&provider)
+                            .cloned()
+                    };
+                    let result = match daemon.client().request(
                         Uuid::nil(),
                         Uuid::nil(),
                         waku_client::Command::FetchPlanUsage {
@@ -91,7 +112,12 @@ impl Waku {
                         Err(error) => Err(error),
                     };
                     if tx
-                        .send((provider, result.map_err(|error| format!("{error:#}"))))
+                        .send((
+                            request_host,
+                            host_generation,
+                            provider,
+                            result.map_err(|error| format!("{error:#}")),
+                        ))
                         .is_ok()
                     {
                         signal_event_pump(&event_wake);
@@ -103,32 +129,53 @@ impl Waku {
 
     pub(super) fn drain_plan_usage_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((provider, result)) = self.plan_usage_events.try_recv() {
-            self.plan_usage_pending.remove(&provider);
-            self.plan_usage_stale.remove(&provider);
-            self.plan_usage_checked_at.insert(provider, Instant::now());
+        while let Ok((host, generation, provider, result)) = self.plan_usage_events.try_recv() {
+            if !self
+                .hosts
+                .get(&host)
+                .is_some_and(|owner| owner.generation == generation)
+            {
+                continue;
+            }
+            self.plan_usage_pending.remove(&(host.clone(), provider));
+            self.plan_usage_stale.remove(&(host.clone(), provider));
+            self.plan_usage_checked_at
+                .insert((host.clone(), provider), Instant::now());
             match result {
                 Ok(Some(usage)) => {
-                    changed |= self.plan_usage.get(&provider) != Some(&usage)
-                        || self.plan_usage_error.contains_key(&provider)
-                        || self.plan_usage_unconfigured.contains(&provider);
-                    self.plan_usage.insert(provider, usage);
-                    self.plan_usage_error.remove(&provider);
-                    self.plan_usage_unconfigured.remove(&provider);
+                    changed |= self.plan_usage.get(&(host.clone(), provider)) != Some(&usage)
+                        || self
+                            .plan_usage_error
+                            .contains_key(&(host.clone(), provider))
+                        || self
+                            .plan_usage_unconfigured
+                            .contains(&(host.clone(), provider));
+                    self.plan_usage.insert((host.clone(), provider), usage);
+                    self.plan_usage_error.remove(&(host.clone(), provider));
+                    self.plan_usage_unconfigured
+                        .remove(&(host.clone(), provider));
                 }
                 Ok(None) => {
-                    let had_usage = self.plan_usage.remove(&provider).is_some();
-                    let had_error = self.plan_usage_error.remove(&provider).is_some();
-                    let newly_unconfigured = self.plan_usage_unconfigured.insert(provider);
+                    let had_usage = self.plan_usage.remove(&(host.clone(), provider)).is_some();
+                    let had_error = self
+                        .plan_usage_error
+                        .remove(&(host.clone(), provider))
+                        .is_some();
+                    let newly_unconfigured = self
+                        .plan_usage_unconfigured
+                        .insert((host.clone(), provider));
                     changed |= had_usage || had_error || newly_unconfigured;
                 }
                 Err(error) => {
-                    let was_unconfigured = self.plan_usage_unconfigured.remove(&provider);
-                    changed |=
-                        self.plan_usage_error.get(&provider) != Some(&error) || was_unconfigured;
+                    let was_unconfigured = self
+                        .plan_usage_unconfigured
+                        .remove(&(host.clone(), provider));
+                    changed |= self.plan_usage_error.get(&(host.clone(), provider)) != Some(&error)
+                        || was_unconfigured;
                     // Keep any previous snapshot; stale meters with reset
                     // times still self-correct visually.
-                    self.plan_usage_error.insert(provider, error);
+                    self.plan_usage_error
+                        .insert((host.clone(), provider), error);
                 }
             }
         }
@@ -180,15 +227,21 @@ impl Waku {
         }
         let session = self.selected_session()?;
         let provider = session.provider;
+        let host = self.selected_host_key();
         let context = session.context_usage;
         let theme = Theme::current(cx);
-        let plan = self.plan_usage.get(&provider).cloned();
-        let error = self.plan_usage_error.get(&provider).cloned();
+        let plan = self.plan_usage.get(&(host.clone(), provider)).cloned();
+        let error = self
+            .plan_usage_error
+            .get(&(host.clone(), provider))
+            .cloned();
         // Fetchable but nothing cached yet: the panel shows a skeleton
         // whether the fetch is already in flight or lands on the next tick.
         let plan_loading = plan.is_none()
             && error.is_none()
-            && !self.plan_usage_unconfigured.contains(&provider)
+            && !self
+                .plan_usage_unconfigured
+                .contains(&(host.clone(), provider))
             && PLAN_USAGE_PROVIDERS.contains(&provider);
 
         let weak = cx.entity().downgrade();
@@ -203,7 +256,8 @@ impl Waku {
                         .map(|session| session.provider)
                         .filter(|provider| PLAN_USAGE_PROVIDERS.contains(provider))
                     {
-                        this.plan_usage_stale.insert(provider);
+                        this.plan_usage_stale
+                            .insert((this.selected_host_key(), provider));
                     }
                     this.maybe_refresh_plan_usage(cx);
                     card_focus = this

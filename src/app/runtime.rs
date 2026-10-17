@@ -70,7 +70,7 @@ fn attach_driver(
     Ok(Some((session, PreparedDriver { handle, events })))
 }
 
-fn load_remote_task_state(
+pub(super) fn load_remote_task_state(
     client: &waku_client::DaemonClient,
 ) -> anyhow::Result<RemoteTaskStateSnapshot> {
     let response = client.request(
@@ -81,11 +81,15 @@ fn load_remote_task_state(
     let waku_client::ResponsePayload::TaskState {
         projects,
         mut sessions,
+        projectless_root,
         ..
     } = response
     else {
         anyhow::bail!("Waku daemon returned an invalid task-state response");
     };
+    if let Some(root) = projectless_root {
+        waku_protocol::projectless::add_workspace_root(root);
+    }
     for session in &mut sessions {
         session.detail_loaded = false;
     }
@@ -154,6 +158,29 @@ pub(super) fn merge_remote_session_catalog(
         }
     }
 
+    removed
+}
+
+/// Apply an authoritative replacement only within the originating host.
+fn merge_host_task_state(
+    state: &mut PersistedState,
+    ownership: &mut waku_client::hosts::HostOwnership,
+    key: &waku_client::hosts::HostKey,
+    snapshot: RemoteTaskStateSnapshot,
+    has_runtime: impl Fn(Uuid) -> bool,
+) -> Vec<Uuid> {
+    ownership.register_new_sessions(state);
+    let (mut sessions, other_sessions) = std::mem::take(&mut state.sessions)
+        .into_iter()
+        .partition(|session| ownership.session(session.id) == *key);
+    state.sessions = other_sessions;
+    ownership.register(key, &snapshot.projects, &snapshot.sessions);
+    let removed = merge_remote_session_catalog(&mut sessions, snapshot.sessions, has_runtime);
+    state.sessions.extend(sessions);
+    state
+        .projects
+        .retain(|project| ownership.project(project.id) != *key);
+    state.projects.extend(snapshot.projects);
     removed
 }
 
@@ -913,93 +940,113 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
 }
 
 impl Waku {
-    pub(super) fn restart_task_state_sync(&self) {
-        let clients = self.daemon.subscribe_clients();
+    pub(super) fn restart_task_state_sync(&mut self) {
+        let keys = self
+            .hosts
+            .hosts
+            .iter()
+            .map(|host| host.key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.start_host_task_state_sync(key);
+        }
+    }
+
+    pub(super) fn start_host_task_state_sync(&mut self, key: waku_client::hosts::HostKey) {
+        let Some(host) = self.hosts.get(&key) else {
+            return;
+        };
+        let clients = host.daemon.subscribe_clients();
+        let load_gate = host.store.task_state_load_gate();
+        let generation = host.generation;
         let results = self.task_state_sync_tx.clone();
         let event_wake = self.event_wake_tx.clone();
+        let (stop_tx, stop) = crossbeam_channel::bounded::<()>(1);
+        self.host_sync_stops.insert(key.clone(), stop_tx);
         std::thread::Builder::new()
-            .name("waku-task-state-sync".into())
+            .name(format!("waku-task-state-{key:?}"))
             .spawn(move || {
-                let Ok(mut client) = clients.recv() else {
-                    return;
+                let mut client = crossbeam_channel::select! {
+                    recv(stop) -> _ => return,
+                    recv(clients) -> client => match client { Ok(client) => client, Err(_) => return },
                 };
                 loop {
-                    while let Ok(newer) = clients.try_recv() {
-                        client = newer;
-                    }
+                    while let Ok(newer) = clients.try_recv() { client = newer; }
                     let revisions = client.subscribe_task_state();
+                    let ticket = load_gate.begin();
                     let result = load_remote_task_state(&client).map_err(|error| error.to_string());
-                    if results.send(result).is_err() {
-                        return;
-                    }
+                    if results.send((key.clone(), generation, ticket, result)).is_err() { return; }
                     signal_event_pump(&event_wake);
                     client = loop {
                         crossbeam_channel::select! {
+                            recv(stop) -> _ => return,
                             recv(clients) -> replacement => {
-                                let Ok(mut replacement) = replacement else {
-                                    return;
-                                };
-                                while let Ok(newer) = clients.try_recv() {
-                                    replacement = newer;
-                                }
+                                let Ok(replacement) = replacement else { return; };
                                 break replacement;
                             }
                             recv(revisions) -> revision => {
                                 if revision.is_err() {
-                                    // Managed replacement publishes the new
-                                    // client after the old socket closes. Wait
-                                    // for that publication instead of exiting
-                                    // the task-state sync worker permanently.
-                                    let Ok(replacement) = clients.recv() else {
-                                        return;
+                                    break crossbeam_channel::select! {
+                                        recv(stop) -> _ => return,
+                                        recv(clients) -> replacement => match replacement { Ok(client) => client, Err(_) => return },
                                     };
-                                    break replacement;
                                 }
                                 while revisions.try_recv().is_ok() {}
-                                let result = load_remote_task_state(&client)
-                                    .map_err(|error| error.to_string());
-                                if results.send(result).is_err() {
-                                    return;
-                                }
+                                let ticket = load_gate.begin();
+                                let result = load_remote_task_state(&client).map_err(|error| error.to_string());
+                                if results.send((key.clone(), generation, ticket, result)).is_err() { return; }
                                 signal_event_pump(&event_wake);
                             }
                         }
                     };
                 }
-            })
-            .ok();
+            }).ok();
     }
 
     fn drain_task_state_sync_events(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut latest = None;
-        while let Ok(result) = self.task_state_sync_events.try_recv() {
-            latest = Some(result);
-        }
-        let Some(result) = latest else {
-            return false;
-        };
-        match result {
-            Ok(snapshot) => {
-                self.apply_remote_task_state(snapshot, cx);
-                true
-            }
-            Err(error) => {
-                eprintln!("could not refresh daemon task state: {error}");
-                false
+        let mut latest = HashMap::new();
+        while let Ok((key, generation, ticket, result)) = self.task_state_sync_events.try_recv() {
+            if self
+                .hosts
+                .get(&key)
+                .is_some_and(|host| host.generation == generation)
+            {
+                latest.insert(key, (ticket, result));
             }
         }
+        let mut changed = false;
+        for (key, (ticket, result)) in latest {
+            match result {
+                Ok(snapshot) => {
+                    if !self
+                        .hosts
+                        .get(&key)
+                        .is_some_and(|host| host.store.task_state_load_gate().complete(ticket))
+                    {
+                        continue;
+                    }
+                    self.apply_remote_task_state(key, snapshot, cx);
+                    changed = true;
+                }
+                Err(error) => eprintln!("could not refresh {key:?} task state: {error}"),
+            }
+        }
+        changed
     }
 
-    fn apply_remote_task_state(
+    pub(super) fn apply_remote_task_state(
         &mut self,
+        key: waku_client::hosts::HostKey,
         snapshot: RemoteTaskStateSnapshot,
         cx: &mut Context<Self>,
     ) {
         let runtime_ids = self.runtimes.keys().copied().collect::<HashSet<_>>();
-        let removed = merge_remote_session_catalog(
-            &mut self.state.sessions,
-            snapshot.sessions,
-            |session_id| runtime_ids.contains(&session_id),
+        let removed = merge_host_task_state(
+            &mut self.state,
+            &mut self.hosts.ownership,
+            &key,
+            snapshot,
+            |id| runtime_ids.contains(&id),
         );
         for session_id in &removed {
             self.runtime_attach_pending.remove(session_id);
@@ -1009,7 +1056,6 @@ impl Waku {
             self.remove_right_panel_session_state(*session_id);
             self.task_switcher.remove(*session_id);
         }
-        self.state.projects = snapshot.projects;
 
         let attach = self
             .state
@@ -1025,12 +1071,19 @@ impl Waku {
             self.start_runtime_attachment(session_id, cx);
         }
 
+        if let Some(id) = self.pending_host_session
+            && self.state.sessions.iter().any(|session| session.id == id)
+        {
+            self.pending_host_session = None;
+            self.select_session(id, cx);
+        }
         if self.state.selected_session.is_some_and(|selected| {
-            !self
-                .state
-                .sessions
-                .iter()
-                .any(|session| session.id == selected)
+            self.pending_host_session != Some(selected)
+                && !self
+                    .state
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == selected)
         }) {
             let previous_project = self.state.selected_project;
             self.state.selected_session = None;
@@ -1075,7 +1128,10 @@ impl Waku {
         {
             return;
         }
-        let daemon = self.daemon.clone();
+        let owner = self.hosts.for_session(session_id);
+        let host_key = owner.key.clone();
+        let host_generation = owner.generation;
+        let daemon = owner.daemon.clone();
         let event_wake = self.event_wake_tx.clone();
         cx.spawn(async move |waku, cx| {
             let result = cx
@@ -1083,6 +1139,13 @@ impl Waku {
                 .spawn(async move { attach_driver(daemon, session_id, event_wake) })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
+                if !waku
+                    .hosts
+                    .get(&host_key)
+                    .is_some_and(|host| host.generation == host_generation)
+                {
+                    return;
+                }
                 waku.finish_runtime_attachment(session_id, result, cx);
             });
         })
@@ -1313,17 +1376,30 @@ impl Waku {
     }
 
     pub(super) fn provider_probe(&self, provider: ProviderKind) -> Option<&ProviderProbe> {
-        self.probes.iter().find(|probe| probe.provider == provider)
+        self.provider_probes()
+            .iter()
+            .find(|probe| probe.provider == provider)
     }
 
     pub(super) fn request_provider_model_discovery(&mut self, provider: ProviderKind) {
+        let key = self.selected_host_key();
+        if key != waku_client::hosts::HostKey::Local {
+            self.refresh_host_catalog(key, Some(provider), false);
+        } else {
+            self.request_local_provider_model_discovery(provider);
+        }
+    }
+
+    fn request_local_provider_model_discovery(&mut self, provider: ProviderKind) {
         if !provider.supports_model_discovery()
             || self.provider_model_discoveries.contains(&provider)
         {
             return;
         }
         let Some(probe) = self
-            .provider_probe(provider)
+            .probes
+            .iter()
+            .find(|probe| probe.provider == provider)
             .filter(|probe| probe.installed)
             .cloned()
         else {
@@ -1368,6 +1444,11 @@ impl Waku {
     /// The stale catalog stays on screen until the fresh probe lands, so an
     /// open menu never blanks into a loading state while it refreshes.
     pub(super) fn refresh_provider_model_discovery(&mut self, provider: ProviderKind) {
+        let key = self.selected_host_key();
+        if key != waku_client::hosts::HostKey::Local {
+            self.refresh_host_catalog(key, Some(provider), true);
+            return;
+        }
         if self.provider_model_discoveries_pending.contains(&provider) {
             return;
         }
@@ -1525,7 +1606,7 @@ impl Waku {
             changed = true;
         }
         for provider in installed_providers {
-            self.request_provider_model_discovery(provider);
+            self.request_local_provider_model_discovery(provider);
         }
         if changed {
             self.request_provider_version_probes();
@@ -1552,7 +1633,7 @@ impl Waku {
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
         super::composer::picker_has_no_providers(
-            &self.probes,
+            self.provider_probes(),
             &self.state.disabled_providers,
             locked_provider,
             self.provider_detection_checked_at.is_some(),
@@ -1561,7 +1642,7 @@ impl Waku {
 
     pub(super) fn model_for_session<'a>(&'a self, session: &'a AgentSession) -> Option<&'a str> {
         session.model.as_deref().or_else(|| {
-            self.provider_probe(session.provider)
+            self.provider_probe_for_session(session)
                 .and_then(ProviderProbe::preferred_model)
                 .map(|model| model.id.as_str())
         })
@@ -1582,7 +1663,7 @@ impl Waku {
         session: &AgentSession,
     ) -> Option<&ProviderModel> {
         let model = self.model_for_session(session)?;
-        self.provider_probe(session.provider)?.model(model)
+        self.provider_probe_for_session(session)?.model(model)
     }
 
     pub(super) fn catalog_model_id_for_session<'a>(
@@ -1608,7 +1689,7 @@ impl Waku {
             .err()
             .map(|error| error.to_string());
         let app_error = self
-            .store
+            .hosts
             .save(&mut self.state)
             .err()
             .map(|error| error.to_string());
@@ -1705,7 +1786,9 @@ impl Waku {
             {
                 continue;
             }
-            let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+            let workspace = waku_client::WorkspaceClient::for_daemon(
+                self.daemon_for_session(session_id).clone(),
+            );
             cx.spawn(async move |waku, cx| {
                 let captured = cx
                     .background_executor()
@@ -1872,7 +1955,7 @@ impl Waku {
             _ => None,
         };
         let binary = binary_provider.and_then(|_| {
-            self.probes
+            self.provider_probes_for_host(&self.hosts.ownership.session(session_id))
                 .iter()
                 .find(|probe| probe.provider == provider)
                 .and_then(|probe| probe.path.clone())
@@ -1904,7 +1987,9 @@ impl Waku {
             None
         };
         let request = ResponseForkRequest {
-            workspace_client: waku_client::WorkspaceClient::new(self.daemon.client()),
+            workspace_client: waku_client::WorkspaceClient::for_daemon(
+                self.daemon_for_session(source.id).clone(),
+            ),
             source,
             source_workspace_path,
             fork_title,
@@ -1976,6 +2061,10 @@ impl Waku {
         self.invalidate_checkpoint_refs();
 
         let fork_id = forked.id;
+        self.hosts
+            .ownership
+            .sessions
+            .insert(forked.id, self.hosts.ownership.project(forked.project_id));
         self.state.push_session(forked);
         self.analytics
             .track(crate::analytics::Event::ResponseForked {
@@ -2245,9 +2334,7 @@ impl Waku {
                 || (source.provider == ProviderKind::Grok && retained_turn_count > 0));
         let binary = needs_binary
             .then(|| {
-                self.probes
-                    .iter()
-                    .find(|probe| probe.provider == source.provider)
+                self.provider_probe_for_session(&source)
                     .and_then(|probe| probe.path.clone())
             })
             .flatten();
@@ -2304,7 +2391,9 @@ impl Waku {
             return;
         };
         let request = MessageRewindRequest {
-            workspace_client: waku_client::WorkspaceClient::new(self.daemon.client()),
+            workspace_client: waku_client::WorkspaceClient::for_daemon(
+                self.daemon_for_session(session_id).clone(),
+            ),
             session_id,
             provider,
             provider_cursor,
@@ -2546,7 +2635,7 @@ impl Waku {
     /// disagree about what the session is currently set to.
     pub(super) fn session_options(&self, session: &AgentSession) -> SessionOptions {
         let model = session.model.clone().or_else(|| {
-            self.provider_probe(session.provider)
+            self.provider_probe_for_session(session)
                 .and_then(ProviderProbe::preferred_model)
                 .map(|model| model.id.clone())
         });
@@ -2575,7 +2664,7 @@ impl Waku {
         });
         if session.provider == ProviderKind::Cursor
             && let Some(requested) = model.as_deref()
-            && let Some(probe) = self.provider_probe(session.provider)
+            && let Some(probe) = self.provider_probe_for_session(session)
             && let Some(matched) =
                 waku_protocol::model_catalog::cursor_catalog_model(&probe.models, requested)
         {
@@ -2606,7 +2695,7 @@ impl Waku {
             return None;
         }
         session.agent_preset.clone().or_else(|| {
-            self.provider_probe(session.provider)
+            self.provider_probe_for_session(session)
                 .and_then(ProviderProbe::preferred_agent_preset)
                 .map(|preset| preset.id.clone())
         })
@@ -2615,7 +2704,7 @@ impl Waku {
     pub(super) fn agent_preset_label_for_session(&self, session: &AgentSession) -> Option<String> {
         let id = self.agent_preset_for_session(session)?;
         Some(
-            self.provider_probe(session.provider)
+            self.provider_probe_for_session(session)
                 .and_then(|probe| probe.agent_presets.iter().find(|preset| preset.id == id))
                 .map(|preset| preset.display_name())
                 .unwrap_or(id),
@@ -2705,9 +2794,7 @@ impl Waku {
         cwd: PathBuf,
     ) -> anyhow::Result<DriverStartRequest> {
         let binary = self
-            .probes
-            .iter()
-            .find(|probe| probe.provider == session.provider)
+            .provider_probe_for_session(session)
             .and_then(|probe| probe.path.clone())
             .ok_or_else(|| {
                 anyhow::anyhow!(tr!(
@@ -2739,7 +2826,7 @@ impl Waku {
                 provider_cursor: session.provider_cursor.clone(),
             },
             event_wake: self.event_wake_tx.clone(),
-            daemon: self.daemon.clone(),
+            daemon: self.daemon_for_session(session.id).clone(),
         })
     }
 
@@ -2805,7 +2892,8 @@ impl Waku {
             .unwrap_or_else(|| tr!("goal.title"));
         self.goal_runtime_starts.insert(session_id);
         cx.notify();
-        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace_client =
+            waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
         cx.spawn(async move |waku, cx| {
             let prepared = cx
                 .background_executor()
@@ -3316,7 +3404,8 @@ impl Waku {
         cx.notify();
 
         let preparation_prompt = human_prompt;
-        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace_client =
+            waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
         cx.spawn(async move |waku, cx| {
             let prepared = cx
                 .background_executor()
@@ -3528,6 +3617,7 @@ impl Waku {
         // queues just because its own drain reported a change first.
         if self.drain_driver_events(cx)
             | self.drain_provider_probe_events()
+            | self.drain_host_catalog_events()
             | self.drain_provider_version_events()
             | self.drain_provider_detection_events()
             | self.drain_computer_permission_events()
@@ -3702,7 +3792,56 @@ impl Waku {
 
 #[cfg(test)]
 mod response_fork_title_tests {
-    use super::next_response_fork_title;
+    use super::{
+        AgentSession, PersistedState, Project, ProviderKind, RemoteTaskStateSnapshot,
+        merge_host_task_state, next_response_fork_title,
+    };
+
+    #[test]
+    fn host_catalog_replacement_keeps_other_hosts_and_removes_only_its_own_sessions() {
+        use waku_client::hosts::{HostKey, HostOwnership};
+        let local = Project::from_path("/same/path".into());
+        let remote = Project::from_path("/same/path".into());
+        let mut local_task = AgentSession::new(local.id, ProviderKind::Codex);
+        local_task.begin_turn("Local task");
+        let mut remote_task = AgentSession::new(remote.id, ProviderKind::Codex);
+        remote_task.begin_turn("Remote task");
+        let remote_key = HostKey::Connection("ssh:build".into());
+        let mut owners = HostOwnership::default();
+        owners.register(&HostKey::Local, &[local.clone()], &[local_task.clone()]);
+        owners.register(&remote_key, &[remote.clone()], &[remote_task.clone()]);
+        let mut state = PersistedState::empty();
+        state.projects = vec![local.clone(), remote.clone()];
+        state.sessions = vec![local_task.clone(), remote_task.clone()];
+        let removed = merge_host_task_state(
+            &mut state,
+            &mut owners,
+            &remote_key,
+            RemoteTaskStateSnapshot {
+                projects: vec![],
+                sessions: vec![],
+            },
+            |_| false,
+        );
+        assert_eq!(removed, vec![remote_task.id]);
+        assert_eq!(
+            state
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![local.id]
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![local_task.id]
+        );
+        assert_eq!(state.sessions[0].turns.len(), local_task.turns.len());
+    }
 
     #[test]
     fn response_fork_titles_advance_one_numbered_sequence() {

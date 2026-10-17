@@ -558,6 +558,8 @@ onboarding.open_project_to_begin:
   en: Open a project to begin
 onboarding.description:
   en: Waku runs coding agents in folders you choose. Your code, sessions, and history stay on this computer
+onboarding.remote_description:
+  en: "Waku runs coding agents in folders you choose. Your code, sessions, and history stay on %{host}"
 onboarding.web_description:
   en: Choose a path on the daemon host, or start without a project.
 onboarding.open_project_folder:
@@ -2189,3 +2191,73 @@ usage_error.unknown_error:
   en: unknown error
 usage_error.curl_no_status:
   en: curl returned no HTTP status line
+settings.connections:
+  en: Connections
+settings.connections_keywords:
+  en: connections remote wsl ssh host server window linux
+connections.local:
+  en: This computer
+connections.connected_hosts:
+  en: Connected hosts
+connections.description:
+  en: "Hosts share this window and are grouped in the sidebar. Agents, files, Git, and terminals run on that host; provider CLIs must be installed and signed in there."
+connections.reconnecting:
+  en: Reconnecting
+connections.refresh:
+  en: Refresh
+connections.wsl_title:
+  en: WSL
+connections.wsl_loading:
+  en: Looking for WSL distributions…
+connections.wsl_unavailable:
+  en: "WSL is unavailable: %{error}"
+connections.wsl_empty:
+  en: No WSL distributions are installed.
+connections.connecting:
+  en: Connecting…
+connections.open:
+  en: Connect
+connections.connected:
+  en: Connected
+connections.disconnect:
+  en: Disconnect
+connections.ssh_title:
+  en: SSH
+connections.ssh_description:
+  en: "Uses your own ssh, so ~/.ssh/config, ssh-agent, and ProxyJump apply. Enter a Host alias or user@host:port, and optionally a private key."
+connections.auth_key:
+  en: private key
+connections.auth_password:
+  en: password
+connections.test:
+  en: Test
+connections.remove:
+  en: Remove
+connections.add:
+  en: Add
+connections.ssh_host_placeholder:
+  en: "Host alias or user@host:port"
+connections.ssh_key_placeholder:
+  en: Private key (optional)
+connections.ssh_host_required:
+  en: Enter an SSH host
+connections.ssh_port_invalid:
+  en: The SSH port is not a number between 1 and 65535
+connections.ssh_duplicate:
+  en: This SSH host is already saved
+connections.save_failed:
+  en: "Could not save connections: %{error}"
+connections.connect_failed:
+  en: "Could not connect to %{name}: %{error}"
+connections.test_succeeded:
+  en: "Connected to %{name}"
+remote_folder.title:
+  en: "Choose a folder on %{host}"
+remote_folder.loading:
+  en: Loading…
+remote_folder.invalid_response:
+  en: The daemon returned an invalid directory listing
+remote_folder.cancel:
+  en: Cancel
+remote_folder.add:
+  en: Add project

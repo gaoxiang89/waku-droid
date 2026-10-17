@@ -286,6 +286,7 @@ project.your_project: あなたのプロジェクト
 
 onboarding.open_project_to_begin: プロジェクトを開いて始めましょう
 onboarding.description: Waku は選択したフォルダでコーディングエージェントを実行します。コード、タスク、履歴はこのコンピュータに保存されます
+onboarding.remote_description: "Waku は選択したフォルダでコーディングエージェントを実行します。コード、タスク、履歴は %{host} に保存されます"
 onboarding.web_description: デーモンホスト上のパスを選ぶか、プロジェクトなしで開始してください。
 onboarding.open_project_folder: プロジェクトフォルダを開く…
 onboarding.what_should_we_build: 何を作りましょうか？
@@ -1119,3 +1120,38 @@ usage_error.curl_did_not_finish: curl がリクエストを完了しませんで
 usage_error.curl_failed: "curl に失敗しました：%{error}"
 usage_error.unknown_error: 不明なエラー
 usage_error.curl_no_status: curl から HTTP ステータス行が返されませんでした
+settings.connections: 接続
+settings.connections_keywords: 接続 リモート wsl ssh ホスト サーバー ウィンドウ linux
+connections.local: このコンピューター
+connections.connected_hosts: 接続中のホスト
+connections.description: ホストは同じウィンドウのサイドバーにグループ別で表示されます。エージェント、ファイル、Git、ターミナルはそのホスト上で動作するため、各プロバイダーの CLI をそのホストにインストールしてサインインしておく必要があります。
+connections.reconnecting: 再接続中
+connections.refresh: 更新
+connections.wsl_title: WSL
+connections.wsl_loading: WSL ディストリビューションを検索しています…
+connections.wsl_unavailable: "WSL を利用できません：%{error}"
+connections.wsl_empty: WSL ディストリビューションがインストールされていません。
+connections.connecting: 接続中…
+connections.open: 接続
+connections.connected: 接続済み
+connections.disconnect: 接続を解除
+connections.ssh_title: SSH
+connections.ssh_description: "お使いの ssh を使用するため、~/.ssh/config、ssh-agent、ProxyJump がそのまま適用されます。Host エイリアスまたは user@host:port を入力し、必要に応じて秘密鍵を指定してください。"
+connections.auth_key: 秘密鍵
+connections.auth_password: パスワード
+connections.test: テスト
+connections.remove: 削除
+connections.add: 追加
+connections.ssh_host_placeholder: "Host エイリアスまたは user@host:port"
+connections.ssh_key_placeholder: 秘密鍵（任意）
+connections.ssh_host_required: SSH ホストを入力してください
+connections.ssh_port_invalid: SSH ポートは 1〜65535 の数値で指定してください
+connections.ssh_duplicate: この SSH ホストは既に保存されています
+connections.save_failed: "接続を保存できませんでした：%{error}"
+connections.connect_failed: "%{name} に接続できませんでした：%{error}"
+connections.test_succeeded: "%{name} に接続しました"
+remote_folder.title: "%{host} のフォルダを選択"
+remote_folder.loading: 読み込み中…
+remote_folder.invalid_response: デーモンが無効なディレクトリ一覧を返しました
+remote_folder.cancel: キャンセル
+remote_folder.add: プロジェクトを追加

@@ -18,9 +18,14 @@ name = "waku-debug-daemon"
 path = "src/bin/waku-debug-daemon.rs"
 required-features = ["dev-binary"]
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0"
+dirs = "6.0"
 serde_json = "1.0"
+uuid = { version = "1.18", features = ["v4"] }
 waku-core = { path = "../waku-core" }
 waku-protocol = { path = "../waku-protocol" }
 

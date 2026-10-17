@@ -28,6 +28,7 @@ macro_rules! tr {
 
 pub mod attachments;
 pub mod blob;
+pub mod bridge;
 pub mod checkpoint;
 pub mod composer;
 pub mod computer_use;

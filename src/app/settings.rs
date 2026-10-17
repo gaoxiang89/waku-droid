@@ -19,7 +19,7 @@ const SETTINGS_SEARCH_CONTEXT: &str = "SettingsSidebar > TextInput";
 
 /// The sidebar's rows in display order, each with the keyword haystack the
 /// search field filters against.
-const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
+const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 8] = [
     (
         SettingsPage::General,
         "settings.general",
@@ -55,6 +55,12 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
         "settings.daemon",
         "icons/server.svg",
         "settings.daemon_keywords",
+    ),
+    (
+        SettingsPage::Connections,
+        "settings.connections",
+        "icons/globe.svg",
+        "settings.connections_keywords",
     ),
     (
         SettingsPage::ComputerUse,
@@ -95,7 +101,9 @@ impl Waku {
         div()
             .key_context("Waku")
             .track_focus(&self.settings_focus)
-            .on_action(|_: &CloseWindow, window, _| crate::platform::hide_window(window))
+            .on_action(
+                cx.listener(|this, _: &CloseWindow, window, _| this.close_or_hide_window(window)),
+            )
             .on_action(cx.listener(Self::new_session_action))
             .on_action(cx.listener(Self::new_project_action))
             .on_action(cx.listener(Self::open_settings_action))
@@ -360,6 +368,7 @@ impl Waku {
                         SettingsPage::Skills => tr!("settings.skills"),
                         SettingsPage::Usage => tr!("settings.usage"),
                         SettingsPage::Daemon => tr!("settings.daemon"),
+                        SettingsPage::Connections => tr!("settings.connections"),
                         SettingsPage::ComputerUse => tr!("settings.computer_use"),
                         SettingsPage::Appearance => tr!("settings.appearance"),
                     }),
@@ -370,6 +379,7 @@ impl Waku {
                 SettingsPage::Skills => self.render_skills_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),
                 SettingsPage::Daemon => self.render_daemon_settings(cx),
+                SettingsPage::Connections => self.render_connections_settings(cx),
                 SettingsPage::ComputerUse => self.render_computer_use_settings(cx),
                 SettingsPage::Appearance => self.render_appearance_settings(cx),
             });
@@ -1632,7 +1642,7 @@ impl Waku {
         let mut rows = div().mt(px(4.0)).flex().flex_col();
         let provider_count = ProviderKind::ALL.len();
         for (index, kind) in ProviderKind::ALL.into_iter().enumerate() {
-            let probe = self.provider_probe(kind);
+            let probe = self.probes.iter().find(|probe| probe.provider == kind);
             let installed = probe.is_some_and(|probe| probe.installed);
             let binary_path = probe
                 .filter(|probe| probe.installed)
@@ -1861,7 +1871,9 @@ impl Waku {
     ) -> Div {
         let override_value = self.state.provider_binary_overrides.get(&kind).cloned();
         let full_path = self
-            .provider_probe(kind)
+            .probes
+            .iter()
+            .find(|probe| probe.provider == kind)
             .filter(|probe| probe.installed)
             .and_then(|probe| probe.path.as_ref())
             .map(|path| path.display().to_string());

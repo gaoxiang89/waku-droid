@@ -23,6 +23,16 @@ bun scripts/cua-driver.ts bundle "$package_dir/bin" "$package_dir/share/waku" re
 install -Dm755 "$target_dir/release/waku" "$package_dir/bin/waku"
 install -Dm755 "$target_dir/release/waku-updater" "$package_dir/bin/waku-updater"
 install -Dm755 "$target_dir/release/waku-daemon" "$package_dir/bin/waku-daemon"
+# Statically linked daemons for SSH hosts of either architecture; this
+# machine's own glibc-linked daemon would not run on an older distribution.
+if [[ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]]; then
+  for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
+    install -Dm755 "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" \
+      "$package_dir/share/waku/remote/$remote_daemon"
+  done
+else
+  echo "warning: WAKU_REMOTE_DAEMONS_DIR is not set; SSH hosts must match this machine's platform." >&2
+fi
 install -Dm644 resources/linux/sh.waku.desktop \
   "$package_dir/share/applications/sh.waku.desktop"
 install -Dm644 resources/linux/self-update-v1 \

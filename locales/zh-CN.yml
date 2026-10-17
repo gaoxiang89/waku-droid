@@ -272,6 +272,7 @@ project.without_a_project: 不使用项目
 project.your_project: 你的项目
 onboarding.open_project_to_begin: 打开一个项目即可开始
 onboarding.description: Waku 会在你选择的文件夹中运行编程智能体。代码、任务和历史记录都保留在这台电脑上
+onboarding.remote_description: "Waku 会在你选择的文件夹中运行编程智能体。代码、任务和历史记录都保留在 %{host} 上"
 onboarding.web_description: 请选择守护进程主机上的路径，或在不使用项目的情况下开始。
 onboarding.open_project_folder: 打开项目文件夹…
 onboarding.what_should_we_build: 想构建什么？
@@ -1067,3 +1068,38 @@ usage_error.curl_did_not_finish: curl 未能完成请求
 usage_error.curl_failed: "curl 失败：%{error}"
 usage_error.unknown_error: 未知错误
 usage_error.curl_no_status: curl 未返回 HTTP 状态行
+settings.connections: 连接
+settings.connections_keywords: 连接 远程 wsl ssh 主机 服务器 窗口 linux
+connections.local: 本机
+connections.connected_hosts: 已连接的主机
+connections.description: 所有主机共用当前窗口，并在侧边栏分组显示。Agent、文件、Git 和终端都在该主机上运行；需要在该主机上安装并登录各 Provider 的 CLI。
+connections.reconnecting: 正在重连
+connections.refresh: 刷新
+connections.wsl_title: WSL
+connections.wsl_loading: 正在查找 WSL 发行版…
+connections.wsl_unavailable: "WSL 不可用：%{error}"
+connections.wsl_empty: 未安装任何 WSL 发行版。
+connections.connecting: 正在连接…
+connections.open: 连接
+connections.connected: 已连接
+connections.disconnect: 断开连接
+connections.ssh_title: SSH
+connections.ssh_description: "使用本机的 ssh，~/.ssh/config、ssh-agent 和 ProxyJump 均会生效。输入 Host 别名或 user@host:port，可选填私钥路径。"
+connections.auth_key: 私钥
+connections.auth_password: 密码
+connections.test: 测试
+connections.remove: 移除
+connections.add: 添加
+connections.ssh_host_placeholder: "Host 别名或 user@host:port"
+connections.ssh_key_placeholder: 私钥（可选）
+connections.ssh_host_required: 请输入 SSH 主机
+connections.ssh_port_invalid: SSH 端口必须是 1 到 65535 之间的数字
+connections.ssh_duplicate: 该 SSH 主机已保存
+connections.save_failed: "无法保存连接：%{error}"
+connections.connect_failed: "无法连接到 %{name}：%{error}"
+connections.test_succeeded: "已连接到 %{name}"
+remote_folder.title: "选择 %{host} 上的文件夹"
+remote_folder.loading: 正在加载…
+remote_folder.invalid_response: 守护进程返回了无效的目录列表
+remote_folder.cancel: 取消
+remote_folder.add: 添加项目

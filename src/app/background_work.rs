@@ -982,7 +982,7 @@ impl Waku {
         workspace_path: Option<&Path>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.daemon.is_remote() {
+        if self.selected_daemon().is_remote() {
             return None;
         }
         let path: Rc<Path> = Rc::from(workspace_path?);

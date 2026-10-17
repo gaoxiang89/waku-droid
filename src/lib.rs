@@ -52,7 +52,8 @@ pub use waku_client::{
 
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, px, size,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, actions, point, px,
+    size,
 };
 
 use crate::app::Waku;
@@ -323,54 +324,7 @@ pub fn run() {
             })
             .detach();
 
-            let (window_bounds, display_id) = restored_window_placement(cx);
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(APP_NAME.into()),
-                            // Windows creates the window without `WS_CAPTION`
-                            // either way; asking for the transparent titlebar
-                            // is what extends the client area over the frame
-                            // so Waku's own header can host the caption
-                            // buttons and drag region.
-                            appears_transparent: cfg!(any(
-                                target_os = "macos",
-                                target_os = "windows"
-                            )),
-                            traffic_light_position: cfg!(target_os = "macos")
-                                .then(|| point(px(16.0), px(17.0))),
-                        }),
-                        // Waku moves its custom macOS titlebar explicitly. Keep
-                        // the NSWindow movable so native controls and Window-menu
-                        // tiling remain enabled.
-                        is_movable: true,
-                        app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                        window_background: if cfg!(target_os = "macos") {
-                            WindowBackgroundAppearance::Blurred
-                        } else {
-                            WindowBackgroundAppearance::Opaque
-                        },
-                        app_id: Some(APP_ID.to_owned()),
-                        // GPUI defaults to compositor/server decorations. If a
-                        // Wayland compositor declines them, it reports the
-                        // client fallback and Waku renders that frame itself.
-                        #[cfg(target_os = "linux")]
-                        icon: crate::platform::linux_app_icon(),
-                        window_bounds: Some(window_bounds),
-                        display_id,
-                        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        crate::platform::configure_main_window_close_behavior(window, cx);
-                        let waku = Waku::new(window, cx, daemon);
-                        let composer_focus = waku.read(cx).composer_focus(cx);
-                        window.focus(&composer_focus, cx);
-                        waku
-                    },
-                )
-                .expect("failed to open Waku window");
+            let window = open_main_window(cx, daemon).expect("failed to open Waku window");
 
             cx.on_system_notification_response({
                 let window = window;
@@ -405,6 +359,57 @@ pub fn run() {
             // relaunched build has successfully opened its main window.
             crate::updater::signal_relaunch_ready();
         });
+}
+
+/// Open the workspace window with its local daemon. Remote hosts join its
+/// registry asynchronously after the first frame.
+pub(crate) fn open_main_window(
+    cx: &mut App,
+    daemon: waku_client::DaemonSupervisor,
+) -> anyhow::Result<WindowHandle<Waku>> {
+    let (window_bounds, display_id) = restored_window_placement(cx);
+    let title = APP_NAME.to_owned();
+    cx.open_window(
+        WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                // Windows creates the window without `WS_CAPTION` either way;
+                // asking for the transparent titlebar is what extends the
+                // client area over the frame so Waku's own header can host
+                // the caption buttons and drag region.
+                appears_transparent: cfg!(any(target_os = "macos", target_os = "windows")),
+                traffic_light_position: cfg!(target_os = "macos")
+                    .then(|| point(px(16.0), px(17.0))),
+            }),
+            // Waku moves its custom macOS titlebar explicitly. Keep the
+            // NSWindow movable so native controls and Window-menu tiling
+            // remain enabled.
+            is_movable: true,
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
+            window_background: if cfg!(target_os = "macos") {
+                WindowBackgroundAppearance::Blurred
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            app_id: Some(APP_ID.to_owned()),
+            // GPUI defaults to compositor/server decorations. If a Wayland
+            // compositor declines them, it reports the client fallback and
+            // Waku renders that frame itself.
+            #[cfg(target_os = "linux")]
+            icon: crate::platform::linux_app_icon(),
+            window_bounds: Some(window_bounds),
+            display_id,
+            window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+            ..Default::default()
+        },
+        move |window, cx| {
+            crate::platform::configure_main_window_close_behavior(window, cx);
+            let waku = Waku::new(window, cx, daemon);
+            let composer_focus = waku.read(cx).composer_focus(cx);
+            window.focus(&composer_focus, cx);
+            waku
+        },
+    )
 }
 
 /// Rebuild the native menu bar in the active locale. GPUI menus own their

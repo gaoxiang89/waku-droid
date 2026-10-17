@@ -55,7 +55,8 @@ impl Waku {
             Query::Pending => fallback,
             Query::Missing(token) => {
                 let fetch_path = workspace_path.clone();
-                let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+                let workspace =
+                    waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
                     let result = cx
                         .background_executor()
@@ -317,7 +318,7 @@ impl Waku {
         }
         self.branch_operation_pending = true;
         cx.notify();
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()

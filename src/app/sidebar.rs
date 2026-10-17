@@ -69,6 +69,7 @@ pub(super) enum SidebarGroup {
     Updated(SessionDateGroup),
     Project(Uuid),
     Projectless,
+    HostProjectless(Uuid),
 }
 
 impl SidebarGroup {
@@ -77,6 +78,7 @@ impl SidebarGroup {
             Self::Updated(group) => format!("updated-{}", group.index()).into(),
             Self::Project(project_id) => format!("project-{project_id}").into(),
             Self::Projectless => "projectless".into(),
+            Self::HostProjectless(index) => format!("projectless-host-{index}").into(),
         }
     }
 
@@ -85,6 +87,7 @@ impl SidebarGroup {
             Self::Updated(group) => mix(fingerprint, group.index() as u64 + 1),
             Self::Project(project_id) => mix_uuid(mix(fingerprint, 0x100), project_id),
             Self::Projectless => mix(fingerprint, 0x200),
+            Self::HostProjectless(id) => mix_uuid(mix(fingerprint, 0x300), id),
         }
     }
 }
@@ -307,8 +310,10 @@ fn visible_project_sessions(
     (visible, older_seen > revealed_older_sessions)
 }
 
-fn sidebar_project_is_projectless(project: &Project, projectless_root: Option<&Path>) -> bool {
-    projectless_root.is_some_and(|root| project.path.starts_with(root))
+fn sidebar_project_is_projectless(project: &Project, projectless_roots: &[PathBuf]) -> bool {
+    projectless_roots
+        .iter()
+        .any(|root| project.path.starts_with(root))
 }
 
 fn persisted_sidebar_branch_label(workspace: &SessionWorkspace) -> Option<&str> {
@@ -337,6 +342,7 @@ pub(super) fn format_time_ago(seconds: u64) -> String {
 pub(super) enum SidebarRow {
     /// Opens the window-wide command palette and scrolls with history.
     Search,
+    Host(usize),
     /// Group header; the first row also carries the sidebar actions.
     Header(SidebarGroup),
     /// A started session.
@@ -354,6 +360,7 @@ fn sidebar_session_row_index(rows: &[SidebarRow], session_id: Uuid) -> Option<us
 
 fn sidebar_row_height(row: SidebarRow) -> Pixels {
     px(match row {
+        SidebarRow::Host(_) => 36.0,
         SidebarRow::Search => SIDEBAR_ACTION_ROW_HEIGHT + SIDEBAR_SEARCH_BOTTOM_GAP,
         SidebarRow::Header(_) => SIDEBAR_GROUP_HEADER_HEIGHT + SIDEBAR_GROUP_HEADER_BOTTOM_GAP,
         SidebarRow::Session(_) => SIDEBAR_SESSION_ROW_HEIGHT,
@@ -784,7 +791,12 @@ impl Waku {
             .w_full()
             .h(px(SIDEBAR_ACTION_ROW_HEIGHT + SIDEBAR_SEARCH_BOTTOM_GAP))
             .flex_none()
-            .child(search)
+            .flex()
+            .items_center()
+            .child(div().flex_1().min_w_0().child(search))
+            .when(self.hosts.hosts.len() > 1, |row| {
+                row.child(self.render_sidebar_header_actions(cx))
+            })
     }
 
     fn start_available_update(&mut self, cx: &mut Context<Self>) {
@@ -937,10 +949,74 @@ impl Waku {
                         this.open_settings_action(&OpenSettings, window, cx);
                     })),
             )
+            .when_some(self.render_remote_connection_chip(cx), |footer, chip| {
+                footer.child(chip)
+            })
             .child(div().flex_1())
             .when_some(self.render_updater_button(cx), |footer, button| {
                 footer.child(button)
             })
+    }
+
+    /// Names the WSL or SSH host a remote window works on, and says so when
+    /// the transport is down. Opens the Connections settings page.
+    fn render_remote_connection_chip(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let name = self.remote_connection_name()?;
+        let theme = Theme::current(cx);
+        let disconnected = self.selected_host_disconnected();
+        let label = if disconnected {
+            SharedString::from(format!("{name} · {}", tr!("connections.reconnecting")))
+        } else {
+            name
+        };
+        Some(
+            div()
+                .id("remote-connection-chip")
+                .tab_index(0)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .ml(px(6.0))
+                .h(px(24.0))
+                .px(px(8.0))
+                .min_w_0()
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_default()
+                .text_size(sp(12.0))
+                .text_color(if disconnected {
+                    theme.warning
+                } else {
+                    theme.text_secondary
+                })
+                .hover(|element| element.bg(theme.overlay))
+                .active(|element| element.bg(theme.overlay_strong))
+                .child(icon(
+                    if disconnected {
+                        "icons/alert.svg"
+                    } else {
+                        "icons/server.svg"
+                    },
+                    12.0,
+                    if disconnected {
+                        theme.warning
+                    } else {
+                        theme.text_tertiary
+                    },
+                ))
+                .child(div().truncate().child(label))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_settings_page(SettingsPage::Connections, cx);
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.open_settings_page(SettingsPage::Connections, cx);
+                        cx.stop_propagation();
+                    }
+                })),
+        )
     }
 
     /// Resolve every ordinary local project's branch in one background pass.
@@ -977,27 +1053,33 @@ impl Waku {
             })
             .map(|session| session.project_id)
             .collect::<HashSet<_>>();
-        let projectless_root = crate::projectless::workspace_root();
+        let projectless_roots = crate::projectless::workspace_roots();
         let paths = self
             .state
             .projects
             .iter()
             .filter(|project| local_project_ids.contains(&project.id))
-            .filter(|project| !sidebar_project_is_projectless(project, projectless_root.as_deref()))
-            .map(|project| project.path.clone())
-            .collect::<HashSet<_>>();
+            .filter(|project| !sidebar_project_is_projectless(project, &projectless_roots))
+            .map(|project| {
+                (
+                    project.id,
+                    project.path.clone(),
+                    self.daemon_for_project(project.id).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         if paths.is_empty() {
             self.sidebar_branch_labels.borrow_mut().clear();
             return;
         }
 
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
         cx.spawn(async move |waku, cx| {
             let labels = cx
                 .background_executor()
                 .spawn(async move {
                     let mut labels = HashMap::new();
-                    for path in paths {
+                    for (project_id, path, daemon) in paths {
+                        let workspace = waku_client::WorkspaceClient::new(daemon.client());
                         let branch = match workspace.request(
                             waku_client::WorkspaceOperation::InspectBranches { cwd: path.clone() },
                         ) {
@@ -1007,7 +1089,7 @@ impl Waku {
                             _ => None,
                         };
                         if let Some(branch) = branch {
-                            labels.insert(path, branch);
+                            labels.insert(project_id, branch);
                         }
                     }
                     labels
@@ -1019,7 +1101,7 @@ impl Waku {
                 }
                 *waku.sidebar_branch_labels.borrow_mut() = labels
                     .into_iter()
-                    .map(|(path, branch)| (path, SharedString::from(branch)))
+                    .map(|(id, branch)| (id, SharedString::from(branch)))
                     .collect();
                 cx.notify();
             });
@@ -1028,11 +1110,23 @@ impl Waku {
     }
 
     pub(super) fn cache_sidebar_branch_label(&self, path: &Path, branch: Option<&str>) {
+        let Some(project_id) = self
+            .state
+            .projects
+            .iter()
+            .find(|project| {
+                project.path == path
+                    && self.hosts.ownership.project(project.id) == self.selected_host_key()
+            })
+            .map(|project| project.id)
+        else {
+            return;
+        };
         let mut labels = self.sidebar_branch_labels.borrow_mut();
         if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
-            labels.insert(path.to_path_buf(), SharedString::from(branch.to_owned()));
+            labels.insert(project_id, SharedString::from(branch.to_owned()));
         } else {
-            labels.remove(path);
+            labels.remove(&project_id);
         }
     }
 
@@ -1173,6 +1267,14 @@ impl Waku {
                 SidebarOrdering::Oldest => 2,
             },
         );
+        for (index, host) in self.hosts.hosts.iter().enumerate() {
+            fingerprint = mix(fingerprint, host.generation);
+            fingerprint = mix(fingerprint, index as u64);
+            fingerprint = mix(
+                fingerprint,
+                u64::from(self.collapsed_hosts.contains(&host.key)),
+            );
+        }
         for session in &self.state.sessions {
             if !session.has_started() {
                 continue;
@@ -1236,6 +1338,15 @@ impl Waku {
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
         let mut rows = vec![SidebarRow::Search];
+        let multi_host = self.hosts.hosts.len() > 1;
+        if multi_host && self.state.sidebar_grouping == SidebarGrouping::Updated {
+            rows.extend((0..self.hosts.hosts.len()).map(SidebarRow::Host));
+            sorted_sessions.retain(|session| {
+                !self
+                    .collapsed_hosts
+                    .contains(&self.hosts.ownership.session(session.id))
+            });
+        }
         match self.state.sidebar_grouping {
             SidebarGrouping::Updated => {
                 let mut grouped_sessions: [Vec<Uuid>; 6] = std::array::from_fn(|_| Vec::new());
@@ -1265,37 +1376,108 @@ impl Waku {
                     .iter()
                     .map(|session| (session.id, sidebar_session_timestamp(session)))
                     .collect::<HashMap<_, _>>();
-                let projectless_root = crate::projectless::workspace_root();
+                let projectless_roots = crate::projectless::workspace_roots();
                 let projectless_project_ids = self
                     .state
                     .projects
                     .iter()
-                    .filter(|project| {
-                        sidebar_project_is_projectless(project, projectless_root.as_deref())
-                    })
+                    .filter(|project| sidebar_project_is_projectless(project, &projectless_roots))
                     .map(|project| project.id)
                     .collect::<HashSet<_>>();
-                for (group, sessions) in
-                    project_sidebar_groups(&sorted_sessions, &projectless_project_ids)
-                {
-                    let revealed_older_sessions = self
+                let mut host_groups = Vec::new();
+                if multi_host {
+                    for (index, host) in self.hosts.hosts.iter().enumerate() {
+                        host_groups.push((None, vec![SidebarRow::Host(index)]));
+                        if self.collapsed_hosts.contains(&host.key) {
+                            continue;
+                        }
+                        let sessions = sorted_sessions
+                            .iter()
+                            .copied()
+                            .filter(|session| self.hosts.ownership.session(session.id) == host.key)
+                            .collect::<Vec<_>>();
+                        let mut groups =
+                            project_sidebar_groups(&sessions, &projectless_project_ids);
+                        for project in &self.state.projects {
+                            if self.hosts.ownership.project(project.id) == host.key
+                                && !projectless_project_ids.contains(&project.id)
+                                && !groups
+                                    .iter()
+                                    .any(|(group, _)| *group == SidebarGroup::Project(project.id))
+                            {
+                                groups.push((SidebarGroup::Project(project.id), Vec::new()));
+                            }
+                        }
+                        for (group, sessions) in groups {
+                            let group = if group == SidebarGroup::Projectless {
+                                SidebarGroup::HostProjectless(
+                                    sessions
+                                        .first()
+                                        .and_then(|id| {
+                                            self.state
+                                                .sessions
+                                                .iter()
+                                                .find(|session| session.id == *id)
+                                        })
+                                        .map(|session| session.project_id)
+                                        .expect("projectless groups contain sessions"),
+                                )
+                            } else {
+                                group
+                            };
+                            host_groups.push((
+                                Some(group),
+                                sessions.into_iter().map(SidebarRow::Session).collect(),
+                            ));
+                        }
+                    }
+                } else {
+                    for (group, sessions) in
+                        project_sidebar_groups(&sorted_sessions, &projectless_project_ids)
+                    {
+                        host_groups.push((
+                            Some(group),
+                            sessions.into_iter().map(SidebarRow::Session).collect(),
+                        ));
+                    }
+                }
+                for (group, items) in host_groups {
+                    let Some(group) = group else {
+                        rows.extend(items);
+                        continue;
+                    };
+                    let sessions = items
+                        .into_iter()
+                        .filter_map(|row| {
+                            if let SidebarRow::Session(id) = row {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let revealed = self
                         .sidebar_project_reveal_counts
                         .get(&group)
                         .copied()
                         .unwrap_or_default();
-                    let (visible_sessions, show_more) = visible_project_sessions(
+                    let (visible, show_more) = visible_project_sessions(
                         &sessions,
                         &session_timestamps,
                         recent_cutoff,
-                        revealed_older_sessions,
+                        revealed,
                     );
-                    append_sidebar_group_rows(
-                        &mut rows,
-                        group,
-                        &visible_sessions,
-                        self.sidebar_collapsed_groups.contains(&group),
-                        show_more,
-                    );
+                    if visible.is_empty() && multi_host {
+                        rows.push(SidebarRow::Header(group));
+                    } else {
+                        append_sidebar_group_rows(
+                            &mut rows,
+                            group,
+                            &visible,
+                            self.sidebar_collapsed_groups.contains(&group),
+                            show_more,
+                        );
+                    }
                 }
             }
         }
@@ -1304,7 +1486,7 @@ impl Waku {
             let group = match self.state.sidebar_grouping {
                 SidebarGrouping::Updated => SidebarGroup::Updated(SessionDateGroup::Today),
                 SidebarGrouping::Project => {
-                    let projectless_root = crate::projectless::workspace_root();
+                    let projectless_roots = crate::projectless::workspace_roots();
                     self.state
                         .selected_project
                         .and_then(|project_id| {
@@ -1315,8 +1497,7 @@ impl Waku {
                         })
                         .or_else(|| self.state.projects.first())
                         .map(|project| {
-                            if sidebar_project_is_projectless(project, projectless_root.as_deref())
-                            {
+                            if sidebar_project_is_projectless(project, &projectless_roots) {
                                 SidebarGroup::Projectless
                             } else {
                                 SidebarGroup::Project(project.id)
@@ -1366,6 +1547,7 @@ impl Waku {
         };
         match *row {
             SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
+            SidebarRow::Host(index) => self.render_sidebar_host(index, cx),
             SidebarRow::Header(group) => {
                 let has_expanded_children = rows.get(index + 1).is_some_and(|row| {
                     matches!(row, SidebarRow::Session(_) | SidebarRow::ShowMore(_))
@@ -1403,8 +1585,10 @@ impl Waku {
             .entry(group)
             .or_insert_with(|| cx.focus_handle())
             .clone();
-        let show_folder_icon =
-            matches!(group, SidebarGroup::Project(_) | SidebarGroup::Projectless);
+        let show_folder_icon = matches!(
+            group,
+            SidebarGroup::Project(_) | SidebarGroup::Projectless | SidebarGroup::HostProjectless(_)
+        );
         let folder_icon = if collapsed {
             "icons/folder.svg"
         } else {
@@ -1419,7 +1603,9 @@ impl Waku {
                 .find(|project| project.id == project_id)
                 .map(Project::display_name)
                 .unwrap_or_else(|| tr!("project.no_project_name")),
-            SidebarGroup::Projectless => tr!("project.no_project_name"),
+            SidebarGroup::Projectless | SidebarGroup::HostProjectless(_) => {
+                tr!("project.no_project_name")
+            }
         };
         let updated_chevron = matches!(group, SidebarGroup::Updated(_)).then(|| {
             icon("icons/chevron-down.svg", 14.0, theme.text_secondary)
@@ -1576,6 +1762,12 @@ impl Waku {
         match group {
             SidebarGroup::Project(project_id) => self.select_project(project_id, cx),
             SidebarGroup::Projectless => self.create_projectless_session(cx),
+            SidebarGroup::HostProjectless(project_id) => {
+                self.create_projectless_session_on_host(
+                    self.hosts.ownership.project(project_id),
+                    cx,
+                );
+            }
             SidebarGroup::Updated(_) => return,
         }
         let focus = self.composer_focus(cx);
@@ -1687,7 +1879,11 @@ impl Waku {
         }
     }
 
-    fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping, cx: &mut Context<Self>) {
+    pub(super) fn set_sidebar_grouping(
+        &mut self,
+        grouping: SidebarGrouping,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.sidebar_grouping == grouping {
             return;
         }
@@ -1822,7 +2018,7 @@ impl Waku {
                     project.and_then(|project| {
                         self.sidebar_branch_labels
                             .borrow()
-                            .get(&project.path)
+                            .get(&project.id)
                             .cloned()
                     })
                 })
@@ -2222,7 +2418,13 @@ impl Waku {
                         .text_size(sp(12.5))
                         .line_height(sp(19.0))
                         .text_color(theme.text_tertiary)
-                        .child(tr_cow!("onboarding.description")),
+                        .child(match self.remote_connection_name().as_ref() {
+                            Some(host) => SharedString::from(tr!(
+                                "onboarding.remote_description",
+                                host = host.as_ref()
+                            )),
+                            None => SharedString::from(tr_cow!("onboarding.description")),
+                        }),
                 )
                 .child(
                     div()
@@ -2569,9 +2771,10 @@ mod tests {
             created_at: 0,
         };
 
-        assert!(sidebar_project_is_projectless(&projectless, Some(root)));
-        assert!(!sidebar_project_is_projectless(&ordinary, Some(root)));
-        assert!(!sidebar_project_is_projectless(&projectless, None));
+        let roots = [PathBuf::from("/home/me/.waku/projects"), root.to_owned()];
+        assert!(sidebar_project_is_projectless(&projectless, &roots));
+        assert!(!sidebar_project_is_projectless(&ordinary, &roots));
+        assert!(!sidebar_project_is_projectless(&projectless, &[]));
     }
 
     #[test]

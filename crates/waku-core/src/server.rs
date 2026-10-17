@@ -3,7 +3,7 @@ use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -59,6 +59,10 @@ pub struct ServerOptions {
     /// shutdown control message. Service-managed daemons keep running when an
     /// authenticated client disconnects.
     pub allow_shutdown: bool,
+    /// Exit after no client has been connected and the backend has had no
+    /// live work for this long. Bridge-managed daemons on WSL or SSH hosts
+    /// use it so an abandoned host does not keep a daemon forever.
+    pub idle_exit: Option<Duration>,
 }
 
 struct ConnectionPermit(Arc<AtomicUsize>);
@@ -73,6 +77,12 @@ pub trait Backend: Send + Sync + 'static {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload>;
 
     fn shutdown(&self) {}
+
+    /// Whether the backend still owns work that must outlive its clients,
+    /// such as a provider runtime or terminal. Idle exit waits for none.
+    fn has_live_work(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -562,7 +572,15 @@ pub fn serve(
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let mut idle_since = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
+        if let Some(idle_exit) = options.idle_exit {
+            if active_connections.load(Ordering::Acquire) > 0 || backend.has_live_work() {
+                idle_since = Instant::now();
+            } else if idle_since.elapsed() >= idle_exit {
+                break;
+            }
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if active_connections
@@ -1175,6 +1193,44 @@ mod tests {
             observer_rx.recv_timeout(Duration::from_secs(1)),
             Ok(ServerMessage::TaskStateChanged { revision: 1 })
         ));
+    }
+
+    struct BusyBackend(AtomicBool);
+
+    impl Backend for BusyBackend {
+        fn handle(&self, _request: Request, _events: EventSink) -> anyhow::Result<ResponsePayload> {
+            Ok(ResponsePayload::Ack)
+        }
+
+        fn has_live_work(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn idle_exit_waits_for_live_work_to_finish() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend = Arc::new(BusyBackend(AtomicBool::new(true)));
+        let server_backend = backend.clone();
+        let (done_tx, done_rx) = bounded(1);
+        std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                server_backend,
+                Arc::new(AtomicBool::new(false)),
+                ServerOptions {
+                    idle_exit: Some(Duration::from_millis(100)),
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap();
+            let _ = done_tx.send(());
+        });
+        // A live runtime keeps an unattended daemon up.
+        assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err());
+        backend.0.store(false, Ordering::Release);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok());
     }
 
     #[test]

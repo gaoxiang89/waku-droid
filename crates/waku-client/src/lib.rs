@@ -9,8 +9,10 @@ pub mod command_env;
 pub mod composer_complete;
 pub mod computer_use;
 pub mod driver;
+pub mod hosts;
 pub mod persistence;
 mod process;
+pub mod remote;
 mod workspace_client;
 
 pub use client::DaemonClient;

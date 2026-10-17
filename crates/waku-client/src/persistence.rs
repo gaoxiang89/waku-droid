@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -652,6 +652,15 @@ impl PersistedState {
     }
 
     fn ensure_runtime_session(&mut self) {
+        // A saved selection may belong to a host that has not reconnected yet.
+        // Preserve its identity until that host's catalog joins the window.
+        if self.selected_session.is_some()
+            && self
+                .selected_project
+                .is_some_and(|id| !self.projects.iter().any(|project| project.id == id))
+        {
+            return;
+        }
         if self
             .selected_session
             .is_some_and(|selected| self.sessions.iter().any(|session| session.id == selected))
@@ -727,6 +736,12 @@ fn configuration_directory() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".waku")
+}
+
+/// Saved WSL and SSH connections live beside `app.json`; they describe how
+/// this desktop reaches other hosts and never cross to a daemon.
+pub(crate) fn default_connections_path() -> PathBuf {
+    default_app_settings_path().with_file_name("connections.json")
 }
 
 fn default_app_settings_path() -> PathBuf {
@@ -810,6 +825,33 @@ pub fn load_or_create_app_settings() -> io::Result<AppSettings> {
     Ok(settings)
 }
 
+/// A write gate and load ticket share one atomic so an old result cannot
+/// reopen persistence after a newer reconnect/load has started.
+#[derive(Clone, Default)]
+pub struct TaskStateLoadGate(Arc<AtomicU64>);
+
+impl TaskStateLoadGate {
+    pub fn begin(&self) -> u64 {
+        let previous = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some((value | 1).wrapping_add(1))
+            })
+            .expect("load generation update cannot fail");
+        (previous | 1).wrapping_add(1)
+    }
+
+    pub fn complete(&self, ticket: u64) -> bool {
+        self.0
+            .compare_exchange(ticket, ticket | 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn loaded(&self) -> bool {
+        self.0.load(Ordering::Acquire) & 1 == 1
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -822,7 +864,11 @@ pub struct StateStore {
     /// loaded the daemon's authoritative state. Falling back to an empty UI
     /// after a transient RPC failure must never turn the next ordinary save
     /// into a destructive replacement of the daemon database.
-    task_state_loaded: AtomicBool,
+    task_state_loaded: TaskStateLoadGate,
+    /// `app.json` as this store last read or wrote it. Several windows share
+    /// the file, so a save rewrites it only when this window changed a
+    /// setting; an idle window must not revert another window's change.
+    last_app_settings: Mutex<Option<Vec<u8>>>,
 }
 
 impl StateStore {
@@ -850,7 +896,8 @@ impl StateStore {
             path: Self::default_path(),
             daemon,
             remote_default_cwd: Mutex::new(None),
-            task_state_loaded: AtomicBool::new(false),
+            task_state_loaded: TaskStateLoadGate::default(),
+            last_app_settings: Mutex::new(None),
         }
     }
 
@@ -923,7 +970,7 @@ impl StateStore {
     pub fn load_or_fresh(&self, cwd: PathBuf) -> PersistedState {
         let mut state = match self.load() {
             Ok(state) => {
-                self.task_state_loaded.store(true, Ordering::Release);
+                self.mark_task_state_loaded();
                 state
             }
             Err(_) if cwd.parent().is_none() => PersistedState::empty(),
@@ -965,7 +1012,14 @@ impl StateStore {
                 default_cwd,
                 projectless_root,
             } => {
-                waku_protocol::projectless::set_workspace_root(projectless_root);
+                // A window on a WSL or SSH daemon adds that host's root
+                // instead of replacing the local one other windows rely on.
+                match projectless_root {
+                    Some(root) if self.daemon.connection().is_some() => {
+                        waku_protocol::projectless::add_workspace_root(root);
+                    }
+                    root => waku_protocol::projectless::set_workspace_root(root),
+                }
                 (projects, sessions, default_cwd)
             }
             _ => {
@@ -991,6 +1045,8 @@ impl StateStore {
         state.migrate_loaded();
         if app_settings_missing {
             let _ = self.write_app_settings(&state.app_settings());
+        } else {
+            *self.last_app_settings.lock() = serde_json::to_vec(&state.app_settings()).ok();
         }
         if app_state_missing {
             let _ = self.write_app_state(&state.app_state());
@@ -1015,35 +1071,44 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
-        self.write_app_settings(&state.app_settings())?;
-        self.write_app_state(&state.app_state())?;
-        if !self.task_state_loaded.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "task state was not loaded; refusing to overwrite daemon data",
-            ));
+        let projects = state.projects.iter().map(|project| project.id).collect();
+        let sessions = state.sessions.iter().map(|session| session.id).collect();
+        self.save_partition(state, &projects, &sessions, true)
+    }
+
+    pub fn task_state_loaded(&self) -> bool {
+        self.task_state_loaded.loaded()
+    }
+
+    /// Call only after the host's complete catalog has been merged. An RPC
+    /// failure never grants permission to replace its authoritative snapshot.
+    pub fn mark_task_state_loaded(&self) {
+        let ticket = self.task_state_loaded.begin();
+        self.task_state_loaded.complete(ticket);
+    }
+
+    pub fn task_state_load_gate(&self) -> TaskStateLoadGate {
+        self.task_state_loaded.clone()
+    }
+
+    pub fn save_partition(
+        &self,
+        state: &mut PersistedState,
+        project_ids: &HashSet<Uuid>,
+        session_ids: &HashSet<Uuid>,
+        write_app_files: bool,
+    ) -> io::Result<()> {
+        if write_app_files {
+            self.write_app_settings(&state.app_settings())?;
+            self.write_app_state(&state.app_state())?;
         }
-        let dirty_ids = state.dirty_sessions.clone();
-        let sessions = state
-            .sessions
-            .iter()
-            .filter(|session| dirty_ids.contains(&session.id))
-            .cloned()
-            .collect();
-        let live_session_ids = state.sessions.iter().map(|session| session.id).collect();
+        let (command, dirty_ids) =
+            task_state_save_command(state, project_ids, session_ids, self.task_state_loaded())?;
         self.daemon
             .client()
-            .notify(
-                Uuid::nil(),
-                Uuid::nil(),
-                Command::SaveTaskState {
-                    projects: state.projects.clone(),
-                    live_session_ids,
-                    sessions,
-                },
-            )
+            .notify(Uuid::nil(), Uuid::nil(), command)
             .map_err(to_io_error)?;
-        state.dirty_sessions.clear();
+        state.dirty_sessions.retain(|id| !dirty_ids.contains(id));
         Ok(())
     }
 
@@ -1076,12 +1141,63 @@ impl StateStore {
     }
 
     fn write_app_settings(&self, settings: &AppSettings) -> io::Result<()> {
-        write_json_atomically(&self.app_settings_path, settings)
+        let encoded = serde_json::to_vec(settings).map_err(to_io_error)?;
+        let mut last = self.last_app_settings.lock();
+        if last.as_deref() == Some(encoded.as_slice()) {
+            return Ok(());
+        }
+        write_json_atomically(&self.app_settings_path, settings)?;
+        *last = Some(encoded);
+        Ok(())
     }
 
     fn write_app_state(&self, state: &AppState) -> io::Result<()> {
         write_json_atomically(&self.app_state_path, state)
     }
+}
+
+fn task_state_save_command(
+    state: &PersistedState,
+    project_ids: &HashSet<Uuid>,
+    session_ids: &HashSet<Uuid>,
+    loaded: bool,
+) -> io::Result<(Command, HashSet<Uuid>)> {
+    if !loaded {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "task state was not loaded; refusing to overwrite daemon data",
+        ));
+    }
+    let dirty_ids = state
+        .dirty_sessions
+        .intersection(session_ids)
+        .copied()
+        .collect::<HashSet<_>>();
+    let sessions = state
+        .sessions
+        .iter()
+        .filter(|session| dirty_ids.contains(&session.id))
+        .cloned()
+        .collect();
+    let live_session_ids = state
+        .sessions
+        .iter()
+        .filter(|session| session_ids.contains(&session.id))
+        .map(|session| session.id)
+        .collect();
+    Ok((
+        Command::SaveTaskState {
+            projects: state
+                .projects
+                .iter()
+                .filter(|project| project_ids.contains(&project.id))
+                .cloned()
+                .collect(),
+            live_session_ids,
+            sessions,
+        },
+        dirty_ids,
+    ))
 }
 
 /// Fetches one daemon-owned session. Remote image materialization is kept
@@ -1107,7 +1223,7 @@ pub fn hydrate_session(
     }
 }
 
-fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> {
+pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1135,6 +1251,108 @@ fn restore_task_state_skeletons(sessions: &mut [AgentSession]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_load_cannot_reopen_the_host_write_gate() {
+        let gate = TaskStateLoadGate::default();
+        assert!(!gate.loaded());
+        let first = gate.begin();
+        assert!(gate.complete(first));
+        assert!(gate.loaded());
+        let old_load = gate.begin();
+        let reconnect = gate.begin();
+        assert!(!gate.complete(old_load));
+        assert!(!gate.loaded());
+        assert!(gate.complete(reconnect));
+        assert!(gate.loaded());
+    }
+
+    #[test]
+    fn failed_host_load_cannot_produce_a_replacement_snapshot() {
+        let mut state = PersistedState::fresh("/local".into());
+        let id = state.sessions[0].id;
+        state.mark_session_dirty(id);
+        let result = task_state_save_command(&state, &HashSet::new(), &HashSet::new(), false);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
+        assert!(state.dirty_sessions.contains(&id));
+    }
+
+    #[test]
+    fn save_partition_excludes_other_hosts_and_keeps_clean_live_sessions() {
+        let mut state = PersistedState::fresh("/local".into());
+        let local = state.projects[0].id;
+        let local_session = state.sessions[0].id;
+        let remote = Project::from_path("/remote".into());
+        let remote_session = AgentSession::new(remote.id, ProviderKind::Codex);
+        state.mark_session_dirty(local_session);
+        state.push_session(remote_session.clone());
+        state.projects.push(remote.clone());
+        let (command, dirty) = task_state_save_command(
+            &state,
+            &HashSet::from([remote.id]),
+            &HashSet::from([remote_session.id]),
+            true,
+        )
+        .unwrap();
+        let Command::SaveTaskState {
+            projects,
+            live_session_ids,
+            sessions,
+        } = command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![remote.id]
+        );
+        assert!(!projects.iter().any(|project| project.id == local));
+        assert_eq!(live_session_ids, vec![remote_session.id]);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![remote_session.id]
+        );
+        assert_eq!(dirty, HashSet::from([remote_session.id]));
+        state.dirty_sessions.remove(&remote_session.id);
+        let (command, _) = task_state_save_command(
+            &state,
+            &HashSet::from([remote.id]),
+            &HashSet::from([remote_session.id]),
+            true,
+        )
+        .unwrap();
+        let Command::SaveTaskState {
+            live_session_ids,
+            sessions,
+            ..
+        } = command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(live_session_ids, vec![remote_session.id]);
+        assert!(sessions.is_empty());
+        assert!(state.dirty_sessions.contains(&local_session));
+    }
+
+    #[test]
+    fn loaded_host_can_save_an_empty_catalog_after_its_last_project_is_removed() {
+        let (command, _) = task_state_save_command(
+            &PersistedState::empty(),
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(command, Command::SaveTaskState { projects, live_session_ids, sessions } if projects.is_empty() && live_session_ids.is_empty() && sessions.is_empty())
+        );
+    }
 
     #[test]
     fn math_rendering_defaults_on_and_persists_as_an_app_preference() {

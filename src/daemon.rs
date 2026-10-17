@@ -36,6 +36,25 @@ pub fn start_process() -> anyhow::Result<waku_client::DaemonSupervisor> {
     )
 }
 
+/// The WSL or SSH connection to open at launch: `WAKU_CONNECTION` (a saved
+/// id, `wsl:<distro>`, or `ssh:<config host>`) wins over the saved choice.
+pub(crate) fn startup_connection() -> Option<waku_client::remote::Connection> {
+    let saved = waku_client::remote::ConnectionsFile::load()
+        .inspect_err(|error| eprintln!("could not read saved connections: {error}"))
+        .unwrap_or_default();
+    let connection = match std::env::var("WAKU_CONNECTION") {
+        Ok(spec) if !spec.trim().is_empty() => {
+            let connection = waku_client::remote::Connection::from_spec(&spec, &saved.connections);
+            if connection.is_none() {
+                eprintln!("WAKU_CONNECTION={spec:?} names no connection");
+            }
+            connection
+        }
+        _ => saved.active_connection().cloned(),
+    };
+    connection.filter(|connection| !connection.is_local())
+}
+
 /// Resolve the local host name once during app construction. Settings can
 /// then show a useful LAN URL without touching the OS from a render frame.
 pub fn local_hostname() -> Option<String> {

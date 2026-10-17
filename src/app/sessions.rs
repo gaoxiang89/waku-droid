@@ -108,7 +108,10 @@ impl Waku {
         if !needs_hydration || !self.session_hydrations.insert(session_id) {
             return;
         }
-        let daemon = self.daemon.clone();
+        let owner = self.hosts.for_session(session_id);
+        let host_key = owner.key.clone();
+        let host_generation = owner.generation;
+        let daemon = owner.daemon.clone();
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -122,6 +125,13 @@ impl Waku {
                 })
                 .await;
             let _ = waku.update(cx, |waku, cx| {
+                if !waku
+                    .hosts
+                    .get(&host_key)
+                    .is_some_and(|host| host.generation == host_generation)
+                {
+                    return;
+                }
                 waku.session_hydrations.remove(&session_id);
                 match result {
                     Ok(session) => {
@@ -172,7 +182,11 @@ impl Waku {
             self.capture_and_save_current_composer_draft(cx);
             self.store_selected_right_panel_state();
         }
+        let old_host = self.selected_host_key();
         self.state.selected_session = Some(session_id);
+        if old_host != self.selected_host_key() {
+            self.clear_host_workspace_caches();
+        }
         self.task_switcher.record_access(session_id);
         if let Some((
             project_id,
@@ -278,6 +292,10 @@ impl Waku {
         let mut session = self.state.new_session(project_id, provider);
         session.runtime_mode = runtime_mode;
         let id = session.id;
+        self.hosts
+            .ownership
+            .sessions
+            .insert(session.id, self.hosts.ownership.project(project_id));
         self.state.push_session(session);
         self.select_session(id, cx);
     }
@@ -330,7 +348,12 @@ impl Waku {
         self.remove_right_panel_session_state(session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
-        if let Err(error) = self.store.remove_session(session_id) {
+        if let Err(error) = self
+            .hosts
+            .for_session(session_id)
+            .store
+            .remove_session(session_id)
+        {
             self.show_toast(tr!("errors.save_local_state", error = error));
         }
         if self
@@ -359,7 +382,9 @@ impl Waku {
             }
         }
         if let Some(project_path) = project_path {
-            let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+            let workspace = waku_client::WorkspaceClient::for_daemon(
+                self.daemon_for_session(session_id).clone(),
+            );
             cx.background_executor()
                 .spawn(async move {
                     let _ = workspace.request(waku_client::WorkspaceOperation::DeleteSessionRefs {
@@ -383,7 +408,10 @@ impl Waku {
             if let Some(session_id) = next_session {
                 self.select_session(session_id, cx);
             } else if projectless {
-                self.create_projectless_session(cx);
+                self.create_projectless_session_on_host(
+                    self.hosts.ownership.session(session_id),
+                    cx,
+                );
             } else {
                 self.create_session_for(project_id, self.state.last_provider, cx);
             }
@@ -395,7 +423,7 @@ impl Waku {
         // Only now is the row gone, so the sweep can see which blobs are
         // genuinely unreferenced. It reads the database and walks the blob
         // directory, so it stays off the UI thread.
-        let sweep = self.store.blob_sweep();
+        let sweep = self.hosts.for_session(session_id).store.blob_sweep();
         cx.background_executor()
             .spawn(async move { sweep() })
             .detach();
@@ -1580,9 +1608,19 @@ impl Waku {
     }
 
     pub(super) fn add_project(&mut self, cx: &mut Context<Self>) {
-        if self.daemon.is_remote() {
-            self.show_toast(tr!("errors.remote_project_picker"));
-            cx.notify();
+        self.add_project_on_host(self.selected_host_key(), cx);
+    }
+
+    pub(super) fn add_project_on_host(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.hosts.get(&host) else {
+            return;
+        };
+        if owner.daemon.is_remote() {
+            self.open_remote_folder_picker(host, cx);
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -1596,28 +1634,60 @@ impl Waku {
                 && let Some(path) = paths.into_iter().next()
             {
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(existing) = this.state.projects.iter().find(|p| p.path == path) {
-                        this.select_project(existing.id, cx);
-                        return;
-                    }
-                    let project = Project::from_path(path);
-                    let project_id = project.id;
-                    this.state.projects.push(project);
-                    this.analytics.track(crate::analytics::Event::ProjectAdded);
-                    this.create_session_for(project_id, this.state.last_provider, cx);
+                    this.add_project_path_on_host(path, host.clone(), cx)
                 });
             }
         })
         .detach();
     }
 
+    pub(super) fn add_project_path_on_host(
+        &mut self,
+        path: PathBuf,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hosts.get(&host).is_none() {
+            return;
+        }
+        if let Some(existing) = self
+            .state
+            .projects
+            .iter()
+            .find(|p| p.path == path && self.hosts.ownership.project(p.id) == host)
+        {
+            self.select_project(existing.id, cx);
+            return;
+        }
+        let project = Project::from_path(path);
+        let project_id = project.id;
+        self.hosts.ownership.projects.insert(project_id, host);
+        self.state.projects.push(project);
+        self.analytics.track(crate::analytics::Event::ProjectAdded);
+        self.create_session_for(project_id, self.state.last_provider, cx);
+    }
+
     pub(super) fn create_projectless_session(&mut self, cx: &mut Context<Self>) {
+        self.create_projectless_session_on_host(self.selected_host_key(), cx);
+    }
+
+    pub(super) fn create_projectless_session_on_host(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.hosts.get(&host) else {
+            return;
+        };
+        let workspace = waku_client::WorkspaceClient::for_daemon(owner.daemon.clone());
+        let generation = owner.generation;
         if let Some(draft_id) = self
             .state
             .sessions
             .iter()
             .find(|session| {
                 !session.has_started()
+                    && self.hosts.ownership.session(session.id) == host
                     && self.state.projects.iter().any(|project| {
                         project.id == session.project_id
                             && project.is_projectless()
@@ -1630,7 +1700,6 @@ impl Waku {
             return;
         }
 
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -1647,9 +1716,20 @@ impl Waku {
                 .await;
             let _ = waku.update(cx, |waku, cx| match result {
                 Ok(cwd) => {
+                    if !waku
+                        .hosts
+                        .get(&host)
+                        .is_some_and(|owner| owner.generation == generation)
+                    {
+                        return;
+                    }
                     let mut project = Project::from_path(cwd);
                     project.name = Project::PROJECTLESS_NAME.to_owned();
                     let project_id = project.id;
+                    waku.hosts
+                        .ownership
+                        .projects
+                        .insert(project_id, host.clone());
                     waku.state.projects.push(project);
                     waku.create_session_for(project_id, waku.state.last_provider, cx);
                 }

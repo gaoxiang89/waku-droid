@@ -178,7 +178,8 @@ impl Waku {
         });
         cx.notify();
 
-        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace_client =
+            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -323,7 +324,8 @@ impl Waku {
         window_handle: gpui::AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace_client =
+            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let generation_workspace = workspace.clone();
             let result = cx
@@ -405,7 +407,8 @@ impl Waku {
         window_handle: gpui::AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let workspace_client = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace_client =
+            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let operation_workspace = workspace.clone();
             let result = cx

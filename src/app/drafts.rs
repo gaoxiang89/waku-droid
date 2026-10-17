@@ -185,16 +185,13 @@ impl Waku {
             cx.background_executor()
                 .timer(COMPOSER_DRAFT_SAVE_DELAY)
                 .await;
-            let Some((store, drafts)) = waku
+            let Some(saves) = waku
                 .update(cx, |waku, cx| {
                     if waku.composer_draft_save_generation != generation {
                         return None;
                     }
                     waku.capture_current_composer_draft(cx);
-                    Some((
-                        waku.composer_draft_store.clone(),
-                        waku.composer_drafts.clone(),
-                    ))
+                    Some(waku.hosts.draft_saves(&waku.composer_drafts))
                 })
                 .ok()
                 .flatten()
@@ -203,7 +200,12 @@ impl Waku {
             };
             let result = cx
                 .background_executor()
-                .spawn(async move { store.save(drafts, generation) })
+                .spawn(async move {
+                    for (store, drafts) in saves {
+                        store.save(drafts, generation)?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
                 .await;
             if let Err(error) = result {
                 let _ = waku.update(cx, |waku, cx| {

@@ -15,13 +15,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::DaemonClient;
+use crate::remote::{BridgeError, BridgeSession, BridgeStage, Connection};
 use waku_protocol::{
     APP_EXECUTABLE_ENV, Command, DAEMON_TOKEN_ENV, DaemonReady, DaemonSettings, PROTOCOL_VERSION,
-    ResponsePayload,
+    ReplayCursor, ResponsePayload,
 };
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Upper bound between attempts to reach an unreachable remote host.
+const MAX_REMOTE_BACKOFF: Duration = Duration::from_secs(30);
 pub const DEFAULT_EXPOSED_DAEMON_PORT: u16 = 34_123;
 
 /// Desktop-owned launch configuration for the daemon it supervises.
@@ -299,6 +302,7 @@ impl ExecutableStamp {
 
 struct SupervisorInner {
     executable: Option<PathBuf>,
+    connection: Mutex<Option<Connection>>,
     target: Mutex<DaemonTarget>,
     exposure: Mutex<Option<DaemonExposureSettings>>,
     restart: Mutex<()>,
@@ -307,6 +311,9 @@ struct SupervisorInner {
     settings_updates: Sender<DaemonSettings>,
     client_updates: Mutex<Vec<Sender<DaemonClient>>>,
     running: AtomicBool,
+    /// Mirrors the remote client's disconnected flag, refreshed by the
+    /// monitor, so readers never take the target lock.
+    transport_down: AtomicBool,
 }
 
 enum DaemonTarget {
@@ -314,9 +321,55 @@ enum DaemonTarget {
     Restarting(DaemonClient),
     Remote {
         client: DaemonClient,
-        address: String,
-        token: String,
+        endpoint: RemoteEndpoint,
     },
+}
+
+/// How a daemon the desktop does not own is reached again after a drop.
+#[derive(Clone)]
+enum RemoteEndpoint {
+    /// A fixed WebSocket address, e.g. from `WAKU_DAEMON_ADDRESS`.
+    Direct { address: String, token: String },
+    /// A WSL distribution or SSH host reached through `waku-daemon bridge`.
+    /// The session is replaced on reconnect; the remote daemon is not.
+    Bridged {
+        connection: Connection,
+        #[allow(dead_code)] // Held so the bridge child lives with the client.
+        session: Arc<BridgeSession>,
+    },
+}
+
+impl RemoteEndpoint {
+    fn reconnect(&self, resume_from: Vec<ReplayCursor>) -> anyhow::Result<(DaemonClient, Self)> {
+        match self {
+            Self::Direct { address, token } => {
+                let client =
+                    DaemonClient::connect_with_resume(address, token.clone(), resume_from)?;
+                Ok((
+                    client,
+                    Self::Direct {
+                        address: address.clone(),
+                        token: token.clone(),
+                    },
+                ))
+            }
+            Self::Bridged { connection, .. } => {
+                let session = Arc::new(BridgeSession::spawn(connection)?);
+                let client = DaemonClient::connect_with_resume(
+                    session.address(),
+                    session.token().to_owned(),
+                    resume_from,
+                )?;
+                Ok((
+                    client,
+                    Self::Bridged {
+                        connection: connection.clone(),
+                        session,
+                    },
+                ))
+            }
+        }
+    }
 }
 
 impl DaemonTarget {
@@ -373,22 +426,74 @@ impl DaemonSupervisor {
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
         let client = DaemonClient::connect(address, token.clone())?;
         let settings = read_settings(&client)?;
-        let supervisor = Self::from_target(
-            DaemonTarget::Remote {
-                client,
+        Self::remote(
+            client,
+            RemoteEndpoint::Direct {
                 address: address.to_owned(),
                 token,
             },
             None,
+            settings,
+        )
+    }
+
+    /// Connect to the daemon on a WSL distribution or SSH host, installing or
+    /// updating it first when needed. Blocking: the first connection to a host
+    /// may upload the daemon. The remote daemon outlives this desktop.
+    pub fn connect_remote(connection: Connection) -> Result<Self, BridgeError> {
+        let session = Arc::new(BridgeSession::open(&connection)?);
+        let bridge_error = |error: anyhow::Error| BridgeError {
+            stage: BridgeStage::Bridge,
+            error: match session.stderr() {
+                detail if detail.is_empty() => error,
+                detail => error.context(detail),
+            },
+        };
+        let client = DaemonClient::connect(session.address(), session.token().to_owned())
+            .map_err(bridge_error)?;
+        let settings = read_settings(&client).map_err(bridge_error)?;
+        Self::remote(
+            client,
+            RemoteEndpoint::Bridged {
+                connection: connection.clone(),
+                session: session.clone(),
+            },
+            Some(connection),
+            settings,
+        )
+        .map_err(bridge_error)
+    }
+
+    fn remote(
+        client: DaemonClient,
+        endpoint: RemoteEndpoint,
+        connection: Option<Connection>,
+        settings: DaemonSettings,
+    ) -> anyhow::Result<Self> {
+        let supervisor = Self::from_target(
+            DaemonTarget::Remote { client, endpoint },
+            None,
             None,
             settings,
         )?;
+        *supervisor.inner.connection.lock() = connection;
         let weak_inner = Arc::downgrade(&supervisor.inner);
         std::thread::Builder::new()
             .name("waku-remote-daemon-supervisor".into())
             .spawn(move || monitor_daemon(weak_inner, None, false))
             .context("could not start remote Waku daemon supervisor")?;
         Ok(supervisor)
+    }
+
+    /// The WSL or SSH connection this supervisor is bound to, if any.
+    pub fn connection(&self) -> Option<Connection> {
+        self.inner.connection.lock().clone()
+    }
+
+    /// Whether the transport to a remote daemon is down while the supervisor
+    /// retries. Lock-free, so a frame may read it.
+    pub fn is_disconnected(&self) -> bool {
+        self.inner.transport_down.load(Ordering::Acquire)
     }
 
     fn from_target(
@@ -400,6 +505,7 @@ impl DaemonSupervisor {
         let (settings_updates, settings_update_rx) = unbounded();
         let inner = Arc::new(SupervisorInner {
             executable,
+            connection: Mutex::new(None),
             target: Mutex::new(target),
             exposure: Mutex::new(exposure),
             restart: Mutex::new(()),
@@ -410,6 +516,7 @@ impl DaemonSupervisor {
             settings_updates,
             client_updates: Mutex::new(Vec::new()),
             running: AtomicBool::new(true),
+            transport_down: AtomicBool::new(false),
         });
         let weak_inner = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -508,6 +615,8 @@ fn monitor_daemon(
     mut active_stamp: Option<ExecutableStamp>,
     watch_for_rebuilds: bool,
 ) {
+    let mut remote_backoff = REBUILD_POLL_INTERVAL;
+    let mut next_remote_attempt = Instant::now();
     loop {
         std::thread::sleep(REBUILD_POLL_INTERVAL);
         let Some(inner) = weak_inner.upgrade() else {
@@ -518,21 +627,22 @@ fn monitor_daemon(
         }
         let remote_reconnect = {
             let target = inner.target.lock();
+            if let DaemonTarget::Remote { client, .. } = &*target {
+                inner
+                    .transport_down
+                    .store(client.is_disconnected(), Ordering::Release);
+            }
             match &*target {
-                DaemonTarget::Remote {
-                    client,
-                    address,
-                    token,
-                } if client.is_disconnected() => Some((
-                    client.clone(),
-                    address.clone(),
-                    token.clone(),
-                    client.last_sequences(),
-                )),
+                DaemonTarget::Remote { client, endpoint } if client.is_disconnected() => {
+                    Some((client.clone(), endpoint.clone(), client.last_sequences()))
+                }
                 _ => None,
             }
         };
-        if let Some((disconnected, address, token, resume_from)) = remote_reconnect {
+        if let Some((disconnected, endpoint, resume_from)) = remote_reconnect {
+            if Instant::now() < next_remote_attempt {
+                continue;
+            }
             let _restart = inner.restart.lock();
             let still_current = matches!(
                 &*inner.target.lock(),
@@ -542,16 +652,25 @@ fn monitor_daemon(
             if !still_current {
                 continue;
             }
-            let Ok(replacement) =
-                DaemonClient::connect_with_resume(&address, token.clone(), resume_from)
-            else {
-                continue;
+            // The target lock is released here: a bridged reconnect starts
+            // `ssh`, and UI-side `client()` calls must not wait behind it.
+            let (replacement, endpoint) = match endpoint.reconnect(resume_from) {
+                Ok(reconnected) => {
+                    remote_backoff = REBUILD_POLL_INTERVAL;
+                    reconnected
+                }
+                Err(error) => {
+                    eprintln!("could not reconnect to the Waku daemon: {error:#}");
+                    remote_backoff = (remote_backoff * 2).min(MAX_REMOTE_BACKOFF);
+                    next_remote_attempt = Instant::now() + remote_backoff;
+                    continue;
+                }
             };
             *inner.target.lock() = DaemonTarget::Remote {
                 client: replacement.clone(),
-                address,
-                token,
+                endpoint,
             };
+            inner.transport_down.store(false, Ordering::Release);
             inner
                 .client_updates
                 .lock()

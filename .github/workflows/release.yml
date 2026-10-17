@@ -68,9 +68,74 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # WSL and SSH hosts run this daemon, so every desktop package carries both
+  # architectures. musl links it statically: a host's glibc can be older than
+  # the runner's.
+  remote-daemon:
+    name: Remote daemon (Linux ${{ matrix.arch }})
+    needs: version
+    if: needs.version.outputs.published != 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustup target add "$TARGET"
+
+      - name: Install musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.runner }}-rust-1.96.0-musl-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.runner }}-rust-1.96.0-musl-
+
+      - name: Build
+        run: |
+          cargo build --locked --release --target "$TARGET" \
+            --package waku-daemon --bin waku-daemon
+          mkdir -p remote-daemon
+          cp "target/$TARGET/release/waku-daemon" \
+            "remote-daemon/waku-daemon-linux-${{ matrix.arch }}"
+          # A dynamically linked result would install fine and then fail to
+          # start on hosts with a different libc.
+          info=$(file -b "remote-daemon/waku-daemon-linux-${{ matrix.arch }}")
+          echo "$info"
+          case "$info" in
+            *"statically linked"* | *"static-pie linked"*) ;;
+            *) echo "::error::waku-daemon is not statically linked"; exit 1 ;;
+          esac
+          "remote-daemon/waku-daemon-linux-${{ matrix.arch }}" --fingerprint
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: remote-daemon-linux-${{ matrix.arch }}
+          path: remote-daemon/waku-daemon-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
   linux-x86_64:
     name: Linux x86_64
-    needs: version
+    needs: [version, remote-daemon]
     if: needs.version.outputs.published != 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -116,8 +181,15 @@ jobs:
       - name: Clear stale bundles
         run: rm -f target/release/waku-*.tar.gz
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: remote-daemon-linux-*
+          path: target/remote-daemons
+          merge-multiple: true
+
       - name: Bundle
         env:
+          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
         run: ./scripts/bundle-linux.sh
@@ -133,7 +205,7 @@ jobs:
 
   linux-arm64:
     name: Linux arm64
-    needs: version
+    needs: [version, remote-daemon]
     if: needs.version.outputs.published != 'true'
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 90
@@ -179,8 +251,15 @@ jobs:
       - name: Clear stale bundles
         run: rm -f target/release/waku-*.tar.gz
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: remote-daemon-linux-*
+          path: target/remote-daemons
+          merge-multiple: true
+
       - name: Bundle
         env:
+          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
         run: ./scripts/bundle-linux.sh
@@ -193,7 +272,7 @@ jobs:
 
   windows-x86_64:
     name: Windows x86_64
-    needs: version
+    needs: [version, remote-daemon]
     if: needs.version.outputs.published != 'true'
     runs-on: windows-latest
     timeout-minutes: 90
@@ -227,8 +306,15 @@ jobs:
       - name: Clear stale bundles
         run: Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: remote-daemon-linux-*
+          path: target/remote-daemons
+          merge-multiple: true
+
       - name: Bundle
         env:
+          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -245,7 +331,7 @@ jobs:
 
   windows-arm64:
     name: Windows arm64
-    needs: version
+    needs: [version, remote-daemon]
     if: needs.version.outputs.published != 'true'
     runs-on: windows-11-arm
     timeout-minutes: 90
@@ -279,8 +365,15 @@ jobs:
       - name: Clear stale bundles
         run: Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: remote-daemon-linux-*
+          path: target/remote-daemons
+          merge-multiple: true
+
       - name: Bundle
         env:
+          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -297,7 +390,7 @@ jobs:
 
   macos:
     name: macOS
-    needs: version
+    needs: [version, remote-daemon]
     if: needs.version.outputs.published != 'true'
     runs-on: macos-latest
     timeout-minutes: 90
@@ -351,8 +444,15 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID"
 
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: remote-daemon-linux-*
+          path: target/remote-daemons
+          merge-multiple: true
+
       - name: Release
         env:
+          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_SIGNING_IDENTITY: ${{ secrets.WAKU_SIGNING_IDENTITY }}
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}

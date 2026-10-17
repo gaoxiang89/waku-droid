@@ -217,6 +217,7 @@ enum SettingsPage {
     Skills,
     Usage,
     Daemon,
+    Connections,
     ComputerUse,
     Appearance,
 }
@@ -1054,9 +1055,10 @@ pub struct Waku {
     /// Selection is committed only after this target's transcript arrives, so
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
+    pending_host_session: Option<Uuid>,
     analytics: crate::analytics::Analytics,
     state: PersistedState,
-    store: StateStore,
+    hosts: waku_client::hosts::HostRegistry,
     /// Cached before rendering so path labels can abbreviate the home prefix
     /// without consulting the environment or account database in a frame.
     home_directory: Option<PathBuf>,
@@ -1065,7 +1067,6 @@ pub struct Waku {
     /// Drafts are independent of transcript persistence: started tasks key by
     /// session id, while blank New Task pages key by project id.
     composer_drafts: ComposerDrafts,
-    composer_draft_store: ComposerDraftStore,
     composer_draft_save_generation: u64,
     command_palette: command_palette::CommandPaletteUi,
     task_switcher: task_switcher::TaskSwitcherUi,
@@ -1075,6 +1076,14 @@ pub struct Waku {
     daemon_origins_input: Entity<TextInput>,
     daemon_reconfigure_pending: bool,
     daemon_token_revealed: bool,
+    connections: connections_page::ConnectionsUi,
+    remote_folder_picker: Option<remote_folder_picker::RemoteFolderPicker>,
+    remote_folder_picker_generation: u64,
+    host_sync_stops: HashMap<waku_client::hosts::HostKey, Sender<()>>,
+    host_disconnected: HashSet<waku_client::hosts::HostKey>,
+    collapsed_hosts: HashSet<waku_client::hosts::HostKey>,
+    host_focuses: RefCell<HashMap<waku_client::hosts::HostKey, [FocusHandle; 2]>>,
+    remote_folder_path_input: Entity<TextInput>,
     settings_focus: FocusHandle,
     onboarding_add_project_focus: FocusHandle,
     onboarding_projectless_focus: FocusHandle,
@@ -1092,6 +1101,19 @@ pub struct Waku {
     updater_button_animation_from_reveal: f32,
     updater_button_animation_generation: u64,
     probes: Vec<ProviderProbe>,
+    host_catalogs: HashMap<waku_client::hosts::HostKey, hosts::HostCatalog>,
+    host_catalog_tx: Sender<(
+        waku_client::hosts::HostKey,
+        u64,
+        ProviderKind,
+        Option<ProviderProbe>,
+    )>,
+    host_catalog_events: Receiver<(
+        waku_client::hosts::HostKey,
+        u64,
+        ProviderKind,
+        Option<ProviderProbe>,
+    )>,
     provider_probe_tx: Sender<ProviderProbe>,
     provider_probe_events: Receiver<ProviderProbe>,
     provider_model_discoveries: HashSet<ProviderKind>,
@@ -1124,29 +1146,33 @@ pub struct Waku {
     /// Account rate-limit meters per provider, fetched off-thread (Claude,
     /// Codex, and OpenCode Go over HTTPS; Grok through a stdio probe) and
     /// refreshed live by Codex's own stream. Frames read only this snapshot.
-    plan_usage: HashMap<ProviderKind, crate::usage::PlanUsage>,
+    plan_usage: HashMap<(waku_client::hosts::HostKey, ProviderKind), crate::usage::PlanUsage>,
     /// Why a provider's last fetch failed, kept alongside stale data for the
     /// meter's tooltip. Cleared by that provider's next success.
-    plan_usage_error: HashMap<ProviderKind, String>,
+    plan_usage_error: HashMap<(waku_client::hosts::HostKey, ProviderKind), String>,
     plan_usage_tx: Sender<(
+        waku_client::hosts::HostKey,
+        u64,
         ProviderKind,
         Result<Option<crate::usage::PlanUsage>, String>,
     )>,
     plan_usage_events: Receiver<(
+        waku_client::hosts::HostKey,
+        u64,
         ProviderKind,
         Result<Option<crate::usage::PlanUsage>, String>,
     )>,
-    plan_usage_pending: HashSet<ProviderKind>,
+    plan_usage_pending: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
     /// Fetchable providers with no matching account credential. Unlike a
     /// request failure, this hides the plan section until a later refresh
     /// discovers a newly configured account.
-    plan_usage_unconfigured: HashSet<ProviderKind>,
+    plan_usage_unconfigured: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
     /// When each provider's last fetch settled, successful or not — the
     /// refresh backoff measures from here.
-    plan_usage_checked_at: HashMap<ProviderKind, Instant>,
+    plan_usage_checked_at: HashMap<(waku_client::hosts::HostKey, ProviderKind), Instant>,
     /// Providers whose turn settled since the last fetch, so the meters have
     /// moved.
-    plan_usage_stale: HashSet<ProviderKind>,
+    plan_usage_stale: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
     /// The settings Usage page's snapshot: historical token/cost usage
     /// scanned from provider transcripts off-thread. Frames read only this.
     usage_history: Option<crate::usage_history::UsageHistory>,
@@ -1276,12 +1302,22 @@ pub struct Waku {
     /// In-memory GPUI images for daemon-owned bytes. A missing entry schedules
     /// one background fetch only when a visible row asks to render it; the
     /// desktop never creates another attachment file.
-    remote_images: RefCell<HashMap<String, RemoteImageState>>,
+    remote_images: RefCell<HashMap<(waku_client::hosts::HostKey, u64, String), RemoteImageState>>,
     /// Coalesced edge trigger for provider and background result queues. The
     /// payloads stay in their typed channels; this channel only wakes the UI.
     event_wake_tx: smol::channel::Sender<()>,
-    task_state_sync_tx: Sender<Result<RemoteTaskStateSnapshot, String>>,
-    task_state_sync_events: Receiver<Result<RemoteTaskStateSnapshot, String>>,
+    task_state_sync_tx: Sender<(
+        waku_client::hosts::HostKey,
+        u64,
+        u64,
+        Result<RemoteTaskStateSnapshot, String>,
+    )>,
+    task_state_sync_events: Receiver<(
+        waku_client::hosts::HostKey,
+        u64,
+        u64,
+        Result<RemoteTaskStateSnapshot, String>,
+    )>,
     runtimes: HashMap<Uuid, SessionRuntime>,
     runtime_attach_pending: HashSet<Uuid>,
     runtime_attach_misses: HashMap<Uuid, u8>,
@@ -1491,7 +1527,7 @@ pub struct Waku {
     sidebar_rows_snapshot: RefCell<Rc<Vec<SidebarRow>>>,
     /// Branch labels for ordinary local project paths, resolved together on a
     /// background executor so sidebar rows only read memory.
-    sidebar_branch_labels: RefCell<HashMap<PathBuf, SharedString>>,
+    sidebar_branch_labels: RefCell<HashMap<Uuid, SharedString>>,
     sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
     sidebar_branch_scan_generation: Cell<u64>,
     transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
@@ -1626,11 +1662,14 @@ mod command_palette;
 mod commit_dialog;
 mod components;
 mod composer;
+mod connections_page;
 mod drafts;
 mod file_search;
 mod goal_dialog;
+mod hosts;
 mod image_preview;
 mod project_picker;
+mod remote_folder_picker;
 mod render;
 mod right_panel;
 mod runtime;
@@ -1959,6 +1998,9 @@ impl Waku {
         let composer_draft_store = ComposerDraftStore::remote(daemon.clone());
         let composer_drafts = composer_draft_store.load().unwrap_or_default();
         let mut state = store.load_or_fresh(cwd);
+        let pending_host_session = state
+            .selected_session
+            .filter(|id| !state.sessions.iter().any(|session| session.id == *id));
         let home_directory = crate::projectless::home_directory();
         state.apply_daemon_settings(daemon.settings());
         if let Err(error) = daemon.update_settings(state.daemon_settings()) {
@@ -2037,6 +2079,8 @@ impl Waku {
             input.set_content(daemon_origins, cx);
             input
         });
+        let connections = connections_page::ConnectionsUi::new(window, cx);
+        let remote_folder_path_input = cx.new(|cx| TextInput::new(window, cx));
         let skills_search = cx.new(|cx| {
             TextInput::new(window, cx)
                 .clear_on_escape()
@@ -2205,6 +2249,7 @@ impl Waku {
             })
             .collect::<Vec<_>>();
         let (provider_probe_tx, provider_probe_events) = unbounded();
+        let (host_catalog_tx, host_catalog_events) = unbounded();
         let (provider_version_tx, provider_version_events) = unbounded();
         let (provider_detection_tx, provider_detection_events) = unbounded();
         let (computer_permission_tx, computer_permission_events) = unbounded();
@@ -2488,11 +2533,12 @@ impl Waku {
                 this.composer_draft_save_generation =
                     this.composer_draft_save_generation.saturating_add(1);
                 let generation = this.composer_draft_save_generation;
-                let store = this.composer_draft_store.clone();
-                let drafts = this.composer_drafts.clone();
-                let save = cx
-                    .background_executor()
-                    .spawn(async move { store.save(drafts, generation) });
+                let saves = this.hosts.draft_saves(&this.composer_drafts);
+                let save = cx.background_executor().spawn(async move {
+                    for (store, drafts) in saves {
+                        let _ = store.save(drafts, generation);
+                    }
+                });
                 async move {
                     let _ = save.await;
                 }
@@ -2588,6 +2634,59 @@ impl Waku {
                 },
             )
             .detach();
+            // Cache transport status outside render for every connected host.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this
+                        .update(cx, |this, cx| {
+                            let down = this
+                                .hosts
+                                .hosts
+                                .iter()
+                                .filter(|host| host.daemon.is_disconnected())
+                                .map(|host| host.key.clone())
+                                .collect::<HashSet<_>>();
+                            if this.host_disconnected != down {
+                                let recovered = this
+                                    .host_disconnected
+                                    .difference(&down)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                this.host_disconnected = down;
+                                for key in recovered {
+                                    this.refresh_host_catalog(key, None, true);
+                                }
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            cx.subscribe(
+                &remote_folder_path_input,
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Submit(_)) {
+                        this.browse_typed_remote_folder(cx);
+                    }
+                },
+            )
+            .detach();
+            for input in connections.inputs() {
+                cx.subscribe(
+                    input,
+                    |this: &mut Self, _, event: &InputEvent, cx| match event {
+                        InputEvent::Submit(_) => this.add_ssh_connection(cx),
+                        InputEvent::Edited => cx.notify(),
+                        _ => {}
+                    },
+                )
+                .detach();
+            }
             for input in [&daemon_port_input, &daemon_origins_input] {
                 cx.subscribe(
                     input,
@@ -2747,19 +2846,25 @@ impl Waku {
                 })
             };
 
+            let hosts = waku_client::hosts::HostRegistry::local(
+                daemon.clone(),
+                store,
+                composer_draft_store,
+                &state,
+            );
             Self {
                 daemon,
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
                 pending_session_activation: None,
+                pending_host_session,
                 analytics,
                 state,
-                store,
+                hosts,
                 home_directory,
                 composer,
                 user_input_answer,
                 composer_drafts,
-                composer_draft_store,
                 composer_draft_save_generation: 0,
                 command_palette: command_palette::CommandPaletteUi::new(command_palette_search),
                 task_switcher,
@@ -2772,6 +2877,14 @@ impl Waku {
                 daemon_origins_input,
                 daemon_reconfigure_pending: false,
                 daemon_token_revealed: false,
+                connections,
+                remote_folder_picker: None,
+                remote_folder_picker_generation: 0,
+                host_sync_stops: HashMap::new(),
+                host_disconnected: HashSet::new(),
+                collapsed_hosts: HashSet::new(),
+                host_focuses: RefCell::new(HashMap::new()),
+                remote_folder_path_input,
                 settings_focus,
                 onboarding_add_project_focus,
                 onboarding_projectless_focus,
@@ -2789,6 +2902,9 @@ impl Waku {
                 updater_button_animation_from_reveal: 0.0,
                 updater_button_animation_generation: 0,
                 probes,
+                host_catalogs: HashMap::new(),
+                host_catalog_tx,
+                host_catalog_events,
                 provider_probe_tx,
                 provider_probe_events,
                 provider_model_discoveries: HashSet::new(),
@@ -3065,6 +3181,7 @@ impl Waku {
         // first frame.
         entity.update(cx, |this, cx| {
             this.restart_task_state_sync();
+            this.reconnect_saved_hosts(cx);
             for session_id in startup_live_session_ids {
                 this.start_runtime_attachment(session_id, cx);
             }

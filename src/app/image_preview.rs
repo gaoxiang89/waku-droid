@@ -56,7 +56,9 @@ impl Waku {
         if !waku_protocol::blob::is_reference(reference) && !attachment_reference {
             return None;
         }
-        if let Some(state) = self.remote_images.borrow().get(reference) {
+        let owner = self.hosts.get(&self.selected_host_key())?;
+        let cache_key = (owner.key.clone(), owner.generation, reference.to_owned());
+        if let Some(state) = self.remote_images.borrow().get(&cache_key) {
             return match state {
                 RemoteImageState::Ready(image) => Some(image.clone()),
                 RemoteImageState::Loading | RemoteImageState::Unavailable => None,
@@ -69,17 +71,16 @@ impl Waku {
         else {
             self.remote_images
                 .borrow_mut()
-                .insert(reference.to_owned(), RemoteImageState::Unavailable);
+                .insert(cache_key, RemoteImageState::Unavailable);
             return None;
         };
 
         self.remote_images
             .borrow_mut()
-            .insert(reference.to_owned(), RemoteImageState::Loading);
-        let cache_key = reference.to_owned();
-        let fetch_reference = cache_key.clone();
+            .insert(cache_key.clone(), RemoteImageState::Loading);
+        let fetch_reference = reference.to_owned();
         let daemon_path = daemon_path.map(Path::to_path_buf);
-        let daemon = self.daemon.clone();
+        let daemon = self.selected_daemon().clone();
         cx.spawn(async move |waku, cx| {
             let image = cx
                 .background_executor()

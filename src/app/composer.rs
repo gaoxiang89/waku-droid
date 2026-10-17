@@ -881,9 +881,9 @@ impl Waku {
         let searching = !normalized_query.is_empty();
         let selected_tab = self.model_picker_tab;
         let selected_model = selected_model.map(str::to_owned);
-        let probes = self.probes.clone();
+        let probes = self.provider_probes().to_vec();
         let disabled_providers = self.state.disabled_providers.clone();
-        let pending_discoveries = self.provider_model_discoveries_pending.clone();
+        let pending_discoveries = self.pending_model_discoveries().clone();
         let favorites = self.state.favorite_models.clone();
         let weak = cx.entity().downgrade();
         let search = self.model_search.clone();
@@ -1405,7 +1405,7 @@ impl Waku {
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
         let tabs = visible_picker_tabs(
-            &self.probes,
+            self.provider_probes(),
             &self.state.disabled_providers,
             locked_provider,
         );
@@ -1432,7 +1432,7 @@ impl Waku {
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
         let index = visible_picker_models(
-            &self.probes,
+            self.provider_probes(),
             &self.state.favorite_models,
             &self.state.disabled_providers,
             locked_provider,
@@ -1941,7 +1941,7 @@ impl Waku {
             return false;
         }
         let paths = paths.to_vec();
-        let daemon = self.daemon.clone();
+        let daemon = self.selected_daemon().clone();
         let draft_owner = self.selected_composer_draft_key();
         cx.spawn(async move |waku, cx| {
             let result = cx
@@ -2057,7 +2057,7 @@ impl Waku {
             return;
         }
 
-        let daemon = self.daemon.clone();
+        let daemon = self.selected_daemon().clone();
         let draft_owner = self.selected_composer_draft_key();
         cx.spawn(async move |waku, cx| {
             let stored = cx
@@ -2153,9 +2153,16 @@ impl Waku {
                 attachment.blob_reference.as_ref(),
                 attachment.client_preview_image.as_ref(),
             ) {
-                self.remote_images
-                    .borrow_mut()
-                    .insert(reference.clone(), RemoteImageState::Ready(image.clone()));
+                self.remote_images.borrow_mut().insert(
+                    (
+                        self.selected_host_key(),
+                        self.hosts
+                            .get(&self.selected_host_key())
+                            .map_or(0, |host| host.generation),
+                        reference.clone(),
+                    ),
+                    RemoteImageState::Ready(image.clone()),
+                );
             }
         }
         let attachments = self
@@ -2365,7 +2372,7 @@ impl Waku {
                     })
                     .flatten()
             });
-            let can_reveal = !self.daemon.is_remote();
+            let can_reveal = !self.selected_daemon().is_remote();
             if attachment.is_image {
                 if let Some(attachment_image) = attachment_image.as_ref() {
                     let preview_image = attachment_image.clone();
@@ -3392,15 +3399,26 @@ impl Waku {
             .selected_session()
             .map(|session| session.workspace.clone())
             .unwrap_or_default();
+        // In a WSL or SSH window "Local" would read as this computer, so the
+        // in-place choice names the host instead.
+        let local_label = self
+            .remote_connection_name()
+            .clone()
+            .unwrap_or_else(|| SharedString::from(tr!("workspace.local")));
+        let local_icon = if self.remote_connection_name().is_some() {
+            "icons/server.svg"
+        } else {
+            "icons/laptop.svg"
+        };
         let workspace_label = match &workspace {
-            SessionWorkspace::Local => SharedString::from(tr!("workspace.local")),
+            SessionWorkspace::Local => local_label.clone(),
             SessionWorkspace::NewWorktree { .. } => {
                 SharedString::from(tr!("workspace.new_worktree"))
             }
             SessionWorkspace::Worktree { branch, .. } => SharedString::from(branch.clone()),
         };
         let workspace_icon = if workspace.is_local() {
-            "icons/laptop.svg"
+            local_icon
         } else {
             "icons/fork.svg"
         };
@@ -3426,12 +3444,12 @@ impl Waku {
                     let worktree = weak.clone();
                     vec![
                         MenuItem::Header(tr!("workspace.work_in").into()),
-                        MenuItem::new(tr!("workspace.local"), move |_, cx| {
+                        MenuItem::new(local_label.clone(), move |_, cx| {
                             let _ = local.update(cx, |this, cx| {
                                 this.select_workspace(SessionWorkspace::Local, cx);
                             });
                         })
-                        .icon("icons/laptop.svg")
+                        .icon(local_icon)
                         .selected(local_selected),
                         MenuItem::new(tr!("workspace.new_worktree"), move |_, cx| {
                             let _ = worktree.update(cx, |this, cx| {

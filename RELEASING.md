@@ -159,6 +159,11 @@ Linux CI adds:
 - `appcast-linux-x86_64.xml`, `appcast-linux-aarch64.xml`
 - `latest-linux.txt` — the version `install.sh` resolves "latest" to
 
+Every desktop package also carries statically linked Linux daemons for WSL
+and SSH hosts (`remote/waku-daemon-linux-{x86_64,aarch64}`). The
+`remote-daemon` job builds them with musl and each platform job stages them
+through `WAKU_REMOTE_DAEMONS_DIR`; see [docs/remote.md](docs/remote.md).
+
 Windows CI adds:
 
 - `Waku-<version>-x86_64-Setup.exe`

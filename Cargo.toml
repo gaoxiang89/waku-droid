@@ -200,6 +200,12 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# With debug assertions GPUI creates its D3D11 device with the debug layer,
+# which fails on every adapter on some Windows machines (0x887A0002) even with
+# the SDK layers installed, so the debug app could not start.
+[profile.dev.package.gpui_windows]
+debug-assertions = false
+
 # `block` 0.1.6 declares an extern static with an uninhabited type. This fork
 # is the crates.io release plus the future-incompatibility fix only.
 [patch.crates-io]

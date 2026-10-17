@@ -52,6 +52,9 @@ impl Waku {
         if page == SettingsPage::Skills {
             self.ensure_skills_catalog(false, cx);
         }
+        if page == SettingsPage::Connections {
+            self.ensure_wsl_distributions(false, cx);
+        }
         cx.notify();
     }
 

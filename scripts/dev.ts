@@ -7,9 +7,10 @@ import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const isMacOS = process.platform === "darwin";
+const isWindows = process.platform === "win32";
 const appName = "Waku Debug";
 const targetDir = resolve(root, process.env.CARGO_TARGET_DIR || "target");
-const executableSuffix = process.platform === "win32" ? ".exe" : "";
+const executableSuffix = isWindows ? ".exe" : "";
 const appPath = isMacOS
   ? join(targetDir, "debug/Waku Debug.app")
   : join(targetDir, `debug/waku${executableSuffix}`);
@@ -348,9 +349,77 @@ async function buildDaemon(): Promise<boolean> {
     );
     return false;
   }
+  scheduleWslDaemonBuild();
   return true;
 }
 
+// WSL connections install a Linux daemon, which a Windows cargo cannot
+// produce. Build it inside WSL into target/remote-dev, where debug builds look
+// for it. This runs beside the watcher so a slow or missing WSL never holds up
+// a relaunch.
+let wslDaemonBuild: Promise<void> | undefined;
+let wslDaemonBuildQueued = false;
+let wslDaemonWarningShown = false;
+
+function scheduleWslDaemonBuild(): void {
+  if (!isWindows || process.env.WAKU_DEV_SKIP_WSL_DAEMON === "1") return;
+  if (wslDaemonBuild !== undefined) {
+    wslDaemonBuildQueued = true;
+    return;
+  }
+  wslDaemonBuild = buildWslDaemon().finally(() => {
+    wslDaemonBuild = undefined;
+    if (wslDaemonBuildQueued && !stopping) {
+      wslDaemonBuildQueued = false;
+      scheduleWslDaemonBuild();
+    }
+  });
+}
+
+async function buildWslDaemon(): Promise<void> {
+  // $1 is the checkout and $2 the output directory, both as Windows paths.
+  // Kept on one line so it survives the Windows command line intact.
+  // Cargo builds into the distribution's own filesystem because building
+  // under /mnt/c is several times slower, and the copy is renamed into place
+  // so a connection in progress never reads a half-written binary.
+  const script = [
+    "set -e",
+    '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"',
+    'command -v cargo >/dev/null || { echo "cargo is not installed in this WSL distribution" >&2; exit 127; }',
+    'source_dir=$(wslpath -u "$1")',
+    'output_dir=$(wslpath -u "$2")',
+    'export CARGO_TARGET_DIR="$HOME/.cache/waku-target"',
+    'cd "$source_dir"',
+    "cargo build --package waku-daemon --bin waku-daemon",
+    'output="$output_dir/waku-daemon-linux-$(uname -m)"',
+    'mkdir -p "$output_dir"',
+    'cp "$CARGO_TARGET_DIR/debug/waku-daemon" "$output.tmp.$$"',
+    'mv -f "$output.tmp.$$" "$output"',
+  ].join("; ");
+  const distro = process.env.WAKU_DEV_WSL_DISTRO;
+  const distroArguments = distro ? ["--distribution", distro] : [];
+  const outputDirectory = join(targetDir, "remote-dev");
+  console.log("[waku-dev] Building the WSL daemon...");
+  const result =
+    await $`wsl.exe ${distroArguments} --exec /bin/sh -c ${script} waku-dev ${root} ${outputDirectory}`
+      .quiet()
+      .nothrow();
+  if (result.exitCode === 0) {
+    console.log(`[waku-dev] WSL daemon ready in ${outputDirectory}.`);
+    return;
+  }
+  // A machine without WSL fails on every rebuild; say so once.
+  if (wslDaemonWarningShown) return;
+  wslDaemonWarningShown = true;
+  const lines = `${result.stderr}\n${result.stdout}`
+    .replaceAll("\0", "")
+    .trim()
+    .split("\n");
+  console.warn(
+    `[waku-dev] Could not build the WSL daemon, so WSL connections will fail. ` +
+      `Set WAKU_DEV_SKIP_WSL_DAEMON=1 to stop trying.\n${lines.slice(-15).join("\n")}`,
+  );
+}
 async function stopApp(): Promise<void> {
   const waiter = app;
   app = undefined;

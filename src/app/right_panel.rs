@@ -1746,7 +1746,7 @@ impl Waku {
                 self.open_right_panel_file(relative_path, cx);
             }
             TranscriptLinkRoute::Finder(path) => {
-                if self.daemon.is_remote() {
+                if self.selected_daemon().is_remote() {
                     self.show_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {
@@ -2115,8 +2115,12 @@ impl Waku {
                 window.focus(&focus_handle, cx);
             }
         } else {
-            crate::platform::hide_window(window);
+            self.close_or_hide_window(window);
         }
+    }
+
+    pub(super) fn close_or_hide_window(&self, window: &mut Window) {
+        crate::platform::hide_window(window);
     }
 
     pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2318,13 +2322,6 @@ impl Waku {
     }
 
     fn ensure_right_panel_terminal(&mut self, terminal_id: Uuid, cx: &mut Context<Self>) {
-        if self.daemon.is_remote() {
-            // A desktop PTY would interpret the daemon's cwd on the wrong
-            // machine. Keep the surface unavailable until the protocol grows
-            // a daemon-owned streaming terminal.
-            self.right_panel_terminals.remove(&terminal_id);
-            return;
-        }
         let Some(working_directory) = self
             .selected_workspace_path()
             .map(std::path::Path::to_path_buf)
@@ -2337,9 +2334,17 @@ impl Waku {
             .get(&terminal_id)
             .is_some_and(|terminal| terminal.read(cx).working_directory() == working_directory);
         if !matches_project {
+            // A desktop PTY would interpret a remote daemon's working
+            // directory on the wrong machine, so remote windows run the shell
+            // on the daemon host.
+            let launcher = if self.selected_daemon().is_remote() {
+                crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
+            } else {
+                crate::terminal::TerminalLauncher::Local
+            };
             self.right_panel_terminals.insert(
                 terminal_id,
-                cx.new(|cx| TerminalView::new(working_directory.clone(), cx)),
+                cx.new(|cx| TerminalView::new(working_directory.clone(), launcher, cx)),
             );
         }
     }
@@ -3069,7 +3074,7 @@ impl Waku {
         editor.reading = true;
         editor.read_epoch += 1;
         let epoch = editor.read_epoch;
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
 
         cx.spawn(async move |waku, cx| {
             let read = cx
@@ -3413,7 +3418,7 @@ impl Waku {
         } else {
             return;
         };
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -4389,7 +4394,8 @@ impl Waku {
             Query::Pending => {}
             Query::Missing(token) => {
                 let expanded = self.right_panel_expanded_paths.clone();
-                let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+                let workspace =
+                    waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
                     let entries = cx
                         .background_executor()
@@ -4537,7 +4543,7 @@ impl Waku {
         self.right_panel_diff_error = None;
         cx.notify();
 
-        let workspace = waku_client::WorkspaceClient::new(self.daemon.client());
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()

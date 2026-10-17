@@ -185,6 +185,22 @@ for sparkle_extra in XPCServices Headers PrivateHeaders Modules; do
   rm -rf "$sparkle_framework/$sparkle_extra" \
     "$sparkle_framework/Versions/B/$sparkle_extra"
 done
+# WSL and SSH hosts run a Linux daemon this Mac cannot compile. Release CI
+# provides both architectures; a local bundle without them cannot connect to
+# Linux hosts.
+if [ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]; then
+  mkdir -p "$contents/Resources/remote"
+  for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
+    if [ ! -f "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" ]; then
+      echo "WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon" >&2
+      exit 1
+    fi
+    cp "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" "$contents/Resources/remote/$remote_daemon"
+    chmod 755 "$contents/Resources/remote/$remote_daemon"
+  done
+elif [ "$profile" = "release" ]; then
+  echo "warning: WAKU_REMOTE_DAEMONS_DIR is not set; this bundle cannot connect to Linux hosts." >&2
+fi
 plutil -replace CFBundleDisplayName -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleExecutable -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$bundle_identifier" "$contents/Info.plist"

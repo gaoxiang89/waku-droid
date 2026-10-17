@@ -868,6 +868,10 @@ impl Backend for WakuBackend {
         }
     }
 
+    fn has_live_work(&self) -> bool {
+        !self.sessions.lock().is_empty() || !self.terminals.lock().is_empty()
+    }
+
     fn shutdown(&self) {
         let sessions = std::mem::take(&mut *self.sessions.lock());
         drop(sessions);

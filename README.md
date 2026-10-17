@@ -24,6 +24,9 @@ per-user and updates itself. A portable `.zip` is published alongside it. See
 [docs/windows.md](docs/windows.md) for requirements and what is not available
 there yet.
 
+To run agents where your code lives, open a WSL distribution or SSH host from
+Settings → Connections; see [docs/remote.md](docs/remote.md).
+
 ## Supported agents
 
 Waku works with:

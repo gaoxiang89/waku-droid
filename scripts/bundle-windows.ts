@@ -11,6 +11,8 @@
 //   CARGO_TARGET_DIR              cargo target directory (default: target)
 //   WINDOWS_CERTIFICATE           base64 Authenticode .pfx (optional)
 //   WINDOWS_CERTIFICATE_PASSWORD  password for it
+//   WAKU_REMOTE_DAEMONS_DIR       directory with waku-daemon-linux-{x86_64,aarch64}
+//                                 for WSL and SSH hosts (release CI sets it)
 import { $ } from "bun";
 import { bundleComputerUse } from "./cua-driver";
 import { existsSync, readdirSync, statSync } from "node:fs";
@@ -75,6 +77,32 @@ function findSigntool(): string {
     }
   }
   throw new Error(`signtool.exe was not found under ${root}.`);
+}
+
+/** Linux daemons for WSL and SSH hosts, which this Windows build cannot
+ *  compile. Release CI provides them; a local package without them still
+ *  works but cannot connect to those hosts. */
+const remoteDaemonNames = [
+  "waku-daemon-linux-x86_64",
+  "waku-daemon-linux-aarch64",
+];
+
+async function stageRemoteDaemons(destination: string): Promise<void> {
+  const source = process.env.WAKU_REMOTE_DAEMONS_DIR;
+  if (!source) {
+    console.warn(
+      "WAKU_REMOTE_DAEMONS_DIR is not set; this package cannot connect to WSL or Linux SSH hosts.",
+    );
+    return;
+  }
+  await mkdir(destination, { recursive: true });
+  for (const name of remoteDaemonNames) {
+    const file = join(resolve(source), name);
+    if (!existsSync(file)) {
+      throw new Error(`WAKU_REMOTE_DAEMONS_DIR has no ${name}: ${file}`);
+    }
+    await copyFile(file, join(destination, name));
+  }
 }
 
 async function sign(
@@ -147,6 +175,7 @@ try {
     join(projectRoot, "LICENSE"),
     join(packageDirectory, "LICENSE"),
   );
+  await stageRemoteDaemons(join(packageDirectory, "remote"));
 
   // Authenticode has to be applied before anything is packaged, so the
   // executables inside the zip and the installer are all signed. Unsigned
