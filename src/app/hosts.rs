@@ -40,6 +40,108 @@ impl Waku {
             .unwrap_or(&self.provider_model_discoveries_pending)
     }
 
+    /// Whether a provider probe for this host is still in flight, for the
+    /// Providers page's checking state.
+    pub(super) fn host_catalog_pending(&self, key: &HostKey) -> bool {
+        self.host_catalogs
+            .get(key)
+            .is_some_and(|catalog| !catalog.pending.is_empty())
+    }
+
+    /// Switch the Providers page to another host. The pending binary override
+    /// edit commits to the host being left before the move; if a row stays
+    /// expanded, its input reloads the new host's override.
+    pub(super) fn set_provider_settings_host(&mut self, key: HostKey, cx: &mut Context<Self>) {
+        if key == self.provider_settings_host || self.hosts.get(&key).is_none() {
+            return;
+        }
+        self.apply_provider_path_override(cx);
+        self.provider_settings_host = key.clone();
+        if key != HostKey::Local {
+            self.sync_host_provider_overrides(&key);
+        }
+        if let Some(provider) = self.expanded_provider_settings {
+            let override_value = self
+                .provider_override_for_host(&key, provider)
+                .cloned()
+                .unwrap_or_default();
+            self.provider_path_input
+                .update(cx, |input, cx| input.set_content(override_value, cx));
+        }
+        cx.notify();
+    }
+
+    /// The override shown for a provider on the Providers page: the desktop's
+    /// own setting for Local, the host snapshot for everyone else.
+    pub(super) fn provider_override_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+    ) -> Option<&String> {
+        if *key == HostKey::Local {
+            self.state.provider_binary_overrides.get(&provider)
+        } else {
+            self.host_provider_overrides
+                .get(key)
+                .and_then(|overrides| overrides.get(&provider))
+        }
+    }
+
+    /// Refresh the render snapshot of a remote host's binary overrides from
+    /// its daemon's settings. Runs in click handlers, never in render.
+    pub(super) fn sync_host_provider_overrides(&mut self, key: &HostKey) {
+        if let Some(host) = self.hosts.get(key) {
+            self.host_provider_overrides.insert(
+                key.clone(),
+                host.daemon.settings().provider_binary_overrides,
+            );
+        }
+    }
+
+    /// Commit a binary override edit against a remote host's daemon settings:
+    /// empty means detect from PATH there. The write persists on that host,
+    /// and a forced re-probe picks the new path up.
+    pub(super) fn apply_host_provider_override(
+        &mut self,
+        key: &HostKey,
+        provider: ProviderKind,
+        text: &str,
+    ) {
+        let Some(host) = self.hosts.get(key) else {
+            return;
+        };
+        let current = self
+            .host_provider_overrides
+            .get(key)
+            .and_then(|overrides| overrides.get(&provider))
+            .cloned();
+        let changed = match current.as_deref() {
+            Some(value) => value != text,
+            None => !text.is_empty(),
+        };
+        if !changed {
+            return;
+        }
+        let mut settings = host.daemon.settings();
+        if text.is_empty() {
+            settings.provider_binary_overrides.remove(&provider);
+        } else {
+            settings
+                .provider_binary_overrides
+                .insert(provider, text.to_owned());
+        }
+        if let Err(error) = host.daemon.update_settings(settings) {
+            self.show_toast(tr!(
+                "errors.save_remote_settings",
+                name = host.name.as_str(),
+                error = error.to_string()
+            ));
+            return;
+        }
+        self.sync_host_provider_overrides(key);
+        self.refresh_host_catalog(key.clone(), Some(provider), true);
+    }
+
     pub(super) fn refresh_host_catalog(
         &mut self,
         key: HostKey,

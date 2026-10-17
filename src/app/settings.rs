@@ -1606,12 +1606,31 @@ impl Waku {
 
     fn render_providers_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
-        let checking = self.provider_detection_remaining > 0;
-        let checked_label = self
-            .provider_detection_checked_at
-            .filter(|_| !checking)
-            .map(|checked_at| detection_checked_label(checked_at.elapsed()));
+        // The page is scoped to one host's daemon: detection, binary
+        // overrides, and the refresh button all act on that host alone. The
+        // enable/disable toggle stays a desktop preference, so it only rides
+        // the local tab.
+        let host_key = if self.hosts.get(&self.provider_settings_host).is_some() {
+            self.provider_settings_host.clone()
+        } else {
+            waku_client::hosts::HostKey::Local
+        };
+        let local = host_key == waku_client::hosts::HostKey::Local;
+        let probes = self.provider_probes_for_host(&host_key);
+        let checking = if local {
+            self.provider_detection_remaining > 0
+        } else {
+            self.host_catalog_pending(&host_key)
+        };
+        let checked_label = if local {
+            self.provider_detection_checked_at
+                .filter(|_| !checking)
+                .map(|checked_at| detection_checked_label(checked_at.elapsed()))
+        } else {
+            None
+        };
 
+        let refresh_host = host_key.clone();
         let refresh = div()
             .id("refresh-providers")
             .tab_index(0)
@@ -1635,30 +1654,85 @@ impl Waku {
             } else {
                 tr!("common.refresh")
             })
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.refresh_provider_detection(None);
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if refresh_host == waku_client::hosts::HostKey::Local {
+                    this.refresh_provider_detection(None);
+                } else {
+                    this.refresh_host_catalog(refresh_host.clone(), None, true);
+                }
                 cx.notify();
             }));
+
+        // One tab per connected host, following the usage page's segmented
+        // switcher. Hidden while the desktop is the only host, so the page
+        // reads exactly as it did before hosts existed.
+        let host_tabs = (self.hosts.hosts.len() > 1).then(|| {
+            let mut tabs = div()
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .overflow_hidden();
+            for (index, host) in self.hosts.hosts.iter().enumerate() {
+                let key = host.key.clone();
+                let label: SharedString = if key == waku_client::hosts::HostKey::Local {
+                    tr!("connections.local").into()
+                } else {
+                    host.name.clone().into()
+                };
+                let selected = key == host_key;
+                tabs = tabs.child(
+                    div()
+                        .id(SharedString::from(format!("provider-host-tab-{index}")))
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .h(px(26.0))
+                        .px(px(11.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |element| element.bg(theme.overlay))
+                        .when(!selected, |element| {
+                            element.hover(|element| element.text_color(theme.text))
+                        })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_provider_settings_host(key.clone(), cx);
+                        })),
+                );
+            }
+            // A flex row lets the segmented control shrink-wrap its tabs
+            // instead of stretching the border across the page.
+            div().mt(px(10.0)).mb(px(-2.0)).flex().child(tabs)
+        });
 
         let mut rows = div().mt(px(4.0)).flex().flex_col();
         let provider_count = ProviderKind::ALL.len();
         for (index, kind) in ProviderKind::ALL.into_iter().enumerate() {
-            let probe = self.probes.iter().find(|probe| probe.provider == kind);
+            let probe = probes.iter().find(|probe| probe.provider == kind);
             let installed = probe.is_some_and(|probe| probe.installed);
             let binary_path = probe
                 .filter(|probe| probe.installed)
                 .and_then(|probe| probe.path.as_deref())
                 .map(|path| abbreviate_home_path(path, self.home_directory.as_deref()));
             let model_count = probe.map(|probe| probe.models.len()).unwrap_or(0);
-            let version = self
-                .provider_versions
-                .get(&kind)
+            let version = local
+                .then(|| self.provider_versions.get(&kind))
+                .flatten()
                 .and_then(|version| version.clone());
-            let disabled = self.state.disabled_providers.contains(&kind);
+            // `None` on a remote tab: switched-off is a desktop preference,
+            // not a fact about that host.
+            let disabled = local.then(|| self.state.disabled_providers.contains(&kind));
 
             let dot_color = if !installed {
                 theme.text_ghost
-            } else if disabled {
+            } else if disabled == Some(true) {
                 theme.warning
             } else {
                 theme.success
@@ -1669,7 +1743,7 @@ impl Waku {
                 if let Some(path) = binary_path {
                     parts.push(path);
                 }
-                if disabled {
+                if disabled == Some(true) {
                     parts.push(tr!("providers.disabled_for_new_tasks"));
                 } else if model_count > 0 {
                     parts.push(if model_count == 1 {
@@ -1693,15 +1767,17 @@ impl Waku {
                     .into_any_element()
             };
 
-            let toggle_on = !disabled;
-            let toggle = toggle_switch(
-                SharedString::from(format!("provider-enabled-{}", kind.id())),
-                toggle_on,
-                false,
-                theme,
-                cx,
-                move |this, _, cx| this.set_provider_enabled(kind, disabled, cx),
-            );
+            let toggle = (local && installed).then(|| {
+                let switched_off = disabled == Some(true);
+                toggle_switch(
+                    SharedString::from(format!("provider-enabled-{}", kind.id())),
+                    !switched_off,
+                    false,
+                    theme,
+                    cx,
+                    move |this, _, cx| this.set_provider_enabled(kind, switched_off, cx),
+                )
+            });
 
             let expanded = self.expanded_provider_settings == Some(kind);
             let expand_button = icon_button(
@@ -1791,7 +1867,7 @@ impl Waku {
                         ),
                 )
                 .child(expand_button)
-                .when(installed, |element| element.child(toggle));
+                .when_some(toggle, |element, toggle| element.child(toggle));
 
             rows = rows.child(
                 div()
@@ -1809,70 +1885,76 @@ impl Waku {
         }
 
         div()
-            .mt(px(15.0))
-            .w_full()
-            .px(px(20.0))
-            .py(px(14.0))
-            .rounded(px(13.0))
-            .bg(theme.raised)
+            .when_some(host_tabs, |element, tabs| element.child(tabs))
             .child(
                 div()
-                    .flex()
-                    .items_start()
-                    .gap(px(20.0))
+                    .mt(px(15.0))
+                    .w_full()
+                    .px(px(20.0))
+                    .py(px(14.0))
+                    .rounded(px(13.0))
+                    .bg(theme.raised)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .flex()
+                            .items_start()
+                            .gap(px(20.0))
                             .child(
                                 div()
-                                    .text_size(sp(13.5))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(tr!("providers.coding_agents")),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_size(sp(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(tr!("providers.coding_agents")),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(5.0))
+                                            .text_size(sp(12.5))
+                                            .line_height(sp(18.0))
+                                            .text_color(theme.text_secondary)
+                                            .child(tr!("providers.description")),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .mt(px(5.0))
-                                    .text_size(sp(12.5))
-                                    .line_height(sp(18.0))
-                                    .text_color(theme.text_secondary)
-                                    .child(tr!("providers.description")),
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .gap(px(6.0))
+                                    .child(refresh)
+                                    .when_some(checked_label, |element, label| {
+                                        element.child(
+                                            div()
+                                                .text_size(sp(12.5))
+                                                .text_color(theme.text_ghost)
+                                                .child(SharedString::from(label)),
+                                        )
+                                    }),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .items_end()
-                            .gap(px(6.0))
-                            .child(refresh)
-                            .when_some(checked_label, |element, label| {
-                                element.child(
-                                    div()
-                                        .text_size(sp(12.5))
-                                        .text_color(theme.text_ghost)
-                                        .child(SharedString::from(label)),
-                                )
-                            }),
-                    ),
+                    .child(rows),
             )
-            .child(rows)
             .into_any_element()
     }
 
     /// The expanded row's settings body: the binary override for this
-    /// provider, with the detection result as its caption.
+    /// provider on the page's host, with that host's detection result as its
+    /// caption.
     fn render_provider_expanded_settings(
         &self,
         kind: ProviderKind,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let override_value = self.state.provider_binary_overrides.get(&kind).cloned();
+        let host_key = self.provider_settings_host.clone();
+        let override_value = self.provider_override_for_host(&host_key, kind).cloned();
         let full_path = self
-            .probes
+            .provider_probes_for_host(&host_key)
             .iter()
             .find(|probe| probe.provider == kind)
             .filter(|probe| probe.installed)
@@ -1972,10 +2054,12 @@ impl Waku {
             self.expanded_provider_settings = None;
         } else {
             self.expanded_provider_settings = Some(provider);
+            let host_key = self.provider_settings_host.clone();
+            if host_key != waku_client::hosts::HostKey::Local {
+                self.sync_host_provider_overrides(&host_key);
+            }
             let override_value = self
-                .state
-                .provider_binary_overrides
-                .get(&provider)
+                .provider_override_for_host(&host_key, provider)
                 .cloned()
                 .unwrap_or_default();
             self.provider_path_input
@@ -1986,9 +2070,10 @@ impl Waku {
         cx.notify();
     }
 
-    /// Commit the binary override edit for the expanded provider: empty means
-    /// detect from PATH. Re-detects that provider and refreshes every catalog
-    /// keyed by the executable path.
+    /// Commit the binary override edit for the expanded provider against the
+    /// page's host: empty means detect from PATH. Local re-detects through the
+    /// desktop daemon; a remote host's settings persist on that host and a
+    /// forced re-probe picks the new path up.
     pub(super) fn apply_provider_path_override(&mut self, cx: &mut Context<Self>) {
         let Some(provider) = self.expanded_provider_settings else {
             return;
@@ -1999,23 +2084,28 @@ impl Waku {
             .content()
             .trim()
             .to_owned();
+        let host_key = self.provider_settings_host.clone();
         let current = self
-            .state
-            .provider_binary_overrides
-            .get(&provider)
+            .provider_override_for_host(&host_key, provider)
             .cloned()
             .unwrap_or_default();
         if text == current {
             return;
         }
-        if text.is_empty() {
-            self.state.provider_binary_overrides.remove(&provider);
+        if host_key == waku_client::hosts::HostKey::Local {
+            if text.is_empty() {
+                self.state.provider_binary_overrides.remove(&provider);
+            } else {
+                self.state
+                    .provider_binary_overrides
+                    .insert(provider, text.clone());
+            }
+            self.save();
+            self.refresh_provider_detection(Some(provider));
+            self.refresh_composer_sources(cx);
         } else {
-            self.state.provider_binary_overrides.insert(provider, text);
+            self.apply_host_provider_override(&host_key, provider, &text);
         }
-        self.save();
-        self.refresh_provider_detection(Some(provider));
-        self.refresh_composer_sources(cx);
         cx.notify();
     }
 
