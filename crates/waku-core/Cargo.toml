@@ -1,6 +1,6 @@
 [package]
 name = "waku-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Headless provider, persistence, and workspace runtime for Waku"
 license = "GPL-3.0-only"

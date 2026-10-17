@@ -1,6 +1,6 @@
 [package]
 name = "waku-protocol"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Versioned, transport-neutral wire contract shared by Waku clients and daemon"
 license = "GPL-3.0-only"

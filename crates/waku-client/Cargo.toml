@@ -1,6 +1,6 @@
 [package]
 name = "waku-client"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Rust client and daemon process supervisor for Waku"
 license = "GPL-3.0-only"

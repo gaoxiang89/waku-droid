@@ -48,6 +48,10 @@ On connect the desktop:
 4. launches `waku-daemon bridge`. A reused install that reports another
    protocol version is reinstalled once.
 
+Settings → General → About lists the version each connected daemon announced
+in its handshake, so a host still running an older install is visible at a
+glance.
+
 Development builds use `~/.cache/waku-dev/server` so they never replace a
 released app's daemon.
 

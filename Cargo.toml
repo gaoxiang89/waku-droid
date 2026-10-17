@@ -1,6 +1,6 @@
 [package]
 name = "waku"
-version = "0.1.20"
+version.workspace = true
 edition = "2024"
 description = "A fast, native control plane for local coding agents"
 license = "GPL-3.0-only"
@@ -16,6 +16,11 @@ default-members = [
   "crates/waku-computer-use",
 ]
 resolver = "2"
+
+[workspace.package]
+# The one release version. Every crate inherits it, so the daemon reports the
+# same version as the app it ships with.
+version = "0.1.21"
 
 [dependencies]
 alacritty_terminal = { version = "0.26", default-features = false }

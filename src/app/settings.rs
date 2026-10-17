@@ -596,7 +596,64 @@ impl Waku {
                         .child(toggle),
                 )
             })
+            .child(self.render_about_card(theme))
             .into_any_element()
+    }
+
+    /// The app's own version, then the version each connected daemon
+    /// announced in its handshake. A remote host keeps the daemon installed
+    /// there until the desktop replaces it, so the two can differ.
+    fn render_about_card(&self, theme: Theme) -> Div {
+        let version_row = |label: SharedString, value: SharedString| {
+            div()
+                .mt(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(16.0))
+                .text_size(sp(12.5))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.text_secondary)
+                        .child(label),
+                )
+                .child(div().text_color(theme.text).child(value))
+        };
+        let daemon_rows = self.hosts.hosts.iter().map(|host| {
+            let label = match &host.key {
+                waku_client::hosts::HostKey::Local => tr!("settings.about_local_daemon"),
+                waku_client::hosts::HostKey::Connection(_) => {
+                    tr!("settings.about_host_daemon", host = host.name.as_str())
+                }
+            };
+            let value = if self.host_disconnected.contains(&host.key) {
+                tr!("daemon.phase_disconnected")
+            } else {
+                host.daemon.client().daemon_version().to_owned()
+            };
+            version_row(label.into(), value.into())
+        });
+        div()
+            .mt(px(15.0))
+            .w_full()
+            .px(px(20.0))
+            .py(px(14.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .child(
+                div()
+                    .text_size(sp(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(tr!("settings.about")),
+            )
+            .child(version_row(
+                crate::identity::APP_NAME.into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
+            .children(daemon_rows)
     }
 
     fn set_analytics_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {

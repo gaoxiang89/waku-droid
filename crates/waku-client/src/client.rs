@@ -36,6 +36,7 @@ struct ClientInner {
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
+    daemon_version: String,
 }
 
 #[derive(Clone, Copy)]
@@ -89,10 +90,11 @@ impl DaemonClient {
             },
         )?;
         let hello = read_server_message(&mut socket)?;
-        match hello {
+        let daemon_version = match hello {
             ServerMessage::Hello {
-                protocol_version, ..
-            } if protocol_version == PROTOCOL_VERSION => {}
+                protocol_version,
+                daemon_version,
+            } if protocol_version == PROTOCOL_VERSION => daemon_version,
             ServerMessage::Hello {
                 protocol_version, ..
             } => bail!(
@@ -100,7 +102,7 @@ impl DaemonClient {
             ),
             ServerMessage::Rejected { message } => bail!("daemon rejected connection: {message}"),
             other => bail!("daemon sent an invalid handshake response: {other:?}"),
-        }
+        };
         set_client_read_timeout(&mut socket, Some(READ_POLL_INTERVAL))?;
 
         let (outgoing, outgoing_rx) = unbounded();
@@ -112,6 +114,7 @@ impl DaemonClient {
             task_state_subscribers: Mutex::new(Vec::new()),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
+            daemon_version,
         });
         let thread_inner = inner.clone();
         std::thread::Builder::new()
@@ -148,6 +151,11 @@ impl DaemonClient {
 
     pub fn is_disconnected(&self) -> bool {
         self.inner.disconnected.load(Ordering::Acquire)
+    }
+
+    /// The release version the daemon announced in its handshake.
+    pub fn daemon_version(&self) -> &str {
+        &self.inner.daemon_version
     }
 
     pub fn unsubscribe(&self, session_id: Uuid, runtime_id: Uuid) {

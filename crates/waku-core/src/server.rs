@@ -1372,6 +1372,8 @@ mod tests {
 
         let source = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
         let observer = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        // The handshake carries the release version every crate inherits.
+        assert_eq!(source.daemon_version(), env!("CARGO_PKG_VERSION"));
         let source_revisions = source.subscribe_task_state();
         let observer_revisions = observer.subscribe_task_state();
         // The handshake can finish before the server registers its subscriber.

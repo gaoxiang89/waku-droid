@@ -137,6 +137,10 @@ Test by keeping an older build around, launching it, and choosing
 
 ### GitHub draft release + R2 sync
 
+The release version lives once, in `[workspace.package]` of the root
+`Cargo.toml`; every crate inherits it, so the daemon's handshake (shown under
+Settings → General → About) reports the same version as the app.
+
 The Release workflow runs two ways:
 
 - **Push a `v*` tag** — the tag must match the `version` in `Cargo.toml`, or the

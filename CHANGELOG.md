@@ -16,6 +16,17 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.21]
+
+- Connect to WSL distributions and SSH hosts from Settings → Connections: tasks, files, Git, checkpoints, and terminals run on that host while Waku only renders, and every package carries the static Linux daemon it installs there
+- Add Factory Droid as a provider, with each model's own reasoning levels and Waku's modes mapped to Droid's autonomy levels; dk users get their managed key automatically through `droid-dk`
+- Show why model discovery failed, such as a rejected `FACTORY_API_KEY`, instead of an empty model list
+- Organize the sidebar as host → workspace → session, with denser rows and status dots
+- Add a terminal panel below the composer, toggled with ⌘J / Ctrl+J
+- Configure each connected host's provider binaries from its own tab on the Providers page
+- Show the app version and every connected daemon's version under Settings → General → About
+- Fix Grok Build, Cursor, Kimi, and Fx failing to start on Windows, and end the agent process when its session closes
+
 ## [0.1.20]
 
 - Support the OpenCode 2.0 release, which now installs as `opencode`: OpenCode runs on its shared background service, OpenCode 2 beta and OpenCode 1 tasks continue as OpenCode tasks, and OpenCode's free models work in Waku tasks
