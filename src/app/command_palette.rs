@@ -159,6 +159,7 @@ enum PaletteAction {
     CollapseSidebarGroups,
     ToggleSidebar,
     ToggleRightPanel,
+    ToggleBottomPanel,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
 }
@@ -804,6 +805,19 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⇧⌘B", "Ctrl+Shift+B")),
                 PaletteAction::ToggleRightPanel,
                 "toggle show hide right panel files diff terminal browser",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!(if self.bottom_panel_visible {
+                    "command_palette.hide_bottom_panel"
+                } else {
+                    "command_palette.show_bottom_panel"
+                }),
+                "icons/panel-bottom.svg",
+                Some(crate::platform::primary_shortcut("⌘J", "Ctrl+J")),
+                PaletteAction::ToggleBottomPanel,
+                "toggle show hide bottom panel terminal shell console",
                 next(),
             ),
         ]);
@@ -1604,6 +1618,9 @@ impl Waku {
             PaletteAction::ToggleSidebar => self.toggle_sidebar_action(&ToggleSidebar, window, cx),
             PaletteAction::ToggleRightPanel => {
                 self.toggle_right_panel_action(&ToggleRightPanel, window, cx)
+            }
+            PaletteAction::ToggleBottomPanel => {
+                self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
             }
             PaletteAction::OpenSettings(page) => {
                 self.open_settings_action(&OpenSettings, window, cx);

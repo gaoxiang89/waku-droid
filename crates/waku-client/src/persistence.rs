@@ -34,6 +34,7 @@ const APP_STATE_VERSION: u32 = 1;
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
+pub const DEFAULT_BOTTOM_PANEL_HEIGHT: f32 = 260.0;
 
 /// Direction of task history inside each sidebar workspace group.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,6 +50,10 @@ fn default_sidebar_visibility() -> bool {
 }
 
 fn default_right_panel_visibility() -> bool {
+    false
+}
+
+fn default_bottom_panel_visibility() -> bool {
     false
 }
 
@@ -82,6 +87,10 @@ fn default_sidebar_width() -> f32 {
 
 fn default_right_panel_width() -> f32 {
     DEFAULT_RIGHT_PANEL_WIDTH
+}
+
+fn default_bottom_panel_height() -> f32 {
+    DEFAULT_BOTTOM_PANEL_HEIGHT
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -318,12 +327,16 @@ struct AppState {
     sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     right_panel_visible: bool,
+    #[serde(default = "default_bottom_panel_visibility")]
+    bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
+    #[serde(default = "default_bottom_panel_height")]
+    bottom_panel_height: f32,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -376,12 +389,16 @@ pub struct PersistedState {
     pub sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     pub right_panel_visible: bool,
+    #[serde(default = "default_bottom_panel_visibility")]
+    pub bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
+    #[serde(default = "default_bottom_panel_height")]
+    pub bottom_panel_height: f32,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -444,9 +461,11 @@ impl PersistedState {
             open_in_app: None,
             sidebar_visible: true,
             right_panel_visible: false,
+            bottom_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
+            bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
             markdown_preview: false,
             window_state: None,
             computer_use_enabled: false,
@@ -587,9 +606,11 @@ impl PersistedState {
             remembered_model_traits: self.remembered_model_traits.clone(),
             sidebar_visible: self.sidebar_visible,
             right_panel_visible: self.right_panel_visible,
+            bottom_panel_visible: self.bottom_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
+            bottom_panel_height: self.bottom_panel_height,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
         }
@@ -620,9 +641,11 @@ impl PersistedState {
         self.remembered_model_traits = app_state.remembered_model_traits;
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
+        self.bottom_panel_visible = app_state.bottom_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
         self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
+        self.bottom_panel_height = app_state.bottom_panel_height;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
     }

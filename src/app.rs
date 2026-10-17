@@ -53,8 +53,8 @@ use crate::ui::tooltip::Tooltip;
 
 use crate::browser::BrowserView;
 use crate::persistence::{
-    ComposerDraftStore, ComposerDrafts, DEFAULT_RIGHT_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH,
-    PersistedState, PersistedWindowState, SidebarOrdering, StateStore,
+    ComposerDraftStore, ComposerDrafts, DEFAULT_BOTTOM_PANEL_HEIGHT, DEFAULT_RIGHT_PANEL_WIDTH,
+    DEFAULT_SIDEBAR_WIDTH, PersistedState, PersistedWindowState, SidebarOrdering, StateStore,
 };
 use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
@@ -71,7 +71,7 @@ use crate::{
     OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile,
     SelectFirstTask, SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleCommandPalette,
     ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    ToggleModelPicker, ToggleBottomPanel, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -90,6 +90,11 @@ const UPDATER_BUTTON_COLLAPSED_WIDTH: f32 = 20.0;
 const UPDATER_BUTTON_EXPANDED_WIDTH: f32 = 58.0;
 const RIGHT_PANEL_MIN_WIDTH: f32 = 280.0;
 const RIGHT_PANEL_MAX_WIDTH: f32 = 1000.0;
+const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
+const BOTTOM_PANEL_MAX_HEIGHT: f32 = 560.0;
+/// Kept for the header, composer, and workspace footer when the bottom panel
+/// claims height, so it can never squeeze the chat column out of the window.
+const BOTTOM_PANEL_HEIGHT_RESERVE: f32 = 280.0;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 184.0;
 const FILE_TREE_MIN_WIDTH: f32 = 140.0;
 const FILE_TREE_MAX_WIDTH: f32 = 360.0;
@@ -258,6 +263,7 @@ enum UsageBreakdown {
 enum PanelResizeTarget {
     Sidebar,
     RightPanel,
+    BottomPanel,
     FileTree,
 }
 
@@ -265,7 +271,9 @@ enum PanelResizeTarget {
 struct PanelResizeDrag {
     target: PanelResizeTarget,
     start_mouse_x: f32,
-    start_width: f32,
+    start_mouse_y: f32,
+    /// Width for the vertical edges, height for the horizontal one.
+    start_size: f32,
 }
 
 #[derive(Debug)]
@@ -1384,16 +1392,22 @@ pub struct Waku {
     sidebar_width: f32,
     right_panel_visible: bool,
     right_panel_width: f32,
+    bottom_panel_visible: bool,
+    bottom_panel_height: f32,
     /// The show/hide slide each panel is in the middle of, if any. Driven by
     /// hand from `render` (see [`motion::WidthTween`]) because the width these
     /// produce is what the transcript column between them is laid out against.
     sidebar_slide: Option<motion::WidthTween>,
     right_panel_slide: Option<motion::WidthTween>,
+    /// The bottom panel's slide is a height tween — same scalar easing, applied
+    /// to the panel that grows upward from below the composer.
+    bottom_panel_slide: Option<motion::WidthTween>,
     /// Width each panel actually occupied in the last frame — where a toggle
     /// starts its slide from, and what the transcript measures itself against
     /// while one is running.
     sidebar_rendered_width: f32,
     right_panel_rendered_width: f32,
+    bottom_panel_rendered_height: f32,
     fps_counter_visible: bool,
     panel_resize_drag: Option<PanelResizeDrag>,
     /// Window-relative PiP position, independent of incoming preview frames.
@@ -1453,6 +1467,11 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
+    /// The bottom panel's terminal, or `None` while the panel has never been
+    /// opened for the current workspace.
+    bottom_panel_terminal: Option<Entity<TerminalView>>,
+    /// The panel was just opened; the next render moves focus into the terminal.
+    bottom_panel_pending_terminal_focus: bool,
     /// A Browser surface was just opened; the next right panel render moves
     /// focus into its address bar.
     right_panel_pending_browser_focus: Option<Uuid>,
@@ -1657,6 +1676,7 @@ pub struct Waku {
 mod activity_diff;
 mod autocomplete;
 mod background_work;
+mod bottom_panel;
 mod branches;
 mod command_palette;
 mod commit_dialog;
@@ -2114,6 +2134,7 @@ impl Waku {
             });
         let sidebar_visible = state.sidebar_visible;
         let right_panel_visible = state.right_panel_visible;
+        let bottom_panel_visible = state.bottom_panel_visible;
         let sidebar_width = sanitize_panel_width(
             state.sidebar_width,
             DEFAULT_SIDEBAR_WIDTH,
@@ -2126,8 +2147,15 @@ impl Waku {
             RIGHT_PANEL_MIN_WIDTH,
             RIGHT_PANEL_MAX_WIDTH,
         );
+        let bottom_panel_height = sanitize_panel_width(
+            state.bottom_panel_height,
+            DEFAULT_BOTTOM_PANEL_HEIGHT,
+            BOTTOM_PANEL_MIN_HEIGHT,
+            BOTTOM_PANEL_MAX_HEIGHT,
+        );
         state.sidebar_width = sidebar_width;
         state.right_panel_width = right_panel_width;
+        state.bottom_panel_height = bottom_panel_height;
         // First launch has no persisted frame yet; seed from the freshly
         // opened window so an immediate zoom or fullscreen still has a
         // floating frame to restore to. The bounds observer keeps it current
@@ -3024,11 +3052,21 @@ impl Waku {
                 sidebar_width,
                 right_panel_visible,
                 right_panel_width,
+                bottom_panel_visible,
+                bottom_panel_height,
+                bottom_panel_terminal: None,
+                bottom_panel_pending_terminal_focus: false,
                 sidebar_slide: None,
                 right_panel_slide: None,
+                bottom_panel_slide: None,
                 sidebar_rendered_width: if sidebar_visible { sidebar_width } else { 0.0 },
                 right_panel_rendered_width: if right_panel_visible {
                     right_panel_width
+                } else {
+                    0.0
+                },
+                bottom_panel_rendered_height: if bottom_panel_visible {
+                    bottom_panel_height
                 } else {
                     0.0
                 },

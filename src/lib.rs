@@ -70,6 +70,7 @@ actions!(
         CheckForUpdates,
         ToggleSidebar,
         ToggleRightPanel,
+        ToggleBottomPanel,
         ToggleCommandPalette,
         OpenResumePicker,
         ToggleFpsCounter,
@@ -239,6 +240,9 @@ pub fn run() {
                 KeyBinding::new("secondary-,", OpenSettings, None),
                 KeyBinding::new("secondary-b", ToggleSidebar, None),
                 KeyBinding::new("secondary-shift-b", ToggleRightPanel, None),
+                // The VS Code convention for the terminal panel beneath the
+                // editor.
+                KeyBinding::new("secondary-j", ToggleBottomPanel, None),
                 KeyBinding::new("secondary-k", ToggleCommandPalette, None),
                 KeyBinding::new("secondary-alt-shift-f", ToggleFpsCounter, None),
                 KeyBinding::new("secondary-[", NavigateBack, Some("Waku")),
@@ -466,6 +470,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 MenuItem::separator(),
                 MenuItem::action(tr!("menu.toggle_sidebar"), ToggleSidebar),
                 MenuItem::action(tr!("menu.toggle_right_panel"), ToggleRightPanel),
+                MenuItem::action(tr!("menu.toggle_bottom_panel"), ToggleBottomPanel),
                 MenuItem::action(tr!("menu.focus_composer"), FocusComposer),
                 MenuItem::action(tr!("menu.toggle_model_picker"), ToggleModelPicker),
                 MenuItem::action(tr!("menu.toggle_usage_panel"), ToggleUsagePanel),

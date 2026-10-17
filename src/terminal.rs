@@ -889,6 +889,11 @@ pub struct TerminalView {
     exited: bool,
     scroll_accumulator: f32,
     panel_width: f32,
+    /// Height the terminal is allowed to fill. `None` keeps the right panel's
+    /// assumption that the grid stretches from below the app header to the
+    /// window bottom; the bottom panel supplies its own height so the PTY's
+    /// row count matches what is actually visible.
+    panel_height: Option<f32>,
     /// Advance width of one grid cell, measured from the terminal font on
     /// first render so grid math matches what `StyledText` actually lays out.
     measured_cell_width: Option<f32>,
@@ -957,6 +962,7 @@ impl TerminalView {
             exited: false,
             scroll_accumulator: 0.0,
             panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
+            panel_height: None,
             measured_cell_width: None,
             scrollbar_state: ScrollbarState::new(),
             grid_bounds: Rc::new(Cell::new(None)),
@@ -975,6 +981,10 @@ impl TerminalView {
 
     pub fn set_panel_width(&mut self, width: f32) {
         self.panel_width = width;
+    }
+
+    pub fn set_panel_height(&mut self, height: f32) {
+        self.panel_height = Some(height);
     }
 
     pub fn refresh_localized_text(&mut self, cx: &mut Context<Self>) {
@@ -1329,7 +1339,10 @@ impl Render for TerminalView {
         let selection_color = theme.selection;
         let viewport = window.viewport_size();
         let panel_width = self.panel_width;
-        let body_height = (f32::from(viewport.height) - 48.0 - TERMINAL_TOOLBAR_HEIGHT).max(120.0);
+        let body_height = match self.panel_height {
+            Some(height) => (height - TERMINAL_TOOLBAR_HEIGHT).max(120.0),
+            None => (f32::from(viewport.height) - 48.0 - TERMINAL_TOOLBAR_HEIGHT).max(120.0),
+        };
         // The rows are laid out by `StyledText` at the font's own advance, so
         // the grid must be sized from that same measured advance or the text
         // wraps short of (or past) the panel edge.

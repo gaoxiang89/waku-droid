@@ -2175,6 +2175,10 @@ impl Waku {
                 ),
             )
             .child(self.render_background_work_summary(cx))
+            // The bottom panel has no chrome of its own — it is just the
+            // terminal — so this toggle stays up whether the panel is open or
+            // closed; it is the mouse way both in and out.
+            .child(self.render_bottom_panel_toggle(cx))
             .when(!self.right_panel_visible, |element| {
                 element
                     .when(self.fps_counter_visible, |element| {

@@ -506,6 +506,15 @@ impl Waku {
         self.set_right_panel_visible(!self.right_panel_visible, cx);
     }
 
+    pub(super) fn toggle_bottom_panel_action(
+        &mut self,
+        _: &ToggleBottomPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_bottom_panel_visible(!self.bottom_panel_visible, cx);
+    }
+
     pub(super) fn toggle_fps_counter_action(
         &mut self,
         _: &ToggleFpsCounter,
@@ -553,11 +562,33 @@ impl Waku {
         cx.notify();
     }
 
+    pub(super) fn set_bottom_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible {
+            self.ensure_bottom_panel_terminal(cx);
+            self.bottom_panel_pending_terminal_focus = true;
+        } else {
+            self.bottom_panel_pending_terminal_focus = false;
+        }
+        if self.bottom_panel_visible == visible {
+            return;
+        }
+        self.bottom_panel_visible = visible;
+        self.bottom_panel_slide = self.begin_panel_slide(self.bottom_panel_rendered_height, cx);
+        if visible {
+            self.analytics
+                .track(crate::analytics::Event::BottomPanelOpened);
+        }
+        self.persist_panel_layout();
+        cx.notify();
+    }
+
     pub(super) fn persist_panel_layout(&mut self) {
         self.state.sidebar_visible = self.sidebar_visible;
         self.state.right_panel_visible = self.right_panel_visible;
+        self.state.bottom_panel_visible = self.bottom_panel_visible;
         self.state.sidebar_width = self.sidebar_width;
         self.state.right_panel_width = self.right_panel_width;
+        self.state.bottom_panel_height = self.bottom_panel_height;
         self.save();
     }
 
@@ -604,6 +635,16 @@ impl Waku {
         )
     }
 
+    /// The height the bottom panel lays its content out at, clamped against
+    /// the viewport the way the side panels' widths are. A panel mid-slide
+    /// counts as on screen and keeps its full height.
+    pub(super) fn effective_bottom_panel_height(&self, window: &Window) -> f32 {
+        let viewport_height = f32::from(window.viewport_size().height);
+        let maximum = BOTTOM_PANEL_MAX_HEIGHT
+            .min((viewport_height - BOTTOM_PANEL_HEIGHT_RESERVE).max(BOTTOM_PANEL_MIN_HEIGHT));
+        self.bottom_panel_height.clamp(BOTTOM_PANEL_MIN_HEIGHT, maximum)
+    }
+
     pub(super) fn begin_panel_resize(
         &mut self,
         target: PanelResizeTarget,
@@ -614,7 +655,7 @@ impl Waku {
         let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
         // A drag tracks the pointer directly; whatever slide was still
         // finishing would fight it for the same edge.
-        let start_width = match target {
+        let start_size = match target {
             PanelResizeTarget::Sidebar => {
                 self.sidebar_slide = None;
                 self.sidebar_width = sidebar_width;
@@ -626,6 +667,12 @@ impl Waku {
                 self.right_panel_width = right_panel_width;
                 right_panel_width
             }
+            PanelResizeTarget::BottomPanel => {
+                let height = self.effective_bottom_panel_height(window);
+                self.bottom_panel_slide = None;
+                self.bottom_panel_height = height;
+                height
+            }
             PanelResizeTarget::FileTree => {
                 let width =
                     fitted_file_tree_width(right_panel_width, self.right_panel_file_tree_width);
@@ -636,7 +683,8 @@ impl Waku {
         self.panel_resize_drag = Some(PanelResizeDrag {
             target,
             start_mouse_x: f32::from(event.position.x),
-            start_width,
+            start_mouse_y: f32::from(event.position.y),
+            start_size,
         });
         cx.stop_propagation();
         cx.notify();
@@ -659,7 +707,7 @@ impl Waku {
                 let maximum = SIDEBAR_MAX_WIDTH
                     .min(viewport_width - MAIN_PANEL_MIN_WIDTH - right_panel_width)
                     .max(SIDEBAR_MIN_WIDTH);
-                let width = (drag.start_width + delta).clamp(SIDEBAR_MIN_WIDTH, maximum);
+                let width = (drag.start_size + delta).clamp(SIDEBAR_MIN_WIDTH, maximum);
                 if (self.sidebar_width - width).abs() < 0.5 {
                     return;
                 }
@@ -670,17 +718,30 @@ impl Waku {
                 let maximum = RIGHT_PANEL_MAX_WIDTH
                     .min(viewport_width - MAIN_PANEL_MIN_WIDTH - sidebar_width)
                     .max(RIGHT_PANEL_MIN_WIDTH);
-                let width = (drag.start_width - delta).clamp(RIGHT_PANEL_MIN_WIDTH, maximum);
+                let width = (drag.start_size - delta).clamp(RIGHT_PANEL_MIN_WIDTH, maximum);
                 if (self.right_panel_width - width).abs() < 0.5 {
                     return;
                 }
                 self.right_panel_width = width;
             }
+            PanelResizeTarget::BottomPanel => {
+                let viewport_height = f32::from(window.viewport_size().height);
+                // The panel grows upward from the bottom, so dragging its top
+                // edge down shrinks it.
+                let delta_y = f32::from(event.position.y) - drag.start_mouse_y;
+                let maximum = BOTTOM_PANEL_MAX_HEIGHT
+                    .min((viewport_height - BOTTOM_PANEL_HEIGHT_RESERVE).max(BOTTOM_PANEL_MIN_HEIGHT));
+                let height = (drag.start_size - delta_y).clamp(BOTTOM_PANEL_MIN_HEIGHT, maximum);
+                if (self.bottom_panel_height - height).abs() < 0.5 {
+                    return;
+                }
+                self.bottom_panel_height = height;
+            }
             PanelResizeTarget::FileTree => {
                 let maximum = FILE_TREE_MAX_WIDTH
                     .min(right_panel_width - FILE_EDITOR_MIN_WIDTH)
                     .max(FILE_TREE_MIN_WIDTH);
-                let width = (drag.start_width - delta).clamp(FILE_TREE_MIN_WIDTH, maximum);
+                let width = (drag.start_size - delta).clamp(FILE_TREE_MIN_WIDTH, maximum);
                 if (self.right_panel_file_tree_width - width).abs() < 0.5 {
                     return;
                 }

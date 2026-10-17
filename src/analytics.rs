@@ -87,6 +87,7 @@ pub enum Event {
     },
     ProjectAdded,
     RightPanelOpened,
+    BottomPanelOpened,
     TurnSubmitted {
         provider: &'static str,
         model: String,
@@ -155,6 +156,7 @@ impl Event {
             ),
             Self::ProjectAdded => ("project.added", json!({})),
             Self::RightPanelOpened => ("right_panel.opened", json!({})),
+            Self::BottomPanelOpened => ("bottom_panel.opened", json!({})),
             Self::TurnSubmitted {
                 provider,
                 model,

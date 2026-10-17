@@ -49,12 +49,17 @@ const ASSET_SWEEP_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
+pub const DEFAULT_BOTTOM_PANEL_HEIGHT: f32 = 260.0;
 
 fn default_sidebar_visibility() -> bool {
     true
 }
 
 fn default_right_panel_visibility() -> bool {
+    false
+}
+
+fn default_bottom_panel_visibility() -> bool {
     false
 }
 
@@ -76,6 +81,10 @@ fn default_sidebar_width() -> f32 {
 
 fn default_right_panel_width() -> f32 {
     DEFAULT_RIGHT_PANEL_WIDTH
+}
+
+fn default_bottom_panel_height() -> f32 {
+    DEFAULT_BOTTOM_PANEL_HEIGHT
 }
 
 /// Explicit trait choices remembered for one provider model.
@@ -232,10 +241,14 @@ struct AppState {
     sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     right_panel_visible: bool,
+    #[serde(default = "default_bottom_panel_visibility")]
+    bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
+    #[serde(default = "default_bottom_panel_height")]
+    bottom_panel_height: f32,
 }
 
 /// The complete in-memory model hydrated from settings, app state, and SQLite.
@@ -272,10 +285,14 @@ pub struct PersistedState {
     pub sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     pub right_panel_visible: bool,
+    #[serde(default = "default_bottom_panel_visibility")]
+    pub bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
+    #[serde(default = "default_bottom_panel_height")]
+    pub bottom_panel_height: f32,
     #[serde(default = "default_computer_use_enabled")]
     pub computer_use_enabled: bool,
     #[serde(default)]
@@ -385,8 +402,10 @@ impl PersistedState {
             language: AppLanguage::default(),
             sidebar_visible: true,
             right_panel_visible: false,
+            bottom_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
+            bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
             computer_use_enabled: false,
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
@@ -506,8 +525,10 @@ impl PersistedState {
             remembered_model_traits: self.remembered_model_traits.clone(),
             sidebar_visible: self.sidebar_visible,
             right_panel_visible: self.right_panel_visible,
+            bottom_panel_visible: self.bottom_panel_visible,
             sidebar_width: self.sidebar_width,
             right_panel_width: self.right_panel_width,
+            bottom_panel_height: self.bottom_panel_height,
         }
     }
 
@@ -538,8 +559,10 @@ impl PersistedState {
         self.remembered_model_traits = app_state.remembered_model_traits;
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
+        self.bottom_panel_visible = app_state.bottom_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
         self.right_panel_width = app_state.right_panel_width;
+        self.bottom_panel_height = app_state.bottom_panel_height;
     }
 
     /// A session only earns a row once it has started; drafts stay in memory.

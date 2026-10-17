@@ -36,6 +36,8 @@ menu.toggle_sidebar:
   en: Toggle Sidebar
 menu.toggle_right_panel:
   en: Toggle Right Panel
+menu.toggle_bottom_panel:
+  en: Toggle Bottom Panel
 menu.focus_composer:
   en: Focus Composer
 menu.toggle_model_picker:
@@ -112,6 +114,10 @@ command_palette.show_right_panel:
   en: Show right panel
 command_palette.hide_right_panel:
   en: Hide right panel
+command_palette.show_bottom_panel:
+  en: Show bottom panel
+command_palette.hide_bottom_panel:
+  en: Hide bottom panel
 command_palette.current:
   en: Current
 command_palette.you:
@@ -1493,6 +1499,10 @@ right_panel.hide:
   en: Hide right panel
 right_panel.close_tab:
   en: Close %{title}
+bottom_panel.toggle:
+  en: Toggle bottom panel
+bottom_panel.resize:
+  en: Resize bottom panel
 
 open_in.open:
   en: Open project in %{app}

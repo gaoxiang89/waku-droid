@@ -1328,7 +1328,7 @@ mod tests {
             .expect("review render fn");
         let body = &source[start + 1..];
         let end = body
-            .find("\n    fn render_right_panel_empty_message(")
+            .find("\n    pub(super) fn render_right_panel_empty_message(")
             .expect("review render end");
         let body = &body[..end];
 
@@ -4327,7 +4327,7 @@ impl Waku {
         }
     }
 
-    fn render_right_panel_empty_message(
+    pub(super) fn render_right_panel_empty_message(
         &self,
         title: String,
         description: String,

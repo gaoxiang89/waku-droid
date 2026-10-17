@@ -18,6 +18,7 @@ menu.view: 显示
 menu.command_palette: 命令面板…
 menu.toggle_sidebar: 显示或隐藏侧边栏
 menu.toggle_right_panel: 显示或隐藏右侧面板
+menu.toggle_bottom_panel: 显示或隐藏底部面板
 menu.focus_composer: 将焦点移到输入框
 menu.toggle_model_picker: 打开或关闭模型选择器
 menu.toggle_usage_panel: 打开或关闭用量面板
@@ -55,6 +56,8 @@ command_palette.show_sidebar: 显示侧边栏
 command_palette.hide_sidebar: 隐藏侧边栏
 command_palette.show_right_panel: 显示右侧面板
 command_palette.hide_right_panel: 隐藏右侧面板
+command_palette.show_bottom_panel: 显示底部面板
+command_palette.hide_bottom_panel: 隐藏底部面板
 command_palette.current: 当前
 command_palette.you: 你
 command_palette.agent: 智能体
@@ -729,6 +732,8 @@ right_panel.tabs: 右侧面板标签页
 right_panel.add_tab: 添加面板标签页
 right_panel.hide: 隐藏右侧面板
 right_panel.close_tab: 关闭%{title}
+bottom_panel.toggle: 显示或隐藏底部面板
+bottom_panel.resize: 调整底部面板高度
 open_in.open: 用%{app}打开项目
 open_in.choose: 选择打开项目的应用…
 environment.title: 环境

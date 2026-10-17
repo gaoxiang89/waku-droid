@@ -31,6 +31,9 @@ impl Waku {
         let (strip_left, strip_width) = match target {
             PanelResizeTarget::RightPanel => (-7.0, 8.0),
             PanelResizeTarget::Sidebar | PanelResizeTarget::FileTree => (-5.0, 10.0),
+            // The bottom panel's edge is horizontal, so it renders its own
+            // handle; this vertical bar is never built for it.
+            PanelResizeTarget::BottomPanel => (-5.0, 10.0),
         };
         div()
             .id(id)
@@ -72,15 +75,20 @@ struct PanelFrame {
     /// Width each panel lays its content out at, sliding or not.
     sidebar_content: f32,
     right_panel_content: f32,
+    /// Height the bottom panel lays its content out at, sliding or not.
+    bottom_panel_content: f32,
     /// Width each panel occupies on screen: the eased slide while one runs.
     sidebar: f32,
     right_panel: f32,
+    /// Height the bottom panel occupies on screen this frame.
+    bottom_panel: f32,
     /// Which edge is mid-slide. The clip that keeps a sliding panel inside its
     /// narrowing container also cuts whatever that panel draws outside its own
     /// bounds — the right panel's resize handle sits entirely left of its edge
     /// — so each clip only goes on while its own panel is actually moving.
     sidebar_sliding: bool,
     right_panel_sliding: bool,
+    bottom_panel_sliding: bool,
     /// An edge is still moving, so the frame loop has to keep going.
     sliding: bool,
 }
@@ -105,7 +113,9 @@ impl Waku {
     /// [`WakuPane::bind`]) and lets the cached-view geometry checks decide
     /// which islands a slide tick actually rebuilds.
     pub(super) fn panels_sliding(&self) -> bool {
-        self.sidebar_slide.is_some() || self.right_panel_slide.is_some()
+        self.sidebar_slide.is_some()
+            || self.right_panel_slide.is_some()
+            || self.bottom_panel_slide.is_some()
     }
 
     /// Settle both panel slides for this frame and publish the widths the
@@ -118,6 +128,7 @@ impl Waku {
             // see; reopening the workspace finds the panels where they belong.
             self.sidebar_slide = None;
             self.right_panel_slide = None;
+            self.bottom_panel_slide = None;
         }
         let (sidebar_content, right_panel_content) = self.effective_panel_widths(window);
         let sidebar = slide_width(
@@ -136,8 +147,18 @@ impl Waku {
                 0.0
             },
         );
+        let bottom_panel_content = self.effective_bottom_panel_height(window);
+        let bottom_panel = slide_width(
+            &mut self.bottom_panel_slide,
+            if self.bottom_panel_visible {
+                bottom_panel_content
+            } else {
+                0.0
+            },
+        );
         self.sidebar_rendered_width = sidebar;
         self.right_panel_rendered_width = right_panel;
+        self.bottom_panel_rendered_height = bottom_panel;
         let sliding = self.panels_sliding();
         if was_sliding && !sliding {
             // The observer gate held root-state fan-out away from any island
@@ -150,10 +171,13 @@ impl Waku {
         PanelFrame {
             sidebar_content,
             right_panel_content,
+            bottom_panel_content,
             sidebar,
             right_panel,
+            bottom_panel,
             sidebar_sliding: self.sidebar_slide.is_some(),
             right_panel_sliding: self.right_panel_slide.is_some(),
+            bottom_panel_sliding: self.bottom_panel_slide.is_some(),
             sliding,
         }
     }
@@ -293,6 +317,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
+            .on_action(cx.listener(Self::toggle_bottom_panel_action))
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::open_resume_picker_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))
@@ -374,6 +399,37 @@ impl Render for Waku {
                         element
                             .children(self.render_queued_messages(cx))
                             .child(self.render_composer(window, cx))
+                            // The bottom panel sits between the composer and
+                            // the workspace footer. It slides through the same
+                            // narrowing-container trick as the side panels,
+                            // flipped: the content stays pinned to the column's
+                            // bottom edge and only the clip moves.
+                            .when(panels.bottom_panel > 0.0, |element| {
+                                element.child(
+                                    div()
+                                        .w_full()
+                                        .flex_none()
+                                        .h(px(panels.bottom_panel))
+                                        .relative()
+                                        .when(panels.bottom_panel_sliding, |element| {
+                                            element.overflow_hidden()
+                                        })
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .w_full()
+                                                .h(px(panels.bottom_panel_content))
+                                                .child(self.render_bottom_panel(
+                                                    panels.bottom_panel_content,
+                                                    self.chat_viewport_width(window),
+                                                    window,
+                                                    cx,
+                                                )),
+                                        ),
+                                )
+                            })
                             .child(self.render_workspace_footer(cx))
                     })
                     .relative()
