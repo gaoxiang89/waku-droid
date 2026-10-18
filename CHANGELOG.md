@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.22]
+
+- Serve in-app updates from this fork's own GitHub releases on every platform: the macOS, Windows, and Linux feeds and signed downloads now resolve against `gaoxiang89/waku-droid` release assets, with the Linux updater pinning enclosure URLs to that repository's downloads
+- This release also carries everything listed under 0.1.21 below, which this fork never published
+
 ## [0.1.21]
 
 - Manage files from the right panel's file list on any host: right-click a file to download it to your machine, rename files and folders inline, or delete them after a confirmation — including over WSL and SSH
