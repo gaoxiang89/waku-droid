@@ -68,10 +68,11 @@ use crate::ui::{
 use crate::{
     CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
     FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
-    OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, ReplaceAllMatches, SaveFile,
-    SelectFirstTask, SelectLastTask, SwitchTaskBackward, SwitchTaskForward, ToggleBottomPanel,
-    ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord,
-    ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings,
+    PreviousTerminal, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
+    SwitchTaskBackward, SwitchTaskForward, ToggleBottomPanel, ToggleCommandPalette,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -1520,10 +1521,15 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
-    /// The bottom panel's terminal, or `None` while the panel has never been
-    /// opened for the current workspace.
-    bottom_panel_terminal: Option<Entity<TerminalView>>,
-    /// The panel was just opened; the next render moves focus into the terminal.
+    /// The bottom panel's terminals, in tab order. They outlive workspace
+    /// switches: each keeps the directory and host it was opened with, and
+    /// only closing its tab (or quitting) ends the process.
+    bottom_panel_terminals: Vec<Entity<TerminalView>>,
+    bottom_panel_active_terminal: Option<usize>,
+    bottom_panel_tabs_scroll_handle: ScrollHandle,
+    bottom_panel_pending_tab_reveal: Option<usize>,
+    /// The panel was just opened or switched tabs; the next render moves
+    /// focus into the active terminal.
     bottom_panel_pending_terminal_focus: bool,
     /// A Browser surface was just opened; the next right panel render moves
     /// focus into its address bar.
@@ -3093,7 +3099,10 @@ impl Waku {
                 right_panel_width,
                 bottom_panel_visible,
                 bottom_panel_height,
-                bottom_panel_terminal: None,
+                bottom_panel_terminals: Vec::new(),
+                bottom_panel_active_terminal: None,
+                bottom_panel_tabs_scroll_handle: ScrollHandle::new(),
+                bottom_panel_pending_tab_reveal: None,
                 bottom_panel_pending_terminal_focus: false,
                 sidebar_slide: None,
                 right_panel_slide: None,

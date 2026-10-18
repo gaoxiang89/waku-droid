@@ -38,6 +38,8 @@ menu.toggle_right_panel:
   en: Toggle Right Panel
 menu.toggle_bottom_panel:
   en: Toggle Bottom Panel
+menu.new_terminal:
+  en: New Terminal
 menu.focus_composer:
   en: Focus Composer
 menu.toggle_model_picker:
@@ -118,6 +120,8 @@ command_palette.show_bottom_panel:
   en: Show bottom panel
 command_palette.hide_bottom_panel:
   en: Hide bottom panel
+command_palette.new_terminal:
+  en: New terminal
 command_palette.current:
   en: Current
 command_palette.you:
@@ -1519,6 +1523,12 @@ bottom_panel.toggle:
   en: Toggle bottom panel
 bottom_panel.resize:
   en: Resize bottom panel
+bottom_panel.new_terminal:
+  en: New terminal
+bottom_panel.tabs:
+  en: Terminal tabs
+bottom_panel.close_tab:
+  en: Close %{title}
 
 open_in.open:
   en: Open project in %{app}

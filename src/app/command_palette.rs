@@ -160,6 +160,7 @@ enum PaletteAction {
     ToggleSidebar,
     ToggleRightPanel,
     ToggleBottomPanel,
+    NewTerminal,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
 }
@@ -818,6 +819,15 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⌘J", "Ctrl+J")),
                 PaletteAction::ToggleBottomPanel,
                 "toggle show hide bottom panel terminal shell console",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.new_terminal"),
+                "icons/terminal.svg",
+                Some(crate::platform::primary_shortcut("⇧⌘J", "Ctrl+Shift+J")),
+                PaletteAction::NewTerminal,
+                "new create terminal shell console bottom panel tab",
                 next(),
             ),
         ]);
@@ -1622,6 +1632,7 @@ impl Waku {
             PaletteAction::ToggleBottomPanel => {
                 self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
             }
+            PaletteAction::NewTerminal => self.new_terminal_action(&NewTerminal, window, cx),
             PaletteAction::OpenSettings(page) => {
                 self.open_settings_action(&OpenSettings, window, cx);
                 self.open_settings_page(page, cx);

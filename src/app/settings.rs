@@ -110,6 +110,7 @@ impl Waku {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
+            .on_action(cx.listener(Self::new_terminal_action))
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))
             .on_action(cx.listener(Self::navigate_back_action))
@@ -2655,6 +2656,9 @@ impl Waku {
             browser.update(cx, |browser, cx| browser.refresh_localized_text(cx));
         }
         for terminal in self.right_panel_terminals.values() {
+            terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
+        }
+        for terminal in &self.bottom_panel_terminals {
             terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
         }
         for probe in &mut self.probes {

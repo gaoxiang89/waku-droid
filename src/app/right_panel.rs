@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
+pub(super) const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
 const REVIEW_DIFF_FILE_HEADER_HEIGHT: f32 = 36.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -956,9 +956,17 @@ fn reusable_surface_index(
 }
 
 #[derive(Clone, Copy)]
-enum TabScrollFadeSide {
+pub(super) enum TabScrollFadeSide {
     Left,
     Right,
+}
+
+/// Which panel a tab scroll helper addresses; the two panels keep separate
+/// pending-reveal state.
+#[derive(Clone, Copy)]
+pub(super) enum PanelTabs {
+    RightPanel,
+    BottomPanel,
 }
 
 fn tab_scroll_fade_visibility(offset_x: Pixels, max_offset: Pixels) -> (bool, bool) {
@@ -987,10 +995,11 @@ fn fade_safe_tab_offset(
     offset.clamp(-max_offset, px(0.0))
 }
 
-fn tab_scroll_reveal_guard(
+pub(super) fn tab_scroll_reveal_guard(
     scroll_handle: ScrollHandle,
     tab_index: usize,
     waku: WeakEntity<Waku>,
+    panel: PanelTabs,
 ) -> impl IntoElement {
     canvas(
         move |_, window, _| {
@@ -1012,8 +1021,12 @@ fn tab_scroll_reveal_guard(
 
             window.on_next_frame(move |_, cx| {
                 let _ = waku.update(cx, |this, cx| {
-                    if this.right_panel_pending_tab_reveal == Some(tab_index) {
-                        this.right_panel_pending_tab_reveal = None;
+                    let pending = match panel {
+                        PanelTabs::RightPanel => &mut this.right_panel_pending_tab_reveal,
+                        PanelTabs::BottomPanel => &mut this.bottom_panel_pending_tab_reveal,
+                    };
+                    if *pending == Some(tab_index) {
+                        *pending = None;
                         cx.notify();
                     }
                 });
@@ -1025,7 +1038,7 @@ fn tab_scroll_reveal_guard(
     .size_full()
 }
 
-fn tab_scroll_fade(
+pub(super) fn tab_scroll_fade(
     scroll_handle: ScrollHandle,
     side: TabScrollFadeSide,
     surface: Hsla,
@@ -2102,6 +2115,8 @@ impl Waku {
         cx.notify();
     }
 
+    /// ⌘W converges layer by layer: the right panel's tab first, then the
+    /// bottom panel's terminal, and only then the window itself.
     pub(super) fn close_window_or_right_panel_tab_action(
         &mut self,
         _: &CloseWindow,
@@ -2111,6 +2126,12 @@ impl Waku {
         if let Some(active) = self.right_panel_active_surface {
             self.close_right_panel_surface(active, cx);
             if self.right_panel_surfaces.is_empty() {
+                let focus_handle = self.composer_focus(cx);
+                window.focus(&focus_handle, cx);
+            }
+        } else if let Some(active) = self.bottom_panel_active_terminal {
+            self.close_bottom_panel_terminal(active, cx);
+            if self.bottom_panel_terminals.is_empty() {
                 let focus_handle = self.composer_focus(cx);
                 window.focus(&focus_handle, cx);
             }
@@ -2515,6 +2536,7 @@ impl Waku {
                             self.right_panel_tabs_scroll_handle.clone(),
                             tab_index,
                             cx.entity().downgrade(),
+                            PanelTabs::RightPanel,
                         ))
                     })
                     .child(tab_scroll_fade(

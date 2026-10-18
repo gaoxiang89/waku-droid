@@ -1,4 +1,11 @@
+use super::right_panel::{
+    PanelTabs, TAB_SCROLL_FADE_WIDTH, TabScrollFadeSide, tab_scroll_fade, tab_scroll_reveal_guard,
+};
 use super::*;
+
+/// Height of the tab strip that owns the panel's chrome — the same 34 px the
+/// terminal's built-in toolbar occupied, so the grid keeps every pixel it had.
+const BOTTOM_PANEL_TAB_STRIP_HEIGHT: f32 = 34.0;
 
 impl Waku {
     /// The header toggle. Mirrors the right panel's toggle in size and
@@ -28,10 +35,11 @@ impl Waku {
             }))
     }
 
-    /// The panel is nothing but the terminal: `TerminalView` carries its own
-    /// toolbar (status, title, working directory), and the window header's
-    /// always-visible toggle is the mouse way out. The resize handle along the
-    /// top edge rides along as an overlay.
+    /// One terminal per tab behind a 34 px strip that replaces the terminal's
+    /// own toolbar; the strip carries what the toolbar did (status, title) per
+    /// tab. Terminals outlive workspace switches — each keeps the directory
+    /// and host it was opened with, and only closing its tab ends the process.
+    /// The resize handle along the top edge rides along as an overlay.
     pub(super) fn render_bottom_panel(
         &mut self,
         height: f32,
@@ -41,24 +49,34 @@ impl Waku {
     ) -> Stateful<Div> {
         self.ensure_bottom_panel_terminal(cx);
         if self.bottom_panel_pending_terminal_focus
-            && let Some(terminal) = self.bottom_panel_terminal.clone()
+            && let Some(terminal) = self.active_bottom_panel_terminal().cloned()
         {
             let focus_handle = terminal.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             self.bottom_panel_pending_terminal_focus = false;
         }
-        let body = match self.bottom_panel_terminal.clone() {
+        let body = match self.active_bottom_panel_terminal().cloned() {
             Some(terminal) => {
                 terminal.update(cx, |terminal, _| {
                     terminal.set_panel_width(width);
-                    terminal.set_panel_height(height);
+                    terminal
+                        .set_panel_height((height - BOTTOM_PANEL_TAB_STRIP_HEIGHT).max(0.0));
                 });
-                terminal.into_any_element()
+                div()
+                    .id("bottom-panel-body")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_bottom_panel_tab_strip(cx))
+                    .child(terminal)
+                    .into_any_element()
             }
             None => self
                 .render_right_panel_empty_message(
                     tr!("right_panel.terminal_unavailable"),
-                    tr!("right_panel.terminal_unavailable_description"),
+                    tr!("terminal.no_workspace_description"),
                     cx,
                 )
                 .into_any_element(),
@@ -76,6 +94,177 @@ impl Waku {
             .relative()
             .child(body)
             .child(self.render_bottom_panel_resize_handle(cx))
+    }
+
+    /// The tab strip: one tab per terminal (status dot, label, close) plus the
+    /// new-terminal button, laid out like the right panel's tab row —
+    /// scrollable with edge fades when tabs overflow.
+    fn render_bottom_panel_tab_strip(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let active = self.bottom_panel_active_terminal;
+        let mut tabs = div()
+            .id("bottom-panel-tabs")
+            .h_full()
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .overflow_x_scroll()
+            .track_scroll(&self.bottom_panel_tabs_scroll_handle);
+        for (index, terminal) in self.bottom_panel_terminals.iter().enumerate() {
+            let is_active = active == Some(index);
+            let terminal = terminal.read(cx);
+            let exited = terminal.exited();
+            let label = bottom_panel_tab_label(terminal.title(), terminal.working_directory());
+            let close_weak = cx.entity().downgrade();
+            let activate_weak = cx.entity().downgrade();
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("bottom-panel-tab-{index}")))
+                    .h(px(26.0))
+                    .min_w(px(90.0))
+                    .max_w(px(160.0))
+                    .px(px(8.0))
+                    .rounded(px(6.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_default()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .when(is_active, |element| element.bg(theme.overlay_strong))
+                    .when(!is_active, |element| {
+                        element.hover(|element| element.bg(theme.overlay))
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "bottom-panel-tab-status-{index}"
+                            )))
+                            .size(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(if exited {
+                                theme.danger
+                            } else {
+                                theme.accent
+                            })
+                            .when(exited, |element| {
+                                element.tooltip(|window, cx| {
+                                    Tooltip::new(tr!("terminal.process_exited"))
+                                        .build(window, cx)
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(sp(12.5))
+                            .text_color(if is_active {
+                                theme.text
+                            } else {
+                                theme.text_secondary
+                            })
+                            .child(SharedString::from(label.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "close-bottom-panel-tab-{index}"
+                            )))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(4.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|element| element.bg(theme.overlay_strong))
+                            .child(icon("icons/x.svg", 10.0, theme.text_tertiary))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tr!("bottom_panel.close_tab", title = label))
+                                    .build(window, cx)
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = close_weak.update(cx, |this, cx| {
+                                    this.close_bottom_panel_terminal(index, cx);
+                                });
+                            }),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = activate_weak.update(cx, |this, cx| {
+                            this.activate_bottom_panel_terminal(index, cx);
+                        });
+                    }),
+            );
+        }
+        tabs = tabs.child(div().w(px(TAB_SCROLL_FADE_WIDTH)).h(px(1.0)).flex_none());
+
+        let new_terminal_weak = cx.entity().downgrade();
+        div()
+            .id("bottom-panel-tab-strip")
+            .h(px(BOTTOM_PANEL_TAB_STRIP_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(6.0))
+            .pr(px(8.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .child(
+                div()
+                    .relative()
+                    .h_full()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(tabs)
+                    .when_some(self.bottom_panel_pending_tab_reveal, |element, tab_index| {
+                        element.child(tab_scroll_reveal_guard(
+                            self.bottom_panel_tabs_scroll_handle.clone(),
+                            tab_index,
+                            cx.entity().downgrade(),
+                            PanelTabs::BottomPanel,
+                        ))
+                    })
+                    .child(tab_scroll_fade(
+                        self.bottom_panel_tabs_scroll_handle.clone(),
+                        TabScrollFadeSide::Left,
+                        theme.surface,
+                    ))
+                    .child(tab_scroll_fade(
+                        self.bottom_panel_tabs_scroll_handle.clone(),
+                        TabScrollFadeSide::Right,
+                        theme.surface,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        icon_button("new-bottom-panel-terminal", "icons/plus.svg", theme)
+                            .tooltip(|window, cx| {
+                                Tooltip::new(tr!("bottom_panel.new_terminal"))
+                                    .build(window, cx)
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = new_terminal_weak.update(cx, |this, cx| {
+                                    this.open_bottom_panel_terminal(cx);
+                                });
+                            }),
+                    ),
+            )
     }
 
     /// The bar along the panel's top edge. It straddles the edge the way the
@@ -119,32 +308,215 @@ impl Waku {
             )
     }
 
-    /// Keep exactly one terminal, recreated when the selected workspace moves
-    /// to another directory or host — same contract as the right panel's
-    /// per-surface terminals.
+    fn active_bottom_panel_terminal(&self) -> Option<&Entity<TerminalView>> {
+        self.bottom_panel_active_terminal
+            .and_then(|index| self.bottom_panel_terminals.get(index))
+    }
+
+    /// Show the panel with a fresh terminal — the `+` button, shortcut, and
+    /// palette all funnel here. With no terminals open this just bootstraps
+    /// the first one; with no workspace selected the panel opens empty.
+    pub(super) fn open_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.bottom_panel_terminals.is_empty() {
+            self.ensure_bottom_panel_terminal(cx);
+        } else if let Some(working_directory) = self.selected_workspace_path() {
+            let working_directory = working_directory.to_path_buf();
+            self.bottom_panel_terminals
+                .push(self.new_bottom_panel_terminal(&working_directory, cx));
+            self.bottom_panel_active_terminal = Some(self.bottom_panel_terminals.len() - 1);
+        }
+        if let Some(active) = self.bottom_panel_active_terminal {
+            self.reveal_bottom_panel_tab(active);
+            self.bottom_panel_pending_terminal_focus = true;
+        }
+        self.set_bottom_panel_visible(true, cx);
+        cx.notify();
+    }
+
+    /// Create the panel's first terminal when none exists. Existing terminals
+    /// are never recreated or dropped here: they belong to the workspace they
+    /// were opened in and die only when their tab closes.
     pub(super) fn ensure_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
-        let Some(working_directory) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
-            self.bottom_panel_terminal = None;
+        if !self.bottom_panel_terminals.is_empty() {
+            return;
+        }
+        let Some(working_directory) = self.selected_workspace_path() else {
             return;
         };
-        let matches_project = self
-            .bottom_panel_terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).working_directory() == working_directory);
-        if !matches_project {
-            // A desktop PTY would interpret a remote daemon's working
-            // directory on the wrong machine, so remote windows run the shell
-            // on the daemon host.
-            let launcher = if self.selected_daemon().is_remote() {
-                crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
-            } else {
-                crate::terminal::TerminalLauncher::Local
-            };
-            self.bottom_panel_terminal =
-                Some(cx.new(|cx| TerminalView::new(working_directory.clone(), launcher, cx)));
+        let working_directory = working_directory.to_path_buf();
+        self.bottom_panel_terminals
+            .push(self.new_bottom_panel_terminal(&working_directory, cx));
+        self.bottom_panel_active_terminal = Some(0);
+    }
+
+    fn new_bottom_panel_terminal(
+        &self,
+        working_directory: &Path,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
+        // A desktop PTY would interpret a remote daemon's working directory on
+        // the wrong machine, so remote windows run the shell on the daemon
+        // host.
+        let launcher = if self.selected_daemon().is_remote() {
+            crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
+        } else {
+            crate::terminal::TerminalLauncher::Local
+        };
+        cx.new(|cx| {
+            TerminalView::new(working_directory.to_path_buf(), launcher, cx)
+                .with_bottom_panel_tabs()
+        })
+    }
+
+    fn activate_bottom_panel_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.bottom_panel_terminals.len() {
+            return;
         }
+        self.bottom_panel_active_terminal = Some(index);
+        self.reveal_bottom_panel_tab(index);
+        self.bottom_panel_pending_terminal_focus = true;
+        cx.notify();
+    }
+
+    fn reveal_bottom_panel_tab(&mut self, index: usize) {
+        self.bottom_panel_pending_tab_reveal = Some(index);
+        self.bottom_panel_tabs_scroll_handle.scroll_to_item(index);
+    }
+
+    /// Close one terminal's tab. Dropping the entity is what shuts the PTY
+    /// down, locally and on a remote daemon alike. Closing the last tab hides
+    /// the panel, the way the right panel does.
+    pub(super) fn close_bottom_panel_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.bottom_panel_terminals.len() {
+            return;
+        }
+        self.bottom_panel_terminals.remove(index);
+        self.bottom_panel_active_terminal = active_index_after_close(
+            index,
+            self.bottom_panel_active_terminal,
+            self.bottom_panel_terminals.len(),
+        );
+        match self.bottom_panel_active_terminal {
+            Some(active) => {
+                self.reveal_bottom_panel_tab(active);
+                self.bottom_panel_pending_terminal_focus = true;
+            }
+            None => {
+                self.bottom_panel_pending_tab_reveal = None;
+                self.bottom_panel_pending_terminal_focus = false;
+                self.set_bottom_panel_visible(false, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cycle tabs for ctrl+pageup/pagedown, wrapping around the ends.
+    pub(super) fn cycle_bottom_panel_terminal(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let len = self.bottom_panel_terminals.len();
+        if len == 0 {
+            return;
+        }
+        let active = self.bottom_panel_active_terminal.unwrap_or(0) as i32;
+        let next = (active + delta).rem_euclid(len as i32) as usize;
+        self.activate_bottom_panel_terminal(next, cx);
+    }
+
+    pub(super) fn new_terminal_action(
+        &mut self,
+        _: &NewTerminal,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_bottom_panel_terminal(cx);
+    }
+
+    pub(super) fn next_terminal_action(
+        &mut self,
+        _: &NextTerminal,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_bottom_panel_terminal(1, cx);
+    }
+
+    pub(super) fn previous_terminal_action(
+        &mut self,
+        _: &PreviousTerminal,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_bottom_panel_terminal(-1, cx);
+    }
+}
+
+/// Where the active index lands after closing tab `closed` from a list that
+/// now holds `remaining` tabs — same fixup the right panel applies to its
+/// surfaces.
+fn active_index_after_close(
+    closed: usize,
+    active: Option<usize>,
+    remaining: usize,
+) -> Option<usize> {
+    if remaining == 0 {
+        return None;
+    }
+    Some(match active {
+        Some(active) if active > closed => active - 1,
+        Some(active) if active == closed => closed.saturating_sub(1).min(remaining - 1),
+        Some(active) => active.min(remaining - 1),
+        None => 0,
+    })
+}
+
+/// The shell's OSC title once it sets one; the working directory's basename
+/// until then — the part that tells several terminals of one workspace apart.
+fn bottom_panel_tab_label(title: &str, working_directory: &Path) -> String {
+    let title = title.trim();
+    if !title.is_empty() && title != tr!("right_panel.terminal") {
+        return single_line_label(title);
+    }
+    let directory = working_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if directory.is_empty() {
+        tr!("right_panel.terminal")
+    } else {
+        single_line_label(directory)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_index_survives_closing_any_tab() {
+        // Closing a tab after the active one pulls the active index in.
+        assert_eq!(active_index_after_close(0, Some(2), 2), Some(1));
+        // Closing the active tab steps back to the previous one, the way the
+        // right panel does; at the start of the row it stays on position 0.
+        assert_eq!(active_index_after_close(1, Some(1), 2), Some(0));
+        assert_eq!(active_index_after_close(2, Some(2), 2), Some(1));
+        assert_eq!(active_index_after_close(0, Some(0), 2), Some(0));
+        // Closing the only tab empties the panel.
+        assert_eq!(active_index_after_close(0, Some(0), 0), None);
+        // No active tab degenerates to the first one.
+        assert_eq!(active_index_after_close(1, None, 2), Some(0));
+    }
+
+    #[test]
+    fn tab_label_prefers_title_then_directory() {
+        // A shell-set OSC title wins.
+        assert_eq!(
+            bottom_panel_tab_label("cargo build", Path::new("/proj/waku")),
+            "cargo build"
+        );
+        // Without one, the workspace's basename tells tabs apart.
+        assert_eq!(bottom_panel_tab_label("Terminal", Path::new("/proj/waku")), "waku");
+        assert_eq!(bottom_panel_tab_label("", Path::new("/proj/waku")), "waku");
+        // A directory without a basename falls back to the generic label.
+        let fallback = bottom_panel_tab_label("", Path::new("/"));
+        assert_eq!(fallback, tr!("right_panel.terminal"));
     }
 }

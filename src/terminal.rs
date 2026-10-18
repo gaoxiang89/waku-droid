@@ -26,7 +26,7 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextRun,
-    UnderlineStyle, Window, canvas, div, font, px, rgb,
+    UnderlineStyle, Window, canvas, div, font, prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -904,6 +904,11 @@ pub struct TerminalView {
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
     context_menu: ContextMenuHandle,
+    /// The bottom panel hosts this terminal behind its own tab strip: the
+    /// built-in toolbar is dropped (the tab carries status and title) and
+    /// ctrl+pageup/pagedown cycle the panel's terminals instead of reaching
+    /// the shell.
+    bottom_panel_tabs: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -971,12 +976,29 @@ impl TerminalView {
             cursor_blink,
             cursor_focus_tracking_started: false,
             context_menu,
+            bottom_panel_tabs: false,
             _subscriptions: subscriptions,
         }
     }
 
+    /// Let the bottom panel's tab strip own this terminal's chrome.
+    pub fn with_bottom_panel_tabs(mut self) -> Self {
+        self.bottom_panel_tabs = true;
+        self
+    }
+
     pub fn working_directory(&self) -> &Path {
         &self.working_directory
+    }
+
+    /// The shell's OSC title, or the localized default while the shell has
+    /// not set one.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn exited(&self) -> bool {
+        self.exited
     }
 
     pub fn set_panel_width(&mut self, width: f32) {
@@ -1023,6 +1045,19 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.pause_cursor_blink(cx);
         let keystroke = &event.keystroke;
+        // The bottom panel's terminals leave ctrl+pageup/pagedown unhandled so
+        // the panel's tab-cycle key bindings (bound in the `Terminal` context)
+        // receive them instead of the shell.
+        if self.bottom_panel_tabs
+            && keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.shift
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function
+            && matches!(keystroke.key.as_str(), "pageup" | "pagedown")
+        {
+            return;
+        }
         if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
             && keystroke.key.eq_ignore_ascii_case("c")
         {
@@ -1339,9 +1374,14 @@ impl Render for TerminalView {
         let selection_color = theme.selection;
         let viewport = window.viewport_size();
         let panel_width = self.panel_width;
+        let toolbar_height = if self.bottom_panel_tabs {
+            0.0
+        } else {
+            TERMINAL_TOOLBAR_HEIGHT
+        };
         let body_height = match self.panel_height {
-            Some(height) => (height - TERMINAL_TOOLBAR_HEIGHT).max(120.0),
-            None => (f32::from(viewport.height) - 48.0 - TERMINAL_TOOLBAR_HEIGHT).max(120.0),
+            Some(height) => (height - toolbar_height).max(120.0),
+            None => (f32::from(viewport.height) - 48.0 - toolbar_height).max(120.0),
         };
         // The rows are laid out by `StyledText` at the font's own advance, so
         // the grid must be sized from that same measured advance or the text
@@ -1573,45 +1613,47 @@ impl Render for TerminalView {
             .flex()
             .flex_col()
             .bg(theme.terminal)
-            .child(
-                div()
-                    .h(px(TERMINAL_TOOLBAR_HEIGHT))
-                    .flex_none()
-                    .px(px(10.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface)
-                    .child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .bg(if self.exited {
-                                theme.danger
-                            } else {
-                                theme.accent
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(sp(12.5))
-                            .text_color(theme.text_secondary)
-                            .child(SharedString::from(title.to_owned())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(sp(12.5))
-                            .text_color(theme.text_tertiary)
-                            .child(directory),
-                    ),
-            )
+            .when(!self.bottom_panel_tabs, |element| {
+                element.child(
+                    div()
+                        .h(px(TERMINAL_TOOLBAR_HEIGHT))
+                        .flex_none()
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface)
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded_full()
+                                .bg(if self.exited {
+                                    theme.danger
+                                } else {
+                                    theme.accent
+                                }),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_secondary)
+                                .child(SharedString::from(title.to_owned())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(directory),
+                        ),
+                )
+            })
             .child(grid)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
