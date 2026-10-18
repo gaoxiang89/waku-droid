@@ -406,6 +406,11 @@ jobs:
     if: needs.version.outputs.published != 'true'
     runs-on: macos-latest
     timeout-minutes: 90
+    env:
+      # The secrets context is unavailable in step `if`, so these flags
+      # carry the presence checks for the optional signing steps below.
+      HAVE_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAVE_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -432,7 +437,7 @@ jobs:
       - name: Import Apple Developer Certificate
         # Fork builds may not configure an Apple signing certificate; the
         # Release step below falls back to ad-hoc codesign in that case.
-        if: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        if: env.HAVE_APPLE_CERTIFICATE == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -450,7 +455,7 @@ jobs:
 
       - name: Store notary credentials
         # Notarization needs Apple ID credentials; skipped for fork builds.
-        if: ${{ secrets.APPLE_ID != '' }}
+        if: env.HAVE_APPLE_ID == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
