@@ -2146,6 +2146,10 @@ pub struct UserInputOption {
     pub description: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
@@ -2156,6 +2160,13 @@ pub struct UserInputQuestion {
     pub options: Vec<UserInputOption>,
     #[serde(default)]
     pub multi_select: bool,
+    /// An empty answer is a valid reply. The provider omits the field.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    /// Free text is an answer of its own. Enumerated and boolean questions
+    /// leave this off so a typed string cannot replace a legal choice.
+    #[serde(default = "default_true")]
+    pub accepts_custom: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]

@@ -522,6 +522,7 @@ impl Waku {
             .collect::<HashSet<_>>();
         for id in &sessions {
             self.runtimes.remove(id);
+            self.clear_user_input_fields(*id);
             self.runtime_attach_pending.remove(id);
             self.session_hydrations.remove(id);
             self.response_fork_preparations.remove(id);

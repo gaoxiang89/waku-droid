@@ -19,7 +19,7 @@ use super::{
     should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
     task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
     transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
-    transcript_rows_fingerprint, widened_panel_width_for_file_editor,
+    transcript_rows_fingerprint, user_input_choice_label, widened_panel_width_for_file_editor,
     widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
@@ -41,6 +41,8 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
                 description: None,
             }],
             multi_select: false,
+            required: true,
+            accepts_custom: true,
         },
         UserInputQuestion {
             id: "notes".into(),
@@ -48,6 +50,8 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
             question: "Anything else?".into(),
             options: Vec::new(),
             multi_select: false,
+            required: false,
+            accepts_custom: true,
         },
     ];
     let mut pending = PendingUserInput::new("request-1".into(), questions);
@@ -66,6 +70,71 @@ fn structured_user_input_preserves_question_order_and_custom_answer_precedence()
     assert_eq!(answers[0].answers, ["Preview"]);
     assert_eq!(answers[1].question_id, "notes");
     assert_eq!(answers[1].answers, ["Use the EU region"]);
+    assert!(pending.ready_to_submit());
+    assert_eq!(
+        pending.transcript_record(),
+        "Environment\nPreview\n\nNotes\nUse the EU region"
+    );
+
+    pending.custom_answers.remove("notes");
+    pending.selections.remove("notes");
+    assert!(pending.ready_to_submit());
+    assert_eq!(pending.transcript_record(), "Environment\nPreview");
+    pending.selections.remove("environment");
+    assert!(!pending.ready_to_submit());
+
+    let mut locked = PendingUserInput::new(
+        "request-2".into(),
+        vec![UserInputQuestion {
+            id: "environment".into(),
+            header: "Environment".into(),
+            question: "Where should this deploy?".into(),
+            options: vec![UserInputOption {
+                label: "Preview".into(),
+                description: None,
+            }],
+            multi_select: false,
+            required: true,
+            accepts_custom: false,
+        }],
+    );
+    locked
+        .selections
+        .insert("environment".into(), vec!["Preview".into()]);
+    locked
+        .custom_answers
+        .insert("environment".into(), "typed".into());
+    assert_eq!(locked.answers()[0].answers, ["Preview"]);
+
+    let mut ship = PendingUserInput::new(
+        "request-3".into(),
+        vec![UserInputQuestion {
+            id: "ship".into(),
+            header: "Ship".into(),
+            question: "Ship it?".into(),
+            options: vec![
+                UserInputOption {
+                    label: "Yes".into(),
+                    description: None,
+                },
+                UserInputOption {
+                    label: "No".into(),
+                    description: None,
+                },
+            ],
+            multi_select: false,
+            required: true,
+            accepts_custom: false,
+        }],
+    );
+    assert!(!ship.ready_to_submit());
+    ship.selections.insert("ship".into(), vec!["Yes".into()]);
+    assert!(ship.ready_to_submit());
+    assert_eq!(user_input_choice_label("Preview"), "Preview");
+    assert_eq!(
+        ship.transcript_record(),
+        format!("Ship\n{}", user_input_choice_label("Yes"))
+    );
 }
 use gpui::{ListAlignment, ListState, Pixels, px};
 use std::{

@@ -2050,6 +2050,8 @@ fn codex_user_input_questions(params: &Value) -> Vec<UserInputQuestion> {
                 // this explicit lets the shared UI support providers that do
                 // ask for multiple choices without changing the wire shape.
                 multi_select: false,
+                required: true,
+                accepts_custom: true,
             })
         })
         .collect()

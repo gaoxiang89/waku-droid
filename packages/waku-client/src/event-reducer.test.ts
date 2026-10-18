@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { reduceRuntimeEvent } from './event-reducer'
+import { reduceRuntimeEvent, userInputAnswers, userInputReady, type PendingUserInput } from './event-reducer'
 import { activityDisclosureSections } from './transcript-presentation'
 import type { AgentSession, SequencedEvent } from './generated'
 
@@ -235,3 +235,83 @@ function runningSession(): AgentSession {
     ],
   }
 }
+
+describe('user input form', () => {
+  test('keeps every elicitation field and does not invent text for a choice', () => {
+    const requested = reduceRuntimeEvent(
+      runningSession(),
+      event('userInputRequested', {
+        requestId: 'question-request',
+        questions: [{
+          id: 'deployment',
+          header: 'Environment',
+          question: 'Where should this deploy?',
+          options: [{ label: 'Preview', description: 'Create a preview deployment' }],
+          multiSelect: false,
+        }, {
+          id: 'limit',
+          header: 'Limit',
+          question: 'How many?',
+          options: [],
+          multiSelect: false,
+          required: false,
+          acceptsCustom: true,
+        }, {
+          id: 'ship',
+          header: 'Ship',
+          question: 'Ship it?',
+          options: [{ label: 'Yes' }, { label: 'No' }],
+          multiSelect: false,
+          required: true,
+          acceptsCustom: false,
+        }],
+      }),
+      clock,
+    )
+
+    expect(requested.session.status).toBe('waiting')
+    expect(requested.userInput?.questions.map((question) => ({
+      id: question.id,
+      required: question.required,
+      acceptsCustom: question.acceptsCustom,
+    }))).toEqual([
+      { id: 'deployment', required: true, acceptsCustom: true },
+      { id: 'limit', required: false, acceptsCustom: true },
+      { id: 'ship', required: true, acceptsCustom: false },
+    ])
+
+    const input: PendingUserInput = {
+      requestId: 'form',
+      questions: [
+        {
+          id: 'scope',
+          header: 'Scope',
+          question: 'Which part?',
+          options: [{ label: 'Keep' }],
+          multiSelect: false,
+          required: true,
+          acceptsCustom: false,
+        },
+        {
+          id: 'limit',
+          header: 'Limit',
+          question: 'Limit',
+          options: [],
+          multiSelect: false,
+          required: false,
+          acceptsCustom: true,
+        },
+      ],
+    }
+    expect(userInputReady(input, {}, {})).toBe(false)
+    expect(userInputReady(input, { scope: ['Keep'] }, { scope: 'typed' })).toBe(true)
+    expect(userInputAnswers(input, { scope: ['Keep'] }, { scope: 'typed', limit: '  ' })).toEqual([
+      { questionId: 'scope', answers: ['Keep'] },
+      { questionId: 'limit', answers: [] },
+    ])
+    expect(userInputAnswers(input, { scope: ['Keep'] }, { limit: '12' })).toEqual([
+      { questionId: 'scope', answers: ['Keep'] },
+      { questionId: 'limit', answers: ['12'] },
+    ])
+  })
+})

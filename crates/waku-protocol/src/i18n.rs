@@ -176,6 +176,12 @@ mod tests {
     #[test]
     fn translations_are_complete_and_interpolate_naturally() {
         assert_eq!(&*rust_i18n::t!("settings.daemon", locale = "en"), "Daemon");
+        assert_eq!(&*rust_i18n::t!("user_input.yes", locale = "en"), "Yes");
+        assert_eq!(&*rust_i18n::t!("user_input.no", locale = "en"), "No");
+        assert_eq!(&*rust_i18n::t!("user_input.yes", locale = "zh-CN"), "是");
+        assert_eq!(&*rust_i18n::t!("user_input.no", locale = "zh-CN"), "否");
+        assert_eq!(&*rust_i18n::t!("user_input.yes", locale = "ja"), "はい");
+        assert_eq!(&*rust_i18n::t!("user_input.no", locale = "ja"), "いいえ");
         assert_eq!(
             &*rust_i18n::t!("daemon.expose_title", locale = "en"),
             "Expose managed daemon"

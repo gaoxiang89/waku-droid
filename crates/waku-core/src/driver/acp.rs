@@ -4,7 +4,7 @@
 //! unknown-method errors, stdio lifetime, and protocol type validation. Waku
 //! only adapts typed ACP messages to its provider-neutral [`DriverEvent`]s.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,13 +13,16 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
+    CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
+    ElicitationContentValue, ElicitationFormCapabilities, ElicitationMode,
+    ElicitationPropertySchema, EnumOption, Implementation, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, MultiSelectItems, NewSessionRequest, PermissionOptionKind, PromptRequest,
     PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
     SessionConfigSelectOptions, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
@@ -54,14 +57,26 @@ enum CommandMessage {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
-    Options(SessionOptions),
+    /// `mode_applied` is present only for a live access-mode switch, and
+    /// answers whether the agent accepted it.
+    Options {
+        options: SessionOptions,
+        mode_applied: Option<smol::channel::Sender<bool>>,
+    },
     Shutdown,
 }
+
+/// How long `apply_options` waits for the agent to accept a live access-mode
+/// switch before asking the app to restart the session instead.
+const MODE_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
     supports_steer: bool,
-    mode: RuntimeMode,
+    mode: Mutex<RuntimeMode>,
+    /// Factory Droid's access mode is a session config option, so it switches
+    /// in place; every other ACP agent restarts to change it.
+    switches_mode_live: bool,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
 }
 
@@ -209,7 +224,8 @@ impl AcpDriver {
             commands,
             // Both reject a second `session/prompt` while one is running.
             supports_steer: !matches!(provider, ProviderKind::Fx | ProviderKind::Droid),
-            mode,
+            mode: Mutex::new(mode),
+            switches_mode_live: provider == ProviderKind::Droid,
             computer_use,
         })
     }
@@ -397,10 +413,19 @@ enum AcpUserInputKind {
     Xai,
 }
 
-struct PendingAcpUserInput {
-    kind: AcpUserInputKind,
-    params: Value,
-    responder: Responder<Value>,
+enum PendingAcpUserInput {
+    Json {
+        kind: AcpUserInputKind,
+        params: Value,
+        responder: Responder<Value>,
+    },
+    /// Factory Droid, and any other ACP agent, asks through `elicitation/create`.
+    /// Zed answers that request from a form; this holds the same request until
+    /// the question UI submits.
+    Elicitation {
+        request: CreateElicitationRequest,
+        responder: Responder<CreateElicitationResponse>,
+    },
 }
 
 type PendingAcpUserInputs = Arc<Mutex<HashMap<String, PendingAcpUserInput>>>;
@@ -476,7 +501,13 @@ async fn run_sdk_connection(
     let pending_user_inputs: PendingAcpUserInputs = Arc::new(Mutex::new(HashMap::new()));
     let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
     let title_refresh = super::title_refresh::NativeTitleRefresh::default();
-    let auto_approve = mode != RuntimeMode::Ask;
+    // The access mode can change in place (Droid), so every reader goes
+    // through this cell rather than the mode the session started with.
+    let access_mode = Arc::new(Mutex::new(mode));
+    let config_options: SharedConfigOptions = Arc::new(Mutex::new(None));
+    // Set once the session's own autonomy has been written, so drift
+    // correction never races the initial write.
+    let droid_autonomy_ready = Arc::new(AtomicBool::new(false));
 
     Client
         .builder()
@@ -486,8 +517,26 @@ async fn run_sdk_connection(
                 let events = events.clone();
                 let suppress_session_updates = suppress_session_updates.clone();
                 let stream_state = stream_state.clone();
-                async move |notification: SessionNotification, _connection| {
+                let access_mode = access_mode.clone();
+                let config_options = config_options.clone();
+                let droid_autonomy_ready = droid_autonomy_ready.clone();
+                async move |notification: SessionNotification, connection: ConnectionTo<Agent>| {
                     if !suppress_session_updates.load(Ordering::Acquire) {
+                        let drifted = track_session_state(
+                            provider,
+                            &notification.update,
+                            *access_mode.lock(),
+                            &config_options,
+                        );
+                        if drifted && droid_autonomy_ready.load(Ordering::Acquire) {
+                            restore_droid_autonomy(
+                                &connection,
+                                notification.session_id.clone(),
+                                droid_autonomy_level(*access_mode.lock()),
+                                &config_options,
+                                &events,
+                            )?;
+                        }
                         handle_session_update(
                             provider,
                             notification,
@@ -530,11 +579,12 @@ async fn run_sdk_connection(
             {
                 let events = events.clone();
                 let pending_permissions = pending_permissions.clone();
+                let access_mode = access_mode.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
                     handle_permission_request(
                         request,
                         responder,
-                        auto_approve,
+                        auto_approves_permissions(provider, *access_mode.lock()),
                         provider == ProviderKind::Droid,
                         &pending_permissions,
                         &events,
@@ -577,7 +627,7 @@ async fn run_sdk_connection(
                     }
                     pending.lock().insert(
                         request_id.clone(),
-                        PendingAcpUserInput {
+                        PendingAcpUserInput::Json {
                             kind,
                             params,
                             responder,
@@ -589,11 +639,47 @@ async fn run_sdk_connection(
                             questions,
                         })
                         .is_err()
-                        && let Some(pending) = pending.lock().remove(&request_id)
+                        && let Some(PendingAcpUserInput::Json {
+                            kind, responder, ..
+                        }) = pending.lock().remove(&request_id)
                     {
-                        let _ = pending
-                            .responder
-                            .respond(cancelled_user_input_response(pending.kind));
+                        let _ = responder.respond(cancelled_user_input_response(kind));
+                    }
+                    Ok(Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let events = events.clone();
+                let pending = pending_user_inputs.clone();
+                async move |request: CreateElicitationRequest, responder, _connection| {
+                    let ElicitationMode::Form(form) = &request.mode else {
+                        responder.respond(cancelled_elicitation_response())?;
+                        return Ok(Handled::Yes);
+                    };
+                    let questions =
+                        elicitation_user_input_questions(&request.message, &form.requested_schema);
+                    if questions.is_empty() {
+                        responder.respond(cancelled_elicitation_response())?;
+                        return Ok(Handled::Yes);
+                    }
+                    let request_id = responder.id().to_string();
+                    pending.lock().insert(
+                        request_id.clone(),
+                        PendingAcpUserInput::Elicitation { request, responder },
+                    );
+                    if events
+                        .send(DriverEvent::UserInputRequested {
+                            request_id: request_id.clone(),
+                            questions,
+                        })
+                        .is_err()
+                        && let Some(PendingAcpUserInput::Elicitation { responder, .. }) =
+                            pending.lock().remove(&request_id)
+                    {
+                        let _ = responder.respond(cancelled_elicitation_response());
                     }
                     Ok(Handled::Yes)
                 }
@@ -601,7 +687,9 @@ async fn run_sdk_connection(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
-            let mut client_capabilities = ClientCapabilities::new().terminal(false);
+            let mut client_capabilities = ClientCapabilities::new().terminal(false).elicitation(
+                ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+            );
             if provider == ProviderKind::Cursor {
                 // Cursor only exposes its parameterized model controls to
                 // clients that opt in. Waku applies the returned config option
@@ -618,7 +706,7 @@ async fn run_sdk_connection(
                 )
                 .block_task()
                 .await?;
-            let (session_id, modes, mut config_options) = establish_session(
+            let (session_id, modes, initial_config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
@@ -626,6 +714,7 @@ async fn run_sdk_connection(
                 &suppress_session_updates,
             )
             .await?;
+            *config_options.lock() = initial_config_options;
 
             if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
                 // Mode selection is opportunistic: an agent can advertise a
@@ -636,17 +725,22 @@ async fn run_sdk_connection(
                     .block_task()
                     .await;
             }
-            if provider == ProviderKind::Droid
-                && let Some(updated) = apply_droid_autonomy(
-                    &connection,
-                    &session_id,
-                    config_options.as_deref(),
-                    mode,
-                    &events,
-                )
-                .await
-            {
-                config_options = Some(updated);
+            if provider == ProviderKind::Droid {
+                let current = config_options.lock().clone();
+                match apply_droid_autonomy(&connection, &session_id, current.as_deref(), mode).await
+                {
+                    Ok(updated) => store_config_options(&config_options, updated),
+                    Err(error) => {
+                        let _ = events.send(DriverEvent::Error(error));
+                        // Fail closed: an unwritten level is the user's CLI
+                        // default, which can pre-approve far more than the
+                        // selected mode. Only Full access has nothing to lose.
+                        if mode != RuntimeMode::FullAccess {
+                            return Ok(());
+                        }
+                    }
+                }
+                droid_autonomy_ready.store(true, Ordering::Release);
             }
             let native_session_id = session_id.to_string();
             let _ = events.send(DriverEvent::Connected {
@@ -660,11 +754,11 @@ async fn run_sdk_connection(
             let mut current_effort = reasoning_effort;
             let mut current_tier = service_tier;
             let mut current_window = context_window;
-            sync_session_model(
+            sync_cached_session_model(
                 &connection,
                 provider,
                 &session_id,
-                &mut config_options,
+                &config_options,
                 current_model.as_deref(),
                 current_effort.as_deref(),
                 current_tier.as_deref(),
@@ -760,18 +854,63 @@ async fn run_sdk_connection(
                         answers,
                     } => {
                         if let Some(pending) = pending_user_inputs.lock().remove(&request_id) {
-                            let response = match pending.kind {
-                                AcpUserInputKind::Cursor => {
-                                    cursor_user_input_response(&pending.params, &answers)
+                            match pending {
+                                PendingAcpUserInput::Json {
+                                    kind,
+                                    params,
+                                    responder,
+                                } => {
+                                    let response = match kind {
+                                        AcpUserInputKind::Cursor => {
+                                            cursor_user_input_response(&params, &answers)
+                                        }
+                                        AcpUserInputKind::Xai => {
+                                            xai_user_input_response(&params, &answers)
+                                        }
+                                    };
+                                    let _ = responder.respond(response);
                                 }
-                                AcpUserInputKind::Xai => {
-                                    xai_user_input_response(&pending.params, &answers)
+                                PendingAcpUserInput::Elicitation { request, responder } => {
+                                    let _ = responder
+                                        .respond(elicitation_accept_response(&request, &answers));
                                 }
-                            };
-                            let _ = pending.responder.respond(response);
+                            }
                         }
                     }
-                    CommandMessage::Options(options) => {
+                    CommandMessage::Options {
+                        options,
+                        mode_applied,
+                    } => {
+                        if let Some(mode_applied) = mode_applied {
+                            // Stop answering permissions under the old mode
+                            // before the agent hears about the new one.
+                            *access_mode.lock() = options.mode;
+                            let current = config_options.lock().clone();
+                            let applied = match apply_droid_autonomy(
+                                &connection,
+                                &session_id,
+                                current.as_deref(),
+                                options.mode,
+                            )
+                            .await
+                            {
+                                Ok(updated) => {
+                                    store_config_options(&config_options, updated);
+                                    true
+                                }
+                                Err(_) => {
+                                    // The app restarts the session on a
+                                    // refusal; until then nothing is approved
+                                    // on the user's behalf.
+                                    *access_mode.lock() = RuntimeMode::Ask;
+                                    false
+                                }
+                            };
+                            let _ = mode_applied.try_send(applied);
+                            if !applied {
+                                continue;
+                            }
+                        }
                         if options.model != current_model
                             || options.reasoning_effort != current_effort
                             || options.service_tier != current_tier
@@ -781,11 +920,11 @@ async fn run_sdk_connection(
                             current_effort = options.reasoning_effort;
                             current_tier = options.service_tier;
                             current_window = options.context_window;
-                            sync_session_model(
+                            sync_cached_session_model(
                                 &connection,
                                 provider,
                                 &session_id,
-                                &mut config_options,
+                                &config_options,
                                 current_model.as_deref(),
                                 current_effort.as_deref(),
                                 current_tier.as_deref(),
@@ -1268,34 +1407,49 @@ fn config_option_by_id<'a>(
         .find(|option| option.id.to_string().eq_ignore_ascii_case(id))
 }
 
+/// The values of Droid's `autonomy_level`, which are also its ACP mode ids.
+const DROID_AUTONOMY_LEVELS: [&str; 4] = ["normal", "auto-low", "auto-medium", "auto-high"];
+
+/// Whether Waku answers the agent's permission requests for the user.
+///
+/// Droid's autonomy level already pre-approves everything the selected mode
+/// allows, so a request that still arrives is exactly what that mode keeps
+/// for the user; answering it would turn every mode into Full access. Other
+/// ACP agents stay in their ordinary mode and rely on Waku to answer.
+fn auto_approves_permissions(provider: ProviderKind, mode: RuntimeMode) -> bool {
+    match provider {
+        ProviderKind::Droid => mode == RuntimeMode::FullAccess,
+        _ => mode != RuntimeMode::Ask,
+    }
+}
+
+/// Writes Droid's autonomy level for `mode`. `Ok(None)` means the session
+/// already had it; `Err` carries a user-facing reason.
 async fn apply_droid_autonomy(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
     config_options: Option<&[SessionConfigOption]>,
     mode: RuntimeMode,
-    events: &DriverEventSender,
-) -> Option<Vec<SessionConfigOption>> {
+) -> Result<Option<Vec<SessionConfigOption>>, String> {
     let desired = droid_autonomy_level(mode);
     let Some(option) =
         config_options.and_then(|options| config_option_by_id(options, "autonomy_level"))
     else {
-        let _ = events.send(DriverEvent::Error(tr!(
+        return Err(tr!(
             "errors.set_session_option",
             error = "Factory Droid did not advertise its autonomy setting"
-        )));
-        return None;
+        ));
     };
     if !session_config_select_values(option).contains(&desired) {
-        let _ = events.send(DriverEvent::Error(tr!(
+        return Err(tr!(
             "errors.set_session_option",
             error = format!("Factory Droid did not advertise autonomy level {desired}")
-        )));
-        return None;
+        ));
     }
     if session_config_current_value(option) == Some(desired) {
-        return None;
+        return Ok(None);
     }
-    match connection
+    connection
         .send_request(SetSessionConfigOptionRequest::new(
             session_id.clone(),
             option.id.clone(),
@@ -1303,16 +1457,89 @@ async fn apply_droid_autonomy(
         ))
         .block_task()
         .await
-    {
-        Ok(response) => Some(response.config_options),
-        Err(error) => {
-            let _ = events.send(DriverEvent::Error(tr!(
-                "errors.set_session_option",
-                error = error
-            )));
-            None
-        }
+        .map(|response| Some(response.config_options))
+        .map_err(|error| tr!("errors.set_session_option", error = error))
+}
+
+/// The session's config options as the agent last reported them. Responses
+/// and `config_option_update` notifications both write here, so a later model
+/// change compares against what the agent holds, not what Waku last sent.
+type SharedConfigOptions = Arc<Mutex<Option<Vec<SessionConfigOption>>>>;
+
+fn store_config_options(cache: &SharedConfigOptions, updated: Option<Vec<SessionConfigOption>>) {
+    if let Some(updated) = updated {
+        *cache.lock() = Some(updated);
     }
+}
+
+/// Records what a session update says about the session's own settings and
+/// reports whether Droid's autonomy has left the level the access mode chose.
+fn track_session_state(
+    provider: ProviderKind,
+    update: &SessionUpdate,
+    mode: RuntimeMode,
+    config_options: &SharedConfigOptions,
+) -> bool {
+    let desired = droid_autonomy_level(mode);
+    match update {
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            *config_options.lock() = Some(update.config_options.clone());
+            provider == ProviderKind::Droid
+                && config_option_by_id(&update.config_options, "autonomy_level")
+                    .and_then(session_config_current_value)
+                    .is_some_and(|current| current != desired)
+        }
+        // Droid's mode ids are its autonomy levels. Other mode ids (its spec
+        // mode) are the user's own choice and are left alone.
+        SessionUpdate::CurrentModeUpdate(update) => {
+            let current = update.current_mode_id.to_string();
+            provider == ProviderKind::Droid
+                && DROID_AUTONOMY_LEVELS.contains(&current.as_str())
+                && current != desired
+        }
+        _ => false,
+    }
+}
+
+/// Puts Droid's autonomy back at the access mode's level after the agent
+/// moved it. Runs from the notification handler, so the reply is handled in
+/// a callback rather than awaited.
+fn restore_droid_autonomy(
+    connection: &ConnectionTo<Agent>,
+    session_id: SessionId,
+    desired: &'static str,
+    config_options: &SharedConfigOptions,
+    events: &DriverEventSender,
+) -> agent_client_protocol::Result<()> {
+    let config_id = config_options
+        .lock()
+        .as_deref()
+        .and_then(|options| config_option_by_id(options, "autonomy_level"))
+        .map_or_else(|| "autonomy_level".into(), |option| option.id.clone());
+    let cache = config_options.clone();
+    let events = events.clone();
+    let cancel = connection.clone();
+    connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            config_id,
+            desired,
+        ))
+        .on_receiving_result(async move |result| {
+            match result {
+                Ok(response) => *cache.lock() = Some(response.config_options),
+                Err(error) => {
+                    // The session now runs at a level nobody chose; stop the
+                    // turn rather than let it continue there.
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.set_session_option",
+                        error = error
+                    )));
+                    let _ = cancel.send_notification(CancelNotification::new(session_id));
+                }
+            }
+            Ok(())
+        })
 }
 
 async fn apply_droid_model(
@@ -1380,6 +1607,40 @@ async fn apply_droid_model(
         }
     }
     Some(options)
+}
+
+/// [`sync_session_model`] against the shared cache. Only an answer from the
+/// agent is written back, so a notification that lands while the requests are
+/// in flight is not overwritten by the snapshot they started from.
+#[allow(clippy::too_many_arguments)]
+async fn sync_cached_session_model(
+    connection: &ConnectionTo<Agent>,
+    provider: ProviderKind,
+    session_id: &SessionId,
+    cache: &SharedConfigOptions,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    context_window: Option<&str>,
+    events: &DriverEventSender,
+) {
+    let before = cache.lock().clone();
+    let mut config_options = before.clone();
+    sync_session_model(
+        connection,
+        provider,
+        session_id,
+        &mut config_options,
+        model,
+        reasoning_effort,
+        service_tier,
+        context_window,
+        events,
+    )
+    .await;
+    if config_options != before {
+        store_config_options(cache, config_options);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1772,10 +2033,21 @@ fn cancel_pending_permissions(pending: &PendingPermissions) {
 
 fn cancel_pending_user_inputs(pending: &PendingAcpUserInputs) {
     for (_, pending) in pending.lock().drain() {
-        let _ = pending
-            .responder
-            .respond(cancelled_user_input_response(pending.kind));
+        match pending {
+            PendingAcpUserInput::Json {
+                kind, responder, ..
+            } => {
+                let _ = responder.respond(cancelled_user_input_response(kind));
+            }
+            PendingAcpUserInput::Elicitation { responder, .. } => {
+                let _ = responder.respond(cancelled_elicitation_response());
+            }
+        }
     }
+}
+
+fn cancelled_elicitation_response() -> CreateElicitationResponse {
+    CreateElicitationResponse::new(ElicitationAction::Cancel)
 }
 
 fn cancelled_user_input_response(kind: AcpUserInputKind) -> Value {
@@ -1840,6 +2112,8 @@ fn cursor_user_input_questions(params: &Value) -> Vec<UserInputQuestion> {
                     .get("allowMultiple")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                required: true,
+                accepts_custom: true,
             })
         })
         .collect()
@@ -1927,6 +2201,8 @@ fn xai_user_input_questions(params: &Value) -> Vec<UserInputQuestion> {
                     .get("multiSelect")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                required: true,
+                accepts_custom: true,
             })
         })
         .collect()
@@ -2022,6 +2298,293 @@ fn xai_user_input_response(params: &Value, submitted: &[UserInputAnswer]) -> Val
     response
 }
 
+struct ElicitationChoice {
+    label: String,
+    value: String,
+    description: Option<String>,
+}
+
+fn elicitation_user_input_questions(
+    message: &str,
+    schema: &agent_client_protocol::schema::v1::ElicitationSchema,
+) -> Vec<UserInputQuestion> {
+    let mut questions = Vec::new();
+    for (name, property) in ordered_elicitation_properties(schema) {
+        let required = schema
+            .required
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|item| item == name));
+        let Some(question) =
+            elicitation_property_question(message, name, property, questions.is_empty(), required)
+        else {
+            continue;
+        };
+        questions.push(question);
+    }
+    questions
+}
+
+fn ordered_elicitation_properties(
+    schema: &agent_client_protocol::schema::v1::ElicitationSchema,
+) -> Vec<(&str, &ElicitationPropertySchema)> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    if let Some(required) = &schema.required {
+        for name in required {
+            if let Some(property) = schema.properties.get(name)
+                && seen.insert(name.as_str())
+            {
+                ordered.push((name.as_str(), property));
+            }
+        }
+    }
+    for (name, property) in &schema.properties {
+        if seen.insert(name.as_str()) {
+            ordered.push((name.as_str(), property));
+        }
+    }
+    ordered
+}
+
+fn elicitation_property_question(
+    message: &str,
+    name: &str,
+    property: &ElicitationPropertySchema,
+    first: bool,
+    required: bool,
+) -> Option<UserInputQuestion> {
+    let (header, description, choices, multi_select) = match property {
+        ElicitationPropertySchema::String(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            string_elicitation_choices(schema),
+            false,
+        ),
+        ElicitationPropertySchema::Array(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            array_elicitation_choices(schema),
+            true,
+        ),
+        ElicitationPropertySchema::Boolean(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            boolean_elicitation_choices(),
+            false,
+        ),
+        ElicitationPropertySchema::Integer(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            Vec::new(),
+            false,
+        ),
+        ElicitationPropertySchema::Number(schema) => (
+            schema.title.as_deref(),
+            schema.description.as_deref(),
+            Vec::new(),
+            false,
+        ),
+        ElicitationPropertySchema::Other(_) | &_ => return None,
+    };
+    let header = header
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(name);
+    Some(UserInputQuestion {
+        id: name.to_owned(),
+        header: header.to_owned(),
+        question: elicitation_question_text(message, header, description, first),
+        options: choices
+            .iter()
+            .map(|choice| UserInputOption {
+                label: choice.label.clone(),
+                description: choice.description.clone(),
+            })
+            .collect(),
+        multi_select,
+        required,
+        accepts_custom: choices.is_empty(),
+    })
+}
+
+fn boolean_elicitation_choices() -> Vec<ElicitationChoice> {
+    vec![
+        ElicitationChoice {
+            label: "Yes".into(),
+            value: "true".into(),
+            description: None,
+        },
+        ElicitationChoice {
+            label: "No".into(),
+            value: "false".into(),
+            description: None,
+        },
+    ]
+}
+
+fn elicitation_question_text(
+    message: &str,
+    header: &str,
+    description: Option<&str>,
+    first: bool,
+) -> String {
+    let message = message.trim();
+    let detail = description
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    match (first, message.is_empty(), detail) {
+        (true, false, Some(detail)) if message != detail => format!("{message}\n\n{detail}"),
+        (true, false, None) if message != header => message.to_owned(),
+        (_, _, Some(detail)) => detail.to_owned(),
+        _ => header.to_owned(),
+    }
+}
+
+fn string_elicitation_choices(
+    schema: &agent_client_protocol::schema::v1::StringPropertySchema,
+) -> Vec<ElicitationChoice> {
+    if let Some(options) = schema.one_of.as_ref().filter(|options| !options.is_empty()) {
+        return titled_elicitation_choices(options);
+    }
+    schema
+        .enum_values
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| ElicitationChoice {
+            label: value.clone(),
+            value: value.clone(),
+            description: None,
+        })
+        .collect()
+}
+
+fn array_elicitation_choices(
+    schema: &agent_client_protocol::schema::v1::MultiSelectPropertySchema,
+) -> Vec<ElicitationChoice> {
+    match &schema.items {
+        MultiSelectItems::Titled(items) => titled_elicitation_choices(&items.options),
+        MultiSelectItems::String(items) => items
+            .values
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| ElicitationChoice {
+                label: value.clone(),
+                value: value.clone(),
+                description: None,
+            })
+            .collect(),
+        MultiSelectItems::Other(_) | &_ => Vec::new(),
+    }
+}
+
+fn titled_elicitation_choices(options: &[EnumOption]) -> Vec<ElicitationChoice> {
+    let mut used = HashSet::new();
+    options
+        .iter()
+        .filter(|option| !option.value.trim().is_empty())
+        .map(|option| {
+            let title = option.title.trim();
+            let mut label = if title.is_empty() {
+                option.value.clone()
+            } else {
+                title.to_owned()
+            };
+            if !used.insert(label.clone()) {
+                label = format!("{label} ({})", option.value);
+                used.insert(label.clone());
+            }
+            ElicitationChoice {
+                label,
+                value: option.value.clone(),
+                description: option
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_owned),
+            }
+        })
+        .collect()
+}
+
+fn elicitation_accept_response(
+    request: &CreateElicitationRequest,
+    submitted: &[UserInputAnswer],
+) -> CreateElicitationResponse {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return cancelled_elicitation_response();
+    };
+    let mut content = BTreeMap::new();
+    for (name, property) in ordered_elicitation_properties(&form.requested_schema) {
+        let Some(answer) = submitted.iter().find(|answer| answer.question_id == name) else {
+            continue;
+        };
+        if let Some(value) = elicitation_content_value(property, &answer.answers) {
+            content.insert(name.to_owned(), value);
+        }
+    }
+    CreateElicitationResponse::new(ElicitationAcceptAction::new().content(content))
+}
+
+fn elicitation_content_value(
+    property: &ElicitationPropertySchema,
+    answers: &[String],
+) -> Option<ElicitationContentValue> {
+    let answers = answers
+        .iter()
+        .map(|answer| answer.trim())
+        .filter(|answer| !answer.is_empty())
+        .collect::<Vec<_>>();
+    let first = answers.first().copied()?;
+    Some(match property {
+        ElicitationPropertySchema::String(schema) => {
+            let choices = string_elicitation_choices(schema);
+            ElicitationContentValue::String(if choices.is_empty() {
+                first.to_owned()
+            } else {
+                resolve_elicitation_choice(&choices, first)
+            })
+        }
+        ElicitationPropertySchema::Array(schema) => {
+            let choices = array_elicitation_choices(schema);
+            ElicitationContentValue::StringArray(if choices.is_empty() {
+                answers.into_iter().map(str::to_owned).collect()
+            } else {
+                answers
+                    .into_iter()
+                    .map(|answer| resolve_elicitation_choice(&choices, answer))
+                    .collect()
+            })
+        }
+        ElicitationPropertySchema::Boolean(_) => {
+            let resolved = resolve_elicitation_choice(&boolean_elicitation_choices(), first);
+            ElicitationContentValue::Boolean(matches!(
+                resolved.to_ascii_lowercase().as_str(),
+                "true" | "yes" | "1"
+            ))
+        }
+        ElicitationPropertySchema::Integer(_) => match first.parse::<i64>() {
+            Ok(value) => ElicitationContentValue::Integer(value),
+            Err(_) => ElicitationContentValue::String(first.to_owned()),
+        },
+        ElicitationPropertySchema::Number(_) => match first.parse::<f64>() {
+            Ok(value) => ElicitationContentValue::Number(value),
+            Err(_) => ElicitationContentValue::String(first.to_owned()),
+        },
+        ElicitationPropertySchema::Other(_) | &_ => return None,
+    })
+}
+
+fn resolve_elicitation_choice(choices: &[ElicitationChoice], answer: &str) -> String {
+    choices
+        .iter()
+        .find(|choice| choice.label == answer || choice.value == answer)
+        .map(|choice| choice.value.clone())
+        .unwrap_or_else(|| answer.to_owned())
+}
+
 /// Droid's "always" answer also raises the session's autonomy level, which
 /// would drift the session away from the selected access mode.
 fn auto_permission_choice(
@@ -2045,19 +2608,18 @@ fn auto_permission_choice(
         .or_else(|| options.iter().find(|option| option.kind == second))
 }
 
-fn handle_permission_request(
-    request: RequestPermissionRequest,
-    responder: PermissionResponder,
-    auto_approve: bool,
-    prefer_allow_once: bool,
-    pending: &PendingPermissions,
-    events: &impl DriverEventSink,
-) -> agent_client_protocol::Result<()> {
-    let request_id = responder.id().to_string();
-    let params = serde_json::to_value(&request)?;
-    let options = request
-        .options
+fn offered_permission_options(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    allow_once_only: bool,
+) -> Vec<PermissionOption> {
+    // Without a one-time allow, dropping "always" would leave only refusals.
+    let hide_allow_always = allow_once_only
+        && options
+            .iter()
+            .any(|option| option.kind == PermissionOptionKind::AllowOnce);
+    options
         .iter()
+        .filter(|option| !(hide_allow_always && option.kind == PermissionOptionKind::AllowAlways))
         .map(|option| PermissionOption {
             id: option.option_id.to_string(),
             label: option.name.clone(),
@@ -2066,10 +2628,26 @@ fn handle_permission_request(
                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
             ),
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// `allow_once_only` is Droid's: its "always" answer raises the session's
+/// autonomy level, so it is neither chosen automatically nor offered, and the
+/// access mode stays the one control over what runs unasked.
+fn handle_permission_request(
+    request: RequestPermissionRequest,
+    responder: PermissionResponder,
+    auto_approve: bool,
+    allow_once_only: bool,
+    pending: &PendingPermissions,
+    events: &impl DriverEventSink,
+) -> agent_client_protocol::Result<()> {
+    let request_id = responder.id().to_string();
+    let params = serde_json::to_value(&request)?;
+    let options = offered_permission_options(&request.options, allow_once_only);
 
     if auto_approve {
-        return match auto_permission_choice(&request.options, prefer_allow_once) {
+        return match auto_permission_choice(&request.options, allow_once_only) {
             Some(choice) => responder.respond(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     choice.option_id.clone(),
@@ -2161,14 +2739,21 @@ fn handle_session_update(
             }
         }
         Some("tool_call" | "tool_call_update") => tool_activity(&update, events, state),
+        // Each update carries the whole plan, so it replaces the previous one
+        // in place and is already settled when it arrives.
         Some("plan") => {
-            let _ = events.send(DriverEvent::Activity {
-                id: Some("acp-plan".into()),
-                kind: ActivityKind::Plan,
-                title: tr!("activity.plan_updated"),
-                detail: None,
-                complete: false,
-            });
+            let steps = plan_steps_text(&update);
+            let item = activity::tool_activity(
+                Some("acp-plan".into()),
+                ActivityKind::Plan,
+                tr!("activity.plan_updated"),
+                None,
+                steps.as_ref(),
+                None,
+                false,
+                true,
+            );
+            let _ = events.send(DriverEvent::RichActivity(item));
         }
         Some("available_commands_update") => {
             let commands = update
@@ -2224,6 +2809,27 @@ fn handle_session_update(
         _ => {}
     }
     Ok(())
+}
+
+/// An ACP plan's entries as one line per step, marked by status.
+fn plan_steps_text(update: &Value) -> Option<Value> {
+    let steps = update
+        .get("entries")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|entry| {
+            let content = entry.get("content").and_then(Value::as_str)?.trim();
+            (!content.is_empty()).then(|| {
+                let marker = match entry.get("status").and_then(Value::as_str) {
+                    Some("completed") => "[x]",
+                    Some("in_progress") => "[~]",
+                    _ => "[ ]",
+                };
+                format!("{marker} {content}")
+            })
+        })
+        .collect::<Vec<_>>();
+    (!steps.is_empty()).then(|| Value::String(steps.join("\n")))
 }
 
 fn fx_context_notice(text: &str) -> bool {
@@ -2379,12 +2985,43 @@ impl DriverControl for AcpDriver {
     }
 
     fn apply_options(&self, options: SessionOptions) -> bool {
-        if options.mode != self.mode {
+        let mode = options.mode;
+        if mode == *self.mode.lock() {
+            return self
+                .commands
+                .try_send(CommandMessage::Options {
+                    options,
+                    mode_applied: None,
+                })
+                .is_ok();
+        }
+        if !self.switches_mode_live {
             return false;
         }
-        self.commands
-            .try_send(CommandMessage::Options(options))
-            .is_ok()
+        // Callers run this off the UI thread, and a refusal must be known
+        // before answering: `false` makes the app restart under the new mode.
+        let (mode_applied, reply) = smol::channel::bounded(1);
+        if self
+            .commands
+            .try_send(CommandMessage::Options {
+                options,
+                mode_applied: Some(mode_applied),
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let applied = smol::block_on(smol::future::or(
+            async { reply.recv().await.unwrap_or(false) },
+            async {
+                smol::Timer::after(MODE_SWITCH_TIMEOUT).await;
+                false
+            },
+        ));
+        if applied {
+            *self.mode.lock() = mode;
+        }
+        applied
     }
 
     fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
@@ -2475,6 +3112,133 @@ mod tests {
             response.pointer("/answers/checks"),
             Some(&json!(["Tests", "Lint"]))
         );
+    }
+
+    #[test]
+    fn droid_elicitation_form_keeps_titles_on_screen_and_const_values_in_the_reply() {
+        use agent_client_protocol::schema::v1::{
+            BooleanPropertySchema, ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
+            IntegerPropertySchema, MultiSelectPropertySchema, SessionId, StringPropertySchema,
+        };
+
+        let message = "The review leaves a few decisions to you. Before I change any code, I need your answers on these:";
+        let schema = ElicitationSchema::new()
+            .property(
+                "scope",
+                StringPropertySchema::new()
+                    .title("Scope")
+                    .description("Which part should change?")
+                    .one_of(vec![
+                        EnumOption::new("keep", "Keep the review")
+                            .description("Leave the findings in place"),
+                        EnumOption::new("rewrite", "Rewrite it"),
+                    ]),
+                true,
+            )
+            .property(
+                "checks",
+                MultiSelectPropertySchema::titled(vec![
+                    EnumOption::new("tests", "Tests"),
+                    EnumOption::new("lint", "Lint"),
+                ])
+                .title("Checks"),
+                true,
+            )
+            .property("ship", BooleanPropertySchema::new().title("Ship"), true)
+            .property("limit", IntegerPropertySchema::new().title("Limit"), false);
+        let request = CreateElicitationRequest::new(
+            ElicitationFormMode::new(
+                ElicitationSessionScope::new(SessionId::new("session-1")),
+                schema,
+            ),
+            message,
+        );
+        let ElicitationMode::Form(form) = &request.mode else {
+            panic!("expected a form elicitation");
+        };
+        let questions = elicitation_user_input_questions(message, &form.requested_schema);
+
+        assert_eq!(
+            questions
+                .iter()
+                .map(|question| question.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scope", "checks", "ship", "limit"]
+        );
+        assert_eq!(questions[0].header, "Scope");
+        assert!(questions[0].question.contains(message));
+        assert!(questions[0].question.contains("Which part should change?"));
+        assert_eq!(questions[0].options[0].label, "Keep the review");
+        assert_eq!(
+            questions[0].options[0].description.as_deref(),
+            Some("Leave the findings in place")
+        );
+        assert!(!questions[0].multi_select);
+        assert!(questions[1].multi_select);
+        assert_eq!(
+            questions[2]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Yes", "No"]
+        );
+        assert!(questions[3].options.is_empty());
+        assert_eq!(questions[3].question, "Limit");
+        assert!(questions[0].required);
+        assert!(!questions[0].accepts_custom);
+        assert!(questions[1].required && !questions[1].accepts_custom);
+        assert!(questions[2].required && !questions[2].accepts_custom);
+        assert!(!questions[3].required);
+        assert!(questions[3].accepts_custom);
+
+        let response = elicitation_accept_response(
+            &request,
+            &[
+                UserInputAnswer {
+                    question_id: "scope".into(),
+                    answers: vec!["Keep the review".into()],
+                },
+                UserInputAnswer {
+                    question_id: "checks".into(),
+                    answers: vec!["Tests".into(), "Lint".into()],
+                },
+                UserInputAnswer {
+                    question_id: "ship".into(),
+                    answers: vec!["Yes".into()],
+                },
+                UserInputAnswer {
+                    question_id: "limit".into(),
+                    answers: vec!["12".into()],
+                },
+            ],
+        );
+        let value = serde_json::to_value(response).expect("elicitation response");
+        assert_eq!(value["action"], "accept");
+        assert_eq!(value["content"]["scope"], "keep");
+        assert_eq!(value["content"]["checks"], json!(["tests", "lint"]));
+        assert_eq!(value["content"]["ship"], true);
+        assert_eq!(value["content"]["limit"], 12);
+
+        let omitted = serde_json::to_value(elicitation_accept_response(
+            &request,
+            &[
+                UserInputAnswer {
+                    question_id: "scope".into(),
+                    answers: vec!["Keep the review".into()],
+                },
+                UserInputAnswer {
+                    question_id: "checks".into(),
+                    answers: vec!["Tests".into(), "Lint".into()],
+                },
+                UserInputAnswer {
+                    question_id: "ship".into(),
+                    answers: vec!["Yes".into()],
+                },
+            ],
+        ))
+        .expect("elicitation response");
+        assert!(omitted["content"].get("limit").is_none());
     }
 
     #[test]
@@ -2619,6 +3383,161 @@ mod tests {
         );
         assert_eq!(droid_autonomy_level(RuntimeMode::Auto), "auto-medium");
         assert_eq!(droid_autonomy_level(RuntimeMode::FullAccess), "auto-high");
+    }
+
+    #[test]
+    fn droid_leaves_requests_beyond_its_autonomy_to_the_user() {
+        for mode in [
+            RuntimeMode::Ask,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+        ] {
+            assert!(!auto_approves_permissions(ProviderKind::Droid, mode));
+        }
+        assert!(auto_approves_permissions(
+            ProviderKind::Droid,
+            RuntimeMode::FullAccess
+        ));
+        assert!(!auto_approves_permissions(
+            ProviderKind::Cursor,
+            RuntimeMode::Ask
+        ));
+        assert!(auto_approves_permissions(
+            ProviderKind::Cursor,
+            RuntimeMode::AutoAcceptEdits
+        ));
+    }
+
+    #[test]
+    fn droid_permission_prompt_omits_the_autonomy_raising_answer() {
+        use agent_client_protocol::schema::v1::PermissionOption as AcpPermissionOption;
+        let options = [
+            AcpPermissionOption::new("proceed_once", "Allow", PermissionOptionKind::AllowOnce),
+            AcpPermissionOption::new(
+                "proceed_always",
+                "Allow & auto-run low risk commands",
+                PermissionOptionKind::AllowAlways,
+            ),
+            AcpPermissionOption::new("cancel", "No, cancel", PermissionOptionKind::RejectOnce),
+        ];
+        let ids = |options: &[AcpPermissionOption], once_only| {
+            offered_permission_options(options, once_only)
+                .into_iter()
+                .map(|option| option.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&options, true), ["proceed_once", "cancel"]);
+        assert_eq!(
+            ids(&options, false),
+            ["proceed_once", "proceed_always", "cancel"]
+        );
+        // Without a one-time allow, "always" is the only way to proceed.
+        assert_eq!(ids(&options[1..], true), ["proceed_always", "cancel"]);
+    }
+
+    #[test]
+    fn config_updates_refresh_the_cache_and_flag_droid_autonomy_drift() {
+        let cache: SharedConfigOptions = Arc::new(Mutex::new(None));
+        let update = |current| {
+            SessionUpdate::ConfigOptionUpdate(
+                agent_client_protocol::schema::v1::ConfigOptionUpdate::new(vec![
+                    select_config_option(
+                        "autonomy_level",
+                        SessionConfigOptionCategory::Mode,
+                        current,
+                        &DROID_AUTONOMY_LEVELS,
+                    ),
+                ]),
+            )
+        };
+
+        assert!(track_session_state(
+            ProviderKind::Droid,
+            &update("auto-low"),
+            RuntimeMode::Ask,
+            &cache,
+        ));
+        let cached = cache.lock().clone().unwrap();
+        assert_eq!(
+            session_config_current_value(&cached[0]),
+            Some("auto-low"),
+            "the cache holds what the agent reported"
+        );
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &update("normal"),
+            RuntimeMode::Ask,
+            &cache,
+        ));
+        // Other agents get the cache refresh but no autonomy correction.
+        assert!(!track_session_state(
+            ProviderKind::Cursor,
+            &update("auto-low"),
+            RuntimeMode::Ask,
+            &cache,
+        ));
+    }
+
+    #[test]
+    fn droid_mode_updates_flag_only_autonomy_levels() {
+        let cache: SharedConfigOptions = Arc::new(Mutex::new(None));
+        let mode = |id: &str| {
+            SessionUpdate::CurrentModeUpdate(
+                agent_client_protocol::schema::v1::CurrentModeUpdate::new(id.to_owned()),
+            )
+        };
+        assert!(track_session_state(
+            ProviderKind::Droid,
+            &mode("auto-medium"),
+            RuntimeMode::AutoAcceptEdits,
+            &cache,
+        ));
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &mode("auto-low"),
+            RuntimeMode::AutoAcceptEdits,
+            &cache,
+        ));
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &mode("spec"),
+            RuntimeMode::AutoAcceptEdits,
+            &cache,
+        ));
+    }
+
+    #[test]
+    fn plan_updates_carry_their_steps_and_settle() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+        let update = serde_json::from_value(json!({
+            "sessionUpdate": "plan",
+            "entries": [
+                {"content": "Read the driver", "priority": "high", "status": "completed"},
+                {"content": "Fix approvals", "priority": "high", "status": "in_progress"},
+                {"content": "Update docs", "priority": "low", "status": "pending"},
+            ]
+        }))
+        .unwrap();
+        handle_session_update(
+            ProviderKind::Droid,
+            SessionNotification::new("s", update),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 1);
+        let DriverEvent::RichActivity(item) = &seen[0] else {
+            panic!("a plan becomes a rich activity");
+        };
+        assert_eq!(item.kind, ActivityKind::Plan);
+        assert!(item.complete);
+        assert_eq!(
+            item.output.as_deref(),
+            Some("[x] Read the driver\n[~] Fix approvals\n[ ] Update docs")
+        );
     }
 
     #[test]

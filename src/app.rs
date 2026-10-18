@@ -891,7 +891,6 @@ struct SessionRuntime {
 struct PendingUserInput {
     request_id: String,
     questions: Vec<UserInputQuestion>,
-    question_index: usize,
     selections: HashMap<String, Vec<String>>,
     custom_answers: HashMap<String, String>,
 }
@@ -901,40 +900,85 @@ impl PendingUserInput {
         Self {
             request_id,
             questions,
-            question_index: 0,
             selections: HashMap::new(),
             custom_answers: HashMap::new(),
         }
     }
 
-    fn current_question(&self) -> Option<&UserInputQuestion> {
-        self.questions.get(self.question_index)
+    fn resolved_answers(&self, question: &UserInputQuestion) -> Vec<String> {
+        let custom = question.accepts_custom.then(|| {
+            self.custom_answers
+                .get(&question.id)
+                .map(|answer| answer.trim())
+                .filter(|answer| !answer.is_empty())
+                .map(str::to_owned)
+        });
+        custom.flatten().map_or_else(
+            || {
+                self.selections
+                    .get(&question.id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            |answer| vec![answer],
+        )
+    }
+
+    fn question_answered(&self, question: &UserInputQuestion) -> bool {
+        !self.resolved_answers(question).is_empty()
+    }
+
+    fn ready_to_submit(&self) -> bool {
+        self.questions
+            .iter()
+            .all(|question| !question.required || self.question_answered(question))
     }
 
     fn answers(&self) -> Vec<UserInputAnswer> {
         self.questions
             .iter()
-            .map(|question| {
-                let custom = self
-                    .custom_answers
-                    .get(&question.id)
-                    .map(|answer| answer.trim())
-                    .filter(|answer| !answer.is_empty());
-                UserInputAnswer {
-                    question_id: question.id.clone(),
-                    answers: custom.map_or_else(
-                        || {
-                            self.selections
-                                .get(&question.id)
-                                .cloned()
-                                .unwrap_or_default()
-                        },
-                        |answer| vec![answer.to_owned()],
-                    ),
-                }
+            .map(|question| UserInputAnswer {
+                question_id: question.id.clone(),
+                answers: self.resolved_answers(question),
             })
             .collect()
     }
+
+    /// The choices the user submitted, kept on the turn after the form closes.
+    fn transcript_record(&self) -> String {
+        self.questions
+            .iter()
+            .filter_map(|question| {
+                let answers = self.resolved_answers(question);
+                if answers.is_empty() {
+                    return None;
+                }
+                let body = answers
+                    .iter()
+                    .map(|answer| user_input_choice_label(answer))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!("{}\n{body}", question.header))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+pub(super) fn user_input_choice_label(label: &str) -> String {
+    match label {
+        "Yes" => tr!("user_input.yes"),
+        "No" => tr!("user_input.no"),
+        other => other.to_owned(),
+    }
+}
+
+pub(super) fn user_input_field_key(
+    session_id: Uuid,
+    request_id: &str,
+    question_id: &str,
+) -> String {
+    format!("{session_id}\0{request_id}\0{question_id}")
 }
 
 struct ComputerUsePreview {
@@ -1071,7 +1115,9 @@ pub struct Waku {
     /// without consulting the environment or account database in a frame.
     home_directory: Option<PathBuf>,
     composer: Entity<ComposerInput>,
-    user_input_answer: Entity<TextInput>,
+    /// Free-text rows in the question form. Keyed by session, request, and
+    /// question so a form that stays open keeps each field's text.
+    user_input_fields: RefCell<HashMap<String, Entity<TextInput>>>,
     /// Drafts are independent of transcript persistence: started tasks key by
     /// session id, while blank New Task pages key by project id.
     composer_drafts: ComposerDrafts,
@@ -2058,8 +2104,6 @@ impl Waku {
         });
 
         let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0), cx));
-        let user_input_answer = cx
-            .new(|cx| TextInput::new(window, cx).placeholder(tr!("user_input.other_placeholder")));
         let command_palette_search = cx.new(|cx| {
             TextInput::new(window, cx)
                 .clear_on_escape()
@@ -2535,21 +2579,6 @@ impl Waku {
             )
             .detach();
 
-            cx.subscribe(
-                &user_input_answer,
-                |this: &mut Self, input, event: &InputEvent, cx| match event {
-                    InputEvent::Submit(answer) => {
-                        this.submit_user_input_custom_answer(answer.clone(), cx);
-                    }
-                    InputEvent::Edited => {
-                        let answer = input.read(cx).content().to_owned();
-                        this.update_user_input_custom_answer(answer, cx);
-                    }
-                    InputEvent::Focus | InputEvent::BackspaceOnEmpty => {}
-                },
-            )
-            .detach();
-
             // Clipboard images and Finder file copies are attachment payloads,
             // not text paths. The input owns representation priority; Waku
             // owns durable staging and composer/session state.
@@ -2899,7 +2928,7 @@ impl Waku {
                 hosts,
                 home_directory,
                 composer,
-                user_input_answer,
+                user_input_fields: RefCell::new(HashMap::new()),
                 composer_drafts,
                 composer_draft_save_generation: 0,
                 command_palette: command_palette::CommandPaletteUi::new(command_palette_search),

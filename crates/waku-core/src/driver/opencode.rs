@@ -2228,6 +2228,8 @@ fn form_questions(form: &FormInfo) -> Vec<UserInputQuestion> {
                     })
                     .collect(),
                 multi_select,
+                required: true,
+                accepts_custom: true,
             })
         })
         .collect()

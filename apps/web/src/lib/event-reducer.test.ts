@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import type { AgentSession, SequencedEvent } from '@waku/client'
-import { reduceRuntimeEvent } from './event-reducer'
+import {
+  reduceRuntimeEvent,
+  userInputAnswers,
+  userInputReady,
+  type PendingUserInput,
+} from './event-reducer'
 
 const clock = {
   nowSeconds: () => 200,
@@ -131,6 +136,22 @@ describe('reduceRuntimeEvent', () => {
           question: 'Where should this deploy?',
           options: [{ label: 'Preview', description: 'Create a preview deployment' }],
           multiSelect: false,
+        }, {
+          id: 'limit',
+          header: 'Limit',
+          question: 'How many?',
+          options: [],
+          multiSelect: false,
+          required: false,
+          acceptsCustom: true,
+        }, {
+          id: 'ship',
+          header: 'Ship',
+          question: 'Ship it?',
+          options: [{ label: 'Yes' }, { label: 'No' }],
+          multiSelect: false,
+          required: true,
+          acceptsCustom: false,
         }],
       }),
       clock,
@@ -140,7 +161,18 @@ describe('reduceRuntimeEvent', () => {
     expect(requested.userInput?.questions[0]).toMatchObject({
       id: 'deployment',
       options: [{ label: 'Preview' }],
+      required: true,
+      acceptsCustom: true,
     })
+    expect(requested.userInput?.questions.map((question) => ({
+      id: question.id,
+      required: question.required,
+      acceptsCustom: question.acceptsCustom,
+    }))).toEqual([
+      { id: 'deployment', required: true, acceptsCustom: true },
+      { id: 'limit', required: false, acceptsCustom: true },
+      { id: 'ship', required: true, acceptsCustom: false },
+    ])
 
     const settled = reduceRuntimeEvent(
       requested.session,
@@ -148,6 +180,44 @@ describe('reduceRuntimeEvent', () => {
       clock,
     )
     expect(settled.userInput).toBeNull()
+  })
+
+  test('submits a whole elicitation form without inventing text for a choice', () => {
+    const input: PendingUserInput = {
+      requestId: 'form',
+      questions: [
+        {
+          id: 'scope',
+          header: 'Scope',
+          question: 'Which part?',
+          options: [{ label: 'Keep' }],
+          multiSelect: false,
+          required: true,
+          acceptsCustom: false,
+        },
+        {
+          id: 'limit',
+          header: 'Limit',
+          question: 'Limit',
+          options: [],
+          multiSelect: false,
+          required: false,
+          acceptsCustom: true,
+        },
+      ],
+    }
+
+    expect(userInputReady(input, {}, {})).toBe(false)
+    expect(userInputReady(input, { scope: ['Keep'] }, { scope: 'typed' })).toBe(true)
+    expect(userInputAnswers(input, { scope: ['Keep'] }, { scope: 'typed', limit: '  ' })).toEqual([
+      { questionId: 'scope', answers: ['Keep'] },
+      { questionId: 'limit', answers: [] },
+    ])
+    expect(userInputAnswers(input, { scope: ['Keep'] }, { limit: '12' })).toEqual([
+      { questionId: 'scope', answers: ['Keep'] },
+      { questionId: 'limit', answers: ['12'] },
+    ])
+    expect(userInputReady(input, {}, { limit: '12' })).toBe(false)
   })
 
   test('keeps the provider error when a working runtime exits', () => {

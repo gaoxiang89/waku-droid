@@ -331,6 +331,8 @@ mod tests {
                     description: Some("Create a preview deployment".into()),
                 }],
                 multi_select: false,
+                required: true,
+                accepts_custom: true,
             }],
         })
         .unwrap();

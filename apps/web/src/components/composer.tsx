@@ -75,7 +75,7 @@ import {
 import { usePrimaryShortcut } from '@/lib/platform'
 import { agentPresetDescription, agentPresetLabel } from '@/lib/agent-preset-presentation'
 import { isProjectlessProject, projectDisplayName } from '@/lib/project-presentation'
-import type { PendingUserInput } from '@/lib/event-reducer'
+import { userInputAnswers, userInputReady, type PendingUserInput } from '@/lib/event-reducer'
 import { useRuntime } from '@/lib/runtime-context'
 import { sessionHasStarted } from '@/lib/sidebar-presentation'
 import { cn } from '@/lib/utils'
@@ -987,32 +987,32 @@ function UserInputPanel({
   onSubmit: (answers: Array<{ questionId: string; answers: string[] }>) => Promise<void>
 }) {
   const { t } = useI18n()
-  const [questionIndex, setQuestionIndex] = useState(0)
   const [selections, setSelections] = useState<Record<string, string[]>>({})
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
+  const ready = userInputReady(input, selections, customAnswers)
 
   useEffect(() => {
-    setQuestionIndex(0)
     setSelections({})
     setCustomAnswers({})
     setSubmitting(false)
   }, [input.requestId])
 
-  const question = input.questions[questionIndex]
-  if (!question) return null
-  const selected = selections[question.id] ?? []
-  const custom = customAnswers[question.id] ?? ''
-  const canContinue = Boolean(custom.trim() || selected.length)
-  const last = questionIndex + 1 === input.questions.length
+  if (!input.questions.length) return null
 
-  function select(label: string) {
-    setCustomAnswers((current) => ({ ...current, [question.id]: '' }))
+  function choiceLabel(label: string) {
+    if (label === 'Yes') return t('user_input.yes')
+    if (label === 'No') return t('user_input.no')
+    return label
+  }
+
+  function select(questionId: string, label: string, multiSelect: boolean) {
+    setCustomAnswers((current) => ({ ...current, [questionId]: '' }))
     setSelections((current) => {
-      const previous = current[question.id] ?? []
+      const previous = current[questionId] ?? []
       return {
         ...current,
-        [question.id]: question.multiSelect
+        [questionId]: multiSelect
           ? previous.includes(label)
             ? previous.filter((answer) => answer !== label)
             : [...previous, label]
@@ -1021,28 +1021,18 @@ function UserInputPanel({
     })
   }
 
-  function setCustom(value: string) {
-    setCustomAnswers((current) => ({ ...current, [question.id]: value }))
+  function setCustom(questionId: string, value: string) {
+    setCustomAnswers((current) => ({ ...current, [questionId]: value }))
     if (value.trim()) {
-      setSelections((current) => ({ ...current, [question.id]: [] }))
+      setSelections((current) => ({ ...current, [questionId]: [] }))
     }
   }
 
-  async function advance() {
-    if (!canContinue || submitting) return
-    if (!last) {
-      setQuestionIndex((current) => current + 1)
-      return
-    }
+  async function submit() {
+    if (!ready || submitting) return
     setSubmitting(true)
     try {
-      await onSubmit(input.questions.map((item) => {
-        const custom = customAnswers[item.id]?.trim()
-        return {
-          questionId: item.id,
-          answers: custom ? [custom] : selections[item.id] ?? [],
-        }
-      }))
+      await onSubmit(userInputAnswers(input, selections, customAnswers))
     } catch (error) {
       toast.error(errorMessage(error))
       setSubmitting(false)
@@ -1051,94 +1041,90 @@ function UserInputPanel({
 
   return (
     <section className="mb-2 w-full rounded-[13px] border bg-card px-3.5 pb-2.5 pt-3">
-      <div className="flex items-center gap-2">
-        <div className="text-[11px] font-semibold text-[var(--text-tertiary)]">
-          {question.header}
-        </div>
-        {input.questions.length > 1 && (
-          <div className="flex h-[18px] items-center rounded-[5px] bg-muted/50 px-1.5 text-[10px] font-medium tabular-nums text-[var(--text-tertiary)]">
-            {t('user_input.progress', {
-              current: questionIndex + 1,
-              total: input.questions.length,
-            })}
-          </div>
-        )}
-      </div>
-      <p className="mt-1.5 whitespace-pre-wrap text-[13px] font-medium leading-[18px]">
-        {question.question}
-      </p>
-      {!!question.options.length && (
-        <div className="mt-2.5 grid gap-1" role={question.multiSelect ? 'group' : 'radiogroup'}>
-          {question.options.map((option) => {
-            const checked = selected.includes(option.label)
+      <div className="max-h-[420px] overflow-y-auto">
+        <div className="grid gap-3.5">
+          {input.questions.map((question) => {
+            const selected = selections[question.id] ?? []
+            const custom = question.acceptsCustom ? customAnswers[question.id] ?? '' : ''
             return (
-              <button
-                aria-checked={checked}
-                className={cn(
-                  'flex min-h-9 w-full items-center gap-2 rounded-lg border border-transparent bg-muted/40 px-2.5 py-1.5 text-left outline-none transition-colors hover:border-border hover:bg-muted/60 focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/30',
-                  checked && 'border-primary/35 bg-primary/[0.08]',
+              <div key={question.id}>
+                <div className="text-[11px] font-semibold text-[var(--text-tertiary)]">
+                  {question.header}
+                </div>
+                <p className="mt-1.5 whitespace-pre-wrap text-[13px] font-medium leading-[18px]">
+                  {question.question}
+                </p>
+                {!!question.options.length && (
+                  <div className="mt-2.5 grid gap-1" role={question.multiSelect ? 'group' : 'radiogroup'}>
+                    {question.options.map((option) => {
+                      const checked = selected.includes(option.label)
+                      return (
+                        <button
+                          aria-checked={checked}
+                          className={cn(
+                            'flex min-h-9 w-full items-center gap-2 rounded-lg border border-transparent bg-muted/40 px-2.5 py-1.5 text-left outline-none transition-colors hover:border-border hover:bg-muted/60 focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/30',
+                            checked && 'border-primary/35 bg-primary/[0.08]',
+                          )}
+                          key={option.label}
+                          role={question.multiSelect ? 'checkbox' : 'radio'}
+                          type="button"
+                          onClick={() => select(question.id, option.label, question.multiSelect)}
+                        >
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-[12px] font-medium">
+                              {choiceLabel(option.label)}
+                            </span>
+                            {option.description && option.description !== option.label && (
+                              <span className="mt-0.5 block text-[10.5px] leading-[15px] text-[var(--text-tertiary)]">
+                                {option.description}
+                              </span>
+                            )}
+                          </span>
+                          {checked && <WakuIcon className="size-3 shrink-0 text-primary" name="check" />}
+                        </button>
+                      )
+                    })}
+                  </div>
                 )}
-                key={option.label}
-                role={question.multiSelect ? 'checkbox' : 'radio'}
-                type="button"
-                onClick={() => select(option.label)}
-              >
-                <span className="min-w-0 flex-1">
-                  <span className="block text-[12px] font-medium">{option.label}</span>
-                  {option.description && option.description !== option.label && (
-                    <span className="mt-0.5 block text-[10.5px] leading-[15px] text-[var(--text-tertiary)]">
-                      {option.description}
-                    </span>
-                  )}
-                </span>
-                {checked && <WakuIcon className="size-3 shrink-0 text-primary" name="check" />}
-              </button>
+                {question.acceptsCustom && (
+                  <div
+                    className={cn(
+                      'flex h-[34px] items-center gap-2 rounded-lg border border-transparent bg-muted/40 px-2.5 focus-within:border-ring',
+                      question.options.length ? 'mt-1' : 'mt-2.5',
+                      custom.trim() && 'border-primary/35 bg-primary/[0.06]',
+                    )}
+                  >
+                    <WakuIcon
+                      className={cn('size-3 shrink-0 text-[var(--text-ghost)]', custom.trim() && 'text-primary')}
+                      name="pencil"
+                    />
+                    <input
+                      className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-[var(--text-ghost)]"
+                      placeholder={t('user_input.other_placeholder')}
+                      value={custom}
+                      onChange={(event) => setCustom(question.id, event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                          event.preventDefault()
+                          void submit()
+                        }
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
             )
           })}
         </div>
-      )}
-      <div
-        className={cn(
-          'mt-1 flex h-[34px] items-center gap-2 rounded-lg border border-transparent bg-muted/40 px-2.5 focus-within:border-ring',
-          custom.trim() && 'border-primary/35 bg-primary/[0.06]',
-        )}
-      >
-        <WakuIcon
-          className={cn('size-3 shrink-0 text-[var(--text-ghost)]', custom.trim() && 'text-primary')}
-          name="pencil"
-        />
-        <input
-          className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-[var(--text-ghost)]"
-          placeholder={t('user_input.other_placeholder')}
-          value={custom}
-          onChange={(event) => setCustom(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
-              event.preventDefault()
-              void advance()
-            }
-          }}
-        />
       </div>
-      <div className="mt-2 flex items-center gap-2">
-        {questionIndex > 0 && (
-          <Button
-            className="h-7 px-2 text-[11px]"
-            size="sm"
-            variant="ghost"
-            onClick={() => setQuestionIndex((value) => value - 1)}
-          >
-            {t('user_input.back')}
-          </Button>
-        )}
-        <div className="flex-1" />
+      <div className="mt-2.5 flex justify-end">
         <Button
           className="h-7 px-2.5 text-[11px]"
-          disabled={!canContinue || submitting}
+          disabled={!ready || submitting}
           size="sm"
-          onClick={() => void advance()}
+          onClick={() => void submit()}
         >
-          {last ? t('user_input.submit') : t('user_input.next')}
+          {t('user_input.submit')}
         </Button>
       </div>
     </section>

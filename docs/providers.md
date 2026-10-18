@@ -713,7 +713,9 @@ or not the account can currently serve a request.
 | `agent_message_chunk` | `TextDelta` |
 | `agent_thought_chunk` | `ReasoningDelta` |
 | `tool_call`, `tool_call_update` | `RichActivity`, correlated by `toolCallId` |
-| `plan` | a plan activity |
+| `plan` | a settled plan activity whose output lists each entry as `[x]` / `[~]` / `[ ]`; every update replaces the last |
+| `config_option_update` | refreshes the cached config options that model and effort changes compare against |
+| `current_mode_update` | for Droid, an autonomy-level mode id other than the access mode's is written back |
 | `usage_update` | `UsageUpdated` — the context gauge, not transcript content |
 | `available_commands_update` | `AvailableCommands` — the composer's slash-command list |
 | `session_info_update` | `AutoTitleUpdated` when it carries a `title` |
@@ -735,6 +737,29 @@ the agent's own explanation from `toolCall.content` ("Not in allowlist: cat,
 pwd") rather than a sentence synthesized from the tool kind — that reason is the
 whole basis for the user's decision. Outside Supervised, Waku answers for the
 user and prefers the durable allow so the agent stops asking about the same tool.
+
+Factory Droid is the exception. Its autonomy level already pre-approves what
+the access mode allows, so a request that still arrives is one the mode keeps
+for the user: Waku answers only under Full access (with `allow_once`).
+Answering in the other auto modes would make every one of them Full access —
+T3 Code likewise auto-approves only in `full-access`. Droid's `allow_always`
+answer raises the session's autonomy level, so it is left out of the prompt
+whenever an `allow_once` exists; the access mode stays the one control over
+what runs unasked.
+
+**Questions** — Factory Droid asks the user to choose through ACP elicitation
+(`elicitation/create`), the same request Zed answers from a form. Waku advertises
+`clientCapabilities.elicitation.form` on every ACP connection and keeps the
+whole form above the composer until it is submitted. Every property stays
+visible and selectable: a `oneOf` title is the option, a boolean is Yes / No
+in the app language, and an integer or open string is a text field. Optional
+properties can be left blank. The reply is `action: accept` with `content`
+keyed by property name; the `const` value is what goes back, and a blank
+optional property is omitted. The submitted choices are appended to the
+current turn. URL elicitation is not advertised. A form with nothing Waku can
+render is cancelled, so the turn is not left waiting on a request that will
+never be answered. Auto modes still wait for these answers; a question is not
+a permission.
 
 **Why the client advertises no `fs` or `terminal` capability.** Those declare
 services *Waku offers the agent*, not permissions the agent needs. `fs` exists so
@@ -760,8 +785,9 @@ is a deliberate future call, not an oversight.
 
 **Access modes** — Fx exposes native `ask` and `code` modes, so Waku maps
 Supervised to `ask` and the auto modes to `code`. Every other ACP agent stays in
-its ordinary execution mode, and `auto_approve` decides whether Waku answers
-`session/request_permission` on the user's behalf. That is why Kimi is left in
+its ordinary execution mode, and `auto_approves_permissions` decides whether
+Waku answers `session/request_permission` on the user's behalf (for Droid,
+only under Full access; see Approvals). That is why Kimi is left in
 `default` rather than switched to `auto` or `yolo`: the permission traffic is
 the feature, not an obstacle. A legacy session still reporting the removed
 read-only setting is returned to the agent's advertised `agent` or `default`
@@ -789,7 +815,15 @@ each model in that throwaway session and records the levels Droid answers with
 (this does not change the user's Droid defaults). Models not reached within the
 probe budget offer no effort picker. `autonomy_level` is always written at
 session start, because an unset session inherits the user's CLI default, which
-may already be `auto-high`. Auto-update is disabled for
+may already be `auto-high`. If it cannot be written, the session fails closed
+outside Full access: Waku reports the error and ends the connection rather than
+run at a level nobody chose. Changing the access mode writes the new level in
+place (`apply_options` waits for the answer, up to 10 s); a refusal or timeout
+makes the app restart the session under the new mode, and until then nothing
+is approved on the user's behalf. If Droid later reports a different level
+(`config_option_update` or `current_mode_update`), Waku writes the selected one
+back, and cancels the turn if that fails. Droid's other mode ids, such as spec
+mode, are left alone. Auto-update is disabled for
 the process (`DROID_DISABLE_AUTO_UPDATE` and `FACTORY_DROID_AUTO_UPDATE_ENABLED`)
 because the ACP registry launches Droid that way: a self-update mid-session
 would replace the binary Waku is talking to. Authentication stays on the CLI

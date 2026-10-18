@@ -1,9 +1,11 @@
-import type {
-  AgentSession,
-  MessageAttachment,
-  PendingPermission,
-  PendingUserInput,
-  UserInputAnswer,
+import {
+  userInputAnswers,
+  userInputReady,
+  type AgentSession,
+  type MessageAttachment,
+  type PendingPermission,
+  type PendingUserInput,
+  type UserInputAnswer,
 } from '@waku/client';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Haptics from 'expo-haptics';
@@ -690,35 +692,29 @@ function UserInputPanel({
   onSubmit: (answers: UserInputAnswer[]) => Promise<void>;
 }) {
   const theme = useTheme();
-  const [index, setIndex] = useState(0);
   const [selections, setSelections] = useState<Record<string, string[]>>({});
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const ready = userInputReady(input, selections, customAnswers);
 
   useEffect(() => {
-    setIndex(0);
     setSelections({});
     setCustomAnswers({});
     setSubmitting(false);
     setError(null);
   }, [input.requestId]);
 
-  const question = input.questions[index];
-  if (!question) return null;
-  const selected = selections[question.id] ?? [];
-  const custom = customAnswers[question.id] ?? '';
-  const canContinue = Boolean(custom.trim() || selected.length);
-  const last = index === input.questions.length - 1;
+  if (!input.questions.length) return null;
 
-  function toggle(label: string) {
+  function select(questionId: string, label: string, multiSelect: boolean) {
     void Haptics.selectionAsync();
-    setCustomAnswers((values) => ({ ...values, [question.id]: '' }));
+    setCustomAnswers((values) => ({ ...values, [questionId]: '' }));
     setSelections((values) => {
-      const previous = values[question.id] ?? [];
+      const previous = values[questionId] ?? [];
       return {
         ...values,
-        [question.id]: question.multiSelect
+        [questionId]: multiSelect
           ? previous.includes(label)
             ? previous.filter((value) => value !== label)
             : [...previous, label]
@@ -727,22 +723,17 @@ function UserInputPanel({
     });
   }
 
-  async function advance() {
-    if (!canContinue || submitting) return;
-    if (!last) {
-      setIndex((value) => value + 1);
-      return;
-    }
+  function setCustom(questionId: string, value: string) {
+    setCustomAnswers((values) => ({ ...values, [questionId]: value }));
+    if (value.trim()) setSelections((values) => ({ ...values, [questionId]: [] }));
+  }
+
+  async function submit() {
+    if (!ready || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
-      await onSubmit(input.questions.map((item) => {
-        const customValue = customAnswers[item.id]?.trim();
-        return {
-          questionId: item.id,
-          answers: customValue ? [customValue] : selections[item.id] ?? [],
-        };
-      }));
+      await onSubmit(userInputAnswers(input, selections, customAnswers));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setSubmitting(false);
@@ -751,93 +742,86 @@ function UserInputPanel({
 
   return (
     <RequestPanel borderColor={theme.accent}>
-      <View style={styles.questionHeader}>
-        <Text style={[styles.questionEyebrow, { color: theme.textTertiary }]}>{question.header}</Text>
-        {input.questions.length > 1 && (
-          <Text style={[styles.progress, { color: theme.textTertiary }]}>
-            {index + 1} of {input.questions.length}
-          </Text>
-        )}
-      </View>
-      <Text style={[styles.questionText, { color: theme.text }]}>{question.question}</Text>
       <ScrollView keyboardShouldPersistTaps="handled" nestedScrollEnabled style={styles.questionOptions}>
-        {question.options.map((option) => {
-          const checked = selected.includes(option.label);
+        {input.questions.map((question) => {
+          const selected = selections[question.id] ?? [];
+          const custom = question.acceptsCustom ? customAnswers[question.id] ?? '' : '';
           return (
-            <Pressable
-              accessibilityRole={question.multiSelect ? 'checkbox' : 'radio'}
-              accessibilityState={{ checked }}
-              key={option.label}
-              onPress={() => toggle(option.label)}
-              style={({ pressed }) => [
-                styles.questionOption,
-                {
-                  backgroundColor: checked ? theme.overlayStrong : theme.surfaceMuted,
-                  borderColor: checked ? NativeTint : 'transparent',
-                  opacity: pressed ? 0.65 : 1,
-                },
-              ]}>
-              <View style={styles.questionOptionCopy}>
-                <Text style={[styles.questionOptionLabel, { color: theme.text }]}>{option.label}</Text>
-                {option.description && option.description !== option.label && (
-                  <Text style={[styles.questionOptionDescription, { color: theme.textSecondary }]}>
-                    {option.description}
-                  </Text>
-                )}
-              </View>
-              {checked && (
-                <AppSymbol
-                  name={{ ios: 'checkmark', android: 'check', web: 'check' }}
-                  size={14}
-                  tintColor={NativeTint}
+            <View key={question.id} style={styles.questionBlock}>
+              <Text style={[styles.questionEyebrow, { color: theme.textTertiary }]}>{question.header}</Text>
+              <Text style={[styles.questionText, { color: theme.text }]}>{question.question}</Text>
+              {question.options.map((option) => {
+                const checked = selected.includes(option.label);
+                return (
+                  <Pressable
+                    accessibilityRole={question.multiSelect ? 'checkbox' : 'radio'}
+                    accessibilityState={{ checked }}
+                    key={option.label}
+                    onPress={() => select(question.id, option.label, question.multiSelect)}
+                    style={({ pressed }) => [
+                      styles.questionOption,
+                      {
+                        backgroundColor: checked ? theme.overlayStrong : theme.surfaceMuted,
+                        borderColor: checked ? NativeTint : 'transparent',
+                        opacity: pressed ? 0.65 : 1,
+                      },
+                    ]}>
+                    <View style={styles.questionOptionCopy}>
+                      <Text style={[styles.questionOptionLabel, { color: theme.text }]}>{option.label}</Text>
+                      {option.description && option.description !== option.label && (
+                        <Text style={[styles.questionOptionDescription, { color: theme.textSecondary }]}>
+                          {option.description}
+                        </Text>
+                      )}
+                    </View>
+                    {checked && (
+                      <AppSymbol
+                        name={{ ios: 'checkmark', android: 'check', web: 'check' }}
+                        size={14}
+                        tintColor={NativeTint}
+                      />
+                    )}
+                  </Pressable>
+                );
+              })}
+              {question.acceptsCustom && (
+                <TextInput
+                  accessibilityLabel="Custom answer"
+                  multiline
+                  placeholder="Write another answer…"
+                  placeholderTextColor={theme.textTertiary}
+                  selectionColor={NativeTint}
+                  style={[
+                    styles.customAnswer,
+                    {
+                      backgroundColor: theme.surfaceMuted,
+                      borderColor: custom.trim() ? NativeTint : 'transparent',
+                      color: theme.text,
+                    },
+                  ]}
+                  value={custom}
+                  onChangeText={(value) => setCustom(question.id, value)}
+                  onSubmitEditing={() => void submit()}
                 />
               )}
-            </Pressable>
+            </View>
           );
         })}
-        <TextInput
-          accessibilityLabel="Custom answer"
-          multiline
-          placeholder="Write another answer…"
-          placeholderTextColor={theme.textTertiary}
-          selectionColor={NativeTint}
-          style={[
-            styles.customAnswer,
-            {
-              backgroundColor: theme.surfaceMuted,
-              borderColor: custom.trim() ? NativeTint : 'transparent',
-              color: theme.text,
-            },
-          ]}
-          value={custom}
-          onChangeText={(value) => {
-            setCustomAnswers((values) => ({ ...values, [question.id]: value }));
-            if (value.trim()) setSelections((values) => ({ ...values, [question.id]: [] }));
-          }}
-        />
       </ScrollView>
       {error && <Text style={[styles.panelError, { color: theme.danger }]}>{error}</Text>}
       <View style={styles.questionActions}>
-        {index > 0 ? (
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => setIndex((value) => value - 1)}
-            style={styles.backButton}>
-            <Text style={[styles.backButtonText, { color: theme.textSecondary }]}>Back</Text>
-          </Pressable>
-        ) : <View />}
+        <View />
         <Pressable
           accessibilityRole="button"
-          disabled={!canContinue || submitting}
-          onPress={() => void advance()}
+          accessibilityState={{ disabled: !ready || submitting }}
+          disabled={!ready || submitting}
+          onPress={() => void submit()}
           style={({ pressed }) => [
             styles.nextButton,
-            { backgroundColor: theme.inverse, opacity: !canContinue || submitting || pressed ? 0.55 : 1 },
+            { backgroundColor: theme.inverse, opacity: !ready || submitting || pressed ? 0.55 : 1 },
           ]}>
           {submitting && <ActivityIndicator color={theme.onInverse} size="small" />}
-          <Text style={[styles.nextButtonText, { color: theme.onInverse }]}>
-            {last ? 'Submit' : 'Next'}
-          </Text>
+          <Text style={[styles.nextButtonText, { color: theme.onInverse }]}>Submit</Text>
         </Pressable>
       </View>
     </RequestPanel>
@@ -946,11 +930,10 @@ const styles = StyleSheet.create({
   },
   optionButtonText: { fontSize: 13, fontWeight: '700' },
   panelError: { fontSize: 12, lineHeight: 17, marginTop: 8 },
-  questionHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  questionBlock: { marginBottom: 14 },
   questionEyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 0.55, textTransform: 'uppercase' },
-  progress: { fontSize: 11, fontWeight: '600' },
   questionText: { fontSize: 14, fontWeight: '600', lineHeight: 20, marginTop: 7 },
-  questionOptions: { marginTop: 10, maxHeight: 260 },
+  questionOptions: { maxHeight: 360 },
   questionOption: {
     alignItems: 'center',
     borderRadius: Radius.medium,
@@ -975,8 +958,6 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   questionActions: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 },
-  backButton: { justifyContent: 'center', minHeight: 36, paddingHorizontal: 6 },
-  backButtonText: { fontSize: 13, fontWeight: '600' },
   nextButton: {
     alignItems: 'center',
     borderRadius: Radius.pill,

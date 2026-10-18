@@ -25,7 +25,43 @@ export interface PendingUserInput {
     question: string
     options: Array<{ label: string; description?: string }>
     multiSelect: boolean
+    /** Absent on older events. Those questions still require an answer. */
+    required: boolean
+    /** Absent on older events. Those questions still accept free text. */
+    acceptsCustom: boolean
   }>
+}
+
+export function userInputAnswers(
+  input: PendingUserInput,
+  selections: Readonly<Record<string, readonly string[]>>,
+  customAnswers: Readonly<Record<string, string>>,
+): Array<{ questionId: string; answers: string[] }> {
+  return input.questions.map((question) => ({
+    questionId: question.id,
+    answers: resolvedUserInputAnswers(question, selections, customAnswers),
+  }))
+}
+
+export function userInputReady(
+  input: PendingUserInput,
+  selections: Readonly<Record<string, readonly string[]>>,
+  customAnswers: Readonly<Record<string, string>>,
+): boolean {
+  return input.questions.every((question) => {
+    if (!question.required) return true
+    return resolvedUserInputAnswers(question, selections, customAnswers).some((answer) => answer.trim())
+  })
+}
+
+function resolvedUserInputAnswers(
+  question: PendingUserInput['questions'][number],
+  selections: Readonly<Record<string, readonly string[]>>,
+  customAnswers: Readonly<Record<string, string>>,
+): string[] {
+  const custom = question.acceptsCustom ? (customAnswers[question.id] ?? '').trim() : ''
+  if (custom) return [custom]
+  return [...(selections[question.id] ?? [])]
 }
 
 export interface RuntimeEventResult {
@@ -325,6 +361,8 @@ function asUserInputQuestion(value: unknown): PendingUserInput['questions'][numb
         })
       : [],
     multiSelect: question.multiSelect === true,
+    required: question.required !== false,
+    acceptsCustom: question.acceptsCustom !== false,
   }
 }
 

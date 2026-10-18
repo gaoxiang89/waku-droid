@@ -1052,6 +1052,7 @@ impl Waku {
             self.runtime_attach_pending.remove(session_id);
             self.runtime_attach_misses.remove(session_id);
             self.runtimes.remove(session_id);
+            self.clear_user_input_fields(*session_id);
             self.background_work.remove(session_id);
             self.remove_right_panel_session_state(*session_id);
             self.task_switcher.remove(*session_id);
@@ -2597,6 +2598,7 @@ impl Waku {
             runtime.pending_user_input = None;
             runtime.pending_computer_approval = None;
         }
+        self.clear_user_input_fields(session_id);
         self.invalidate_checkpoint_refs();
         if self
             .message_edit
@@ -3000,6 +3002,7 @@ impl Waku {
         session_id: Uuid,
         prepared: PreparedDriver,
     ) -> DriverHandle {
+        self.clear_user_input_fields(session_id);
         let handle = prepared.handle.clone();
         self.runtimes.insert(
             session_id,
@@ -3542,6 +3545,7 @@ impl Waku {
             runtime.pending_computer_approval = None;
             runtime.last_active_at = Instant::now();
         }
+        self.clear_user_input_fields(session_id);
         // The transcript already shows the turn — the prompt message, its
         // anchor, and the working indicator all landed at accept time. Only
         // preparation's own output surfaces here.

@@ -52,9 +52,13 @@ pub(super) fn composer_submit_action(
 impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
-    pub(super) fn render_permission(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn render_permission(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         if let Some(input) = self.selected_runtime()?.pending_user_input.clone() {
-            return Some(self.render_user_input(input, cx));
+            return Some(self.render_user_input(input, window, cx));
         }
         if let Some(permission) = self.selected_runtime()?.pending_computer_approval.as_ref() {
             return Some(self.render_computer_permission(permission, cx));
@@ -65,14 +69,24 @@ impl Waku {
         let mut buttons = div().flex().items_center().gap(px(8.0)).mt(px(10.0));
         for option in &permission.options {
             let request_id = request_id.clone();
+            let key_request_id = request_id.clone();
             let option_id = option.id.clone();
+            let key_option_id = option.id.clone();
             let allow = option.allow;
+            let focus = self.transcript_control_focus(
+                format!("permission-{}-{}", permission.request_id, option.id),
+                cx,
+            );
             buttons = buttons.child(
                 div()
                     .id(SharedString::from(format!(
                         "permission-{}-{}",
                         permission.request_id, option.id
                     )))
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_color(theme.accent))
                     .h(px(28.0))
                     .px(px(13.0))
                     .rounded(px(7.0))
@@ -98,6 +112,16 @@ impl Waku {
                     .child(SharedString::from(option.label.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.respond_permission(request_id.clone(), option_id.clone(), cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.respond_permission(
+                                key_request_id.clone(),
+                                key_option_id.clone(),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
                     })),
             );
         }
@@ -107,6 +131,9 @@ impl Waku {
                     .w_full()
                     .max_w(px(CONTENT_MAX_WIDTH))
                     .mx_auto()
+                    .tab_index(0)
+                    .tab_group()
+                    .tab_stop(false)
                     .p(px(12.0))
                     .rounded(px(12.0))
                     .border_1()
@@ -148,145 +175,247 @@ impl Waku {
         )
     }
 
-    fn render_user_input(&self, pending: PendingUserInput, cx: &mut Context<Self>) -> Div {
+    fn user_input_field(
+        &mut self,
+        session_id: Uuid,
+        request_id: &str,
+        question_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let key = user_input_field_key(session_id, request_id, question_id);
+        if let Some(existing) = self.user_input_fields.borrow().get(&key).cloned() {
+            return existing;
+        }
+        let input = cx
+            .new(|cx| TextInput::new(window, cx).placeholder(tr!("user_input.other_placeholder")));
+        let question_id = question_id.to_owned();
+        cx.subscribe(
+            &input,
+            move |_this, field, event: &InputEvent, cx| match event {
+                InputEvent::Submit(_) => {
+                    let waku = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        let _ = waku.update(cx, |this, cx| this.submit_user_input_form(cx));
+                    });
+                }
+                InputEvent::Edited => {
+                    let answer = field.read(cx).content().to_owned();
+                    let question_id = question_id.clone();
+                    let waku = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        let _ = waku.update(cx, |this, cx| {
+                            let Some(session_id) = this.state.selected_session else {
+                                return;
+                            };
+                            this.update_user_input_custom_answer(
+                                session_id,
+                                question_id,
+                                answer,
+                                cx,
+                            );
+                        });
+                    });
+                }
+                InputEvent::Focus | InputEvent::BackspaceOnEmpty => {}
+            },
+        )
+        .detach();
+        self.user_input_fields
+            .borrow_mut()
+            .insert(key, input.clone());
+        input
+    }
+
+    fn render_user_input(
+        &mut self,
+        pending: PendingUserInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let theme = Theme::current(cx);
-        let Some(question) = pending.current_question().cloned() else {
+        let Some(session_id) = self.state.selected_session else {
             return div();
         };
-        let selected = pending
-            .selections
-            .get(&question.id)
-            .cloned()
-            .unwrap_or_default();
-        let has_custom = pending
-            .custom_answers
-            .get(&question.id)
-            .is_some_and(|answer| !answer.trim().is_empty());
-        let can_continue = has_custom || !selected.is_empty();
-        let is_last = pending.question_index + 1 == pending.questions.len();
+        if pending.questions.is_empty() {
+            return div();
+        }
         let request_id = pending.request_id.clone();
-        let question_index = pending.question_index;
-        let mut options = div().mt(px(9.0)).flex().flex_col().gap(px(4.0));
-        for (index, option) in question.options.iter().enumerate() {
-            let is_selected = selected.iter().any(|answer| answer == &option.label);
-            let click_label = option.label.clone();
-            let key_label = option.label.clone();
-            let focus = self.transcript_control_focus(
-                format!("user-input-{request_id}-{question_index}-option-{index}"),
-                cx,
-            );
-            options = options.child(
+        let ready = pending.ready_to_submit();
+        let mut fields = div().flex().flex_col().gap(px(14.0));
+        for question in &pending.questions {
+            let selected = pending
+                .selections
+                .get(&question.id)
+                .cloned()
+                .unwrap_or_default();
+            let has_custom = question.accepts_custom
+                && pending
+                    .custom_answers
+                    .get(&question.id)
+                    .is_some_and(|answer| !answer.trim().is_empty());
+            let mut options = div().mt(px(8.0)).flex().flex_col().gap(px(4.0));
+            for (index, option) in question.options.iter().enumerate() {
+                let is_selected = selected.iter().any(|answer| answer == &option.label);
+                let question_id = question.id.clone();
+                let key_question_id = question.id.clone();
+                let click_label = option.label.clone();
+                let key_label = option.label.clone();
+                let focus = self.transcript_control_focus(
+                    format!("user-input-{request_id}-{}-option-{index}", question.id),
+                    cx,
+                );
+                options = options.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "user-input-{request_id}-{}-option-{index}",
+                            question.id
+                        )))
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .min_h(px(36.0))
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if is_selected {
+                            theme.accent.opacity(0.34)
+                        } else {
+                            theme.border.opacity(0.0)
+                        })
+                        .bg(if is_selected {
+                            theme.accent.opacity(0.08)
+                        } else {
+                            theme.overlay
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .cursor_default()
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .when(!is_selected, |row| {
+                            row.hover(|style| {
+                                style.border_color(theme.border).bg(theme.overlay_strong)
+                            })
+                        })
+                        .active(|style| style.opacity(0.85))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(sp(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(user_input_choice_label(
+                                            &option.label,
+                                        ))),
+                                )
+                                .children(option.description.as_ref().map(|description| {
+                                    div()
+                                        .mt(px(1.0))
+                                        .text_size(sp(12.5))
+                                        .line_height(sp(15.0))
+                                        .text_color(theme.text_secondary)
+                                        .whitespace_normal()
+                                        .child(SharedString::from(description.clone()))
+                                })),
+                        )
+                        .when(is_selected, |row| {
+                            row.child(icon("icons/check.svg", 12.0, theme.accent))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_user_input_option(
+                                question_id.clone(),
+                                click_label.clone(),
+                                cx,
+                            );
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.select_user_input_option(
+                                    key_question_id.clone(),
+                                    key_label.clone(),
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        })),
+                );
+            }
+            let custom = question.accepts_custom.then(|| {
+                let field =
+                    self.user_input_field(session_id, &request_id, &question.id, window, cx);
                 div()
-                    .id(SharedString::from(format!(
-                        "user-input-{request_id}-{question_index}-option-{index}"
-                    )))
-                    .track_focus(&focus)
-                    .tab_index(0)
-                    .tab_stop(true)
-                    .min_h(px(36.0))
+                    .mt(px(if question.options.is_empty() {
+                        8.0
+                    } else {
+                        4.0
+                    }))
+                    .h(px(34.0))
                     .px(px(10.0))
-                    .py(px(5.0))
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(if is_selected {
+                    .border_color(if has_custom {
                         theme.accent.opacity(0.34)
                     } else {
                         theme.border.opacity(0.0)
                     })
-                    .bg(if is_selected {
-                        theme.accent.opacity(0.08)
+                    .bg(if has_custom {
+                        theme.accent.opacity(0.06)
                     } else {
                         theme.overlay
                     })
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .cursor_default()
-                    .focus_visible(|style| style.border_color(theme.accent))
-                    .when(!is_selected, |row| {
-                        row.hover(|style| style.border_color(theme.border).bg(theme.overlay_strong))
-                    })
-                    .active(|style| style.opacity(0.85))
+                    .gap(px(7.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(16.0))
+                    .child(icon(
+                        "icons/pencil.svg",
+                        11.0,
+                        if has_custom {
+                            theme.accent
+                        } else {
+                            theme.text_ghost
+                        },
+                    ))
+                    .child(field)
+            });
+            fields = fields.child(
+                div()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(sp(12.5))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(option.label.clone())),
-                            )
-                            .children(option.description.as_ref().map(|description| {
-                                div()
-                                    .mt(px(1.0))
-                                    .text_size(sp(12.5))
-                                    .line_height(sp(15.0))
-                                    .text_color(theme.text_secondary)
-                                    .whitespace_normal()
-                                    .child(SharedString::from(description.clone()))
-                            })),
+                            .text_size(sp(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_tertiary)
+                            .child(SharedString::from(question.header.clone())),
                     )
-                    .when(is_selected, |row| {
-                        row.child(icon("icons/check.svg", 12.0, theme.accent))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_user_input_option(click_label.clone(), cx);
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.select_user_input_option(key_label.clone(), cx);
-                            cx.stop_propagation();
-                        }
-                    })),
+                    .child(
+                        div()
+                            .mt(px(5.0))
+                            .text_size(sp(13.0))
+                            .line_height(sp(18.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .whitespace_normal()
+                            .child(SharedString::from(question.question.clone())),
+                    )
+                    .children((!question.options.is_empty()).then_some(options))
+                    .children(custom),
             );
         }
-
-        let next_focus = self.transcript_control_focus(
-            format!("user-input-{request_id}-{question_index}-continue"),
-            cx,
-        );
-        let back = (question_index > 0).then(|| {
-            let focus = self.transcript_control_focus(
-                format!("user-input-{request_id}-{question_index}-back"),
-                cx,
-            );
-            div()
-                .id(SharedString::from(format!(
-                    "user-input-{request_id}-{question_index}-back"
-                )))
-                .track_focus(&focus)
-                .tab_index(0)
-                .tab_stop(true)
-                .h(px(26.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .flex()
-                .items_center()
-                .cursor_default()
-                .text_size(sp(12.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text_tertiary)
-                .focus_visible(|style| style.border_1().border_color(theme.accent))
-                .hover(|style| style.bg(theme.overlay).text_color(theme.text_secondary))
-                .active(|style| style.opacity(0.8))
-                .child(tr!("user_input.back"))
-                .on_click(cx.listener(|this, _, _, cx| this.previous_user_input(cx)))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        this.previous_user_input(cx);
-                        cx.stop_propagation();
-                    }
-                }))
-        });
-        let continue_button = div()
+        let submit_focus =
+            self.transcript_control_focus(format!("user-input-{request_id}-submit"), cx);
+        let submit = div()
             .id(SharedString::from(format!(
-                "user-input-{request_id}-{question_index}-continue"
+                "user-input-{request_id}-submit"
             )))
-            .track_focus(&next_focus)
+            .track_focus(&submit_focus)
             .tab_index(0)
-            .tab_stop(can_continue)
+            .tab_stop(ready)
             .h(px(26.0))
             .px(px(10.0))
             .rounded(px(6.0))
@@ -295,52 +424,26 @@ impl Waku {
             .cursor_default()
             .text_size(sp(12.5))
             .font_weight(FontWeight::SEMIBOLD)
-            .bg(if can_continue {
-                theme.inverse
-            } else {
-                theme.overlay
-            })
-            .text_color(if can_continue {
+            .bg(if ready { theme.inverse } else { theme.overlay })
+            .text_color(if ready {
                 theme.on_inverse
             } else {
                 theme.text_ghost
             })
-            .when(can_continue, |button| {
+            .when(ready, |button| {
                 button
                     .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .hover(|style| style.opacity(0.9))
                     .active(|style| style.opacity(0.8))
-                    .on_click(cx.listener(|this, _, _, cx| this.advance_user_input(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.submit_user_input_form(cx)))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.advance_user_input(cx);
+                            this.submit_user_input_form(cx);
                             cx.stop_propagation();
                         }
                     }))
             })
-            .child(if is_last {
-                tr!("user_input.submit")
-            } else {
-                tr!("user_input.next")
-            });
-
-        let progress = (pending.questions.len() > 1).then(|| {
-            div()
-                .h(px(18.0))
-                .px(px(6.0))
-                .rounded(px(5.0))
-                .bg(theme.overlay)
-                .flex()
-                .items_center()
-                .text_size(sp(12.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text_tertiary)
-                .child(tr!(
-                    "user_input.progress",
-                    current = question_index + 1,
-                    total = pending.questions.len()
-                ))
-        });
+            .child(tr!("user_input.submit"));
 
         div().flex_none().px(px(20.0)).pb(px(8.0)).child(
             div()
@@ -360,74 +463,18 @@ impl Waku {
                 .tab_stop(false)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(sp(12.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.text_tertiary)
-                                .child(SharedString::from(question.header.clone())),
-                        )
-                        .children(progress),
+                        .id("user-input-fields")
+                        .max_h(px(420.0))
+                        .overflow_y_scroll()
+                        .child(fields),
                 )
                 .child(
                     div()
-                        .mt(px(5.0))
-                        .text_size(sp(13.0))
-                        .line_height(sp(18.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .whitespace_normal()
-                        .child(SharedString::from(question.question.clone())),
-                )
-                .children((!question.options.is_empty()).then_some(options))
-                .child(
-                    div()
-                        .mt(px(if question.options.is_empty() {
-                            9.0
-                        } else {
-                            4.0
-                        }))
-                        .h(px(34.0))
-                        .px(px(10.0))
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(if has_custom {
-                            theme.accent.opacity(0.34)
-                        } else {
-                            theme.border.opacity(0.0)
-                        })
-                        .bg(if has_custom {
-                            theme.accent.opacity(0.06)
-                        } else {
-                            theme.overlay
-                        })
+                        .mt(px(10.0))
                         .flex()
                         .items_center()
-                        .gap(px(7.0))
-                        .text_size(sp(12.5))
-                        .line_height(sp(16.0))
-                        .child(icon(
-                            "icons/pencil.svg",
-                            11.0,
-                            if has_custom {
-                                theme.accent
-                            } else {
-                                theme.text_ghost
-                            },
-                        ))
-                        .child(self.user_input_answer.clone()),
-                )
-                .child(
-                    div()
-                        .mt(px(8.0))
-                        .flex()
-                        .items_center()
-                        .children(back)
-                        .child(div().flex_1())
-                        .child(continue_button),
+                        .justify_end()
+                        .child(submit),
                 ),
         )
     }

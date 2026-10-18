@@ -1677,6 +1677,8 @@ fn request_user_input(
                     .get("multiSelect")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                required: true,
+                accepts_custom: true,
             })
         })
         .collect::<Vec<_>>();
