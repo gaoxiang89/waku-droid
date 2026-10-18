@@ -18,6 +18,7 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [0.1.21]
 
+- Manage files from the right panel's file list on any host: right-click a file to download it to your machine, rename files and folders inline, or delete them after a confirmation — including over WSL and SSH
 - Connect to WSL distributions and SSH hosts from Settings → Connections: tasks, files, Git, checkpoints, and terminals run on that host while Waku only renders, and every package carries the static Linux daemon it installs there
 - Add Factory Droid as a provider, with each model's own reasoning levels and Waku's modes mapped to Droid's autonomy levels; dk users get their managed key automatically through `droid-dk`
 - Show why model discovery failed, such as a rejected `FACTORY_API_KEY`, instead of an empty model list
