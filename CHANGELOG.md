@@ -20,7 +20,7 @@ the original feature bullet instead of adding separate entries for them.
 
 - Manage files from the right panel's file list on any host: right-click a file to download it to your machine, rename files and folders inline, or delete them after a confirmation — including over WSL and SSH
 - Connect to WSL distributions and SSH hosts from Settings → Connections: tasks, files, Git, checkpoints, and terminals run on that host while Waku only renders, and every package carries the static Linux daemon it installs there
-- Add Factory Droid as a provider, with each model's own reasoning levels and Waku's modes mapped to Droid's autonomy levels; dk users get their managed key automatically through `droid-dk`
+- Add Factory Droid as a provider, with each model's own reasoning levels and Waku's modes mapped to Droid's autonomy levels; dk users get their managed key automatically through `droid-dk`, and a running turn keeps its thinking and tool groups expanded until the turn settles, so reasoning interleaved with answer text stays visible
 - Show why model discovery failed, such as a rejected `FACTORY_API_KEY`, instead of an empty model list
 - Organize the sidebar as host → workspace → session, with denser rows and status dots
 - Add a terminal panel below the composer, toggled with ⌘J / Ctrl+J: run several terminals as tabs, open new ones with ⇧⌘J / Ctrl+Shift+J, switch tabs with Ctrl+PageUp/PageDown, and switch tasks without losing a running terminal
