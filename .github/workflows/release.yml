@@ -479,8 +479,10 @@ jobs:
         env:
           WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_SIGNING_IDENTITY: ${{ secrets.WAKU_SIGNING_IDENTITY }}
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
+          # release.ts requires an analytics endpoint/website id for any
+          # build; fork builds without the secrets embed inert placeholders.
+          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT || 'https://analytics.invalid/ingest' }}
+          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID || 'fork-placeholder' }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           # Without a Developer ID identity (fork builds), ad-hoc sign and
