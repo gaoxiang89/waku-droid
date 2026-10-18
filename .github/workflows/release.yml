@@ -404,109 +404,6 @@ jobs:
             target/release/Waku-${{ needs.version.outputs.version }}-aarch64-Setup.exe
           if-no-files-found: error
 
-  macos:
-    name: macOS
-    needs: [version, remote-daemon]
-    if: needs.version.outputs.published != 'true'
-    runs-on: macos-latest
-    timeout-minutes: 90
-    env:
-      # The secrets context is unavailable in step `if`, so these flags
-      # carry the presence checks for the optional signing steps below.
-      HAVE_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
-      HAVE_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install create-dmg
-        run: brew install create-dmg
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-latest-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            macos-latest-rust-1.96.0-release-
-
-      - name: Import Apple Developer Certificate
-        # Fork builds may not configure an Apple signing certificate; the
-        # Release step below falls back to ad-hoc codesign in that case.
-        if: env.HAVE_APPLE_CERTIFICATE == 'true'
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
-          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          security find-identity -v -p codesigning build.keychain
-          rm certificate.p12
-
-      - name: Store notary credentials
-        # Notarization needs Apple ID credentials; skipped for fork builds.
-        if: env.HAVE_APPLE_ID == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          xcrun notarytool store-credentials NOTARY \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID"
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: remote-daemon-linux-*
-          path: target/remote-daemons
-          merge-multiple: true
-          # Both legs must land: the packaging scripts warn (rather than fail)
-          # on an architecture they cannot find, for local builds' sake.
-          if-no-files-found: error
-
-      - name: Release
-        env:
-          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
-          WAKU_SIGNING_IDENTITY: ${{ secrets.WAKU_SIGNING_IDENTITY }}
-          # release.ts requires an analytics endpoint/website id for any
-          # build; fork builds without the secrets embed inert placeholders.
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT || 'https://analytics.invalid/ingest' }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID || 'fork-placeholder' }}
-          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: |
-          # Without a Developer ID identity (fork builds), ad-hoc sign and
-          # skip notarization; the Sparkle feed still signs via the key.
-          if [ -n "$WAKU_SIGNING_IDENTITY" ]; then
-            bun run release --local
-          else
-            bun run release --adhoc
-          fi
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: macos
-          path: |
-            dist/Waku-${{ needs.version.outputs.version }}.dmg
-            dist/Waku-${{ needs.version.outputs.version }}.md
-            dist/Waku-${{ needs.version.outputs.version }}.zip
-            dist/appcast.xml
-          if-no-files-found: error
-
   draft-release:
     name: Draft GitHub release
     needs:
@@ -516,7 +413,6 @@ jobs:
         linux-arm64,
         windows-x86_64,
         windows-arm64,
-        macos,
       ]
     if: needs.version.outputs.published != 'true'
     runs-on: ubuntu-latest
@@ -591,11 +487,8 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz
-            artifacts/*.dmg
-            artifacts/*.md
             artifacts/*.zip
             artifacts/*.exe
-            artifacts/appcast.xml
             artifacts/appcast-linux-*.xml
             artifacts/appcast-windows-*.xml
             artifacts/latest-linux.txt
