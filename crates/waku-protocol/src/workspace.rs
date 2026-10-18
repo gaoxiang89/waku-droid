@@ -70,6 +70,26 @@ pub enum WorkspaceOperation {
         relative_path: PathBuf,
         content: String,
     },
+    ReadFile {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+    },
+    RenamePath {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        from_relative_path: PathBuf,
+        #[ts(type = "string")]
+        to_relative_path: PathBuf,
+    },
+    DeletePath {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+    },
     ListProjectFiles {
         #[ts(type = "string")]
         root: PathBuf,
@@ -211,6 +231,10 @@ pub enum WorkspaceResult {
     },
     TextFile {
         content: String,
+    },
+    File {
+        /// Base64-encoded file bytes, matching the blob command framing.
+        bytes: String,
     },
     ProjectFiles {
         entries: Vec<FileEntry>,

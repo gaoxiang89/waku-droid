@@ -1497,6 +1497,14 @@ pub struct Waku {
     right_panel_files_selected_path: Option<String>,
     right_panel_file_tree_width: f32,
     right_panel_file_editors: HashMap<String, RightPanelFileEditor>,
+    /// Working-tree row currently showing its inline rename field. One target
+    /// at a time; the field itself is the shared `right_panel_file_rename_input`.
+    right_panel_file_rename: Option<right_panel::RightPanelFileRename>,
+    /// One stable field reused across working-tree rows so redraws never
+    /// replace the focused editor mid-rename, mirroring `session_rename_input`.
+    right_panel_file_rename_input: Entity<TextInput>,
+    /// Pending destructive delete awaiting the confirm dialog.
+    right_panel_delete_confirm: Option<right_panel::RightPanelDeleteConfirm>,
     /// Find-and-replace over the visible file editor. Created on first use of
     /// the primary find shortcut and kept for the window's lifetime so the
     /// query and toggles survive closing the bar; `open` says whether it shows.
@@ -1775,6 +1783,7 @@ use components::*;
 pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 use project_picker::ProjectPickerSite;
+pub use right_panel::init as init_right_panel_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
 use sidebar::{SidebarGroup, SidebarRow};
@@ -2164,6 +2173,7 @@ impl Waku {
                 .placeholder(tr!("skills.search"))
         });
         let session_rename_input = cx.new(|cx| TextInput::new(window, cx));
+        let right_panel_file_rename_input = cx.new(|cx| TextInput::new(window, cx));
         let provider_path_input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .select_all_on_focus_click()
@@ -2785,6 +2795,15 @@ impl Waku {
             )
             .detach();
             cx.subscribe(
+                &right_panel_file_rename_input,
+                |this: &mut Self, _, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(_) => this.commit_right_panel_file_rename(cx),
+                    InputEvent::Edited if this.right_panel_file_rename.is_some() => cx.notify(),
+                    _ => {}
+                },
+            )
+            .detach();
+            cx.subscribe(
                 &usage_project_filter,
                 |_: &mut Self, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Edited) {
@@ -3088,6 +3107,9 @@ impl Waku {
                 session_navigation,
                 session_rename: None,
                 session_rename_input,
+                right_panel_file_rename: None,
+                right_panel_file_rename_input,
+                right_panel_delete_confirm: None,
                 sidebar_collapsed_groups: HashSet::new(),
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),

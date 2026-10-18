@@ -1676,6 +1676,26 @@ files.could_not_save_read_only:
   en: "Could not save %{path}: file is not editable"
 files.could_not_save:
   en: "Could not save %{path}: %{error}"
+files.download:
+  en: Download…
+files.download_saved:
+  en: "Saved %{name} to %{path}"
+files.download_failed:
+  en: "Could not download the file: %{error}"
+files.delete:
+  en: Delete
+files.delete_confirm_title:
+  en: Delete permanently?
+files.delete_confirm_message:
+  en: "“%{name}” will be permanently deleted. This cannot be undone."
+files.delete_confirm_message_dir:
+  en: "“%{name}” and everything inside it will be permanently deleted. This cannot be undone."
+files.delete_failed:
+  en: "Could not delete %{path}: %{error}"
+files.rename_failed:
+  en: "Could not rename %{path}: %{error}"
+files.invalid_name:
+  en: "Names cannot be empty or contain path separators"
 files.preview_markdown:
   en: Preview markdown
 files.edit_markdown_source:

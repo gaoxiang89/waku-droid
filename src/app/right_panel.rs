@@ -1,7 +1,45 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use gpui::{KeyBinding, actions};
+
 use super::*;
+
+actions!(
+    waku_right_panel,
+    [
+        CancelRightPanelFileRename,
+        ConfirmRightPanelFileDelete,
+        DismissRightPanelFileDelete
+    ]
+);
+
+const FILE_RENAME_PARENT_CONTEXT: &str = "RightPanelFileRename";
+const FILE_RENAME_FIELD_CONTEXT: &str = "RightPanelFileRename > TextInput";
+const FILE_DELETE_DIALOG_CONTEXT: &str = "RightPanelFileDeleteDialog";
+
+/// Keep Escape inside the focused inline editor so it cancels the rename,
+/// and give the delete confirm dialog its confirm/dismiss keys.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(
+            "escape",
+            CancelRightPanelFileRename,
+            Some(FILE_RENAME_FIELD_CONTEXT),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            ConfirmRightPanelFileDelete,
+            Some(FILE_DELETE_DIALOG_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            DismissRightPanelFileDelete,
+            Some(FILE_DELETE_DIALOG_CONTEXT),
+        ),
+    ]);
+}
 
 pub(super) const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
 const REVIEW_DIFF_FILE_HEADER_HEIGHT: f32 = 36.0;
@@ -15,6 +53,25 @@ pub(super) struct WorkingTreeEntry {
     file_icon: Option<&'static str>,
     expanded: bool,
     depth: usize,
+}
+
+/// The working-tree row an inline rename is editing. Renames stay inside the
+/// entry's directory: only the new name travels over the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RightPanelFileRename {
+    pub(super) relative_path: String,
+    pub(super) absolute_path: PathBuf,
+}
+
+/// A delete parked behind the confirm dialog until the user approves it.
+#[derive(Clone, Debug)]
+pub(super) struct RightPanelDeleteConfirm {
+    pub(super) relative_path: String,
+    pub(super) name: String,
+    pub(super) is_dir: bool,
+    /// Keyboard focus for the safe choice, so Enter cannot confirm by accident.
+    pub(super) cancel_focus: FocusHandle,
+    pub(super) confirm_focus: FocusHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1885,6 +1942,10 @@ impl Waku {
         self.right_panel_files_selected_path = state.files_selected_path;
         self.right_panel_file_tree_width = state.file_tree_width;
         self.right_panel_file_editors = state.file_editors;
+        // A rename or delete confirm belongs to the tree it was opened on;
+        // switching sessions abandons it rather than retargeting the wrong row.
+        self.right_panel_file_rename = None;
+        self.right_panel_delete_confirm = None;
         self.right_panel_diff_generation = self.right_panel_diff_generation.wrapping_add(1);
         self.right_panel_diff_selection.clear();
         self.right_panel_diff_source = state.diff_source;
@@ -2765,8 +2826,26 @@ impl Waku {
         for entry in entries {
             let relative_path = entry.relative_path.clone();
             let absolute_path = entry.absolute_path.clone();
+            let name = entry.name.clone();
             let is_dir = entry.is_dir;
             let selected = selected_path == Some(relative_path.as_str());
+            let renaming = self
+                .right_panel_file_rename
+                .as_ref()
+                .is_some_and(|rename| rename.relative_path == relative_path);
+            let rename_input = renaming.then(|| self.right_panel_file_rename_input.clone());
+            let waku = cx.entity().downgrade();
+            let menu = self.menu_handle(
+                SharedString::from(format!("right-panel-file-menu-{relative_path}")),
+                cx,
+            );
+            let keyboard_menu = menu.clone();
+            let key_relative_path = relative_path.clone();
+            let key_absolute_path = absolute_path.clone();
+            let click_relative_path = relative_path.clone();
+            let click_absolute_path = absolute_path.clone();
+            let menu_relative_path = relative_path.clone();
+            let row_focus = menu.trigger_focus_handle().clone();
             let row = div()
                 .id(SharedString::from(format!(
                     "right-panel-file-{relative_path}"
@@ -2799,29 +2878,159 @@ impl Waku {
                 .when_some(entry.file_icon, |element, file_icon_path| {
                     element.child(file_icon(file_icon_path, 14.0))
                 })
-                .child(
+                .child(if let Some(rename_input) = rename_input {
+                    div()
+                        .id(SharedString::from(format!(
+                            "right-panel-file-rename-{relative_path}"
+                        )))
+                        .key_context(FILE_RENAME_PARENT_CONTEXT)
+                        .on_action(
+                            cx.listener(|this, _: &CancelRightPanelFileRename, window, cx| {
+                                this.cancel_right_panel_file_rename(window, cx);
+                            }),
+                        )
+                        .h(px(18.0))
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(4.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.inset)
+                        .flex()
+                        .items_center()
+                        .text_size(sp(12.0))
+                        .text_color(theme.text)
+                        .child(rename_input)
+                        .into_any_element()
+                } else {
                     div()
                         .min_w_0()
                         .flex_1()
                         .truncate()
                         .text_size(sp(12.5))
                         .text_color(theme.text_secondary)
-                        .child(entry.name),
-                );
-            list = if is_dir {
-                list.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.right_panel_expanded_paths.remove(&absolute_path) {
-                        this.right_panel_expanded_paths
-                            .insert(absolute_path.clone());
-                    }
-                    this.refresh_right_panel_working_tree(cx);
-                    cx.notify();
-                })))
+                        .child(name.clone())
+                        .into_any_element()
+                })
+                .when(!renaming, |element| {
+                    element
+                        .track_focus(&row_focus)
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .on_key_down(cx.listener(
+                            move |this, event: &KeyDownEvent, window, cx| {
+                                let key = event.keystroke.key.as_str();
+                                if matches!(key, "enter" | "space") {
+                                    if is_dir {
+                                        if !this
+                                            .right_panel_expanded_paths
+                                            .remove(&key_absolute_path)
+                                        {
+                                            this.right_panel_expanded_paths
+                                                .insert(key_absolute_path.clone());
+                                        }
+                                        this.refresh_right_panel_working_tree(cx);
+                                        cx.notify();
+                                    } else {
+                                        this.open_right_panel_file(key_relative_path.clone(), cx);
+                                    }
+                                    cx.stop_propagation();
+                                } else if key == "f10" && event.keystroke.modifiers.shift {
+                                    keyboard_menu.open_context_menu(window, cx);
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if is_dir {
+                                if !this.right_panel_expanded_paths.remove(&click_absolute_path) {
+                                    this.right_panel_expanded_paths
+                                        .insert(click_absolute_path.clone());
+                                }
+                                this.refresh_right_panel_working_tree(cx);
+                                cx.notify();
+                            } else {
+                                this.open_right_panel_file(click_relative_path.clone(), cx);
+                            }
+                        }))
+                });
+            let row = if renaming {
+                div()
+                    .w_full()
+                    .child(row)
+                    .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                        if this
+                            .right_panel_file_rename
+                            .as_ref()
+                            .is_some_and(|rename| rename.relative_path == relative_path)
+                        {
+                            this.commit_right_panel_file_rename(cx);
+                        }
+                    }))
+                    .into_any_element()
             } else {
-                list.child(row.on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_right_panel_file(relative_path.clone(), cx);
-                })))
+                context_menu(
+                    div().w_full().child(row),
+                    SharedString::from(format!("right-panel-file-menu-{relative_path}")),
+                    &menu,
+                    move |_| {
+                        let download_waku = waku.clone();
+                        let rename_waku = waku.clone();
+                        let delete_waku = waku.clone();
+                        let mut items = Vec::new();
+                        if !is_dir {
+                            let relative_path = menu_relative_path.clone();
+                            let item_name = name.clone();
+                            items.push(
+                                MenuItem::new(tr!("files.download"), move |_, cx| {
+                                    let _ = download_waku.update(cx, |waku, cx| {
+                                        waku.download_right_panel_file(
+                                            relative_path.clone(),
+                                            item_name.clone(),
+                                            cx,
+                                        )
+                                    });
+                                })
+                                .icon("icons/download.svg"),
+                            );
+                            items.push(MenuItem::Separator);
+                        }
+                        let rename_relative_path = menu_relative_path.clone();
+                        items.push(
+                            MenuItem::new(tr!("common.rename"), move |window, cx| {
+                                let _ = rename_waku.update(cx, |waku, cx| {
+                                    waku.begin_right_panel_file_rename(
+                                        rename_relative_path.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            })
+                            .icon("icons/pencil.svg"),
+                        );
+                        let delete_relative_path = menu_relative_path.clone();
+                        let delete_name = name.clone();
+                        items.push(
+                            MenuItem::new(tr!("files.delete"), move |window, cx| {
+                                let _ = delete_waku.update(cx, |waku, cx| {
+                                    waku.request_right_panel_file_delete(
+                                        delete_relative_path.clone(),
+                                        delete_name.clone(),
+                                        is_dir,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            })
+                            .icon("icons/trash.svg"),
+                        );
+                        items
+                    },
+                )
+                .into_any_element()
             };
+            list = list.child(row);
         }
 
         div()
@@ -2869,6 +3078,186 @@ impl Waku {
                         &self.right_panel_files_scrollbar,
                     )),
             )
+    }
+
+    /// The delete confirm dialog: a deferred scrim layer, so a destructive
+    /// remote delete always needs a second explicit action.
+    pub(super) fn render_right_panel_delete_confirm(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let confirm_state = self.right_panel_delete_confirm.clone()?;
+        let theme = Theme::current(cx);
+
+        let cancel = div()
+            .id("right-panel-delete-cancel")
+            .track_focus(&confirm_state.cancel_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_secondary)
+            .bg(theme.overlay)
+            .hover(|element| element.bg(theme.overlay_strong))
+            .child(tr_cow!("common.cancel"))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.right_panel_delete_confirm = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.right_panel_delete_confirm = None;
+                cx.notify();
+            }));
+        let confirm = div()
+            .id("right-panel-delete-confirm")
+            .track_focus(&confirm_state.confirm_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.danger))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.danger)
+            .bg(theme.danger_soft)
+            .hover(|element| element.bg(theme.danger.opacity(0.16)))
+            .child(icon("icons/trash.svg", 13.0, theme.danger))
+            .child(tr_cow!("files.delete"))
+            .on_key_down(cx.listener(
+                move |this, event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.confirm_right_panel_file_delete_action(
+                            &ConfirmRightPanelFileDelete,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.confirm_right_panel_file_delete_action(
+                        &ConfirmRightPanelFileDelete,
+                        window,
+                        cx,
+                    );
+                },
+            ));
+
+        let message = if confirm_state.is_dir {
+            tr!(
+                "files.delete_confirm_message_dir",
+                name = confirm_state.name
+            )
+        } else {
+            tr!("files.delete_confirm_message", name = confirm_state.name)
+        };
+        let card = div()
+            .id("right-panel-delete-confirm-card")
+            .key_context(FILE_DELETE_DIALOG_CONTEXT)
+            .on_action(
+                cx.listener(|waku, _: &ConfirmRightPanelFileDelete, window, cx| {
+                    waku.confirm_right_panel_file_delete_action(
+                        &ConfirmRightPanelFileDelete,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(cx.listener(|waku, _: &DismissRightPanelFileDelete, window, cx| {
+                waku.dismiss_right_panel_file_delete_action(
+                    &DismissRightPanelFileDelete,
+                    window,
+                    cx,
+                );
+            }))
+            .tab_group()
+            .tab_stop(false)
+            .w_full()
+            .max_w(px(400.0))
+            .overflow_hidden()
+            .rounded(px(18.0))
+            .bg(theme.composer)
+            .shadow_xl()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(48.0))
+                    .px(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .text_size(sp(14.0))
+                    .text_color(theme.text)
+                    .child(icon("icons/alert.svg", 15.0, theme.danger))
+                    .child(tr_cow!("files.delete_confirm_title")),
+            )
+            .child(
+                div()
+                    .px(px(16.0))
+                    .pb(px(14.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(17.0))
+                    .text_color(theme.text_secondary)
+                    .child(message),
+            )
+            .child(div().mx(px(16.0)).h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(cancel)
+                    .child(confirm),
+            );
+
+        let scrim = if theme.is_dark {
+            gpui::hsla(0.0, 0.0, 0.0, 0.34)
+        } else {
+            gpui::hsla(0.0, 0.0, 0.0, 0.16)
+        };
+        let layer = div()
+            .id("right-panel-delete-confirm-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(scrim)
+            .p(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|waku, _, window, cx| {
+                    waku.dismiss_right_panel_file_delete_action(
+                        &DismissRightPanelFileDelete,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child(card);
+        Some(gpui::deferred(layer).with_priority(4).into_any_element())
     }
 
     fn render_right_panel_file(
@@ -3488,6 +3877,424 @@ impl Waku {
             });
         })
         .detach();
+    }
+
+    /// Starts the inline rename for a working-tree row. Renaming stays inside
+    /// the entry's directory: the field edits the name only.
+    pub(super) fn begin_right_panel_file_rename(
+        &mut self,
+        relative_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .right_panel_working_tree
+            .iter()
+            .find(|entry| entry.relative_path == relative_path)
+            .cloned()
+        else {
+            return;
+        };
+        self.right_panel_file_rename = Some(RightPanelFileRename {
+            relative_path,
+            absolute_path: entry.absolute_path,
+        });
+        self.right_panel_file_rename_input.update(cx, |input, cx| {
+            input.set_content(entry.name, cx);
+            input.select_all_text(cx);
+        });
+        let focus = self.right_panel_file_rename_input.read(cx).focus();
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        cx.notify();
+    }
+
+    pub(super) fn commit_right_panel_file_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.right_panel_file_rename.take() else {
+            return;
+        };
+        let new_name = self
+            .right_panel_file_rename_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
+        let old_name = rename
+            .relative_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if new_name.is_empty() || new_name == old_name {
+            cx.notify();
+            return;
+        }
+        if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
+            self.show_toast(tr!("files.invalid_name"));
+            cx.notify();
+            return;
+        }
+        // Preserve whatever separator convention the tree itself carries.
+        let to_relative = match rename.relative_path.rfind(['/', '\\']) {
+            Some(index) => format!("{}{}", &rename.relative_path[..=index], new_name),
+            None => new_name.clone(),
+        };
+
+        let Some(project_path) = self
+            .selected_workspace_path()
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        let from_relative = rename.relative_path.clone();
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let project_path = project_path.clone();
+                    let from_relative = from_relative.clone();
+                    let to_relative = to_relative.clone();
+                    async move {
+                        match workspace.request(waku_client::WorkspaceOperation::RenamePath {
+                            root: project_path,
+                            from_relative_path: PathBuf::from(from_relative),
+                            to_relative_path: PathBuf::from(to_relative),
+                        })? {
+                            waku_client::WorkspaceResult::Ack => Ok(()),
+                            _ => anyhow::bail!("the daemon returned an invalid rename response"),
+                        }
+                    }
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                if waku.state.selected_session != Some(session_id)
+                    || waku
+                        .selected_workspace_path()
+                        .is_none_or(|path| path != project_path)
+                {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        waku.retarget_right_panel_file_paths(&from_relative, &to_relative);
+                        waku.refresh_right_panel_working_tree(cx);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        waku.show_toast(tr!(
+                            "files.rename_failed",
+                            path = from_relative,
+                            error = error.to_string()
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn cancel_right_panel_file_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_panel_file_rename.take().is_none() {
+            return;
+        }
+        let focus = self.composer_focus(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Moves every reference to a just-renamed entry — open editors, tabs, the
+    /// selected file, and the expanded-directory set — onto its new path.
+    fn retarget_right_panel_file_paths(&mut self, from_relative: &str, to_relative: &str) {
+        fn retarget(key: &str, from: &str, to: &str) -> Option<String> {
+            if key == from {
+                return Some(to.to_owned());
+            }
+            for separator in ['/', '\\'] {
+                if let Some(rest) = key.strip_prefix(&format!("{from}{separator}")) {
+                    return Some(format!("{to}{separator}{rest}"));
+                }
+            }
+            None
+        }
+        if let Some(editor) = self.right_panel_file_editors.remove(from_relative) {
+            self.right_panel_file_editors
+                .insert(to_relative.to_owned(), editor);
+        } else {
+            let editor_moves: Vec<(String, String)> = self
+                .right_panel_file_editors
+                .keys()
+                .filter_map(|key| {
+                    retarget(key, from_relative, to_relative).map(|to| (key.clone(), to))
+                })
+                .collect();
+            for (from, to) in editor_moves {
+                if let Some(editor) = self.right_panel_file_editors.remove(&from) {
+                    self.right_panel_file_editors.insert(to, editor);
+                }
+            }
+        }
+        for surface in &mut self.right_panel_surfaces {
+            if let RightPanelSurface::File(path) = surface
+                && let Some(retargeted) = retarget(path, from_relative, to_relative)
+            {
+                *path = retargeted;
+            }
+        }
+        if let Some(selected) = self.right_panel_files_selected_path.as_mut()
+            && let Some(retargeted) = retarget(selected, from_relative, to_relative)
+        {
+            *selected = retargeted;
+        }
+        if let Some(rename) = self.right_panel_file_rename.as_ref()
+            && let Some(retargeted) = retarget(&rename.relative_path, from_relative, to_relative)
+        {
+            let renamed = RightPanelFileRename {
+                relative_path: retargeted,
+                absolute_path: rename.absolute_path.clone(),
+            };
+            self.right_panel_file_rename = Some(renamed);
+        }
+        let absolute_moves: Vec<(PathBuf, PathBuf)> = self
+            .right_panel_expanded_paths
+            .iter()
+            .filter_map(|path| {
+                let key = path.to_string_lossy();
+                retarget(&key, from_relative, to_relative).map(|to| {
+                    (path.clone(), PathBuf::from(to))
+                })
+            })
+            .collect();
+        for (from, to) in absolute_moves {
+            self.right_panel_expanded_paths.remove(&from);
+            self.right_panel_expanded_paths.insert(to);
+        }
+    }
+
+    /// Saves a remote (or local) file to a path of the user's choosing. The
+    /// bytes travel over the daemon RPC, so this works unchanged over SSH and
+    /// WSL bridges.
+    pub(super) fn download_right_panel_file(
+        &mut self,
+        relative_path: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = self
+            .selected_workspace_path()
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let default_directory =
+            dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
+        let receiver = cx.prompt_for_new_path(&default_directory, Some(&name));
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        let display_name = name.clone();
+        cx.spawn(async move |waku, cx| {
+            let Ok(Ok(Some(destination))) = receiver.await else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let project_path = project_path.clone();
+                    let relative_path = relative_path.clone();
+                    let destination = destination.clone();
+                    async move {
+                        match workspace.request(waku_client::WorkspaceOperation::ReadFile {
+                            root: project_path,
+                            relative_path: PathBuf::from(relative_path),
+                        })? {
+                            waku_client::WorkspaceResult::File { bytes } => {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .decode(bytes.trim())?;
+                                std::fs::write(&destination, bytes)?;
+                                Ok(())
+                            }
+                            _ => anyhow::bail!("the daemon returned an invalid file response"),
+                        }
+                    }
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                match result {
+                    Ok(()) => waku.show_success_toast(tr!(
+                        "files.download_saved",
+                        name = display_name,
+                        path = destination.display()
+                    )),
+                    Err(error) => waku.show_toast(tr!(
+                        "files.download_failed",
+                        error = error.to_string()
+                    )),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Parks a delete behind the confirm dialog. Remote deletion is
+    /// unrecoverable, so it never runs straight from the menu.
+    pub(super) fn request_right_panel_file_delete(
+        &mut self,
+        relative_path: String,
+        name: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cancel_focus = cx.focus_handle();
+        let confirm_focus = cx.focus_handle();
+        self.right_panel_delete_confirm = Some(RightPanelDeleteConfirm {
+            relative_path,
+            name,
+            is_dir,
+            cancel_focus: cancel_focus.clone(),
+            confirm_focus,
+        });
+        // Like the other deferred layers, the dialog joins the dispatch tree
+        // only after it has drawn; focus the safe choice two frames later so
+        // keys cannot fall through to the transcript beneath it.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| window.focus(&cancel_focus, cx));
+        });
+        cx.notify();
+    }
+
+    pub(super) fn confirm_right_panel_file_delete_action(
+        &mut self,
+        _: &ConfirmRightPanelFileDelete,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(confirm) = self.right_panel_delete_confirm.take() else {
+            return;
+        };
+        let Some(project_path) = self
+            .selected_workspace_path()
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let project_path = project_path.clone();
+                    let relative_path = confirm.relative_path.clone();
+                    async move {
+                        match workspace.request(waku_client::WorkspaceOperation::DeletePath {
+                            root: project_path,
+                            relative_path: PathBuf::from(relative_path),
+                        })? {
+                            waku_client::WorkspaceResult::Ack => Ok(()),
+                            _ => anyhow::bail!("the daemon returned an invalid delete response"),
+                        }
+                    }
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                if waku.state.selected_session != Some(session_id)
+                    || waku
+                        .selected_workspace_path()
+                        .is_none_or(|path| path != project_path)
+                {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        waku.close_right_panel_paths_under(
+                            &confirm.relative_path,
+                            confirm.is_dir,
+                            cx,
+                        );
+                        if let Some(absolute) = waku
+                            .right_panel_working_tree
+                            .iter()
+                            .find(|entry| entry.relative_path == confirm.relative_path)
+                            .map(|entry| entry.absolute_path.clone())
+                        {
+                            waku.right_panel_expanded_paths.retain(|path| {
+                                path != &absolute && !path.starts_with(&absolute)
+                            });
+                        }
+                        waku.refresh_right_panel_working_tree(cx);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        waku.show_toast(tr!(
+                            "files.delete_failed",
+                            path = confirm.relative_path,
+                            error = error.to_string()
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn dismiss_right_panel_file_delete_action(
+        &mut self,
+        _: &DismissRightPanelFileDelete,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_panel_delete_confirm = None;
+        cx.notify();
+    }
+
+    /// Closes every open editor and tab that a deleted path leaves dangling:
+    /// the entry itself, and — for a directory — everything under it.
+    fn close_right_panel_paths_under(
+        &mut self,
+        relative_path: &str,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        fn path_matches(key: &str, relative_path: &str, is_dir: bool) -> bool {
+            if key == relative_path {
+                return true;
+            }
+            is_dir && ['/', '\\'].iter().any(|separator| key.starts_with(&format!(
+                "{relative_path}{separator}"
+            )))
+        }
+        loop {
+            let index = self.right_panel_surfaces.iter().position(|surface| {
+                match surface {
+                    RightPanelSurface::File(path) => path_matches(path, relative_path, is_dir),
+                    _ => false,
+                }
+            });
+            match index {
+                Some(index) => self.close_right_panel_surface(index, cx),
+                None => break,
+            }
+        }
+        self.right_panel_file_editors
+            .retain(|key, _| !path_matches(key, relative_path, is_dir));
+        if self
+            .right_panel_files_selected_path
+            .as_deref()
+            .is_some_and(|path| path_matches(path, relative_path, is_dir))
+        {
+            self.right_panel_files_selected_path = None;
+        }
     }
 
     fn render_right_panel_diff(

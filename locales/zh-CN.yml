@@ -818,6 +818,16 @@ files.unable_to_edit: "无法编辑此文件：%{error}"
 files.could_not_save_opening: "无法保存 %{path}：文件仍在打开"
 files.could_not_save_read_only: "无法保存 %{path}：文件不可编辑"
 files.could_not_save: "无法保存 %{path}：%{error}"
+files.download: 下载…
+files.download_saved: "已将 %{name} 保存到 %{path}"
+files.download_failed: "无法下载文件：%{error}"
+files.delete: 删除
+files.delete_confirm_title: 永久删除？
+files.delete_confirm_message: "“%{name}”将被永久删除,此操作无法撤销。"
+files.delete_confirm_message_dir: "“%{name}”及其中的所有内容将被永久删除,此操作无法撤销。"
+files.delete_failed: "无法删除 %{path}：%{error}"
+files.rename_failed: "无法重命名 %{path}：%{error}"
+files.invalid_name: "名称不能为空,也不能包含路径分隔符"
 files.preview_markdown: 预览 Markdown
 files.edit_markdown_source: 编辑源码
 files.resize_tree: 调整文件树宽度

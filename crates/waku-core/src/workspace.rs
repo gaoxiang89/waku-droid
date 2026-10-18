@@ -9,8 +9,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 
 use anyhow::{Context as _, anyhow, bail};
+use base64::Engine as _;
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DOWNLOADABLE_FILE_BYTES: usize = 256 * 1024 * 1024;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub use waku_protocol::workspace::{
@@ -61,6 +63,60 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             content,
         } => {
             fs::write(resolve_workspace_path(&root, &relative_path)?, content)?;
+            WorkspaceResult::Ack
+        }
+        WorkspaceOperation::ReadFile {
+            root,
+            relative_path,
+        } => {
+            let path = resolve_workspace_path(&root, &relative_path)?;
+            let metadata = fs::metadata(&path)
+                .with_context(|| format!("could not open file {}", path.display()))?;
+            if metadata.is_dir() {
+                bail!("not a file: {}", path.display());
+            }
+            if metadata.len() > MAX_DOWNLOADABLE_FILE_BYTES as u64 {
+                bail!(
+                    "file {} is {} bytes, larger than the {} MiB download limit",
+                    path.display(),
+                    metadata.len(),
+                    MAX_DOWNLOADABLE_FILE_BYTES / (1024 * 1024)
+                );
+            }
+            let bytes = fs::read(&path)?;
+            WorkspaceResult::File {
+                bytes: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        }
+        WorkspaceOperation::RenamePath {
+            root,
+            from_relative_path,
+            to_relative_path,
+        } => {
+            let from = resolve_workspace_path(&root, &from_relative_path)?;
+            let to = resolve_workspace_path(&root, &to_relative_path)?;
+            if fs::symlink_metadata(&to).is_ok() {
+                bail!(
+                    "{} already exists in the destination directory",
+                    to.display()
+                );
+            }
+            fs::rename(&from, &to)
+                .with_context(|| format!("could not rename {}", from.display()))?;
+            WorkspaceResult::Ack
+        }
+        WorkspaceOperation::DeletePath {
+            root,
+            relative_path,
+        } => {
+            let path = resolve_workspace_path(&root, &relative_path)?;
+            if fs::symlink_metadata(&path)?.is_dir() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("could not remove directory {}", path.display()))?;
+            } else {
+                fs::remove_file(&path)
+                    .with_context(|| format!("could not remove file {}", path.display()))?;
+            }
             WorkspaceResult::Ack
         }
         WorkspaceOperation::ListProjectFiles { root, cap } => WorkspaceResult::ProjectFiles {
@@ -628,6 +684,101 @@ mod tests {
             })
             .is_err()
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_reader_round_trips_arbitrary_bytes() {
+        let root = std::env::temp_dir().join(format!("waku-binary-read-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bytes: Vec<u8> = (0..=u8::MAX).chain([0u8; 64]).collect();
+        fs::write(root.join("blob.bin"), &bytes).unwrap();
+
+        let WorkspaceResult::File {
+            bytes: encoded,
+        } = execute(WorkspaceOperation::ReadFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("blob.bin"),
+        })
+        .unwrap()
+        else {
+            panic!("unexpected workspace response")
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            bytes
+        );
+        assert!(execute(WorkspaceOperation::ReadFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("missing.bin"),
+        })
+        .is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_mutations_stay_inside_the_workspace() {
+        let root = std::env::temp_dir().join(format!("waku-path-mutations-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+        execute(WorkspaceOperation::RenamePath {
+            root: root.clone(),
+            from_relative_path: PathBuf::from("src/lib.rs"),
+            to_relative_path: PathBuf::from("src/main.rs"),
+        })
+        .unwrap();
+        assert!(root.join("src/main.rs").is_file());
+        assert!(!root.join("src/lib.rs").exists());
+
+        execute(WorkspaceOperation::DeletePath {
+            root: root.clone(),
+            relative_path: PathBuf::from("src/main.rs"),
+        })
+        .unwrap();
+        assert!(!root.join("src/main.rs").exists());
+
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/deep.txt"), "deep").unwrap();
+        execute(WorkspaceOperation::DeletePath {
+            root: root.clone(),
+            relative_path: PathBuf::from("src/nested"),
+        })
+        .unwrap();
+        assert!(!root.join("src/nested").exists());
+
+        // Renaming onto an existing entry is refused instead of silently
+        // replacing it, and traversal outside the root never reaches the FS.
+        fs::write(root.join("occupied.txt"), "occupied").unwrap();
+        fs::write(root.join("other.txt"), "other").unwrap();
+        assert!(execute(WorkspaceOperation::RenamePath {
+            root: root.clone(),
+            from_relative_path: PathBuf::from("other.txt"),
+            to_relative_path: PathBuf::from("occupied.txt"),
+        })
+        .is_err());
+        assert_eq!(fs::read_to_string(root.join("occupied.txt")).unwrap(), "occupied");
+        for operation in [
+            WorkspaceOperation::RenamePath {
+                root: root.clone(),
+                from_relative_path: PathBuf::from("other.txt"),
+                to_relative_path: PathBuf::from("../escape.txt"),
+            },
+            WorkspaceOperation::DeletePath {
+                root: root.clone(),
+                relative_path: PathBuf::from("../escape.txt"),
+            },
+            WorkspaceOperation::DeletePath {
+                root: root.clone(),
+                relative_path: PathBuf::from(""),
+            },
+        ] {
+            assert!(execute(operation).is_err());
+        }
+        assert!(root.join("other.txt").is_file());
+        assert!(!root.parent().unwrap().join("escape.txt").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
