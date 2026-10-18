@@ -1876,26 +1876,39 @@ impl Waku {
         // the next tool after the previous result. The group leaves the live
         // tail only when answer text is appended (so `after_message` falls
         // behind) or when the turn itself settles.
-        let live_group = self.selected_session().is_some_and(|session| {
-            session
-                .transcript_blocks
-                .get(block_index)
-                .is_some_and(|block| {
-                    activity_group_is_live(
-                        session
+        let (live_group, live_turn_block) = self
+            .selected_session()
+            .map(|session| {
+                session
+                    .transcript_blocks
+                    .get(block_index)
+                    .map(|block| {
+                        let live_turn = session
                             .active_turn_id()
-                            .is_some_and(|turn_id| block.turn_id == Some(turn_id)),
-                        block_index + 1 == session.transcript_blocks.len(),
-                        block.after_message,
-                        session.messages.len(),
-                    )
-                })
-        });
+                            .is_some_and(|turn_id| block.turn_id == Some(turn_id));
+                        (
+                            activity_group_is_live(
+                                live_turn,
+                                block_index + 1 == session.transcript_blocks.len(),
+                                block.after_message,
+                                session.messages.len(),
+                            ),
+                            live_turn,
+                        )
+                    })
+                    .unwrap_or((false, false))
+            })
+            .unwrap_or((false, false));
+        // Answer text between tool batches seals a group, but the turn is
+        // still the freshest context — folding each segment the moment its
+        // text lands hides thinking the reader was just watching. Every
+        // group the running turn produced stays open; the settled turn
+        // folds once, into its turn divider.
         let expanded = self
             .activities_expanded
             .get(&block_index)
             .copied()
-            .unwrap_or(live_group);
+            .unwrap_or(live_turn_block);
         let live_reasoning_id = (self
             .selected_runtime()
             .is_some_and(|runtime| runtime.stream_phase == Some(StreamPhase::Reasoning))
