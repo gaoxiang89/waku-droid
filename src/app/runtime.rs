@@ -2610,6 +2610,7 @@ impl Waku {
         if selected {
             self.activities_expanded.clear();
             self.expanded_activity_items.clear();
+            self.unfolded_activity_runs.clear();
             self.expanded_turns.clear();
             self.expanded_changed_files.clear();
             self.transcript_control_focuses.borrow_mut().clear();
@@ -3383,6 +3384,7 @@ impl Waku {
         if selected {
             self.activities_expanded.clear();
             self.expanded_activity_items.clear();
+            self.unfolded_activity_runs.clear();
             self.expanded_turns.clear();
             self.expanded_changed_files.clear();
             self.transcript_control_focuses.borrow_mut().clear();

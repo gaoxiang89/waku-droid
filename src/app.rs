@@ -1415,6 +1415,9 @@ pub struct Waku {
     /// Per-item disclosure overrides. Reasoning starts open while live; tool
     /// details start closed, so the stored bool must preserve either choice.
     expanded_activity_items: HashMap<Uuid, bool>,
+    /// Tool runs in a running turn that the user unfolded past their recent
+    /// tail, keyed by the run's first activity.
+    unfolded_activity_runs: HashSet<Uuid>,
     /// Settled turns whose folded work the user has reopened.
     expanded_turns: HashSet<Uuid>,
     /// Per-response file cards the user expanded beyond their three-file
@@ -3101,6 +3104,7 @@ impl Waku {
                 last_stream_save: Instant::now(),
                 activities_expanded: HashMap::new(),
                 expanded_activity_items: HashMap::new(),
+                unfolded_activity_runs: HashSet::new(),
                 expanded_turns: HashSet::new(),
                 expanded_changed_files: HashSet::new(),
                 transcript_control_focuses: RefCell::new(HashMap::new()),

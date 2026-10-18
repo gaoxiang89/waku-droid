@@ -638,6 +638,10 @@ activity.named_content:
   en: "%{name} content"
 activity.ran:
   en: Ran %{activities}
+activity.failed_count:
+  en: "%{count} failed"
+activity.show_earlier:
+  en: "%{count} earlier"
 activity.action_think:
   en: Think
 activity.action_run:

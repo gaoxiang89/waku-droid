@@ -310,6 +310,8 @@ activity.running: 正在执行：%{activities}
 activity.detail: 活动详情
 activity.named_content: "%{name}内容"
 activity.ran: 已执行：%{activities}
+activity.failed_count: "%{count} 次失败"
+activity.show_earlier: "更早的 %{count} 项"
 activity.action_think: 思考
 activity.action_run: 运行
 activity.action_edit: 编辑

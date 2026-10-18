@@ -13,6 +13,13 @@ const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
 /// Aligns a hunk separator with the line numbers in the rows below it; see
 /// `DiffRowStyle::ACTIVITY`.
 const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
+/// A tool run in a running turn shows only its most recent activities; the
+/// earlier ones fold behind a single "N earlier" line.
+const LIVE_ACTIVITY_RUN_TAIL: usize = 3;
+/// A thought reads as a few lines of prose by default; opening it raises the
+/// cap to the same scrolling viewport as tool output.
+const REASONING_PREVIEW_HEIGHT: f32 = 84.0;
+const REASONING_FULL_HEIGHT: f32 = 400.0;
 
 #[derive(Clone, Debug)]
 struct ConversationNavigationRailSnapshot {
@@ -869,6 +876,12 @@ impl Waku {
     ) {
         self.toggle_block_disclosure(block_index, cx, |this| {
             this.activities_expanded.insert(block_index, !current);
+        });
+    }
+
+    fn unfold_activity_run(&mut self, block_index: usize, run_start: Uuid, cx: &mut Context<Self>) {
+        self.toggle_block_disclosure(block_index, cx, |this| {
+            this.unfolded_activity_runs.insert(run_start);
         });
     }
 
@@ -1993,8 +2006,61 @@ impl Waku {
             .border_color(theme.border)
             .flex()
             .flex_col()
-            .gap(px(8.0));
-        for activity in activities {
+            .gap(px(6.0));
+        // Thoughts split the group into runs of tool activity. While the turn
+        // runs, a long run keeps only its recent tail on screen so the newest
+        // work and the reasoning around it stay in view.
+        let mut hidden = vec![false; activities.len()];
+        let mut earlier_lines: Vec<(usize, usize, Uuid)> = Vec::new();
+        if live_turn_block {
+            let mut start = 0;
+            while start < activities.len() {
+                if activities[start].reasoning.is_some() {
+                    start += 1;
+                    continue;
+                }
+                let end = activities[start..]
+                    .iter()
+                    .position(|activity| activity.reasoning.is_some())
+                    .map_or(activities.len(), |offset| start + offset);
+                let run_start = activities[start].id;
+                if end - start > LIVE_ACTIVITY_RUN_TAIL
+                    && !self.unfolded_activity_runs.contains(&run_start)
+                {
+                    let visible_from = end - LIVE_ACTIVITY_RUN_TAIL;
+                    hidden[start..visible_from].fill(true);
+                    earlier_lines.push((visible_from, visible_from - start, run_start));
+                }
+                start = end;
+            }
+        }
+        for (index, activity) in activities.iter().enumerate() {
+            if hidden[index] {
+                continue;
+            }
+            if let Some(&(_, count, run_start)) = earlier_lines
+                .iter()
+                .find(|(visible_from, ..)| *visible_from == index)
+            {
+                items = items.child(self.render_activity_run_earlier(
+                    block_index,
+                    count,
+                    run_start,
+                    theme,
+                    cx,
+                ));
+            }
+            if let Some(reasoning) = activity.reasoning.as_ref() {
+                items = items.child(self.render_reasoning_prose(
+                    activity.id,
+                    reasoning,
+                    live_reasoning_id == Some(activity.id),
+                    theme,
+                    window,
+                    cx,
+                ));
+                continue;
+            }
             let id = activity.id;
             let background_work = self
                 .state
@@ -2038,20 +2104,10 @@ impl Waku {
                         }
                     }))
             });
-            let reasoning = activity.reasoning.as_ref();
-            let reasoning_live = live_reasoning_id == Some(id);
-            let sections = if reasoning.is_some() {
-                Vec::new()
-            } else {
-                activity_disclosure_sections(activity)
-            };
-            let preview = if reasoning.is_some() {
-                String::new()
-            } else {
-                activity_preview(activity)
-            };
+            let sections = activity_disclosure_sections(activity);
+            let preview = activity_preview(activity);
             let action_label = activity_action_label(activity);
-            let mut row_detail = activity_row_detail(activity, reasoning_live);
+            let mut row_detail = activity_row_detail(activity, false);
             if row_detail.trim().is_empty() {
                 row_detail = preview;
             }
@@ -2070,26 +2126,28 @@ impl Waku {
                 }
                 _ => None,
             };
-            let shows_diff = reasoning.is_none() && activity_shows_diff(activity);
-            let has_detail = reasoning
-                .is_some_and(|reasoning| !reasoning.content.trim().is_empty())
-                || !sections.is_empty()
-                || shows_diff;
+            let shows_diff = activity_shows_diff(activity);
+            let has_detail = !sections.is_empty() || shows_diff;
             let item_expanded = has_detail
                 && self
                     .expanded_activity_items
                     .get(&id)
                     .copied()
-                    .unwrap_or(reasoning_live);
+                    .unwrap_or(false);
+            // A closed exploration step drops its card and reads as one line,
+            // so the edits and commands around it stand out.
+            let compact = activity_is_exploration(activity.kind) && !item_expanded;
             let item_focus = self.transcript_control_focus(format!("activity-item-{id}"), cx);
             let mut item = div()
                 .w_full()
                 .min_w_0()
                 .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .bg(activity_surface)
+                .when(!compact, |item| {
+                    item.rounded(px(9.0))
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .bg(activity_surface)
+                })
                 .flex()
                 .flex_col()
                 .child(
@@ -2097,8 +2155,9 @@ impl Waku {
                         .id(SharedString::from(format!("activity-item-{id}")))
                         // The parent owns a 1px border on each edge, so a
                         // 28px row makes the visible activity header 30px.
-                        .h(px(28.0))
-                        .px(px(8.0))
+                        // A compact row has no border and shows 24px.
+                        .h(px(if compact { 24.0 } else { 28.0 }))
+                        .px(px(if compact { 9.0 } else { 8.0 }))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
@@ -2167,7 +2226,7 @@ impl Waku {
                                 theme.text_tertiary,
                             ))
                         })
-                        .when(!has_detail && reasoning.is_none(), |element| {
+                        .when(!has_detail, |element| {
                             element
                                 .when(activity.failed, |element| {
                                     element.child(
@@ -2192,100 +2251,6 @@ impl Waku {
                             }
                         })),
                 );
-            if item_expanded && let Some(reasoning) = reasoning {
-                // Reasoning remains model prose even though it now shares the
-                // activity stream, so keep selectable markdown rather than
-                // presenting it as monospace tool output.
-                let mut palette = MarkdownPalette::from_theme(theme);
-                palette.text = theme.text_secondary;
-                palette.secondary = theme.text_tertiary;
-                let ctx = self
-                    .markdown_ctx(
-                        format!("reasoning-{id}"),
-                        &palette,
-                        self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
-                        reasoning_live && !cx.reduce_motion(),
-                    )
-                    .with_math_context_menu(self.menu_handle(format!("reasoning-math-{id}"), cx));
-                let reasoning_viewport = self
-                    .activity_scroll_viewports
-                    .borrow_mut()
-                    .entry(id)
-                    .or_default()
-                    .clone();
-                let mut views = self.activity_markdown.borrow_mut();
-                let view = views.entry(id).or_default();
-                if reasoning_live {
-                    let start = self.live_reasoning_window_start(id, &reasoning.content, view);
-                    view.set_text(&reasoning.content[start..], true);
-                } else {
-                    self.reasoning_window_starts.borrow_mut().remove(&id);
-                    view.set_text(&reasoning.content, false);
-                }
-                let wheel_scroll = reasoning_viewport.scroll_handle.clone();
-                let wheel_follow_tail = reasoning_viewport.follow_tail.clone();
-                let markdown = if reasoning_live {
-                    // The live peek pins to the tail of a growing document;
-                    // building every block of a long think per pulse tick was
-                    // the remaining 40%-CPU streaming path.
-                    md::render::markdown_tail(view, &ctx, LIVE_REASONING_TAIL_BLOCKS)
-                } else {
-                    md::render::markdown(view, &ctx)
-                };
-                if reasoning_live && !cx.reduce_motion() && view.is_fading() {
-                    // The reasoning dissolve rides the half-rate lease: fast
-                    // thinking keeps a fade active for the whole phase, every
-                    // tick rebuilds each visible transcript row, and 15 fps
-                    // alpha on the dim compact peek is indistinguishable. The
-                    // answer text keeps the full-rate dissolve.
-                    motion::pulse_lease_slow(window.current_view(), cx);
-                }
-                item = item.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .relative()
-                        .max_h(px(400.0))
-                        .overflow_hidden()
-                        .border_t_1()
-                        .border_color(theme.border_strong)
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("reasoning-scroll-{id}")))
-                                .w_full()
-                                .min_w_0()
-                                .max_h(px(400.0))
-                                .overflow_y_scroll()
-                                .track_scroll(&reasoning_viewport.scroll_handle)
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .children(markdown)
-                                .on_scroll_wheel(move |_, window, cx| {
-                                    contain_scroll(&wheel_scroll, cx);
-                                    let scroll = wheel_scroll.clone();
-                                    let follow_tail = wheel_follow_tail.clone();
-                                    window.defer(cx, move |_, _| {
-                                        follow_tail.set(activity_scroll_at_bottom(&scroll));
-                                    });
-                                }),
-                        )
-                        .child(scrollbar::edge_fade(
-                            reasoning_viewport.scroll_handle.clone(),
-                            scrollbar::FadeEdge::Top,
-                            activity_surface,
-                        ))
-                        .child(scrollbar::edge_fade(
-                            reasoning_viewport.scroll_handle.clone(),
-                            scrollbar::FadeEdge::Bottom,
-                            activity_surface,
-                        ))
-                        .child(scrollbar::vertical(
-                            &reasoning_viewport.scroll_handle,
-                            &reasoning_viewport.scrollbar,
-                        ))
-                        .child(activity_scroll_guard(reasoning_viewport, reasoning_live)),
-                );
-            }
             if item_expanded && shows_diff {
                 let diff = self.activity_diff_rows(activity);
                 if !diff.is_empty() {
@@ -2298,10 +2263,7 @@ impl Waku {
                     ));
                 }
             }
-            if item_expanded
-                && reasoning.is_none()
-                && (!sections.is_empty() || !activity.image_urls.is_empty())
-            {
+            if item_expanded && (!sections.is_empty() || !activity.image_urls.is_empty()) {
                 let palette = MarkdownPalette::from_theme(theme);
                 let ctx = self.markdown_ctx(
                     format!("activity-{id}"),
@@ -2515,6 +2477,256 @@ impl Waku {
             items = items.child(item);
         }
         cluster.child(items).into_any_element()
+    }
+
+    /// The line standing in for a running tool run's earlier activities.
+    fn render_activity_run_earlier(
+        &self,
+        block_index: usize,
+        count: usize,
+        run_start: Uuid,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focus = self.transcript_control_focus(format!("activity-earlier-{run_start}"), cx);
+        div()
+            .id(SharedString::from(format!("activity-earlier-{run_start}")))
+            .track_focus(&focus)
+            .tab_index(0)
+            .h(px(22.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(sp(12.5))
+            .line_height(sp(16.0))
+            .text_color(theme.text_tertiary)
+            .cursor_default()
+            .focus_visible(|style| style.text_color(theme.text))
+            .hover(|style| style.text_color(theme.text))
+            .child(icon("icons/chevron-right.svg", 10.0, theme.text_tertiary))
+            .child(SharedString::from(tr!(
+                "activity.show_earlier",
+                count = count
+            )))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.unfold_activity_run(block_index, run_start, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.unfold_activity_run(block_index, run_start, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// A thought as dim prose between tool runs rather than another card.
+    ///
+    /// It shows its opening lines — or, while streaming, its newest ones —
+    /// and opens to the same capped scrolling viewport as tool output.
+    fn render_reasoning_prose(
+        &self,
+        id: Uuid,
+        reasoning: &ReasoningBlock,
+        live: bool,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let has_content = !reasoning.content.trim().is_empty();
+        let full = has_content
+            && self
+                .expanded_activity_items
+                .get(&id)
+                .copied()
+                .unwrap_or(false);
+        let focus = self.transcript_control_focus(format!("activity-item-{id}"), cx);
+        let header = div()
+            .id(SharedString::from(format!("activity-item-{id}")))
+            .h(px(22.0))
+            .px(px(9.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(sp(12.5))
+            .line_height(sp(16.0))
+            .text_color(theme.text_tertiary)
+            .child(icon(
+                activity_icon(ActivityKind::Reasoning),
+                12.0,
+                theme.text_tertiary,
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(SharedString::from(reasoning_activity_title(
+                        reasoning, live,
+                    ))),
+            )
+            .when(has_content, |header| {
+                header
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .cursor_default()
+                    .focus_visible(|style| style.text_color(theme.text))
+                    .hover(|style| style.text_color(theme.text))
+                    .child(icon(
+                        if full {
+                            "icons/chevron-down.svg"
+                        } else {
+                            "icons/chevron-right.svg"
+                        },
+                        10.0,
+                        theme.text_tertiary,
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_activity_item(id, full, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.toggle_activity_item(id, full, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            });
+        if !has_content {
+            return header.into_any_element();
+        }
+
+        // Reasoning is model prose, so keep selectable markdown rather than
+        // presenting it as monospace tool output.
+        let mut palette = MarkdownPalette::from_theme(theme);
+        palette.text = theme.text_tertiary;
+        palette.secondary = theme.text_tertiary;
+        let ctx = self
+            .markdown_ctx(
+                format!("reasoning-{id}"),
+                &palette,
+                self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
+                live && !cx.reduce_motion(),
+            )
+            .with_math_context_menu(self.menu_handle(format!("reasoning-math-{id}"), cx));
+        let mut views = self.activity_markdown.borrow_mut();
+        let view = views.entry(id).or_default();
+        if live {
+            let start = self.live_reasoning_window_start(id, &reasoning.content, view);
+            view.set_text(&reasoning.content[start..], true);
+        } else {
+            self.reasoning_window_starts.borrow_mut().remove(&id);
+            view.set_text(&reasoning.content, false);
+        }
+        let markdown = if live {
+            // The live peek pins to the tail of a growing document;
+            // building every block of a long think per pulse tick was the
+            // remaining 40%-CPU streaming path.
+            md::render::markdown_tail(view, &ctx, LIVE_REASONING_TAIL_BLOCKS)
+        } else {
+            md::render::markdown(view, &ctx)
+        };
+        if live && !cx.reduce_motion() && view.is_fading() {
+            // The reasoning dissolve rides the half-rate lease: fast thinking
+            // keeps a fade active for the whole phase, every tick rebuilds
+            // each visible transcript row, and 15 fps alpha on the dim peek
+            // is indistinguishable. The answer text keeps the full-rate
+            // dissolve.
+            motion::pulse_lease_slow(window.current_view(), cx);
+        }
+
+        let body = if !live && !full {
+            // A settled preview never scrolls, so the transcript keeps the
+            // wheel; the fade marks that the thought continues.
+            let transparent = theme.surface.opacity(0.0);
+            div()
+                .w_full()
+                .min_w_0()
+                .relative()
+                .max_h(px(REASONING_PREVIEW_HEIGHT))
+                .overflow_hidden()
+                .children(markdown)
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(20.0))
+                        .bg(linear_gradient(
+                            180.0,
+                            linear_color_stop(transparent, 0.0),
+                            linear_color_stop(theme.surface, 1.0),
+                        )),
+                )
+                .into_any_element()
+        } else {
+            let max_height = if full {
+                REASONING_FULL_HEIGHT
+            } else {
+                REASONING_PREVIEW_HEIGHT
+            };
+            let viewport = self
+                .activity_scroll_viewports
+                .borrow_mut()
+                .entry(id)
+                .or_default()
+                .clone();
+            let wheel_scroll = viewport.scroll_handle.clone();
+            let wheel_follow_tail = viewport.follow_tail.clone();
+            div()
+                .w_full()
+                .min_w_0()
+                .relative()
+                .max_h(px(max_height))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("reasoning-scroll-{id}")))
+                        .w_full()
+                        .min_w_0()
+                        .max_h(px(max_height))
+                        .overflow_y_scroll()
+                        .track_scroll(&viewport.scroll_handle)
+                        .pr(px(8.0))
+                        .children(markdown)
+                        .on_scroll_wheel(move |_, window, cx| {
+                            contain_scroll(&wheel_scroll, cx);
+                            let scroll = wheel_scroll.clone();
+                            let follow_tail = wheel_follow_tail.clone();
+                            window.defer(cx, move |_, _| {
+                                follow_tail.set(activity_scroll_at_bottom(&scroll));
+                            });
+                        }),
+                )
+                .child(scrollbar::edge_fade(
+                    viewport.scroll_handle.clone(),
+                    scrollbar::FadeEdge::Top,
+                    theme.surface,
+                ))
+                .child(scrollbar::edge_fade(
+                    viewport.scroll_handle.clone(),
+                    scrollbar::FadeEdge::Bottom,
+                    theme.surface,
+                ))
+                .child(scrollbar::vertical(
+                    &viewport.scroll_handle,
+                    &viewport.scrollbar,
+                ))
+                .child(activity_scroll_guard(viewport, live))
+                .into_any_element()
+        };
+
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(header)
+            // Align the prose with the title, past the padding, icon and gap.
+            .child(div().w_full().min_w_0().pl(px(27.0)).child(body))
+            .into_any_element()
     }
 
     /// The diff for an expanded file-change activity.

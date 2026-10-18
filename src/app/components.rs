@@ -997,6 +997,38 @@ pub(super) fn fenced_code(content: &str) -> Option<String> {
     (!code_blocks.is_empty()).then(|| code_blocks.join("\n\n"))
 }
 
+/// Summary order, most consequential first: edits and commands change the
+/// workspace, exploration only looks at it, and thoughts read best inline.
+fn activity_summary_rank(kind: crate::model::ActivityKind) -> u8 {
+    use crate::model::ActivityKind;
+
+    match kind {
+        ActivityKind::FileChange => 0,
+        ActivityKind::Command => 1,
+        ActivityKind::Tool => 2,
+        ActivityKind::Plan => 3,
+        ActivityKind::Search => 4,
+        ActivityKind::FileSearch => 5,
+        ActivityKind::FileList => 6,
+        ActivityKind::FileRead => 7,
+        ActivityKind::Reasoning => 8,
+    }
+}
+
+/// Exploration only reads the workspace, so it renders as a compact line
+/// rather than a card competing with edits and commands.
+pub(super) fn activity_is_exploration(kind: crate::model::ActivityKind) -> bool {
+    use crate::model::ActivityKind;
+
+    matches!(
+        kind,
+        ActivityKind::FileRead
+            | ActivityKind::FileSearch
+            | ActivityKind::FileList
+            | ActivityKind::Search
+    )
+}
+
 pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
     let mut counts: Vec<(crate::model::ActivityKind, usize)> = Vec::new();
     for activity in activities {
@@ -1006,6 +1038,8 @@ pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
             counts.push((activity.kind, 1));
         }
     }
+    counts.sort_by_key(|(kind, _)| activity_summary_rank(*kind));
+    let failed = activities.iter().filter(|activity| activity.failed).count();
     let parts = counts
         .into_iter()
         .map(|(kind, count)| {
@@ -1016,6 +1050,7 @@ pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
                 activity = if count == 1 { singular } else { plural }
             )
         })
+        .chain((failed > 0).then(|| tr!("activity.failed_count", count = failed)))
         .collect::<Vec<_>>();
     let running = activities.iter().any(|activity| !activity.complete);
     if running {
@@ -1875,7 +1910,7 @@ mod message_time_tests {
         assert!(!activity_group_is_live(true, true, 1, 2));
         assert_eq!(
             activity_header_title(&activities, false, None),
-            "Ran 1 thought · 1 command"
+            "Ran 1 command · 1 thought"
         );
         assert!(!activity_group_is_live(true, false, 1, 1));
         assert!(!activity_group_is_live(false, true, 1, 1));
