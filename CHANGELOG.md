@@ -22,7 +22,7 @@ the original feature bullet instead of adding separate entries for them.
 - Add Factory Droid as a provider, with each model's own reasoning levels and Waku's modes mapped to Droid's autonomy levels; dk users get their managed key automatically through `droid-dk`
 - Show why model discovery failed, such as a rejected `FACTORY_API_KEY`, instead of an empty model list
 - Organize the sidebar as host → workspace → session, with denser rows and status dots
-- Add a terminal panel below the composer, toggled with ⌘J / Ctrl+J
+- Add a terminal panel below the composer, toggled with ⌘J / Ctrl+J: run several terminals as tabs, open new ones with ⇧⌘J / Ctrl+Shift+J, switch tabs with Ctrl+PageUp/PageDown, and switch tasks without losing a running terminal
 - Configure each connected host's provider binaries from its own tab on the Providers page
 - Show the app version and every connected daemon's version under Settings → General → About
 - Fix Grok Build, Cursor, Kimi, and Fx failing to start on Windows, and end the agent process when its session closes
