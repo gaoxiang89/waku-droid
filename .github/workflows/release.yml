@@ -15,6 +15,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Enclosure links point at this fork's GitHub Release assets; the tag rides
+  # in the path, so the appcast scripts resolve the {version} placeholder per
+  # item. The feeds themselves are fetched via releases/latest/download.
+  WAKU_DOWNLOAD_URL_PREFIX: https://github.com/gaoxiang89/waku-droid/releases/download/v{version}/
 
 jobs:
   version:
@@ -546,11 +550,12 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           # Merge into the live feeds so previously published releases keep
-          # their entries; a first run simply starts from nothing.
+          # their entries; a first run simply starts from nothing. The fork's
+          # live feed is the latest published release's own asset.
           for platform in linux windows; do
             for arch in x86_64 aarch64; do
               curl -fsSL --max-time 30 \
-                "https://releases.waku.sh/appcast-$platform-$arch.xml" \
+                "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-$platform-$arch.xml" \
                 -o "artifacts/appcast-$platform-$arch.xml" || true
             done
           done

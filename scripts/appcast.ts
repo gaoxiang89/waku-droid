@@ -13,13 +13,55 @@
 // Env overrides:
 //   SPARKLE_BIN                dir containing the Sparkle tools
 //   SPARKLE_PRIVATE_KEY        EdDSA private key (CI; otherwise the keychain)
-//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links
+//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links; may contain a
+//                              {version} placeholder for tag-scoped hosts
+//                              such as GitHub Release assets
 import { existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const projectRoot = resolve(import.meta.dir, "..");
 
 export const defaultDownloadUrlPrefix = "https://releases.waku.sh/";
+
+/** Build one file's download URL. A prefix may contain a `{version}`
+ *  placeholder — GitHub Release assets need the tag in the path
+ *  (`…/releases/download/v{version}/Waku-{version}.zip`) while a flat bucket
+ *  prefix has no placeholder and resolves to itself. */
+export function downloadUrlFor(
+  prefix: string,
+  version: string,
+  file: string,
+): string {
+  return `${prefix.replaceAll("{version}", version)}${file}`;
+}
+
+/** The version an update file carries: the last `x.y.z` run in its name, so
+ *  `Waku-0.1.21.zip` and a `Waku-0.1.20-0.1.21.delta` both resolve to the
+ *  version they belong to. */
+function versionFromFile(file: string): string | null {
+  const matches = file.match(/\d+\.\d+\.\d+/g);
+  return matches ? matches[matches.length - 1] : null;
+}
+
+/** Resolve `{version}` in the URLs `generate_appcast` wrote. Sparkle's tool
+ *  has no placeholder support of its own, so it copies the prefix verbatim;
+ *  each rewritten URL picks the version from its own filename, which keeps
+ *  merged items from older releases pointing at their own tags. */
+export function resolvePlaceholderUrls(
+  appcastXml: string,
+  prefix: string,
+): string {
+  if (!prefix.includes("{version}")) return appcastXml;
+  return appcastXml.replace(
+    /(url="|<sparkle:releaseNotesLink>)([^"<]+)/g,
+    (whole, lead: string, url: string) => {
+      if (!url.startsWith(prefix)) return whole;
+      const file = url.slice(prefix.length);
+      const version = versionFromFile(file);
+      return version ? `${lead}${downloadUrlFor(prefix, version, file)}` : whole;
+    },
+  );
+}
 
 /** Locate Sparkle's `generate_appcast`: SPARKLE_BIN first, then the pinned
  *  distribution scripts/bundle.sh caches under .waku-cache, then PATH. */
@@ -88,8 +130,19 @@ export async function generateAppcast(
   // used does not match the bundle's SUPublicEDKey, and Sparkle rejects an
   // unsigned enclosure — so a silent mismatch would ship a dead update feed.
   const appcastPath = join(updatesDir, "appcast.xml");
+  const resolved = resolvePlaceholderUrls(
+    await Bun.file(appcastPath).text(),
+    downloadUrlPrefix,
+  );
+  if (resolved.includes("{version}")) {
+    throw new Error(
+      "appcast.xml still contains a literal {version}; a URL's filename " +
+        "carried no version to resolve it with.",
+    );
+  }
+  await Bun.write(appcastPath, resolved);
   const unsigned = [
-    ...(await Bun.file(appcastPath).text()).matchAll(/<enclosure\b[^>]*>/g),
+    ...resolved.matchAll(/<enclosure\b[^>]*>/g),
   ]
     .filter(([tag]) => !tag.includes("sparkle:edSignature="))
     .map(([tag]) => tag.match(/url="([^"]*)"/)?.[1] ?? tag);

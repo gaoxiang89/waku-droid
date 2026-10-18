@@ -24,12 +24,13 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- Sparkle auto-update configuration. The appcast feed lives in the
-         waku-releases Cloudflare R2 bucket behind releases.waku.sh, and the
-         private half of SUPublicEDKey signs each archive from the login
-         keychain during `bun run release` (see RELEASING.md). -->
+    <!-- Sparkle auto-update configuration. The appcast feed and every archive
+         are GitHub Release assets of gaoxiang89/waku-droid (releases/latest
+         resolves the published feed; enclosure URLs carry their own tag), and
+         the private half of SUPublicEDKey signs each archive via
+         SPARKLE_PRIVATE_KEY in CI (see RELEASING.md). -->
     <key>SUFeedURL</key>
-    <string>https://releases.waku.sh/appcast.xml</string>
+    <string>https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>Ky1Vp09kIu2oShZLIYE7GJT9KlLjBzLEJzhCvbUYeec=</string>
 	<key>NSHighResolutionCapable</key>

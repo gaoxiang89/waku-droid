@@ -36,10 +36,16 @@ const MAX_ERROR_BYTES: u64 = 16 * 1024;
 
 static TEMPORARY_NONCE: AtomicU64 = AtomicU64::new(0);
 
+// The feed is a GitHub Release asset: `releases/latest/download` redirects
+// (curl follows) to the published release's copy of the appcast.
 #[cfg(target_arch = "aarch64")]
-const FEED_URL: Option<&str> = Some("https://releases.waku.sh/appcast-linux-aarch64.xml");
+const FEED_URL: Option<&str> = Some(
+    "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-linux-aarch64.xml",
+);
 #[cfg(target_arch = "x86_64")]
-const FEED_URL: Option<&str> = Some("https://releases.waku.sh/appcast-linux-x86_64.xml");
+const FEED_URL: Option<&str> = Some(
+    "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-linux-x86_64.xml",
+);
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 const FEED_URL: Option<&str> = None;
 
@@ -535,14 +541,25 @@ fn validate_release_version(version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The fork's download origin: assets of the `gaoxiang89/waku-droid`
+/// repository. GitHub redirects these to a signed CDN URL, so the pin is on
+/// the enclosure URL the feed names, not on wherever the bytes end up — the
+/// EdDSA signature remains what actually trusts the content.
+const DOWNLOAD_HOST: &str = "github.com";
+const DOWNLOAD_PATH_PREFIX: &str = "/gaoxiang89/waku-droid/releases/download/";
+
 fn validate_download_url(value: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(value)?;
+    let on_fork = url.host_str() == Some(DOWNLOAD_HOST)
+        && url
+            .path()
+            .starts_with(DOWNLOAD_PATH_PREFIX);
     anyhow::ensure!(
         url.scheme() == "https"
-            && url.host_str() == Some("releases.waku.sh")
+            && on_fork
             && url.username().is_empty()
             && url.password().is_none(),
-        "the update feed points outside releases.waku.sh"
+        "the update feed points outside the fork's GitHub releases"
     );
     Ok(())
 }
@@ -798,6 +815,29 @@ mod tests {
         assert!(validate_release_version("../../tmp/payload").is_err());
         assert!(validate_release_version("1.2.3/evil").is_err());
         assert!(validate_release_version("").is_err());
+    }
+
+    #[test]
+    fn download_urls_must_stay_on_the_forks_releases() {
+        assert!(validate_download_url(
+            "https://github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/waku-0.1.21-x86_64-unknown-linux-gnu.tar.gz"
+        )
+        .is_ok());
+        assert!(
+            validate_download_url("https://releases.waku.sh/waku-0.1.21.tar.gz").is_err()
+        );
+        assert!(validate_download_url(
+            "https://github.com/evil/waku-droid/releases/download/v0.1.21/payload.tar.gz"
+        )
+        .is_err());
+        assert!(
+            validate_download_url("http://github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/payload.tar.gz")
+                .is_err()
+        );
+        assert!(
+            validate_download_url("https://user:pass@github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/payload.tar.gz")
+                .is_err()
+        );
     }
 
     #[test]

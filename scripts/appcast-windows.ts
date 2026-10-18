@@ -17,12 +17,13 @@
 //
 // Env:
 //   SPARKLE_PRIVATE_KEY        EdDSA private key, base64 (required)
-//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links
+//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links ({version}
+//                              placeholder allowed)
 import { createPrivateKey, sign } from "node:crypto";
 import { readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { defaultDownloadUrlPrefix } from "./appcast.ts";
+import { defaultDownloadUrlPrefix, downloadUrlFor } from "./appcast.ts";
 
 const projectRoot = resolve(import.meta.dir, "..");
 
@@ -197,7 +198,7 @@ export async function generateWindowsAppcasts(
     const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
     const item: AppcastItem = {
       version,
-      url: `${downloadUrlPrefix}${installer}`,
+      url: downloadUrlFor(downloadUrlPrefix, version, installer),
       length: statSync(path).size,
       signature: Buffer.from(sign(null, bytes, privateKey)).toString("base64"),
       pubDate,

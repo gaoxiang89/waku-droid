@@ -9,12 +9,13 @@
 //
 // Env:
 //   SPARKLE_PRIVATE_KEY        EdDSA private key, base64 (required)
-//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links
+//   WAKU_DOWNLOAD_URL_PREFIX   base URL for enclosure links ({version}
+//                              placeholder allowed)
 import { sign } from "node:crypto";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { defaultDownloadUrlPrefix } from "./appcast.ts";
+import { defaultDownloadUrlPrefix, downloadUrlFor } from "./appcast.ts";
 import {
   appPublicKey,
   architectures,
@@ -89,7 +90,7 @@ export async function generateLinuxAppcasts(
     const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
     const item: AppcastItem = {
       version,
-      url: `${downloadUrlPrefix}${archive}`,
+      url: downloadUrlFor(downloadUrlPrefix, version, archive),
       length: statSync(path).size,
       signature: Buffer.from(sign(null, bytes, privateKey)).toString("base64"),
       pubDate,
