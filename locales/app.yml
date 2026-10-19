@@ -1951,6 +1951,10 @@ transcript.turn_label:
   en: "Turn %{number}: %{prompt}"
 transcript.edit_message:
   en: Edit message
+transcript.show_more:
+  en: Show more
+transcript.show_less:
+  en: Show less
 
 duration.second:
   en: "%{count} second"

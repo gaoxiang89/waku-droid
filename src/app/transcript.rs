@@ -1154,6 +1154,47 @@ pub(super) fn response_row_turn_id(session: &AgentSession, row: TranscriptRowKin
     }
 }
 
+pub(super) fn turn_fold_work_summary(session: &AgentSession, turn_id: Uuid) -> Option<String> {
+    let rows = turn_rows(session, turn_id);
+    let hidden = &rows[..turn_answer_start(session, &rows)];
+    let mut counts: Vec<(ActivityKind, usize)> = Vec::new();
+    for row in hidden {
+        let TranscriptRowKind::TurnBlock(block_index) = *row else {
+            continue;
+        };
+        let Some(block) = session.transcript_blocks.get(block_index) else {
+            continue;
+        };
+        for activity in &block.activities {
+            if activity.kind == ActivityKind::Reasoning {
+                continue;
+            }
+            if let Some(entry) = counts.iter_mut().find(|(kind, _)| *kind == activity.kind) {
+                entry.1 += 1;
+            } else {
+                counts.push((activity.kind, 1));
+            }
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    counts.sort_by_key(|(kind, _)| activity_summary_rank(*kind));
+    let parts = counts
+        .into_iter()
+        .take(2)
+        .map(|(kind, count)| {
+            let (singular, plural) = activity_noun(kind);
+            tr!(
+                "activity.count",
+                count = count,
+                activity = if count == 1 { singular } else { plural }
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(parts.join(" · "))
+}
+
 pub(super) fn turn_fold_label(session: &AgentSession, turn_id: Uuid) -> String {
     let Some(turn) = session.turns.iter().find(|turn| turn.id == turn_id) else {
         return tr!("transcript.worked");
@@ -1164,10 +1205,14 @@ pub(super) fn turn_fold_label(session: &AgentSession, turn_id: Uuid) -> String {
         .saturating_sub(turn.started_at)
         .max(1);
     let duration = format_worked_duration(seconds);
-    if turn.status == TurnStatus::Interrupted {
+    let base = if turn.status == TurnStatus::Interrupted {
         tr!("transcript.you_stopped_after", duration = duration)
     } else {
         tr!("transcript.worked_for", duration = duration)
+    };
+    match turn_fold_work_summary(session, turn_id) {
+        Some(summary) => format!("{base} · {summary}"),
+        None => base,
     }
 }
 

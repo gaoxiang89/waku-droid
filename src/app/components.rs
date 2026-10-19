@@ -5,6 +5,23 @@ use std::path::Path;
 
 const USER_MESSAGE_MAX_HEIGHT: f32 = 400.0;
 const USER_MESSAGE_VIEWPORT_MAX_HEIGHT: f32 = USER_MESSAGE_MAX_HEIGHT - 16.0;
+const USER_MESSAGE_COLLAPSED_VIEWPORT_HEIGHT: f32 = 148.0;
+const USER_MESSAGE_COLLAPSE_LINE_LIMIT: usize = 8;
+const USER_MESSAGE_COLLAPSE_CHAR_LIMIT: usize = 600;
+
+pub(super) fn user_message_is_collapsible(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed
+        .lines()
+        .take(USER_MESSAGE_COLLAPSE_LINE_LIMIT + 1)
+        .count()
+        > USER_MESSAGE_COLLAPSE_LINE_LIMIT
+        || trimmed
+            .chars()
+            .take(USER_MESSAGE_COLLAPSE_CHAR_LIMIT + 1)
+            .count()
+            > USER_MESSAGE_COLLAPSE_CHAR_LIMIT
+}
 
 pub(super) fn pulse_dot(size: f32, color: Hsla) -> AnyElement {
     motion::pulse(Duration::from_millis(1600), move |phase| {
@@ -352,12 +369,15 @@ pub(super) fn render_message_footer(
 pub(super) struct MessageRender<'a> {
     pub(super) theme: &'a Theme,
     pub(super) message: &'a Message,
+    pub(super) message_index: usize,
     pub(super) assistant_footer_copy_content: Option<SharedString>,
     pub(super) assistant_footer_time: Option<u64>,
     pub(super) copied: bool,
     pub(super) assistant_message_action: Option<AssistantMessageAction>,
     pub(super) user_message_action: Option<UserMessageAction>,
     pub(super) user_message_viewport: Option<&'a UserMessageScrollViewport>,
+    pub(super) user_message_expanded: bool,
+    pub(super) user_message_expand_focus: Option<FocusHandle>,
     pub(super) message_edit_input: Option<Entity<ComposerInput>>,
     pub(super) attachment_menus: Vec<ContextMenuHandle>,
     pub(super) attachment_images: Vec<Option<Arc<gpui::Image>>>,
@@ -548,12 +568,15 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
     let MessageRender {
         theme,
         message,
+        message_index,
         assistant_footer_copy_content,
         assistant_footer_time,
         copied,
         assistant_message_action,
         user_message_action,
         user_message_viewport,
+        user_message_expanded,
+        user_message_expand_focus,
         message_edit_input,
         attachment_menus,
         attachment_images,
@@ -681,6 +704,19 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 );
             } else {
                 if !content.trim().is_empty() {
+                    let collapsible = user_message_is_collapsible(&content);
+                    let collapsed = collapsible && !user_message_expanded;
+                    let viewport_max_height = if collapsed {
+                        USER_MESSAGE_COLLAPSED_VIEWPORT_HEIGHT
+                    } else {
+                        USER_MESSAGE_VIEWPORT_MAX_HEIGHT
+                    };
+                    let bubble_max_height = if collapsible && user_message_expanded {
+                        USER_MESSAGE_MAX_HEIGHT + 30.0
+                    } else {
+                        USER_MESSAGE_MAX_HEIGHT
+                    };
+                    let scrollable_viewport = user_message_viewport.filter(|_| !collapsed);
                     let body = render_markdown_message_body(&content, markdown, theme, ctx);
                     column = column.child(
                         div()
@@ -688,7 +724,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                 "user-message-bubble-{message_id}"
                             )))
                             .max_w(px(540.0))
-                            .max_h(px(USER_MESSAGE_MAX_HEIGHT))
+                            .max_h(px(bubble_max_height))
                             .min_w_0()
                             .relative()
                             .overflow_hidden()
@@ -704,7 +740,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                 div()
                                     .min_w_0()
                                     .relative()
-                                    .max_h(px(USER_MESSAGE_VIEWPORT_MAX_HEIGHT))
+                                    .max_h(px(viewport_max_height))
                                     .overflow_hidden()
                                     .child(
                                         div()
@@ -712,8 +748,8 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                                 "user-message-scroll-{message_id}"
                                             )))
                                             .min_w_0()
-                                            .max_h(px(USER_MESSAGE_VIEWPORT_MAX_HEIGHT))
-                                            .when_some(user_message_viewport, |body, viewport| {
+                                            .max_h(px(viewport_max_height))
+                                            .when_some(scrollable_viewport, |body, viewport| {
                                                 let wheel_scroll = viewport.scroll_handle.clone();
                                                 body.overflow_y_scroll()
                                                     .track_scroll(&viewport.scroll_handle)
@@ -725,7 +761,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                     )
                                     // Keep the fades inside the bubble's padding so
                                     // square fade quads cannot paint over its rounded corners.
-                                    .when_some(user_message_viewport, |body, viewport| {
+                                    .when_some(scrollable_viewport, |body, viewport| {
                                         body.child(scrollbar::edge_fade(
                                             viewport.scroll_handle.clone(),
                                             scrollbar::FadeEdge::Top,
@@ -738,9 +774,96 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                                 theme.raised,
                                             ),
                                         )
+                                    })
+                                    .when(collapsed, |body| {
+                                        body.child(
+                                            div()
+                                                .h(px(32.0))
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .right_0()
+                                                .bg(linear_gradient(
+                                                    180.0,
+                                                    linear_color_stop(
+                                                        theme.raised.opacity(0.0),
+                                                        0.0,
+                                                    ),
+                                                    linear_color_stop(theme.raised, 1.0),
+                                                )),
+                                        )
                                     }),
                             )
-                            .when_some(user_message_viewport, |bubble, viewport| {
+                            .when(collapsible, |bubble| {
+                                let toggle_waku = waku.clone();
+                                let key_waku = waku.clone();
+                                let label = if user_message_expanded {
+                                    tr!("transcript.show_less")
+                                } else {
+                                    tr!("transcript.show_more")
+                                };
+                                let mut toggle = div()
+                                    .id(SharedString::from(format!(
+                                        "user-message-toggle-{message_id}"
+                                    )))
+                                    .mt(px(4.0))
+                                    .pt(px(4.0))
+                                    .border_t_1()
+                                    .border_color(theme.border)
+                                    .rounded(px(6.0))
+                                    .px(px(4.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .cursor_default()
+                                    .text_size(sp(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_secondary)
+                                    .focus_visible(|style| style.bg(theme.overlay_strong))
+                                    .hover(|style| {
+                                        style.bg(theme.overlay_strong).text_color(theme.text)
+                                    })
+                                    .active(|style| style.bg(theme.overlay))
+                                    .child(SharedString::from(label))
+                                    .child(icon(
+                                        if user_message_expanded {
+                                            "icons/chevron-down.svg"
+                                        } else {
+                                            "icons/chevron-right.svg"
+                                        },
+                                        10.0,
+                                        theme.text_tertiary,
+                                    ))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = toggle_waku.update(cx, |this, cx| {
+                                            this.toggle_user_message(
+                                                message_id,
+                                                message_index,
+                                                user_message_expanded,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                        if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                        {
+                                            let _ = key_waku.update(cx, |this, cx| {
+                                                this.toggle_user_message(
+                                                    message_id,
+                                                    message_index,
+                                                    user_message_expanded,
+                                                    cx,
+                                                );
+                                            });
+                                            cx.stop_propagation();
+                                        }
+                                    });
+                                if let Some(focus) = user_message_expand_focus.as_ref() {
+                                    toggle = toggle.track_focus(focus).tab_index(0);
+                                }
+                                bubble.child(toggle)
+                            })
+                            .when_some(scrollable_viewport, |bubble, viewport| {
                                 let key_scroll = viewport.scroll_handle.clone();
                                 let key_menu = menu.clone();
                                 let key_owner = waku.entity_id();
@@ -999,7 +1122,7 @@ pub(super) fn fenced_code(content: &str) -> Option<String> {
 
 /// Summary order, most consequential first: edits and commands change the
 /// workspace, exploration only looks at it, and thoughts read best inline.
-fn activity_summary_rank(kind: crate::model::ActivityKind) -> u8 {
+pub(super) fn activity_summary_rank(kind: crate::model::ActivityKind) -> u8 {
     use crate::model::ActivityKind;
 
     match kind {
@@ -1013,6 +1136,64 @@ fn activity_summary_rank(kind: crate::model::ActivityKind) -> u8 {
         ActivityKind::FileRead => 7,
         ActivityKind::Reasoning => 8,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PlanStep {
+    pub(super) status: PlanStepStatus,
+    pub(super) label: String,
+}
+
+pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
+    if activity.kind != crate::model::ActivityKind::Plan {
+        return Vec::new();
+    }
+    let Some(source) = activity.output.as_deref().or(activity.detail.as_deref()) else {
+        return Vec::new();
+    };
+    let mut steps = Vec::new();
+    for raw_line in source.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let line = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed);
+        let parsed = if let Some(rest) = line
+            .strip_prefix("[x] ")
+            .or_else(|| line.strip_prefix("[X] "))
+        {
+            Some((PlanStepStatus::Completed, rest.trim()))
+        } else if let Some(rest) = line
+            .strip_prefix("[~] ")
+            .or_else(|| line.strip_prefix("[-] "))
+        {
+            Some((PlanStepStatus::InProgress, rest.trim()))
+        } else if let Some(rest) = line.strip_prefix("[ ] ") {
+            Some((PlanStepStatus::Pending, rest.trim()))
+        } else {
+            None
+        };
+        let Some((status, label)) = parsed else {
+            return Vec::new();
+        };
+        if !label.is_empty() {
+            steps.push(PlanStep {
+                status,
+                label: label.to_owned(),
+            });
+        }
+    }
+    steps
 }
 
 /// Exploration only reads the workspace, so it renders as a compact line
@@ -2074,5 +2255,48 @@ mod message_time_tests {
             false,
         );
         assert_eq!(activity_display_title(&plan), "Updating plan");
+    }
+
+    #[test]
+    fn collapsible_user_message_threshold_detects_long_lines_or_characters() {
+        assert!(!user_message_is_collapsible("short prompt\nsecond line"));
+        let nine_lines = (1..=9)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_message_is_collapsible(&nine_lines));
+        let long_single_line = "x".repeat(601);
+        assert!(user_message_is_collapsible(&long_single_line));
+    }
+
+    #[test]
+    fn plan_activity_parses_structured_checklist_steps() {
+        let plan = ActivityItem::new(
+            Some("plan-1".into()),
+            crate::model::ActivityKind::Plan,
+            "TodoWrite",
+            None,
+            false,
+        )
+        .with_output(Some(
+            "[x] Inspect ACP tool_call_update\n[~] Preserve rawInput across updates\n[ ] Run cargo test".into(),
+        ));
+        assert_eq!(
+            activity_plan_steps(&plan),
+            vec![
+                PlanStep {
+                    status: PlanStepStatus::Completed,
+                    label: "Inspect ACP tool_call_update".into(),
+                },
+                PlanStep {
+                    status: PlanStepStatus::InProgress,
+                    label: "Preserve rawInput across updates".into(),
+                },
+                PlanStep {
+                    status: PlanStepStatus::Pending,
+                    label: "Run cargo test".into(),
+                },
+            ]
+        );
     }
 }

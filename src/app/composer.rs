@@ -254,6 +254,7 @@ impl Waku {
                     .custom_answers
                     .get(&question.id)
                     .is_some_and(|answer| !answer.trim().is_empty());
+            let multi_select = question.multi_select;
             let mut options = div().mt(px(8.0)).flex().flex_col().gap(px(4.0));
             for (index, option) in question.options.iter().enumerate() {
                 let is_selected = selected.iter().any(|answer| answer == &option.label);
@@ -265,6 +266,46 @@ impl Waku {
                     format!("user-input-{request_id}-{}-option-{index}", question.id),
                     cx,
                 );
+                let indicator = if multi_select {
+                    div()
+                        .size(px(14.0))
+                        .flex_none()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(if is_selected {
+                            theme.accent
+                        } else {
+                            theme.border_strong
+                        })
+                        .bg(if is_selected {
+                            theme.accent.opacity(0.16)
+                        } else {
+                            theme.overlay.opacity(0.0)
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(is_selected, |box_el| {
+                            box_el.child(icon("icons/check.svg", 10.0, theme.accent))
+                        })
+                } else {
+                    div()
+                        .size(px(14.0))
+                        .flex_none()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if is_selected {
+                            theme.accent
+                        } else {
+                            theme.border_strong
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(is_selected, |circle| {
+                            circle.child(div().size(px(6.0)).rounded_full().bg(theme.accent))
+                        })
+                };
                 options = options.child(
                     div()
                         .id(SharedString::from(format!(
@@ -300,6 +341,7 @@ impl Waku {
                             })
                         })
                         .active(|style| style.opacity(0.85))
+                        .child(indicator)
                         .child(
                             div()
                                 .flex_1()
@@ -1738,10 +1780,11 @@ impl Waku {
 
     pub(super) fn render_access_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
-        let selected_mode = self
-            .selected_session()
+        let session = self.selected_session();
+        let selected_mode = session
             .map(|session| session.runtime_mode)
             .unwrap_or_default();
+        let is_droid = session.is_some_and(|session| session.provider == ProviderKind::Droid);
         let weak = cx.entity().downgrade();
         let handle = self.menu_handle("runtime-mode", cx);
         dropdown_menu(
@@ -1774,15 +1817,40 @@ impl Waku {
                                         .child(
                                             div()
                                                 .w_full()
-                                                .truncate()
-                                                .text_size(sp(12.5))
-                                                .font_weight(if selected {
-                                                    FontWeight::SEMIBOLD
-                                                } else {
-                                                    FontWeight::MEDIUM
-                                                })
-                                                .text_color(theme.text)
-                                                .child(option.label()),
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(sp(12.5))
+                                                        .font_weight(if selected {
+                                                            FontWeight::SEMIBOLD
+                                                        } else {
+                                                            FontWeight::MEDIUM
+                                                        })
+                                                        .text_color(theme.text)
+                                                        .child(option.label()),
+                                                )
+                                                .when(is_droid, |header| {
+                                                    header.child(
+                                                        div()
+                                                            .h(px(17.0))
+                                                            .px(px(5.0))
+                                                            .flex_none()
+                                                            .rounded(px(4.0))
+                                                            .border_1()
+                                                            .border_color(theme.border_strong)
+                                                            .bg(theme.overlay)
+                                                            .flex()
+                                                            .items_center()
+                                                            .font_family(md::render::MONO_FAMILY)
+                                                            .text_size(sp(11.0))
+                                                            .text_color(theme.text_tertiary)
+                                                            .child(option.droid_autonomy_level()),
+                                                    )
+                                                }),
                                         )
                                         .child(
                                             div()

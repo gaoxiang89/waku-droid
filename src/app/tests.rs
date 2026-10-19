@@ -2227,3 +2227,68 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
         ProviderKind::Claude
     ));
 }
+
+#[test]
+fn settled_turn_fold_label_includes_hidden_tool_work_summary() {
+    use super::transcript::turn_fold_label;
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Droid);
+    session.begin_turn("Refactor Droid ACP tool handling");
+    let turn_id = session.active_turn_id().expect("turn started");
+    if let Some(turn) = session.turns.last_mut() {
+        turn.started_at = 100;
+    }
+
+    push_transcript_activity(
+        &mut session,
+        ActivityItem::from_reasoning(
+            ReasoningBlock {
+                content: "Checking ACP update flow".into(),
+                started_at_ms: 100_000,
+                finished_at_ms: 103_000,
+            },
+            true,
+        ),
+        false,
+    );
+    push_transcript_activity(
+        &mut session,
+        ActivityItem::new(
+            Some("edit-1".into()),
+            ActivityKind::FileChange,
+            "str_replace_editor",
+            None,
+            true,
+        ),
+        true,
+    );
+    push_transcript_activity(
+        &mut session,
+        ActivityItem::new(
+            Some("cmd-1".into()),
+            ActivityKind::Command,
+            "Execute",
+            None,
+            true,
+        ),
+        true,
+    );
+    let session_id = session.id;
+    let mut sessions = vec![session];
+    append_text_delta_to_session(
+        &mut sessions,
+        session_id,
+        false,
+        "Done updating Droid ACP normalization.".into(),
+    );
+    let mut session = sessions.pop().expect("session exists");
+    session.finish_active_turn(TurnStatus::Completed);
+    if let Some(turn) = session.turns.last_mut() {
+        turn.completed_at = Some(112);
+    }
+
+    assert_eq!(
+        turn_fold_label(&session, turn_id),
+        "Worked for 12 seconds · 1 file edit · 1 command"
+    );
+}

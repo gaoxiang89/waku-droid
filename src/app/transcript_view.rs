@@ -1332,6 +1332,16 @@ impl Waku {
                     if let Some(highlights) = self.transcript_search_highlights(message_index) {
                         ctx = ctx.with_search_highlights(highlights);
                     }
+                    let user_message_expanded = message.role == MessageRole::User
+                        && self.expanded_user_messages.contains(&message.id);
+                    let user_message_expand_focus = (message.role == MessageRole::User
+                        && user_message_is_collapsible(message.visible_content()))
+                    .then(|| {
+                        self.transcript_control_focus(
+                            format!("user-message-toggle-{}", message.id),
+                            cx,
+                        )
+                    });
                     // Human and assistant messages share the Markdown path.
                     // Parse only visible rows rather than doing work for every
                     // driver delta or every off-screen prompt.
@@ -1346,12 +1356,15 @@ impl Waku {
                         MessageRender {
                             theme: &theme,
                             message: &message,
+                            message_index,
                             assistant_footer_copy_content,
                             assistant_footer_time,
                             copied,
                             assistant_message_action,
                             user_message_action,
                             user_message_viewport: user_message_viewport.as_ref(),
+                            user_message_expanded,
+                            user_message_expand_focus,
                             message_edit_input,
                             attachment_menus,
                             attachment_images,
@@ -1501,6 +1514,23 @@ impl Waku {
             self.expanded_changed_files.insert(turn_id);
         }
         self.remeasure_changed_files(turn_id);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_user_message(
+        &mut self,
+        message_id: Uuid,
+        message_index: usize,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.pin_transcript_for_disclosure();
+        if expanded {
+            self.expanded_user_messages.remove(&message_id);
+        } else {
+            self.expanded_user_messages.insert(message_id);
+        }
+        self.remeasure_transcript_message(message_index);
         cx.notify();
     }
 
@@ -1772,6 +1802,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expanded = self.expanded_turns.contains(&turn_id);
+        let focus = self.transcript_control_focus(format!("turn-fold-{turn_id}"), cx);
         let label = self
             .selected_session()
             .map(|session| turn_fold_label(session, turn_id))
@@ -1786,8 +1817,11 @@ impl Waku {
             .child(
                 div()
                     .id(SharedString::from(format!("turn-fold-{turn_id}")))
+                    .track_focus(&focus)
+                    .tab_index(0)
                     .h(px(24.0))
-                    .px(px(2.0))
+                    .px(px(4.0))
+                    .rounded(px(6.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1797,6 +1831,8 @@ impl Waku {
                     .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
+                    .focus_visible(|style| style.bg(theme.overlay_strong).text_color(theme.text))
+                    .hover(|style| style.text_color(theme.text))
                     .child(SharedString::from(label))
                     .child(icon(
                         if expanded {
@@ -1809,6 +1845,12 @@ impl Waku {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_turn_fold(turn_id, expanded, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.toggle_turn_fold(turn_id, expanded, cx);
+                            cx.stop_propagation();
+                        }
                     })),
             )
             .child(div().h(px(1.0)).flex_1().bg(theme.border))
@@ -2068,12 +2110,29 @@ impl Waku {
                 .zip(activity.source_id.as_deref())
                 .and_then(|(session_id, source_id)| {
                     self.background_work_for_activity(session_id, source_id)
-                        .map(|item| (session_id, item.key.clone(), item.status))
+                        .map(|item| {
+                            (
+                                session_id,
+                                item.key.clone(),
+                                item.status,
+                                item.role.clone(),
+                            )
+                        })
                 });
-            let background_badge = background_work.map(|(session_id, key, status)| {
+            let background_badge = background_work.map(|(session_id, key, status, role)| {
                 let click_key = key.clone();
+                let kind = key.kind;
                 let focus = self.transcript_control_focus(format!("activity-background-{id}"), cx);
                 let color = work_status_color(status, *theme);
+                let role_label = role
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_owned);
+                let badge_text = match role_label {
+                    Some(role) => format!("{role} · {}", work_status_label(status)),
+                    None => work_status_label(status),
+                };
                 div()
                     .id(SharedString::from(format!("activity-background-{id}")))
                     .track_focus(&focus)
@@ -2086,12 +2145,18 @@ impl Waku {
                     .flex_none()
                     .flex()
                     .items_center()
+                    .gap(px(5.0))
                     .cursor_default()
                     .text_size(sp(12.5))
                     .text_color(color)
                     .focus_visible(|style| style.border_color(theme.accent))
                     .hover(|style| style.bg(theme.overlay_strong))
-                    .child(work_status_label(status))
+                    .child(if status.is_live() {
+                        pulse_dot(5.0, color)
+                    } else {
+                        icon(work_kind_icon(kind), 11.0, color).into_any_element()
+                    })
+                    .child(SharedString::from(badge_text))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -2105,6 +2170,14 @@ impl Waku {
                     }))
             });
             let sections = activity_disclosure_sections(activity);
+            let plan_steps = activity_plan_steps(activity);
+            let plan_progress = (!plan_steps.is_empty()).then(|| {
+                let completed = plan_steps
+                    .iter()
+                    .filter(|step| step.status == PlanStepStatus::Completed)
+                    .count();
+                (completed, plan_steps.len())
+            });
             let preview = activity_preview(activity);
             let action_label = activity_action_label(activity);
             let mut row_detail = activity_row_detail(activity, false);
@@ -2211,6 +2284,26 @@ impl Waku {
                                     .flex_none()
                                     .text_color(theme.danger)
                                     .child(SharedString::from(format!("-{deletions}"))),
+                            )
+                        })
+                        .when_some(plan_progress, |row, (completed, total)| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .h(px(18.0))
+                                    .px(px(5.0))
+                                    .rounded(px(4.0))
+                                    .bg(theme.overlay)
+                                    .flex()
+                                    .items_center()
+                                    .text_size(sp(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if completed == total {
+                                        theme.success
+                                    } else {
+                                        theme.text_tertiary
+                                    })
+                                    .child(SharedString::from(format!("{completed}/{total}"))),
                             )
                         })
                         .children(background_badge)
@@ -2382,7 +2475,86 @@ impl Waku {
                         );
                     }
                     if !content.is_empty() {
-                        if activity.kind == ActivityKind::Command
+                        if activity.kind == ActivityKind::Plan
+                            && matches!(
+                                section_kind,
+                                ActivityDisclosureSectionKind::Output
+                                    | ActivityDisclosureSectionKind::Detail
+                            )
+                            && !plan_steps.is_empty()
+                        {
+                            let mut checklist =
+                                div().w_full().min_w_0().flex().flex_col().gap(px(4.0));
+                            for step in &plan_steps {
+                                let indicator = match step.status {
+                                    PlanStepStatus::Completed => div()
+                                        .size(px(14.0))
+                                        .mt(px(1.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(icon("icons/check.svg", 11.5, theme.success))
+                                        .into_any_element(),
+                                    PlanStepStatus::InProgress => div()
+                                        .size(px(14.0))
+                                        .mt(px(1.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(if !activity.complete {
+                                            pulse_dot(6.0, theme.accent)
+                                        } else {
+                                            div()
+                                                .size(px(6.0))
+                                                .rounded_full()
+                                                .bg(theme.accent)
+                                                .into_any_element()
+                                        })
+                                        .into_any_element(),
+                                    PlanStepStatus::Pending => div()
+                                        .size(px(12.0))
+                                        .mt(px(2.0))
+                                        .mx(px(1.0))
+                                        .flex_none()
+                                        .rounded(px(3.5))
+                                        .border_1()
+                                        .border_color(theme.border_strong)
+                                        .into_any_element(),
+                                };
+                                let (text_color, weight) = match step.status {
+                                    PlanStepStatus::Completed => {
+                                        (theme.text_tertiary, FontWeight::NORMAL)
+                                    }
+                                    PlanStepStatus::InProgress => (theme.text, FontWeight::MEDIUM),
+                                    PlanStepStatus::Pending => {
+                                        (theme.text_secondary, FontWeight::NORMAL)
+                                    }
+                                };
+                                checklist = checklist.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(7.0))
+                                        .child(indicator)
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .font_family(md::render::MONO_FAMILY)
+                                                .text_size(sp(12.5))
+                                                .line_height(sp(16.0))
+                                                .font_weight(weight)
+                                                .text_color(text_color)
+                                                .child(SharedString::from(step.label.clone())),
+                                        ),
+                                );
+                            }
+                            section_view = section_view.child(checklist);
+                        } else if activity.kind == ActivityKind::Command
                             && section_kind == ActivityDisclosureSectionKind::Output
                         {
                             let output_viewport = self

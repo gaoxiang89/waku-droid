@@ -950,6 +950,8 @@ transcript.scroll_to_bottom: 滚动到底部
 transcript.conversation_turns: 对话轮次
 transcript.turn_label: "第 %{number} 轮：%{prompt}"
 transcript.edit_message: 编辑消息
+transcript.show_more: 展开全文
+transcript.show_less: 收起
 duration.second: "%{count} 秒"
 duration.seconds: "%{count} 秒"
 duration.minute: "%{count} 分钟"

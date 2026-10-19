@@ -2836,9 +2836,17 @@ fn fx_context_notice(text: &str) -> bool {
     text.starts_with("[context] ") || text.starts_with("skill discovery warning: ")
 }
 
+#[derive(Clone)]
+struct StoredToolCall {
+    kind: ActivityKind,
+    title: String,
+    raw_input: Option<Value>,
+    tool_name: Option<String>,
+}
+
 #[derive(Default)]
 struct AcpStreamState {
-    tools: HashMap<String, (ActivityKind, String)>,
+    tools: HashMap<String, StoredToolCall>,
     /// Whether the running turn has produced anything visible. A turn that
     /// ends having produced nothing is the shape a swallowed provider error
     /// takes, which is what makes a native failure worth looking up.
@@ -2898,7 +2906,7 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
     });
     let mut kind = wire_kind
         .map(classify)
-        .or_else(|| stored.as_ref().map(|(kind, _)| *kind))
+        .or_else(|| stored.as_ref().map(|tool| tool.kind))
         .unwrap_or(ActivityKind::Tool);
     if matches!(kind, ActivityKind::Search | ActivityKind::Tool)
         && let Some(wire_title) = wire_title
@@ -2908,17 +2916,34 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
             kind = named_kind;
         }
     }
-    let arguments = update.get("rawInput").filter(|value| !value.is_null());
+    let arguments = update
+        .get("rawInput")
+        .filter(|value| !value.is_null())
+        .or_else(|| stored.as_ref().and_then(|tool| tool.raw_input.as_ref()));
     let title = activity::input_title(arguments)
         .or_else(|| {
             wire_title
                 .filter(|title| !title.is_empty())
                 .map(str::to_owned)
         })
-        .or_else(|| stored.map(|(_, title)| title))
+        .or_else(|| stored.as_ref().map(|tool| tool.title.clone()))
         .unwrap_or_else(|| "Tool".to_owned());
+    let tool_name = arguments
+        .and_then(|input| input.get("tool_name"))
+        .and_then(Value::as_str)
+        .or_else(|| wire_title.filter(|title| title.starts_with("mcp__")))
+        .or_else(|| stored.as_ref().and_then(|tool| tool.tool_name.as_deref()))
+        .map(str::to_owned);
     if !complete && let Some(id) = id.as_ref() {
-        state.tools.insert(id.clone(), (kind, title.clone()));
+        state.tools.insert(
+            id.clone(),
+            StoredToolCall {
+                kind,
+                title: title.clone(),
+                raw_input: arguments.cloned(),
+                tool_name: tool_name.clone(),
+            },
+        );
     }
 
     let output = update
@@ -2927,12 +2952,7 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
         .or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
     let item =
         activity::tool_activity(id, kind, title, arguments, output, output, failed, complete)
-            .with_tool_name(
-                arguments
-                    .and_then(|input| input.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .or_else(|| wire_title.filter(|title| title.starts_with("mcp__"))),
-            );
+            .with_tool_name(tool_name.as_deref());
     let _ = events.send(DriverEvent::RichActivity(item));
 }
 
@@ -3906,6 +3926,54 @@ mod tests {
             permission_reason(&params).as_deref(),
             Some("Not in allowlist: rm")
         );
+    }
+
+    #[test]
+    fn tool_call_update_preserves_raw_input_and_file_changes_from_initial_tool_call() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+
+        tool_activity(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-edit-1",
+                "title": "str_replace_editor",
+                "status": "in_progress",
+                "rawInput": {
+                    "file_path": "src/main.rs",
+                    "old_str": "fn old() {}",
+                    "new_str": "fn updated() {}\nfn extra() {}"
+                }
+            }),
+            &events,
+            &mut state,
+        );
+        tool_activity(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "droid-edit-1",
+                "status": "completed",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": "Applied edit"}}
+                ]
+            }),
+            &events,
+            &mut state,
+        );
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        let DriverEvent::RichActivity(completed) = &seen[1] else {
+            panic!("expected completed RichActivity");
+        };
+        assert_eq!(completed.kind, ActivityKind::FileChange);
+        assert!(completed.complete);
+        assert!(!completed.failed);
+        assert_eq!(completed.file_changes.len(), 1);
+        assert_eq!(completed.file_changes[0].path, "src/main.rs");
+        assert_eq!(completed.file_changes[0].additions, Some(2));
+        assert_eq!(completed.file_changes[0].deletions, Some(1));
+        assert!(completed.file_changes[0].diff.is_some());
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:

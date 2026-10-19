@@ -1423,6 +1423,8 @@ pub struct Waku {
     /// Per-response file cards the user expanded beyond their three-file
     /// preview. Runtime-only, like the other transcript disclosures.
     expanded_changed_files: HashSet<Uuid>,
+    /// Long user messages the user expanded beyond their compact preview.
+    expanded_user_messages: HashSet<Uuid>,
     /// Stable focus identities for controls inside virtualized transcript and
     /// diff rows. Recreating a handle on every row build would drop keyboard
     /// focus whenever GPUI re-renders the list.
@@ -3107,6 +3109,7 @@ impl Waku {
                 unfolded_activity_runs: HashSet::new(),
                 expanded_turns: HashSet::new(),
                 expanded_changed_files: HashSet::new(),
+                expanded_user_messages: HashSet::new(),
                 transcript_control_focuses: RefCell::new(HashMap::new()),
                 session_navigation,
                 session_rename: None,

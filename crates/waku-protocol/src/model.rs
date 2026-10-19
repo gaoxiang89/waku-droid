@@ -366,6 +366,15 @@ impl RuntimeMode {
             Self::FullAccess => "icons/lock-open.svg",
         }
     }
+
+    pub const fn droid_autonomy_level(self) -> &'static str {
+        match self {
+            Self::Ask => "normal",
+            Self::AutoAcceptEdits => "auto-low",
+            Self::Auto => "auto-medium",
+            Self::FullAccess => "auto-high",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -1774,7 +1783,7 @@ impl ActivityKind {
 
         if matches!(
             compact.as_str(),
-            "todo" | "todowrite" | "updateplan" | "plan"
+            "todo" | "todoread" | "todowrite" | "updateplan" | "plan"
         ) {
             Self::Plan
         } else if matches!(
@@ -1812,13 +1821,14 @@ impl ActivityKind {
                 | "replace"
                 | "savefile"
                 | "strreplace"
+                | "strreplaceeditor"
                 | "write"
                 | "writefile"
         ) {
             Self::FileChange
         } else if matches!(
             compact.as_str(),
-            "read" | "fileread" | "readfile" | "readtextfile" | "viewfile"
+            "read" | "fileread" | "readfile" | "readtextfile" | "view" | "viewfile"
         ) {
             Self::FileRead
         } else if matches!(
@@ -2689,7 +2699,7 @@ fn extract_activity_display_target(
         ActivityKind::FileSearch => &["pattern", "query", "regex", "glob"],
         ActivityKind::FileList => &["path", "directory", "dir", "root"],
         ActivityKind::Search => &["query", "queries"],
-        ActivityKind::Tool => &["title"],
+        ActivityKind::Tool => &["title", "description", "task"],
         _ => return None,
     };
     find_activity_string(source, keys, 0).map(|value| compact_activity_target(&value))
@@ -3627,6 +3637,7 @@ mod tests {
             "read",
             "ReadFile",
             "read_text_file",
+            "view",
             "mcp__filesystem__read_file",
         ] {
             assert_eq!(
@@ -3649,10 +3660,23 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["WriteFile", "applyPatch", "move_file", "str_replace"] {
+        for name in [
+            "WriteFile",
+            "applyPatch",
+            "move_file",
+            "str_replace",
+            "str_replace_editor",
+        ] {
             assert_eq!(
                 ActivityKind::from_tool_name(name),
                 ActivityKind::FileChange,
+                "{name}"
+            );
+        }
+        for name in ["todo_read", "TodoWrite", "update_plan"] {
+            assert_eq!(
+                ActivityKind::from_tool_name(name),
+                ActivityKind::Plan,
                 "{name}"
             );
         }
