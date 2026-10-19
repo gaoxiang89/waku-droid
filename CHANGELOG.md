@@ -16,6 +16,15 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.23]
+
+- Lead activity groups with reasoning, stream thoughts inline, and fold intermediate tool noise during active turns
+- Render plan steps as structured checklists with progress indicators in transcript activity cards
+- Collapse long user messages into compact previews with a "Show more" / "Show less" disclosure
+- Support multi-select option checklists in structured user input requests
+- Preserve tool arguments and file changes across ACP tool call updates
+- Show Droid autonomy level tags in the runtime mode selector
+
 ## [0.1.22]
 
 - Serve in-app updates from this fork's own GitHub releases on every platform: the macOS, Windows, and Linux feeds and signed downloads now resolve against `gaoxiang89/waku-droid` release assets, with the Linux updater pinning enclosure URLs to that repository's downloads
