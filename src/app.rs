@@ -776,6 +776,36 @@ impl RightPanelSessionState {
     }
 }
 
+/// The bottom panel's half of a session's panel state. Terminal tabs belong
+/// to the session they were opened in: switching sessions swaps the tabs —
+/// and the panel's visibility — the way the right panel's surfaces swap, and
+/// deleting the session ends the processes.
+struct BottomPanelSessionState {
+    visible: bool,
+    terminals: Vec<Entity<TerminalView>>,
+    active_terminal: Option<usize>,
+    tabs_scroll_handle: ScrollHandle,
+    pending_tab_reveal: Option<usize>,
+}
+
+impl BottomPanelSessionState {
+    fn empty(visible: bool) -> Self {
+        Self {
+            visible,
+            terminals: Vec::new(),
+            active_terminal: None,
+            tabs_scroll_handle: ScrollHandle::new(),
+            pending_tab_reveal: None,
+        }
+    }
+
+    fn take_or_closed(states: &mut HashMap<Uuid, Self>, session_id: Uuid) -> Self {
+        states
+            .remove(&session_id)
+            .unwrap_or_else(|| Self::empty(false))
+    }
+}
+
 /// One choice in the model-traits menu: a label plus a badge marking the
 /// provider's own default, so the current selection and the default read apart.
 fn traits_choice(theme: Theme, label: String, is_default: bool, selected: bool) -> MenuItem {
@@ -1472,6 +1502,7 @@ pub struct Waku {
     /// Window-relative PiP position, independent of incoming preview frames.
     computer_use_preview_position: Option<gpui::Point<Pixels>>,
     right_panel_session_states: HashMap<Uuid, RightPanelSessionState>,
+    bottom_panel_session_states: HashMap<Uuid, BottomPanelSessionState>,
     right_panel_surfaces: Vec<RightPanelSurface>,
     right_panel_active_surface: Option<usize>,
     right_panel_tabs_scroll_handle: ScrollHandle,
@@ -1534,9 +1565,9 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
-    /// The bottom panel's terminals, in tab order. They outlive workspace
-    /// switches: each keeps the directory and host it was opened with, and
-    /// only closing its tab (or quitting) ends the process.
+    /// The bottom panel's terminals, in tab order — the selected session's.
+    /// Each keeps the directory and host it was opened with, and only closing
+    /// its tab (or deleting its session, or quitting) ends the process.
     bottom_panel_terminals: Vec<Entity<TerminalView>>,
     bottom_panel_active_terminal: Option<usize>,
     bottom_panel_tabs_scroll_handle: ScrollHandle,
@@ -3151,6 +3182,7 @@ impl Waku {
                 panel_resize_drag: None,
                 computer_use_preview_position: None,
                 right_panel_session_states: HashMap::new(),
+                bottom_panel_session_states: HashMap::new(),
                 right_panel_surfaces: Vec::new(),
                 right_panel_active_surface: None,
                 right_panel_tabs_scroll_handle: ScrollHandle::new(),

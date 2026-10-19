@@ -2658,7 +2658,15 @@ impl Waku {
         for terminal in self.right_panel_terminals.values() {
             terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
         }
-        for terminal in &self.bottom_panel_terminals {
+        for terminal in self
+            .bottom_panel_terminals
+            .iter()
+            .chain(
+                self.bottom_panel_session_states
+                    .values()
+                    .flat_map(|state| state.terminals.iter()),
+            )
+        {
             terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
         }
         for probe in &mut self.probes {

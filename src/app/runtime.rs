@@ -1055,6 +1055,7 @@ impl Waku {
             self.clear_user_input_fields(*session_id);
             self.background_work.remove(session_id);
             self.remove_right_panel_session_state(*session_id);
+            self.remove_bottom_panel_session_state(*session_id);
             self.task_switcher.remove(*session_id);
         }
 

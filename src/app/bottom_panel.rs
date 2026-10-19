@@ -37,9 +37,10 @@ impl Waku {
 
     /// One terminal per tab behind a 34 px strip that replaces the terminal's
     /// own toolbar; the strip carries what the toolbar did (status, title) per
-    /// tab. Terminals outlive workspace switches — each keeps the directory
-    /// and host it was opened with, and only closing its tab ends the process.
-    /// The resize handle along the top edge rides along as an overlay.
+    /// tab. Terminals belong to the session they were opened in — switching
+    /// sessions swaps the panel's tabs and visibility, and only closing a tab
+    /// (or deleting the session) ends the process. The resize handle along the
+    /// top edge rides along as an overlay.
     pub(super) fn render_bottom_panel(
         &mut self,
         height: f32,
@@ -334,7 +335,7 @@ impl Waku {
     }
 
     /// Create the panel's first terminal when none exists. Existing terminals
-    /// are never recreated or dropped here: they belong to the workspace they
+    /// are never recreated or dropped here: they belong to the session they
     /// were opened in and die only when their tab closes.
     pub(super) fn ensure_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
         if !self.bottom_panel_terminals.is_empty() {
@@ -366,6 +367,71 @@ impl Waku {
             TerminalView::new(working_directory.to_path_buf(), launcher, cx)
                 .with_bottom_panel_tabs()
         })
+    }
+
+    /// Park the selected session's panel state, the bottom panel's half of
+    /// what `store_selected_right_panel_state` saves. Terminal entities move
+    /// into the map, so their processes keep running off screen.
+    pub(super) fn store_selected_bottom_panel_state(&mut self) {
+        let Some(session_id) = self.state.selected_session else {
+            return;
+        };
+        let state = self.take_active_bottom_panel_state();
+        self.bottom_panel_session_states.insert(session_id, state);
+    }
+
+    /// Swap in the newly selected session's panel state. A session never
+    /// seen before opens closed, exactly as the right panel does.
+    pub(super) fn restore_bottom_panel_state(&mut self, session_id: Uuid) {
+        let state = BottomPanelSessionState::take_or_closed(
+            &mut self.bottom_panel_session_states,
+            session_id,
+        );
+        self.replace_active_bottom_panel_state(state);
+        // The persisted layout flag follows whichever session is on screen, so
+        // relaunching restores the panel the way this session left it.
+        self.state.bottom_panel_visible = self.bottom_panel_visible;
+        if self.bottom_panel_visible && self.bottom_panel_active_terminal.is_some() {
+            self.bottom_panel_pending_terminal_focus = true;
+        }
+    }
+
+    /// Drop a session's stored panel state, together with its terminals when
+    /// it is the selected one — the same split the right panel applies to its
+    /// surfaces. Dropping the entities is what shuts the PTYs down.
+    pub(super) fn remove_bottom_panel_session_state(&mut self, session_id: Uuid) {
+        let removed = if self.state.selected_session == Some(session_id) {
+            let removed = self.take_active_bottom_panel_state();
+            self.replace_active_bottom_panel_state(BottomPanelSessionState::empty(false));
+            removed
+        } else {
+            self.bottom_panel_session_states
+                .remove(&session_id)
+                .unwrap_or_else(|| BottomPanelSessionState::empty(false))
+        };
+        drop(removed);
+    }
+
+    fn take_active_bottom_panel_state(&mut self) -> BottomPanelSessionState {
+        BottomPanelSessionState {
+            visible: self.bottom_panel_visible,
+            terminals: std::mem::take(&mut self.bottom_panel_terminals),
+            active_terminal: self.bottom_panel_active_terminal.take(),
+            tabs_scroll_handle: std::mem::replace(
+                &mut self.bottom_panel_tabs_scroll_handle,
+                ScrollHandle::new(),
+            ),
+            pending_tab_reveal: self.bottom_panel_pending_tab_reveal.take(),
+        }
+    }
+
+    fn replace_active_bottom_panel_state(&mut self, state: BottomPanelSessionState) {
+        self.bottom_panel_visible = state.visible;
+        self.bottom_panel_terminals = state.terminals;
+        self.bottom_panel_active_terminal = state.active_terminal;
+        self.bottom_panel_tabs_scroll_handle = state.tabs_scroll_handle;
+        self.bottom_panel_pending_tab_reveal = state.pending_tab_reveal;
+        self.bottom_panel_pending_terminal_focus = false;
     }
 
     fn activate_bottom_panel_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -503,6 +569,32 @@ mod tests {
         assert_eq!(active_index_after_close(0, Some(0), 0), None);
         // No active tab degenerates to the first one.
         assert_eq!(active_index_after_close(1, None, 2), Some(0));
+    }
+
+    #[test]
+    fn take_or_closed_returns_stored_state_or_closed() {
+        let session = Uuid::new_v4();
+        let other_session = Uuid::new_v4();
+        let mut states = HashMap::new();
+        let mut state = BottomPanelSessionState::empty(true);
+        state.active_terminal = Some(0);
+        states.insert(session, state);
+
+        // A session with no stored panel state opens closed, exactly as the
+        // right panel treats one never visited before.
+        let missing = BottomPanelSessionState::take_or_closed(&mut states, other_session);
+        assert!(!missing.visible);
+        assert_eq!(missing.active_terminal, None);
+
+        // Taking hands the stored state over once, so a session opened twice
+        // without being switched away from in between reads closed the second
+        // time — the map, not the flag, is the source of truth.
+        let restored = BottomPanelSessionState::take_or_closed(&mut states, session);
+        assert!(restored.visible);
+        assert_eq!(restored.active_terminal, Some(0));
+        let again = BottomPanelSessionState::take_or_closed(&mut states, session);
+        assert!(!again.visible);
+        assert!(again.terminals.is_empty());
     }
 
     #[test]

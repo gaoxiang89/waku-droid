@@ -182,6 +182,7 @@ impl Waku {
         if session_changed {
             self.capture_and_save_current_composer_draft(cx);
             self.store_selected_right_panel_state();
+            self.store_selected_bottom_panel_state();
         }
         let old_host = self.selected_host_key();
         self.state.selected_session = Some(session_id);
@@ -225,6 +226,7 @@ impl Waku {
         if session_changed {
             self.restore_selected_composer_draft(cx);
             self.restore_right_panel_state(session_id, cx);
+            self.restore_bottom_panel_state(session_id);
         } else {
             self.ensure_right_panel_terminals(cx);
         }
@@ -346,6 +348,7 @@ impl Waku {
         self.reset_session_runtime(session_id);
         self.background_work.remove(&session_id);
         self.remove_right_panel_session_state(session_id);
+        self.remove_bottom_panel_session_state(session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
         if let Err(error) = self

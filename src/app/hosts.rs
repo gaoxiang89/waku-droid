@@ -532,6 +532,7 @@ impl Waku {
             self.runtime_attach_misses.remove(id);
             self.background_work.remove(id);
             self.remove_right_panel_session_state(*id);
+            self.remove_bottom_panel_session_state(*id);
             self.task_switcher.remove(*id);
         }
         self.state
