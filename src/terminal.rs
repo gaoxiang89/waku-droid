@@ -22,13 +22,13 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText,
-    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font,
-    prelude::FluentBuilder, px, rgb,
+    App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, ElementInputHandler,
+    EntityInputHandler, FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight, Hsla,
+    ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextRun,
+    UTF16Selection, UnderlineStyle, Window, canvas, div, font, prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -898,8 +898,139 @@ impl TerminalCursorBlink {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalPasteContent {
+    Text(String),
+    Image { format: ImageFormat, bytes: Vec<u8> },
+    Paths(Vec<PathBuf>),
+}
+
+fn extract_terminal_paste_content(clipboard: &ClipboardItem) -> Option<TerminalPasteContent> {
+    if let Some(ClipboardEntry::Image(image)) = clipboard.entries().first() {
+        if !image.bytes.is_empty() {
+            return Some(TerminalPasteContent::Image {
+                format: image.format,
+                bytes: image.bytes.clone(),
+            });
+        }
+    }
+
+    if let Some(ClipboardEntry::ExternalPaths(external)) = clipboard.entries().first() {
+        if !external.paths().is_empty() {
+            return Some(TerminalPasteContent::Paths(external.paths().to_vec()));
+        }
+    }
+
+    if let Some(text) = clipboard.text().filter(|t| !t.is_empty()) {
+        return Some(TerminalPasteContent::Text(text));
+    }
+
+    for entry in clipboard.entries() {
+        match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+                return Some(TerminalPasteContent::Image {
+                    format: image.format,
+                    bytes: image.bytes.clone(),
+                });
+            }
+            ClipboardEntry::ExternalPaths(external) if !external.paths().is_empty() => {
+                return Some(TerminalPasteContent::Paths(external.paths().to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn clipboard_has_paste_content(clipboard: &ClipboardItem) -> bool {
+    extract_terminal_paste_content(clipboard).is_some()
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    let is_safe = !path_str.is_empty()
+        && path_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '\\' | ':' | '.' | '_' | '-'));
+    if is_safe {
+        return path_str.into_owned();
+    }
+
+    if cfg!(windows) || path_str.contains('\\') {
+        let escaped = path_str.replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        let escaped = path_str.replace('\'', "'\\''");
+        format!("'{escaped}'")
+    }
+}
+
+/// Agent CLIs accept only PNG and JPEG, while clipboards also carry BMP (every
+/// Windows screenshot) and TIFF. Re-encode those as PNG; anything that does not
+/// decode is passed through unchanged.
+fn paste_image_as_png(format: ImageFormat, bytes: Vec<u8>) -> (ImageFormat, Vec<u8>) {
+    if matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Svg
+    ) {
+        return (format, bytes);
+    }
+    let mut png = Vec::new();
+    let encoded = image::load_from_memory(&bytes).and_then(|decoded| {
+        decoded.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    });
+    match encoded {
+        Ok(()) => (ImageFormat::Png, png),
+        Err(_) => (format, bytes),
+    }
+}
+
+fn save_pasted_image(
+    launcher: TerminalLauncher,
+    format: ImageFormat,
+    bytes: Vec<u8>,
+) -> Result<PathBuf> {
+    let (format, bytes) = paste_image_as_png(format, bytes);
+    if let TerminalLauncher::Daemon(daemon) = launcher {
+        let response = daemon.client().request(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            waku_client::Command::StoreBlob {
+                mime_type: format.mime_type().to_owned(),
+                bytes: bytes.clone(),
+            },
+        );
+        if let Ok(waku_client::ResponsePayload::BlobStored { path, .. }) = response {
+            return Ok(path);
+        }
+    }
+
+    let ext = match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        _ => "png",
+    };
+    let file_name = format!(
+        "waku-paste-{}-{}.{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().simple().to_string()[..6],
+        ext
+    );
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join(file_name);
+    std::fs::write(&temp_path, bytes)?;
+    Ok(temp_path)
+}
+
 pub struct TerminalView {
     session: Option<TerminalSession>,
+    launcher: TerminalLauncher,
     error: Option<String>,
     focus_handle: FocusHandle,
     working_directory: PathBuf,
@@ -939,10 +1070,11 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let terminal_cwd = working_directory.clone();
+        let session_launcher = launcher.clone();
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
-                .spawn(async move { TerminalSession::new(&terminal_cwd, 52, 36, launcher) })
+                .spawn(async move { TerminalSession::new(&terminal_cwd, 52, 36, session_launcher) })
                 .await;
             if this
                 .update(cx, |this, cx| {
@@ -980,6 +1112,7 @@ impl TerminalView {
 
         Self {
             session: None,
+            launcher,
             error: None,
             focus_handle: cx.focus_handle(),
             title: tr!("right_panel.terminal"),
@@ -1109,14 +1242,9 @@ impl TerminalView {
         if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
             && keystroke.key.eq_ignore_ascii_case("v")
         {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                session.term.lock().selection = None;
-                let bytes = bracketed_paste(text, session.mode());
-                session.write(bytes);
-                session.dirty.store(true, Ordering::Release);
-                window.prevent_default();
-                cx.stop_propagation();
-            }
+            self.paste_from_clipboard(cx);
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
 
@@ -1312,6 +1440,49 @@ impl TerminalView {
         session.write(bracketed_paste(text, session.mode()));
         session.dirty.store(true, Ordering::Release);
         cx.notify();
+    }
+
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(content) = extract_terminal_paste_content(&clipboard) else {
+            return;
+        };
+
+        match content {
+            TerminalPasteContent::Text(text) => {
+                self.paste(text, cx);
+            }
+            TerminalPasteContent::Paths(paths) => {
+                let text = paths
+                    .iter()
+                    .map(|p| shell_quote_path(p))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.paste(text, cx);
+            }
+            TerminalPasteContent::Image { format, bytes } => {
+                self.pause_cursor_blink(cx);
+                let launcher = self.launcher.clone();
+                cx.spawn(async move |this, cx| {
+                    let saved_path = cx
+                        .background_executor()
+                        .spawn(async move { save_pasted_image(launcher, format, bytes) })
+                        .await;
+                    if let Ok(path) = saved_path {
+                        let text = shell_quote_path(&path);
+                        let _ = this.update(cx, |this, cx| {
+                            this.paste(text, cx);
+                        });
+                    }
+                })
+                .detach();
+            }
+        }
     }
 
     fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -1730,8 +1901,8 @@ impl Render for TerminalView {
                 let has_selection = context_terminal.read(cx).selected_text().is_some();
                 let can_paste = cx
                     .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .is_some_and(|text| !text.is_empty());
+                    .as_ref()
+                    .is_some_and(clipboard_has_paste_content);
                 let has_session = context_terminal.read(cx).session.is_some();
 
                 let copy_terminal = context_terminal.clone();
@@ -1746,11 +1917,7 @@ impl Render for TerminalView {
                     })
                     .disabled(!has_selection),
                     MenuItem::new(tr!("menu.paste"), move |_, cx| {
-                        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
-                        else {
-                            return;
-                        };
-                        paste_terminal.update(cx, |terminal, cx| terminal.paste(text, cx));
+                        paste_terminal.update(cx, |terminal, cx| terminal.paste_from_clipboard(cx));
                     })
                     .disabled(!can_paste),
                     MenuItem::Separator,
@@ -2285,7 +2452,7 @@ mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
-    use gpui::{Modifiers, point, size};
+    use gpui::{ExternalPaths, Image, Modifiers, point, size};
 
     #[test]
     fn printable_keys_use_platform_text_input_but_terminal_controls_do_not() {
@@ -2400,6 +2567,7 @@ mod tests {
                     dark_theme,
                     url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
                 }),
+                launcher: TerminalLauncher::Local,
                 error: None,
                 focus_handle: cx.focus_handle(),
                 working_directory: PathBuf::new(),
@@ -2733,5 +2901,92 @@ mod tests {
             ),
             Some((TerminalPoint::new(Line(-3), Column(0)), Side::Left))
         );
+    }
+
+    // Linux builds `image` with PNG alone, so BMP falls through unchanged there.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pasted_bmp_is_re_encoded_as_png() {
+        let mut bmp = Vec::new();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([200, 30, 30]))
+            .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        let (format, bytes) = paste_image_as_png(ImageFormat::Bmp, bmp);
+        assert_eq!(format, ImageFormat::Png);
+        assert!(bytes.starts_with(b"\x89PNG"));
+
+        let (format, bytes) = paste_image_as_png(ImageFormat::Bmp, b"not an image".to_vec());
+        assert_eq!(format, ImageFormat::Bmp, "undecodable bytes pass through");
+        assert_eq!(bytes, b"not an image");
+    }
+
+    #[test]
+    fn quotes_terminal_paths_only_when_needed() {
+        let clean_path = PathBuf::from("/tmp/waku-paste-20261020.png");
+        assert_eq!(
+            shell_quote_path(&clean_path),
+            "/tmp/waku-paste-20261020.png"
+        );
+
+        let space_posix = PathBuf::from("/Users/alice/my images/photo.png");
+        if !cfg!(windows) {
+            assert_eq!(
+                shell_quote_path(&space_posix),
+                "'/Users/alice/my images/photo.png'"
+            );
+        }
+
+        let quoted_posix = PathBuf::from("/tmp/bob's photo.png");
+        if !cfg!(windows) {
+            assert_eq!(
+                shell_quote_path(&quoted_posix),
+                "'/tmp/bob'\\''s photo.png'"
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_terminal_paste_content_with_correct_priority() {
+        // Text-only clipboard
+        let text_item = ClipboardItem::new_string("echo hello".to_string());
+        assert_eq!(
+            extract_terminal_paste_content(&text_item),
+            Some(TerminalPasteContent::Text("echo hello".into()))
+        );
+        assert!(clipboard_has_paste_content(&text_item));
+
+        // Image clipboard
+        let image = Image {
+            format: ImageFormat::Png,
+            bytes: vec![137, 80, 78, 71],
+            id: 1,
+        };
+        let image_item = ClipboardItem::new_image(&image);
+        assert_eq!(
+            extract_terminal_paste_content(&image_item),
+            Some(TerminalPasteContent::Image {
+                format: ImageFormat::Png,
+                bytes: vec![137, 80, 78, 71],
+            })
+        );
+        assert!(clipboard_has_paste_content(&image_item));
+
+        // External paths clipboard
+        let paths = ExternalPaths(vec![PathBuf::from("/tmp/file.png")].into());
+        let paths_item = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(paths)],
+        };
+        assert_eq!(
+            extract_terminal_paste_content(&paths_item),
+            Some(TerminalPasteContent::Paths(vec![PathBuf::from(
+                "/tmp/file.png"
+            )]))
+        );
+        assert!(clipboard_has_paste_content(&paths_item));
+
+        // Empty clipboard
+        let empty_item = ClipboardItem { entries: vec![] };
+        assert_eq!(extract_terminal_paste_content(&empty_item), None);
+        assert!(!clipboard_has_paste_content(&empty_item));
     }
 }

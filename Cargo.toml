@@ -162,6 +162,9 @@ tar = "0.4"
 embed-resource = "3.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# The Windows clipboard hands images over as a DIB, which GPUI reports as BMP.
+# A terminal paste re-encodes it to PNG, since agent CLIs read only PNG/JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff"] }
 raw-window-handle = "0.6"
 # The browser surface. WebView2 is evergreen on Windows 10 and in-box on 11.
 # Waku drives it through `webview2-com` rather than wry because it needs the
