@@ -823,6 +823,7 @@ files.could_not_save: "无法保存 %{path}：%{error}"
 files.download: 下载…
 files.download_saved: "已将 %{name} 保存到 %{path}"
 files.download_failed: "无法下载文件：%{error}"
+files.download_canceled: "已取消下载 %{name}"
 files.delete: 删除
 files.delete_confirm_title: 永久删除？
 files.delete_confirm_message: "“%{name}”将被永久删除,此操作无法撤销。"

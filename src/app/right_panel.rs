@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use base64::Engine as _;
 use gpui::{KeyBinding, actions};
@@ -18,6 +19,11 @@ actions!(
 const FILE_RENAME_PARENT_CONTEXT: &str = "RightPanelFileRename";
 const FILE_RENAME_FIELD_CONTEXT: &str = "RightPanelFileRename > TextInput";
 const FILE_DELETE_DIALOG_CONTEXT: &str = "RightPanelFileDeleteDialog";
+
+/// Bytes requested per chunk of a streamed download. The daemon clamps to its
+/// own cap; this keeps every wire message small and gives the progress card
+/// fine-grained updates even for multi-gigabyte files.
+const DOWNLOAD_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Keep Escape inside the focused inline editor so it cancels the rename,
 /// and give the delete confirm dialog its confirm/dismiss keys.
@@ -4078,9 +4084,10 @@ impl Waku {
         }
     }
 
-    /// Saves a remote (or local) file to a path of the user's choosing. The
-    /// bytes travel over the daemon RPC, so this works unchanged over SSH and
-    /// WSL bridges.
+    /// Streams a remote (or local) file to a path of the user's choosing, one
+    /// chunk per request, so the transfer is bounded only by disk space — the
+    /// VS Code remote-download shape. The bytes travel over the daemon RPC,
+    /// so this works unchanged over SSH and WSL bridges.
     pub(super) fn download_right_panel_file(
         &mut self,
         relative_path: String,
@@ -4102,36 +4109,113 @@ impl Waku {
             let Ok(Ok(Some(destination))) = receiver.await else {
                 return;
             };
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let project_path = project_path.clone();
-                    let relative_path = relative_path.clone();
-                    let destination = destination.clone();
-                    async move {
-                        match workspace.request(waku_client::WorkspaceOperation::ReadFile {
-                            root: project_path,
-                            relative_path: PathBuf::from(relative_path),
-                        })? {
-                            waku_client::WorkspaceResult::File { bytes } => {
-                                let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(bytes.trim())?;
-                                std::fs::write(&destination, bytes)?;
-                                Ok(())
+            let Ok((download_id, cancel)) =
+                waku.update(cx, |waku, cx| waku.begin_download(display_name.clone(), cx))
+            else {
+                return;
+            };
+            enum Outcome {
+                Complete,
+                Canceled,
+                Failed(anyhow::Error),
+            }
+            let mut offset: u64 = 0;
+            let outcome = loop {
+                if cancel.load(Ordering::Acquire) {
+                    break Outcome::Canceled;
+                }
+                // One request plus one bounded write, both off the UI thread.
+                let step = cx
+                    .background_executor()
+                    .spawn({
+                        let workspace = workspace.clone();
+                        let project_path = project_path.clone();
+                        let relative_path = relative_path.clone();
+                        let destination = destination.clone();
+                        async move {
+                            let response = workspace.request(
+                                waku_client::WorkspaceOperation::ReadFileChunk {
+                                    root: project_path,
+                                    relative_path: PathBuf::from(relative_path),
+                                    offset,
+                                    length: DOWNLOAD_CHUNK_BYTES,
+                                },
+                            )?;
+                            let waku_client::WorkspaceResult::FileChunk {
+                                bytes,
+                                total_bytes,
+                            } = response
+                            else {
+                                anyhow::bail!("the daemon returned an invalid file response");
+                            };
+                            let bytes =
+                                base64::engine::general_purpose::STANDARD.decode(bytes.trim())?;
+                            let mut file = std::fs::OpenOptions::new();
+                            let mut file = if offset == 0 {
+                                file.create(true).write(true).truncate(true)
+                            } else {
+                                file.append(true)
                             }
-                            _ => anyhow::bail!("the daemon returned an invalid file response"),
+                            .open(&destination)?;
+                            use std::io::Write as _;
+                            file.write_all(&bytes)?;
+                            Ok((bytes.len() as u64, total_bytes))
+                        }
+                    })
+                    .await;
+                match step {
+                    Ok((chunk_bytes, total_bytes)) => {
+                        offset += chunk_bytes;
+                        if waku
+                            .update(cx, |waku, cx| {
+                                waku.update_download_progress(
+                                    download_id,
+                                    offset,
+                                    total_bytes,
+                                    cx,
+                                )
+                            })
+                            .is_err()
+                        {
+                            // The window went away; stop rather than stream
+                            // into a card nobody will see.
+                            break Outcome::Canceled;
+                        }
+                        if chunk_bytes == 0 {
+                            if offset != total_bytes {
+                                break Outcome::Failed(anyhow::anyhow!(
+                                    "the file changed size from {total_bytes} to {offset} bytes while downloading"
+                                ));
+                            }
+                            break Outcome::Complete;
                         }
                     }
-                })
-                .await;
+                    Err(error) => break Outcome::Failed(error),
+                }
+            };
+            let cleanup = cx.background_executor().spawn({
+                let destination = destination.clone();
+                let keep_file = matches!(outcome, Outcome::Complete);
+                async move {
+                    if !keep_file {
+                        // A canceled or failed transfer leaves nothing behind.
+                        let _ = std::fs::remove_file(&destination);
+                    }
+                }
+            });
+            cleanup.await;
             let _ = waku.update(cx, |waku, cx| {
-                match result {
-                    Ok(()) => waku.show_success_toast(tr!(
+                waku.end_download(download_id, cx);
+                match outcome {
+                    Outcome::Complete => waku.show_success_toast(tr!(
                         "files.download_saved",
                         name = display_name,
                         path = destination.display()
                     )),
-                    Err(error) => waku.show_toast(tr!(
+                    Outcome::Canceled => {
+                        waku.show_toast(tr!("files.download_canceled", name = display_name))
+                    }
+                    Outcome::Failed(error) => waku.show_toast(tr!(
                         "files.download_failed",
                         error = error.to_string()
                     )),

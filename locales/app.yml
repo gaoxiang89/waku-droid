@@ -1686,6 +1686,8 @@ files.download_saved:
   en: "Saved %{name} to %{path}"
 files.download_failed:
   en: "Could not download the file: %{error}"
+files.download_canceled:
+  en: "Canceled the download of %{name}"
 files.delete:
   en: Delete
 files.delete_confirm_title:

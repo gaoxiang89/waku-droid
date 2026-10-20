@@ -12,7 +12,11 @@ use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
-const MAX_DOWNLOADABLE_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// One chunk of a streamed file download, before base64. The 4/3 inflation
+/// plus the JSON envelope keeps even a maximum chunk far below the daemon
+/// wire's per-message cap, so no whole-file read can ever be assembled into
+/// a single oversized response.
+const MAX_FILE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub use waku_protocol::workspace::{
@@ -65,9 +69,11 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             fs::write(resolve_workspace_path(&root, &relative_path)?, content)?;
             WorkspaceResult::Ack
         }
-        WorkspaceOperation::ReadFile {
+        WorkspaceOperation::ReadFileChunk {
             root,
             relative_path,
+            offset,
+            length,
         } => {
             let path = resolve_workspace_path(&root, &relative_path)?;
             let metadata = fs::metadata(&path)
@@ -75,17 +81,33 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             if metadata.is_dir() {
                 bail!("not a file: {}", path.display());
             }
-            if metadata.len() > MAX_DOWNLOADABLE_FILE_BYTES as u64 {
-                bail!(
-                    "file {} is {} bytes, larger than the {} MiB download limit",
-                    path.display(),
-                    metadata.len(),
-                    MAX_DOWNLOADABLE_FILE_BYTES / (1024 * 1024)
-                );
+            let total_bytes = metadata.len();
+            let remaining = total_bytes.saturating_sub(offset);
+            let wanted = (length as usize)
+                .min(MAX_FILE_CHUNK_BYTES)
+                .min(remaining as usize);
+            let mut buffer = vec![0u8; wanted];
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("could not open file {}", path.display()))?;
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("could not seek in file {}", path.display()))?;
+            let mut filled = 0;
+            while filled < wanted {
+                match std::io::Read::read(&mut file, &mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(read) => filled += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        return Err(anyhow!(error))
+                            .with_context(|| format!("could not read file {}", path.display()))
+                    }
+                }
             }
-            let bytes = fs::read(&path)?;
-            WorkspaceResult::File {
-                bytes: base64::engine::general_purpose::STANDARD.encode(bytes),
+            buffer.truncate(filled);
+            WorkspaceResult::FileChunk {
+                bytes: base64::engine::general_purpose::STANDARD.encode(buffer),
+                total_bytes,
             }
         }
         WorkspaceOperation::RenamePath {
@@ -689,17 +711,67 @@ mod tests {
     }
 
     #[test]
-    fn file_reader_round_trips_arbitrary_bytes() {
+    fn file_chunks_round_trip_arbitrary_bytes() {
         let root = std::env::temp_dir().join(format!("waku-binary-read-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let bytes: Vec<u8> = (0..=u8::MAX).chain([0u8; 64]).collect();
+        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(100_000).collect();
         fs::write(root.join("blob.bin"), &bytes).unwrap();
 
-        let WorkspaceResult::File {
+        // Walking the file in chunks of an odd size reassembles it exactly,
+        // with the final short chunk and the total length reported throughout.
+        let mut offset = 0;
+        let mut restored = Vec::new();
+        loop {
+            let WorkspaceResult::FileChunk {
+                bytes: encoded,
+                total_bytes,
+            } = execute(WorkspaceOperation::ReadFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("blob.bin"),
+                offset,
+                length: 1021,
+            })
+            .unwrap()
+            else {
+                panic!("unexpected workspace response")
+            };
+            assert_eq!(total_bytes, bytes.len() as u64);
+            let chunk =
+                base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            assert!(chunk.len() <= 1021);
+            restored.extend_from_slice(&chunk);
+            offset += chunk.len() as u64;
+        }
+        assert_eq!(restored, bytes);
+
+        // Reads past the end answer with an empty chunk, not an error, and an
+        // offset inside the file returns only the remaining bytes.
+        let WorkspaceResult::FileChunk { bytes: encoded, .. } =
+            execute(WorkspaceOperation::ReadFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("blob.bin"),
+                offset: bytes.len() as u64,
+                length: 1021,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected workspace response")
+        };
+        assert!(base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+            .is_empty());
+        let WorkspaceResult::FileChunk {
             bytes: encoded,
-        } = execute(WorkspaceOperation::ReadFile {
+            total_bytes,
+        } = execute(WorkspaceOperation::ReadFileChunk {
             root: root.clone(),
             relative_path: PathBuf::from("blob.bin"),
+            offset: bytes.len() as u64 - 10,
+            length: 1021,
         })
         .unwrap()
         else {
@@ -707,13 +779,42 @@ mod tests {
         };
         assert_eq!(
             base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
-            bytes
+            &bytes[bytes.len() - 10..]
         );
-        assert!(execute(WorkspaceOperation::ReadFile {
+        assert!(execute(WorkspaceOperation::ReadFileChunk {
             root: root.clone(),
             relative_path: PathBuf::from("missing.bin"),
+            offset: 0,
+            length: 1021,
         })
         .is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_chunk_requests_are_capped_per_message() {
+        let root = std::env::temp_dir().join(format!("waku-chunk-cap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("big.bin"), [0u8; 128]).unwrap();
+
+        // However much a caller asks for, one response stays small enough to
+        // fit the wire budget after base64.
+        let WorkspaceResult::FileChunk { bytes: encoded, .. } =
+            execute(WorkspaceOperation::ReadFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("big.bin"),
+                offset: 0,
+                length: u64::MAX,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected workspace response")
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            [0u8; 128]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

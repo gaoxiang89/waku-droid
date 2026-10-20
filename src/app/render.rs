@@ -273,7 +273,7 @@ impl Render for Waku {
             let goal_dialog = self.render_goal_dialog(window, cx);
             let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
             let remote_folder_picker = self.render_remote_folder_picker(window, cx);
-            let toast = self.render_active_toast(cx);
+            let toast = self.render_notifications(cx);
             let content = div()
                 .relative()
                 .size_full()
@@ -311,7 +311,7 @@ impl Render for Waku {
         let goal_dialog = self.render_goal_dialog(window, cx);
         let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
         let remote_folder_picker = self.render_remote_folder_picker(window, cx);
-        let toast = self.render_active_toast(cx);
+        let toast = self.render_notifications(cx);
         let content = div()
             .key_context("Waku")
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
@@ -506,20 +506,48 @@ mod tests {
 }
 
 impl Waku {
-    /// Arm the dismiss timer and build the floating toast layer, if a toast
-    /// is active. Every full-window surface (workspace and settings alike)
-    /// must include this, or a toast raised there stays invisible until the
-    /// user navigates away.
-    fn render_active_toast(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Arm the dismiss timer and build the floating notification layer — the
+    /// toast plus one live card per streaming download. Every full-window
+    /// surface (workspace and settings alike) must include this, or a toast
+    /// raised there stays invisible until the user navigates away.
+    fn render_notifications(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.start_toast_dismiss_timer(cx);
         let toast = self
             .toast
             .as_ref()
             .map(|toast| (toast.message.clone(), toast.tone, toast.id));
-        toast.map(|(message, tone, generation)| {
-            self.render_toast(message, tone, generation, cx)
-                .into_any_element()
-        })
+        let downloads: Vec<(u64, String, u64, u64)> = self
+            .downloads
+            .iter()
+            .map(|download| {
+                (
+                    download.id,
+                    download.name.clone(),
+                    download.written,
+                    download.total_bytes,
+                )
+            })
+            .collect();
+        if toast.is_none() && downloads.is_empty() {
+            return None;
+        }
+        let mut column = div()
+            .absolute()
+            .left_0()
+            .top(px(56.0))
+            .w_full()
+            .px(px(20.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(8.0));
+        if let Some((message, tone, generation)) = toast {
+            column = column.child(self.render_toast(message, tone, generation, cx));
+        }
+        for (id, name, written, total_bytes) in downloads {
+            column = column.child(self.render_download_card(id, name, written, total_bytes, cx));
+        }
+        Some(column.into_any_element())
     }
 
     fn render_toast(
@@ -528,8 +556,7 @@ impl Waku {
         tone: ToastTone,
         generation: u64,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = Theme::current(cx);
+    ) -> impl IntoElement {        let theme = Theme::current(cx);
         let (status_icon, status_color) = match tone {
             ToastTone::Alert => ("icons/alert.svg", theme.danger),
             ToastTone::Success => ("icons/check.svg", theme.success),
@@ -577,46 +604,35 @@ impl Waku {
             }));
 
         div()
-            .id(SharedString::from(format!("toast-layer-{generation}")))
-            .absolute()
-            .left_0()
-            .top(px(56.0))
-            .w_full()
-            .px(px(20.0))
+            .id(SharedString::from(format!("toast-{generation}")))
+            .occlude()
+            .max_w(px(560.0))
+            .min_w_0()
+            .px(px(10.0))
+            .py(px(7.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_lg()
             .flex()
-            .justify_center()
-            .child(
-                div()
-                    .id(SharedString::from(format!("toast-{generation}")))
-                    .occlude()
-                    .max_w(px(560.0))
-                    .min_w_0()
-                    .px(px(10.0))
-                    .py(px(7.0))
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(theme.border_strong)
-                    .bg(theme.raised)
-                    .shadow_lg()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .text_size(sp(12.5))
-                    .line_height(sp(16.0))
-                    .text_color(theme.text)
-                    .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
-                        this.set_toast_hovered(*hovering, cx);
-                    }))
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(md::render::frame_reset(self.toast_selection.clone()))
-                    .child(icon(status_icon, 14.0, status_color))
-                    .child(div().flex_1().min_w_0().whitespace_normal().child(message))
-                    .child(dismiss)
-                    .child(self.toast_selection_input()),
-            )
-            // Keep the toast top-centered just beneath Waku's 48px header.
-            // GPUI's animation path honors the system reduce-motion preference
-            // and resolves immediately.
+            .items_center()
+            .gap(px(8.0))
+            .text_size(sp(12.5))
+            .line_height(sp(16.0))
+            .text_color(theme.text)
+            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                this.set_toast_hovered(*hovering, cx);
+            }))
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(md::render::frame_reset(self.toast_selection.clone()))
+            .child(icon(status_icon, 14.0, status_color))
+            .child(div().flex_1().min_w_0().whitespace_normal().child(message))
+            .child(dismiss)
+            .child(self.toast_selection_input())
+            // The notification column keeps this top-centered just beneath
+            // Waku's 48px header. GPUI's animation path honors the system
+            // reduce-motion preference and resolves immediately.
             .with_animation(
                 SharedString::from(format!("toast-enter-{generation}")),
                 Animation::new(TOAST_ANIMATION_DURATION).with_easing(ease_out_quint()),
@@ -625,6 +641,125 @@ impl Waku {
                         .top(px(48.0 + 8.0 * delta))
                         .opacity(0.4 + 0.6 * delta)
                 },
+            )
+    }
+
+    /// One live card in the notification column for a file being streamed to
+    /// disk: name, share, byte counts, and a cancel that stops the transfer
+    /// at its next chunk. The moving bar is decorative; the percent label
+    /// carries the same meaning without it.
+    fn render_download_card(
+        &self,
+        id: u64,
+        name: String,
+        written: u64,
+        total_bytes: u64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = Theme::current(cx);
+        let fraction = if total_bytes > 0 {
+            (written as f32 / total_bytes as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let percent = (fraction * 100.0).round() as u32;
+        let cancel = div()
+            .id(SharedString::from(format!("cancel-download-{id}")))
+            .tab_index(0)
+            .size(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .active(|element| element.bg(theme.overlay_strong))
+            .tooltip(Tooltip::text(tr!("common.cancel")))
+            .child(icon("icons/x.svg", 12.0, theme.text_tertiary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.cancel_download(id, cx);
+                cx.stop_propagation();
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | "escape") {
+                    this.cancel_download(id, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }));
+
+        div()
+            .id(SharedString::from(format!("download-card-{id}")))
+            .occlude()
+            .min_w(px(360.0))
+            .max_w(px(560.0))
+            .px(px(10.0))
+            .py(px(7.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.raised)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .text_size(sp(12.5))
+            .line_height(sp(16.0))
+            .text_color(theme.text)
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .min_w_0()
+                    .child(icon("icons/download.svg", 14.0, theme.accent))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_tertiary)
+                            .child(SharedString::from(format!("{percent}%"))),
+                    )
+                    .child(cancel),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(3.0))
+                            .rounded_full()
+                            .bg(theme.overlay_strong)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(theme.accent)
+                                    .w(gpui::relative(fraction)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_tertiary)
+                            .child(SharedString::from(format!(
+                                "{}/{}",
+                                super::skills_page::format_bytes(written),
+                                super::skills_page::format_bytes(total_bytes)
+                            ))),
+                    ),
             )
     }
 }

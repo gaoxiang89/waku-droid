@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
@@ -292,6 +293,18 @@ struct ToastState {
 enum ToastTone {
     Alert,
     Success,
+}
+
+/// One workspace file being streamed to a user-chosen local path. The flag is
+/// the cancel signal the transfer loop polls between chunks; the card reads
+/// only the counters, so rendering never touches the transfer itself.
+#[derive(Debug)]
+pub(crate) struct ActiveDownload {
+    id: u64,
+    name: String,
+    total_bytes: u64,
+    written: u64,
+    cancel: Arc<AtomicBool>,
 }
 
 fn paused_toast_duration(remaining: Duration, elapsed: Duration) -> Duration {
@@ -1627,6 +1640,10 @@ pub struct Waku {
     header_drag_armed: bool,
     toast: Option<ToastState>,
     toast_generation: u64,
+    /// Workspace files being streamed to local disk, one card each. Transient
+    /// by design: an interrupted download is simply gone on relaunch.
+    downloads: Vec<ActiveDownload>,
+    download_generation: u64,
     copied_control_feedback: HashMap<String, u64>,
     copied_control_generation: u64,
     copied_message_feedback: HashMap<Uuid, u64>,
@@ -2004,6 +2021,56 @@ impl Waku {
             timer_started: None,
             hovered: false,
         });
+    }
+
+    /// Registers a streaming download card and returns its handle: the id the
+    /// transfer reports progress against, and the flag that cancels it.
+    pub(super) fn begin_download(&mut self, name: String, cx: &mut Context<Self>) -> (u64, Arc<AtomicBool>) {
+        self.download_generation = self.download_generation.wrapping_add(1);
+        let id = self.download_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.downloads.push(ActiveDownload {
+            id,
+            name,
+            total_bytes: 0,
+            written: 0,
+            cancel: cancel.clone(),
+        });
+        cx.notify();
+        (id, cancel)
+    }
+
+    pub(super) fn update_download_progress(
+        &mut self,
+        id: u64,
+        written: u64,
+        total_bytes: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(download) = self.downloads.iter_mut().find(|download| download.id == id) {
+            download.written = written;
+            download.total_bytes = total_bytes;
+            cx.notify();
+        }
+    }
+
+    /// Drops the card. The transfer task calls this whether it finished,
+    /// failed, or was canceled; it owns the follow-up toast.
+    pub(super) fn end_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.downloads.len();
+        self.downloads.retain(|download| download.id != id);
+        if self.downloads.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Signals cancellation and removes the card immediately; the transfer
+    /// notices on its next chunk boundary and cleans up the partial file.
+    fn cancel_download(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(download) = self.downloads.iter().find(|download| download.id == id) {
+            download.cancel.store(true, Ordering::Release);
+        }
+        self.end_download(id, cx);
     }
 
     /// Arm one wake-up for the moment a time-derived label next changes —
@@ -3253,6 +3320,8 @@ impl Waku {
                     hovered: false,
                 }),
                 toast_generation: 0,
+                downloads: Vec::new(),
+                download_generation: 0,
                 copied_control_feedback: HashMap::new(),
                 copied_control_generation: 0,
                 copied_message_feedback: HashMap::new(),

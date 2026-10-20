@@ -865,6 +865,7 @@ files.could_not_save: "%{path} を保存できませんでした：%{error}"
 files.download: ダウンロード…
 files.download_saved: "%{name} を %{path} に保存しました"
 files.download_failed: "ファイルをダウンロードできませんでした：%{error}"
+files.download_canceled: "%{name} のダウンロードをキャンセルしました"
 files.delete: 削除
 files.delete_confirm_title: 完全に削除しますか？
 files.delete_confirm_message: "「%{name}」は完全に削除されます。この操作は元に戻せません。"

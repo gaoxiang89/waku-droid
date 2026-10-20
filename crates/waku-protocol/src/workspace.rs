@@ -70,11 +70,18 @@ pub enum WorkspaceOperation {
         relative_path: PathBuf,
         content: String,
     },
-    ReadFile {
+    /// Reads one bounded chunk of a file starting at `offset`, so arbitrarily
+    /// large files travel as many small messages instead of one that the wire
+    /// limit rejects. `total_bytes` on the response carries the current file
+    /// length, letting callers drive progress without a separate stat.
+    ReadFileChunk {
         #[ts(type = "string")]
         root: PathBuf,
         #[ts(type = "string")]
         relative_path: PathBuf,
+        offset: u64,
+        /// Bytes requested; the daemon clamps this to its own per-chunk cap.
+        length: u64,
     },
     RenamePath {
         #[ts(type = "string")]
@@ -232,9 +239,12 @@ pub enum WorkspaceResult {
     TextFile {
         content: String,
     },
-    File {
-        /// Base64-encoded file bytes, matching the blob command framing.
+    FileChunk {
+        /// Base64-encoded file bytes at the requested offset, matching the
+        /// blob command framing.
         bytes: String,
+        /// File length in bytes when the chunk was read.
+        total_bytes: u64,
     },
     ProjectFiles {
         entries: Vec<FileEntry>,
