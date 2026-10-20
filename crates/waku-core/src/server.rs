@@ -30,6 +30,14 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// not reading. Keeping the connection would let its event queue grow without
 /// bound, so it is dropped; clients reconnect and resume from their cursors.
 const SOCKET_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// A client that sends nothing for this long is probed with a WebSocket
+/// ping. Browser and native stacks answer control pings automatically, so
+/// silence past `HEARTBEAT_DEAD_TIMEOUT` — not a TCP accept — is the only
+/// reliable sign of a peer that vanished without a close frame (suspended
+/// tab, dead network path) and would otherwise hold a connection permit,
+/// and an idle-exit daemon, forever.
+const HEARTBEAT_PING_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_DEAD_TIMEOUT: Duration = Duration::from_secs(75);
 const MAX_HANDSHAKE_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_REPLAY_EVENTS_PER_SESSION: usize = 2048;
@@ -703,9 +711,22 @@ fn handle_connection(
     let (subscriber, kicked) = Subscriber::new(outgoing.clone());
     let subscriber_id = hub.subscribe(&resume_from, subscriber);
 
+    let mut last_inbound = Instant::now();
+    let mut last_ping_sent = Instant::now();
     'connection: while !shutdown.load(Ordering::Acquire) {
         if kicked.try_recv().is_ok() {
             break;
+        }
+        // Probe a silent client so a peer that vanished without a close
+        // frame is evicted rather than holding its connection forever.
+        let now = Instant::now();
+        if now.duration_since(last_inbound) >= HEARTBEAT_PING_INTERVAL
+            && now.duration_since(last_ping_sent) >= HEARTBEAT_PING_INTERVAL
+        {
+            if socket.send(Message::Ping(Vec::new().into())).is_err() {
+                break 'connection;
+            }
+            last_ping_sent = now;
         }
         while let Ok(message) = outgoing_rx.try_recv() {
             if write_json(&mut socket, &message).is_err() {
@@ -713,58 +734,72 @@ fn handle_connection(
             }
         }
         match socket.read() {
-            Ok(Message::Text(text)) => match serde_json::from_str(text.as_ref()) {
-                Ok(ClientMessage::Request(request)) => {
-                    dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
-                }
-                Ok(ClientMessage::Shutdown) => {
-                    if options.allow_shutdown {
-                        write_json(&mut socket, &ServerMessage::ShuttingDown)?;
-                        shutdown.store(true, Ordering::Release);
-                        break;
-                    }
-                    write_json(
-                        &mut socket,
-                        &ServerMessage::Rejected {
-                            message: "daemon shutdown is managed by its service owner".into(),
-                        },
-                    )?;
-                }
-                Ok(ClientMessage::Hello { .. }) => {}
-                Err(error) => {
-                    eprintln!("waku-daemon could not parse a client message: {error}");
-                    // A request the daemon cannot parse — most often a newer
-                    // client naming a provider or command it predates — still
-                    // carries a request id its sender is waiting on. Answer it
-                    // instead of dropping it, so the client reports the
-                    // mismatch instead of waiting on a response that never
-                    // comes. Messages without a recoverable id are still only
-                    // logged.
-                    if let Some(request_id) = unparsed_request_id(text.as_ref()) {
-                        write_json(
-                            &mut socket,
-                            &ServerMessage::Response {
-                                request_id,
-                                outcome: ResponseOutcome::Error {
-                                    error: RpcError {
-                                        message: format!(
-                                            "the daemon could not parse this request: {error}"
-                                        ),
-                                    },
+            Ok(message) => {
+                last_inbound = Instant::now();
+                match message {
+                    Message::Text(text) => match serde_json::from_str(text.as_ref()) {
+                        Ok(ClientMessage::Request(request)) => {
+                            dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
+                        }
+                        Ok(ClientMessage::Shutdown) => {
+                            if options.allow_shutdown {
+                                write_json(&mut socket, &ServerMessage::ShuttingDown)?;
+                                shutdown.store(true, Ordering::Release);
+                                break;
+                            }
+                            write_json(
+                                &mut socket,
+                                &ServerMessage::Rejected {
+                                    message: "daemon shutdown is managed by its service owner"
+                                        .into(),
                                 },
-                            },
-                        )?;
+                            )?;
+                        }
+                        Ok(ClientMessage::Hello { .. }) => {}
+                        Err(error) => {
+                            eprintln!("waku-daemon could not parse a client message: {error}");
+                            // A request the daemon cannot parse — most often a newer
+                            // client naming a provider or command it predates — still
+                            // carries a request id its sender is waiting on. Answer it
+                            // instead of dropping it, so the client reports the
+                            // mismatch instead of waiting on a response that never
+                            // comes. Messages without a recoverable id are still only
+                            // logged.
+                            if let Some(request_id) = unparsed_request_id(text.as_ref()) {
+                                write_json(
+                                    &mut socket,
+                                    &ServerMessage::Response {
+                                        request_id,
+                                        outcome: ResponseOutcome::Error {
+                                            error: RpcError {
+                                                message: format!(
+                                                    "the daemon could not parse this request: {error}"
+                                                ),
+                                            },
+                                        },
+                                    },
+                                )?;
+                            }
+                        }
+                    },
+                    Message::Close(_) => break,
+                    Message::Ping(_) => {
+                        let _ = socket.flush();
                     }
+                    _ => {}
                 }
-            },
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) => {
-                let _ = socket.flush();
             }
-            Ok(_) => {}
             Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {}
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
             Err(error) => return Err(error).context("Waku daemon WebSocket failed"),
+        }
+        // Judged after the read: a long drain can queue a pong that the read
+        // above has just consumed, and that pong is proof of life.
+        if last_inbound.elapsed() >= HEARTBEAT_DEAD_TIMEOUT {
+            eprintln!(
+                "waku-daemon dropped a client that was silent for over {HEARTBEAT_DEAD_TIMEOUT:?}"
+            );
+            break 'connection;
         }
     }
     hub.unsubscribe(subscriber_id);

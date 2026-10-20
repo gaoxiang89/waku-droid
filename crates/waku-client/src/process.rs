@@ -25,6 +25,11 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound between attempts to reach an unreachable remote host.
 const MAX_REMOTE_BACKOFF: Duration = Duration::from_secs(30);
+/// How long the desktop keeps re-dialing its own daemon process before it
+/// concludes the process is hung (alive but not answering) and replaces it
+/// the way a crash is replaced. Generous on purpose: replacing kills live
+/// provider runtimes, so only a daemon unreachable for minutes qualifies.
+const LOCAL_RECONNECT_PATIENCE: Duration = Duration::from_secs(60);
 pub const DEFAULT_EXPOSED_DAEMON_PORT: u16 = 34_123;
 
 /// Desktop-owned launch configuration for the daemon it supervises.
@@ -130,7 +135,11 @@ pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
 }
 
 pub struct DaemonProcess {
-    client: DaemonClient,
+    client: Mutex<DaemonClient>,
+    /// Loopback address and bearer token for re-dialing this daemon after a
+    /// dropped WebSocket; the port is chosen by the daemon at spawn time.
+    address: String,
+    token: String,
     child: Child,
 }
 
@@ -227,7 +236,7 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        let client = match DaemonClient::connect(&client_address, token) {
+        let client = match DaemonClient::connect(&client_address, token.clone()) {
             Ok(client) => client,
             Err(error) => {
                 let _ = child.kill();
@@ -235,11 +244,31 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        Ok(Self { client, child })
+        Ok(Self {
+            client: Mutex::new(client),
+            address: client_address,
+            token,
+            child,
+        })
     }
 
     pub fn client(&self) -> DaemonClient {
-        self.client.clone()
+        self.client.lock().clone()
+    }
+
+    /// Swap in a re-established connection to the same daemon process after
+    /// the previous WebSocket dropped. The caller has verified the target
+    /// still owns this process; the old client is already disconnected.
+    fn replace_client(&self, client: DaemonClient) {
+        *self.client.lock() = client;
+    }
+
+    fn reconnect_address(&self) -> &str {
+        &self.address
+    }
+
+    fn reconnect_token(&self) -> &str {
+        &self.token
     }
 
     fn has_exited(&mut self) -> bool {
@@ -247,7 +276,7 @@ impl DaemonProcess {
     }
 
     fn stop(&mut self) {
-        self.client.shutdown();
+        self.client.lock().shutdown();
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         while Instant::now() < deadline {
             match self.child.try_wait() {
@@ -380,6 +409,19 @@ impl DaemonTarget {
             Self::Remote { client, .. } => client.clone(),
         }
     }
+}
+
+/// A disconnected transport the monitor should re-establish this tick.
+#[derive(Clone)]
+enum DisconnectedTarget {
+    Remote {
+        client: DaemonClient,
+        endpoint: RemoteEndpoint,
+        resume_from: Vec<ReplayCursor>,
+    },
+    Local {
+        client: DaemonClient,
+    },
 }
 
 /// Owns the current daemon and, in development, swaps it after a successful
@@ -617,6 +659,9 @@ fn monitor_daemon(
 ) {
     let mut remote_backoff = REBUILD_POLL_INTERVAL;
     let mut next_remote_attempt = Instant::now();
+    let mut local_backoff = REBUILD_POLL_INTERVAL;
+    let mut next_local_attempt = Instant::now();
+    let mut local_down_since: Option<Instant> = None;
     loop {
         std::thread::sleep(REBUILD_POLL_INTERVAL);
         let Some(inner) = weak_inner.upgrade() else {
@@ -625,57 +670,162 @@ fn monitor_daemon(
         if !inner.running.load(Ordering::Acquire) {
             return;
         }
-        let remote_reconnect = {
+        // Transport liveness is mirrored for every target kind — a local
+        // connection drop is as visible to the UI as a remote one — and a
+        // disconnected transport becomes this tick's reconnection work.
+        let reconnect = {
             let target = inner.target.lock();
-            if let DaemonTarget::Remote { client, .. } = &*target {
-                inner
-                    .transport_down
-                    .store(client.is_disconnected(), Ordering::Release);
-            }
+            let down = target.client().is_disconnected();
+            inner.transport_down.store(down, Ordering::Release);
             match &*target {
-                DaemonTarget::Remote { client, endpoint } if client.is_disconnected() => {
-                    Some((client.clone(), endpoint.clone(), client.last_sequences()))
+                DaemonTarget::Remote { client, endpoint } if down => {
+                    Some(DisconnectedTarget::Remote {
+                        client: client.clone(),
+                        endpoint: endpoint.clone(),
+                        resume_from: client.last_sequences(),
+                    })
                 }
+                DaemonTarget::Local(_) if down => Some(DisconnectedTarget::Local {
+                    client: target.client(),
+                }),
                 _ => None,
             }
         };
-        if let Some((disconnected, endpoint, resume_from)) = remote_reconnect {
-            if Instant::now() < next_remote_attempt {
-                continue;
-            }
-            let _restart = inner.restart.lock();
-            let still_current = matches!(
-                &*inner.target.lock(),
-                DaemonTarget::Remote { client, .. }
-                    if client.same_connection(&disconnected) && client.is_disconnected()
-            );
-            if !still_current {
-                continue;
-            }
-            // The target lock is released here: a bridged reconnect starts
-            // `ssh`, and UI-side `client()` calls must not wait behind it.
-            let (replacement, endpoint) = match endpoint.reconnect(resume_from) {
-                Ok(reconnected) => {
-                    remote_backoff = REBUILD_POLL_INTERVAL;
-                    reconnected
-                }
-                Err(error) => {
-                    eprintln!("could not reconnect to the Waku daemon: {error:#}");
-                    remote_backoff = (remote_backoff * 2).min(MAX_REMOTE_BACKOFF);
-                    next_remote_attempt = Instant::now() + remote_backoff;
-                    continue;
-                }
-            };
-            *inner.target.lock() = DaemonTarget::Remote {
-                client: replacement.clone(),
+        // A healthy tick clears the local re-dial state, so one outage's
+        // backoff and hang patience never bleed into the next one (the
+        // crash path below can replace the daemon without passing through
+        // the re-dial branch that resets them).
+        if reconnect.is_none() {
+            local_backoff = REBUILD_POLL_INTERVAL;
+            next_local_attempt = Instant::now();
+            local_down_since = None;
+        }
+        match reconnect {
+            Some(DisconnectedTarget::Remote {
+                client: disconnected,
                 endpoint,
-            };
-            inner.transport_down.store(false, Ordering::Release);
-            inner
-                .client_updates
-                .lock()
-                .retain(|subscriber| subscriber.send(replacement.clone()).is_ok());
-            continue;
+                resume_from,
+            }) => {
+                if Instant::now() >= next_remote_attempt {
+                    let _restart = inner.restart.lock();
+                    let still_current = matches!(
+                        &*inner.target.lock(),
+                        DaemonTarget::Remote { client, .. }
+                            if client.same_connection(&disconnected) && client.is_disconnected()
+                    );
+                    if still_current {
+                        // The target lock is released here: a bridged reconnect
+                        // starts `ssh`, and UI-side `client()` calls must not
+                        // wait behind it.
+                        match endpoint.reconnect(resume_from) {
+                            Ok((replacement, endpoint)) => {
+                                remote_backoff = REBUILD_POLL_INTERVAL;
+                                *inner.target.lock() = DaemonTarget::Remote {
+                                    client: replacement.clone(),
+                                    endpoint,
+                                };
+                                inner.transport_down.store(false, Ordering::Release);
+                                inner.client_updates.lock().retain(|subscriber| {
+                                    subscriber.send(replacement.clone()).is_ok()
+                                });
+                            }
+                            Err(error) => {
+                                eprintln!("could not reconnect to the Waku daemon: {error:#}");
+                                remote_backoff = (remote_backoff * 2).min(MAX_REMOTE_BACKOFF);
+                                next_remote_attempt = Instant::now() + remote_backoff;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            Some(DisconnectedTarget::Local {
+                client: disconnected,
+            }) if Instant::now() >= next_local_attempt => {
+                // A dropped WebSocket says nothing about the daemon process.
+                // Re-dial the same process so live provider runtimes survive;
+                // the crashed-process path below stays reachable because a
+                // backoff-gated tick matches no arm above and falls through.
+                let _restart = inner.restart.lock();
+                let current = {
+                    let target = inner.target.lock();
+                    match &*target {
+                        DaemonTarget::Local(process)
+                            if process.client().same_connection(&disconnected) =>
+                        {
+                            Some((
+                                process.reconnect_address().to_owned(),
+                                process.reconnect_token().to_owned(),
+                                disconnected.last_sequences(),
+                            ))
+                        }
+                        _ => None,
+                    }
+                };
+                match current {
+                    None => {
+                        // Another path already replaced the target.
+                        local_backoff = REBUILD_POLL_INTERVAL;
+                        next_local_attempt = Instant::now();
+                        local_down_since = None;
+                    }
+                    Some((address, token, resume_from)) => {
+                        local_down_since.get_or_insert_with(Instant::now);
+                        if local_down_since
+                            .is_some_and(|since| since.elapsed() >= LOCAL_RECONNECT_PATIENCE)
+                        {
+                            // The process lives but stopped answering; treat
+                            // it like a crash and replace it. Killing live
+                            // runtimes is deliberate: a daemon this
+                            // unreachable could not serve them anyway.
+                            local_backoff = REBUILD_POLL_INTERVAL;
+                            next_local_attempt = Instant::now();
+                            local_down_since = None;
+                            if let Some(executable) = inner.executable.as_ref()
+                                && let Some(exposure) = inner.exposure.lock().clone()
+                                && let Err(error) =
+                                    replace_local_daemon(&inner, executable, &exposure)
+                            {
+                                eprintln!("could not restart the hung Waku daemon: {error:#}");
+                            }
+                        } else {
+                            // The target lock is released here: dialing a
+                            // wedged daemon can block for seconds, and
+                            // UI-side `client()` calls must not wait.
+                            match DaemonClient::connect_with_resume(&address, token, resume_from) {
+                                Ok(replacement) => {
+                                    local_backoff = REBUILD_POLL_INTERVAL;
+                                    next_local_attempt = Instant::now();
+                                    local_down_since = None;
+                                    let mut target = inner.target.lock();
+                                    let replaced = match &mut *target {
+                                        DaemonTarget::Local(process)
+                                            if process.client().same_connection(&disconnected) =>
+                                        {
+                                            process.replace_client(replacement.clone());
+                                            true
+                                        }
+                                        _ => false,
+                                    };
+                                    drop(target);
+                                    if replaced {
+                                        inner.transport_down.store(false, Ordering::Release);
+                                        inner.client_updates.lock().retain(|subscriber| {
+                                            subscriber.send(replacement.clone()).is_ok()
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!("could not reconnect to the Waku daemon: {error:#}");
+                                    local_backoff = (local_backoff * 2).min(MAX_REMOTE_BACKOFF);
+                                    next_local_attempt = Instant::now() + local_backoff;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         let process_exited = match &mut *inner.target.lock() {
             DaemonTarget::Local(process) => process.has_exited(),

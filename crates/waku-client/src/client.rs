@@ -3,7 +3,7 @@ use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -22,6 +22,18 @@ use waku_protocol::{
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_BUFFERED_EVENTS_PER_RUNTIME: usize = 4096;
+/// A write that makes no progress for this long means the daemon stopped
+/// reading. Without a deadline, a full TCP buffer would block the socket
+/// thread — which owns reads as well — and stall the whole client.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// An otherwise-idle daemon is probed with a WebSocket ping so a silently
+/// dead path (sleep/wake, network change) is detected instead of waiting
+/// for a request to time out.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+/// Nothing at all from the daemon for this long means it is unreachable.
+/// Must exceed `HEARTBEAT_INTERVAL` by enough margin that a busy daemon's
+/// pong is never mistaken for silence.
+const HEARTBEAT_DEAD_TIMEOUT: Duration = Duration::from_secs(75);
 
 enum Outgoing {
     Message(ClientMessage),
@@ -36,6 +48,8 @@ struct ClientInner {
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
+    /// Why the current or most recent connection ended, for diagnostics.
+    disconnect_reason: Mutex<Option<String>>,
     daemon_version: String,
 }
 
@@ -79,7 +93,11 @@ impl DaemonClient {
         let (mut socket, _) =
             tungstenite::client::connect_with_config(url.as_str(), Some(config), 3)
                 .context("could not connect to Waku daemon")?;
-        set_client_read_timeout(&mut socket, Some(Duration::from_secs(5)))?;
+        set_client_timeouts(
+            &mut socket,
+            Some(Duration::from_secs(5)),
+            Some(WRITE_STALL_TIMEOUT),
+        )?;
         write_json(
             &mut socket,
             &ClientMessage::Hello {
@@ -103,7 +121,11 @@ impl DaemonClient {
             ServerMessage::Rejected { message } => bail!("daemon rejected connection: {message}"),
             other => bail!("daemon sent an invalid handshake response: {other:?}"),
         };
-        set_client_read_timeout(&mut socket, Some(READ_POLL_INTERVAL))?;
+        set_client_timeouts(
+            &mut socket,
+            Some(READ_POLL_INTERVAL),
+            Some(WRITE_STALL_TIMEOUT),
+        )?;
 
         let (outgoing, outgoing_rx) = unbounded();
         let inner = Arc::new(ClientInner {
@@ -114,6 +136,7 @@ impl DaemonClient {
             task_state_subscribers: Mutex::new(Vec::new()),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
+            disconnect_reason: Mutex::new(None),
             daemon_version,
         });
         let thread_inner = inner.clone();
@@ -151,6 +174,12 @@ impl DaemonClient {
 
     pub fn is_disconnected(&self) -> bool {
         self.inner.disconnected.load(Ordering::Acquire)
+    }
+
+    /// Why the current or most recent connection ended, when the socket
+    /// thread has already observed it. Cleared only by using a new client.
+    pub fn disconnect_reason(&self) -> Option<String> {
+        self.inner.disconnect_reason.lock().clone()
     }
 
     /// The release version the daemon announced in its handshake.
@@ -265,94 +294,137 @@ fn run_client(
     outgoing: Receiver<Outgoing>,
     inner: Arc<ClientInner>,
 ) {
+    let mut last_inbound = Instant::now();
+    let mut last_ping_sent = Instant::now();
+    // Set by every exit path below before the connection is torn down.
+    let close_reason: String;
     'connection: loop {
+        // Probe a silent daemon so a dead path is discovered while idle
+        // instead of by a request timing out minutes later.
+        let now = Instant::now();
+        if now.duration_since(last_inbound) >= HEARTBEAT_INTERVAL
+            && now.duration_since(last_ping_sent) >= HEARTBEAT_INTERVAL
+        {
+            if socket.send(Message::Ping(Vec::new().into())).is_err() {
+                close_reason = "the daemon stopped accepting writes".into();
+                break 'connection;
+            }
+            last_ping_sent = now;
+        }
         while let Ok(message) = outgoing.try_recv() {
             match message {
                 Outgoing::Message(message) => {
-                    if write_json(&mut socket, &message).is_err() {
+                    if let Err(error) = write_json(&mut socket, &message) {
+                        close_reason = format!("a write to the daemon failed: {error}");
                         break 'connection;
                     }
                 }
                 Outgoing::Shutdown => {
                     let _ = write_json(&mut socket, &ClientMessage::Shutdown);
                     let _ = socket.flush();
+                    close_reason = "the desktop shut the daemon connection down".into();
                     break 'connection;
                 }
             }
         }
 
         match socket.read() {
-            Ok(Message::Text(text)) => {
-                let Ok(message) = serde_json::from_str::<ServerMessage>(text.as_ref()) else {
-                    continue;
-                };
+            Ok(message) => {
+                last_inbound = Instant::now();
                 match message {
-                    ServerMessage::Response {
-                        request_id,
-                        outcome,
-                    } => {
-                        if let Some(pending) = inner.pending.lock().remove(&request_id) {
-                            let result = match outcome {
-                                ResponseOutcome::Ok { payload } => Ok(payload),
-                                ResponseOutcome::Error { error } => Err(error),
-                            };
-                            let _ = pending.send(result);
-                        }
-                    }
-                    ServerMessage::Event(event) => {
-                        let should_deliver = {
-                            let mut sequences = inner.last_sequences.lock();
-                            let previous = sequences
-                                .entry((event.session_id, event.runtime_id))
-                                .or_insert(LastSequence {
-                                    epoch: event.epoch,
-                                    sequence: 0,
-                                });
-                            if previous.epoch == event.epoch && event.sequence <= previous.sequence
-                            {
-                                false
-                            } else {
-                                previous.epoch = event.epoch;
-                                previous.sequence = event.sequence;
-                                true
-                            }
+                    Message::Text(text) => {
+                        let Ok(message) = serde_json::from_str::<ServerMessage>(text.as_ref())
+                        else {
+                            continue;
                         };
-                        if should_deliver {
-                            let key = (event.session_id, event.runtime_id);
-                            let sessions = inner.sessions.lock();
-                            if let Some(events) = sessions.get(&key) {
-                                let _ = events.send(event);
-                            } else {
-                                let mut pending = inner.pending_events.lock();
-                                let buffered = pending.entry(key).or_default();
-                                buffered.push_back(event);
-                                while buffered.len() > MAX_BUFFERED_EVENTS_PER_RUNTIME {
-                                    buffered.pop_front();
+                        match message {
+                            ServerMessage::Response {
+                                request_id,
+                                outcome,
+                            } => {
+                                if let Some(pending) = inner.pending.lock().remove(&request_id) {
+                                    let result = match outcome {
+                                        ResponseOutcome::Ok { payload } => Ok(payload),
+                                        ResponseOutcome::Error { error } => Err(error),
+                                    };
+                                    let _ = pending.send(result);
                                 }
                             }
+                            ServerMessage::Event(event) => {
+                                let should_deliver = {
+                                    let mut sequences = inner.last_sequences.lock();
+                                    let previous = sequences
+                                        .entry((event.session_id, event.runtime_id))
+                                        .or_insert(LastSequence {
+                                            epoch: event.epoch,
+                                            sequence: 0,
+                                        });
+                                    if previous.epoch == event.epoch
+                                        && event.sequence <= previous.sequence
+                                    {
+                                        false
+                                    } else {
+                                        previous.epoch = event.epoch;
+                                        previous.sequence = event.sequence;
+                                        true
+                                    }
+                                };
+                                if should_deliver {
+                                    let key = (event.session_id, event.runtime_id);
+                                    let sessions = inner.sessions.lock();
+                                    if let Some(events) = sessions.get(&key) {
+                                        let _ = events.send(event);
+                                    } else {
+                                        let mut pending = inner.pending_events.lock();
+                                        let buffered = pending.entry(key).or_default();
+                                        buffered.push_back(event);
+                                        while buffered.len() > MAX_BUFFERED_EVENTS_PER_RUNTIME {
+                                            buffered.pop_front();
+                                        }
+                                    }
+                                }
+                            }
+                            ServerMessage::TaskStateChanged { revision } => {
+                                inner
+                                    .task_state_subscribers
+                                    .lock()
+                                    .retain(|subscriber| subscriber.send(revision).is_ok());
+                            }
+                            ServerMessage::ShuttingDown => {
+                                close_reason = "the daemon is shutting down".into();
+                                break;
+                            }
+                            ServerMessage::Hello { .. } | ServerMessage::Rejected { .. } => {}
                         }
                     }
-                    ServerMessage::TaskStateChanged { revision } => {
-                        inner
-                            .task_state_subscribers
-                            .lock()
-                            .retain(|subscriber| subscriber.send(revision).is_ok());
+                    Message::Close(_) => {
+                        close_reason = "the daemon closed the connection".into();
+                        break;
                     }
-                    ServerMessage::ShuttingDown => break,
-                    ServerMessage::Hello { .. } | ServerMessage::Rejected { .. } => {}
+                    Message::Ping(_) => {
+                        let _ = socket.flush();
+                    }
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) => {
-                let _ = socket.flush();
-            }
-            Ok(_) => {}
             Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {}
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
-            Err(_) => break,
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                close_reason = "the daemon connection was closed".into();
+                break;
+            }
+            Err(error) => {
+                close_reason = format!("the daemon connection failed: {error}");
+                break;
+            }
+        }
+        if last_inbound.elapsed() >= HEARTBEAT_DEAD_TIMEOUT {
+            close_reason = format!("the daemon was silent for over {HEARTBEAT_DEAD_TIMEOUT:?}");
+            break 'connection;
         }
     }
 
+    eprintln!("Waku daemon connection lost: {close_reason}");
+    inner.disconnect_reason.lock().replace(close_reason);
     inner.disconnected.store(true, Ordering::Release);
     let pending = std::mem::take(&mut *inner.pending.lock());
     for (_, response) in pending {
@@ -369,13 +441,20 @@ fn run_client(
     inner.task_state_subscribers.lock().clear();
 }
 
-fn set_client_read_timeout(
+fn set_client_timeouts(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    timeout: Option<Duration>,
+    read: Option<Duration>,
+    write: Option<Duration>,
 ) -> io::Result<()> {
     match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        MaybeTlsStream::Rustls(stream) => stream.sock.set_read_timeout(timeout),
+        MaybeTlsStream::Plain(stream) => {
+            stream.set_read_timeout(read)?;
+            stream.set_write_timeout(write)
+        }
+        MaybeTlsStream::Rustls(stream) => {
+            stream.sock.set_read_timeout(read)?;
+            stream.sock.set_write_timeout(write)
+        }
         #[allow(unreachable_patterns)]
         _ => Ok(()),
     }
