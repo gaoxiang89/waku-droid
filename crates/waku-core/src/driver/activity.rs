@@ -91,6 +91,37 @@ mod tests {
             Some("Verify Grok bridge")
         );
     }
+
+    #[test]
+    fn acp_content_envelopes_unwrap_to_their_text() {
+        let output = serde_json::json!([
+            {"type": "content", "content": {"type": "text", "text": "a.rs\nb.rs"}},
+            {"type": "content", "content": {"type": "image", "data": "AAAA", "mimeType": "image/png"}},
+            {"type": "content", "content": {"type": "text", "text": "done"}}
+        ]);
+        assert_eq!(
+            format_output(&output).as_deref(),
+            Some("a.rs\nb.rs\n\ndone")
+        );
+    }
+
+    #[test]
+    fn legacy_pretty_printed_envelopes_recover_their_text() {
+        let first = format_json(&serde_json::json!(
+            {"type": "content", "content": {"type": "text", "text": ".\\a.rs\n.\\b.rs"}}
+        ))
+        .unwrap();
+        let second = format_json(&serde_json::json!(
+            {"type": "content", "content": {"type": "text", "text": "2 files"}}
+        ))
+        .unwrap();
+        assert_eq!(
+            unwrap_legacy_output(&format!("{first}\n\n{second}")).as_deref(),
+            Some(".\\a.rs\n.\\b.rs\n\n2 files")
+        );
+        assert_eq!(unwrap_legacy_output("plain output"), None);
+        assert_eq!(unwrap_legacy_output("{\n  \"exit_code\": 0\n}"), None);
+    }
 }
 
 pub(super) fn format_json(value: &Value) -> Option<String> {
@@ -99,8 +130,36 @@ pub(super) fn format_json(value: &Value) -> Option<String> {
         .and_then(non_empty_text)
 }
 
+/// Transcripts stored before ACP tool content was unwrapped hold each wire
+/// envelope (`{"type": "content", "content": {"type": "text", ...}}`) as pretty
+/// JSON, one per item. Recovers the text they carried; `None` leaves the output
+/// as it is.
+pub(crate) fn unwrap_legacy_output(output: &str) -> Option<String> {
+    let trimmed = output.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('['))
+        || !output.contains("\"type\": \"content\"")
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for value in serde_json::Deserializer::from_str(output).into_iter::<Value>() {
+        parts.push(format_output(&value.ok()?)?);
+    }
+    let text = parts.join("\n\n");
+    (!text.is_empty() && text != output).then_some(text)
+}
+
 fn format_output(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
+        return non_empty_text(text.to_owned());
+    }
+    // Images surface through `image_urls`, never as a base64 dump.
+    if is_image_item(value) {
+        return None;
+    }
+    if value.get("type").and_then(Value::as_str) == Some("text")
+        && let Some(text) = value.get("text").and_then(Value::as_str)
+    {
         return non_empty_text(text.to_owned());
     }
     if let Some(structured) = value
@@ -115,15 +174,9 @@ fn format_output(value: &Value) -> Option<String> {
     if let Some(items) = value.as_array() {
         let text = items
             .iter()
-            .filter(|item| !is_image_item(item))
-            .filter_map(|item| {
-                item.as_str().map(str::to_owned).or_else(|| {
-                    (item.get("type").and_then(Value::as_str) == Some("text"))
-                        .then(|| item.get("text").and_then(Value::as_str).map(str::to_owned))
-                        .flatten()
-                        .or_else(|| format_json(item))
-                })
-            })
+            // ACP wraps each item as `{"type": "content", "content": {...}}`;
+            // recursing unwraps that envelope like any other `content` field.
+            .filter_map(format_output)
             .collect::<Vec<_>>()
             .join("\n\n");
         return non_empty_text(text);

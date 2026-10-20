@@ -1903,24 +1903,34 @@ fn table_row(
     row
 }
 
-/// Content-proportional column widths as fractions of the table, floored so a
-/// narrow column stays readable.
+/// Column widths as fractions of the table, laid out the way a browser sizes
+/// an auto table: each column first gets its longest unbreakable piece (a path
+/// in code, a word), and the room left is shared by how much longer its
+/// longest cell runs. Floored so a narrow column stays readable.
 fn column_widths(
     header: &[Vec<InlineRun>],
     rows: &[Vec<Vec<InlineRun>>],
     columns: usize,
 ) -> Vec<f32> {
     const MIN_FRACTION_SCALE: f32 = 0.55;
+    // Widths are in units of one average Latin character of table text. A
+    // transcript table is at most `CONTENT_MAX_WIDTH` (720px) wide, which
+    // measures about this many units at the body text size.
+    const TABLE_UNITS: f32 = 72.0;
+    // Horizontal cell padding, in the same units.
+    const CELL_PADDING_UNITS: f32 = 2.0;
+    // A URL or long identifier should wrap rather than starve its neighbours.
+    const MAX_ATOM_UNITS: f32 = 28.0;
 
     let mut content = vec![0.0f32; columns];
+    let mut atom = vec![0.0f32; columns];
     let mut note = |index: usize, cell: &Vec<InlineRun>| {
-        if let Some(slot) = content.get_mut(index) {
-            let length = cell
-                .iter()
-                .map(|run| run.text.chars().count())
-                .sum::<usize>();
-            *slot = slot.max(length as f32);
+        if index >= columns {
+            return;
         }
+        let (length, longest) = cell_measure(cell);
+        content[index] = content[index].max(length);
+        atom[index] = atom[index].max(longest.min(MAX_ATOM_UNITS));
     };
     for (index, cell) in header.iter().enumerate() {
         note(index, cell);
@@ -1936,6 +1946,28 @@ fn column_widths(
     if content.iter().sum::<f32>() <= 0.0 {
         return vec![even; columns];
     }
+
+    let max = content
+        .iter()
+        .map(|units| units + CELL_PADDING_UNITS)
+        .collect::<Vec<_>>();
+    let min = atom
+        .iter()
+        .zip(&content)
+        .map(|(atom, content)| atom.min(*content) + CELL_PADDING_UNITS)
+        .collect::<Vec<_>>();
+    let (min_total, max_total) = (min.iter().sum::<f32>(), max.iter().sum::<f32>());
+    let content = if max_total <= TABLE_UNITS || min_total >= TABLE_UNITS {
+        // Everything fits on one line, or not even the unbreakable pieces do:
+        // either way, proportional is the best there is.
+        if max_total <= TABLE_UNITS { max } else { min }
+    } else {
+        let slack = max_total - min_total;
+        min.iter()
+            .zip(&max)
+            .map(|(min, max)| min + (TABLE_UNITS - min_total) * (max - min) / slack)
+            .collect()
+    };
 
     // Water-fill rather than clamp-then-renormalise: renormalising after a
     // clamp erodes the very floor it just applied. Each pass pins whatever fell
@@ -1975,6 +2007,56 @@ fn column_widths(
         }
     }
     widths
+}
+
+/// A cell's single-line width and its longest unbreakable piece, in units of
+/// one average Latin character. Code breaks only at whitespace, so a path
+/// stays whole; prose also breaks around each CJK character.
+fn cell_measure(cell: &[InlineRun]) -> (f32, f32) {
+    const CODE_UNITS: f32 = 1.15;
+    const WIDE_UNITS: f32 = 1.8;
+
+    let (mut length, mut longest, mut piece) = (0.0f32, 0.0f32, 0.0f32);
+    for run in cell {
+        for c in run.text.chars() {
+            if c.is_whitespace() {
+                length += 1.0;
+                longest = longest.max(piece);
+                piece = 0.0;
+                continue;
+            }
+            let wide = is_wide_char(c);
+            let units = if wide {
+                WIDE_UNITS
+            } else if run.style.code {
+                CODE_UNITS
+            } else {
+                1.0
+            };
+            length += units;
+            if wide && !run.style.code {
+                longest = longest.max(piece).max(units);
+                piece = 0.0;
+            } else {
+                piece += units;
+            }
+        }
+    }
+    (length, longest.max(piece))
+}
+
+fn is_wide_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{1100}'..='\u{115F}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF00}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}'
+            | '\u{20000}'..='\u{3FFFD}'
+    )
 }
 
 #[cfg(test)]
@@ -2307,12 +2389,57 @@ mod tests {
         );
         assert!((widths.iter().sum::<f32>() - 1.0).abs() < 1e-4);
 
-        // A column that is merely narrow, not starved, stays proportional.
+        // A column that is merely narrow, not starved, stays proportional
+        // (padding included: 6 against 8).
         let balanced = column_widths(&[runs_of("aaaa"), runs_of("bbbbbb")], &[], 2);
-        assert!((balanced[0] - 0.4).abs() < 1e-3, "{balanced:?}");
+        assert!((balanced[0] - 6.0 / 14.0).abs() < 1e-3, "{balanced:?}");
 
         // An empty table falls back to even columns.
         let even = column_widths(&[], &[], 3);
         assert!(even.iter().all(|width| (width - 1.0 / 3.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn column_widths_keep_a_code_path_on_one_line() {
+        let header = vec![runs_of("传输"), runs_of("文件"), runs_of("覆盖的 provider")];
+        let rows = [
+            (
+                "Codex app-server(JSON-RPC over stdio) with resume and approvals",
+                "`driver/codex.rs`",
+                "Codex CLI",
+            ),
+            (
+                "OpenCode 后台服务(HTTP + SSE)",
+                "`driver/opencode.rs`",
+                "OpenCode",
+            ),
+            (
+                "ACP(JSON-RPC over stdio)",
+                "`driver/acp.rs`",
+                "Cursor、Fx、Grok、Kimi、Factory Droid",
+            ),
+        ]
+        .map(|(a, b, c)| vec![runs_of(a), runs_of(b), runs_of(c)]);
+        let widths = column_widths(&header, &rows, 3);
+        // `driver/opencode.rs` is 18 code characters plus cell padding.
+        let path_units = 18.0 * 1.15 + 2.0;
+        assert!(
+            widths[1] * 72.0 >= path_units - 1e-3,
+            "the path column fits its longest path: {widths:?}"
+        );
+        assert!(
+            widths[0] > widths[2],
+            "the longest prose still gets the most room"
+        );
+        assert!((widths.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cell_measure_counts_cjk_wide_and_breaks_around_it() {
+        let (length, longest) = cell_measure(&runs_of("你好 abc"));
+        assert!((length - (1.8 * 2.0 + 1.0 + 3.0)).abs() < 1e-4);
+        assert!((longest - 3.0).abs() < 1e-4);
+        let (_, path) = cell_measure(&runs_of("`a/b.rs`"));
+        assert!((path - 6.0 * 1.15).abs() < 1e-4, "code stays whole");
     }
 }

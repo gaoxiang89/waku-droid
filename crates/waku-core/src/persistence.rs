@@ -31,7 +31,7 @@ use crate::i18n::AppLanguage;
 use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
     AgentSession, FavoriteModel, Message, MessageAttachment, MessageRole, Project, ProviderKind,
-    RuntimeMode, SessionWorkspace,
+    RuntimeMode, SessionWorkspace, TranscriptBlock,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
@@ -677,6 +677,22 @@ fn externalize_blobs<'a>(
     }
 }
 
+/// Recovers readable tool output from transcripts stored while ACP envelopes
+/// were still kept verbatim. Runs on hydrate, so rendering never parses JSON.
+fn unwrap_legacy_tool_output(blocks: &mut [TranscriptBlock]) {
+    for block in blocks {
+        for activity in &mut block.activities {
+            if let Some(output) = activity
+                .output
+                .as_deref()
+                .and_then(crate::driver::unwrap_legacy_output)
+            {
+                activity.output = Some(output);
+            }
+        }
+    }
+}
+
 /// Every blob reference named by any stored session.
 ///
 /// Read from the database rather than from memory: a session that has not been
@@ -1292,6 +1308,7 @@ impl StateStore {
         };
         let stored = serde_json::from_str::<AgentSession>(&data).map_err(to_io_error)?;
         session.transcript_blocks = stored.transcript_blocks;
+        unwrap_legacy_tool_output(&mut session.transcript_blocks);
         session.turns = stored.turns;
         session.queued_messages = stored.queued_messages;
         session.workspace = stored.workspace;
