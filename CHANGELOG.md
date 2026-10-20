@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.24]
+
+- Stream file downloads from the right panel in chunks instead of one whole-file message: no size cap remains, downloads show a live card with progress and a cancel button in the notification area, and canceled or failed transfers remove their partial file — all unchanged over WSL and SSH bridges
+- Scope bottom panel terminal tabs to each session: switching tasks parks their terminals with the processes alive and restores them on return, instead of one window-global list
+
 ## [0.1.23]
 
 - Lead activity groups with reasoning, stream thoughts inline, and fold intermediate tool noise during active turns
