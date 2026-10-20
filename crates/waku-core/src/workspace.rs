@@ -100,7 +100,7 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => {
                         return Err(anyhow!(error))
-                            .with_context(|| format!("could not read file {}", path.display()))
+                            .with_context(|| format!("could not read file {}", path.display()));
                     }
                 }
             }
@@ -736,8 +736,9 @@ mod tests {
                 panic!("unexpected workspace response")
             };
             assert_eq!(total_bytes, bytes.len() as u64);
-            let chunk =
-                base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+            let chunk = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
             if chunk.is_empty() {
                 break;
             }
@@ -760,10 +761,12 @@ mod tests {
         else {
             panic!("unexpected workspace response")
         };
-        assert!(base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap()
-            .is_empty());
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap()
+                .is_empty()
+        );
         let WorkspaceResult::FileChunk {
             bytes: encoded,
             total_bytes,
@@ -778,16 +781,20 @@ mod tests {
             panic!("unexpected workspace response")
         };
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
             &bytes[bytes.len() - 10..]
         );
-        assert!(execute(WorkspaceOperation::ReadFileChunk {
-            root: root.clone(),
-            relative_path: PathBuf::from("missing.bin"),
-            offset: 0,
-            length: 1021,
-        })
-        .is_err());
+        assert!(
+            execute(WorkspaceOperation::ReadFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("missing.bin"),
+                offset: 0,
+                length: 1021,
+            })
+            .is_err()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -812,7 +819,9 @@ mod tests {
             panic!("unexpected workspace response")
         };
         assert_eq!(
-            base64::engine::general_purpose::STANDARD.decode(encoded).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
             [0u8; 128]
         );
 
@@ -854,13 +863,18 @@ mod tests {
         // replacing it, and traversal outside the root never reaches the FS.
         fs::write(root.join("occupied.txt"), "occupied").unwrap();
         fs::write(root.join("other.txt"), "other").unwrap();
-        assert!(execute(WorkspaceOperation::RenamePath {
-            root: root.clone(),
-            from_relative_path: PathBuf::from("other.txt"),
-            to_relative_path: PathBuf::from("occupied.txt"),
-        })
-        .is_err());
-        assert_eq!(fs::read_to_string(root.join("occupied.txt")).unwrap(), "occupied");
+        assert!(
+            execute(WorkspaceOperation::RenamePath {
+                root: root.clone(),
+                from_relative_path: PathBuf::from("other.txt"),
+                to_relative_path: PathBuf::from("occupied.txt"),
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("occupied.txt")).unwrap(),
+            "occupied"
+        );
         for operation in [
             WorkspaceOperation::RenamePath {
                 root: root.clone(),
