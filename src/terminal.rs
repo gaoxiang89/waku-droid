@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,12 +22,13 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontFallbacks,
-    FontStyle, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextRun,
-    UnderlineStyle, Window, canvas, div, font, prelude::FluentBuilder, px, rgb,
+    App, AppContext, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
+    FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText,
+    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font,
+    prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -98,6 +100,8 @@ enum TerminalUiEvent {
 enum PtyInput {
     Local(EventLoopSender),
     Remote(Arc<RemoteTerminal>),
+    #[cfg(test)]
+    Test(Sender<Vec<u8>>),
 }
 
 impl PtyInput {
@@ -107,6 +111,8 @@ impl PtyInput {
                 let _ = sender.send(Msg::Input(bytes));
             }
             Self::Remote(remote) => remote.write(bytes.into_owned()),
+            #[cfg(test)]
+            Self::Test(sender) => sender.send(bytes.into_owned()).unwrap(),
         }
     }
 
@@ -116,6 +122,8 @@ impl PtyInput {
                 let _ = sender.send(Msg::Resize(size));
             }
             Self::Remote(remote) => remote.resize(size.num_cols, size.num_lines),
+            #[cfg(test)]
+            Self::Test(_) => {}
         }
     }
 
@@ -125,6 +133,8 @@ impl PtyInput {
                 let _ = sender.send(Msg::Shutdown);
             }
             Self::Remote(remote) => remote.close(),
+            #[cfg(test)]
+            Self::Test(_) => {}
         }
     }
 }
@@ -680,6 +690,8 @@ impl TerminalSession {
         TerminalSnapshot {
             rows: rendered_rows,
             outline_cursor,
+            cursor_position: ((0..rows as i32).contains(&cursor_row) && cursor_column < columns)
+                .then_some((cursor_row as usize, cursor_column)),
         }
     }
 }
@@ -778,6 +790,12 @@ struct TerminalRow {
 struct TerminalSnapshot {
     rows: Vec<TerminalRow>,
     outline_cursor: Option<(usize, usize)>,
+    cursor_position: Option<(usize, usize)>,
+}
+
+struct TerminalComposition {
+    text: String,
+    selection: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -899,6 +917,8 @@ pub struct TerminalView {
     measured_cell_width: Option<f32>,
     scrollbar_state: Rc<ScrollbarState>,
     grid_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    cursor_position: Option<(usize, usize)>,
+    composition: Option<TerminalComposition>,
     selecting: bool,
     hovered_link: Option<TerminalLink>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
@@ -971,6 +991,8 @@ impl TerminalView {
             measured_cell_width: None,
             scrollbar_state: ScrollbarState::new(),
             grid_bounds: Rc::new(Cell::new(None)),
+            cursor_position: None,
+            composition: None,
             selecting: false,
             hovered_link: None,
             cursor_blink,
@@ -1045,6 +1067,12 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.pause_cursor_blink(cx);
         let keystroke = &event.keystroke;
+        // The platform owns candidate navigation/confirmation while composing.
+        // Printable input must also reach its text handler, otherwise dead keys
+        // and IMEs are bypassed (or ordinary characters get sent twice).
+        if self.composition.is_some() || terminal_uses_text_input(event) {
+            return;
+        }
         // The bottom panel's terminals leave ctrl+pageup/pagedown unhandled so
         // the panel's tab-cycle key bindings (bound in the `Terminal` context)
         // receive them instead of the shell.
@@ -1339,7 +1367,9 @@ impl TerminalView {
                 terminal.update_cursor_blinking(window, cx);
             }),
             cx.on_blur(&focus_handle, window, |terminal, window, cx| {
+                terminal.composition = None;
                 terminal.update_cursor_blinking(window, cx);
+                cx.notify();
             }),
         ]);
         self.update_cursor_blinking(window, cx);
@@ -1364,6 +1394,120 @@ impl TerminalView {
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        // The shell owns committed text; the terminal has no editable document.
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self
+                .composition
+                .as_ref()
+                .map_or(0..0, |ime| ime.selection.clone()),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.composition
+            .as_ref()
+            .map(|ime| 0..ime.text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.composition = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composition = None;
+        self.pause_cursor_blink(cx);
+        if !text.is_empty()
+            && let Some(session) = &self.session
+        {
+            session.term.lock().selection = None;
+            session.write(text.as_bytes().to_vec());
+            session.dirty.store(true, Ordering::Release);
+        }
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Pre-edit stays local until the IME commits it. Sending pinyin to
+        // the PTY here would let the shell execute unconfirmed input.
+        self.composition = (!text.is_empty()).then(|| {
+            let len = text.encode_utf16().count();
+            TerminalComposition {
+                text: text.to_owned(),
+                selection: selection
+                    .map_or(len..len, |range| range.start.min(len)..range.end.min(len)),
+            }
+        });
+        self.pause_cursor_blink(cx);
+        window.invalidate_character_coordinates();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let grid = self.grid_bounds.get()?;
+        let (row, column) = self.cursor_position?;
+        Some(Bounds::new(
+            grid.origin
+                + gpui::point(
+                    px((column + range.start) as f32 * self.cell_width()),
+                    px(row as f32 * TERMINAL_CELL_HEIGHT),
+                ),
+            gpui::size(px(self.cell_width()), px(TERMINAL_CELL_HEIGHT)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.session.is_some() && !self.exited
     }
 }
 
@@ -1419,6 +1563,9 @@ impl Render for TerminalView {
             .session
             .as_ref()
             .map(|session| session.snapshot(theme, selection_color, cursor_style, hovered_link));
+        self.cursor_position = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.cursor_position);
         let title = if self.title.trim().is_empty() {
             tr!("right_panel.terminal")
         } else {
@@ -1455,6 +1602,7 @@ impl Render for TerminalView {
             let TerminalSnapshot {
                 rows: snapshot_rows,
                 outline_cursor,
+                cursor_position,
             } = snapshot;
             for row in snapshot_rows {
                 let runs = row
@@ -1508,6 +1656,34 @@ impl Render for TerminalView {
                         .border_color(theme.text),
                 );
             }
+            if terminal_focused
+                && let Some(ime) = &self.composition
+                && let Some((row, column)) = cursor_position
+            {
+                screen = screen.child(
+                    div()
+                        .absolute()
+                        .left(px(column as f32 * cell_width))
+                        .top(px(row as f32 * TERMINAL_CELL_HEIGHT))
+                        .h(px(TERMINAL_CELL_HEIGHT))
+                        .bg(theme.terminal)
+                        .text_size(px(TERMINAL_FONT_SIZE))
+                        .line_height(px(TERMINAL_CELL_HEIGHT))
+                        .whitespace_nowrap()
+                        .child(StyledText::new(ime.text.clone()).with_runs(vec![TextRun {
+                            len: ime.text.len(),
+                            font: terminal_font(),
+                            color: theme.text,
+                            background_color: None,
+                            underline: Some(UnderlineStyle {
+                                thickness: px(1.0),
+                                color: Some(theme.text),
+                                wavy: false,
+                            }),
+                            strikethrough: None,
+                        }])),
+                );
+            }
         } else {
             screen = screen.child(
                 div()
@@ -1528,10 +1704,18 @@ impl Render for TerminalView {
         }
 
         let grid_bounds = self.grid_bounds.clone();
+        let input_view = cx.entity();
+        let input_focus = self.focus_handle.clone();
         screen = screen.child(
             canvas(
                 move |bounds, _, _| grid_bounds.set(Some(bounds)),
-                |_, _, _, _| {},
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &input_focus,
+                        ElementInputHandler::new(bounds, input_view),
+                        cx,
+                    );
+                },
             )
             .absolute()
             .inset_0(),
@@ -1874,6 +2058,19 @@ fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {
     }
 }
 
+fn terminal_uses_text_input(event: &KeyDownEvent) -> bool {
+    let modifiers = event.keystroke.modifiers;
+    event.prefer_character_input
+        || (event
+            .keystroke
+            .key_char
+            .as_ref()
+            .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control))
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform)
+}
+
 fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let modifiers = keystroke.modifiers;
     let key = keystroke.key.as_str();
@@ -2089,6 +2286,230 @@ mod tests {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
     use gpui::{Modifiers, point, size};
+
+    #[test]
+    fn printable_keys_use_platform_text_input_but_terminal_controls_do_not() {
+        let event = |key_name, text, modifiers, prefer_character_input| KeyDownEvent {
+            keystroke: key(key_name, text, modifiers),
+            is_held: false,
+            prefer_character_input,
+        };
+        assert!(terminal_uses_text_input(&event(
+            "a",
+            Some("a"),
+            Modifiers::default(),
+            false
+        )));
+        assert!(terminal_uses_text_input(&event(
+            "space",
+            Some(" "),
+            Modifiers::default(),
+            false
+        )));
+        assert!(terminal_uses_text_input(&event(
+            "e",
+            Some("€"),
+            Modifiers {
+                control: true,
+                alt: true,
+                ..Default::default()
+            },
+            true
+        )));
+        for key_name in ["enter", "backspace", "escape", "up", "tab"] {
+            assert!(!terminal_uses_text_input(&event(
+                key_name,
+                None,
+                Modifiers::default(),
+                false
+            )));
+        }
+        // macOS supplies key_char for Return/Tab too; keep their terminal
+        // sequences (CR and Shift-Tab) instead of sending text input.
+        assert!(!terminal_uses_text_input(&event(
+            "enter",
+            Some("\n"),
+            Modifiers::default(),
+            false
+        )));
+        assert!(!terminal_uses_text_input(&event(
+            "tab",
+            Some("\t"),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            false
+        )));
+        for modifiers in [
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!terminal_uses_text_input(&event(
+                "c",
+                Some("c"),
+                modifiers,
+                false
+            )));
+        }
+    }
+
+    /// Exercise the input protocol without launching a shell or rendering a UI.
+    #[gpui::test]
+    fn ime_preedit_commit_and_cancel_only_write_confirmed_text(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let (sender, written) = unbounded();
+            let dirty = Arc::new(AtomicBool::new(false));
+            let (ui_tx, ui_events) = unbounded();
+            let window_size = Arc::new(Mutex::new(WindowSize {
+                num_cols: 40,
+                num_lines: 8,
+                cell_width: 8,
+                cell_height: 18,
+            }));
+            let dark_theme = Arc::new(AtomicBool::new(true));
+            let proxy = TerminalEventProxy {
+                dirty: dirty.clone(),
+                sender: Arc::new(OnceLock::new()),
+                ui_events: ui_tx,
+                window_size: window_size.clone(),
+                dark_theme: dark_theme.clone(),
+            };
+            let view = cx.new(|cx| TerminalView {
+                session: Some(TerminalSession {
+                    term: Arc::new(FairMutex::new(Term::new(
+                        Config::default(),
+                        &TerminalDimensions {
+                            columns: 40,
+                            rows: 8,
+                        },
+                        proxy,
+                    ))),
+                    sender: PtyInput::Test(sender),
+                    dirty,
+                    ui_events,
+                    window_size,
+                    grid_size: (40, 8),
+                    dark_theme,
+                    url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+                }),
+                error: None,
+                focus_handle: cx.focus_handle(),
+                working_directory: PathBuf::new(),
+                title: String::new(),
+                exited: false,
+                scroll_accumulator: 0.0,
+                panel_width: 320.0,
+                panel_height: Some(160.0),
+                measured_cell_width: Some(8.0),
+                scrollbar_state: ScrollbarState::new(),
+                grid_bounds: Rc::new(Cell::new(Some(Bounds::new(
+                    point(px(10.), px(20.)),
+                    size(px(320.), px(144.)),
+                )))),
+                cursor_position: Some((2, 3)),
+                composition: None,
+                selecting: false,
+                hovered_link: None,
+                cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
+                cursor_focus_tracking_started: false,
+                context_menu: ContextMenuHandle::new(cx),
+                bottom_panel_tabs: true,
+                _subscriptions: Vec::new(),
+            });
+            view.update(cx, |view, cx| {
+                assert!(view.accepts_text_input(window, cx));
+                assert_eq!(
+                    view.selected_text_range(false, window, cx).unwrap().range,
+                    0..0
+                );
+                // Candidate windows stay anchored even when the terminal caret blinks off.
+                assert_eq!(
+                    view.bounds_for_range(0..0, Bounds::default(), window, cx)
+                        .unwrap()
+                        .origin,
+                    point(px(34.), px(56.))
+                );
+                view.replace_and_mark_text_in_range(None, "nihao", Some(5..5), window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(0..5));
+                assert!(written.is_empty());
+                // Confirmation/navigation must never escape to the shell during pre-edit.
+                for key_name in ["enter", "escape", "up", "backspace"] {
+                    view.on_key_down(
+                        &KeyDownEvent {
+                            keystroke: key(key_name, None, Modifiers::default()),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                assert!(written.is_empty());
+                view.replace_and_mark_text_in_range(None, "你好😀", Some(4..4), window, cx);
+                assert_eq!(view.marked_text_range(window, cx), Some(0..4));
+                assert_eq!(
+                    view.selected_text_range(false, window, cx).unwrap().range,
+                    4..4
+                );
+                view.replace_text_in_range(None, "你好😀", window, cx);
+                assert_eq!(written.try_recv().unwrap(), "你好😀".as_bytes());
+                assert!(view.composition.is_none());
+                assert!(written.is_empty());
+                view.replace_and_mark_text_in_range(None, "quxiao", None, window, cx);
+                view.replace_text_in_range(None, "", window, cx);
+                assert!(view.composition.is_none());
+                assert!(written.is_empty());
+                view.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                view.unmark_text(window, cx);
+                assert!(view.composition.is_none());
+                assert!(written.is_empty());
+                view.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                view.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert!(view.composition.is_none());
+                assert!(written.is_empty());
+                // Ordinary text goes through this same path, with no duplicate key write.
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: key("a", Some("a"), Modifiers::default()),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(written.is_empty());
+                view.replace_text_in_range(None, "a", window, cx);
+                assert_eq!(written.try_recv().unwrap(), b"a");
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: key(
+                            "c",
+                            Some("c"),
+                            Modifiers {
+                                control: true,
+                                ..Default::default()
+                            },
+                        ),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(written.try_recv().unwrap(), vec![3]);
+                view.exited = true;
+                assert!(!view.accepts_text_input(window, cx));
+            });
+        });
+    }
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
