@@ -16,6 +16,10 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.25]
+
+- Fix Chinese and other IME text input in the terminal, including composition previews, candidate window positioning, confirmation, and cancellation while preserving terminal control keys
+
 ## [0.1.24]
 
 - Stream file downloads from the right panel in chunks instead of one whole-file message: no size cap remains, downloads show a live card with progress and a cancel button in the notification area, and canceled or failed transfers remove their partial file — all unchanged over WSL and SSH bridges
