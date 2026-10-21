@@ -716,7 +716,7 @@ impl Waku {
             .child(self.render_sidebar_header_actions(cx))
     }
 
-    fn start_available_update(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start_available_update(&mut self, cx: &mut Context<Self>) {
         if self.updater_status != crate::updater::UpdateStatus::Available {
             return;
         }

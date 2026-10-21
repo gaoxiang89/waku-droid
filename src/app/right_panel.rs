@@ -2430,10 +2430,9 @@ impl Waku {
             } else {
                 crate::terminal::TerminalLauncher::Local
             };
-            self.right_panel_terminals.insert(
-                terminal_id,
-                cx.new(|cx| TerminalView::new(working_directory.clone(), launcher, cx)),
-            );
+            let terminal = cx.new(|cx| TerminalView::new(working_directory.clone(), launcher, cx));
+            Self::show_terminal_notices(&terminal, cx);
+            self.right_panel_terminals.insert(terminal_id, terminal);
         }
     }
 

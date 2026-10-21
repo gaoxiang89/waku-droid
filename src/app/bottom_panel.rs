@@ -363,10 +363,24 @@ impl Waku {
         } else {
             crate::terminal::TerminalLauncher::Local
         };
-        cx.new(|cx| {
+        let terminal = cx.new(|cx| {
             TerminalView::new(working_directory.to_path_buf(), launcher, cx)
                 .with_bottom_panel_tabs()
-        })
+        });
+        Self::show_terminal_notices(&terminal, cx);
+        terminal
+    }
+
+    /// A terminal reports what a paste could not do; surface it as a toast.
+    pub(super) fn show_terminal_notices(terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        cx.subscribe(
+            terminal,
+            |this, _, notice: &crate::terminal::TerminalNotice, cx| {
+                this.show_toast(notice.0.clone());
+                cx.notify();
+            },
+        )
+        .detach();
     }
 
     /// Park the selected session's panel state, the bottom panel's half of

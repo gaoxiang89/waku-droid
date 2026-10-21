@@ -621,6 +621,8 @@ workspace.new_worktree: 新建工作树
 workspace.workspace: 工作区
 workspace.worktree: 工作树
 terminal.starting: 正在启动终端…
+terminal.paste_image_failed: "无法粘贴图片：%{error}"
+terminal.paste_files_skipped: "远端终端只能粘贴图片，已跳过 %{count} 个文件"
 project.add_project: 添加项目
 errors.remote_project_picker: 添加守护进程主机上的项目需要远程路径选择器，但该功能尚不可用
 session.stopped: 已停止

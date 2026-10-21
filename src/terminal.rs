@@ -23,8 +23,8 @@ use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
     App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, ElementInputHandler,
-    EntityInputHandler, FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight, Hsla,
-    ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight,
+    Hsla, ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextRun,
@@ -992,18 +992,22 @@ fn save_pasted_image(
     bytes: Vec<u8>,
 ) -> Result<PathBuf> {
     let (format, bytes) = paste_image_as_png(format, bytes);
+    // A daemon terminal's shell runs on the daemon host, so the image has to
+    // land there. A desktop temp path would mean nothing to that shell, so a
+    // failed upload is an error rather than a local fallback.
     if let TerminalLauncher::Daemon(daemon) = launcher {
         let response = daemon.client().request(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             waku_client::Command::StoreBlob {
                 mime_type: format.mime_type().to_owned(),
-                bytes: bytes.clone(),
+                bytes,
             },
-        );
-        if let Ok(waku_client::ResponsePayload::BlobStored { path, .. }) = response {
-            return Ok(path);
-        }
+        )?;
+        return match response {
+            waku_client::ResponsePayload::BlobStored { path, .. } => Ok(path),
+            _ => anyhow::bail!("Waku daemon returned an invalid blob response"),
+        };
     }
 
     let ext = match format {
@@ -1027,6 +1031,62 @@ fn save_pasted_image(
     std::fs::write(&temp_path, bytes)?;
     Ok(temp_path)
 }
+
+fn join_shell_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| shell_quote_path(path))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The image format a copied file's extension names, for files that can be
+/// uploaded to a daemon host the way a clipboard image is.
+fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => return None,
+    };
+    ImageFormat::from_mime_type(mime)
+}
+
+/// What pasting copied files into a daemon terminal produced: host paths for
+/// the images it uploaded, and how many files it had to leave behind.
+#[derive(Debug, Default)]
+struct UploadedPastePaths {
+    paths: Vec<PathBuf>,
+    skipped: usize,
+}
+
+/// Copied files live on this machine, not on the daemon host. Images are
+/// uploaded like a clipboard image; anything else cannot be reached from the
+/// remote shell and is skipped.
+fn upload_pasted_paths(launcher: TerminalLauncher, paths: Vec<PathBuf>) -> UploadedPastePaths {
+    let mut uploaded = UploadedPastePaths::default();
+    for path in paths {
+        let stored = image_format_for_path(&path).and_then(|format| {
+            let bytes = std::fs::read(&path).ok()?;
+            save_pasted_image(launcher.clone(), format, bytes).ok()
+        });
+        match stored {
+            Some(stored) => uploaded.paths.push(stored),
+            None => uploaded.skipped += 1,
+        }
+    }
+    uploaded
+}
+
+/// Something a paste could not do that the user should hear about; the app
+/// shows it as a toast.
+pub struct TerminalNotice(pub String);
+
+impl EventEmitter<TerminalNotice> for TerminalView {}
 
 pub struct TerminalView {
     session: Option<TerminalSession>,
@@ -1458,12 +1518,30 @@ impl TerminalView {
                 self.paste(text, cx);
             }
             TerminalPasteContent::Paths(paths) => {
-                let text = paths
-                    .iter()
-                    .map(|p| shell_quote_path(p))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                self.paste(text, cx);
+                if matches!(self.launcher, TerminalLauncher::Local) {
+                    self.paste(join_shell_paths(&paths), cx);
+                    return;
+                }
+                self.pause_cursor_blink(cx);
+                let launcher = self.launcher.clone();
+                cx.spawn(async move |this, cx| {
+                    let uploaded = cx
+                        .background_executor()
+                        .spawn(async move { upload_pasted_paths(launcher, paths) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if !uploaded.paths.is_empty() {
+                            this.paste(join_shell_paths(&uploaded.paths), cx);
+                        }
+                        if uploaded.skipped > 0 {
+                            cx.emit(TerminalNotice(tr!(
+                                "terminal.paste_files_skipped",
+                                count = uploaded.skipped
+                            )));
+                        }
+                    });
+                })
+                .detach();
             }
             TerminalPasteContent::Image { format, bytes } => {
                 self.pause_cursor_blink(cx);
@@ -1473,12 +1551,13 @@ impl TerminalView {
                         .background_executor()
                         .spawn(async move { save_pasted_image(launcher, format, bytes) })
                         .await;
-                    if let Ok(path) = saved_path {
-                        let text = shell_quote_path(&path);
-                        let _ = this.update(cx, |this, cx| {
-                            this.paste(text, cx);
-                        });
-                    }
+                    let _ = this.update(cx, |this, cx| match saved_path {
+                        Ok(path) => this.paste(shell_quote_path(&path), cx),
+                        Err(error) => cx.emit(TerminalNotice(tr!(
+                            "terminal.paste_image_failed",
+                            error = error.to_string()
+                        ))),
+                    });
                 })
                 .detach();
             }
@@ -2918,6 +2997,41 @@ mod tests {
         let (format, bytes) = paste_image_as_png(ImageFormat::Bmp, b"not an image".to_vec());
         assert_eq!(format, ImageFormat::Bmp, "undecodable bytes pass through");
         assert_eq!(bytes, b"not an image");
+    }
+
+    #[test]
+    fn copied_image_files_upload_and_other_files_are_skipped() {
+        assert_eq!(
+            image_format_for_path(Path::new("shot.PNG")),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            image_format_for_path(Path::new("a/b.jpeg")),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(image_format_for_path(Path::new("notes.txt")), None);
+        assert_eq!(image_format_for_path(Path::new("Makefile")), None);
+
+        let dir =
+            std::env::temp_dir().join(format!("waku-paste-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("shot.png");
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&image, &png).unwrap();
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "hi").unwrap();
+        let missing = dir.join("gone.png");
+
+        // The local launcher stands in for the daemon upload: same sorting.
+        let uploaded = upload_pasted_paths(TerminalLauncher::Local, vec![image, text, missing]);
+        assert_eq!(uploaded.paths.len(), 1);
+        assert_eq!(std::fs::read(&uploaded.paths[0]).unwrap(), png);
+        assert_eq!(uploaded.skipped, 2);
+        let _ = std::fs::remove_file(&uploaded.paths[0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

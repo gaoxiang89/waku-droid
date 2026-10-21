@@ -1272,6 +1272,10 @@ workspace.worktree:
 
 terminal.starting:
   en: Starting terminal…
+terminal.paste_image_failed:
+  en: "Could not paste the image: %{error}"
+terminal.paste_files_skipped:
+  en: "Only images can be pasted into a remote terminal. Files skipped: %{count}"
 
 project.add_project:
   en: Add project

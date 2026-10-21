@@ -653,6 +653,8 @@ workspace.workspace: ワークスペース
 workspace.worktree: ワークツリー
 
 terminal.starting: ターミナルを起動中…
+terminal.paste_image_failed: "画像を貼り付けられませんでした: %{error}"
+terminal.paste_files_skipped: "リモートターミナルには画像のみ貼り付けられます。スキップしたファイル: %{count} 件"
 
 project.add_project: プロジェクトを追加
 errors.remote_project_picker: デーモンホスト上のプロジェクトを追加するにはリモートパス選択が必要ですが、まだ利用できません
