@@ -1189,6 +1189,7 @@ pub struct Waku {
     /// settings opens and on toggle, so frames never read user defaults —
     /// that lookup can reach cfprefsd.
     automatic_updates_enabled: bool,
+    pub(crate) updater_available: bool,
     updater_status: crate::updater::UpdateStatus,
     updater_button_focus: FocusHandle,
     updater_button_hovered: bool,
@@ -1978,6 +1979,9 @@ impl Waku {
             crate::updater::UpdaterEvent::StatusChanged(status) => {
                 self.updater_status = status;
                 self.reset_updater_button_animation();
+                if status == crate::updater::UpdateStatus::Available {
+                    self.show_toast_with_tone(tr!("updater.update_available"), ToastTone::Success);
+                }
             }
             crate::updater::UpdaterEvent::UpToDate => {
                 self.updater_status = crate::updater::UpdateStatus::Idle;
@@ -1989,9 +1993,9 @@ impl Waku {
                 self.reset_updater_button_animation();
                 self.show_toast(tr!("updater.failed", error = error));
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             crate::updater::UpdaterEvent::QuitAndInstall => {
-                // The helper has already validated both prefixes and now
+                // The handoff helper or installer has launched and now
                 // waits for GPUI's normal asynchronous quit hooks to finish
                 // saving drafts and window state before it swaps them.
                 cx.quit();
@@ -2025,7 +2029,11 @@ impl Waku {
 
     /// Registers a streaming download card and returns its handle: the id the
     /// transfer reports progress against, and the flag that cancels it.
-    pub(super) fn begin_download(&mut self, name: String, cx: &mut Context<Self>) -> (u64, Arc<AtomicBool>) {
+    pub(super) fn begin_download(
+        &mut self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> (u64, Arc<AtomicBool>) {
         self.download_generation = self.download_generation.wrapping_add(1);
         let id = self.download_generation;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2552,6 +2560,9 @@ impl Waku {
             .and_then(|state| state.0.as_ref())
             .map(|updater| (updater.status(), Some(updater.events())))
             .unwrap_or_default();
+        let updater_available = cx
+            .try_global::<crate::updater::UpdaterState>()
+            .is_some_and(|updater| updater.0.is_some());
         let entity = cx.new(|cx| {
             let settings_focus = cx.focus_handle();
             let onboarding_add_project_focus = cx.focus_handle();
@@ -3085,6 +3096,7 @@ impl Waku {
                     .try_global::<crate::updater::UpdaterState>()
                     .and_then(|updater| updater.0.as_ref())
                     .is_some_and(|updater| updater.automatically_checks_for_updates()),
+                updater_available,
                 updater_status,
                 updater_button_focus,
                 updater_button_hovered: false,

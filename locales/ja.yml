@@ -32,6 +32,8 @@ window.restore: 元に戻す
 
 updater.update: アップデート
 updater.updating: アップデート中…
+updater.checking: アップデートを確認中…
+updater.update_available: 新しいバージョンが利用可能です。インストール準備が完了しました
 updater.up_to_date: Waku は最新です
 updater.failed: "アップデートに失敗しました：%{error}"
 
@@ -196,6 +198,8 @@ settings.local_by_default_description: プロジェクト、会話、設定は�
 settings.local_by_default_web_description: プロジェクト、会話、添付ファイルは接続先デーモンのホストに保存されます。Waku Web の設定はこのブラウザに保存されます。
 settings.automatic_updates: 自動アップデート
 settings.automatic_updates_description: バックグラウンドで新しいバージョンを確認し、インストールを案内します
+settings.check_for_updates: アップデートを確認
+settings.check_for_updates_description: GitHub Releases で Waku の最新ビルドを確認します
 settings.about: このアプリについて
 settings.about_local_daemon: このコンピューターのデーモン
 settings.about_host_daemon: "%{host} のデーモン"

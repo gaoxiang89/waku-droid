@@ -161,6 +161,7 @@ enum PaletteAction {
     ToggleRightPanel,
     ToggleBottomPanel,
     NewTerminal,
+    CheckForUpdates,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
 }
@@ -831,6 +832,18 @@ impl Waku {
                 next(),
             ),
         ]);
+
+        if self.updater_available {
+            commands.push(CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("menu.check_for_updates"),
+                "icons/rotate-cw.svg",
+                None,
+                PaletteAction::CheckForUpdates,
+                "check update upgrade version software 检查更新 升级",
+                next(),
+            ));
+        }
 
         for (page, label_key, icon, keywords) in [
             (
@@ -1633,6 +1646,15 @@ impl Waku {
                 self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
             }
             PaletteAction::NewTerminal => self.new_terminal_action(&NewTerminal, window, cx),
+            PaletteAction::CheckForUpdates => {
+                if let Some(updater) = cx
+                    .try_global::<crate::updater::UpdaterState>()
+                    .and_then(|u| u.0.as_ref())
+                {
+                    self.show_toast_with_tone(tr!("updater.checking"), ToastTone::Success);
+                    updater.check_for_updates();
+                }
+            }
             PaletteAction::OpenSettings(page) => {
                 self.open_settings_action(&OpenSettings, window, cx);
                 self.open_settings_page(page, cx);

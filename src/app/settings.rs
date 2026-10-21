@@ -437,9 +437,7 @@ impl Waku {
 
     fn render_general_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
-        let updater_available = cx
-            .try_global::<crate::updater::UpdaterState>()
-            .is_some_and(|updater| updater.0.is_some());
+        let updater_available = self.updater_available;
         let analytics_enabled = self.state.analytics_enabled;
         let analytics_toggle = toggle_switch(
             "anonymous-analytics-toggle",
@@ -562,40 +560,126 @@ impl Waku {
                     cx,
                     move |this, _, cx| this.set_automatic_updates_enabled(!enabled, cx),
                 );
-                column.child(
+                let action_button = if self.updater_status
+                    == crate::updater::UpdateStatus::Available
+                {
                     div()
-                        .mt(px(15.0))
-                        .w_full()
-                        .min_h(px(60.0))
-                        .px(px(20.0))
-                        .py(px(12.0))
-                        .rounded(px(13.0))
-                        .bg(theme.raised)
-                        .flex()
-                        .items_center()
-                        .gap(px(24.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .text_size(sp(13.5))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(tr!("settings.automatic_updates")),
-                                )
-                                .child(
-                                    div()
-                                        .mt(px(5.0))
-                                        .text_size(sp(12.5))
-                                        .line_height(sp(18.0))
-                                        .text_color(theme.text_secondary)
-                                        .child(tr!("settings.automatic_updates_description")),
-                                ),
-                        )
-                        .child(toggle),
-                )
+                        .id("install-update-settings-button")
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(6.0))
+                        .cursor_default()
+                        .bg(theme.gauge)
+                        .hover(|element| element.opacity(0.92))
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(0xFFFFFF))
+                        .child(tr!("updater.update"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.start_available_update(cx);
+                        }))
+                } else if self.updater_status == crate::updater::UpdateStatus::Updating {
+                    div()
+                        .id("updating-settings-indicator")
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_secondary)
+                        .child(tr!("updater.updating"))
+                } else {
+                    div()
+                        .id("check-for-updates-settings-button")
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(6.0))
+                        .cursor_default()
+                        .bg(theme.overlay)
+                        .hover(|element| element.bg(theme.overlay_strong))
+                        .active(|element| element.bg(theme.raised))
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(tr!("settings.check_for_updates"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_toast_with_tone(tr!("updater.checking"), ToastTone::Success);
+                            if let Some(updater) = cx
+                                .try_global::<crate::updater::UpdaterState>()
+                                .and_then(|updater| updater.0.as_ref())
+                            {
+                                updater.check_for_updates();
+                            }
+                        }))
+                };
+                column
+                    .child(
+                        div()
+                            .mt(px(15.0))
+                            .w_full()
+                            .min_h(px(60.0))
+                            .px(px(20.0))
+                            .py(px(12.0))
+                            .rounded(px(13.0))
+                            .bg(theme.raised)
+                            .flex()
+                            .items_center()
+                            .gap(px(24.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_size(sp(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(tr!("settings.automatic_updates")),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(5.0))
+                                            .text_size(sp(12.5))
+                                            .line_height(sp(18.0))
+                                            .text_color(theme.text_secondary)
+                                            .child(tr!("settings.automatic_updates_description")),
+                                    ),
+                            )
+                            .child(toggle),
+                    )
+                    .child(
+                        div()
+                            .mt(px(15.0))
+                            .w_full()
+                            .min_h(px(60.0))
+                            .px(px(20.0))
+                            .py(px(12.0))
+                            .rounded(px(13.0))
+                            .bg(theme.raised)
+                            .flex()
+                            .items_center()
+                            .gap(px(24.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_size(sp(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(tr!("settings.check_for_updates")),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(5.0))
+                                            .text_size(sp(12.5))
+                                            .line_height(sp(18.0))
+                                            .text_color(theme.text_secondary)
+                                            .child(tr!("settings.check_for_updates_description")),
+                                    ),
+                            )
+                            .child(action_button),
+                    )
             })
             .child(self.render_about_card(theme))
             .into_any_element()
@@ -2658,15 +2742,11 @@ impl Waku {
         for terminal in self.right_panel_terminals.values() {
             terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
         }
-        for terminal in self
-            .bottom_panel_terminals
-            .iter()
-            .chain(
-                self.bottom_panel_session_states
-                    .values()
-                    .flat_map(|state| state.terminals.iter()),
-            )
-        {
+        for terminal in self.bottom_panel_terminals.iter().chain(
+            self.bottom_panel_session_states
+                .values()
+                .flat_map(|state| state.terminals.iter()),
+        ) {
             terminal.update(cx, |terminal, cx| terminal.refresh_localized_text(cx));
         }
         for probe in &mut self.probes {

@@ -188,6 +188,7 @@ impl Updater {
         if updater.automatically_checks_for_updates() {
             updater.start_check(false);
         }
+        updater.spawn_periodic_checker();
         Some(updater)
     }
 
@@ -195,28 +196,76 @@ impl Updater {
         self.start_check(true);
     }
 
-    fn start_check(&self, user_initiated: bool) {
-        if self.status() == UpdateStatus::Updating {
-            return;
-        }
-        if self
-            .checking
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            if user_initiated {
-                self.explicit_check.store(true, Ordering::Relaxed);
-            }
-            return;
-        }
-        self.explicit_check.store(user_initiated, Ordering::Relaxed);
-
+    fn spawn_periodic_checker(&self) {
         let layout = self.layout.clone();
         let status = self.status.clone();
         let staged = self.staged.clone();
         let checking = self.checking.clone();
         let explicit_check = self.explicit_check.clone();
         let events = self.events.clone();
+        let automatic = self.automatic.clone();
+
+        let _ = std::thread::Builder::new()
+            .name("waku-updater-periodic".into())
+            .spawn(move || {
+                const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+                loop {
+                    std::thread::sleep(CHECK_INTERVAL);
+                    if automatic.load(Ordering::Relaxed) {
+                        Self::perform_check(
+                            false,
+                            &layout,
+                            &status,
+                            &staged,
+                            &checking,
+                            &explicit_check,
+                            &events,
+                        );
+                    }
+                }
+            });
+    }
+
+    fn start_check(&self, user_initiated: bool) {
+        Self::perform_check(
+            user_initiated,
+            &self.layout,
+            &self.status,
+            &self.staged,
+            &self.checking,
+            &self.explicit_check,
+            &self.events,
+        );
+    }
+
+    fn perform_check(
+        user_initiated: bool,
+        layout: &ManagedLayout,
+        status: &Arc<Mutex<UpdateStatus>>,
+        staged: &Arc<Mutex<Option<StagedUpdate>>>,
+        checking: &Arc<AtomicBool>,
+        explicit_check: &Arc<AtomicBool>,
+        events: &smol::channel::Sender<UpdaterEvent>,
+    ) {
+        if *status.lock().unwrap_or_else(|p| p.into_inner()) == UpdateStatus::Updating {
+            return;
+        }
+        if checking
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            if user_initiated {
+                explicit_check.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        explicit_check.store(user_initiated, Ordering::Relaxed);
+
+        let layout = layout.clone();
+        let status = status.clone();
+        let staged = staged.clone();
+        let checking_bg = checking.clone();
+        let explicit_check = explicit_check.clone();
         let publish_events = events.clone();
         let publish = move |next: UpdateStatus| {
             let mut status = status
@@ -228,6 +277,7 @@ impl Updater {
             *status = next;
             let _ = publish_events.try_send(UpdaterEvent::StatusChanged(next));
         };
+        let check_events = events.clone();
         let spawned = std::thread::Builder::new()
             .name("waku-updater-check".into())
             .spawn(move || {
@@ -243,22 +293,22 @@ impl Updater {
                     Ok(None) => {
                         publish(UpdateStatus::Idle);
                         if report {
-                            let _ = events.try_send(UpdaterEvent::UpToDate);
+                            let _ = check_events.try_send(UpdaterEvent::UpToDate);
                         }
                     }
                     Err(error) => {
                         publish(UpdateStatus::Idle);
                         if report {
-                            let _ = events.try_send(UpdaterEvent::Failed(error.to_string()));
+                            let _ = check_events.try_send(UpdaterEvent::Failed(error.to_string()));
                         } else {
                             eprintln!("Waku updater: {error:#}");
                         }
                     }
                 }
-                checking.store(false, Ordering::Release);
+                checking_bg.store(false, Ordering::Release);
             });
         if spawned.is_err() {
-            self.checking.store(false, Ordering::Release);
+            checking.store(false, Ordering::Release);
         }
     }
 
@@ -550,15 +600,10 @@ const DOWNLOAD_PATH_PREFIX: &str = "/gaoxiang89/waku-droid/releases/download/";
 
 fn validate_download_url(value: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(value)?;
-    let on_fork = url.host_str() == Some(DOWNLOAD_HOST)
-        && url
-            .path()
-            .starts_with(DOWNLOAD_PATH_PREFIX);
+    let on_fork =
+        url.host_str() == Some(DOWNLOAD_HOST) && url.path().starts_with(DOWNLOAD_PATH_PREFIX);
     anyhow::ensure!(
-        url.scheme() == "https"
-            && on_fork
-            && url.username().is_empty()
-            && url.password().is_none(),
+        url.scheme() == "https" && on_fork && url.username().is_empty() && url.password().is_none(),
         "the update feed points outside the fork's GitHub releases"
     );
     Ok(())
@@ -823,16 +868,18 @@ mod tests {
             "https://github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/waku-0.1.21-x86_64-unknown-linux-gnu.tar.gz"
         )
         .is_ok());
+        assert!(validate_download_url("https://releases.waku.sh/waku-0.1.21.tar.gz").is_err());
         assert!(
-            validate_download_url("https://releases.waku.sh/waku-0.1.21.tar.gz").is_err()
+            validate_download_url(
+                "https://github.com/evil/waku-droid/releases/download/v0.1.21/payload.tar.gz"
+            )
+            .is_err()
         );
-        assert!(validate_download_url(
-            "https://github.com/evil/waku-droid/releases/download/v0.1.21/payload.tar.gz"
-        )
-        .is_err());
         assert!(
-            validate_download_url("http://github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/payload.tar.gz")
-                .is_err()
+            validate_download_url(
+                "http://github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/payload.tar.gz"
+            )
+            .is_err()
         );
         assert!(
             validate_download_url("https://user:pass@github.com/gaoxiang89/waku-droid/releases/download/v0.1.21/payload.tar.gz")

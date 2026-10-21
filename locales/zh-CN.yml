@@ -31,6 +31,8 @@ window.maximize: 最大化
 window.restore: 还原
 updater.update: 更新
 updater.updating: 正在更新…
+updater.checking: 正在检查更新…
+updater.update_available: 发现新版本，已准备好安装
 updater.up_to_date: Waku 已是最新版本
 updater.failed: "更新失败：%{error}"
 command_palette.placeholder: 搜索任务或运行命令…
@@ -189,6 +191,8 @@ settings.local_by_default_description: 项目、对话和设置均存储在这�
 settings.local_by_default_web_description: 项目、对话和附件保留在所连接的守护进程主机上。Waku Web 的偏好设置保留在此浏览器中。
 settings.automatic_updates: 自动更新
 settings.automatic_updates_description: 在后台检查新版本，并在发现更新时提示安装
+settings.check_for_updates: 检查更新
+settings.check_for_updates_description: 检查 GitHub Releases 获取 Waku 的最新版本
 settings.about: 关于
 settings.about_local_daemon: 本机守护进程
 settings.about_host_daemon: "%{host} 上的守护进程"

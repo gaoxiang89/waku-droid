@@ -63,6 +63,10 @@ updater.update:
   en: Update
 updater.updating:
   en: Updating…
+updater.checking:
+  en: Checking for updates…
+updater.update_available:
+  en: A new version of Waku is ready to install
 updater.up_to_date:
   en: Waku is up to date
 updater.failed:
