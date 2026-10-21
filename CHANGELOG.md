@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.27]
+
+- Split the bottom panel terminal into panes with keyboard shortcuts, so one session can watch two shells or logs side by side
+- Draw mermaid fences as rendered diagrams in the transcript markdown, with a refined block rhythm for headings, lists, and code
+
 ## [0.1.26]
 
 - Paste images and copied files straight into the terminal: a clipboard image is saved to a file and its path is typed into the shell (BMP and TIFF screenshots are re-encoded as PNG first), and copied files paste as shell-quoted paths — remote terminals upload images to the daemon host and say what they had to skip
