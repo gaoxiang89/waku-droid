@@ -240,7 +240,7 @@ impl Updater {
 
     fn perform_check(
         user_initiated: bool,
-        layout: &ManagedLayout,
+        layout: &InstallLayout,
         status: &Arc<Mutex<UpdateStatus>>,
         staged: &Arc<Mutex<Option<StagedUpdate>>>,
         checking: &Arc<AtomicBool>,
