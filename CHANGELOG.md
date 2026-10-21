@@ -16,6 +16,13 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.26]
+
+- Paste images and copied files straight into the terminal: a clipboard image is saved to a file and its path is typed into the shell (BMP and TIFF screenshots are re-encoded as PNG first), and copied files paste as shell-quoted paths — remote terminals upload images to the daemon host and say what they had to skip
+- Show context compaction in the transcript as its own row with an archive glyph and state ("Compacting context", "Compacted context", failures) for Claude and OpenCode, instead of hiding it among tool calls, and cap collapsed activity summaries at the two most important kinds with the rest folded into a count
+- Add a Check for Updates command to the palette, an install button and check action in Settings → General, a toast when an update is ready, and native silent updates on Windows through the installer handoff
+- Read ACP tool output as text instead of escaped JSON envelopes, and size markdown table columns so code paths never wrap mid-path
+
 ## [0.1.25]
 
 - Fix Chinese and other IME text input in the terminal, including composition previews, candidate window positioning, confirmation, and cancellation while preserving terminal control keys
