@@ -1128,13 +1128,14 @@ pub(super) fn activity_summary_rank(kind: crate::model::ActivityKind) -> u8 {
     match kind {
         ActivityKind::FileChange => 0,
         ActivityKind::Command => 1,
-        ActivityKind::Tool => 2,
-        ActivityKind::Plan => 3,
-        ActivityKind::Search => 4,
-        ActivityKind::FileSearch => 5,
-        ActivityKind::FileList => 6,
-        ActivityKind::FileRead => 7,
-        ActivityKind::Reasoning => 8,
+        ActivityKind::Compaction => 2,
+        ActivityKind::Tool => 3,
+        ActivityKind::Plan => 4,
+        ActivityKind::Search => 5,
+        ActivityKind::FileSearch => 6,
+        ActivityKind::FileList => 7,
+        ActivityKind::FileRead => 8,
+        ActivityKind::Reasoning => 9,
     }
 }
 
@@ -1210,6 +1211,11 @@ pub(super) fn activity_is_exploration(kind: crate::model::ActivityKind) -> bool 
     )
 }
 
+/// How many kinds the collapsed group summary names before folding the rest
+/// into a count. The kinds are importance-ranked first, so the fold only ever
+/// swallows reads and searches.
+const SUMMARY_NAMED_KINDS: usize = 2;
+
 pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
     let mut counts: Vec<(crate::model::ActivityKind, usize)> = Vec::new();
     for activity in activities {
@@ -1221,9 +1227,14 @@ pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
     }
     counts.sort_by_key(|(kind, _)| activity_summary_rank(*kind));
     let failed = activities.iter().filter(|activity| activity.failed).count();
-    let parts = counts
-        .into_iter()
-        .map(|(kind, count)| {
+    let named = counts.len().min(SUMMARY_NAMED_KINDS);
+    let folded = counts[named..]
+        .iter()
+        .map(|(_, count)| count)
+        .sum::<usize>();
+    let parts = counts[..named]
+        .iter()
+        .map(|&(kind, count)| {
             let (singular, plural) = activity_noun(kind);
             tr!(
                 "activity.count",
@@ -1231,6 +1242,7 @@ pub(super) fn activity_summary(activities: &[ActivityItem]) -> String {
                 activity = if count == 1 { singular } else { plural }
             )
         })
+        .chain((folded > 0).then(|| tr!("activity.more_count", count = folded)))
         .chain((failed > 0).then(|| tr!("activity.failed_count", count = failed)))
         .collect::<Vec<_>>();
     let running = activities.iter().any(|activity| !activity.complete);
@@ -1481,6 +1493,16 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
                 (true, true) => tr!("activity.plan_update_failed"),
             }
         }
+        ActivityKind::Compaction => {
+            if !crate::model::is_generic_activity_title(activity.kind, &activity.title) {
+                return activity.title.clone();
+            }
+            match (activity.complete, activity.failed) {
+                (false, _) => tr!("activity.compacting_context"),
+                (true, false) => tr!("activity.compacted_context"),
+                (true, true) => tr!("activity.compaction_failed"),
+            }
+        }
         ActivityKind::Tool => activity_tool_display_name(activity),
         ActivityKind::Reasoning => activity.title.clone(),
     }
@@ -1497,6 +1519,7 @@ pub(super) fn activity_action_label(activity: &ActivityItem) -> String {
         ActivityKind::FileSearch | ActivityKind::Search => tr!("activity.action_search"),
         ActivityKind::FileList => tr!("activity.action_list"),
         ActivityKind::Plan => tr!("activity.action_plan"),
+        ActivityKind::Compaction => tr!("activity.action_compact"),
         ActivityKind::Tool if is_ask_user_question(activity) => tr!("activity.ask_questions"),
         ActivityKind::Tool => tr!("activity.tool"),
     }
@@ -1539,6 +1562,7 @@ pub(super) fn activity_row_detail(activity: &ActivityItem, reasoning_live: bool)
             |query| tr!("activity.search_for", query = query),
         ),
         ActivityKind::Plan => custom_title().unwrap_or_default(),
+        ActivityKind::Compaction => activity_display_title(activity),
         ActivityKind::Tool if is_ask_user_question(activity) => String::new(),
         ActivityKind::Tool => {
             let has_name = activity
@@ -2100,6 +2124,75 @@ mod message_time_tests {
             activity_row_detail(&activities[1], false),
             "git log --oneline -15"
         );
+    }
+
+    #[test]
+    fn long_group_summaries_fold_low_ranked_kinds_into_a_count() {
+        let edit = ActivityItem::new(
+            Some("edit-1".into()),
+            crate::model::ActivityKind::FileChange,
+            "edit",
+            None,
+            true,
+        );
+        let command = ActivityItem::new(
+            Some("command-1".into()),
+            crate::model::ActivityKind::Command,
+            "bash",
+            None,
+            true,
+        );
+        let reads = (0..3)
+            .map(|index| {
+                ActivityItem::new(
+                    Some(format!("read-{index}")),
+                    crate::model::ActivityKind::FileRead,
+                    "read",
+                    None,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let searches = (0..2)
+            .map(|index| {
+                ActivityItem::new(
+                    Some(format!("search-{index}")),
+                    crate::model::ActivityKind::Search,
+                    "search",
+                    None,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut activities = vec![edit, command];
+        activities.extend(reads);
+        activities.extend(searches);
+
+        assert_eq!(
+            activity_summary(&activities),
+            "Ran 1 file edit · 1 command · and 5 more"
+        );
+    }
+
+    #[test]
+    fn compaction_titles_carry_their_state() {
+        let mut activity = ActivityItem::new(
+            None,
+            crate::model::ActivityKind::Compaction,
+            tr!("activity.compacting_context"),
+            None,
+            false,
+        );
+        assert_eq!(activity_display_title(&activity), "Compacting context");
+        activity.complete = true;
+        assert_eq!(activity_display_title(&activity), "Compacted context");
+        assert_eq!(activity_row_detail(&activity, false), "Compacted context");
+        activity.failed = true;
+        assert_eq!(
+            activity_display_title(&activity),
+            "Context compaction failed"
+        );
+        assert_eq!(activity_action_label(&activity), "Compact");
     }
 
     #[test]

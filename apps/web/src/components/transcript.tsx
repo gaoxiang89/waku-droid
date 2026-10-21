@@ -1945,6 +1945,7 @@ function activityIcon(activity: ActivityItem): WakuIconName {
   if (activity.kind === 'fileChange') return 'pencil'
   if (activity.kind === 'fileList') return 'folder'
   if (activity.kind === 'plan') return 'list'
+  if (activity.kind === 'compaction') return 'archive'
   return 'wrench'
 }
 

@@ -27,14 +27,41 @@ export function userMessageRewindTurnCount(
   return turn.turn_count
 }
 
+/** How many kinds the collapsed group summary names before folding the rest
+ * into a count; mirrors the native summary in components.rs. */
+const SUMMARY_NAMED_KINDS = 2
+
+const SUMMARY_KIND_ORDER: Record<ActivityItem['kind'], number> = {
+  fileChange: 0,
+  command: 1,
+  compaction: 2,
+  tool: 3,
+  plan: 4,
+  search: 5,
+  fileSearch: 6,
+  fileList: 7,
+  fileRead: 8,
+  reasoning: 9,
+}
+
 export function activitySummary(activities: ActivityItem[], t?: Translator) {
   const counts = new Map<ActivityItem['kind'], number>()
   for (const activity of activities) {
     counts.set(activity.kind, (counts.get(activity.kind) ?? 0) + 1)
   }
-  const parts = [...counts].map(([kind, count]) => t
+  const ranked = [...counts].sort(([a], [b]) => SUMMARY_KIND_ORDER[a]! - SUMMARY_KIND_ORDER[b]!)
+  const named = ranked.slice(0, SUMMARY_NAMED_KINDS)
+  const folded = ranked.slice(SUMMARY_NAMED_KINDS).reduce((sum, [, count]) => sum + count, 0)
+  const parts = named.map(([kind, count]) => t
     ? t('activity.count', { count, activity: t(activityNounKey(kind, count)) })
     : `${count} ${activityNoun(kind, count)}`)
+  if (folded > 0) {
+    parts.push(t ? t('activity.more_count', { count: folded }) : `and ${folded} more`)
+  }
+  if (activities.some((activity) => activity.failed)) {
+    const failed = activities.filter((activity) => activity.failed).length
+    parts.push(t ? t('activity.failed_count', { count: failed }) : `${failed} failed`)
+  }
   const joined = parts.join(' · ')
   return t
     ? t(activities.some((activity) => !activity.complete) ? 'activity.running' : 'activity.ran', { activities: joined })
@@ -167,6 +194,12 @@ export function activityDisplayTitle(activity: ActivityItem, t?: Translator) {
       return activity.failed
         ? t ? t('activity.plan_update_failed') : 'Failed to update plan'
         : t ? t('activity.updated_plan') : 'Updated plan'
+    case 'compaction':
+      if (!isGenericActivityTitle(activity)) return activity.title
+      if (!activity.complete) return t ? t('activity.compacting_context') : 'Compacting context'
+      return activity.failed
+        ? t ? t('activity.compaction_failed') : 'Context compaction failed'
+        : t ? t('activity.compacted_context') : 'Compacted context'
     case 'tool':
       return activityToolDisplayName(activity, t)
     case 'reasoning':
@@ -192,7 +225,9 @@ export function activityActionLabel(activity: ActivityItem, t?: Translator) {
               ? 'activity.action_list'
               : activity.kind === 'plan'
                 ? 'activity.action_plan'
-                : 'activity.tool'
+                : activity.kind === 'compaction'
+                  ? 'activity.action_compact'
+                  : 'activity.tool'
   if (t) return t(key)
   return {
     'activity.action_think': 'Think',
@@ -202,6 +237,7 @@ export function activityActionLabel(activity: ActivityItem, t?: Translator) {
     'activity.action_search': 'Search',
     'activity.action_list': 'List',
     'activity.action_plan': 'Plan',
+    'activity.action_compact': 'Compact',
     'activity.tool': 'Tool',
   }[key]!
 }
@@ -236,6 +272,8 @@ export function activityRowDetail(activity: ActivityItem, t?: Translator) {
         : customTitle
     case 'plan':
       return customTitle
+    case 'compaction':
+      return activityDisplayTitle(activity, t)
     case 'tool':
       if (isAskUserQuestion(activity)) return ''
       return activity.display_target?.trim() || !isGenericActivityTitle(activity)
@@ -567,6 +605,7 @@ function activityNoun(kind: ActivityItem['kind'], count: number) {
     search: ['search', 'searches'],
     plan: ['plan step', 'plan steps'],
     tool: ['tool call', 'tool calls'],
+    compaction: ['compaction', 'compactions'],
   }
   const [one, many] = nouns[kind]
   return count === 1 ? one : many
@@ -583,6 +622,7 @@ function activityNounKey(kind: ActivityItem['kind'], count: number) {
     search: ['activity.search', 'activity.searches'],
     plan: ['activity.plan_step', 'activity.plan_steps'],
     tool: ['activity.tool_call', 'activity.tool_calls'],
+    compaction: ['activity.compaction', 'activity.compactions'],
   }
   const [one, many] = keys[kind]
   return count === 1 ? one : many
@@ -635,6 +675,7 @@ function isGenericActivityTitle(activity: ActivityItem) {
     plan: ['plan', 'planupdated', 'updateplan'],
     tool: ['tool'],
     reasoning: ['reasoning'],
+    compaction: ['compactingcontext', 'compactedcontext', 'compactionfailed'],
   }[activity.kind]
   return generic.includes(normalized)
 }

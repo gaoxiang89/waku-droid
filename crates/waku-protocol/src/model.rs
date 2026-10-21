@@ -1765,6 +1765,9 @@ pub enum ActivityKind {
     Search,
     Plan,
     Tool,
+    /// The provider compacted the conversation itself. Not a tool the model
+    /// chose to run, so it never renders as one.
+    Compaction,
 }
 
 impl ActivityKind {
@@ -1859,6 +1862,8 @@ impl ActivityKind {
             "search" | "searchtool" | "webfetch" | "websearch"
         ) {
             Self::Search
+        } else if matches!(compact.as_str(), "compact" | "compactcontext") {
+            Self::Compaction
         } else {
             Self::Tool
         }
@@ -2676,6 +2681,11 @@ pub fn is_generic_activity_title(kind: ActivityKind, title: &str) -> bool {
         }
         ActivityKind::FileList => title == tr!("activity.list_files"),
         ActivityKind::Plan => title == tr!("activity.plan_updated"),
+        ActivityKind::Compaction => {
+            title == tr!("activity.compacting_context")
+                || title == tr!("activity.compacted_context")
+                || title == tr!("activity.compaction_failed")
+        }
         ActivityKind::Tool => title.eq_ignore_ascii_case("tool") || title == tr!("activity.tool"),
         _ => false,
     }

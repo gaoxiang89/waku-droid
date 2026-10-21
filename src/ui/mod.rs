@@ -230,6 +230,7 @@ pub fn activity_icon(kind: ActivityKind) -> &'static str {
         ActivityKind::Search => "icons/search.svg",
         ActivityKind::Plan => "icons/list.svg",
         ActivityKind::Tool => "icons/wrench.svg",
+        ActivityKind::Compaction => "icons/archive.svg",
     }
 }
 
@@ -244,6 +245,7 @@ pub fn activity_noun(kind: ActivityKind) -> (String, String) {
         ActivityKind::Search => (tr!("activity.search"), tr!("activity.searches")),
         ActivityKind::Plan => (tr!("activity.plan_step"), tr!("activity.plan_steps")),
         ActivityKind::Tool => (tr!("activity.tool_call"), tr!("activity.tool_calls")),
+        ActivityKind::Compaction => (tr!("activity.compaction"), tr!("activity.compactions")),
     }
 }
 

@@ -39,8 +39,31 @@ describe('desktop transcript language', () => {
       reasoning(true, 0, 1_000),
       { ...reasoning(true, 0, 1_000), id: 'thought-2' },
       activity('command', true),
-    ])).toBe('Ran 2 thoughts · 1 command')
+    ])).toBe('Ran 1 command · 2 thoughts')
     expect(activitySummary([reasoning(false, 0, 0)])).toBe('Running 1 thought')
+  })
+
+  test('folds low-ranked kinds into a count so summaries stay one line', () => {
+    expect(activitySummary([
+      activity('fileChange', true),
+      activity('command', true),
+      activity('fileRead', true),
+      { ...activity('fileRead', true), id: 'fileRead-2' },
+      { ...activity('fileRead', true), id: 'fileRead-3' },
+      activity('search', true),
+      { ...activity('search', true), id: 'search-2' },
+    ])).toBe('Ran 1 file edit · 1 command · and 5 more')
+  })
+
+  test('titles compaction rows by their state', () => {
+    const compacting = { ...activity('compaction', false), title: 'Compacting context' }
+    const compacted = { ...activity('compaction', true), title: 'Compacted context' }
+    const failed = { ...activity('compaction', true), title: 'Context compaction failed', failed: true }
+    expect(activityDisplayTitle(compacting)).toBe('Compacting context')
+    expect(activityDisplayTitle(compacted)).toBe('Compacted context')
+    expect(activityDisplayTitle(failed)).toBe('Context compaction failed')
+    expect(activityActionLabel(compacted)).toBe('Compact')
+    expect(activityRowDetail(compacted)).toBe('Compacted context')
   })
 
   test('summarizes an activity group only after it leaves the live tail', () => {
@@ -55,7 +78,7 @@ describe('desktop transcript language', () => {
     command.complete = true
     expect(activityHeaderTitle(activities, true)).toBe('Ran git log --oneline -15')
     expect(activityGroupIsLive(true, true, 1, 2)).toBe(false)
-    expect(activityHeaderTitle(activities, false)).toBe('Ran 1 thought · 1 command')
+    expect(activityHeaderTitle(activities, false)).toBe('Ran 1 command · 1 thought')
     expect(activityGroupIsLive(true, false, 1, 1)).toBe(false)
     expect(activityGroupIsLive(false, true, 1, 1)).toBe(false)
     expect(activityActionLabel(command)).toBe('Run')

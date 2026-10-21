@@ -2103,7 +2103,7 @@ fn compaction_activity(
     let delta = delta.map(|delta| Value::String(delta.to_owned()));
     let item = activity::tool_activity(
         Some(format!("compaction:{}", state.session_id)),
-        ActivityKind::Tool,
+        ActivityKind::Compaction,
         title,
         None,
         delta.as_ref(),
@@ -3264,6 +3264,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, ["compaction:ses_1"; 3]);
+        assert!(
+            seen.iter().all(|event| {
+                matches!(
+                    event,
+                    DriverEvent::RichActivity(item) if item.kind == ActivityKind::Compaction
+                )
+            }),
+            "compaction renders as its own kind, not a generic tool"
+        );
         assert!(
             !seen
                 .iter()

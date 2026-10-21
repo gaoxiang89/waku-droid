@@ -640,6 +640,8 @@ activity.ran:
   en: Ran %{activities}
 activity.failed_count:
   en: "%{count} failed"
+activity.more_count:
+  en: and %{count} more
 activity.show_earlier:
   en: "%{count} earlier"
 activity.action_think:
@@ -656,6 +658,8 @@ activity.action_list:
   en: List
 activity.action_plan:
   en: Plan
+activity.action_compact:
+  en: Compact
 activity.action_use:
   en: Use
 activity.ask_questions:
@@ -858,6 +862,10 @@ activity.tool_call:
   en: tool call
 activity.tool_calls:
   en: tool calls
+activity.compaction:
+  en: compaction
+activity.compactions:
+  en: compactions
 
 mode.supervised:
   en: Supervised

@@ -645,6 +645,7 @@ function isActivityKind(value: unknown): value is ActivityKind {
       'search',
       'plan',
       'tool',
+      'compaction',
     ].includes(value)
   )
 }

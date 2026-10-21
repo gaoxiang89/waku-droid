@@ -1065,6 +1065,23 @@ fn handle_claude_system(
     state: &mut ClaudeStreamState,
 ) {
     let subtype = value.get("subtype").and_then(Value::as_str);
+    if subtype == Some("compact_boundary") {
+        // The boundary lands after the CLI finished compacting; the payload
+        // carries no token counts to summarize, only the marker itself. No
+        // `source_id`: a completed sourceless activity never merges, so a
+        // session that compacts twice shows two rows.
+        let _ = events.send(DriverEvent::RichActivity(activity::tool_activity(
+            None,
+            ActivityKind::Compaction,
+            tr!("activity.compacted_context"),
+            None,
+            None,
+            None,
+            false,
+            true,
+        )));
+        return;
+    }
     if subtype == Some("background_tasks_changed") {
         let tasks = value
             .get("background_tasks")
@@ -1790,6 +1807,40 @@ mod tests {
             Mutex::new(true),
             ClaudeStreamState::default(),
         )
+    }
+
+    #[test]
+    fn compact_boundary_becomes_a_completed_compaction_row() {
+        let (events, event_rx, commands, _command_rx, turn, mut state) = harness();
+        handle_message(
+            &json!({"type": "system", "subtype": "compact_boundary"}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            true,
+            &mut state,
+        );
+        handle_message(
+            &json!({"type": "system", "subtype": "compact_boundary"}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            true,
+            &mut state,
+        );
+
+        let rows = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                DriverEvent::RichActivity(item) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "each boundary is its own row");
+        assert!(rows.iter().all(|item| {
+            item.kind == ActivityKind::Compaction && item.complete && item.source_id.is_none()
+        }));
     }
 
     #[cfg(unix)]

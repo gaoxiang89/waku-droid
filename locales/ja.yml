@@ -329,6 +329,7 @@ activity.detail: アクティビティの詳細
 activity.named_content: "%{name} の内容"
 activity.ran: 実行済み：%{activities}
 activity.failed_count: "失敗 %{count} 件"
+activity.more_count: "他 %{count} 件"
 activity.show_earlier: "以前の %{count} 件"
 activity.action_think: 思考
 activity.action_run: 実行
@@ -337,6 +338,7 @@ activity.action_read: 読み込み
 activity.action_search: 検索
 activity.action_list: 一覧
 activity.action_plan: 計画
+activity.action_compact: 圧縮
 activity.action_use: 使用
 activity.ask_questions: 質問する
 activity.arguments: 引数
@@ -438,6 +440,8 @@ activity.plan_step: プランのステップ
 activity.plan_steps: プランのステップ
 activity.tool_call: ツール呼び出し
 activity.tool_calls: ツール呼び出し
+activity.compaction: 回のコンテキスト圧縮
+activity.compactions: 回のコンテキスト圧縮
 
 mode.supervised: 監督モード
 mode.auto_accept_edits: 編集を自動承認

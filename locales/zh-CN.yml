@@ -311,6 +311,7 @@ activity.detail: 活动详情
 activity.named_content: "%{name}内容"
 activity.ran: 已执行：%{activities}
 activity.failed_count: "%{count} 次失败"
+activity.more_count: "另有 %{count} 项"
 activity.show_earlier: "更早的 %{count} 项"
 activity.action_think: 思考
 activity.action_run: 运行
@@ -319,6 +320,7 @@ activity.action_read: 读取
 activity.action_search: 搜索
 activity.action_list: 列出
 activity.action_plan: 计划
+activity.action_compact: 压缩
 activity.action_use: 使用
 activity.ask_questions: 提问
 activity.arguments: 参数
@@ -420,6 +422,8 @@ activity.plan_step: 计划步骤
 activity.plan_steps: 计划步骤
 activity.tool_call: 工具调用
 activity.tool_calls: 工具调用
+activity.compaction: 次上下文压缩
+activity.compactions: 次上下文压缩
 mode.supervised: 监督
 mode.auto_accept_edits: 自动接受修改
 mode.auto: 自动
