@@ -1252,6 +1252,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "compiler"
+version = "0.0.0"
+source = "git+https://github.com/wevm/ondine?rev=6a1586e5af980e67c104239593ae931837157b8b#6a1586e5af980e67c104239593ae931837157b8b"
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8630,6 +8635,7 @@ dependencies = [
  "base64",
  "block2 0.6.2",
  "chrono",
+ "compiler",
  "crossbeam-channel",
  "dirs",
  "ed25519-dalek",

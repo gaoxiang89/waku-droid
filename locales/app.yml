@@ -585,6 +585,12 @@ common.copy_to_composer:
   en: Copy to Composer
 common.copy_code:
   en: Copy Code
+common.show_diagram_source:
+  en: Show Source
+common.show_diagram:
+  en: Show Diagram
+common.diagram_render_failed:
+  en: This diagram could not be drawn.
 common.copy_expression:
   en: Copy Expression
 common.cancel:

@@ -20,7 +20,7 @@
 //! stable while a selection is dragged across it.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ use regex::Regex;
 
 use super::highlight::{self, Lang, TokenClass};
 use super::mend::PENDING_LINK_URL;
+use super::mermaid;
 use super::parser::{Block, IncrementalParser, InlineRun, ListItem, TableAlign, TopBlock};
 use super::selection::{
     RegisteredText, SelectionRegistry, SelectionState, TextKey, line_range, word_range,
@@ -257,6 +258,10 @@ impl Palette {
         }
     }
 
+    pub fn is_dark(&self) -> bool {
+        self.is_dark
+    }
+
     /// Token colors. Deliberately restrained: three hues plus muted comments,
     /// so a code block still reads as part of a graphite transcript. Shared with
     /// the code editor, so both surfaces colour code identically.
@@ -466,6 +471,8 @@ pub struct MarkdownView {
     /// outside the parsed/flattened caches so a three-second icon change never
     /// invalidates text shaping.
     copied_code_blocks: Rc<RefCell<HashMap<usize, u64>>>,
+    /// Mermaid-fence ordinals the user flipped to show their source.
+    diagram_sources: Rc<RefCell<HashSet<usize>>>,
     streaming: Cell<bool>,
 }
 
@@ -485,6 +492,7 @@ impl MarkdownView {
             style: Cell::new(None),
             veil: RefCell::new(RowVeil::default()),
             copied_code_blocks: Rc::new(RefCell::new(HashMap::new())),
+            diagram_sources: Rc::new(RefCell::new(HashSet::new())),
             streaming: Cell::new(false),
         }
     }
@@ -545,6 +553,9 @@ impl MarkdownView {
                 self.flats
                     .borrow_mut()
                     .retain(|ordinal, _| *ordinal < boundary);
+                self.diagram_sources
+                    .borrow_mut()
+                    .retain(|ordinal| *ordinal < boundary);
             }
         }
     }
@@ -604,6 +615,9 @@ pub struct Ctx<'a> {
     next_ordinal: Cell<usize>,
     /// Set while rendering the first element of a block, for copy spacing.
     starts_block: Cell<bool>,
+    /// Nesting depth of the list and block quote being rendered.
+    list_depth: Cell<usize>,
+    quote_depth: Cell<usize>,
     animate_streaming: bool,
     math_enabled: bool,
     math_menu: Option<ContextMenuHandle>,
@@ -628,6 +642,8 @@ impl<'a> Ctx<'a> {
             cache: None,
             next_ordinal: Cell::new(0),
             starts_block: Cell::new(true),
+            list_depth: Cell::new(0),
+            quote_depth: Cell::new(0),
             animate_streaming: true,
             math_enabled: true,
             math_menu: None,
@@ -685,6 +701,8 @@ impl<'a> Ctx<'a> {
             cache: Some(view),
             next_ordinal: Cell::new(self.next_ordinal.get()),
             starts_block: Cell::new(self.starts_block.get()),
+            list_depth: Cell::new(self.list_depth.get()),
+            quote_depth: Cell::new(self.quote_depth.get()),
             animate_streaming: self.animate_streaming,
             math_enabled: self.math_enabled,
             math_menu: self.math_menu.clone(),
@@ -701,6 +719,21 @@ impl<'a> Ctx<'a> {
 
     fn take_block_break(&self) -> bool {
         self.starts_block.replace(false)
+    }
+
+    /// Prose color at the current nesting: quoted text steps back a tone.
+    fn prose_color(&self) -> Hsla {
+        if self.quote_depth.get() > 0 {
+            self.palette.secondary
+        } else {
+            self.palette.text
+        }
+    }
+
+    /// Whether `ordinal` belongs to the block a streamed append can still change.
+    fn is_volatile(&self, ordinal: usize) -> bool {
+        self.cache
+            .is_some_and(|view| view.streaming.get() && ordinal >= view.volatile_from.get())
     }
 
     /// Flatten through the cache when one is wired: a settled block reuses its
@@ -1301,7 +1334,8 @@ fn markdown_capped<'a>(
     let mut children = Vec::with_capacity(blocks.len() - first);
     for (block_ix, block) in leading.iter().enumerate().skip(first) {
         ctx.next_ordinal.set(block_ordinal_base(block_ix));
-        children.push(render_block(block, &ctx));
+        let element = render_block(block, &ctx);
+        children.push(with_heading_space(block, block_ix == first, element, &ctx));
         debug_assert!(
             ctx.next_ordinal.get() - block_ordinal_base(block_ix) < 1 << BLOCK_ORDINAL_STRIDE_BITS,
             "a single block overflowed its ordinal stride"
@@ -1313,7 +1347,13 @@ fn markdown_capped<'a>(
     ctx.next_ordinal.set(last_base);
     view.volatile_from
         .set(block_ordinal_base(view.parser.display_tail_start()));
-    children.push(render_block(last, &ctx));
+    let element = render_block(last, &ctx);
+    children.push(with_heading_space(
+        last,
+        blocks.len() - 1 == first,
+        element,
+        &ctx,
+    ));
     if ctx.animate_streaming && view.streaming.get() {
         // Every element visible on the attach pass has synchronously adopted
         // its baseline. Elements introduced by later appends should now fade.
@@ -1350,7 +1390,7 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
         Block::Paragraph { runs } => {
             let key = ctx.next_key();
             let flat = ctx.flat(key.index, || {
-                flatten(runs, ctx.palette, FontWeight::NORMAL, ctx.palette.text)
+                flatten(runs, ctx.palette, FontWeight::NORMAL, ctx.prose_color())
             });
             div()
                 .w_full()
@@ -1364,12 +1404,19 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
             let (size, line_height, weight) = heading_metrics(*level, &ctx.metrics);
             let key = ctx.next_key();
             let flat = ctx.flat(key.index, || {
-                flatten(runs, ctx.palette, weight, ctx.palette.text)
+                flatten(runs, ctx.palette, weight, ctx.prose_color())
             });
             div()
                 .w_full()
                 .min_w_0()
-                .when(*level <= 2, |element| element.pt(px(4.0)))
+                // The top-level heading rule: a document title separates
+                // itself from what follows the way GitHub's does.
+                .when(*level == 1 && ctx.quote_depth.get() == 0, |element| {
+                    element
+                        .pb(px((ctx.metrics.block_gap * 0.5).round()))
+                        .border_b_1()
+                        .border_color(ctx.palette.border)
+                })
                 .text_size(px(size))
                 .line_height(px(line_height))
                 .child(text_element(&flat, key, ctx))
@@ -1404,18 +1451,17 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
         }
         Block::CodeBlock { language, code } => render_code_block(language.as_deref(), code, ctx),
         Block::BlockQuote { children } => {
-            let rendered = children
-                .iter()
-                .map(|child| render_block(child, ctx))
-                .collect::<Vec<_>>();
+            ctx.quote_depth.set(ctx.quote_depth.get() + 1);
+            let rendered = render_children(children, ctx);
+            ctx.quote_depth.set(ctx.quote_depth.get() - 1);
             div()
                 .w_full()
                 .min_w_0()
                 .flex()
-                .gap(px(10.0))
+                .gap(px(12.0))
                 .child(
                     div()
-                        .w(px(2.0))
+                        .w(px(3.0))
                         .flex_none()
                         .rounded_full()
                         .bg(ctx.palette.border),
@@ -1446,14 +1492,62 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
         Block::Rule => div()
             .w_full()
             .h(px(1.0))
-            .my(px(4.0))
+            .my(px(ctx.metrics.block_gap.round()))
             .bg(ctx.palette.border)
             .into_any_element(),
     }
 }
 
+/// Sibling blocks of one container, with headings given room above them.
+fn render_children(blocks: &[Block], ctx: &Ctx) -> Vec<AnyElement> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| with_heading_space(block, index == 0, render_block(block, ctx), ctx))
+        .collect()
+}
+
+/// A heading binds to the content below it, so it takes extra space above
+/// and only the ordinary block gap below. The first block of a container
+/// already sits against its edge and gets none.
+fn with_heading_space(block: &Block, first: bool, element: AnyElement, ctx: &Ctx) -> AnyElement {
+    let Block::Heading { level, .. } = block else {
+        return element;
+    };
+    if first {
+        return element;
+    }
+    let scale = match level {
+        1 | 2 => 1.0,
+        3 => 0.7,
+        _ => 0.4,
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .pt(px((ctx.metrics.block_gap * scale).round()))
+        .child(element)
+        .into_any_element()
+}
+
+/// Bullet glyphs by nesting depth, cycling like a browser's disc/circle/square.
+const BULLETS: [&str; 3] = ["•", "◦", "▪"];
+
 fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> AnyElement {
-    let marker_width = if ordered_start.is_some() { 22.0 } else { 14.0 };
+    let depth = ctx.list_depth.get();
+    let text_size = ctx.metrics.text_size;
+    // Ordered markers are right-aligned in a column sized for the widest
+    // number, so "9." and "10." share a text edge instead of pushing it.
+    let marker_width = match ordered_start {
+        Some(start) => {
+            let last = start.saturating_add(items.len().saturating_sub(1) as u64);
+            let digits = last.max(1).ilog10() as f32 + 1.0;
+            (text_size * (0.62 * digits + 0.95)).round()
+        }
+        None => (text_size * 1.15).round(),
+    };
+    let bullet = BULLETS[depth % BULLETS.len()];
+    ctx.list_depth.set(depth + 1);
     let rendered = items
         .iter()
         .enumerate()
@@ -1466,16 +1560,15 @@ fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> Any
                     .justify_start()
                     .child(checkbox(checked, ctx))
                     .into_any_element(),
-                (Some(start), None) => {
-                    marker_text(format!("{}.", start + index as u64), marker_width, ctx)
-                }
-                (None, None) => marker_text("•".to_owned(), marker_width, ctx),
+                (Some(start), None) => marker_text(
+                    format!("{}.", start.saturating_add(index as u64)),
+                    marker_width,
+                    true,
+                    ctx,
+                ),
+                (None, None) => marker_text(bullet.to_owned(), marker_width, false, ctx),
             };
-            let blocks = item
-                .blocks
-                .iter()
-                .map(|block| render_block(block, ctx))
-                .collect::<Vec<_>>();
+            let blocks = render_children(&item.blocks, ctx);
             div()
                 .w_full()
                 .min_w_0()
@@ -1497,6 +1590,7 @@ fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> Any
                 .into_any_element()
         })
         .collect::<Vec<_>>();
+    ctx.list_depth.set(depth);
 
     div()
         .w_full()
@@ -1510,13 +1604,18 @@ fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> Any
 
 /// A list marker. Markers are not selectable: they are generated ornament, not
 /// content the user typed, so they stay out of the selection registry.
-fn marker_text(label: String, width: f32, ctx: &Ctx) -> AnyElement {
+fn marker_text(label: String, width: f32, ordered: bool, ctx: &Ctx) -> AnyElement {
     div()
         .w(px(width))
         .flex_none()
         .text_size(px(ctx.metrics.text_size))
         .line_height(px(ctx.metrics.line_height))
         .text_color(ctx.palette.tertiary)
+        .when(ordered, |element| {
+            element
+                .text_right()
+                .pr(px((ctx.metrics.text_size * 0.45).round()))
+        })
         .child(SharedString::from(label))
         .into_any_element()
 }
@@ -1710,6 +1809,44 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
             }
         });
 
+    // A Mermaid fence draws as a diagram once it has settled. While it streams
+    // the source is still growing, and every delta would compile and cache a
+    // new half-finished picture, so it stays code until then.
+    let volatile = ctx.is_volatile(key.index);
+    let diagram_sources = mermaid::is_mermaid(language)
+        .then(|| ctx.cache.map(|view| view.diagram_sources.clone()))
+        .flatten();
+    let showing_source = diagram_sources
+        .as_ref()
+        .is_some_and(|sources| sources.borrow().contains(&key.index));
+    let toggle = diagram_sources
+        .filter(|_| !volatile)
+        .map(|sources| diagram_toggle(sources, &key, showing_source, ctx));
+    let body = if toggle.is_some() && !showing_source {
+        render_diagram(&flat, key.clone(), ctx)
+    } else {
+        div()
+            .id(SharedString::from(format!(
+                "code-{}-{}",
+                key.row, key.index
+            )))
+            .w_full()
+            .min_w_0()
+            .px(px(10.0))
+            .py(px(8.0))
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_size(px(ctx.metrics.code_text_size))
+                    .line_height(px(ctx.metrics.code_line_height))
+                    .text_color(ctx.palette.secondary)
+                    .child(text_element(&flat, key.clone(), ctx)),
+            )
+            .into_any_element()
+    };
+
     div()
         .id(SharedString::from(format!(
             "code-block-{}-{}",
@@ -1747,29 +1884,10 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
                             element.child(SharedString::from(label))
                         }),
                 )
+                .children(toggle)
                 .child(copy_button),
         )
-        .child(
-            div()
-                .id(SharedString::from(format!(
-                    "code-{}-{}",
-                    key.row, key.index
-                )))
-                .w_full()
-                .min_w_0()
-                .px(px(10.0))
-                .py(px(8.0))
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .whitespace_normal()
-                        .text_size(px(ctx.metrics.code_text_size))
-                        .line_height(px(ctx.metrics.code_line_height))
-                        .text_color(ctx.palette.secondary)
-                        .child(text_element(&flat, key, ctx)),
-                ),
-        )
+        .child(body)
         .into_any_element()
 }
 
@@ -1819,6 +1937,148 @@ fn code_runs(code: &str, lang: Option<Lang>, code_font: &Font, palette: &Palette
     runs
 }
 
+/// Header button flipping a Mermaid fence between its diagram and source.
+fn diagram_toggle(
+    sources: Rc<RefCell<HashSet<usize>>>,
+    key: &TextKey,
+    showing_source: bool,
+    ctx: &Ctx,
+) -> AnyElement {
+    let ordinal = key.index;
+    let toggle = move |cx: &mut gpui::App| {
+        let mut sources = sources.borrow_mut();
+        if !sources.remove(&ordinal) {
+            sources.insert(ordinal);
+        }
+        cx.refresh_windows();
+    };
+    let keyboard_toggle = toggle.clone();
+    div()
+        .id(SharedString::from(format!(
+            "diagram-toggle-{}-{}",
+            key.row, key.index
+        )))
+        .tab_index(0)
+        .size(px(24.0))
+        .flex_none()
+        .rounded(px(5.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_default()
+        .focus_visible(|style| style.border_1().border_color(ctx.palette.accent))
+        .hover(|style| style.bg(ctx.palette.overlay))
+        .child(crate::ui::icon(
+            if showing_source {
+                "icons/eye.svg"
+            } else {
+                "icons/file.svg"
+            },
+            11.0,
+            ctx.palette.ghost,
+        ))
+        .tooltip(Tooltip::text(if showing_source {
+            tr!("common.show_diagram")
+        } else {
+            tr!("common.show_diagram_source")
+        }))
+        .on_click(move |_, _, cx| toggle(cx))
+        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                keyboard_toggle(cx);
+                cx.stop_propagation();
+            }
+        })
+        .into_any_element()
+}
+
+/// A settled Mermaid fence drawn as an image. Compiling and rasterizing run
+/// as a background asset load; a diagram that cannot be drawn falls back to
+/// its source, still selectable, under a one-line notice.
+fn render_diagram(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
+    let diagram =
+        mermaid::DiagramSource::new(flat.text.clone(), ctx.metrics.code_text_size, ctx.palette);
+    let source = gpui::ImageSource::Custom(std::sync::Arc::new(move |window, cx| {
+        window.use_asset::<mermaid::MermaidDiagram>(&diagram, cx)
+    }));
+
+    // The fallback outlives this frame's `Ctx`, so it carries owned copies of
+    // what the source text needs.
+    let fallback = {
+        let flat = flat.clone();
+        let key = key.clone();
+        let selection = ctx.selection.clone();
+        let search = ctx.search.clone();
+        let palette = *ctx.palette;
+        let metrics = ctx.metrics;
+        let block_break = ctx.take_block_break();
+        move || {
+            let text = text_element_with_selection(
+                &flat,
+                flat.runs.clone(),
+                key.clone(),
+                selection.clone(),
+                search.clone(),
+                None,
+                palette.code_wash,
+                palette.selection,
+                palette.search_match,
+                palette.active_search_match,
+                block_break,
+            );
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .pt(px(8.0))
+                        .text_size(px((metrics.text_size - 1.5).max(12.0)))
+                        .line_height(px(metrics.line_height - 3.0))
+                        .text_color(palette.ghost)
+                        .child(tr!("common.diagram_render_failed")),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .whitespace_normal()
+                        .text_size(px(metrics.code_text_size))
+                        .line_height(px(metrics.code_line_height))
+                        .text_color(palette.secondary)
+                        .child(text),
+                )
+                .into_any_element()
+        }
+    };
+
+    div()
+        .id(SharedString::from(format!(
+            "diagram-{}-{}",
+            key.row, key.index
+        )))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .overflow_x_scroll()
+        .restrict_scroll_to_axis()
+        .p(px(12.0))
+        .child(
+            img(source)
+                // Natural size, centered; a diagram wider than the block
+                // scrolls rather than shrinking its labels below legibility.
+                .flex_none()
+                .mx_auto()
+                .with_loading(|| div().h(px(48.0)).into_any_element())
+                .with_fallback(fallback),
+        )
+        .into_any_element()
+}
+
 fn render_table(
     header: &[Vec<InlineRun>],
     rows: &[Vec<Vec<InlineRun>>],
@@ -1850,14 +2110,20 @@ fn render_table(
         );
     }
     for (index, row) in rows.iter().enumerate() {
-        table = table.child(table_row(
-            row,
-            &widths,
-            align,
-            ctx,
-            FontWeight::NORMAL,
-            index + 1 < rows.len(),
-        ));
+        table = table.child(
+            table_row(
+                row,
+                &widths,
+                align,
+                ctx,
+                FontWeight::NORMAL,
+                index + 1 < rows.len(),
+            )
+            // Faint banding keeps a wide row traceable across columns.
+            .when(index % 2 == 1, |row| {
+                row.bg(ctx.palette.overlay.opacity(0.45))
+            }),
+        );
     }
     table.into_any_element()
 }

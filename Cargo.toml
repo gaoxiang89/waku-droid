@@ -50,6 +50,8 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 waku-client = { path = "crates/waku-client" }
 waku-protocol = { path = "crates/waku-protocol" }
 pulldown-cmark = "0.13"
+# Mermaid fences: ondine's pure-Rust Mermaid-to-SVG compiler (not on crates.io).
+ondine = { package = "compiler", git = "https://github.com/wevm/ondine", rev = "6a1586e5af980e67c104239593ae931837157b8b" }
 # Native, offline math typesetting; all layout and raster work runs on workers.
 ratex-parser = "=0.1.14"
 ratex-layout = "=0.1.14"
