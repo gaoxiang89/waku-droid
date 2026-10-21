@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, Div,
-    Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, KeyDownEvent,
-    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels, Render, ScrollHandle,
-    SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window, WindowBounds, canvas,
-    div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient, list, point,
-    prelude::*, pulsating_between, px, rgb,
+    Animation, AnimationExt, AnyElement, App, Axis, Bounds, ClipboardEntry, ClipboardItem,
+    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels,
+    Render, ScrollHandle, SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
+    WindowBounds, canvas, div, ease_out_quint, fill, font, img, linear_color_stop, linear_gradient,
+    list, point, prelude::*, pulsating_between, px, rgb,
 };
 use uuid::Uuid;
 
@@ -61,19 +61,24 @@ use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
 use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference, sp};
+use terminal_split::{
+    MAX_SPLIT_PANES, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup, SplitMember,
+    axis_child_sizes,
+};
 use crate::ui::text_field::TextField;
 use crate::ui::{
     MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
     icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
 };
 use crate::{
-    CancelTaskSwitch, CancelTurn, CloseFind, CloseWindow, ConfirmTaskSwitch, CopySelection,
-    FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward, NewProject, NewSession,
-    NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings,
-    PreviousTerminal, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
-    SwitchTaskBackward, SwitchTaskForward, ToggleBottomPanel, ToggleCommandPalette,
-    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    CancelTaskSwitch, CancelTurn, CloseFind, CloseTerminalPane, CloseWindow, ConfirmTaskSwitch,
+    CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
+    NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker,
+    OpenSettings, PreviousTerminal, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
+    SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward, SwitchTaskForward,
+    ToggleBottomPanel, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
+    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
+    ToggleUsagePanel,
 };
 
 #[cfg(target_os = "macos")]
@@ -795,8 +800,8 @@ impl RightPanelSessionState {
 /// deleting the session ends the processes.
 struct BottomPanelSessionState {
     visible: bool,
-    terminals: Vec<Entity<TerminalView>>,
-    active_terminal: Option<usize>,
+    groups: Vec<SplitGroup>,
+    active_group: Option<usize>,
     tabs_scroll_handle: ScrollHandle,
     pending_tab_reveal: Option<usize>,
 }
@@ -805,8 +810,8 @@ impl BottomPanelSessionState {
     fn empty(visible: bool) -> Self {
         Self {
             visible,
-            terminals: Vec::new(),
-            active_terminal: None,
+            groups: Vec::new(),
+            active_group: None,
             tabs_scroll_handle: ScrollHandle::new(),
             pending_tab_reveal: None,
         }
@@ -1579,11 +1584,15 @@ pub struct Waku {
     workspace_queries_stale: bool,
     right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
-    /// The bottom panel's terminals, in tab order — the selected session's.
-    /// Each keeps the directory and host it was opened with, and only closing
-    /// its tab (or deleting its session, or quitting) ends the process.
-    bottom_panel_terminals: Vec<Entity<TerminalView>>,
-    bottom_panel_active_terminal: Option<usize>,
+    /// The bottom panel's terminal tabs, in tab order — the selected
+    /// session's. Each tab is a split group: one pane at first, more as the
+    /// user splits. Each terminal keeps the directory and host it was opened
+    /// with, and only closing its tab (or deleting its session, or quitting)
+    /// ends the process.
+    bottom_panel_terminal_groups: Vec<SplitGroup>,
+    bottom_panel_active_group: Option<usize>,
+    /// A split divider is being dragged; pointer moves re-weigh its panes.
+    split_divider_drag: Option<SplitDividerDrag>,
     bottom_panel_tabs_scroll_handle: ScrollHandle,
     bottom_panel_pending_tab_reveal: Option<usize>,
     /// The panel was just opened or switched tabs; the next render moves
@@ -1820,6 +1829,7 @@ mod sidebar;
 mod skills_page;
 mod streaming;
 mod task_switcher;
+mod terminal_split;
 mod transcript;
 mod transcript_search;
 mod transcript_view;
@@ -3238,8 +3248,9 @@ impl Waku {
                 right_panel_width,
                 bottom_panel_visible,
                 bottom_panel_height,
-                bottom_panel_terminals: Vec::new(),
-                bottom_panel_active_terminal: None,
+                bottom_panel_terminal_groups: Vec::new(),
+                bottom_panel_active_group: None,
+                split_divider_drag: None,
                 bottom_panel_tabs_scroll_handle: ScrollHandle::new(),
                 bottom_panel_pending_tab_reveal: None,
                 bottom_panel_pending_terminal_focus: false,

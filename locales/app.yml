@@ -1551,6 +1551,12 @@ bottom_panel.resize:
   en: Resize bottom panel
 bottom_panel.new_terminal:
   en: New terminal
+bottom_panel.split_right:
+  en: Split terminal right
+bottom_panel.split_down:
+  en: Split terminal down
+bottom_panel.close_pane:
+  en: Close terminal pane
 bottom_panel.tabs:
   en: Terminal tabs
 bottom_panel.close_tab:

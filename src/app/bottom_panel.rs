@@ -35,12 +35,14 @@ impl Waku {
             }))
     }
 
-    /// One terminal per tab behind a 34 px strip that replaces the terminal's
-    /// own toolbar; the strip carries what the toolbar did (status, title) per
-    /// tab. Terminals belong to the session they were opened in — switching
-    /// sessions swaps the panel's tabs and visibility, and only closing a tab
-    /// (or deleting the session) ends the process. The resize handle along the
-    /// top edge rides along as an overlay.
+    /// One terminal tab behind a 34 px strip that replaces the terminal's own
+    /// toolbar; the strip carries what the toolbar did (status, title) per
+    /// tab. A tab's terminals fill the panel together as a split tree that
+    /// the split shortcuts grow and the close shortcut shrinks. Terminals
+    /// belong to the session they were opened in — switching sessions swaps
+    /// the panel's tabs and visibility, and only closing a tab (or deleting
+    /// the session) ends the process. The resize handle along the top edge
+    /// rides along as an overlay.
     pub(super) fn render_bottom_panel(
         &mut self,
         height: f32,
@@ -50,19 +52,19 @@ impl Waku {
     ) -> Stateful<Div> {
         self.ensure_bottom_panel_terminal(cx);
         if self.bottom_panel_pending_terminal_focus
-            && let Some(terminal) = self.active_bottom_panel_terminal().cloned()
+            && let Some(terminal) = self.active_bottom_panel_terminal()
         {
             let focus_handle = terminal.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             self.bottom_panel_pending_terminal_focus = false;
         }
-        let body = match self.active_bottom_panel_terminal().cloned() {
-            Some(terminal) => {
-                terminal.update(cx, |terminal, _| {
-                    terminal.set_panel_width(width);
-                    terminal
-                        .set_panel_height((height - BOTTOM_PANEL_TAB_STRIP_HEIGHT).max(0.0));
-                });
+        let body = match self.active_bottom_panel_group_index() {
+            Some(group_index) => {
+                let content_height = (height - BOTTOM_PANEL_TAB_STRIP_HEIGHT).max(0.0);
+                let member = &self.bottom_panel_terminal_groups[group_index].root;
+                let splits = self.render_bottom_panel_split(
+                    group_index, member, 1.0, width, content_height, &[], cx,
+                );
                 div()
                     .id("bottom-panel-body")
                     .flex_1()
@@ -70,8 +72,9 @@ impl Waku {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .overflow_hidden()
                     .child(self.render_bottom_panel_tab_strip(cx))
-                    .child(terminal)
+                    .child(splits)
                     .into_any_element()
             }
             None => self
@@ -97,12 +100,187 @@ impl Waku {
             .child(self.render_bottom_panel_resize_handle(cx))
     }
 
-    /// The tab strip: one tab per terminal (status dot, label, close) plus the
-    /// new-terminal button, laid out like the right panel's tab row —
-    /// scrollable with edge fades when tabs overflow.
+    /// The active tab's split tree. Pane wrappers carry the split and close
+    /// actions so they run against the focused pane — the key chords only
+    /// reach the keymap from a bottom-panel terminal, and the action rides
+    /// the same focus path back down.
+    #[allow(clippy::too_many_arguments)]
+    fn render_bottom_panel_split(
+        &self,
+        group_index: usize,
+        member: &SplitMember,
+        flex: f32,
+        width: f32,
+        height: f32,
+        path: &[usize],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match member {
+            SplitMember::Pane(terminal) => {
+                // The mirrored box this pane will occupy; the terminal sizes
+                // its grid from it, so it must match the flexbox arithmetic
+                // below (grow weights, zero basis, flex-none dividers).
+                terminal.update(cx, |terminal, _| {
+                    terminal.set_panel_width(width);
+                    terminal.set_panel_height(height);
+                });
+                let split_right_pane = terminal.clone();
+                let split_down_pane = terminal.clone();
+                let close_pane = terminal.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "bottom-panel-pane-{:?}",
+                        terminal.entity_id()
+                    )))
+                    .relative()
+                    .overflow_hidden()
+                    .flex_grow(flex)
+                    .flex_basis(px(0.0))
+                    .min_w_0()
+                    .min_h_0()
+                    .child(terminal.clone())
+                    .on_action(cx.listener(move |this, _: &SplitTerminalRight, _, cx| {
+                        this.split_bottom_panel_pane(&split_right_pane, Axis::Horizontal, cx);
+                    }))
+                    .on_action(cx.listener(move |this, _: &SplitTerminalDown, _, cx| {
+                        this.split_bottom_panel_pane(&split_down_pane, Axis::Vertical, cx);
+                    }))
+                    .on_action(cx.listener(move |this, _: &CloseTerminalPane, _, cx| {
+                        this.close_bottom_panel_pane(&close_pane, cx);
+                    }))
+                    .into_any_element()
+            }
+            SplitMember::Axis(axis) => {
+                let (child_sizes, space_per_flex) = axis_child_sizes(
+                    match axis.axis {
+                        Axis::Horizontal => width,
+                        Axis::Vertical => height,
+                    },
+                    &axis.flexes,
+                );
+                let mut container = div()
+                    .flex()
+                    .when(axis.axis == Axis::Horizontal, |element| element.flex_row())
+                    .when(axis.axis == Axis::Vertical, |element| element.flex_col())
+                    .relative()
+                    .overflow_hidden()
+                    .flex_grow(flex)
+                    .flex_basis(px(0.0))
+                    .min_w_0()
+                    .min_h_0();
+                for (index, child) in axis.members.iter().enumerate() {
+                    let child_width = match axis.axis {
+                        Axis::Horizontal => child_sizes[index],
+                        Axis::Vertical => width,
+                    };
+                    let child_height = match axis.axis {
+                        Axis::Vertical => child_sizes[index],
+                        Axis::Horizontal => height,
+                    };
+                    let mut child_path = path.to_vec();
+                    child_path.push(index);
+                    if index > 0 {
+                        container = container.child(self.render_bottom_panel_divider(
+                            group_index,
+                            path.to_vec(),
+                            index - 1,
+                            axis.axis,
+                            child_sizes[index - 1],
+                            child_sizes[index],
+                            space_per_flex,
+                            cx,
+                        ));
+                    }
+                    container = container.child(self.render_bottom_panel_split(
+                        group_index,
+                        child,
+                        axis.flexes.get(index).copied().unwrap_or(1.0),
+                        child_width,
+                        child_height,
+                        &child_path,
+                        cx,
+                    ));
+                }
+                container.into_any_element()
+            }
+        }
+    }
+
+    /// The draggable seam between two panes: a flex-none strip wider than
+    /// its 1 px paint so the grab area is humane.
+    #[allow(clippy::too_many_arguments)]
+    fn render_bottom_panel_divider(
+        &self,
+        group_index: usize,
+        path: Vec<usize>,
+        divider_after: usize,
+        axis: Axis,
+        first_size: f32,
+        second_size: f32,
+        space_per_flex: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let horizontal = axis == Axis::Horizontal;
+        let (line, drag) = if horizontal {
+            (
+                div()
+                    .absolute()
+                    .left(px((SPLIT_DIVIDER_SIZE - 1.0) / 2.0))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(theme.border_strong),
+                div().w(px(SPLIT_DIVIDER_SIZE)).h_full().cursor_col_resize(),
+            )
+        } else {
+            (
+                div()
+                    .absolute()
+                    .top(px((SPLIT_DIVIDER_SIZE - 1.0) / 2.0))
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(theme.border_strong),
+                div().h(px(SPLIT_DIVIDER_SIZE)).w_full().cursor_row_resize(),
+            )
+        };
+        drag.id(SharedString::from(format!(
+            "bottom-panel-divider-{group_index}-{}",
+            path.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("-")
+        )))
+        .relative()
+        .flex_none()
+        .child(line)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.split_divider_drag = Some(SplitDividerDrag::new(
+                    group_index,
+                    path.clone(),
+                    divider_after,
+                    axis,
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                    first_size,
+                    second_size,
+                    space_per_flex,
+                ));
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+    }
+
+    /// The tab strip: one tab per group (status dot, label, pane count,
+    /// close) plus the new-terminal and split buttons, laid out like the
+    /// right panel's tab row — scrollable with edge fades when tabs overflow.
     fn render_bottom_panel_tab_strip(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let active = self.bottom_panel_active_terminal;
+        let active = self.bottom_panel_active_group;
         let mut tabs = div()
             .id("bottom-panel-tabs")
             .h_full()
@@ -113,11 +291,18 @@ impl Waku {
             .gap(px(4.0))
             .overflow_x_scroll()
             .track_scroll(&self.bottom_panel_tabs_scroll_handle);
-        for (index, terminal) in self.bottom_panel_terminals.iter().enumerate() {
+        for (index, group) in self.bottom_panel_terminal_groups.iter().enumerate() {
             let is_active = active == Some(index);
-            let terminal = terminal.read(cx);
+            let Some(reference) = group.active_or_first() else {
+                continue;
+            };
+            let terminal = reference.read(cx);
             let exited = terminal.exited();
-            let label = bottom_panel_tab_label(terminal.title(), terminal.working_directory());
+            let pane_count = group.pane_count();
+            let mut label = bottom_panel_tab_label(terminal.title(), terminal.working_directory());
+            if pane_count > 1 {
+                label.push_str(&format!(" · {pane_count}"));
+            }
             let close_weak = cx.entity().downgrade();
             let activate_weak = cx.entity().downgrade();
             tabs = tabs.child(
@@ -193,13 +378,13 @@ impl Waku {
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
                                 let _ = close_weak.update(cx, |this, cx| {
-                                    this.close_bottom_panel_terminal(index, cx);
+                                    this.close_bottom_panel_group(index, cx);
                                 });
                             }),
                     )
                     .on_click(move |_, _, cx| {
                         let _ = activate_weak.update(cx, |this, cx| {
-                            this.activate_bottom_panel_terminal(index, cx);
+                            this.activate_bottom_panel_group(index, cx);
                         });
                     }),
             );
@@ -207,6 +392,8 @@ impl Waku {
         tabs = tabs.child(div().w(px(TAB_SCROLL_FADE_WIDTH)).h(px(1.0)).flex_none());
 
         let new_terminal_weak = cx.entity().downgrade();
+        let split_weak = cx.entity().downgrade();
+        let split_pane = self.active_bottom_panel_terminal();
         div()
             .id("bottom-panel-tab-strip")
             .h(px(BOTTOM_PANEL_TAB_STRIP_HEIGHT))
@@ -264,7 +451,26 @@ impl Waku {
                                     this.open_bottom_panel_terminal(cx);
                                 });
                             }),
-                    ),
+                    )
+                    .when_some(split_pane, |element, pane| {
+                        element.child(
+                            icon_button(
+                                "split-bottom-panel-terminal",
+                                "icons/split.svg",
+                                theme,
+                            )
+                            .tooltip(|window, cx| {
+                                Tooltip::new(tr!("bottom_panel.split_right"))
+                                    .build(window, cx)
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = split_weak.update(cx, |this, cx| {
+                                    this.split_bottom_panel_pane(&pane, Axis::Horizontal, cx);
+                                });
+                            }),
+                        )
+                    }),
             )
     }
 
@@ -309,24 +515,33 @@ impl Waku {
             )
     }
 
-    fn active_bottom_panel_terminal(&self) -> Option<&Entity<TerminalView>> {
-        self.bottom_panel_active_terminal
-            .and_then(|index| self.bottom_panel_terminals.get(index))
+    fn active_bottom_panel_group_index(&self) -> Option<usize> {
+        self.bottom_panel_active_group
+            .filter(|index| *index < self.bottom_panel_terminal_groups.len())
+    }
+
+    fn active_bottom_panel_terminal(&self) -> Option<Entity<TerminalView>> {
+        self.bottom_panel_active_group
+            .and_then(|index| self.bottom_panel_terminal_groups.get(index))
+            .and_then(SplitGroup::active_or_first)
     }
 
     /// Show the panel with a fresh terminal — the `+` button, shortcut, and
     /// palette all funnel here. With no terminals open this just bootstraps
     /// the first one; with no workspace selected the panel opens empty.
     pub(super) fn open_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.bottom_panel_terminals.is_empty() {
+        if self.bottom_panel_terminal_groups.is_empty() {
             self.ensure_bottom_panel_terminal(cx);
         } else if let Some(working_directory) = self.selected_workspace_path() {
             let working_directory = working_directory.to_path_buf();
-            self.bottom_panel_terminals
-                .push(self.new_bottom_panel_terminal(&working_directory, cx));
-            self.bottom_panel_active_terminal = Some(self.bottom_panel_terminals.len() - 1);
+            let mut group = SplitGroup::single(self.new_bottom_panel_terminal(&working_directory, cx));
+            if let Some(first) = group.active_or_first() {
+                group.set_active(first.entity_id());
+            }
+            self.bottom_panel_terminal_groups.push(group);
+            self.bottom_panel_active_group = Some(self.bottom_panel_terminal_groups.len() - 1);
         }
-        if let Some(active) = self.bottom_panel_active_terminal {
+        if let Some(active) = self.bottom_panel_active_group {
             self.reveal_bottom_panel_tab(active);
             self.bottom_panel_pending_terminal_focus = true;
         }
@@ -338,16 +553,19 @@ impl Waku {
     /// are never recreated or dropped here: they belong to the session they
     /// were opened in and die only when their tab closes.
     pub(super) fn ensure_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
-        if !self.bottom_panel_terminals.is_empty() {
+        if !self.bottom_panel_terminal_groups.is_empty() {
             return;
         }
         let Some(working_directory) = self.selected_workspace_path() else {
             return;
         };
         let working_directory = working_directory.to_path_buf();
-        self.bottom_panel_terminals
-            .push(self.new_bottom_panel_terminal(&working_directory, cx));
-        self.bottom_panel_active_terminal = Some(0);
+        let mut group = SplitGroup::single(self.new_bottom_panel_terminal(&working_directory, cx));
+        if let Some(first) = group.active_or_first() {
+            group.set_active(first.entity_id());
+        }
+        self.bottom_panel_terminal_groups.push(group);
+        self.bottom_panel_active_group = Some(0);
     }
 
     fn new_bottom_panel_terminal(
@@ -405,7 +623,7 @@ impl Waku {
         // The persisted layout flag follows whichever session is on screen, so
         // relaunching restores the panel the way this session left it.
         self.state.bottom_panel_visible = self.bottom_panel_visible;
-        if self.bottom_panel_visible && self.bottom_panel_active_terminal.is_some() {
+        if self.bottom_panel_visible && self.bottom_panel_active_group.is_some() {
             self.bottom_panel_pending_terminal_focus = true;
         }
     }
@@ -429,8 +647,8 @@ impl Waku {
     fn take_active_bottom_panel_state(&mut self) -> BottomPanelSessionState {
         BottomPanelSessionState {
             visible: self.bottom_panel_visible,
-            terminals: std::mem::take(&mut self.bottom_panel_terminals),
-            active_terminal: self.bottom_panel_active_terminal.take(),
+            groups: std::mem::take(&mut self.bottom_panel_terminal_groups),
+            active_group: self.bottom_panel_active_group.take(),
             tabs_scroll_handle: std::mem::replace(
                 &mut self.bottom_panel_tabs_scroll_handle,
                 ScrollHandle::new(),
@@ -441,18 +659,18 @@ impl Waku {
 
     fn replace_active_bottom_panel_state(&mut self, state: BottomPanelSessionState) {
         self.bottom_panel_visible = state.visible;
-        self.bottom_panel_terminals = state.terminals;
-        self.bottom_panel_active_terminal = state.active_terminal;
+        self.bottom_panel_terminal_groups = state.groups;
+        self.bottom_panel_active_group = state.active_group;
         self.bottom_panel_tabs_scroll_handle = state.tabs_scroll_handle;
         self.bottom_panel_pending_tab_reveal = state.pending_tab_reveal;
         self.bottom_panel_pending_terminal_focus = false;
     }
 
-    fn activate_bottom_panel_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.bottom_panel_terminals.len() {
+    fn activate_bottom_panel_group(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.bottom_panel_terminal_groups.len() {
             return;
         }
-        self.bottom_panel_active_terminal = Some(index);
+        self.bottom_panel_active_group = Some(index);
         self.reveal_bottom_panel_tab(index);
         self.bottom_panel_pending_terminal_focus = true;
         cx.notify();
@@ -463,20 +681,75 @@ impl Waku {
         self.bottom_panel_tabs_scroll_handle.scroll_to_item(index);
     }
 
-    /// Close one terminal's tab. Dropping the entity is what shuts the PTY
-    /// down, locally and on a remote daemon alike. Closing the last tab hides
-    /// the panel, the way the right panel does.
-    pub(super) fn close_bottom_panel_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.bottom_panel_terminals.len() {
+    /// Split one pane in two. The new pane takes the focus so consecutive
+    /// splits stack where the user is looking.
+    pub(super) fn split_bottom_panel_pane(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        axis: Axis,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group_index) = self
+            .bottom_panel_terminal_groups
+            .iter()
+            .position(|group| group.contains(pane.entity_id()))
+        else {
+            return;
+        };
+        if self.bottom_panel_terminal_groups[group_index].pane_count() >= MAX_SPLIT_PANES {
             return;
         }
-        self.bottom_panel_terminals.remove(index);
-        self.bottom_panel_active_terminal = active_index_after_close(
+        let Some(working_directory) = self.selected_workspace_path() else {
+            return;
+        };
+        let working_directory = working_directory.to_path_buf();
+        let new_pane = self.new_bottom_panel_terminal(&working_directory, cx);
+        let group = &mut self.bottom_panel_terminal_groups[group_index];
+        if !group.split_pane(pane.entity_id(), new_pane, axis) {
+            return;
+        }
+        self.bottom_panel_active_group = Some(group_index);
+        self.reveal_bottom_panel_tab(group_index);
+        self.bottom_panel_pending_terminal_focus = true;
+        cx.notify();
+    }
+
+    /// Close one pane. Closing the last pane of a tab closes the tab; closing
+    /// the last tab hides the panel, the way the right panel does.
+    pub(super) fn close_bottom_panel_pane(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group_index) = self
+            .bottom_panel_terminal_groups
+            .iter()
+            .position(|group| group.contains(pane.entity_id()))
+        else {
+            return;
+        };
+        if self.bottom_panel_terminal_groups[group_index].remove_pane(pane.entity_id()) {
+            self.bottom_panel_pending_terminal_focus = true;
+            cx.notify();
+            return;
+        }
+        self.close_bottom_panel_group(group_index, cx);
+    }
+
+    /// Close one terminal tab, together with every pane it still shows.
+    /// Dropping the entities is what shuts the PTYs down, locally and on a
+    /// remote daemon alike.
+    pub(super) fn close_bottom_panel_group(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.bottom_panel_terminal_groups.len() {
+            return;
+        }
+        self.bottom_panel_terminal_groups.remove(index);
+        self.bottom_panel_active_group = active_index_after_close(
             index,
-            self.bottom_panel_active_terminal,
-            self.bottom_panel_terminals.len(),
+            self.bottom_panel_active_group,
+            self.bottom_panel_terminal_groups.len(),
         );
-        match self.bottom_panel_active_terminal {
+        match self.bottom_panel_active_group {
             Some(active) => {
                 self.reveal_bottom_panel_tab(active);
                 self.bottom_panel_pending_terminal_focus = true;
@@ -490,15 +763,49 @@ impl Waku {
         cx.notify();
     }
 
+    /// Dragging a divider re-weighs its two neighbors; the mirrored layout
+    /// math turns the pointer delta into flex weights.
+    pub(super) fn split_divider_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.split_divider_drag.clone() else {
+            return;
+        };
+        let resized = self
+            .bottom_panel_terminal_groups
+            .get_mut(drag.group_index)
+            .is_some_and(|group| {
+                group.resize_divider(&drag, f32::from(event.position.x), f32::from(event.position.y))
+            });
+        if !resized {
+            self.split_divider_drag = None;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn finish_split_divider_drag(
+        &mut self,
+        event: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left && self.split_divider_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Cycle tabs for ctrl+pageup/pagedown, wrapping around the ends.
     pub(super) fn cycle_bottom_panel_terminal(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let len = self.bottom_panel_terminals.len();
+        let len = self.bottom_panel_terminal_groups.len();
         if len == 0 {
             return;
         }
-        let active = self.bottom_panel_active_terminal.unwrap_or(0) as i32;
+        let active = self.bottom_panel_active_group.unwrap_or(0) as i32;
         let next = (active + delta).rem_euclid(len as i32) as usize;
-        self.activate_bottom_panel_terminal(next, cx);
+        self.activate_bottom_panel_group(next, cx);
     }
 
     pub(super) fn new_terminal_action(
@@ -591,24 +898,24 @@ mod tests {
         let other_session = Uuid::new_v4();
         let mut states = HashMap::new();
         let mut state = BottomPanelSessionState::empty(true);
-        state.active_terminal = Some(0);
+        state.active_group = Some(0);
         states.insert(session, state);
 
         // A session with no stored panel state opens closed, exactly as the
         // right panel treats one never visited before.
         let missing = BottomPanelSessionState::take_or_closed(&mut states, other_session);
         assert!(!missing.visible);
-        assert_eq!(missing.active_terminal, None);
+        assert_eq!(missing.active_group, None);
 
         // Taking hands the stored state over once, so a session opened twice
         // without being switched away from in between reads closed the second
         // time — the map, not the flag, is the source of truth.
         let restored = BottomPanelSessionState::take_or_closed(&mut states, session);
         assert!(restored.visible);
-        assert_eq!(restored.active_terminal, Some(0));
+        assert_eq!(restored.active_group, Some(0));
         let again = BottomPanelSessionState::take_or_closed(&mut states, session);
         assert!(!again.visible);
-        assert!(again.terminals.is_empty());
+        assert!(again.groups.is_empty());
     }
 
     #[test]

@@ -74,6 +74,9 @@ actions!(
         NewTerminal,
         NextTerminal,
         PreviousTerminal,
+        SplitTerminalRight,
+        SplitTerminalDown,
+        CloseTerminalPane,
         ToggleCommandPalette,
         OpenResumePicker,
         ToggleFpsCounter,
@@ -250,6 +253,13 @@ pub fn run() {
                 KeyBinding::new("secondary-shift-j", NewTerminal, None),
                 KeyBinding::new("ctrl-pagedown", NextTerminal, Some("Terminal")),
                 KeyBinding::new("ctrl-pageup", PreviousTerminal, Some("Terminal")),
+                // Split the focused terminal pane; the down chord stacks,
+                // the plain chord goes side by side. The close chord shuts
+                // the focused pane, and the tab with it when it was the
+                // last pane.
+                KeyBinding::new("secondary-shift-d", SplitTerminalRight, Some("Terminal")),
+                KeyBinding::new("secondary-alt-shift-d", SplitTerminalDown, Some("Terminal")),
+                KeyBinding::new("secondary-shift-w", CloseTerminalPane, Some("Terminal")),
                 KeyBinding::new("secondary-k", ToggleCommandPalette, None),
                 KeyBinding::new("secondary-alt-shift-f", ToggleFpsCounter, None),
                 KeyBinding::new("secondary-[", NavigateBack, Some("Waku")),

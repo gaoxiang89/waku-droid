@@ -1196,6 +1196,36 @@ impl TerminalView {
         }
     }
 
+    /// An entity with no session and no subscriptions, for tests outside
+    /// this module that need terminals without a live PTY.
+    #[cfg(test)]
+    pub(crate) fn inert_test_view_entity(cx: &mut App) -> gpui::Entity<Self> {
+        cx.new(|cx| Self {
+            session: None,
+            launcher: TerminalLauncher::Local,
+            error: None,
+            focus_handle: cx.focus_handle(),
+            title: String::new(),
+            working_directory: PathBuf::new(),
+            exited: false,
+            scroll_accumulator: 0.0,
+            panel_width: 320.0,
+            panel_height: Some(160.0),
+            measured_cell_width: Some(8.0),
+            scrollbar_state: ScrollbarState::new(),
+            grid_bounds: Rc::new(Cell::new(None)),
+            cursor_position: None,
+            composition: None,
+            selecting: false,
+            hovered_link: None,
+            cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
+            cursor_focus_tracking_started: false,
+            context_menu: ContextMenuHandle::new(cx),
+            bottom_panel_tabs: true,
+            _subscriptions: Vec::new(),
+        })
+    }
+
     /// Let the bottom panel's tab strip own this terminal's chrome.
     pub fn with_bottom_panel_tabs(mut self) -> Self {
         self.bottom_panel_tabs = true;
@@ -1278,6 +1308,22 @@ impl TerminalView {
             && matches!(keystroke.key.as_str(), "pageup" | "pagedown")
         {
             return;
+        }
+        // Split and close-pane chords reach the panel's actions the same way:
+        // secondary+shift+d splits right, secondary+alt+shift+d splits down,
+        // and secondary+shift+w closes the focused pane.
+        if self.bottom_panel_tabs
+            && keystroke.modifiers.secondary()
+            && keystroke.modifiers.shift
+            && !keystroke.modifiers.function
+        {
+            let key = keystroke.key.as_str();
+            let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
+            let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
+            let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
+            if split_right || split_down || close_pane {
+                return;
+            }
         }
         if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
             && keystroke.key.eq_ignore_ascii_case("c")

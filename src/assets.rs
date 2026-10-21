@@ -193,6 +193,7 @@ const ICONS: &[(&str, &[u8])] = icons![
     "settings",
     "slash",
     "sparkle",
+    "split",
     "star",
     "star-filled",
     "stop",

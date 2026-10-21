@@ -797,6 +797,9 @@ right_panel.close_tab: "%{title} を閉じる"
 bottom_panel.toggle: 下パネルの表示を切り替える
 bottom_panel.resize: 下パネルの高さを変更
 bottom_panel.new_terminal: 新規ターミナル
+bottom_panel.split_right: ターミナルを左右に分割
+bottom_panel.split_down: ターミナルを上下に分割
+bottom_panel.close_pane: 分割ペインを閉じる
 bottom_panel.tabs: ターミナルタブ
 bottom_panel.close_tab: "%{title} を閉じる"
 

@@ -2196,9 +2196,9 @@ impl Waku {
                 let focus_handle = self.composer_focus(cx);
                 window.focus(&focus_handle, cx);
             }
-        } else if let Some(active) = self.bottom_panel_active_terminal {
-            self.close_bottom_panel_terminal(active, cx);
-            if self.bottom_panel_terminals.is_empty() {
+        } else if let Some(active) = self.bottom_panel_active_group {
+            self.close_bottom_panel_group(active, cx);
+            if self.bottom_panel_terminal_groups.is_empty() {
                 let focus_handle = self.composer_focus(cx);
                 window.focus(&focus_handle, cx);
             }

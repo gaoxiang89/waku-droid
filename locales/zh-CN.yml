@@ -760,6 +760,9 @@ right_panel.close_tab: 关闭%{title}
 bottom_panel.toggle: 显示或隐藏底部面板
 bottom_panel.resize: 调整底部面板高度
 bottom_panel.new_terminal: 新建终端
+bottom_panel.split_right: 向右分屏
+bottom_panel.split_down: 向下分屏
+bottom_panel.close_pane: 关闭终端分屏
 bottom_panel.tabs: 终端标签页
 bottom_panel.close_tab: 关闭%{title}
 open_in.open: 用%{app}打开项目
