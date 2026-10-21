@@ -95,8 +95,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
           rustup target add "$TARGET"
 
       - name: Install musl
@@ -110,9 +110,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.runner }}-rust-1.96.0-musl-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.runner }}-rust-1.97.0-musl-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.runner }}-rust-1.96.0-musl-
+            ${{ matrix.runner }}-rust-1.97.0-musl-
 
       - name: Build
         run: |
@@ -150,8 +150,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
 
       - name: Install Linux dependencies
         run: |
@@ -177,7 +177,7 @@ jobs:
             target
           key: ubuntu-22.04-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ubuntu-22.04-rust-1.96.0-release-
+            ubuntu-22.04-rust-1.97.0-release-
 
       # `target/` is restored from the release cache, so the previous
       # release's bundles are still sitting in `target/release` when this one
@@ -223,8 +223,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
 
       - name: Install Linux dependencies
         run: |
@@ -250,7 +250,7 @@ jobs:
             target
           key: ubuntu-22.04-arm-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ubuntu-22.04-arm-rust-1.96.0-release-
+            ubuntu-22.04-arm-rust-1.97.0-release-
 
       # `target/` is restored from the release cache, so the previous
       # release's bundles are still sitting in `target/release` when this one
@@ -291,8 +291,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
           rustup target add x86_64-pc-windows-msvc
 
       - uses: oven-sh/setup-bun@v2
@@ -308,7 +308,7 @@ jobs:
             target
           key: windows-latest-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-latest-rust-1.96.0-release-
+            windows-latest-rust-1.97.0-release-
 
       # `target/` is restored from the release cache, so the previous
       # release's bundles are still sitting in `target/release` when this one
@@ -353,8 +353,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
           rustup target add aarch64-pc-windows-msvc
 
       - uses: oven-sh/setup-bun@v2
@@ -370,7 +370,7 @@ jobs:
             target
           key: windows-11-arm-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-11-arm-rust-1.96.0-release-
+            windows-11-arm-rust-1.97.0-release-
 
       # `target/` is restored from the release cache, so the previous
       # release's bundles are still sitting in `target/release` when this one

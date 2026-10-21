@@ -27,8 +27,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -57,9 +57,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.os }}-rust-1.96.0-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.os }}-rust-1.97.0-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.os }}-rust-1.96.0-cargo-
+            ${{ matrix.os }}-rust-1.97.0-cargo-
 
       - name: Run tests
         run: cargo test --locked
