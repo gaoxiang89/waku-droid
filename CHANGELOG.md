@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.29]
+
+- Browse the project's commit history in a Git graph tab in the right panel, with branch lanes, branch and tag labels, search, and a detail view of each commit's message and files
+- Resize the right panel and bottom panel as far as the window allows instead of stopping at a fixed size
+
 ## [0.1.28]
 
 - Scroll full-screen terminal apps such as Claude Code with the mouse wheel; Shift-scroll still moves the terminal's own history
