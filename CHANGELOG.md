@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.32]
+
+- Keep the bottom panel's terminal buttons on one row instead of letting them stack and overflow, and light up the documented split, resize, and close shortcuts there on Windows, including Windows Terminal's Shift+Alt+=, Shift+Alt+-, and Shift+Alt+arrow chords
+- Recognize inline code file paths in the transcript as links that open the file in the Files panel
+
 ## [0.1.31]
 
 - Keep workspace panels (Files, Git, and both terminals) across sessions tied to the workspace directory, and reorder header toggle buttons to lead with the bottom terminal
