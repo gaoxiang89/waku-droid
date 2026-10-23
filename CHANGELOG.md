@@ -16,6 +16,9 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.28]
+
+- Scroll full-screen terminal apps such as Claude Code with the mouse wheel; Shift-scroll still moves the terminal's own history
 - Offer the reasoning effort picker for Grok 4.7 and Grok 4.7 Fast in Grok Build, including Extra High
 
 ## [0.1.27]
