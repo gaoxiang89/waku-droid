@@ -1290,6 +1290,97 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.pause_cursor_blink(cx);
         let keystroke = &event.keystroke;
+
+        // Split, close-pane, and resize chords reach the panel's actions:
+        // secondary+shift+d splits right, secondary+alt+shift+d splits down,
+        // secondary+shift+w / ctrl+shift+w closes the focused pane,
+        // and Windows Terminal chords (alt+shift+plus/minus, alt+shift+arrows)
+        // split and resize.
+        if self.bottom_panel_tabs {
+            if (keystroke.modifiers.secondary() || keystroke.modifiers.control)
+                && keystroke.modifiers.shift
+                && !keystroke.modifiers.function
+            {
+                let key = keystroke.key.as_str();
+                let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
+                let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
+                let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
+                if split_right {
+                    cx.dispatch_action(&crate::SplitTerminalRight);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if split_down {
+                    cx.dispatch_action(&crate::SplitTerminalDown);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if close_pane {
+                    cx.dispatch_action(&crate::CloseTerminalPane);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+            if keystroke.modifiers.alt && !keystroke.modifiers.function {
+                let key = keystroke.key.as_str();
+                let key_char = keystroke.key_char.as_deref().unwrap_or("");
+                let split_right = (keystroke.modifiers.shift
+                    && (matches!(key, "+" | "=" | "plus" | "add" | "equal") || key_char == "+"))
+                    || matches!(key, "+" | "add" | "plus")
+                    || key_char == "+";
+                let split_down = (keystroke.modifiers.shift
+                    && (matches!(key, "-" | "_" | "minus" | "subtract" | "underscore")
+                        || key_char == "-"
+                        || key_char == "_"))
+                    || matches!(key, "-" | "subtract" | "minus")
+                    || key_char == "-";
+                if split_right {
+                    cx.dispatch_action(&crate::SplitTerminalRight);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if split_down {
+                    cx.dispatch_action(&crate::SplitTerminalDown);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                if keystroke.modifiers.shift {
+                    match key {
+                        "left" => {
+                            cx.dispatch_action(&crate::ResizeTerminalPaneLeft);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "right" => {
+                            cx.dispatch_action(&crate::ResizeTerminalPaneRight);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "up" => {
+                            cx.dispatch_action(&crate::ResizeTerminalPaneUp);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "down" => {
+                            cx.dispatch_action(&crate::ResizeTerminalPaneDown);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // The platform owns candidate navigation/confirmation while composing.
         // Printable input must also reach its text handler, otherwise dead keys
         // and IMEs are bypassed (or ordinary characters get sent twice).
@@ -1308,35 +1399,6 @@ impl TerminalView {
             && matches!(keystroke.key.as_str(), "pageup" | "pagedown")
         {
             return;
-        }
-        // Split, close-pane, and resize chords reach the panel's actions the same way:
-        // secondary+shift+d splits right, secondary+alt+shift+d splits down,
-        // secondary+shift+w / ctrl+shift+w closes the focused pane,
-        // and Windows Terminal chords (alt+shift+plus/minus, alt+shift+arrows)
-        // split and resize.
-        if self.bottom_panel_tabs {
-            if (keystroke.modifiers.secondary() || keystroke.modifiers.control)
-                && keystroke.modifiers.shift
-                && !keystroke.modifiers.function
-            {
-                let key = keystroke.key.as_str();
-                let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
-                let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
-                let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
-                if split_right || split_down || close_pane {
-                    return;
-                }
-            }
-            if keystroke.modifiers.alt && keystroke.modifiers.shift && !keystroke.modifiers.function
-            {
-                let key = keystroke.key.as_str();
-                let split_right = matches!(key, "+" | "=" | "plus" | "add");
-                let split_down = matches!(key, "-" | "_" | "minus" | "subtract");
-                let resize = matches!(key, "left" | "right" | "up" | "down");
-                if split_right || split_down || resize {
-                    return;
-                }
-            }
         }
         if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
             && keystroke.key.eq_ignore_ascii_case("c")

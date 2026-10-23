@@ -938,6 +938,83 @@ impl Waku {
     ) {
         self.cycle_bottom_panel_terminal(-1, cx);
     }
+
+    pub(super) fn split_terminal_right_action(
+        &mut self,
+        _: &SplitTerminalRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.split_bottom_panel_pane(&pane, Axis::Horizontal, cx);
+        }
+    }
+
+    pub(super) fn split_terminal_down_action(
+        &mut self,
+        _: &SplitTerminalDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.split_bottom_panel_pane(&pane, Axis::Vertical, cx);
+        }
+    }
+
+    pub(super) fn close_terminal_pane_action(
+        &mut self,
+        _: &CloseTerminalPane,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.close_bottom_panel_pane(&pane, cx);
+        }
+    }
+
+    pub(super) fn resize_terminal_pane_left_action(
+        &mut self,
+        _: &ResizeTerminalPaneLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.resize_bottom_panel_pane(&pane, ResizeDirection::Left, cx);
+        }
+    }
+
+    pub(super) fn resize_terminal_pane_right_action(
+        &mut self,
+        _: &ResizeTerminalPaneRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.resize_bottom_panel_pane(&pane, ResizeDirection::Right, cx);
+        }
+    }
+
+    pub(super) fn resize_terminal_pane_up_action(
+        &mut self,
+        _: &ResizeTerminalPaneUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.resize_bottom_panel_pane(&pane, ResizeDirection::Up, cx);
+        }
+    }
+
+    pub(super) fn resize_terminal_pane_down_action(
+        &mut self,
+        _: &ResizeTerminalPaneDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.resize_bottom_panel_pane(&pane, ResizeDirection::Down, cx);
+        }
+    }
 }
 
 /// Where the active index lands after closing tab `closed` from a list that
