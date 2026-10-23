@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Axis, Bounds, ClipboardEntry, ClipboardItem,
-    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
+    Animation, AnimationExt, AnyElement, App, Axis, Bounds, ClipboardEntry, ClipboardItem, Context,
+    Div, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
     KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit, PathPromptOptions, Pixels,
     Render, ScrollHandle, SharedString, Stateful, StyleRefinement, TextRun, WeakEntity, Window,
@@ -61,10 +61,6 @@ use crate::query::{Query, QueryCache};
 use crate::review_diff::{Snapshot as ReviewDiffSnapshot, Source as ReviewDiffSource};
 use crate::terminal::TerminalView;
 use crate::theme::{Theme, ThemePreference, sp};
-use terminal_split::{
-    MAX_SPLIT_PANES, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup, SplitMember,
-    axis_child_sizes,
-};
 use crate::ui::text_field::TextField;
 use crate::ui::{
     MenuChip, ProjectNameSelector, activity_icon, activity_noun, contain_scroll, file_icon, icon,
@@ -79,6 +75,10 @@ use crate::{
     ToggleBottomPanel, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
     ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
     ToggleUsagePanel,
+};
+use terminal_split::{
+    MAX_SPLIT_PANES, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup, SplitMember,
+    axis_child_sizes,
 };
 
 #[cfg(target_os = "macos")]
@@ -96,11 +96,11 @@ const SIDEBAR_MAX_WIDTH: f32 = 420.0;
 const UPDATER_BUTTON_COLLAPSED_WIDTH: f32 = 20.0;
 const UPDATER_BUTTON_EXPANDED_WIDTH: f32 = 58.0;
 const RIGHT_PANEL_MIN_WIDTH: f32 = 280.0;
-const RIGHT_PANEL_MAX_WIDTH: f32 = 1000.0;
 const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
-const BOTTOM_PANEL_MAX_HEIGHT: f32 = 560.0;
 /// Kept for the header, composer, and workspace footer when the bottom panel
 /// claims height, so it can never squeeze the chat column out of the window.
+/// The panel has no fixed ceiling: it may grow to the viewport height minus
+/// this reserve, but never below `BOTTOM_PANEL_MIN_HEIGHT`.
 const BOTTOM_PANEL_HEIGHT_RESERVE: f32 = 280.0;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 184.0;
 const FILE_TREE_MIN_WIDTH: f32 = 140.0;
@@ -458,11 +458,14 @@ fn fitted_file_tree_width(panel_width: f32, file_tree_width: f32) -> f32 {
 }
 
 fn widened_panel_width_for_file_editor(panel_width: f32, file_tree_width: f32) -> f32 {
+    // No fixed ceiling: a panel widened on a large display keeps that width,
+    // and layout-time fitting (`fitted_panel_widths`) clamps it against the
+    // live viewport when the window is smaller.
     let panel_width = sanitize_panel_width(
         panel_width,
         DEFAULT_RIGHT_PANEL_WIDTH,
         RIGHT_PANEL_MIN_WIDTH,
-        RIGHT_PANEL_MAX_WIDTH,
+        f32::INFINITY,
     );
     let file_tree_width = sanitize_panel_width(
         file_tree_width,
@@ -470,9 +473,7 @@ fn widened_panel_width_for_file_editor(panel_width: f32, file_tree_width: f32) -
         FILE_TREE_MIN_WIDTH,
         FILE_TREE_MAX_WIDTH,
     );
-    panel_width
-        .max(file_tree_width + FILE_EDITOR_INITIAL_WIDTH)
-        .min(RIGHT_PANEL_MAX_WIDTH)
+    panel_width.max(file_tree_width + FILE_EDITOR_INITIAL_WIDTH)
 }
 
 fn widened_panel_width_for_review(panel_width: f32) -> f32 {
@@ -480,7 +481,7 @@ fn widened_panel_width_for_review(panel_width: f32) -> f32 {
         panel_width,
         DEFAULT_RIGHT_PANEL_WIDTH,
         RIGHT_PANEL_MIN_WIDTH,
-        RIGHT_PANEL_MAX_WIDTH,
+        f32::INFINITY,
     )
     .max(REVIEW_INITIAL_WIDTH)
 }
@@ -513,11 +514,12 @@ fn fitted_panel_widths(
         0.0
     };
     let mut right_panel = if right_panel_visible {
+        // No fixed ceiling: the overflow pass below fits it to the viewport.
         sanitize_panel_width(
             right_panel_width,
             DEFAULT_RIGHT_PANEL_WIDTH,
             RIGHT_PANEL_MIN_WIDTH,
-            RIGHT_PANEL_MAX_WIDTH,
+            f32::INFINITY,
         )
     } else {
         0.0
@@ -543,6 +545,16 @@ fn fitted_panel_widths(
     }
 
     (sidebar, right_panel)
+}
+
+fn fitted_bottom_panel_height(viewport_height: f32, height: f32) -> f32 {
+    let maximum = (viewport_height - BOTTOM_PANEL_HEIGHT_RESERVE).max(BOTTOM_PANEL_MIN_HEIGHT);
+    sanitize_panel_width(
+        height,
+        DEFAULT_BOTTOM_PANEL_HEIGHT.clamp(BOTTOM_PANEL_MIN_HEIGHT, maximum),
+        BOTTOM_PANEL_MIN_HEIGHT,
+        maximum,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2358,17 +2370,21 @@ impl Waku {
             SIDEBAR_MIN_WIDTH,
             SIDEBAR_MAX_WIDTH,
         );
+        // Neither panel has a fixed ceiling. Layout fits the stored size to
+        // the live viewport, so a size left on a larger display comes back
+        // once the window has room, unless a resize on a smaller window
+        // replaced it in the meantime.
         let right_panel_width = sanitize_panel_width(
             state.right_panel_width,
             DEFAULT_RIGHT_PANEL_WIDTH,
             RIGHT_PANEL_MIN_WIDTH,
-            RIGHT_PANEL_MAX_WIDTH,
+            f32::INFINITY,
         );
         let bottom_panel_height = sanitize_panel_width(
             state.bottom_panel_height,
             DEFAULT_BOTTOM_PANEL_HEIGHT,
             BOTTOM_PANEL_MIN_HEIGHT,
-            BOTTOM_PANEL_MAX_HEIGHT,
+            f32::INFINITY,
         );
         state.sidebar_width = sidebar_width;
         state.right_panel_width = right_panel_width;

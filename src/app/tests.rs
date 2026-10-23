@@ -10,17 +10,17 @@ use super::{
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
     assistant_response_footer_time, compact_driver_error, disclosure_leading_space, fenced_code,
-    fitted_file_tree_width, fitted_panel_widths, folded_transcript_row_kinds,
-    format_worked_duration, format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
-    message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
-    navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
-    push_transcript_activity, response_footer_message_index, response_row_turn_id,
-    session_accepts_turn_output, session_is_reapable, should_refresh_branch_after_activity,
-    should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
-    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
-    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
-    transcript_rows_fingerprint, user_input_choice_label, widened_panel_width_for_file_editor,
-    widened_panel_width_for_review,
+    fitted_bottom_panel_height, fitted_file_tree_width, fitted_panel_widths,
+    folded_transcript_row_kinds, format_worked_duration, format_working_elapsed,
+    maintain_transcript_anchor, message_opens_turn, message_starts_followup_turn,
+    navigation_preview_snippet, navigation_rail_fade_visibility, navigation_rail_height,
+    navigation_rail_scale, paused_toast_duration, pop_stream_batch, push_transcript_activity,
+    response_footer_message_index, response_row_turn_id, session_accepts_turn_output,
+    session_is_reapable, should_refresh_branch_after_activity, should_show_navigation_rail,
+    should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
+    transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
+    transcript_row_kinds, transcript_row_splice, transcript_rows_fingerprint,
+    user_input_choice_label, widened_panel_width_for_file_editor, widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
@@ -587,6 +587,44 @@ fn hidden_panels_do_not_consume_layout_width() {
 
     assert_eq!(sidebar, 0.0);
     assert_eq!(right_panel, 620.0);
+}
+
+#[test]
+fn right_panel_width_has_no_fixed_cap() {
+    // A width left from a larger display keeps in full when the viewport has
+    // room (2000 - 360 chat minimum = 1640 available) instead of stopping at
+    // a fixed ceiling; only the live viewport bounds the drag.
+    let (sidebar, right_panel) = fitted_panel_widths(2000.0, false, true, 420.0, 1600.0);
+
+    assert_eq!(sidebar, 0.0);
+    assert_eq!(right_panel, 1600.0);
+}
+
+#[test]
+fn oversized_panel_width_fits_the_viewport() {
+    // The same remembered width on a smaller window is fitted down to leave
+    // the chat column its minimum, never overflowing the window.
+    let (sidebar, right_panel) = fitted_panel_widths(1200.0, false, true, 420.0, 1600.0);
+
+    assert_eq!(sidebar, 0.0);
+    assert_eq!(right_panel, 840.0);
+    assert_eq!(1200.0 - sidebar - right_panel, 360.0);
+}
+
+#[test]
+fn bottom_panel_height_has_no_fixed_cap() {
+    // 1440 - 280 reserve = 1160 available, so a tall remembered height keeps.
+    assert_eq!(fitted_bottom_panel_height(1440.0, 900.0), 900.0);
+}
+
+#[test]
+fn oversized_bottom_panel_height_fits_the_viewport() {
+    // The minimum window (680 tall) leaves the reserve for the chat column.
+    assert_eq!(fitted_bottom_panel_height(680.0, 900.0), 400.0);
+    assert_eq!(fitted_bottom_panel_height(680.0, 40.0), 140.0);
+    // A viewport briefly smaller than reserve + minimum still keeps the minimum.
+    assert_eq!(fitted_bottom_panel_height(300.0, 900.0), 140.0);
+    assert!(fitted_bottom_panel_height(680.0, f32::NAN).is_finite());
 }
 
 #[test]

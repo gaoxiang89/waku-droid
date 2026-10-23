@@ -642,11 +642,10 @@ impl Waku {
     /// the viewport the way the side panels' widths are. A panel mid-slide
     /// counts as on screen and keeps its full height.
     pub(super) fn effective_bottom_panel_height(&self, window: &Window) -> f32 {
-        let viewport_height = f32::from(window.viewport_size().height);
-        let maximum = BOTTOM_PANEL_MAX_HEIGHT
-            .min((viewport_height - BOTTOM_PANEL_HEIGHT_RESERVE).max(BOTTOM_PANEL_MIN_HEIGHT));
-        self.bottom_panel_height
-            .clamp(BOTTOM_PANEL_MIN_HEIGHT, maximum)
+        fitted_bottom_panel_height(
+            f32::from(window.viewport_size().height),
+            self.bottom_panel_height,
+        )
     }
 
     pub(super) fn begin_panel_resize(
@@ -719,8 +718,7 @@ impl Waku {
                 crate::platform::set_sidebar_material_width(window, width);
             }
             PanelResizeTarget::RightPanel => {
-                let maximum = RIGHT_PANEL_MAX_WIDTH
-                    .min(viewport_width - MAIN_PANEL_MIN_WIDTH - sidebar_width)
+                let maximum = (viewport_width - MAIN_PANEL_MIN_WIDTH - sidebar_width)
                     .max(RIGHT_PANEL_MIN_WIDTH);
                 let width = (drag.start_size - delta).clamp(RIGHT_PANEL_MIN_WIDTH, maximum);
                 if (self.right_panel_width - width).abs() < 0.5 {
@@ -733,10 +731,7 @@ impl Waku {
                 // The panel grows upward from the bottom, so dragging its top
                 // edge down shrinks it.
                 let delta_y = f32::from(event.position.y) - drag.start_mouse_y;
-                let maximum = BOTTOM_PANEL_MAX_HEIGHT.min(
-                    (viewport_height - BOTTOM_PANEL_HEIGHT_RESERVE).max(BOTTOM_PANEL_MIN_HEIGHT),
-                );
-                let height = (drag.start_size - delta_y).clamp(BOTTOM_PANEL_MIN_HEIGHT, maximum);
+                let height = fitted_bottom_panel_height(viewport_height, drag.start_size - delta_y);
                 if (self.bottom_panel_height - height).abs() < 0.5 {
                     return;
                 }
