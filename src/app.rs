@@ -19,6 +19,7 @@ use gpui::{
     list, point, prelude::*, pulsating_between, px, rgb,
 };
 use uuid::Uuid;
+use waku_client::hosts::HostKey;
 
 use crate::checkpoint;
 use crate::composer_complete::{FileEntry, SlashCommand};
@@ -72,9 +73,9 @@ use crate::{
     NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker,
     OpenSettings, PreviousTerminal, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
     SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward, SwitchTaskForward,
-    ToggleBottomPanel, ToggleCommandPalette, ToggleFindCaseSensitive, ToggleFindRegex,
-    ToggleFindWholeWord, ToggleFpsCounter, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    ToggleBottomPanel, ToggleCommandPalette, ToggleFilesSurface, ToggleFindCaseSensitive,
+    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleGitGraphSurface,
+    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 use terminal_split::{
     MAX_SPLIT_PANES, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup, SplitMember,
@@ -765,7 +766,18 @@ struct RightPanelFileEditor {
     read_epoch: u64,
 }
 
-struct RightPanelSessionState {
+/// The identity panels hang off: a directory on a host. Sessions opened into
+/// the same workspace share one panel state, so creating or switching
+/// sessions there keeps Files, Terminal, and GitGraph on screen; a session
+/// with its own materialized worktree is a separate scope, because its tree
+/// and terminals point somewhere else.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PanelScope {
+    host: HostKey,
+    workspace: PathBuf,
+}
+
+struct RightPanelWorkspaceState {
     visible: bool,
     surfaces: Vec<RightPanelSurface>,
     active_surface: Option<usize>,
@@ -781,7 +793,7 @@ struct RightPanelSessionState {
     diff_expanded_paths: HashSet<String>,
 }
 
-impl RightPanelSessionState {
+impl RightPanelWorkspaceState {
     fn empty(visible: bool) -> Self {
         Self {
             visible,
@@ -800,18 +812,66 @@ impl RightPanelSessionState {
         }
     }
 
-    fn take_or_closed(states: &mut HashMap<Uuid, Self>, session_id: Uuid) -> Self {
-        states
-            .remove(&session_id)
-            .unwrap_or_else(|| Self::empty(false))
+    fn take_or_closed(states: &mut HashMap<PanelScope, Self>, scope: &PanelScope) -> Self {
+        states.remove(scope).unwrap_or_else(|| Self::empty(false))
+    }
+
+    /// Drop the tabs a deleted session owned — a review pinned to one of its
+    /// turns, and background work it reported — remapping the active tab the
+    /// way closing it by hand would. Everything else belongs to the workspace
+    /// and stays.
+    fn close_session_surfaces(&mut self, session_id: Uuid, work_keys: &HashSet<BackgroundWorkKey>) {
+        let old_active = self.active_surface;
+        let mut kept = Vec::with_capacity(self.surfaces.len());
+        let mut new_index_of = Vec::with_capacity(self.surfaces.len());
+        for surface in std::mem::take(&mut self.surfaces) {
+            let keep = match &surface {
+                RightPanelSurface::Diff => !matches!(
+                    &self.diff_source,
+                    ReviewDiffSource::LastTurn {
+                        session_id: owner, ..
+                    } if *owner == session_id
+                ),
+                RightPanelSurface::BackgroundWork { key, .. } => !work_keys.contains(key),
+                _ => true,
+            };
+            if keep {
+                new_index_of.push(Some(kept.len()));
+                kept.push(surface);
+            } else {
+                new_index_of.push(None);
+            }
+        }
+        self.active_surface = match old_active.and_then(|active| new_index_of[active]) {
+            Some(active) => Some(active),
+            None if kept.is_empty() => None,
+            // The active tab itself closed; step to the neighbor, like
+            // `close_right_panel_surface` does.
+            None => Some(
+                old_active
+                    .unwrap_or(0)
+                    .saturating_sub(1)
+                    .min(kept.len() - 1),
+            ),
+        };
+        if kept.is_empty() {
+            self.visible = false;
+            self.pending_tab_reveal = None;
+        } else if self
+            .pending_tab_reveal
+            .is_some_and(|reveal| reveal >= kept.len())
+        {
+            self.pending_tab_reveal = None;
+        }
+        self.surfaces = kept;
     }
 }
 
-/// The bottom panel's half of a session's panel state. Terminal tabs belong
-/// to the session they were opened in: switching sessions swaps the tabs —
-/// and the panel's visibility — the way the right panel's surfaces swap, and
-/// deleting the session ends the processes.
-struct BottomPanelSessionState {
+/// The bottom panel's half of a workspace's panel state. Terminal tabs
+/// belong to the directory they were opened in: switching sessions inside
+/// one workspace keeps them, and the PTYs live until the workspace's last
+/// session goes away.
+struct BottomPanelWorkspaceState {
     visible: bool,
     groups: Vec<SplitGroup>,
     active_group: Option<usize>,
@@ -819,7 +879,7 @@ struct BottomPanelSessionState {
     pending_tab_reveal: Option<usize>,
 }
 
-impl BottomPanelSessionState {
+impl BottomPanelWorkspaceState {
     fn empty(visible: bool) -> Self {
         Self {
             visible,
@@ -830,10 +890,8 @@ impl BottomPanelSessionState {
         }
     }
 
-    fn take_or_closed(states: &mut HashMap<Uuid, Self>, session_id: Uuid) -> Self {
-        states
-            .remove(&session_id)
-            .unwrap_or_else(|| Self::empty(false))
+    fn take_or_closed(states: &mut HashMap<PanelScope, Self>, scope: &PanelScope) -> Self {
+        states.remove(scope).unwrap_or_else(|| Self::empty(false))
     }
 }
 
@@ -1556,8 +1614,8 @@ pub struct Waku {
     panel_resize_drag: Option<PanelResizeDrag>,
     /// Window-relative PiP position, independent of incoming preview frames.
     computer_use_preview_position: Option<gpui::Point<Pixels>>,
-    right_panel_session_states: HashMap<Uuid, RightPanelSessionState>,
-    bottom_panel_session_states: HashMap<Uuid, BottomPanelSessionState>,
+    right_panel_workspace_states: HashMap<PanelScope, RightPanelWorkspaceState>,
+    bottom_panel_workspace_states: HashMap<PanelScope, BottomPanelWorkspaceState>,
     right_panel_surfaces: Vec<RightPanelSurface>,
     right_panel_active_surface: Option<usize>,
     right_panel_tabs_scroll_handle: ScrollHandle,
@@ -3340,8 +3398,8 @@ impl Waku {
                 fps_counter_visible: false,
                 panel_resize_drag: None,
                 computer_use_preview_position: None,
-                right_panel_session_states: HashMap::new(),
-                bottom_panel_session_states: HashMap::new(),
+                right_panel_workspace_states: HashMap::new(),
+                bottom_panel_workspace_states: HashMap::new(),
                 right_panel_surfaces: Vec::new(),
                 right_panel_active_surface: None,
                 right_panel_tabs_scroll_handle: ScrollHandle::new(),

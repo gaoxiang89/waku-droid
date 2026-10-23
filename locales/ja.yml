@@ -64,6 +64,8 @@ command_palette.hide_right_panel: 右パネルを隠す
 command_palette.show_bottom_panel: 下パネルを表示
 command_palette.hide_bottom_panel: 下パネルを隠す
 command_palette.new_terminal: 新規ターミナル
+command_palette.toggle_files: ファイルパネルを切り替え
+command_palette.toggle_git_graph: Git Graph パネルを切り替え
 command_palette.current: 現在
 command_palette.you: あなた
 command_palette.agent: エージェント
@@ -781,6 +783,7 @@ right_panel.terminal: ターミナル
 right_panel.files: ファイル
 right_panel.diff: レビュー
 right_panel.toggle: 右パネルの表示を切り替える
+right_panel.toggle_terminal: 右パネルのターミナルを切り替える
 right_panel.open_surface: パネルを開く
 right_panel.choose_surface: 右パネルに表示する内容を選択します
 right_panel.browser_description: ローカルアプリまたは URL を開きます

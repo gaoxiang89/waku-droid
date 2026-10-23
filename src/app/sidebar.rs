@@ -432,8 +432,16 @@ impl Waku {
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus("toggle-sidebar", cx);
+        let tooltip_label = if self.sidebar_visible {
+            tr!("command_palette.hide_sidebar")
+        } else {
+            tr!("command_palette.show_sidebar")
+        };
         div()
             .id("toggle-sidebar")
+            .track_focus(&focus)
+            .tab_index(0)
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -442,15 +450,33 @@ impl Waku {
             .items_center()
             .justify_center()
             .cursor_default()
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
             .hover(|element| element.bg(theme.overlay))
             .active(|element| element.bg(theme.overlay_strong))
             .child(icon("icons/panel-left.svg", 14.0, theme.text_tertiary))
+            .tooltip(Tooltip::with_shortcut(
+                tooltip_label,
+                crate::platform::primary_shortcut("⌘B", "Ctrl+B"),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_sidebar_visible(!this.sidebar_visible, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.set_sidebar_visible(!this.sidebar_visible, cx);
+                    cx.stop_propagation();
+                }
             }))
     }
 
@@ -2175,17 +2201,28 @@ impl Waku {
                 ),
             )
             .child(self.render_background_work_summary(cx))
-            // The bottom panel has no chrome of its own — it is just the
-            // terminal — so this toggle stays up whether the panel is open or
-            // closed; it is the mouse way both in and out.
-            .child(self.render_bottom_panel_toggle(cx))
-            .when(!self.right_panel_visible, |element| {
-                element
-                    .when(self.fps_counter_visible, |element| {
-                        element.child(self.render_fps_counter(cx))
-                    })
-                    .child(self.render_right_panel_toggle(cx))
+            .when(self.fps_counter_visible, |element| {
+                element.child(self.render_fps_counter(cx))
             })
+            .child(
+                div()
+                    .id("header-panel-controls")
+                    .tab_group()
+                    .tab_stop(false)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    // The bottom terminal is the leftmost control in this cluster.
+                    // Files and Git follow; the right-panel terminal sits immediately
+                    // after Git. The bottom panel has no chrome of its own, so its
+                    // toggle stays up whether that panel is open or closed.
+                    .child(self.render_bottom_panel_toggle(cx))
+                    .child(self.render_header_surface_buttons(cx))
+                    .when(!self.right_panel_visible, |element| {
+                        element.child(self.render_right_panel_toggle(cx))
+                    }),
+            )
             .children(right_window_controls)
     }
 

@@ -321,6 +321,8 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
+            .on_action(cx.listener(Self::toggle_files_surface_action))
+            .on_action(cx.listener(Self::toggle_git_graph_surface_action))
             .on_action(cx.listener(Self::new_terminal_action))
             .on_action(cx.listener(Self::next_terminal_action))
             .on_action(cx.listener(Self::previous_terminal_action))

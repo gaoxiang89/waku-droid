@@ -4,6 +4,7 @@
 //! through `InteractiveElement::tooltip`, which asks only for a view to render.
 //! This is that view, and nothing more.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyView, App, AppContext, IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
@@ -11,16 +12,23 @@ use gpui::{
 
 use crate::theme::{Theme, sp};
 
-/// A single-line hint.
+/// A single-line hint, optionally paired with its keyboard shortcut.
 pub struct Tooltip {
     label: SharedString,
+    shortcut: Option<SharedString>,
 }
 
 impl Tooltip {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
+            shortcut: None,
         }
+    }
+
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
     }
 
     /// Build the view GPUI's `.tooltip(..)` expects.
@@ -35,6 +43,20 @@ impl Tooltip {
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         let label = label.into();
         move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+    }
+
+    /// Shorthand for a hint paired with a keyboard shortcut.
+    pub fn with_shortcut(
+        label: impl Into<SharedString>,
+        shortcut: impl Into<SharedString>,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        let label = label.into();
+        let shortcut = shortcut.into();
+        move |window, cx| {
+            Tooltip::new(label.clone())
+                .shortcut(shortcut.clone())
+                .build(window, cx)
+        }
     }
 }
 
@@ -58,7 +80,10 @@ impl Render for Tooltip {
                 .text_size(sp(12.5))
                 .line_height(sp(15.0))
                 .text_color(theme.text_secondary)
-                .child(self.label.clone()),
+                .child(self.label.clone())
+                .when_some(self.shortcut.clone(), |card, shortcut| {
+                    card.child(div().text_color(theme.text_tertiary).child(shortcut))
+                }),
         )
     }
 }

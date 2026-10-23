@@ -9,11 +9,17 @@ const BOTTOM_PANEL_TAB_STRIP_HEIGHT: f32 = 34.0;
 
 impl Waku {
     /// The header toggle. Mirrors the right panel's toggle in size and
-    /// treatment so the two read as a pair.
+    /// treatment so the two read as a pair. Wears the terminal glyph and the
+    /// panel's open state, and stays up whether the panel is open or closed —
+    /// the mouse way both in and out.
     pub(super) fn render_bottom_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let active = self.bottom_panel_visible;
+        let focus = self.transcript_control_focus("toggle-bottom-panel", cx);
         div()
             .id("toggle-bottom-panel")
+            .track_focus(&focus)
+            .tab_index(0)
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -22,16 +28,44 @@ impl Waku {
             .items_center()
             .justify_center()
             .cursor_default()
-            .hover(|element| element.bg(theme.overlay))
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .when(active, |element| element.bg(theme.overlay_strong))
+            .when(!active, |element| {
+                element.hover(|element| element.bg(theme.overlay))
+            })
             .active(|element| element.bg(theme.overlay_strong))
-            .child(icon("icons/panel-bottom.svg", 14.0, theme.text_tertiary))
-            .tooltip(|window, cx| Tooltip::new(tr!("bottom_panel.toggle")).build(window, cx))
+            .child(icon(
+                "icons/terminal.svg",
+                14.0,
+                if active {
+                    theme.text
+                } else {
+                    theme.text_tertiary
+                },
+            ))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("bottom_panel.toggle"),
+                crate::platform::primary_shortcut("⌘J", "Ctrl+J"),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_bottom_panel_visible(!this.bottom_panel_visible, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.set_bottom_panel_visible(!this.bottom_panel_visible, cx);
+                    cx.stop_propagation();
+                }
             }))
     }
 
@@ -600,51 +634,72 @@ impl Waku {
         .detach();
     }
 
-    /// Park the selected session's panel state, the bottom panel's half of
+    /// Park the selected workspace's panel state, the bottom panel's half of
     /// what `store_selected_right_panel_state` saves. Terminal entities move
     /// into the map, so their processes keep running off screen.
     pub(super) fn store_selected_bottom_panel_state(&mut self) {
-        let Some(session_id) = self.state.selected_session else {
+        let Some(scope) = self
+            .state
+            .selected_session
+            .and_then(|id| self.panel_scope_for_session(id))
+        else {
             return;
         };
         let state = self.take_active_bottom_panel_state();
-        self.bottom_panel_session_states.insert(session_id, state);
+        self.bottom_panel_workspace_states.insert(scope, state);
     }
 
-    /// Swap in the newly selected session's panel state. A session never
+    /// Swap in the newly selected workspace's panel state. A workspace never
     /// seen before opens closed, exactly as the right panel does.
     pub(super) fn restore_bottom_panel_state(&mut self, session_id: Uuid) {
-        let state = BottomPanelSessionState::take_or_closed(
-            &mut self.bottom_panel_session_states,
-            session_id,
-        );
+        let state = self
+            .panel_scope_for_session(session_id)
+            .map(|scope| {
+                BottomPanelWorkspaceState::take_or_closed(
+                    &mut self.bottom_panel_workspace_states,
+                    &scope,
+                )
+            })
+            .unwrap_or_else(|| BottomPanelWorkspaceState::empty(false));
         self.replace_active_bottom_panel_state(state);
-        // The persisted layout flag follows whichever session is on screen, so
-        // relaunching restores the panel the way this session left it.
+        // The persisted layout flag follows whichever workspace is on screen,
+        // so relaunching restores the panel the way it was left.
         self.state.bottom_panel_visible = self.bottom_panel_visible;
         if self.bottom_panel_visible && self.bottom_panel_active_group.is_some() {
             self.bottom_panel_pending_terminal_focus = true;
         }
     }
 
-    /// Drop a session's stored panel state, together with its terminals when
-    /// it is the selected one — the same split the right panel applies to its
-    /// surfaces. Dropping the entities is what shuts the PTYs down.
+    /// Drop a deleted session's share of the bottom panel. Terminal groups
+    /// belong to the workspace, so they outlive the session while any other
+    /// session still opens into it; only the workspace's last session takes
+    /// the PTYs down.
     pub(super) fn remove_bottom_panel_session_state(&mut self, session_id: Uuid) {
+        let Some(scope) = self.panel_scope_for_session(session_id) else {
+            return;
+        };
+        let workspace_still_open = self.state.sessions.iter().any(|session| {
+            session.id != session_id
+                && self.panel_scope_for_session(session.id).as_ref() == Some(&scope)
+        });
         let removed = if self.state.selected_session == Some(session_id) {
             let removed = self.take_active_bottom_panel_state();
-            self.replace_active_bottom_panel_state(BottomPanelSessionState::empty(false));
-            removed
+            self.replace_active_bottom_panel_state(BottomPanelWorkspaceState::empty(false));
+            Some(removed)
         } else {
-            self.bottom_panel_session_states
-                .remove(&session_id)
-                .unwrap_or_else(|| BottomPanelSessionState::empty(false))
+            self.bottom_panel_workspace_states.remove(&scope)
         };
-        drop(removed);
+        if workspace_still_open {
+            if let Some(removed) = removed {
+                self.bottom_panel_workspace_states.insert(scope, removed);
+            }
+        }
+        // A workspace with no sessions left drops its groups, which is what
+        // shuts the PTYs down.
     }
 
-    fn take_active_bottom_panel_state(&mut self) -> BottomPanelSessionState {
-        BottomPanelSessionState {
+    fn take_active_bottom_panel_state(&mut self) -> BottomPanelWorkspaceState {
+        BottomPanelWorkspaceState {
             visible: self.bottom_panel_visible,
             groups: std::mem::take(&mut self.bottom_panel_terminal_groups),
             active_group: self.bottom_panel_active_group.take(),
@@ -656,7 +711,7 @@ impl Waku {
         }
     }
 
-    fn replace_active_bottom_panel_state(&mut self, state: BottomPanelSessionState) {
+    fn replace_active_bottom_panel_state(&mut self, state: BottomPanelWorkspaceState) {
         self.bottom_panel_visible = state.visible;
         self.bottom_panel_terminal_groups = state.groups;
         self.bottom_panel_active_group = state.active_group;
@@ -897,26 +952,33 @@ mod tests {
 
     #[test]
     fn take_or_closed_returns_stored_state_or_closed() {
-        let session = Uuid::new_v4();
-        let other_session = Uuid::new_v4();
+        let scope = PanelScope {
+            host: HostKey::Local,
+            workspace: PathBuf::from("/repos/waku"),
+        };
+        let other_scope = PanelScope {
+            host: HostKey::Local,
+            workspace: PathBuf::from("/repos/other"),
+        };
         let mut states = HashMap::new();
-        let mut state = BottomPanelSessionState::empty(true);
+        let mut state = BottomPanelWorkspaceState::empty(true);
         state.active_group = Some(0);
-        states.insert(session, state);
+        states.insert(scope.clone(), state);
 
-        // A session with no stored panel state opens closed, exactly as the
+        // A workspace with no stored panel state opens closed, exactly as the
         // right panel treats one never visited before.
-        let missing = BottomPanelSessionState::take_or_closed(&mut states, other_session);
+        let missing = BottomPanelWorkspaceState::take_or_closed(&mut states, &other_scope);
         assert!(!missing.visible);
         assert_eq!(missing.active_group, None);
 
-        // Taking hands the stored state over once, so a session opened twice
+        // Taking hands the stored state over once, so a workspace opened twice
         // without being switched away from in between reads closed the second
-        // time — the map, not the flag, is the source of truth.
-        let restored = BottomPanelSessionState::take_or_closed(&mut states, session);
+        // time — the map, not the flag, is the source of truth. Every session
+        // of the workspace reads the same entry.
+        let restored = BottomPanelWorkspaceState::take_or_closed(&mut states, &scope);
         assert!(restored.visible);
         assert_eq!(restored.active_group, Some(0));
-        let again = BottomPanelSessionState::take_or_closed(&mut states, session);
+        let again = BottomPanelWorkspaceState::take_or_closed(&mut states, &scope);
         assert!(!again.visible);
         assert!(again.groups.is_empty());
     }

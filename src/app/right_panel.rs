@@ -1006,6 +1006,43 @@ fn right_panel_tab_icon(
     }
 }
 
+/// What the header's right-panel terminal button should do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RightPanelTerminalToggle {
+    /// A terminal is already the surface on screen.
+    Hide,
+    /// Reveal this existing terminal tab.
+    Show(usize),
+    /// No terminal tab yet.
+    OpenNew,
+}
+
+/// Files and Git are single-instance surfaces. A terminal tab is not, so the
+/// header button hides the panel only while a terminal is showing, and
+/// otherwise reveals the active terminal tab, the first one, or a new one.
+fn right_panel_terminal_toggle(
+    visible: bool,
+    surfaces: &[RightPanelSurface],
+    active: Option<usize>,
+) -> RightPanelTerminalToggle {
+    let active_terminal = active.filter(|index| {
+        surfaces
+            .get(*index)
+            .is_some_and(|surface| matches!(surface, RightPanelSurface::Terminal(_)))
+    });
+    if visible && active_terminal.is_some() {
+        return RightPanelTerminalToggle::Hide;
+    }
+    if let Some(index) = active_terminal.or_else(|| {
+        surfaces
+            .iter()
+            .position(|surface| matches!(surface, RightPanelSurface::Terminal(_)))
+    }) {
+        return RightPanelTerminalToggle::Show(index);
+    }
+    RightPanelTerminalToggle::OpenNew
+}
+
 fn reusable_surface_index(
     surfaces: &[RightPanelSurface],
     requested: &RightPanelSurface,
@@ -1750,24 +1787,64 @@ mod tests {
     }
 
     #[test]
-    fn right_panel_state_isolated_by_session() {
-        let session_with_terminal = Uuid::new_v4();
-        let other_session = Uuid::new_v4();
+    fn header_terminal_button_reuses_a_terminal_tab() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let surfaces = vec![
+            RightPanelSurface::Files,
+            RightPanelSurface::Terminal(first),
+            RightPanelSurface::GitGraph,
+            RightPanelSurface::Terminal(second),
+        ];
+
+        assert_eq!(
+            right_panel_terminal_toggle(true, &surfaces, Some(1)),
+            RightPanelTerminalToggle::Hide
+        );
+        // Hidden while a terminal is active: show that same tab, not a new one.
+        assert_eq!(
+            right_panel_terminal_toggle(false, &surfaces, Some(3)),
+            RightPanelTerminalToggle::Show(3)
+        );
+        // Another surface is showing: jump to the first terminal tab.
+        assert_eq!(
+            right_panel_terminal_toggle(true, &surfaces, Some(0)),
+            RightPanelTerminalToggle::Show(1)
+        );
+        assert_eq!(
+            right_panel_terminal_toggle(false, &[RightPanelSurface::Files], Some(0)),
+            RightPanelTerminalToggle::OpenNew
+        );
+    }
+
+    #[test]
+    fn right_panel_state_isolated_by_workspace() {
+        let scope = PanelScope {
+            host: HostKey::Local,
+            workspace: PathBuf::from("/repos/waku"),
+        };
+        let other_scope = PanelScope {
+            host: HostKey::Local,
+            workspace: PathBuf::from("/repos/other"),
+        };
         let terminal_id = Uuid::new_v4();
         let mut states = HashMap::new();
-        let mut terminal_state = RightPanelSessionState::empty(true);
+        let mut terminal_state = RightPanelWorkspaceState::empty(true);
         terminal_state.surfaces = vec![RightPanelSurface::Terminal(terminal_id)];
         terminal_state.active_surface = Some(0);
         terminal_state.file_tree_width = 248.0;
-        states.insert(session_with_terminal, terminal_state);
+        states.insert(scope.clone(), terminal_state);
 
-        let other_state = RightPanelSessionState::take_or_closed(&mut states, other_session);
+        // A workspace with no stored panel state opens closed.
+        let other_state = RightPanelWorkspaceState::take_or_closed(&mut states, &other_scope);
         assert!(!other_state.visible);
         assert!(other_state.surfaces.is_empty());
         assert_eq!(other_state.active_surface, None);
         assert_eq!(other_state.file_tree_width, DEFAULT_FILE_TREE_WIDTH);
 
-        let restored = RightPanelSessionState::take_or_closed(&mut states, session_with_terminal);
+        // Sessions of the same workspace all find the same state, which is
+        // the point: creating or switching sessions keeps the panels.
+        let restored = RightPanelWorkspaceState::take_or_closed(&mut states, &scope);
         assert!(restored.visible);
         assert_eq!(
             restored.surfaces,
@@ -1775,6 +1852,75 @@ mod tests {
         );
         assert_eq!(restored.active_surface, Some(0));
         assert_eq!(restored.file_tree_width, 248.0);
+    }
+
+    #[test]
+    fn closed_session_surfaces_drop_only_session_owned_tabs() {
+        let session = Uuid::new_v4();
+        let other_session = Uuid::new_v4();
+        let work_key = BackgroundWorkKey::new(BackgroundWorkKind::Process, "process-1");
+        let terminal_id = Uuid::new_v4();
+        let mut state = RightPanelWorkspaceState::empty(true);
+        state.surfaces = vec![
+            RightPanelSurface::Files,
+            RightPanelSurface::Diff,
+            RightPanelSurface::BackgroundWork {
+                key: work_key.clone(),
+                title: "Process one".into(),
+            },
+            RightPanelSurface::Terminal(terminal_id),
+        ];
+        state.active_surface = Some(1);
+        state.diff_source = ReviewDiffSource::LastTurn {
+            session_id: session,
+            turn_id: Uuid::new_v4(),
+            turn_count: 3,
+        };
+        let work_keys = HashSet::from([work_key]);
+
+        state.close_session_surfaces(session, &work_keys);
+        // The workspace's Files tab and terminal stay; the session's diff and
+        // background work close with it.
+        assert_eq!(
+            state.surfaces,
+            vec![
+                RightPanelSurface::Files,
+                RightPanelSurface::Terminal(terminal_id)
+            ]
+        );
+        assert!(state.visible);
+        // The active Diff tab closed; the panel steps to a remaining tab.
+        assert_eq!(state.active_surface, Some(0));
+
+        // A diff owned by another session — or a workspace review — stays.
+        state.surfaces = vec![
+            RightPanelSurface::Files,
+            RightPanelSurface::Diff,
+            RightPanelSurface::GitGraph,
+        ];
+        state.active_surface = Some(1);
+        state.diff_source = ReviewDiffSource::LastTurn {
+            session_id: other_session,
+            turn_id: Uuid::new_v4(),
+            turn_count: 1,
+        };
+        state.close_session_surfaces(session, &HashSet::new());
+        assert_eq!(state.surfaces.len(), 3);
+        assert_eq!(state.active_surface, Some(1));
+
+        // Stripping the last tab closes the panel instead of orphaning it.
+        state.surfaces = vec![RightPanelSurface::Diff];
+        state.active_surface = Some(0);
+        state.diff_source = ReviewDiffSource::LastTurn {
+            session_id: session,
+            turn_id: Uuid::new_v4(),
+            turn_count: 2,
+        };
+        state.close_session_surfaces(session, &HashSet::new());
+        assert!(state.surfaces.is_empty());
+        assert!(!state.visible);
+        assert_eq!(state.active_surface, None);
+        assert_eq!(state.pending_tab_reveal, None);
     }
 
     #[test]
@@ -1863,19 +2009,31 @@ impl Waku {
         self.open_transcript_link(&resolved.to_string_lossy(), cx);
     }
 
+    /// Park the selected workspace's panel state under its scope. Terminal
+    /// and browser entities move into the map, so their processes keep
+    /// running off screen while another workspace is shown.
     pub(super) fn store_selected_right_panel_state(&mut self) {
-        let Some(session_id) = self.state.selected_session else {
+        let Some(scope) = self
+            .state
+            .selected_session
+            .and_then(|id| self.panel_scope_for_session(id))
+        else {
             return;
         };
         let state = self.take_active_right_panel_state();
-        self.right_panel_session_states.insert(session_id, state);
+        self.right_panel_workspace_states.insert(scope, state);
     }
 
     pub(super) fn restore_right_panel_state(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
-        let state = RightPanelSessionState::take_or_closed(
-            &mut self.right_panel_session_states,
-            session_id,
-        );
+        let state = self
+            .panel_scope_for_session(session_id)
+            .map(|scope| {
+                RightPanelWorkspaceState::take_or_closed(
+                    &mut self.right_panel_workspace_states,
+                    &scope,
+                )
+            })
+            .unwrap_or_else(|| RightPanelWorkspaceState::empty(false));
         self.replace_active_right_panel_state(state);
         self.sync_right_panel_diff_tree_rows(cx);
         // A read in flight when this session was switched away from had its
@@ -1908,15 +2066,34 @@ impl Waku {
         }
     }
 
+    /// Remove a deleted session's share of the panel state. A review pinned
+    /// to one of its turns and the background work it reported close with
+    /// it; everything else belongs to the workspace and survives while any
+    /// other session still opens into it. Only when the last session of a
+    /// workspace goes away do the terminals and browsers shut down.
     pub(super) fn remove_right_panel_session_state(&mut self, session_id: Uuid) {
+        let Some(scope) = self.panel_scope_for_session(session_id) else {
+            return;
+        };
+        let work_keys = self.background_work_keys(session_id);
+        let workspace_still_open = self.state.sessions.iter().any(|session| {
+            session.id != session_id
+                && self.panel_scope_for_session(session.id).as_ref() == Some(&scope)
+        });
         let state = if self.state.selected_session == Some(session_id) {
             let state = self.take_active_right_panel_state();
-            self.replace_active_right_panel_state(RightPanelSessionState::empty(false));
+            self.replace_active_right_panel_state(RightPanelWorkspaceState::empty(false));
             Some(state)
         } else {
-            self.right_panel_session_states.remove(&session_id)
+            self.right_panel_workspace_states.remove(&scope)
         };
-        if let Some(state) = state {
+        let Some(mut state) = state else {
+            return;
+        };
+        if workspace_still_open {
+            state.close_session_surfaces(session_id, &work_keys);
+            self.right_panel_workspace_states.insert(scope, state);
+        } else {
             for surface in &state.surfaces {
                 if let Some(terminal_id) = surface.terminal_id() {
                     self.right_panel_terminals.remove(&terminal_id);
@@ -1928,8 +2105,8 @@ impl Waku {
         }
     }
 
-    fn take_active_right_panel_state(&mut self) -> RightPanelSessionState {
-        RightPanelSessionState {
+    fn take_active_right_panel_state(&mut self) -> RightPanelWorkspaceState {
+        RightPanelWorkspaceState {
             visible: self.right_panel_visible,
             surfaces: std::mem::take(&mut self.right_panel_surfaces),
             active_surface: self.right_panel_active_surface.take(),
@@ -1949,7 +2126,7 @@ impl Waku {
         }
     }
 
-    fn replace_active_right_panel_state(&mut self, state: RightPanelSessionState) {
+    fn replace_active_right_panel_state(&mut self, state: RightPanelWorkspaceState) {
         self.right_panel_visible = state.visible;
         self.right_panel_surfaces = state.surfaces;
         self.right_panel_active_surface = state.active_surface;
@@ -2086,6 +2263,22 @@ impl Waku {
         self.request_active_browser_focus();
         self.set_right_panel_visible(true, cx);
         cx.notify();
+    }
+
+    /// Zed-style panel-button semantics: bring the surface up, or put the
+    /// panel away when it is already the one showing.
+    pub(super) fn toggle_right_panel_surface(
+        &mut self,
+        surface: RightPanelSurface,
+        cx: &mut Context<Self>,
+    ) {
+        let showing =
+            self.right_panel_visible && self.active_right_panel_surface() == Some(&surface);
+        if showing {
+            self.set_right_panel_visible(false, cx);
+        } else {
+            self.open_right_panel_surface(surface, cx);
+        }
     }
 
     pub(super) fn open_turn_diff(&mut self, turn_id: Uuid, cx: &mut Context<Self>) {
@@ -2228,10 +2421,47 @@ impl Waku {
         crate::platform::hide_window(window);
     }
 
-    pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = Theme::current(cx);
+    /// The header's one-click surface shortcuts. They skip the open-panel
+    /// then pick-a-tab round trip, and stay visible while the panel is open
+    /// so they double as tab switching and as the mouse way out.
+    pub(super) fn render_header_surface_buttons(&self, cx: &mut Context<Self>) -> Div {
         div()
-            .id("toggle-right-panel")
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .child(self.render_header_surface_button(
+                "header-files-button",
+                RightPanelSurface::Files,
+                "right_panel.files",
+                crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
+                cx,
+            ))
+            .child(self.render_header_surface_button(
+                "header-git-graph-button",
+                RightPanelSurface::GitGraph,
+                "right_panel.git_graph",
+                crate::platform::primary_shortcut("⇧⌘G", "Ctrl+Shift+G"),
+                cx,
+            ))
+            .child(self.render_header_right_terminal_button(cx))
+    }
+
+    /// The header shortcut for the right panel's terminal. Unlike Files and
+    /// Git it is not a single-instance surface, so the click reveals an
+    /// existing terminal tab — or opens the first one — and hides the panel
+    /// only when a terminal is already what is showing.
+    fn render_header_right_terminal_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let active = self.right_panel_visible
+            && matches!(
+                self.active_right_panel_surface(),
+                Some(RightPanelSurface::Terminal(_))
+            );
+        let focus = self.transcript_control_focus("header-right-terminal-button", cx);
+        div()
+            .id("header-right-terminal-button")
+            .track_focus(&focus)
+            .tab_index(0)
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -2240,16 +2470,181 @@ impl Waku {
             .items_center()
             .justify_center()
             .cursor_default()
-            .hover(|element| element.bg(theme.overlay))
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .when(active, |element| element.bg(theme.overlay_strong))
+            .when(!active, |element| {
+                element.hover(|element| element.bg(theme.overlay))
+            })
             .active(|element| element.bg(theme.overlay_strong))
-            .child(icon("icons/panel-right.svg", 14.0, theme.text_tertiary))
-            .tooltip(|window, cx| Tooltip::new(tr!("right_panel.toggle")).build(window, cx))
+            .child(icon(
+                "icons/terminal-square.svg",
+                14.0,
+                if active {
+                    theme.text
+                } else {
+                    theme.text_tertiary
+                },
+            ))
+            .tooltip(Tooltip::text(tr!("right_panel.toggle_terminal")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_right_panel_terminal(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.toggle_right_panel_terminal(cx);
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    pub(super) fn toggle_right_panel_terminal(&mut self, cx: &mut Context<Self>) {
+        match right_panel_terminal_toggle(
+            self.right_panel_visible,
+            &self.right_panel_surfaces,
+            self.right_panel_active_surface,
+        ) {
+            RightPanelTerminalToggle::Hide => self.set_right_panel_visible(false, cx),
+            RightPanelTerminalToggle::Show(index) => {
+                self.right_panel_active_surface = Some(index);
+                self.reveal_right_panel_tab(index);
+                self.request_active_terminal_focus();
+                self.set_right_panel_visible(true, cx);
+                cx.notify();
+            }
+            RightPanelTerminalToggle::OpenNew => {
+                self.open_right_panel_surface(RightPanelSurface::new_terminal(), cx);
+            }
+        }
+    }
+
+    fn render_header_surface_button(
+        &self,
+        id: &'static str,
+        surface: RightPanelSurface,
+        tooltip_key: &'static str,
+        shortcut: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let active =
+            self.right_panel_visible && self.active_right_panel_surface() == Some(&surface);
+        let focus = self.transcript_control_focus(id, cx);
+        let key_surface = surface.clone();
+        div()
+            .id(id)
+            .track_focus(&focus)
+            .tab_index(0)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .when(active, |element| element.bg(theme.overlay_strong))
+            .when(!active, |element| {
+                element.hover(|element| element.bg(theme.overlay))
+            })
+            .active(|element| element.bg(theme.overlay_strong))
+            .child(icon(
+                surface.icon_path(),
+                14.0,
+                if active {
+                    theme.text
+                } else {
+                    theme.text_tertiary
+                },
+            ))
+            .tooltip(Tooltip::with_shortcut(tr!(tooltip_key), shortcut))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_right_panel_surface(surface.clone(), cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.toggle_right_panel_surface(key_surface.clone(), cx);
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let active = self.right_panel_visible;
+        let focus = self.transcript_control_focus("toggle-right-panel", cx);
+        div()
+            .id("toggle-right-panel")
+            .track_focus(&focus)
+            .tab_index(0)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .when(active, |element| element.bg(theme.overlay_strong))
+            .when(!active, |element| {
+                element.hover(|element| element.bg(theme.overlay))
+            })
+            .active(|element| element.bg(theme.overlay_strong))
+            .child(icon(
+                "icons/panel-right.svg",
+                14.0,
+                if active {
+                    theme.text
+                } else {
+                    theme.text_tertiary
+                },
+            ))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("right_panel.toggle"),
+                crate::platform::primary_shortcut("⇧⌘B", "Ctrl+Shift+B"),
+            ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.set_right_panel_visible(!this.right_panel_visible, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.set_right_panel_visible(!this.right_panel_visible, cx);
+                    cx.stop_propagation();
+                }
             }))
     }
 
@@ -2360,12 +2755,16 @@ impl Waku {
             .right_panel_surfaces
             .iter()
             .filter_map(RightPanelSurface::browser_id)
-            .chain(self.right_panel_session_states.values().flat_map(|state| {
-                state
-                    .surfaces
-                    .iter()
-                    .filter_map(RightPanelSurface::browser_id)
-            }))
+            .chain(
+                self.right_panel_workspace_states
+                    .values()
+                    .flat_map(|state| {
+                        state
+                            .surfaces
+                            .iter()
+                            .filter_map(RightPanelSurface::browser_id)
+                    }),
+            )
             .collect::<HashSet<_>>();
         self.right_panel_browsers
             .retain(|browser_id, _| retained_browser_ids.contains(browser_id));
@@ -2463,12 +2862,16 @@ impl Waku {
         let retained_terminal_ids = active_terminal_ids
             .iter()
             .copied()
-            .chain(self.right_panel_session_states.values().flat_map(|state| {
-                state
-                    .surfaces
-                    .iter()
-                    .filter_map(RightPanelSurface::terminal_id)
-            }))
+            .chain(
+                self.right_panel_workspace_states
+                    .values()
+                    .flat_map(|state| {
+                        state
+                            .surfaces
+                            .iter()
+                            .filter_map(RightPanelSurface::terminal_id)
+                    }),
+            )
             .collect::<HashSet<_>>();
         self.right_panel_terminals
             .retain(|terminal_id, _| retained_terminal_ids.contains(terminal_id));
@@ -2770,9 +3173,21 @@ impl Waku {
                                 tr!("right_panel.git_graph_description"),
                                 cx,
                             ))
-                            .child(div().flex_1()),
+                            .child(self.render_right_panel_card_placeholder()),
                     ),
             )
+    }
+
+    fn render_right_panel_card_placeholder(&self) -> Stateful<Div> {
+        div()
+            .id("right-panel-card-placeholder")
+            .h(px(112.0))
+            .flex_1()
+            .min_w_0()
+            .p(px(14.0))
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .invisible()
     }
 
     fn render_right_panel_card(

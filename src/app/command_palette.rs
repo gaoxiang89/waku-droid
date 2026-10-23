@@ -160,6 +160,8 @@ enum PaletteAction {
     ToggleSidebar,
     ToggleRightPanel,
     ToggleBottomPanel,
+    ToggleFilesSurface,
+    ToggleGitGraphSurface,
     NewTerminal,
     CheckForUpdates,
     OpenSettings(SettingsPage),
@@ -820,6 +822,24 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⌘J", "Ctrl+J")),
                 PaletteAction::ToggleBottomPanel,
                 "toggle show hide bottom panel terminal shell console",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.toggle_files"),
+                "icons/folder.svg",
+                Some(crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E")),
+                PaletteAction::ToggleFilesSurface,
+                "toggle show hide files surface browse tree workspace panel",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.toggle_git_graph"),
+                "icons/git-commit-horizontal.svg",
+                Some(crate::platform::primary_shortcut("⇧⌘G", "Ctrl+Shift+G")),
+                PaletteAction::ToggleGitGraphSurface,
+                "toggle show hide git graph commits branches tags history panel",
                 next(),
             ),
             CommandPaletteItem::command(
@@ -1647,6 +1667,12 @@ impl Waku {
             }
             PaletteAction::ToggleBottomPanel => {
                 self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
+            }
+            PaletteAction::ToggleFilesSurface => {
+                self.toggle_files_surface_action(&ToggleFilesSurface, window, cx)
+            }
+            PaletteAction::ToggleGitGraphSurface => {
+                self.toggle_git_graph_surface_action(&ToggleGitGraphSurface, window, cx)
             }
             PaletteAction::NewTerminal => self.new_terminal_action(&NewTerminal, window, cx),
             PaletteAction::CheckForUpdates => {

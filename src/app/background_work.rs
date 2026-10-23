@@ -598,6 +598,15 @@ impl Waku {
             .unwrap_or_default()
     }
 
+    /// The work keys a session's provider has reported, so a deleted
+    /// session's background-work tabs can close with it.
+    pub(super) fn background_work_keys(&self, session_id: Uuid) -> HashSet<BackgroundWorkKey> {
+        self.background_work
+            .get(&session_id)
+            .map(|registry| registry.items.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn background_work_for_activity(
         &self,
         session_id: Uuid,

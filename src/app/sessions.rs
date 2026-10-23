@@ -179,10 +179,23 @@ impl Waku {
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         let session_changed = self.state.selected_session != Some(session_id);
+        // Panels belong to the workspace, so moving between sessions that
+        // open into the same directory keeps Files, Terminal, and GitGraph
+        // exactly where they are; only a real workspace change swaps the
+        // stashed panel state in and out.
+        let panel_scope_changed = session_changed
+            && self
+                .state
+                .selected_session
+                .and_then(|id| self.panel_scope_for_session(id))
+                .zip(self.panel_scope_for_session(session_id))
+                .is_none_or(|(old, new)| old != new);
         if session_changed {
             self.capture_and_save_current_composer_draft(cx);
-            self.store_selected_right_panel_state();
-            self.store_selected_bottom_panel_state();
+            if panel_scope_changed {
+                self.store_selected_right_panel_state();
+                self.store_selected_bottom_panel_state();
+            }
         }
         let old_host = self.selected_host_key();
         self.state.selected_session = Some(session_id);
@@ -225,8 +238,15 @@ impl Waku {
         }
         if session_changed {
             self.restore_selected_composer_draft(cx);
-            self.restore_right_panel_state(session_id, cx);
-            self.restore_bottom_panel_state(session_id);
+            if panel_scope_changed {
+                self.restore_right_panel_state(session_id, cx);
+                self.restore_bottom_panel_state(session_id);
+            } else {
+                // Same workspace: the live panels are already the right ones,
+                // but a terminal opened earlier may still bind to another
+                // directory the session has since moved off of.
+                self.ensure_right_panel_terminals(cx);
+            }
         } else {
             self.ensure_right_panel_terminals(cx);
         }
@@ -352,9 +372,11 @@ impl Waku {
         self.pending_goal_operations.remove(&session_id);
         self.goal_observed_at.remove(&session_id);
         self.reset_session_runtime(session_id);
-        self.background_work.remove(&session_id);
+        // The panel cleanup reads the session's background-work keys, so it
+        // runs before that registry is dropped.
         self.remove_right_panel_session_state(session_id);
         self.remove_bottom_panel_session_state(session_id);
+        self.background_work.remove(&session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
         if let Err(error) = self
@@ -521,6 +543,24 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.set_bottom_panel_visible(!self.bottom_panel_visible, cx);
+    }
+
+    pub(super) fn toggle_files_surface_action(
+        &mut self,
+        _: &ToggleFilesSurface,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_right_panel_surface(RightPanelSurface::Files, cx);
+    }
+
+    pub(super) fn toggle_git_graph_surface_action(
+        &mut self,
+        _: &ToggleGitGraphSurface,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_right_panel_surface(RightPanelSurface::GitGraph, cx);
     }
 
     pub(super) fn toggle_fps_counter_action(

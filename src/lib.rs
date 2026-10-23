@@ -71,6 +71,8 @@ actions!(
         ToggleSidebar,
         ToggleRightPanel,
         ToggleBottomPanel,
+        ToggleFilesSurface,
+        ToggleGitGraphSurface,
         NewTerminal,
         NextTerminal,
         PreviousTerminal,
@@ -250,6 +252,9 @@ pub fn run() {
                 // The VS Code convention for the terminal panel beneath the
                 // editor.
                 KeyBinding::new("secondary-j", ToggleBottomPanel, None),
+                // VS Code again: the explorer and source-control chords.
+                KeyBinding::new("secondary-shift-e", ToggleFilesSurface, None),
+                KeyBinding::new("secondary-shift-g", ToggleGitGraphSurface, None),
                 KeyBinding::new("secondary-shift-j", NewTerminal, None),
                 KeyBinding::new("ctrl-pagedown", NextTerminal, Some("Terminal")),
                 KeyBinding::new("ctrl-pageup", PreviousTerminal, Some("Terminal")),

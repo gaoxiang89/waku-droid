@@ -62,6 +62,8 @@ command_palette.hide_right_panel: 隐藏右侧面板
 command_palette.show_bottom_panel: 显示底部面板
 command_palette.hide_bottom_panel: 隐藏底部面板
 command_palette.new_terminal: 新建终端
+command_palette.toggle_files: 切换文件面板
+command_palette.toggle_git_graph: 切换 Git Graph 面板
 command_palette.current: 当前
 command_palette.you: 你
 command_palette.agent: 智能体
@@ -744,6 +746,7 @@ right_panel.terminal: 终端
 right_panel.files: 文件
 right_panel.diff: 审阅
 right_panel.toggle: 显示或隐藏右侧面板
+right_panel.toggle_terminal: 显示或隐藏右侧终端
 right_panel.open_surface: 打开一个面板
 right_panel.choose_surface: 选择要在右侧面板中显示的内容
 right_panel.browser_description: 打开本地应用或网址

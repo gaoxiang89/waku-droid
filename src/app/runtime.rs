@@ -1053,9 +1053,11 @@ impl Waku {
             self.runtime_attach_misses.remove(session_id);
             self.runtimes.remove(session_id);
             self.clear_user_input_fields(*session_id);
-            self.background_work.remove(session_id);
+            // Panel cleanup reads the session's background-work keys, so it
+            // runs before that registry is dropped.
             self.remove_right_panel_session_state(*session_id);
             self.remove_bottom_panel_session_state(*session_id);
+            self.background_work.remove(session_id);
             self.task_switcher.remove(*session_id);
         }
 
@@ -1365,6 +1367,22 @@ impl Waku {
     pub(super) fn selected_workspace_path(&self) -> Option<&std::path::Path> {
         let session = self.selected_session()?;
         self.workspace_path_for_session(session)
+    }
+
+    /// The panel scope a session belongs to: its host plus the directory its
+    /// panels read. Sessions opening into the same directory share Files,
+    /// Terminal, and GitGraph state; a materialized worktree is its own
+    /// scope, because its tree points somewhere else.
+    pub(super) fn panel_scope_for_session(&self, session_id: Uuid) -> Option<PanelScope> {
+        let session = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)?;
+        Some(PanelScope {
+            host: self.hosts.ownership.session(session_id),
+            workspace: self.workspace_path_for_session(session)?.to_path_buf(),
+        })
     }
 
     /// Marks the session for the next save; see `PersistedState::session_mut`.

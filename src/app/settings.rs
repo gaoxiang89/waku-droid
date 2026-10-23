@@ -2775,7 +2775,7 @@ impl Waku {
             .iter()
             .flat_map(|group| group.panes())
             .chain(
-                self.bottom_panel_session_states
+                self.bottom_panel_workspace_states
                     .values()
                     .flat_map(|state| state.groups.iter().flat_map(|group| group.panes())),
             )

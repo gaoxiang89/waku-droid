@@ -581,9 +581,11 @@ impl Waku {
             self.pending_goal_operations.remove(id);
             self.goal_runtime_starts.remove(id);
             self.runtime_attach_misses.remove(id);
-            self.background_work.remove(id);
+            // Panel cleanup reads the session's background-work keys, so it
+            // runs before that registry is dropped.
             self.remove_right_panel_session_state(*id);
             self.remove_bottom_panel_session_state(*id);
+            self.background_work.remove(id);
             self.task_switcher.remove(*id);
         }
         self.state
