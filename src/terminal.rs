@@ -1642,7 +1642,22 @@ impl TerminalView {
         let lines = self.scroll_accumulator.trunc() as i32;
         if lines != 0 {
             self.scroll_accumulator -= lines as f32;
-            session.scroll(lines);
+            let cell = self.grid_bounds.get().and_then(|bounds| {
+                terminal_grid_point(
+                    bounds,
+                    event.position,
+                    self.cell_width(),
+                    session.grid_size.0,
+                    session.grid_size.1,
+                    0,
+                    true,
+                )
+                .map(|(point, _)| (point.column.0, point.line.0.max(0) as usize))
+            });
+            match terminal_wheel_input(lines, cell, &event.modifiers, session.mode()) {
+                Some(bytes) => session.write(bytes),
+                None => session.scroll(lines),
+            }
             cx.stop_propagation();
             cx.notify();
         }
@@ -2342,8 +2357,65 @@ fn existing_terminal_file_path(value: &str, working_directory: &Path) -> Option<
     }
 }
 
-fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {
-    if mode.contains(TermMode::BRACKETED_PASTE) {
+/// Full-screen TUIs that request mouse reporting or run on the alternate
+/// screen have no local scrollback to move, so the wheel must reach the
+/// program instead, matching Alacritty and Zed. `None` scrolls the local
+/// history; Shift forces that as the conventional escape hatch. `cell` is the
+/// pointer's (column, viewport row).
+fn terminal_wheel_input(
+    lines: i32,
+    cell: Option<(usize, usize)>,
+    modifiers: &Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if lines == 0 || modifiers.shift {
+        return None;
+    }
+    let count = lines.unsigned_abs() as usize;
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        // An unencodable position is dropped rather than scrolling history
+        // the application cannot see.
+        let report = cell
+            .and_then(|(column, row)| {
+                let button = if lines > 0 { 64 } else { 65 }
+                    + if modifiers.alt { 8 } else { 0 }
+                    + if modifiers.control { 16 } else { 0 };
+                mouse_report(button, column, row, mode)
+            })
+            .unwrap_or_default();
+        return Some(report.repeat(count));
+    }
+    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        let arrow: &[u8] = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
+        return Some(arrow.repeat(count));
+    }
+    None
+}
+
+fn mouse_report(button: u8, column: usize, row: usize, mode: TermMode) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return Some(format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes());
+    }
+
+    let utf8 = mode.contains(TermMode::UTF8_MOUSE);
+    let max_position = if utf8 { 2015 } else { 223 };
+    if column >= max_position || row >= max_position {
+        return None;
+    }
+    let mut report = vec![0x1b, b'[', b'M', 32 + button];
+    for position in [column, row] {
+        let encoded = 32 + 1 + position as u32;
+        if utf8 && encoded >= 0x80 {
+            report.push((0xC0 + encoded / 64) as u8);
+            report.push((0x80 + (encoded & 63)) as u8);
+        } else {
+            report.push(encoded as u8);
+        }
+    }
+    Some(report)
+}
+
+fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {    if mode.contains(TermMode::BRACKETED_PASTE) {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
         text.into_bytes()
@@ -2941,6 +3013,61 @@ mod tests {
         assert!(primary_modifier_pressed(&control));
         assert!(!terminal_clipboard_modifier_pressed(&control));
         assert!(terminal_clipboard_modifier_pressed(&control_shift));
+    }
+
+    #[test]
+    fn wheel_reaches_mouse_reporting_and_alternate_screen_apps() {
+        let plain = Modifiers::default();
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            terminal_wheel_input(3, Some((0, 0)), &plain, TermMode::default()),
+            None
+        );
+        assert_eq!(
+            terminal_wheel_input(
+                2,
+                Some((4, 1)),
+                &plain,
+                TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+            ),
+            Some(b"\x1b[<64;5;2M\x1b[<64;5;2M".to_vec())
+        );
+        assert_eq!(
+            terminal_wheel_input(-1, Some((0, 0)), &plain, TermMode::MOUSE_DRAG),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 33, 33])
+        );
+        assert_eq!(
+            terminal_wheel_input(
+                -1,
+                Some((100, 0)),
+                &plain,
+                TermMode::MOUSE_MOTION | TermMode::UTF8_MOUSE
+            ),
+            Some(vec![0x1b, b'[', b'M', 32 + 65, 0xC2, 0x85, 33])
+        );
+        assert_eq!(
+            terminal_wheel_input(
+                1,
+                Some((0, 0)),
+                &shift,
+                TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+            ),
+            None
+        );
+
+        let alt_screen = TermMode::default() | TermMode::ALT_SCREEN;
+        assert_eq!(
+            terminal_wheel_input(-2, None, &plain, alt_screen),
+            Some(b"\x1bOB\x1bOB".to_vec())
+        );
+        assert_eq!(
+            terminal_wheel_input(1, None, &plain, TermMode::ALT_SCREEN),
+            None
+        );
     }
 
     #[test]
