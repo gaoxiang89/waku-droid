@@ -1,5 +1,13 @@
 # Waku development guidance
 
+## Repositories and CI
+
+- `origin` points at the upstream `egoist/waku`; the user's fork is
+  `gaoxiang89/waku-droid` (remote `gaoxiang89`). Releases and version-bump tags
+  live on the fork, so query Actions runs with
+  `gh run list --repo gaoxiang89/waku-droid` — not the upstream repo, where the
+  runs do not exist or are not the relevant ones.
+
 ## Development runtime
 
 - Assume `bun ./scripts/dev.ts` is already running and owns the current
