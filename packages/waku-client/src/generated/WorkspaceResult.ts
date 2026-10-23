@@ -4,6 +4,8 @@ import type { Checkpoint } from "./Checkpoint";
 import type { CommitSnapshot } from "./CommitSnapshot";
 import type { CreatedWorktree } from "./CreatedWorktree";
 import type { FileEntry } from "./FileEntry";
+import type { GitCommitDetail } from "./GitCommitDetail";
+import type { GitGraphSnapshot } from "./GitGraphSnapshot";
 import type { ReviewDiffData } from "./ReviewDiffData";
 import type { SlashCommand } from "./SlashCommand";
 import type { WorkingTreeEntry } from "./WorkingTreeEntry";
@@ -17,4 +19,4 @@ bytes: string,
 /**
  * File length in bytes when the chunk was read.
  */
-total_bytes: number, } | { "type": "projectFiles", entries: Array<FileEntry>, } | { "type": "slashCommands", commands: Array<SlashCommand>, } | { "type": "projectlessWorkspace", cwd: string, } | { "type": "branches", snapshot: BranchSnapshot | null, } | { "type": "branchChanged", snapshot: BranchSnapshot, } | { "type": "worktreeCreated", worktree: CreatedWorktree, } | { "type": "commitSnapshot", snapshot: CommitSnapshot, } | { "type": "commitMessage", message: string, } | { "type": "checkpoint", checkpoint: Checkpoint, } | { "type": "bool", value: boolean, } | { "type": "turnRefs", turn_counts: Array<number>, } | { "type": "reviewDiff", data: ReviewDiffData, };
+total_bytes: number, } | { "type": "projectFiles", entries: Array<FileEntry>, } | { "type": "slashCommands", commands: Array<SlashCommand>, } | { "type": "projectlessWorkspace", cwd: string, } | { "type": "branches", snapshot: BranchSnapshot | null, } | { "type": "branchChanged", snapshot: BranchSnapshot, } | { "type": "worktreeCreated", worktree: CreatedWorktree, } | { "type": "commitSnapshot", snapshot: CommitSnapshot, } | { "type": "commitMessage", message: string, } | { "type": "checkpoint", checkpoint: Checkpoint, } | { "type": "bool", value: boolean, } | { "type": "turnRefs", turn_counts: Array<number>, } | { "type": "reviewDiff", data: ReviewDiffData, } | { "type": "gitGraph", snapshot: GitGraphSnapshot | null, } | { "type": "gitCommit", detail: GitCommitDetail, };

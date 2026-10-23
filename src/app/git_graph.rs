@@ -18,6 +18,10 @@ const GIT_GRAPH_SEARCH_CONTEXT: &str = "GitGraph > TextInput";
 const ROW_HEIGHT: f32 = 48.0;
 const LANE_PITCH: f32 = 12.0;
 const LANE_PAD: f32 = 10.0;
+/// Columns past this are clipped so a wide history cannot push subjects out
+/// of a narrow panel.
+const MAX_VISIBLE_LANES: u16 = 16;
+const MAX_REF_CHIPS: usize = 3;
 const PAGE: u32 = 400;
 const MAX_LIMIT: u32 = 4_000;
 
@@ -26,6 +30,8 @@ const LANE_HUES: [f32; 8] = [211.0, 28.0, 152.0, 274.0, 48.0, 332.0, 188.0, 12.0
 actions!(waku_git_graph, [GitGraphTop, GitGraphBottom]);
 
 pub(super) fn init(cx: &mut App) {
+    // Home/End stay with the search field's caret; they only jump rows when
+    // the list itself has focus.
     cx.bind_keys([
         KeyBinding::new("down", SelectNextEntry, Some(GIT_GRAPH_CONTEXT)),
         KeyBinding::new("up", SelectPreviousEntry, Some(GIT_GRAPH_CONTEXT)),
@@ -33,8 +39,6 @@ pub(super) fn init(cx: &mut App) {
         KeyBinding::new("up", SelectPreviousEntry, Some(GIT_GRAPH_SEARCH_CONTEXT)),
         KeyBinding::new("home", GitGraphTop, Some(GIT_GRAPH_CONTEXT)),
         KeyBinding::new("end", GitGraphBottom, Some(GIT_GRAPH_CONTEXT)),
-        KeyBinding::new("home", GitGraphTop, Some(GIT_GRAPH_SEARCH_CONTEXT)),
-        KeyBinding::new("end", GitGraphBottom, Some(GIT_GRAPH_SEARCH_CONTEXT)),
         KeyBinding::new("enter", ConfirmEntry, Some(GIT_GRAPH_CONTEXT)),
         KeyBinding::new("escape", DismissMenu, Some(GIT_GRAPH_CONTEXT)),
     ]);
@@ -48,6 +52,34 @@ enum GitGraphView {
     Ready(Arc<waku_client::git::GitGraphSnapshot>),
 }
 
+/// What a selected row points at, so a refresh that adds or drops rows keeps
+/// the same commit selected instead of the same index.
+enum GitGraphRowKey {
+    Uncommitted,
+    Commit(String),
+}
+
+/// Per-row search result for one snapshot and query, rebuilt only when either
+/// changes so row builders never lowercase strings on a frame.
+pub(super) struct GitGraphMatches {
+    snapshot: Arc<waku_client::git::GitGraphSnapshot>,
+    query: String,
+    matched: Rc<Vec<bool>>,
+}
+
+/// Everything a row builder needs, resolved once per frame.
+#[derive(Clone)]
+struct GitGraphRowContext {
+    snapshot: Arc<waku_client::git::GitGraphSnapshot>,
+    matches: Option<Rc<Vec<bool>>>,
+    cursor: Option<usize>,
+    head_lane: u16,
+    head_on_top: bool,
+    graph_width: f32,
+    canvas_width: f32,
+    now: i64,
+}
+
 impl Waku {
     pub(super) fn clear_git_graph_cache(&mut self) {
         self.git_graph_snapshots.clear();
@@ -55,6 +87,7 @@ impl Waku {
         self.git_graph_limits.clear();
         self.visible_git_graph = None;
         self.git_graph_cursor = None;
+        self.git_graph_matches = None;
     }
 
     fn refresh_git_graph(&mut self, cx: &mut Context<Self>) {
@@ -80,6 +113,35 @@ impl Waku {
 
     fn git_graph_page_limit(&self, path: &Path) -> u32 {
         self.git_graph_limits.get(path).copied().unwrap_or(PAGE)
+    }
+
+    fn git_graph_cursor_in(&self, path: &Path) -> Option<usize> {
+        self.git_graph_cursor
+            .as_ref()
+            .filter(|(cursor_path, _)| cursor_path == path)
+            .map(|(_, index)| *index)
+    }
+
+    fn selected_git_graph_cursor(&self) -> Option<usize> {
+        self.git_graph_cursor_in(self.selected_workspace_path()?)
+    }
+
+    /// Carry the selection from the snapshot on screen to one that just
+    /// arrived for the same workspace.
+    fn remap_git_graph_cursor(&mut self, path: &Path, next: &waku_client::git::GitGraphSnapshot) {
+        let Some(index) = self.git_graph_cursor_in(path) else {
+            return;
+        };
+        let previous = match &self.visible_git_graph {
+            Some((visible, snapshot)) if visible == path => Arc::clone(snapshot),
+            _ => {
+                self.git_graph_cursor = None;
+                return;
+            }
+        };
+        self.git_graph_cursor = git_graph_row_key(&previous, index)
+            .and_then(|key| git_graph_row_index(next, &key))
+            .map(|index| (path.to_path_buf(), index));
     }
 
     /// The graph for the selected workspace. A miss starts one daemon fetch.
@@ -144,9 +206,9 @@ impl Waku {
                             Ok(waku_client::WorkspaceResult::GitGraph { snapshot }) => {
                                 Ok(snapshot.map(Arc::new))
                             }
-                            Ok(_) => Err(
-                                "the daemon returned an invalid git graph response".to_owned()
-                            ),
+                            Ok(_) => {
+                                Err("the daemon returned an invalid git graph response".to_owned())
+                            }
                             Err(error) => Err(error.to_string()),
                         }
                     }
@@ -157,6 +219,7 @@ impl Waku {
                     return;
                 }
                 if let Ok(Some(snapshot)) = &result {
+                    waku.remap_git_graph_cursor(&path, snapshot);
                     waku.visible_git_graph = Some((path, Arc::clone(snapshot)));
                 }
                 cx.notify();
@@ -197,15 +260,14 @@ impl Waku {
                     let path = path.clone();
                     let hash = hash.clone();
                     async move {
-                        match workspace
-                            .request(waku_client::WorkspaceOperation::InspectGitCommit {
-                                cwd: path,
-                                hash,
-                            }) {
+                        match workspace.request(waku_client::WorkspaceOperation::InspectGitCommit {
+                            cwd: path,
+                            hash,
+                        }) {
                             Ok(waku_client::WorkspaceResult::GitCommit { detail }) => Ok(detail),
-                            Ok(_) => Err(
-                                "the daemon returned an invalid commit response".to_owned()
-                            ),
+                            Ok(_) => {
+                                Err("the daemon returned an invalid commit response".to_owned())
+                            }
                             Err(error) => Err(error.to_string()),
                         }
                     }
@@ -221,38 +283,37 @@ impl Waku {
     }
 
     fn step_git_graph(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(snapshot) = self
-            .visible_git_graph
-            .as_ref()
-            .filter(|(path, _)| {
-                self.selected_workspace_path()
-                    .is_some_and(|selected| selected == path)
-            })
-            .map(|(_, snapshot)| Arc::clone(snapshot))
-        else {
+        let Some(count) = self.selected_git_graph_row_count() else {
             return;
         };
-        let count = git_graph_row_count(&snapshot);
         if count == 0 {
             return;
         }
-        let next = match self.git_graph_cursor {
+        let next = match self.selected_git_graph_cursor() {
             None if delta < 0 => count - 1,
             None => 0,
-            Some(current) => {
-                let next = current as isize + delta;
-                if next < 0 {
-                    0
-                } else {
-                    (next as usize).min(count - 1)
-                }
-            }
+            Some(current) => current.saturating_add_signed(delta).min(count - 1),
         };
         self.focus_git_graph_row(next, cx);
     }
 
+    fn selected_git_graph_row_count(&self) -> Option<usize> {
+        let selected = self.selected_workspace_path()?;
+        self.visible_git_graph
+            .as_ref()
+            .filter(|(path, _)| path == selected)
+            .map(|(_, snapshot)| git_graph_row_count(snapshot))
+    }
+
     fn focus_git_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.git_graph_cursor = Some(index);
+        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.git_graph_cursor_in(&path) != Some(index) {
+            self.git_graph_detail_scroll
+                .set_offset(point(px(0.0), px(0.0)));
+        }
+        self.git_graph_cursor = Some((path, index));
         self.git_graph_list_state.scroll_to_reveal_item(index);
         cx.notify();
     }
@@ -263,6 +324,34 @@ impl Waku {
             .content()
             .trim()
             .to_lowercase()
+    }
+
+    fn git_graph_row_matches(
+        &mut self,
+        snapshot: &Arc<waku_client::git::GitGraphSnapshot>,
+        cx: &App,
+    ) -> Option<Rc<Vec<bool>>> {
+        let query = self.git_graph_query(cx);
+        if query.is_empty() {
+            return None;
+        }
+        if let Some(cache) = &self.git_graph_matches
+            && Arc::ptr_eq(&cache.snapshot, snapshot)
+            && cache.query == query
+        {
+            return Some(Rc::clone(&cache.matched));
+        }
+        let matched = Rc::new(
+            (0..git_graph_row_count(snapshot))
+                .map(|index| git_graph_row_matches(snapshot, index, &query))
+                .collect::<Vec<_>>(),
+        );
+        self.git_graph_matches = Some(GitGraphMatches {
+            snapshot: Arc::clone(snapshot),
+            query,
+            matched: Rc::clone(&matched),
+        });
+        Some(matched)
     }
 
     pub(super) fn render_git_graph(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -283,20 +372,26 @@ impl Waku {
                 this.step_git_graph(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &GitGraphTop, _, cx| {
-                this.focus_git_graph_row(0, cx);
+                if this
+                    .selected_git_graph_row_count()
+                    .is_some_and(|count| count > 0)
+                {
+                    this.focus_git_graph_row(0, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &GitGraphBottom, _, cx| {
-                let Some(count) = this.visible_git_graph.as_ref().map(|(_, snapshot)| {
-                    git_graph_row_count(snapshot)
-                }) else {
-                    return;
-                };
-                if count > 0 {
+                if let Some(count) = this.selected_git_graph_row_count()
+                    && count > 0
+                {
                     this.focus_git_graph_row(count - 1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ConfirmEntry, _, cx| {
-                if this.git_graph_cursor.is_none() {
+                if this.selected_git_graph_cursor().is_none()
+                    && this
+                        .selected_git_graph_row_count()
+                        .is_some_and(|count| count > 0)
+                {
                     this.focus_git_graph_row(0, cx);
                 }
             }))
@@ -385,17 +480,44 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
+        let path = self
+            .selected_workspace_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let rows = git_graph_row_count(&snapshot);
-        if self.git_graph_cursor.is_some_and(|cursor| cursor >= rows) {
+        if self
+            .git_graph_cursor_in(&path)
+            .is_some_and(|cursor| cursor >= rows)
+        {
             self.git_graph_cursor = None;
         }
-        if self.git_graph_list_rows != rows {
+        let same_path = self.git_graph_list_path.as_deref() == Some(path.as_path());
+        if self.git_graph_list_rows != rows || !same_path {
+            // A reset scrolls to the top; keep the reader's place when the
+            // same history only grew or shrank (load more, a new commit).
+            let keep = same_path.then(|| self.git_graph_list_state.logical_scroll_top());
             self.git_graph_list_rows = rows;
+            self.git_graph_list_path = Some(path.clone());
             self.git_graph_list_state
                 .reset_with_uniform_height(rows, px(ROW_HEIGHT));
+            if let Some(top) = keep {
+                self.git_graph_list_state.scroll_to(top);
+            }
         }
-        let width = graph_width(&snapshot);
-        let listed = snapshot.clone();
+        let cursor = self.git_graph_cursor_in(&path);
+        let head = snapshot
+            .head_row
+            .and_then(|row| snapshot.rows.get(row as usize));
+        let context = GitGraphRowContext {
+            matches: self.git_graph_row_matches(&snapshot, cx),
+            cursor,
+            head_lane: head.map_or(0, |row| row.node_lane),
+            head_on_top: snapshot.head_row == Some(0),
+            graph_width: graph_width(&snapshot),
+            canvas_width: canvas_width(&snapshot),
+            now: unix_time() as i64,
+            snapshot: Arc::clone(&snapshot),
+        };
         let entity = cx.entity().downgrade();
         let mut body = div().flex_1().min_h_0().flex().flex_col().child(
             div()
@@ -410,12 +532,11 @@ impl Waku {
                     list(
                         self.git_graph_list_state.clone(),
                         move |index, _window, cx| {
-                            let listed = listed.clone();
                             entity
                                 .upgrade()
                                 .map(|entity| {
                                     entity.update(cx, |this, cx| {
-                                        this.git_graph_row(index, &listed, width, cx)
+                                        this.git_graph_row(index, &context, cx)
                                     })
                                 })
                                 .unwrap_or_else(|| div().into_any_element())
@@ -428,59 +549,46 @@ impl Waku {
                     &self.git_graph_scrollbar,
                 )),
         );
-        if let Some(cursor) = self.git_graph_cursor {
+        if let Some(cursor) = cursor {
             body = body.child(self.render_git_graph_detail(cursor, &snapshot, theme, cx));
         }
-        if snapshot.truncated && self.git_graph_page_limit_for_snapshot(&snapshot) < MAX_LIMIT {
+        if snapshot.truncated && self.git_graph_page_limit(&path) < MAX_LIMIT {
             body = body.child(self.render_git_graph_load_more(theme, cx));
         }
         body
     }
 
-    fn git_graph_page_limit_for_snapshot(
-        &self,
-        _snapshot: &waku_client::git::GitGraphSnapshot,
-    ) -> u32 {
-        self.selected_workspace_path()
-            .map(|path| self.git_graph_page_limit(path))
-            .unwrap_or(PAGE)
-    }
-
     fn git_graph_row(
         &self,
         index: usize,
-        snapshot: &waku_client::git::GitGraphSnapshot,
-        graph_width: f32,
+        context: &GitGraphRowContext,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::current(cx);
-        let query = self.git_graph_query(cx);
-        let selected = self.git_graph_cursor == Some(index);
-        let matched = git_graph_row_matches(snapshot, index, &query);
-        let uncommitted = !snapshot.uncommitted.is_empty();
-        let commit_index = index.saturating_sub(usize::from(uncommitted));
-        let row = if uncommitted && index == 0 {
+        let snapshot = &context.snapshot;
+        let selected = context.cursor == Some(index);
+        let matched = context
+            .matches
+            .as_ref()
+            .is_none_or(|matches| matches.get(index).copied().unwrap_or(false));
+        let has_uncommitted = !snapshot.uncommitted.is_empty();
+        let is_uncommitted = has_uncommitted && index == 0;
+        let commit = if is_uncommitted {
             None
         } else {
-            snapshot.rows.get(commit_index).cloned()
+            snapshot.commits.get(index - usize::from(has_uncommitted))
         };
-        let head_lane = snapshot
-            .rows
-            .first()
-            .map(|row| row.node_lane)
-            .unwrap_or(0);
-        let label = if uncommitted && index == 0 {
-            tr!("git_graph.uncommitted")
+        let row = if is_uncommitted {
+            None
         } else {
-            snapshot
-                .commits
-                .get(commit_index)
-                .map(|commit| commit.subject.clone())
-                .unwrap_or_default()
+            snapshot.rows.get(index - usize::from(has_uncommitted))
         };
-        let secondary = snapshot.commits.get(commit_index).map(|commit| {
-            let age = unix_time() as i64;
-            let seconds = age.saturating_sub(commit.authored_at).max(0) as u64;
+        let label = match commit {
+            Some(commit) => commit.subject.clone(),
+            None => tr!("git_graph.uncommitted"),
+        };
+        let secondary = commit.map(|commit| {
+            let seconds = context.now.saturating_sub(commit.authored_at).max(0) as u64;
             format!(
                 "{} · {} · {}",
                 commit.author,
@@ -488,15 +596,11 @@ impl Waku {
                 short_hash(&commit.hash)
             )
         });
-        let refs = if uncommitted && index == 0 {
-            Vec::new()
-        } else {
-            snapshot
-                .commits
-                .get(commit_index)
-                .map(|commit| commit.refs.clone())
-                .unwrap_or_default()
-        };
+        let refs = commit.map(|commit| commit.refs.as_slice()).unwrap_or(&[]);
+        let hidden_refs = refs.len().saturating_sub(MAX_REF_CHIPS);
+        // The dashed link from the uncommitted row can only be drawn when
+        // HEAD is the row right below it.
+        let connect_above = has_uncommitted && index == 1 && context.head_on_top;
 
         div()
             .id(SharedString::from(format!("git-graph-row-{index}")))
@@ -513,11 +617,13 @@ impl Waku {
                 element.hover(|element| element.bg(theme.overlay))
             })
             .child(git_graph_lanes(
-                row,
-                uncommitted && index == 0,
-                uncommitted && index == 1,
-                head_lane,
-                graph_width,
+                row.cloned(),
+                is_uncommitted,
+                connect_above,
+                context.head_lane,
+                context.head_on_top,
+                context.graph_width,
+                context.canvas_width,
             ))
             .child(
                 div()
@@ -549,7 +655,14 @@ impl Waku {
                                     .truncate()
                                     .child(label),
                             )
-                            .children(refs.iter().map(|git_ref| git_ref_chip(git_ref, &theme))),
+                            .children(
+                                refs.iter()
+                                    .take(MAX_REF_CHIPS)
+                                    .map(|git_ref| git_ref_chip(git_ref, &theme)),
+                            )
+                            .when(hidden_refs > 0, |element| {
+                                element.child(overflow_chip(hidden_refs, &theme))
+                            }),
                     )
                     .when_some(secondary, |element, secondary| {
                         element.child(
@@ -603,27 +716,27 @@ impl Waku {
                 .border_color(theme.border),
         )
         .track_scroll(&self.git_graph_detail_scroll)
-            .px(px(12.0))
-            .py(px(10.0))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(sp(12.5))
-                    .line_height(sp(17.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .whitespace_normal()
-                    .child(commit.subject.clone()),
-            )
-            .child(
-                div()
-                    .text_size(sp(11.5))
-                    .text_color(theme.text_tertiary)
-                    .child(format!("{} · {}", commit.author, authored)),
-            )
-            .child(self.render_git_graph_hash(&hash, theme, cx));
+        .px(px(12.0))
+        .py(px(10.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(sp(12.5))
+                .line_height(sp(17.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .whitespace_normal()
+                .child(commit.subject.clone()),
+        )
+        .child(
+            div()
+                .text_size(sp(11.5))
+                .text_color(theme.text_tertiary)
+                .child(format!("{} · {}", commit.author, authored)),
+        )
+        .child(self.render_git_graph_hash(&hash, theme, cx));
         if !commit.parents.is_empty() {
             body = body.child(
                 div()
@@ -684,19 +797,19 @@ impl Waku {
                 .border_color(theme.border),
         )
         .track_scroll(&self.git_graph_detail_scroll)
-            .px(px(12.0))
-            .py(px(10.0))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(sp(12.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(tr!("git_graph.uncommitted")),
-            )
-            .child(git_graph_files(&snapshot.uncommitted, theme))
+        .px(px(12.0))
+        .py(px(10.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(sp(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(tr!("git_graph.uncommitted")),
+        )
+        .child(git_graph_files(&snapshot.uncommitted, theme))
     }
 
     fn render_git_graph_hash(
@@ -798,6 +911,35 @@ fn git_graph_row_count(snapshot: &waku_client::git::GitGraphSnapshot) -> usize {
     snapshot.commits.len() + usize::from(!snapshot.uncommitted.is_empty())
 }
 
+fn git_graph_row_key(
+    snapshot: &waku_client::git::GitGraphSnapshot,
+    index: usize,
+) -> Option<GitGraphRowKey> {
+    let uncommitted = !snapshot.uncommitted.is_empty();
+    if uncommitted && index == 0 {
+        return Some(GitGraphRowKey::Uncommitted);
+    }
+    snapshot
+        .commits
+        .get(index - usize::from(uncommitted))
+        .map(|commit| GitGraphRowKey::Commit(commit.hash.clone()))
+}
+
+fn git_graph_row_index(
+    snapshot: &waku_client::git::GitGraphSnapshot,
+    key: &GitGraphRowKey,
+) -> Option<usize> {
+    let uncommitted = !snapshot.uncommitted.is_empty();
+    match key {
+        GitGraphRowKey::Uncommitted => uncommitted.then_some(0),
+        GitGraphRowKey::Commit(hash) => snapshot
+            .commits
+            .iter()
+            .position(|commit| &commit.hash == hash)
+            .map(|index| index + usize::from(uncommitted)),
+    }
+}
+
 fn git_graph_row_matches(
     snapshot: &waku_client::git::GitGraphSnapshot,
     index: usize,
@@ -857,6 +999,22 @@ fn git_ref_chip(git_ref: &waku_client::git::GitGraphRef, theme: &Theme) -> Div {
         .when(git_ref.current, |element| {
             element.child(tr!("git_graph.head"))
         })
+}
+
+fn overflow_chip(hidden: usize, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .h(px(16.0))
+        .px(px(5.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(theme.text_tertiary)
+        .flex()
+        .items_center()
+        .text_size(sp(10.0))
+        .line_height(sp(12.0))
+        .text_color(theme.text_tertiary)
+        .child(format!("+{hidden}"))
 }
 
 fn git_graph_files(files: &[waku_client::git::GitGraphFile], theme: &Theme) -> Div {
@@ -940,14 +1098,12 @@ fn short_hashes(parents: &[String]) -> String {
 }
 
 fn graph_width(snapshot: &waku_client::git::GitGraphSnapshot) -> f32 {
-    let lanes = snapshot
-        .rows
-        .iter()
-        .map(|row| row.lanes.len())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let lanes = snapshot.lane_count.clamp(1, MAX_VISIBLE_LANES);
     LANE_PAD + lanes as f32 * LANE_PITCH
+}
+
+fn canvas_width(snapshot: &waku_client::git::GitGraphSnapshot) -> f32 {
+    LANE_PAD + snapshot.lane_count.max(1) as f32 * LANE_PITCH
 }
 
 fn git_graph_lanes(
@@ -955,17 +1111,16 @@ fn git_graph_lanes(
     uncommitted: bool,
     connect_above: bool,
     head_lane: u16,
+    head_on_top: bool,
     width: f32,
-) -> impl IntoElement {
-    canvas(
-        {
-            let row = row.clone();
-            move |_, _, _| (row.clone(), uncommitted, connect_above, head_lane)
-        },
-        move |bounds, (row, uncommitted, connect_above, head_lane), window, cx| {
+    canvas_width: f32,
+) -> Div {
+    let painted = canvas(
+        move |_, _, _| row,
+        move |bounds, row, window, cx| {
             let theme = Theme::current(cx);
             if uncommitted {
-                paint_uncommitted_marker(bounds, head_lane, theme.text_ghost, window);
+                paint_uncommitted_marker(bounds, head_lane, head_on_top, theme.text_ghost, window);
                 return;
             }
             let Some(row) = row else {
@@ -981,9 +1136,15 @@ fn git_graph_lanes(
             );
         },
     )
-    .w(px(width))
+    .w(px(canvas_width))
     .h(px(ROW_HEIGHT))
-    .flex_none()
+    .flex_none();
+    div()
+        .flex_none()
+        .w(px(width))
+        .h(px(ROW_HEIGHT))
+        .overflow_hidden()
+        .child(painted)
 }
 
 fn lane_x(origin_x: Pixels, lane: u16) -> Pixels {
@@ -1057,13 +1218,16 @@ fn paint_commit_row(
 fn paint_uncommitted_marker(
     bounds: gpui::Bounds<Pixels>,
     lane: u16,
+    stem: bool,
     color: Hsla,
     window: &mut Window,
 ) {
     let x = lane_x(bounds.origin.x, lane);
     let mid = bounds.origin.y + bounds.size.height / 2.0;
     let bottom = bounds.origin.y + bounds.size.height;
-    paint_dashed_vertical(window, x, mid + px(6.0), bottom, color);
+    if stem {
+        paint_dashed_vertical(window, x, mid + px(6.0), bottom, color);
+    }
     let mut ring = PathBuilder::stroke(px(1.25));
     stroke_circle(&mut ring, point(x, mid), px(3.5));
     if let Ok(path) = ring.build() {
@@ -1071,13 +1235,7 @@ fn paint_uncommitted_marker(
     }
 }
 
-fn paint_dashed_vertical(
-    window: &mut Window,
-    x: Pixels,
-    y0: Pixels,
-    y1: Pixels,
-    color: Hsla,
-) {
+fn paint_dashed_vertical(window: &mut Window, x: Pixels, y0: Pixels, y1: Pixels, color: Hsla) {
     let mut line = PathBuilder::stroke(px(1.25)).dash_array(&[px(2.0), px(3.0)]);
     line.move_to(point(x, y0));
     line.line_to(point(x, y1));

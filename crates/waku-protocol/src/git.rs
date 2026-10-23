@@ -139,6 +139,10 @@ pub struct GitGraphSnapshot {
     pub commits: Vec<GitGraphCommit>,
     pub rows: Vec<GitGraphRow>,
     pub uncommitted: Vec<GitGraphFile>,
+    /// Index into `commits` of the checked-out commit, when it is loaded.
+    pub head_row: Option<u32>,
+    /// Widest row, so the client sizes the graph column without a scan.
+    pub lane_count: u16,
     pub truncated: bool,
     pub limit: u32,
 }
