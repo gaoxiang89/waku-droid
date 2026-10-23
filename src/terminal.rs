@@ -1301,18 +1301,10 @@ impl TerminalView {
                 PaneChord::SplitRight => cx.dispatch_action(&crate::SplitTerminalRight),
                 PaneChord::SplitDown => cx.dispatch_action(&crate::SplitTerminalDown),
                 PaneChord::ClosePane => cx.dispatch_action(&crate::CloseTerminalPane),
-                PaneChord::Resize(ResizeDirection::Left) => {
-                    cx.dispatch_action(&crate::ResizeTerminalPaneLeft)
-                }
-                PaneChord::Resize(ResizeDirection::Right) => {
-                    cx.dispatch_action(&crate::ResizeTerminalPaneRight)
-                }
-                PaneChord::Resize(ResizeDirection::Up) => {
-                    cx.dispatch_action(&crate::ResizeTerminalPaneUp)
-                }
-                PaneChord::Resize(ResizeDirection::Down) => {
-                    cx.dispatch_action(&crate::ResizeTerminalPaneDown)
-                }
+                PaneChord::ResizeLeft => cx.dispatch_action(&crate::ResizeTerminalPaneLeft),
+                PaneChord::ResizeRight => cx.dispatch_action(&crate::ResizeTerminalPaneRight),
+                PaneChord::ResizeUp => cx.dispatch_action(&crate::ResizeTerminalPaneUp),
+                PaneChord::ResizeDown => cx.dispatch_action(&crate::ResizeTerminalPaneDown),
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -2455,7 +2447,10 @@ enum PaneChord {
     SplitRight,
     SplitDown,
     ClosePane,
-    Resize(ResizeDirection),
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
 }
 
 /// The pane chord a keydown carries, whatever spelling the platform reports.
@@ -2503,10 +2498,10 @@ fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
     }
     if shifted {
         return match key {
-            "left" => Some(PaneChord::Resize(ResizeDirection::Left)),
-            "right" => Some(PaneChord::Resize(ResizeDirection::Right)),
-            "up" => Some(PaneChord::Resize(ResizeDirection::Up)),
-            "down" => Some(PaneChord::Resize(ResizeDirection::Down)),
+            "left" => Some(PaneChord::ResizeLeft),
+            "right" => Some(PaneChord::ResizeRight),
+            "up" => Some(PaneChord::ResizeUp),
+            "down" => Some(PaneChord::ResizeDown),
             _ => None,
         };
     }
@@ -3377,14 +3372,8 @@ mod tests {
             Some(PaneChord::SplitDown)
         );
         // The unshifted keys stay with the shell.
-        assert_eq!(
-            bottom_panel_pane_chord(&key("=", Some("="), alt)),
-            None
-        );
-        assert_eq!(
-            bottom_panel_pane_chord(&key("-", Some("-"), alt)),
-            None
-        );
+        assert_eq!(bottom_panel_pane_chord(&key("=", Some("="), alt)), None);
+        assert_eq!(bottom_panel_pane_chord(&key("-", Some("-"), alt)), None);
         // Platforms that keep the shift flag report the unshifted key.
         assert_eq!(
             bottom_panel_pane_chord(&key("=", Some("+"), alt_shift)),
@@ -3427,15 +3416,15 @@ mod tests {
             shift: true,
             ..Default::default()
         };
-        for (name, direction) in [
-            ("left", ResizeDirection::Left),
-            ("right", ResizeDirection::Right),
-            ("up", ResizeDirection::Up),
-            ("down", ResizeDirection::Down),
+        for (name, chord) in [
+            ("left", PaneChord::ResizeLeft),
+            ("right", PaneChord::ResizeRight),
+            ("up", PaneChord::ResizeUp),
+            ("down", PaneChord::ResizeDown),
         ] {
             assert_eq!(
                 bottom_panel_pane_chord(&key(name, None, alt_shift)),
-                Some(PaneChord::Resize(direction))
+                Some(chord)
             );
         }
         // Alt+arrow without shift belongs to the shell.
