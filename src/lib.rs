@@ -270,12 +270,12 @@ pub fn run() {
                 KeyBinding::new("secondary-alt-shift-d", SplitTerminalDown, Some("Terminal")),
                 KeyBinding::new("secondary-shift-w", CloseTerminalPane, Some("Terminal")),
                 KeyBinding::new("ctrl-shift-w", CloseTerminalPane, Some("Terminal")),
-                KeyBinding::new("alt-shift-+", SplitTerminalRight, Some("Terminal")),
                 KeyBinding::new("alt-shift-=", SplitTerminalRight, Some("Terminal")),
-                KeyBinding::new("alt-shift-plus", SplitTerminalRight, Some("Terminal")),
+                // Windows folds the shift into the produced character and
+                // clears the modifier, so shift+= arrives as "+".
+                KeyBinding::new("alt-+", SplitTerminalRight, Some("Terminal")),
                 KeyBinding::new("alt-shift--", SplitTerminalDown, Some("Terminal")),
-                KeyBinding::new("alt-shift-minus", SplitTerminalDown, Some("Terminal")),
-                KeyBinding::new("alt-shift-_", SplitTerminalDown, Some("Terminal")),
+                KeyBinding::new("alt-_", SplitTerminalDown, Some("Terminal")),
                 KeyBinding::new("alt-shift-left", ResizeTerminalPaneLeft, Some("Terminal")),
                 KeyBinding::new("alt-shift-right", ResizeTerminalPaneRight, Some("Terminal")),
                 KeyBinding::new("alt-shift-up", ResizeTerminalPaneUp, Some("Terminal")),

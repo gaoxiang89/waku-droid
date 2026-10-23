@@ -1291,94 +1291,32 @@ impl TerminalView {
         self.pause_cursor_blink(cx);
         let keystroke = &event.keystroke;
 
-        // Split, close-pane, and resize chords reach the panel's actions:
-        // secondary+shift+d splits right, secondary+alt+shift+d splits down,
-        // secondary+shift+w / ctrl+shift+w closes the focused pane,
-        // and Windows Terminal chords (alt+shift+plus/minus, alt+shift+arrows)
-        // split and resize.
-        if self.bottom_panel_tabs {
-            if (keystroke.modifiers.secondary() || keystroke.modifiers.control)
-                && keystroke.modifiers.shift
-                && !keystroke.modifiers.function
-            {
-                let key = keystroke.key.as_str();
-                let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
-                let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
-                let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
-                if split_right {
-                    cx.dispatch_action(&crate::SplitTerminalRight);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
+        // Split, close-pane, and resize chords reach the panel's actions from
+        // the focused pane. Only the bottom panel can split, so other
+        // terminals leave these chords to the shell.
+        if self.bottom_panel_tabs
+            && let Some(chord) = bottom_panel_pane_chord(keystroke)
+        {
+            match chord {
+                PaneChord::SplitRight => cx.dispatch_action(&crate::SplitTerminalRight),
+                PaneChord::SplitDown => cx.dispatch_action(&crate::SplitTerminalDown),
+                PaneChord::ClosePane => cx.dispatch_action(&crate::CloseTerminalPane),
+                PaneChord::Resize(ResizeDirection::Left) => {
+                    cx.dispatch_action(&crate::ResizeTerminalPaneLeft)
                 }
-                if split_down {
-                    cx.dispatch_action(&crate::SplitTerminalDown);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
+                PaneChord::Resize(ResizeDirection::Right) => {
+                    cx.dispatch_action(&crate::ResizeTerminalPaneRight)
                 }
-                if close_pane {
-                    cx.dispatch_action(&crate::CloseTerminalPane);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
+                PaneChord::Resize(ResizeDirection::Up) => {
+                    cx.dispatch_action(&crate::ResizeTerminalPaneUp)
+                }
+                PaneChord::Resize(ResizeDirection::Down) => {
+                    cx.dispatch_action(&crate::ResizeTerminalPaneDown)
                 }
             }
-            if keystroke.modifiers.alt && !keystroke.modifiers.function {
-                let key = keystroke.key.as_str();
-                let key_char = keystroke.key_char.as_deref().unwrap_or("");
-                let split_right = (keystroke.modifiers.shift
-                    && (matches!(key, "+" | "=" | "plus" | "add" | "equal") || key_char == "+"))
-                    || matches!(key, "+" | "add" | "plus")
-                    || key_char == "+";
-                let split_down = (keystroke.modifiers.shift
-                    && (matches!(key, "-" | "_" | "minus" | "subtract" | "underscore")
-                        || key_char == "-"
-                        || key_char == "_"))
-                    || matches!(key, "-" | "subtract" | "minus")
-                    || key_char == "-";
-                if split_right {
-                    cx.dispatch_action(&crate::SplitTerminalRight);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
-                }
-                if split_down {
-                    cx.dispatch_action(&crate::SplitTerminalDown);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    return;
-                }
-                if keystroke.modifiers.shift {
-                    match key {
-                        "left" => {
-                            cx.dispatch_action(&crate::ResizeTerminalPaneLeft);
-                            window.prevent_default();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        "right" => {
-                            cx.dispatch_action(&crate::ResizeTerminalPaneRight);
-                            window.prevent_default();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        "up" => {
-                            cx.dispatch_action(&crate::ResizeTerminalPaneUp);
-                            window.prevent_default();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        "down" => {
-                            cx.dispatch_action(&crate::ResizeTerminalPaneDown);
-                            window.prevent_default();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
         }
 
         // The platform owns candidate navigation/confirmation while composing.
@@ -2511,6 +2449,70 @@ fn terminal_uses_text_input(event: &KeyDownEvent) -> bool {
             && !modifiers.platform)
 }
 
+/// A split, close, or resize chord for the bottom panel's pane tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneChord {
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    Resize(ResizeDirection),
+}
+
+/// The pane chord a keydown carries, whatever spelling the platform reports.
+///
+/// Windows folds a shifted punctuation key into the character it produces and
+/// clears the shift flag before the event reaches us: shift+= arrives as `+`
+/// and shift+- as `_`, both without a shift modifier. Those shifted
+/// characters therefore count as the chord on their own, while the unshifted
+/// `=` and `-` stay with the shell.
+fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
+    let modifiers = keystroke.modifiers;
+    if modifiers.function {
+        return None;
+    }
+    let key = keystroke.key.as_str();
+    let key_char = keystroke.key_char.as_deref().unwrap_or("");
+
+    if (modifiers.secondary() || modifiers.control) && modifiers.shift {
+        if key.eq_ignore_ascii_case("d") {
+            return Some(if modifiers.alt {
+                PaneChord::SplitDown
+            } else {
+                PaneChord::SplitRight
+            });
+        }
+        if key.eq_ignore_ascii_case("w") && !modifiers.alt {
+            return Some(PaneChord::ClosePane);
+        }
+    }
+
+    if !modifiers.alt {
+        return None;
+    }
+
+    let shifted = modifiers.shift;
+    let split_right = matches!(key, "+" | "plus" | "add")
+        || (shifted && (matches!(key, "=" | "equal") || key_char == "+"));
+    let split_down = matches!(key, "_" | "underscore")
+        || (shifted && (matches!(key, "-" | "minus" | "subtract") || key_char == "_"));
+    if split_right {
+        return Some(PaneChord::SplitRight);
+    }
+    if split_down {
+        return Some(PaneChord::SplitDown);
+    }
+    if shifted {
+        return match key {
+            "left" => Some(PaneChord::Resize(ResizeDirection::Left)),
+            "right" => Some(PaneChord::Resize(ResizeDirection::Right)),
+            "up" => Some(PaneChord::Resize(ResizeDirection::Up)),
+            "down" => Some(PaneChord::Resize(ResizeDirection::Down)),
+            _ => None,
+        };
+    }
+    None
+}
+
 fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let modifiers = keystroke.modifiers;
     let key = keystroke.key.as_str();
@@ -3351,5 +3353,96 @@ mod tests {
         let empty_item = ClipboardItem { entries: vec![] };
         assert_eq!(extract_terminal_paste_content(&empty_item), None);
         assert!(!clipboard_has_paste_content(&empty_item));
+    }
+
+    #[test]
+    fn bottom_panel_chords_accept_windows_folded_symbols() {
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        // gpui_windows reports shift+= as "+" and shift+- as "_" with the
+        // shift flag cleared; those must still split.
+        assert_eq!(
+            bottom_panel_pane_chord(&key("+", Some("+"), alt)),
+            Some(PaneChord::SplitRight)
+        );
+        assert_eq!(
+            bottom_panel_pane_chord(&key("_", Some("_"), alt)),
+            Some(PaneChord::SplitDown)
+        );
+        // The unshifted keys stay with the shell.
+        assert_eq!(
+            bottom_panel_pane_chord(&key("=", Some("="), alt)),
+            None
+        );
+        assert_eq!(
+            bottom_panel_pane_chord(&key("-", Some("-"), alt)),
+            None
+        );
+        // Platforms that keep the shift flag report the unshifted key.
+        assert_eq!(
+            bottom_panel_pane_chord(&key("=", Some("+"), alt_shift)),
+            Some(PaneChord::SplitRight)
+        );
+        assert_eq!(
+            bottom_panel_pane_chord(&key("-", Some("_"), alt_shift)),
+            Some(PaneChord::SplitDown)
+        );
+    }
+
+    #[test]
+    fn bottom_panel_chords_cover_split_close_and_resize() {
+        let ctrl_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl_alt_shift = Modifiers {
+            control: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            bottom_panel_pane_chord(&key("d", Some("d"), ctrl_shift)),
+            Some(PaneChord::SplitRight)
+        );
+        assert_eq!(
+            bottom_panel_pane_chord(&key("d", Some("d"), ctrl_alt_shift)),
+            Some(PaneChord::SplitDown)
+        );
+        assert_eq!(
+            bottom_panel_pane_chord(&key("w", None, ctrl_shift)),
+            Some(PaneChord::ClosePane)
+        );
+
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        for (name, direction) in [
+            ("left", ResizeDirection::Left),
+            ("right", ResizeDirection::Right),
+            ("up", ResizeDirection::Up),
+            ("down", ResizeDirection::Down),
+        ] {
+            assert_eq!(
+                bottom_panel_pane_chord(&key(name, None, alt_shift)),
+                Some(PaneChord::Resize(direction))
+            );
+        }
+        // Alt+arrow without shift belongs to the shell.
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(bottom_panel_pane_chord(&key("left", None, alt)), None);
     }
 }
