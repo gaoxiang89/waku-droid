@@ -114,7 +114,9 @@ fn reasoning_options<const N: usize>(efforts: [&str; N]) -> Vec<ProviderModelOpt
 pub fn grok_model_reasoning_efforts(id: &str) -> Option<&'static [&'static str]> {
     match id.to_ascii_lowercase().as_str() {
         "grok-4.5" => Some(&["low", "medium", "high"]),
-        "grok-4.6" => Some(&["low", "medium", "high", "xhigh"]),
+        "grok-4.6" | "grok-4.7" | "grok-4.7-build-fast" => {
+            Some(&["low", "medium", "high", "xhigh"])
+        }
         _ => None,
     }
 }
@@ -297,6 +299,14 @@ mod tests {
         );
         assert_eq!(
             grok_model_reasoning_efforts("grok-4.6"),
+            Some(&["low", "medium", "high", "xhigh"][..])
+        );
+        assert_eq!(
+            grok_model_reasoning_efforts("grok-4.7"),
+            Some(&["low", "medium", "high", "xhigh"][..])
+        );
+        assert_eq!(
+            grok_model_reasoning_efforts("grok-4.7-build-fast"),
             Some(&["low", "medium", "high", "xhigh"][..])
         );
         // Custom models and unknown spellings get no menu.

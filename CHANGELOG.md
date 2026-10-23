@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Offer the reasoning effort picker for Grok 4.7 and Grok 4.7 Fast in Grok Build, including Extra High
+
 ## [0.1.27]
 
 - Split the bottom panel terminal into panes with keyboard shortcuts, so one session can watch two shells or logs side by side

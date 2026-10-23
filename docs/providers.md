@@ -850,7 +850,8 @@ applied, because that is what reveals the thought-level option.
 
 Grok's catalog comes from the plain-text `grok models` listing, which reports
 ids but no effort metadata. The hardcoded menu therefore covers only the exact
-built-ins (`grok-4.5` stops at high, `grok-4.6` offers xhigh): the listing also
+built-ins (`grok-4.5` stops at high; `grok-4.6`, `grok-4.7`, and
+`grok-4.7-build-fast` offer xhigh): the listing also
 includes custom models from the user's config, whose effort support the id
 alone cannot establish, so they are offered without an effort menu. Discovery
 is authoritative — a stale fallback would name a model the CLI rejects.

@@ -921,8 +921,8 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
                 return None;
             }
             // The default is starred and the rest are dashed:
-            //   * grok-4.6 (default)
-            //   - grok-4.5
+            //   * grok-4.7 (default)
+            //   - grok-4.6
             let entry = line
                 .strip_prefix('*')
                 .or_else(|| line.strip_prefix('-'))?
@@ -2445,10 +2445,10 @@ printf '%s\n' '{"type":"control_response","response":{"request_id":"waku-initial
     #[test]
     fn parses_grok_default_and_available_models() {
         let models = parse_grok_models(
-            "You are logged in with grok.com.\n\nDefault model: grok-4.6\n\nAvailable models:\n  * grok-4.6 (default)\n  - grok-4.5\n  - my-custom-test\n",
+            "You are logged in with grok.com.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.5\n  - my-custom-test\n",
         );
         assert_eq!(models.len(), 3);
-        assert_eq!(models[0].id, "grok-4.6");
+        assert_eq!(models[0].id, "grok-4.7");
         assert!(models[0].is_default);
         assert_eq!(
             models[0]
