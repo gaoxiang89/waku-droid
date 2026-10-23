@@ -210,76 +210,6 @@ jobs:
           path: target/release/waku-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
           if-no-files-found: error
 
-  linux-arm64:
-    name: Linux arm64
-    needs: [version, remote-daemon]
-    if: needs.version.outputs.published != 'true'
-    runs-on: ubuntu-22.04-arm
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            cmake \
-            libfontconfig-dev \
-            libvulkan1 \
-            libwayland-dev \
-            libx11-xcb-dev \
-            libxi-dev \
-            libxtst-dev \
-            libxkbcommon-x11-dev \
-            pkg-config \
-            xdg-desktop-portal
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-22.04-arm-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ubuntu-22.04-arm-rust-1.97.0-release-
-
-      # `target/` is restored from the release cache, so the previous
-      # release's bundles are still sitting in `target/release` when this one
-      # starts. Cargo does not own them, so nothing else clears them.
-      - name: Clear stale bundles
-        run: rm -f target/release/waku-*.tar.gz
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: remote-daemon-linux-*
-          path: target/remote-daemons
-          merge-multiple: true
-          # Both legs must land: the packaging scripts warn (rather than fail)
-          # on an architecture they cannot find, for local builds' sake.
-          if-no-files-found: error
-
-      - name: Bundle
-        env:
-          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
-        run: ./scripts/bundle-linux.sh
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: linux-arm64
-          path: target/release/waku-${{ needs.version.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
-          if-no-files-found: error
-
   windows-x86_64:
     name: Windows x86_64
     needs: [version, remote-daemon]
@@ -342,78 +272,9 @@ jobs:
             target/release/Waku-${{ needs.version.outputs.version }}-x86_64-Setup.exe
           if-no-files-found: error
 
-  windows-arm64:
-    name: Windows arm64
-    needs: [version, remote-daemon]
-    if: needs.version.outputs.published != 'true'
-    runs-on: windows-11-arm
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-          rustup target add aarch64-pc-windows-msvc
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install Inno Setup
-        run: choco install innosetup --yes --no-progress
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-11-arm-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            windows-11-arm-rust-1.97.0-release-
-
-      # `target/` is restored from the release cache, so the previous
-      # release's bundles are still sitting in `target/release` when this one
-      # starts. Cargo does not own them, so nothing else clears them.
-      - name: Clear stale bundles
-        run: Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: remote-daemon-linux-*
-          path: target/remote-daemons
-          merge-multiple: true
-          # Both legs must land: the packaging scripts warn (rather than fail)
-          # on an architecture they cannot find, for local builds' sake.
-          if-no-files-found: error
-
-      - name: Bundle
-        env:
-          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: bun scripts/bundle-windows.ts
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: windows-arm64
-          path: |
-            target/release/waku-${{ needs.version.outputs.version }}-aarch64-pc-windows-msvc.zip
-            target/release/Waku-${{ needs.version.outputs.version }}-aarch64-Setup.exe
-          if-no-files-found: error
-
   draft-release:
     name: Draft GitHub release
-    needs:
-      [
-        version,
-        linux-x86_64,
-        linux-arm64,
-        windows-x86_64,
-        windows-arm64,
-      ]
+    needs: [version, linux-x86_64, windows-x86_64]
     if: needs.version.outputs.published != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -447,9 +308,11 @@ jobs:
         run: |
           # Merge into the live feeds so previously published releases keep
           # their entries; a first run simply starts from nothing. The fork's
-          # live feed is the latest published release's own asset.
+          # live feed is the latest published release's own asset. Only x86_64
+          # is fetched: the desktop arm64 builds were dropped, and their feeds
+          # are no longer regenerated.
           for platform in linux windows; do
-            for arch in x86_64 aarch64; do
+            for arch in x86_64; do
               curl -fsSL --max-time 30 \
                 "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-$platform-$arch.xml" \
                 -o "artifacts/appcast-$platform-$arch.xml" || true
