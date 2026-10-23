@@ -182,6 +182,7 @@ impl Waku {
                         this.composer_drafts.sessions.extend(drafts.sessions);
                         host.store.mark_task_state_loaded();
                         this.hosts.hosts.push(host);
+                        this.sync_host_provider_settings(&key);
                         this.apply_remote_task_state(key.clone(), snapshot, cx);
                         this.refresh_host_catalog(key.clone(), None, true);
                         this.start_host_task_state_sync(key);

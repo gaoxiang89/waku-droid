@@ -292,6 +292,11 @@ impl Waku {
         // a selected source task.
         let runtime_mode =
             new_task_runtime_mode(self.selected_session(), self.state.last_runtime_mode);
+        // The remembered provider is global, but each host's switch is not.
+        // A provider turned off on this project’s daemon must not be what the
+        // new draft starts on.
+        let host = self.hosts.ownership.project(project_id);
+        let provider = self.provider_enabled_for_new_session(&host, provider);
         let mut session = self.state.new_session(project_id, provider);
         session.runtime_mode = runtime_mode;
         let id = session.id;

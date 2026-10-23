@@ -971,7 +971,9 @@ impl Waku {
         let selected_tab = self.model_picker_tab;
         let selected_model = selected_model.map(str::to_owned);
         let probes = self.provider_probes().to_vec();
-        let disabled_providers = self.state.disabled_providers.clone();
+        let disabled_providers = self
+            .disabled_providers_for(&self.selected_host_key())
+            .to_vec();
         let pending_discoveries = self.pending_model_discoveries().clone();
         let favorites = self.state.favorite_models.clone();
         let weak = cx.entity().downgrade();
@@ -1002,15 +1004,18 @@ impl Waku {
                         let locked = this
                             .selected_session()
                             .is_some_and(|session| !session.messages.is_empty());
-                        let provider =
-                            if !locked && this.state.disabled_providers.contains(&provider) {
-                                ProviderKind::ALL
-                                    .into_iter()
-                                    .find(|kind| this.provider_enabled(*kind))
-                                    .unwrap_or(provider)
-                            } else {
-                                provider
-                            };
+                        let provider = if !locked
+                            && this
+                                .disabled_providers_for(&this.selected_host_key())
+                                .contains(&provider)
+                        {
+                            ProviderKind::ALL
+                                .into_iter()
+                                .find(|kind| this.provider_enabled(*kind))
+                                .unwrap_or(provider)
+                        } else {
+                            provider
+                        };
                         this.model_picker_tab = ModelPickerTab::Provider(provider);
                         // Opening re-runs the tab's catalog discovery so models
                         // authored since launch appear without a restart; the
@@ -1502,11 +1507,10 @@ impl Waku {
             .selected_session()
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
-        let tabs = visible_picker_tabs(
-            self.provider_probes(),
-            &self.state.disabled_providers,
-            locked_provider,
-        );
+        let disabled = self
+            .disabled_providers_for(&self.selected_host_key())
+            .to_vec();
+        let tabs = visible_picker_tabs(self.provider_probes(), &disabled, locked_provider);
         let current = tabs.iter().position(|tab| *tab == self.model_picker_tab);
         let Some(next) = next_picker_highlight(current, tabs.len(), key) else {
             return;
@@ -1529,10 +1533,13 @@ impl Waku {
         let locked_provider = session
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
+        let disabled = self
+            .disabled_providers_for(&self.selected_host_key())
+            .to_vec();
         let index = visible_picker_models(
             self.provider_probes(),
             &self.state.favorite_models,
-            &self.state.disabled_providers,
+            &disabled,
             locked_provider,
             self.model_picker_tab,
             "",

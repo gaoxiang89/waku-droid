@@ -1048,7 +1048,9 @@ impl Waku {
             .into_iter()
             .filter(|provider| {
                 *provider == self.command_palette.resume_provider
-                    || !self.state.disabled_providers.contains(provider)
+                    || !self
+                        .disabled_providers_for(&self.selected_host_key())
+                        .contains(provider)
             })
             .enumerate()
             .map(|(order, provider)| CommandPaletteItem {
@@ -1343,9 +1345,10 @@ impl Waku {
         self.selected_session()
             .map(|session| session.provider)
             .or_else(|| {
+                let host = self.selected_host_key();
                 ProviderKind::ALL
                     .into_iter()
-                    .find(|provider| !self.state.disabled_providers.contains(provider))
+                    .find(|provider| !self.disabled_providers_for(&host).contains(provider))
             })
             .unwrap_or_default()
     }

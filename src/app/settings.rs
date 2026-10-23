@@ -1749,9 +1749,8 @@ impl Waku {
     fn render_providers_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         // The page is scoped to one host's daemon: detection, binary
-        // overrides, and the refresh button all act on that host alone. The
-        // enable/disable toggle stays a desktop preference, so it only rides
-        // the local tab.
+        // overrides, and which providers may back new tasks all act on that
+        // host alone. Local and a WSL or SSH host keep separate switches.
         let host_key = if self.hosts.get(&self.provider_settings_host).is_some() {
             self.provider_settings_host.clone()
         } else {
@@ -1868,13 +1867,11 @@ impl Waku {
                 .then(|| self.provider_versions.get(&kind))
                 .flatten()
                 .and_then(|version| version.clone());
-            // `None` on a remote tab: switched-off is a desktop preference,
-            // not a fact about that host.
-            let disabled = local.then(|| self.state.disabled_providers.contains(&kind));
+            let switched_off = self.disabled_providers_for(&host_key).contains(&kind);
 
             let dot_color = if !installed {
                 theme.text_ghost
-            } else if disabled == Some(true) {
+            } else if switched_off {
                 theme.warning
             } else {
                 theme.success
@@ -1885,7 +1882,7 @@ impl Waku {
                 if let Some(path) = binary_path {
                     parts.push(path);
                 }
-                if disabled == Some(true) {
+                if switched_off {
                     parts.push(tr!("providers.disabled_for_new_tasks"));
                 } else if model_count > 0 {
                     parts.push(if model_count == 1 {
@@ -1898,6 +1895,12 @@ impl Waku {
                     .truncate()
                     .child(SharedString::from(parts.join("  ·  ")))
                     .into_any_element()
+            } else if switched_off {
+                div()
+                    .flex()
+                    .items_baseline()
+                    .child(tr!("providers.disabled_for_new_tasks"))
+                    .into_any_element()
             } else {
                 div()
                     .flex()
@@ -1909,17 +1912,19 @@ impl Waku {
                     .into_any_element()
             };
 
-            let toggle = (local && installed).then(|| {
-                let switched_off = disabled == Some(true);
-                toggle_switch(
-                    SharedString::from(format!("provider-enabled-{}", kind.id())),
-                    !switched_off,
-                    false,
-                    theme,
-                    cx,
-                    move |this, _, cx| this.set_provider_enabled(kind, switched_off, cx),
-                )
-            });
+            // The switch is available before a CLI is found, so a provider can
+            // be opted out of detection entirely.
+            let toggle_host = host_key.clone();
+            let toggle = toggle_switch(
+                SharedString::from(format!("provider-enabled-{}", kind.id())),
+                !switched_off,
+                false,
+                theme,
+                cx,
+                move |this, _, cx| {
+                    this.set_provider_enabled(toggle_host.clone(), kind, switched_off, cx);
+                },
+            );
 
             let expanded = self.expanded_provider_settings == Some(kind);
             let expand_button = icon_button(
@@ -2009,7 +2014,7 @@ impl Waku {
                         ),
                 )
                 .child(expand_button)
-                .when_some(toggle, |element, toggle| element.child(toggle));
+                .child(toggle);
 
             rows = rows.child(
                 div()
@@ -2198,7 +2203,7 @@ impl Waku {
             self.expanded_provider_settings = Some(provider);
             let host_key = self.provider_settings_host.clone();
             if host_key != waku_client::hosts::HostKey::Local {
-                self.sync_host_provider_overrides(&host_key);
+                self.sync_host_provider_settings(&host_key);
             }
             let override_value = self
                 .provider_override_for_host(&host_key, provider)
@@ -2251,31 +2256,50 @@ impl Waku {
         cx.notify();
     }
 
-    /// Providers switched off here stop offering models to new sessions;
-    /// sessions already locked to them keep working.
+    /// Providers switched off here stop offering models to new sessions on
+    /// this host; sessions already locked to them keep working. Local and
+    /// each remote daemon store the switch separately.
     fn set_provider_enabled(
         &mut self,
+        host_key: waku_client::hosts::HostKey,
         provider: ProviderKind,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
+        if host_key == waku_client::hosts::HostKey::Local {
+            if enabled {
+                self.state
+                    .disabled_providers
+                    .retain(|kind| *kind != provider);
+            } else if !self.state.disabled_providers.contains(&provider) {
+                self.state.disabled_providers.push(provider);
+            }
+        } else if !self.set_remote_provider_enabled(&host_key, provider, enabled) {
+            cx.notify();
+            return;
+        }
+        // Turning a provider back on is the moment to look for it. While it
+        // stays off, detection and catalog refreshes leave it alone.
         if enabled {
-            self.state
-                .disabled_providers
-                .retain(|kind| *kind != provider);
-        } else if !self.state.disabled_providers.contains(&provider) {
-            self.state.disabled_providers.push(provider);
+            if host_key == waku_client::hosts::HostKey::Local {
+                self.refresh_provider_detection(Some(provider));
+            } else {
+                self.refresh_host_catalog(host_key.clone(), Some(provider), true);
+            }
         }
         if !enabled
             && let Some(fallback) = ProviderKind::ALL
                 .into_iter()
-                .find(|kind| self.provider_enabled(*kind))
+                .find(|kind| self.provider_enabled_on(&host_key, *kind))
         {
-            // New work must land somewhere usable: move the new-session
-            // default and any unstarted drafts off the switched-off provider.
-            // The remembered model belongs to the old provider, so it resets
-            // with it.
-            if self.state.last_provider == provider {
+            // New work on this host must land somewhere usable: move its
+            // unstarted drafts off the switched-off provider. The remembered
+            // model belongs to the old provider, so it resets with it. The
+            // desktop default only moves when this computer's own switch
+            // changes — a WSL or SSH host does not rewrite it.
+            if host_key == waku_client::hosts::HostKey::Local
+                && self.state.last_provider == provider
+            {
                 self.state.last_provider = fallback;
                 self.state.last_model = None;
                 self.state.last_reasoning_effort = None;
@@ -2288,6 +2312,10 @@ impl Waku {
                 .iter()
                 .filter(|session| session.provider == provider && !session.has_started())
                 .map(|session| session.id)
+                .collect::<Vec<_>>();
+            let draft_ids = draft_ids
+                .into_iter()
+                .filter(|id| self.hosts.ownership.session(*id) == host_key)
                 .collect::<Vec<_>>();
             for id in draft_ids {
                 if let Some(session) = self.state.session_mut(id) {

@@ -58,7 +58,7 @@ impl Waku {
         self.apply_provider_path_override(cx);
         self.provider_settings_host = key.clone();
         if key != HostKey::Local {
-            self.sync_host_provider_overrides(&key);
+            self.sync_host_provider_settings(&key);
         }
         if let Some(provider) = self.expanded_provider_settings {
             let override_value = self
@@ -69,6 +69,19 @@ impl Waku {
                 .update(cx, |input, cx| input.set_content(override_value, cx));
         }
         cx.notify();
+    }
+
+    /// Providers switched off for new sessions on this host. Local is the
+    /// desktop preference; a remote host reads the snapshot of its daemon.
+    pub(super) fn disabled_providers_for(&self, key: &HostKey) -> &[ProviderKind] {
+        if *key == HostKey::Local {
+            &self.state.disabled_providers
+        } else {
+            self.host_disabled_providers
+                .get(key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        }
     }
 
     /// The override shown for a provider on the Providers page: the desktop's
@@ -87,15 +100,46 @@ impl Waku {
         }
     }
 
-    /// Refresh the render snapshot of a remote host's binary overrides from
-    /// its daemon's settings. Runs in click handlers, never in render.
-    pub(super) fn sync_host_provider_overrides(&mut self, key: &HostKey) {
+    /// Refresh the render snapshot of a remote host's provider settings from
+    /// its daemon. Runs in click handlers and on connect, never in render.
+    pub(super) fn sync_host_provider_settings(&mut self, key: &HostKey) {
         if let Some(host) = self.hosts.get(key) {
-            self.host_provider_overrides.insert(
-                key.clone(),
-                host.daemon.settings().provider_binary_overrides,
-            );
+            let settings = host.daemon.settings();
+            self.host_provider_overrides
+                .insert(key.clone(), settings.provider_binary_overrides);
+            self.host_disabled_providers
+                .insert(key.clone(), settings.disabled_providers);
         }
+    }
+
+    /// Persist whether a provider may back new sessions on a remote host.
+    /// Returns false when the daemon rejected the write.
+    pub(super) fn set_remote_provider_enabled(
+        &mut self,
+        key: &HostKey,
+        provider: ProviderKind,
+        enabled: bool,
+    ) -> bool {
+        let Some(host) = self.hosts.get(key) else {
+            return false;
+        };
+        let mut settings = host.daemon.settings();
+        if enabled {
+            settings.disabled_providers.retain(|kind| *kind != provider);
+        } else if !settings.disabled_providers.contains(&provider) {
+            settings.disabled_providers.push(provider);
+        }
+        let name = host.name.clone();
+        if let Err(error) = host.daemon.update_settings(settings) {
+            self.show_toast(tr!(
+                "errors.save_remote_settings",
+                name = name.as_str(),
+                error = error.to_string()
+            ));
+            return false;
+        }
+        self.sync_host_provider_settings(key);
+        true
     }
 
     /// Commit a binary override edit against a remote host's daemon settings:
@@ -138,7 +182,7 @@ impl Waku {
             ));
             return;
         }
-        self.sync_host_provider_overrides(key);
+        self.sync_host_provider_settings(key);
         self.refresh_host_catalog(key.clone(), Some(provider), true);
     }
 
@@ -156,6 +200,11 @@ impl Waku {
         };
         let daemon = host.daemon.clone();
         let generation = host.generation;
+        let disabled = self
+            .disabled_providers_for(&key)
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let catalog = self
             .host_catalogs
             .entry(key.clone())
@@ -179,7 +228,8 @@ impl Waku {
         let providers = providers
             .into_iter()
             .filter(|provider| {
-                !catalog.pending.contains(provider)
+                !disabled.contains(provider)
+                    && !catalog.pending.contains(provider)
                     && (force || !catalog.discovered.contains(provider))
             })
             .collect::<Vec<_>>();
@@ -559,6 +609,8 @@ impl Waku {
         self.hosts.hosts.retain(|host| &host.key != key);
         self.host_disconnected.remove(key);
         self.host_catalogs.remove(key);
+        self.host_provider_overrides.remove(key);
+        self.host_disabled_providers.remove(key);
         self.plan_usage_pending.retain(|(owner, _)| owner != key);
         self.plan_usage_checked_at
             .retain(|(owner, _), _| owner != key);

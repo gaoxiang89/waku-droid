@@ -1393,7 +1393,8 @@ impl Waku {
     }
 
     fn request_local_provider_model_discovery(&mut self, provider: ProviderKind) {
-        if !provider.supports_model_discovery()
+        if self.state.disabled_providers.contains(&provider)
+            || !provider.supports_model_discovery()
             || self.provider_model_discoveries.contains(&provider)
         {
             return;
@@ -1447,6 +1448,9 @@ impl Waku {
     /// open menu never blanks into a loading state while it refreshes.
     pub(super) fn refresh_provider_model_discovery(&mut self, provider: ProviderKind) {
         let key = self.selected_host_key();
+        if self.disabled_providers_for(&key).contains(&provider) {
+            return;
+        }
         if key != waku_client::hosts::HostKey::Local {
             self.refresh_host_catalog(key, Some(provider), true);
             return;
@@ -1465,7 +1469,9 @@ impl Waku {
         let targets = self
             .probes
             .iter()
-            .filter(|probe| probe.installed)
+            .filter(|probe| {
+                probe.installed && !self.state.disabled_providers.contains(&probe.provider)
+            })
             .map(|probe| probe.provider)
             .collect::<Vec<_>>();
         for provider in targets {
@@ -1521,10 +1527,19 @@ impl Waku {
         if self.provider_detection_remaining > 0 {
             return;
         }
+        let disabled = &self.state.disabled_providers;
         let providers = match scope {
+            Some(provider) if disabled.contains(&provider) => Vec::new(),
             Some(provider) => vec![provider],
-            None => ProviderKind::ALL.to_vec(),
+            None => ProviderKind::ALL
+                .into_iter()
+                .filter(|provider| !disabled.contains(provider))
+                .collect(),
         };
+        if providers.is_empty() {
+            self.provider_detection_checked_at = Some(Instant::now());
+            return;
+        }
         self.provider_detection_remaining = providers.len();
         let overrides = self.state.provider_binary_overrides.clone();
         let provider_detection_tx = self.provider_detection_tx.clone();
@@ -1617,13 +1632,44 @@ impl Waku {
         changed
     }
 
-    /// Whether the provider can back a new session: installed and not switched
-    /// off in the Providers settings.
+    /// Whether the provider can back a new session on the selected host:
+    /// installed there and not switched off in that host's Providers settings.
     pub(super) fn provider_enabled(&self, provider: ProviderKind) -> bool {
-        !self.state.disabled_providers.contains(&provider)
+        self.provider_enabled_on(&self.selected_host_key(), provider)
+    }
+
+    pub(super) fn provider_enabled_on(
+        &self,
+        key: &waku_client::hosts::HostKey,
+        provider: ProviderKind,
+    ) -> bool {
+        let switched_off = self.disabled_providers_for(key).contains(&provider);
+        !switched_off
             && self
-                .provider_probe(provider)
-                .is_some_and(|probe| probe.installed)
+                .provider_probes_for_host(key)
+                .iter()
+                .any(|probe| probe.provider == provider && probe.installed)
+    }
+
+    /// Prefer `provider` for a new session on `key`, unless that host has
+    /// switched it off. An empty catalog means detection has not landed yet,
+    /// so the requested provider is kept rather than guessed.
+    pub(super) fn provider_enabled_for_new_session(
+        &self,
+        key: &waku_client::hosts::HostKey,
+        provider: ProviderKind,
+    ) -> ProviderKind {
+        let probes = self.provider_probes_for_host(key);
+        if !probes.iter().any(|probe| probe.installed) {
+            return provider;
+        }
+        if self.provider_enabled_on(key, provider) {
+            return provider;
+        }
+        ProviderKind::ALL
+            .into_iter()
+            .find(|kind| self.provider_enabled_on(key, *kind))
+            .unwrap_or(provider)
     }
 
     /// Whether the model picker has no provider left to offer — nothing
@@ -1635,9 +1681,12 @@ impl Waku {
             .selected_session()
             .filter(|session| !session.messages.is_empty())
             .map(|session| session.provider);
+        let disabled = self
+            .disabled_providers_for(&self.selected_host_key())
+            .to_vec();
         super::composer::picker_has_no_providers(
             self.provider_probes(),
-            &self.state.disabled_providers,
+            &disabled,
             locked_provider,
             self.provider_detection_checked_at.is_some(),
         )

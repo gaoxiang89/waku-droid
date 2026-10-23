@@ -1259,10 +1259,11 @@ pub struct Waku {
     /// The host whose catalog the Providers page is showing. The binary
     /// override edits this host's daemon settings, not the desktop's own.
     provider_settings_host: waku_client::hosts::HostKey,
-    /// Remote hosts' `provider_binary_overrides` as last read or written by
-    /// the Providers page, keyed by host. Render reads only this snapshot —
+    /// Remote hosts' provider settings as last read or written by the
+    /// Providers page, keyed by host. Render reads only these snapshots —
     /// the daemon's live settings are touched in click handlers alone.
     host_provider_overrides: HashMap<waku_client::hosts::HostKey, HashMap<ProviderKind, String>>,
+    host_disabled_providers: HashMap<waku_client::hosts::HostKey, Vec<ProviderKind>>,
     computer_permissions: ComputerPermissions,
     computer_permission_tx: Sender<Result<ComputerPermissions, String>>,
     computer_permission_events: Receiver<Result<ComputerPermissions, String>>,
@@ -3187,6 +3188,7 @@ impl Waku {
                 provider_path_input,
                 provider_settings_host: waku_client::hosts::HostKey::Local,
                 host_provider_overrides: HashMap::new(),
+                host_disabled_providers: HashMap::new(),
                 computer_permissions: ComputerPermissions::default(),
                 computer_permission_tx,
                 computer_permission_events,
