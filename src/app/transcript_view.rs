@@ -2110,14 +2110,7 @@ impl Waku {
                 .zip(activity.source_id.as_deref())
                 .and_then(|(session_id, source_id)| {
                     self.background_work_for_activity(session_id, source_id)
-                        .map(|item| {
-                            (
-                                session_id,
-                                item.key.clone(),
-                                item.status,
-                                item.role.clone(),
-                            )
-                        })
+                        .map(|item| (session_id, item.key.clone(), item.status, item.role.clone()))
                 });
             let background_badge = background_work.map(|(session_id, key, status, role)| {
                 let click_key = key.clone();

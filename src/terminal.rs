@@ -2415,7 +2415,8 @@ fn mouse_report(button: u8, column: usize, row: usize, mode: TermMode) -> Option
     Some(report)
 }
 
-fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {    if mode.contains(TermMode::BRACKETED_PASTE) {
+fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {
+    if mode.contains(TermMode::BRACKETED_PASTE) {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
         text.into_bytes()

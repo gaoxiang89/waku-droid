@@ -129,8 +129,10 @@ impl SplitDividerDrag {
             Axis::Vertical => mouse_y - self.start_mouse_y,
         };
         let pair_total = self.start_first_size + self.start_second_size;
-        let first = (self.start_first_size + delta)
-            .clamp(SPLIT_MIN_PANE, (pair_total - SPLIT_MIN_PANE).max(SPLIT_MIN_PANE));
+        let first = (self.start_first_size + delta).clamp(
+            SPLIT_MIN_PANE,
+            (pair_total - SPLIT_MIN_PANE).max(SPLIT_MIN_PANE),
+        );
         let second = (pair_total - first).max(0.0);
         if self.space_per_flex <= f32::EPSILON {
             return (1.0, 1.0);
@@ -150,9 +152,7 @@ impl SplitMember {
     fn panes(&self) -> Vec<Entity<TerminalView>> {
         match self {
             SplitMember::Pane(terminal) => vec![terminal.clone()],
-            SplitMember::Axis(axis) => {
-                axis.members.iter().flat_map(SplitMember::panes).collect()
-            }
+            SplitMember::Axis(axis) => axis.members.iter().flat_map(SplitMember::panes).collect(),
         }
     }
 
@@ -202,7 +202,9 @@ impl SplitMember {
                 if parent.axis == axis
                     && matches!(&parent.members[index], SplitMember::Pane(terminal) if terminal.entity_id() == target)
                 {
-                    parent.members.insert(index + 1, SplitMember::Pane(new_pane));
+                    parent
+                        .members
+                        .insert(index + 1, SplitMember::Pane(new_pane));
                     parent.flexes.insert(index + 1, 1.0);
                 } else {
                     parent.members[index].split_pane(target, new_pane, axis);
@@ -436,7 +438,10 @@ mod tests {
         assert!(group.split_pane(terminals[0].entity_id(), new.clone(), Axis::Horizontal));
         assert_eq!(group.pane_count(), 2);
         assert!(group.contains(new.entity_id()));
-        assert_eq!(group.active_or_first().unwrap().entity_id(), new.entity_id());
+        assert_eq!(
+            group.active_or_first().unwrap().entity_id(),
+            new.entity_id()
+        );
     }
 
     #[gpui::test]
@@ -497,10 +502,11 @@ mod tests {
             panic!("root should still be an axis");
         };
         assert_eq!(root.members.len(), 2);
-        assert!(root
-            .members
-            .iter()
-            .all(|member| matches!(member, SplitMember::Pane(_))));
+        assert!(
+            root.members
+                .iter()
+                .all(|member| matches!(member, SplitMember::Pane(_)))
+        );
     }
 
     #[gpui::test]

@@ -63,7 +63,13 @@ impl Waku {
                 let content_height = (height - BOTTOM_PANEL_TAB_STRIP_HEIGHT).max(0.0);
                 let member = &self.bottom_panel_terminal_groups[group_index].root;
                 let splits = self.render_bottom_panel_split(
-                    group_index, member, 1.0, width, content_height, &[], cx,
+                    group_index,
+                    member,
+                    1.0,
+                    width,
+                    content_height,
+                    &[],
+                    cx,
                 );
                 div()
                     .id("bottom-panel-body")
@@ -333,15 +339,10 @@ impl Waku {
                             .size(px(6.0))
                             .flex_none()
                             .rounded_full()
-                            .bg(if exited {
-                                theme.danger
-                            } else {
-                                theme.accent
-                            })
+                            .bg(if exited { theme.danger } else { theme.accent })
                             .when(exited, |element| {
                                 element.tooltip(|window, cx| {
-                                    Tooltip::new(tr!("terminal.process_exited"))
-                                        .build(window, cx)
+                                    Tooltip::new(tr!("terminal.process_exited")).build(window, cx)
                                 })
                             }),
                     )
@@ -414,14 +415,17 @@ impl Waku {
                     .flex_1()
                     .overflow_hidden()
                     .child(tabs)
-                    .when_some(self.bottom_panel_pending_tab_reveal, |element, tab_index| {
-                        element.child(tab_scroll_reveal_guard(
-                            self.bottom_panel_tabs_scroll_handle.clone(),
-                            tab_index,
-                            cx.entity().downgrade(),
-                            PanelTabs::BottomPanel,
-                        ))
-                    })
+                    .when_some(
+                        self.bottom_panel_pending_tab_reveal,
+                        |element, tab_index| {
+                            element.child(tab_scroll_reveal_guard(
+                                self.bottom_panel_tabs_scroll_handle.clone(),
+                                tab_index,
+                                cx.entity().downgrade(),
+                                PanelTabs::BottomPanel,
+                            ))
+                        },
+                    )
                     .child(tab_scroll_fade(
                         self.bottom_panel_tabs_scroll_handle.clone(),
                         TabScrollFadeSide::Left,
@@ -442,8 +446,7 @@ impl Waku {
                     .child(
                         icon_button("new-bottom-panel-terminal", "icons/plus.svg", theme)
                             .tooltip(|window, cx| {
-                                Tooltip::new(tr!("bottom_panel.new_terminal"))
-                                    .build(window, cx)
+                                Tooltip::new(tr!("bottom_panel.new_terminal")).build(window, cx)
                             })
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
@@ -454,21 +457,16 @@ impl Waku {
                     )
                     .when_some(split_pane, |element, pane| {
                         element.child(
-                            icon_button(
-                                "split-bottom-panel-terminal",
-                                "icons/split.svg",
-                                theme,
-                            )
-                            .tooltip(|window, cx| {
-                                Tooltip::new(tr!("bottom_panel.split_right"))
-                                    .build(window, cx)
-                            })
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let _ = split_weak.update(cx, |this, cx| {
-                                    this.split_bottom_panel_pane(&pane, Axis::Horizontal, cx);
-                                });
-                            }),
+                            icon_button("split-bottom-panel-terminal", "icons/split.svg", theme)
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(tr!("bottom_panel.split_right")).build(window, cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = split_weak.update(cx, |this, cx| {
+                                        this.split_bottom_panel_pane(&pane, Axis::Horizontal, cx);
+                                    });
+                                }),
                         )
                     }),
             )
@@ -534,7 +532,8 @@ impl Waku {
             self.ensure_bottom_panel_terminal(cx);
         } else if let Some(working_directory) = self.selected_workspace_path() {
             let working_directory = working_directory.to_path_buf();
-            let mut group = SplitGroup::single(self.new_bottom_panel_terminal(&working_directory, cx));
+            let mut group =
+                SplitGroup::single(self.new_bottom_panel_terminal(&working_directory, cx));
             if let Some(first) = group.active_or_first() {
                 group.set_active(first.entity_id());
             }
@@ -778,7 +777,11 @@ impl Waku {
             .bottom_panel_terminal_groups
             .get_mut(drag.group_index)
             .is_some_and(|group| {
-                group.resize_divider(&drag, f32::from(event.position.x), f32::from(event.position.y))
+                group.resize_divider(
+                    &drag,
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                )
             });
         if !resized {
             self.split_divider_drag = None;
@@ -926,7 +929,10 @@ mod tests {
             "cargo build"
         );
         // Without one, the workspace's basename tells tabs apart.
-        assert_eq!(bottom_panel_tab_label("Terminal", Path::new("/proj/waku")), "waku");
+        assert_eq!(
+            bottom_panel_tab_label("Terminal", Path::new("/proj/waku")),
+            "waku"
+        );
         assert_eq!(bottom_panel_tab_label("", Path::new("/proj/waku")), "waku");
         // A directory without a basename falls back to the generic label.
         let fallback = bottom_panel_tab_label("", Path::new("/"));

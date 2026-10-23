@@ -2921,11 +2921,11 @@ impl Waku {
                             "right-panel-file-rename-{relative_path}"
                         )))
                         .key_context(FILE_RENAME_PARENT_CONTEXT)
-                        .on_action(
-                            cx.listener(|this, _: &CancelRightPanelFileRename, window, cx| {
+                        .on_action(cx.listener(
+                            |this, _: &CancelRightPanelFileRename, window, cx| {
                                 this.cancel_right_panel_file_rename(window, cx);
-                            }),
-                        )
+                            },
+                        ))
                         .h(px(18.0))
                         .flex_1()
                         .min_w_0()
@@ -2955,30 +2955,25 @@ impl Waku {
                         .track_focus(&row_focus)
                         .tab_index(0)
                         .focus_visible(|style| style.border_1().border_color(theme.accent))
-                        .on_key_down(cx.listener(
-                            move |this, event: &KeyDownEvent, window, cx| {
-                                let key = event.keystroke.key.as_str();
-                                if matches!(key, "enter" | "space") {
-                                    if is_dir {
-                                        if !this
-                                            .right_panel_expanded_paths
-                                            .remove(&key_absolute_path)
-                                        {
-                                            this.right_panel_expanded_paths
-                                                .insert(key_absolute_path.clone());
-                                        }
-                                        this.refresh_right_panel_working_tree(cx);
-                                        cx.notify();
-                                    } else {
-                                        this.open_right_panel_file(key_relative_path.clone(), cx);
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            let key = event.keystroke.key.as_str();
+                            if matches!(key, "enter" | "space") {
+                                if is_dir {
+                                    if !this.right_panel_expanded_paths.remove(&key_absolute_path) {
+                                        this.right_panel_expanded_paths
+                                            .insert(key_absolute_path.clone());
                                     }
-                                    cx.stop_propagation();
-                                } else if key == "f10" && event.keystroke.modifiers.shift {
-                                    keyboard_menu.open_context_menu(window, cx);
-                                    cx.stop_propagation();
+                                    this.refresh_right_panel_working_tree(cx);
+                                    cx.notify();
+                                } else {
+                                    this.open_right_panel_file(key_relative_path.clone(), cx);
                                 }
-                            },
-                        ))
+                                cx.stop_propagation();
+                            } else if key == "f10" && event.keystroke.modifiers.shift {
+                                keyboard_menu.open_context_menu(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if is_dir {
                                 if !this.right_panel_expanded_paths.remove(&click_absolute_path) {
@@ -3174,27 +3169,23 @@ impl Waku {
             .hover(|element| element.bg(theme.danger.opacity(0.16)))
             .child(icon("icons/trash.svg", 13.0, theme.danger))
             .child(tr_cow!("files.delete"))
-            .on_key_down(cx.listener(
-                move |this, event: &KeyDownEvent, window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        this.confirm_right_panel_file_delete_action(
-                            &ConfirmRightPanelFileDelete,
-                            window,
-                            cx,
-                        );
-                        cx.stop_propagation();
-                    }
-                },
-            ))
-            .on_click(cx.listener(
-                move |this, _, window, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     this.confirm_right_panel_file_delete_action(
                         &ConfirmRightPanelFileDelete,
                         window,
                         cx,
                     );
-                },
-            ));
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_right_panel_file_delete_action(
+                    &ConfirmRightPanelFileDelete,
+                    window,
+                    cx,
+                );
+            }));
 
         let message = if confirm_state.is_dir {
             tr!(
@@ -3216,13 +3207,15 @@ impl Waku {
                     );
                 }),
             )
-            .on_action(cx.listener(|waku, _: &DismissRightPanelFileDelete, window, cx| {
-                waku.dismiss_right_panel_file_delete_action(
-                    &DismissRightPanelFileDelete,
-                    window,
-                    cx,
-                );
-            }))
+            .on_action(
+                cx.listener(|waku, _: &DismissRightPanelFileDelete, window, cx| {
+                    waku.dismiss_right_panel_file_delete_action(
+                        &DismissRightPanelFileDelete,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .tab_group()
             .tab_stop(false)
             .w_full()
@@ -3976,10 +3969,7 @@ impl Waku {
             None => new_name.clone(),
         };
 
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
             return;
         };
         let Some(session_id) = self.state.selected_session else {
@@ -4104,9 +4094,8 @@ impl Waku {
             .iter()
             .filter_map(|path| {
                 let key = path.to_string_lossy();
-                retarget(&key, from_relative, to_relative).map(|to| {
-                    (path.clone(), PathBuf::from(to))
-                })
+                retarget(&key, from_relative, to_relative)
+                    .map(|to| (path.clone(), PathBuf::from(to)))
             })
             .collect();
         for (from, to) in absolute_moves {
@@ -4125,14 +4114,12 @@ impl Waku {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
             return;
         };
-        let default_directory =
-            dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
+        let default_directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
         let receiver = cx.prompt_for_new_path(&default_directory, Some(&name));
         let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         let display_name = name.clone();
@@ -4294,10 +4281,7 @@ impl Waku {
         let Some(confirm) = self.right_panel_delete_confirm.take() else {
             return;
         };
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
             return;
         };
         let Some(session_id) = self.state.selected_session else {
@@ -4342,9 +4326,8 @@ impl Waku {
                             .find(|entry| entry.relative_path == confirm.relative_path)
                             .map(|entry| entry.absolute_path.clone())
                         {
-                            waku.right_panel_expanded_paths.retain(|path| {
-                                path != &absolute && !path.starts_with(&absolute)
-                            });
+                            waku.right_panel_expanded_paths
+                                .retain(|path| path != &absolute && !path.starts_with(&absolute));
                         }
                         waku.refresh_right_panel_working_tree(cx);
                         cx.notify();
@@ -4385,17 +4368,19 @@ impl Waku {
             if key == relative_path {
                 return true;
             }
-            is_dir && ['/', '\\'].iter().any(|separator| key.starts_with(&format!(
-                "{relative_path}{separator}"
-            )))
+            is_dir
+                && ['/', '\\']
+                    .iter()
+                    .any(|separator| key.starts_with(&format!("{relative_path}{separator}")))
         }
         loop {
-            let index = self.right_panel_surfaces.iter().position(|surface| {
-                match surface {
+            let index = self
+                .right_panel_surfaces
+                .iter()
+                .position(|surface| match surface {
                     RightPanelSurface::File(path) => path_matches(path, relative_path, is_dir),
                     _ => false,
-                }
-            });
+                });
             match index {
                 Some(index) => self.close_right_panel_surface(index, cx),
                 None => break,

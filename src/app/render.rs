@@ -558,7 +558,8 @@ impl Waku {
         tone: ToastTone,
         generation: u64,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {        let theme = Theme::current(cx);
+    ) -> impl IntoElement {
+        let theme = Theme::current(cx);
         let (status_icon, status_color) = match tone {
             ToastTone::Alert => ("icons/alert.svg", theme.danger),
             ToastTone::Success => ("icons/check.svg", theme.success),
@@ -752,16 +753,13 @@ impl Waku {
                                     .w(gpui::relative(fraction)),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(theme.text_tertiary)
-                            .child(SharedString::from(format!(
-                                "{}/{}",
-                                super::skills_page::format_bytes(written),
-                                super::skills_page::format_bytes(total_bytes)
-                            ))),
-                    ),
+                    .child(div().flex_none().text_color(theme.text_tertiary).child(
+                        SharedString::from(format!(
+                            "{}/{}",
+                            super::skills_page::format_bytes(written),
+                            super::skills_page::format_bytes(total_bytes)
+                        )),
+                    )),
             )
     }
 }
