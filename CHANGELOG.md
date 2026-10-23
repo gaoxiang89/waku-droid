@@ -16,6 +16,10 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.30]
+
+- Turn coding agents on or off separately for this computer and for each connected WSL or SSH host. Every agent has a switch, including ones not detected yet, and later scans skip agents you turn off
+
 ## [0.1.29]
 
 - Browse the project's commit history in a Git graph tab in the right panel, with branch lanes, branch and tag labels, search, and a detail view of each commit's message and files

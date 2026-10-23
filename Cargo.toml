@@ -20,7 +20,7 @@ resolver = "2"
 [workspace.package]
 # The one release version. Every crate inherits it, so the daemon reports the
 # same version as the app it ships with.
-version = "0.1.29"
+version = "0.1.30"
 
 [dependencies]
 alacritty_terminal = { version = "0.26", default-features = false }
