@@ -260,18 +260,23 @@ jobs:
             );
           '
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          draft: true
-          # A manual run has no tag yet; publishing the draft creates this one
-          # at the commit that was built.
-          tag_name: ${{ needs.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ needs.version.outputs.tag }}
-          body_path: release-notes.md
-          fail_on_unmatched_files: true
-          files: |
-            artifacts/*.zip
-            artifacts/*.exe
-            artifacts/appcast-windows-*.xml
-            artifacts/latest-windows.txt
+      # softprops/action-gh-release@v3 kept hitting 403 "Resource not
+      # accessible by integration" on this repo even with the same
+      # GITHUB_TOKEN that succeeds via `gh api`, so create the release
+      # directly. `--target` only matters for a manual run with no tag yet;
+      # publishing the draft creates the tag at the commit that was built.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: >
+          gh release create "$TAG"
+          --repo "$GITHUB_REPOSITORY"
+          --draft
+          --target "$GITHUB_SHA"
+          --title "$TAG"
+          --notes-file release-notes.md
+          artifacts/*.zip
+          artifacts/*.exe
+          artifacts/appcast-windows-*.xml
+          artifacts/latest-windows.txt
