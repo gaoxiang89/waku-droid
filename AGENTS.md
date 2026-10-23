@@ -7,11 +7,51 @@
   live on the fork, so query Actions runs with
   `gh run list --repo gaoxiang89/waku-droid` — not the upstream repo, where the
   runs do not exist or are not the relevant ones.
-- Never push changes under `.github/workflows` to the fork's `main` while a
-  Release run is in progress, and push them before tagging. GITHUB_TOKEN
-  cannot touch workflow files, so creating the release fails with 403
-  "Resource not accessible by integration" when the target commit's
-  workflows differ from `main`.
+- Fork releases ship only the Windows x86_64 desktop package (zip and
+  Setup.exe). The Linux remote daemon is still built for x86_64 and aarch64
+  because the Windows package bundles both for SSH/WSL hosts.
+
+### Fork release procedure
+
+Follow these steps in order. Each step guards against a failure that has
+already happened on this fork.
+
+1. Land every CI change first. Push all edits under `.github/workflows` to
+   `gaoxiang89/main` before bumping the version, and never push workflow edits
+   while a Release run is in progress. GITHUB_TOKEN can never hold the
+   `workflows` permission, so creating the release returns 403 "Resource not
+   accessible by integration" whenever the target commit's workflows differ
+   from `main`. Toggling the repository's default workflow permissions does
+   not fix that 403.
+2. Bump the version in one commit, `chore: bump version to X.Y.Z`: the
+   workspace `version` in `Cargo.toml`, the matching `Cargo.lock` entries, and
+   a `## [X.Y.Z]` section in `CHANGELOG.md`, which becomes the release notes.
+   The tag must equal the `Cargo.toml` version, or `Resolve version` fails.
+3. Push `main`, then wait for that commit's **Tests** run to pass on all three
+   OSes (`gh run list --repo gaoxiang89/waku-droid --workflow Tests --branch main`).
+   Release builds only Windows and Linux, so a compile error confined to one
+   platform, or a toolchain too old for a dependency, otherwise surfaces 20
+   minutes into the release. When a dependency needs a newer rustc, bump the
+   pinned toolchain in `test.yml` and `release.yml` together.
+4. Tag the same commit and push only the tag:
+   `git tag vX.Y.Z && git push gaoxiang89 vX.Y.Z`. Do not use
+   `workflow_dispatch` for a normal release. A manual run has no tag, so it
+   pins the release to `main`'s HEAD and breaks as soon as `main` moves.
+5. Watch with `gh run watch <id> --repo gaoxiang89/waku-droid --exit-status`.
+   A run takes about 25 minutes and ends with a **draft** release.
+6. Review the draft, then publish it:
+   `gh release edit vX.Y.Z --repo gaoxiang89/waku-droid --draft=false`.
+   Publish each draft before tagging the next version. The next run merges its
+   update feed into the latest *published* release's
+   `appcast-windows-x86_64.xml`.
+
+When a run fails, read `gh run view <id> --repo gaoxiang89/waku-droid
+--log-failed` before changing anything. `gh run rerun --failed` reuses the
+built artifacts and only helps with transient failures. A 403 when creating
+the draft release means workflow drift (step 1). Fix that by tagging a fresh
+version from `main`, not by rerunning. When editing workflow files from tool
+output, never write back `***` runs: they are secret redactions, and copying
+them corrupted a cache key once.
 
 ## Development runtime
 
