@@ -16,6 +16,10 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.31]
+
+- Keep workspace panels (Files, Git, and both terminals) across sessions tied to the workspace directory, and reorder header toggle buttons to lead with the bottom terminal
+
 ## [0.1.30]
 
 - Turn coding agents on or off separately for this computer and for each connected WSL or SSH host. Every agent has a switch, including ones not detected yet, and later scans skip agents you turn off
