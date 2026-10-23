@@ -292,6 +292,12 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         WorkspaceOperation::CollectReviewDiff { cwd, source } => WorkspaceResult::ReviewDiff {
             data: collect_review_diff(&cwd, source)?,
         },
+        WorkspaceOperation::InspectGitGraph { cwd, limit } => WorkspaceResult::GitGraph {
+            snapshot: crate::git_graph::inspect(&cwd, limit)?,
+        },
+        WorkspaceOperation::InspectGitCommit { cwd, hash } => WorkspaceResult::GitCommit {
+            detail: crate::git_graph::commit_detail(&cwd, &hash)?,
+        },
     })
 }
 

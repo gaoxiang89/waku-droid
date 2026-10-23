@@ -5,7 +5,10 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::composer::{FileEntry, SlashCommand};
-use crate::git::{AgentInvocation, BranchSnapshot, CommitSnapshot, CreatedWorktree};
+use crate::git::{
+    AgentInvocation, BranchSnapshot, CommitSnapshot, CreatedWorktree, GitCommitDetail,
+    GitGraphSnapshot,
+};
 use crate::model::{Checkpoint, ProviderKind};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -216,6 +219,20 @@ pub enum WorkspaceOperation {
         cwd: PathBuf,
         source: ReviewDiffSource,
     },
+    /// Commit graph for the right-panel Git Graph. `limit` is a page size;
+    /// the daemon clamps it.
+    InspectGitGraph {
+        #[ts(type = "string")]
+        cwd: PathBuf,
+        limit: u32,
+    },
+    /// Message body and name-status for one commit. The hash is a full object
+    /// id; the daemon rejects anything that is not hex.
+    InspectGitCommit {
+        #[ts(type = "string")]
+        cwd: PathBuf,
+        hash: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -282,5 +299,11 @@ pub enum WorkspaceResult {
     },
     ReviewDiff {
         data: ReviewDiffData,
+    },
+    GitGraph {
+        snapshot: Option<GitGraphSnapshot>,
+    },
+    GitCommit {
+        detail: GitCommitDetail,
     },
 }

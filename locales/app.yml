@@ -1545,6 +1545,46 @@ right_panel.hide:
   en: Hide right panel
 right_panel.close_tab:
   en: Close %{title}
+right_panel.git_graph:
+  en: Git Graph
+right_panel.git_graph_description:
+  en: Browse commits, branches, and tags
+git_graph.uncommitted:
+  en: Uncommitted changes
+git_graph.loading:
+  en: Loading Git graph
+git_graph.loading_description:
+  en: Reading commits from this repository
+git_graph.no_project:
+  en: No project open
+git_graph.no_project_description:
+  en: Open a project to see its commit graph
+git_graph.not_a_repository:
+  en: Not a Git repository
+git_graph.not_a_repository_description:
+  en: This workspace is not inside a Git work tree
+git_graph.empty:
+  en: No commits yet
+git_graph.empty_description:
+  en: This repository does not have any commits
+git_graph.error:
+  en: Could not read the Git graph
+git_graph.refresh:
+  en: Refresh
+git_graph.search:
+  en: Filter commits
+git_graph.load_more:
+  en: Load more commits
+git_graph.copy_hash:
+  en: Copy commit hash
+git_graph.copied:
+  en: Copied commit hash
+git_graph.parents:
+  en: Parents
+git_graph.no_files:
+  en: No files
+git_graph.head:
+  en: HEAD
 bottom_panel.toggle:
   en: Toggle bottom panel
 bottom_panel.resize:

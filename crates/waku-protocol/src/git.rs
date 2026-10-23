@@ -56,3 +56,97 @@ pub struct CreatedWorktree {
     pub path: PathBuf,
     pub branch: String,
 }
+
+/// How a path changed, in a commit or in the uncommitted row.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum GitGraphFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    TypeChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: GitGraphFileStatus,
+}
+
+/// A ref painted as a capsule on a commit. `current` is also written out as
+/// text in the UI — the color of the capsule is not the only signal.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum GitGraphRefKind {
+    /// Detached `HEAD`, when no branch is checked out.
+    Head,
+    Branch,
+    Remote,
+    Tag,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphRef {
+    pub kind: GitGraphRefKind,
+    pub name: String,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphCommit {
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub authored_at: i64,
+    pub subject: String,
+    pub refs: Vec<GitGraphRef>,
+}
+
+/// One column of a commit row. `node` is the commit dot; other columns are
+/// lines passing through. `up` / `down` say which half of the row the line
+/// occupies. A curve between columns is a [`GitGraphEdge`], not a lane.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphLane {
+    pub color: u8,
+    pub up: bool,
+    pub down: bool,
+    pub node: bool,
+}
+
+/// A curve from the commit dot (`from`) to another column's bottom (`to`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphEdge {
+    pub from: u16,
+    pub to: u16,
+    pub color: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphRow {
+    pub node_lane: u16,
+    pub lanes: Vec<GitGraphLane>,
+    pub edges: Vec<GitGraphEdge>,
+}
+
+/// One repository's graph, already laid out. The client paints `rows` and
+/// never walks parents on a frame.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitGraphSnapshot {
+    pub commits: Vec<GitGraphCommit>,
+    pub rows: Vec<GitGraphRow>,
+    pub uncommitted: Vec<GitGraphFile>,
+    pub truncated: bool,
+    pub limit: u32,
+}
+
+/// The body and file list of one commit, loaded only after that row is selected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitCommitDetail {
+    pub hash: String,
+    pub body: String,
+    pub files: Vec<GitGraphFile>,
+}

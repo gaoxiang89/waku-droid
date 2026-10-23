@@ -28,6 +28,7 @@ const DOWNLOAD_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 /// Keep Escape inside the focused inline editor so it cancels the rename,
 /// and give the delete confirm dialog its confirm/dismiss keys.
 pub fn init(cx: &mut App) {
+    super::git_graph::init(cx);
     cx.bind_keys([
         KeyBinding::new(
             "escape",
@@ -962,6 +963,7 @@ impl RightPanelSurface {
             }
             Self::Files => tr!("right_panel.files"),
             Self::Diff => tr!("right_panel.diff"),
+            Self::GitGraph => tr!("right_panel.git_graph"),
             Self::File(path) => path.rsplit('/').next().unwrap_or(path).to_owned(),
         }
     }
@@ -973,6 +975,7 @@ impl RightPanelSurface {
             Self::BackgroundWork { key, .. } => work_kind_icon(key.kind),
             Self::Files => "icons/folder.svg",
             Self::Diff => "icons/file-diff.svg",
+            Self::GitGraph => "icons/git-commit-horizontal.svg",
             Self::File(path) => file_icon_for_path(path),
         }
     }
@@ -1012,7 +1015,10 @@ fn reusable_surface_index(
         RightPanelSurface::BackgroundWork { key, .. } => surfaces.iter().position(|surface| {
             matches!(surface, RightPanelSurface::BackgroundWork { key: candidate, .. } if candidate == key)
         }),
-        RightPanelSurface::Files | RightPanelSurface::Diff | RightPanelSurface::File(_) => {
+        RightPanelSurface::Files
+        | RightPanelSurface::Diff
+        | RightPanelSurface::File(_)
+        | RightPanelSurface::GitGraph => {
             surfaces.iter().position(|surface| surface == requested)
         }
     }
@@ -1708,6 +1714,7 @@ mod tests {
             background,
             RightPanelSurface::Files,
             RightPanelSurface::Diff,
+            RightPanelSurface::GitGraph,
         ];
 
         assert_eq!(
@@ -1735,6 +1742,10 @@ mod tests {
         assert_eq!(
             reusable_surface_index(&surfaces, &RightPanelSurface::Diff),
             Some(4)
+        );
+        assert_eq!(
+            reusable_surface_index(&surfaces, &RightPanelSurface::GitGraph),
+            Some(5)
         );
     }
 
@@ -2045,6 +2056,12 @@ impl Waku {
             }
             self.refresh_right_panel_diff(cx);
         }
+        if surface == RightPanelSurface::GitGraph
+            && let Some(path) = self.selected_workspace_path()
+        {
+            let path = path.to_path_buf();
+            self.git_graph_snapshots.invalidate(&path);
+        }
         if matches!(
             surface,
             RightPanelSurface::Files | RightPanelSurface::File(_)
@@ -2265,6 +2282,7 @@ impl Waku {
             Some(RightPanelSurface::Diff) => self
                 .render_right_panel_diff(width, window, cx)
                 .into_any_element(),
+            Some(RightPanelSurface::GitGraph) => self.render_git_graph(cx),
             Some(RightPanelSurface::Terminal(terminal_id)) => self
                 .right_panel_terminals
                 .get(&terminal_id)
@@ -2625,6 +2643,7 @@ impl Waku {
                 RightPanelSurface::new_terminal(),
                 RightPanelSurface::Files,
                 RightPanelSurface::Diff,
+                RightPanelSurface::GitGraph,
             ];
             let handle = self.menu_handle("add-right-panel-surface", cx);
             header = header.child(
@@ -2739,6 +2758,19 @@ impl Waku {
                                 tr!("right_panel.diff_description"),
                                 cx,
                             )),
+                    )
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .w_full()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(self.render_right_panel_card(
+                                RightPanelSurface::GitGraph,
+                                tr!("right_panel.git_graph_description"),
+                                cx,
+                            ))
+                            .child(div().flex_1()),
                     ),
             )
     }
@@ -5277,6 +5309,13 @@ impl Waku {
     pub(super) fn refresh_workspace_surfaces(&mut self, cx: &mut Context<Self>) {
         match self.active_right_panel_surface() {
             Some(RightPanelSurface::Diff) => self.refresh_right_panel_diff(cx),
+            Some(RightPanelSurface::GitGraph) => {
+                if let Some(path) = self.selected_workspace_path() {
+                    let path = path.to_path_buf();
+                    self.git_graph_snapshots.invalidate(&path);
+                }
+                cx.notify();
+            }
             Some(RightPanelSurface::Files | RightPanelSurface::File(_)) => {
                 self.refresh_right_panel_working_tree(cx)
             }

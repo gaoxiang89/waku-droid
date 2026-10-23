@@ -556,6 +556,7 @@ enum RightPanelSurface {
     Files,
     Diff,
     File(String),
+    GitGraph,
 }
 
 /// A turn whose checkpoint still has to be captured.
@@ -1363,6 +1364,24 @@ pub struct Waku {
     /// Stale-while-revalidate value for the selected path, avoiding label
     /// flicker when app activation invalidates the query.
     visible_branch_snapshot: Option<(PathBuf, BranchSnapshot)>,
+    /// Commit graph per workspace. Render reads this; a miss fetches on the
+    /// daemon. The visible copy stays up while a refresh is in flight.
+    git_graph_snapshots:
+        QueryCache<PathBuf, Result<Option<Arc<waku_client::git::GitGraphSnapshot>>, String>>,
+    visible_git_graph: Option<(PathBuf, Arc<waku_client::git::GitGraphSnapshot>)>,
+    git_graph_limits: HashMap<PathBuf, u32>,
+    git_commit_details:
+        QueryCache<(PathBuf, String), Result<waku_client::git::GitCommitDetail, String>>,
+    git_graph_list_state: ListState,
+    git_graph_list_rows: usize,
+    git_graph_scrollbar: Rc<ScrollbarState>,
+    git_graph_search: Entity<TextInput>,
+    git_graph_focus: FocusHandle,
+    git_graph_refresh_focus: FocusHandle,
+    git_graph_load_more_focus: FocusHandle,
+    git_graph_copy_focus: FocusHandle,
+    git_graph_detail_scroll: ScrollHandle,
+    git_graph_cursor: Option<usize>,
     branch_operation_pending: bool,
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
@@ -1815,6 +1834,7 @@ mod composer;
 mod connections_page;
 mod drafts;
 mod file_search;
+mod git_graph;
 mod goal_dialog;
 mod hosts;
 mod image_preview;
@@ -2255,6 +2275,11 @@ impl Waku {
                 .clear_on_escape()
                 .placeholder(tr!("input.search_branches"))
         });
+        let git_graph_search = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .clear_on_escape()
+                .placeholder(tr!("git_graph.search"))
+        });
         let branch_create_input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .clear_on_escape()
@@ -2524,6 +2549,8 @@ impl Waku {
         let usage_projects_list = ListState::new(0, ListAlignment::Top, px(256.0));
         let branch_picker_list_state = ListState::new(0, ListAlignment::Top, px(152.0));
         let project_picker_list_state = ListState::new(0, ListAlignment::Top, px(152.0));
+        let git_graph_list_state = ListState::new(0, ListAlignment::Top, px(256.0))
+            .with_uniform_item_height(px(48.0));
         let transcript_is_scrolled = Rc::new(Cell::new(false));
         let transcript_anchor_following = Rc::new(Cell::new(false));
         let transcript_tail_recheck = Rc::new(Cell::new(false));
@@ -2579,6 +2606,10 @@ impl Waku {
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
+            let git_graph_focus = cx.focus_handle();
+            let git_graph_refresh_focus = cx.focus_handle();
+            let git_graph_load_more_focus = cx.focus_handle();
+            let git_graph_copy_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
                 &task_switcher_focus,
@@ -3186,6 +3217,20 @@ impl Waku {
                 )),
                 branch_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
                 visible_branch_snapshot: None,
+                git_graph_snapshots: QueryCache::new(MAX_CACHED_WORKSPACES),
+                visible_git_graph: None,
+                git_graph_limits: HashMap::new(),
+                git_commit_details: QueryCache::new(32),
+                git_graph_list_state,
+                git_graph_list_rows: 0,
+                git_graph_scrollbar: ScrollbarState::new(),
+                git_graph_search,
+                git_graph_focus,
+                git_graph_refresh_focus,
+                git_graph_load_more_focus,
+                git_graph_copy_focus,
+                git_graph_detail_scroll: ScrollHandle::new(),
+                git_graph_cursor: None,
                 branch_operation_pending: false,
                 commit_dialog: None,
                 goal_dialog: None,

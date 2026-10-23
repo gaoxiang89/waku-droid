@@ -757,6 +757,26 @@ right_panel.tabs: 右侧面板标签页
 right_panel.add_tab: 添加面板标签页
 right_panel.hide: 隐藏右侧面板
 right_panel.close_tab: 关闭%{title}
+right_panel.git_graph: Git 图谱
+right_panel.git_graph_description: 浏览提交、分支和标签
+git_graph.uncommitted: 未提交的更改
+git_graph.loading: 正在加载 Git 图谱
+git_graph.loading_description: 正在读取此仓库的提交
+git_graph.no_project: 未打开项目
+git_graph.no_project_description: 打开项目后即可查看提交图谱
+git_graph.not_a_repository: 不是 Git 仓库
+git_graph.not_a_repository_description: 此工作区不在 Git 工作树中
+git_graph.empty: 还没有提交
+git_graph.empty_description: 此仓库还没有任何提交
+git_graph.error: 无法读取 Git 图谱
+git_graph.refresh: 刷新
+git_graph.search: 筛选提交
+git_graph.load_more: 加载更多提交
+git_graph.copy_hash: 复制提交哈希
+git_graph.copied: 已复制提交哈希
+git_graph.parents: 父提交
+git_graph.no_files: 没有文件
+git_graph.head: HEAD
 bottom_panel.toggle: 显示或隐藏底部面板
 bottom_panel.resize: 调整底部面板高度
 bottom_panel.new_terminal: 新建终端

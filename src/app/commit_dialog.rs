@@ -471,6 +471,7 @@ impl Waku {
                     waku.invalidate_workspace_queries(cx);
                 } else {
                     waku.branch_snapshots.invalidate(&workspace);
+                    waku.git_graph_snapshots.invalidate(&workspace);
                 }
                 let focus = match result {
                     Ok(()) => {

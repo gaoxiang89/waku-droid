@@ -476,6 +476,7 @@ impl Waku {
 
     pub(super) fn clear_host_workspace_caches(&mut self) {
         self.branch_snapshots.clear();
+        self.clear_git_graph_cache();
         self.slash_commands.clear();
         self.mention_files.clear();
         self.working_trees.clear();

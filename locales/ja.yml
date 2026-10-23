@@ -794,6 +794,26 @@ right_panel.tabs: 右パネルのタブ
 right_panel.add_tab: パネルタブを追加
 right_panel.hide: 右パネルを隠す
 right_panel.close_tab: "%{title} を閉じる"
+right_panel.git_graph: Git グラフ
+right_panel.git_graph_description: コミット、ブランチ、タグを閲覧します
+git_graph.uncommitted: 未コミットの変更
+git_graph.loading: Git グラフを読み込み中
+git_graph.loading_description: このリポジトリのコミットを読み込んでいます
+git_graph.no_project: プロジェクトが開いていません
+git_graph.no_project_description: プロジェクトを開くとコミットグラフが表示されます
+git_graph.not_a_repository: Git リポジトリではありません
+git_graph.not_a_repository_description: このワークスペースは Git 作業ツリー内にありません
+git_graph.empty: コミットがありません
+git_graph.empty_description: このリポジトリにはまだコミットがありません
+git_graph.error: Git グラフを読み取れませんでした
+git_graph.refresh: 更新
+git_graph.search: コミットを絞り込む
+git_graph.load_more: さらにコミットを読み込む
+git_graph.copy_hash: コミットハッシュをコピー
+git_graph.copied: コミットハッシュをコピーしました
+git_graph.parents: 親
+git_graph.no_files: ファイルなし
+git_graph.head: HEAD
 bottom_panel.toggle: 下パネルの表示を切り替える
 bottom_panel.resize: 下パネルの高さを変更
 bottom_panel.new_terminal: 新規ターミナル

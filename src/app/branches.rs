@@ -133,6 +133,7 @@ impl Waku {
             return;
         };
         self.branch_snapshots.invalidate(&path);
+        self.git_graph_snapshots.invalidate(&path);
         cx.notify();
     }
 
@@ -352,6 +353,7 @@ impl Waku {
                         waku.cache_sidebar_branch_label(&path, snapshot.display_branch());
                         waku.visible_branch_snapshot = Some((path.clone(), snapshot));
                         waku.branch_snapshots.invalidate(&path);
+                        waku.git_graph_snapshots.invalidate(&path);
                         let selected_path = waku
                             .selected_workspace_path()
                             .map(std::path::Path::to_path_buf);
