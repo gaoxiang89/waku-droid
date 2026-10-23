@@ -86,47 +86,26 @@ enum TranscriptLinkRoute {
     ProjectFile(String),
     Finder(PathBuf),
     External,
+    /// Recognized as a workspace file, but no project is selected to open it in.
+    NoWorkspace,
 }
 
-fn positive_number(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-        && value.parse::<usize>().is_ok_and(|value| value > 0)
-}
-
-fn line_fragment(fragment: &str) -> bool {
-    let Some(location) = fragment.strip_prefix('L') else {
-        return false;
-    };
-    match location.split_once('C') {
-        Some((line, column)) => positive_number(line) && positive_number(column),
-        None => positive_number(location),
+/// Directories that must be expanded so `relative_path` is visible in a
+/// working tree that starts collapsed. The file itself is not included.
+pub(super) fn ancestor_directories(workspace: &Path, relative_path: &str) -> Vec<PathBuf> {
+    let mut directory = workspace.to_path_buf();
+    let mut ancestors = Vec::new();
+    let mut components = Path::new(relative_path).components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        if let std::path::Component::Normal(part) = component {
+            directory.push(part);
+            ancestors.push(directory.clone());
+        }
     }
-}
-
-/// Removes the `:line`, `:line:column`, or `#LlineCcolumn` suffixes Codex uses
-/// in clickable local-file references. The location is not yet consumed by
-/// Waku's compact editor, but it must not become part of the filesystem path.
-fn strip_file_location(target: &str) -> &str {
-    if let Some((path, fragment)) = target.rsplit_once('#')
-        && line_fragment(fragment)
-    {
-        return path;
-    }
-
-    let Some((before_last, last)) = target.rsplit_once(':') else {
-        return target;
-    };
-    if !positive_number(last) {
-        return target;
-    }
-    if let Some((path, line)) = before_last.rsplit_once(':')
-        && positive_number(line)
-    {
-        path
-    } else {
-        before_last
-    }
+    ancestors
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -160,7 +139,7 @@ fn percent_decode_file_path(path: &str) -> String {
 }
 
 fn markdown_file_link_path(target: &str) -> Option<PathBuf> {
-    let target = strip_file_location(target.trim());
+    let target = crate::md::parser::strip_file_location(target.trim());
     if target
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
@@ -203,16 +182,34 @@ fn workspace_relative_file_path(workspace: &Path, target: &Path) -> Option<Strin
 }
 
 fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLinkRoute {
-    let Some(path) = markdown_file_link_path(target) else {
+    if let Some(path) = markdown_file_link_path(target) {
+        let path = normalized_path(&path);
+        return if let Some(relative_path) =
+            workspace.and_then(|workspace| workspace_relative_file_path(workspace, &path))
+        {
+            TranscriptLinkRoute::ProjectFile(relative_path)
+        } else {
+            TranscriptLinkRoute::Finder(path)
+        };
+    }
+
+    let Some(reference) = crate::md::parser::file_reference_link(target) else {
         return TranscriptLinkRoute::External;
     };
-    let path = normalized_path(&path);
-    if let Some(relative_path) =
-        workspace.and_then(|workspace| workspace_relative_file_path(workspace, &path))
-    {
+    let Some(workspace) = workspace else {
+        return TranscriptLinkRoute::NoWorkspace;
+    };
+    let relative = PathBuf::from(percent_decode_file_path(
+        crate::md::parser::strip_file_location(reference),
+    ));
+    if relative.as_os_str().is_empty() {
+        return TranscriptLinkRoute::NoWorkspace;
+    }
+    let joined = normalized_path(&workspace.join(relative));
+    if let Some(relative_path) = workspace_relative_file_path(workspace, &joined) {
         TranscriptLinkRoute::ProjectFile(relative_path)
     } else {
-        TranscriptLinkRoute::Finder(path)
+        TranscriptLinkRoute::Finder(joined)
     }
 }
 
@@ -1237,6 +1234,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relative_file_references_open_in_the_project_even_before_files_exists() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let scheme = Path::new("docs")
+            .join("可编程刺激发送器方案.md")
+            .to_string_lossy()
+            .into_owned();
+        let source = Path::new("src")
+            .join("app.rs")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            transcript_link_route("docs/可编程刺激发送器方案.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(scheme.clone())
+        );
+        assert_eq!(
+            transcript_link_route("`docs/可编程刺激发送器方案.md`", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(scheme)
+        );
+        assert_eq!(
+            transcript_link_route("src/app.rs:12:8", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(source.clone())
+        );
+        assert_eq!(
+            transcript_link_route("src/app.rs#L12C4", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(source)
+        );
+        assert_eq!(
+            transcript_link_route("0x47", Some(workspace)),
+            TranscriptLinkRoute::External
+        );
+        assert_eq!(
+            transcript_link_route("docs/可编程刺激发送器方案.md", None),
+            TranscriptLinkRoute::NoWorkspace
+        );
+
+        let outside = normalized_path(&workspace.join("../kero/src/app.rs"));
+        assert_eq!(
+            transcript_link_route("../kero/src/app.rs", Some(workspace)),
+            TranscriptLinkRoute::Finder(outside)
+        );
+
+        let ancestors = ancestor_directories(workspace, "docs/可编程刺激发送器方案.md");
+        assert_eq!(ancestors, vec![workspace.join("docs")]);
+        assert!(ancestor_directories(workspace, "README.md").is_empty());
+    }
+
     /// Selection resolves rows by key, so a repeated key makes a drag jump
     /// between the duplicates. Numbered rows keep their number-derived keys
     /// (stable across Review's gap expansion); rows a provider never
@@ -1975,6 +2020,14 @@ impl Waku {
     pub(super) fn open_transcript_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         match transcript_link_route(target, self.selected_workspace_path()) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
+                // Files may never have been opened. Create that surface, expand
+                // every parent so the row exists in the first tree walk, then
+                // select the file inside it.
+                if let Some(workspace) = self.selected_workspace_path().map(Path::to_path_buf) {
+                    for directory in ancestor_directories(&workspace, &relative_path) {
+                        self.right_panel_expanded_paths.insert(directory);
+                    }
+                }
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);
                 self.open_right_panel_file(relative_path, cx);
             }
@@ -1985,6 +2038,10 @@ impl Waku {
                 } else {
                     crate::platform::reveal_in_file_manager(&path, cx);
                 }
+            }
+            TranscriptLinkRoute::NoWorkspace => {
+                self.show_toast(tr!("files.no_project_open"));
+                cx.notify();
             }
             TranscriptLinkRoute::External => return false,
         }

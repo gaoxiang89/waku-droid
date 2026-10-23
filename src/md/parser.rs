@@ -652,6 +652,9 @@ fn merge_pieces(pieces: Vec<InlinePiece>) -> Vec<InlinePiece> {
 /// Linkify after Markdown has produced and merged its inline runs. Pulldown
 /// can split ordinary text at potential emphasis punctuation inside a URL;
 /// merging first lets the detector recover the whole displayed target.
+///
+/// Inline code stays literal for web URLs, but a span whose whole text is a
+/// file reference becomes a link. The transcript opens that path in Files.
 fn linkify_bare_urls(pieces: Vec<InlinePiece>) -> Vec<InlinePiece> {
     let mut linked = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -661,10 +664,192 @@ fn linkify_bare_urls(pieces: Vec<InlinePiece>) -> Vec<InlinePiece> {
             {
                 push_linkified_run(run, &mut linked);
             }
+            InlinePiece::Run(run)
+                if run.style.code && !run.style.math && run.style.link.is_none() =>
+            {
+                push_file_reference_run(run, &mut linked);
+            }
             piece => linked.push(piece),
         }
     }
     linked
+}
+
+fn push_file_reference_run(mut run: InlineRun, pieces: &mut Vec<InlinePiece>) {
+    if let Some(target) = file_reference_link(&run.text) {
+        run.style.link = Some(target.to_owned());
+    }
+    pieces.push(InlinePiece::Run(run));
+}
+
+fn positive_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<usize>().is_ok_and(|value| value > 0)
+}
+
+fn line_fragment(fragment: &str) -> bool {
+    let Some(location) = fragment.strip_prefix('L') else {
+        return false;
+    };
+    match location.split_once('C') {
+        Some((line, column)) => positive_number(line) && positive_number(column),
+        None => positive_number(location),
+    }
+}
+
+/// Removes the `:line`, `:line:column`, or `#LlineCcolumn` suffixes providers
+/// attach to file references. The location is not yet consumed by the editor,
+/// but it must not become part of the filesystem path.
+pub(crate) fn strip_file_location(target: &str) -> &str {
+    if let Some((path, fragment)) = target.rsplit_once('#')
+        && line_fragment(fragment)
+    {
+        return path;
+    }
+
+    let Some((before_last, last)) = target.rsplit_once(':') else {
+        return target;
+    };
+    if !positive_number(last) {
+        return target;
+    }
+    if let Some((path, line)) = before_last.rsplit_once(':')
+        && positive_number(line)
+    {
+        path
+    } else {
+        before_last
+    }
+}
+
+/// The file reference inside `text`, when the whole span is one path.
+///
+/// Returns the trimmed reference, including a trailing `:line` or `#Lline`
+/// suffix. Callers that open the file strip that suffix themselves. Web URLs,
+/// Rust paths (`std::io::Error`), and short tokens (`0x47`) are not files.
+pub fn file_reference_link(text: &str) -> Option<&str> {
+    let trimmed = text.trim().trim_matches(['"', '\'', '`']);
+    if trimmed.is_empty() || trimmed.len() > 1024 {
+        return None;
+    }
+    if trimmed
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        return Some(trimmed);
+    }
+    is_inline_file_path(strip_file_location(trimmed)).then_some(trimmed)
+}
+
+fn is_inline_file_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.contains(['\n', '\r', ' ', '\t'])
+        || path.contains("://")
+        || path.contains("::")
+    {
+        return false;
+    }
+    if path.chars().any(|character| {
+        matches!(
+            character,
+            '|' | '&'
+                | ';'
+                | '$'
+                | '<'
+                | '>'
+                | '*'
+                | '?'
+                | '`'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '"'
+                | '\''
+        )
+    }) {
+        return false;
+    }
+
+    let body = strip_windows_drive(path);
+    if body.contains(':') || body.ends_with('/') || body.ends_with('\\') {
+        return false;
+    }
+    let file_name = body.rsplit(['/', '\\']).next().unwrap_or(body);
+    if file_name.is_empty() || file_name == "." || file_name == ".." {
+        return false;
+    }
+    if file_name
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return false;
+    }
+
+    let has_separator = body.contains('/') || body.contains('\\') || body.len() != path.len();
+    has_separator
+        || has_file_extension(file_name)
+        || is_dotfile(file_name)
+        || is_extensionless_file(file_name)
+}
+
+fn strip_windows_drive(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        &path[2..]
+    } else {
+        path
+    }
+}
+
+fn has_file_extension(file_name: &str) -> bool {
+    let Some((name, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.ends_with('.')
+        && (1..=10).contains(&extension.len())
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        && !extension
+            .chars()
+            .all(|character| character.is_ascii_digit())
+}
+
+fn is_dotfile(file_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix('.') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains("..")
+        && rest.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
+fn is_extensionless_file(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "Makefile"
+            | "Dockerfile"
+            | "Containerfile"
+            | "README"
+            | "LICENSE"
+            | "LICENCE"
+            | "Gemfile"
+            | "Rakefile"
+            | "Procfile"
+            | "Justfile"
+            | "Brewfile"
+    )
 }
 
 fn push_linkified_run(run: InlineRun, pieces: &mut Vec<InlinePiece>) {
@@ -1114,6 +1299,43 @@ mod tests {
         assert!(runs.iter().any(|run| {
             run.text == "https://example.com/code" && run.style.code && run.style.link.is_none()
         }));
+    }
+
+    #[test]
+    fn inline_code_file_paths_become_links() {
+        let tree = parse(
+            "方案写在 `docs/可编程刺激发送器方案.md`。命令是 `0x47`，\
+             另见 `src/app.rs:12`、`README.md`、`std::io::Error` 和 `foo`。",
+        );
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected a paragraph");
+        };
+
+        assert!(runs.iter().any(|run| {
+            run.text == "docs/可编程刺激发送器方案.md"
+                && run.style.code
+                && run.style.link.as_deref() == Some("docs/可编程刺激发送器方案.md")
+        }));
+        assert!(runs.iter().any(|run| {
+            run.text == "src/app.rs:12"
+                && run.style.code
+                && run.style.link.as_deref() == Some("src/app.rs:12")
+        }));
+        assert!(runs.iter().any(|run| {
+            run.text == "README.md"
+                && run.style.code
+                && run.style.link.as_deref() == Some("README.md")
+        }));
+        for literal in ["0x47", "std::io::Error", "foo"] {
+            assert!(
+                runs.iter().any(|run| {
+                    run.text == literal && run.style.code && run.style.link.is_none()
+                }),
+                "{literal} should stay literal code"
+            );
+        }
+        assert!(file_reference_link("file:///tmp/note.md").is_some());
+        assert!(file_reference_link("https://example.com/code").is_none());
     }
 
     #[test]
