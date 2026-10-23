@@ -137,79 +137,6 @@ jobs:
           path: remote-daemon/waku-daemon-linux-${{ matrix.arch }}
           if-no-files-found: error
 
-  linux-x86_64:
-    name: Linux x86_64
-    needs: [version, remote-daemon]
-    if: needs.version.outputs.published != 'true'
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: oven-sh/setup-bun@v2
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal
-          rustup default 1.97.0
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            clang \
-            cmake \
-            libfontconfig-dev \
-            libvulkan1 \
-            libwayland-dev \
-            libx11-xcb-dev \
-            libxi-dev \
-            libxtst-dev \
-            libxkbcommon-x11-dev \
-            pkg-config \
-            xdg-desktop-portal
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-22.04-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ubuntu-22.04-rust-1.97.0-release-
-
-      # `target/` is restored from the release cache, so the previous
-      # release's bundles are still sitting in `target/release` when this one
-      # starts. Cargo does not own them, so nothing else clears them.
-      - name: Clear stale bundles
-        run: rm -f target/release/waku-*.tar.gz
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: remote-daemon-linux-*
-          path: target/remote-daemons
-          merge-multiple: true
-          # Both legs must land: the packaging scripts warn (rather than fail)
-          # on an architecture they cannot find, for local builds' sake.
-          if-no-files-found: error
-
-      - name: Bundle
-        env:
-          WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
-        run: ./scripts/bundle-linux.sh
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: linux-x86_64
-          # Named exactly, not globbed: `if-no-files-found: error` is then a
-          # real check that this version built, rather than something an older
-          # bundle can satisfy.
-          path: target/release/waku-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
-          if-no-files-found: error
-
   windows-x86_64:
     name: Windows x86_64
     needs: [version, remote-daemon]
@@ -236,7 +163,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-latest-rust-1.96.0-release-${{ hashFiles('Cargo.lock') }}
+          key: windows-latest-rust-1.97.0-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             windows-latest-rust-1.97.0-release-
 
@@ -274,7 +201,7 @@ jobs:
 
   draft-release:
     name: Draft GitHub release
-    needs: [version, linux-x86_64, windows-x86_64]
+    needs: [version, windows-x86_64]
     if: needs.version.outputs.published != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -294,31 +221,26 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          # What `install.sh` and the website's Windows download resolve
-          # "latest" to. In-app updates read the appcasts instead.
-          echo "$VERSION" > artifacts/latest-linux.txt
+          # What the website's Windows download resolves "latest" to. In-app
+          # updates read the appcasts instead. Linux desktop builds were
+          # dropped, so there is no latest-linux.txt anymore.
           echo "$VERSION" > artifacts/latest-windows.txt
 
       # Signed here rather than on platform runners: this is the only job that
       # holds every native artifact, and the signing key stays in one place.
-      - name: Sign the Linux and Windows update feeds
+      - name: Sign the Windows update feed
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          # Merge into the live feeds so previously published releases keep
+          # Merge into the live feed so previously published releases keep
           # their entries; a first run simply starts from nothing. The fork's
-          # live feed is the latest published release's own asset. Only x86_64
-          # is fetched: the desktop arm64 builds were dropped, and their feeds
-          # are no longer regenerated.
-          for platform in linux windows; do
-            for arch in x86_64; do
-              curl -fsSL --max-time 30 \
-                "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-$platform-$arch.xml" \
-                -o "artifacts/appcast-$platform-$arch.xml" || true
-            done
-          done
-          bun scripts/appcast-linux.ts artifacts "$VERSION"
+          # live feed is the latest published release's own asset. Only
+          # windows x86_64 is fetched: the Linux and arm64 desktop builds were
+          # dropped, and their feeds are no longer regenerated.
+          curl -fsSL --max-time 30 \
+            "https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-windows-x86_64.xml" \
+            -o "artifacts/appcast-windows-x86_64.xml" || true
           bun scripts/appcast-windows.ts artifacts "$VERSION"
 
       - name: Write release notes
@@ -349,10 +271,7 @@ jobs:
           body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
-            artifacts/*.tar.gz
             artifacts/*.zip
             artifacts/*.exe
-            artifacts/appcast-linux-*.xml
             artifacts/appcast-windows-*.xml
-            artifacts/latest-linux.txt
             artifacts/latest-windows.txt
