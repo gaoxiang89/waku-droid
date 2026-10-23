@@ -16,12 +16,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          code=$(gh api -X POST repos/gaoxiang89/waku-droid/releases \
+          if gh api -X POST repos/gaoxiang89/waku-droid/releases \
             -F tag_name=v0.0.0-gh-token-probe -F draft=true -F name="gh token probe" \
-            2>&1 -w "\n%{http_code}" | tail -1) || true
-          echo "create status: $code"
-          if [ "$code" = "201" ]; then
+            > /tmp/resp.json 2>/tmp/err.txt; then
+            echo "create: OK"
             id=$(gh api repos/gaoxiang89/waku-droid/releases --jq '.[] | select(.tag_name=="v0.0.0-gh-token-probe") | .id')
             gh api -X DELETE "repos/gaoxiang89/waku-droid/releases/$id"
             echo "cleaned up"
+          else
+            echo "create: FAILED"
+            cat /tmp/err.txt
           fi
