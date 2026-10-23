@@ -71,15 +71,16 @@ use crate::{
     CancelTaskSwitch, CancelTurn, CloseFind, CloseTerminalPane, CloseWindow, ConfirmTaskSwitch,
     CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
     NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker,
-    OpenSettings, PreviousTerminal, ReplaceAllMatches, SaveFile, SelectFirstTask, SelectLastTask,
-    SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward, SwitchTaskForward,
-    ToggleBottomPanel, ToggleCommandPalette, ToggleFilesSurface, ToggleFindCaseSensitive,
-    ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter, ToggleGitGraphSurface,
-    ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
+    ResizeTerminalPaneLeft, ResizeTerminalPaneRight, ResizeTerminalPaneUp, SaveFile,
+    SelectFirstTask, SelectLastTask, SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward,
+    SwitchTaskForward, ToggleBottomPanel, ToggleCommandPalette, ToggleFilesSurface,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 use terminal_split::{
-    MAX_SPLIT_PANES, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup, SplitMember,
-    axis_child_sizes,
+    MAX_SPLIT_PANES, ResizeDirection, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup,
+    SplitMember, axis_child_sizes,
 };
 
 #[cfg(target_os = "macos")]

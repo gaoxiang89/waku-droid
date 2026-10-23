@@ -16,6 +16,14 @@ pub(crate) const SPLIT_DIVIDER_SIZE: f32 = 5.0;
 /// Smallest pane a divider drag may leave behind, in pixels.
 pub(crate) const SPLIT_MIN_PANE: f32 = 80.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Distribute `along_total` across `flexes` the way the flexbox will: one
 /// divider per seam is set aside, the rest splits by grow weight. Also
 /// returns the pixels one unit of flex is worth, which divider drags convert
@@ -297,9 +305,78 @@ impl SplitMember {
             }
         }
     }
+
+    fn resize_pane(&mut self, target: EntityId, direction: ResizeDirection) -> bool {
+        let SplitMember::Axis(axis) = self else {
+            return false;
+        };
+        let target_axis = match direction {
+            ResizeDirection::Left | ResizeDirection::Right => Axis::Horizontal,
+            ResizeDirection::Up | ResizeDirection::Down => Axis::Vertical,
+        };
+
+        for member in &mut axis.members {
+            if member.contains(target) {
+                if member.resize_pane(target, direction) {
+                    return true;
+                }
+                break;
+            }
+        }
+
+        if axis.axis == target_axis {
+            if let Some(index) = axis.members.iter().position(|m| m.contains(target)) {
+                return axis.adjust_divider_for_member(index, direction);
+            }
+        }
+
+        false
+    }
+}
+
+impl SplitAxis {
+    fn adjust_divider_for_member(&mut self, index: usize, direction: ResizeDirection) -> bool {
+        if self.members.len() < 2 || self.flexes.len() < self.members.len() {
+            return false;
+        }
+
+        let is_positive = matches!(direction, ResizeDirection::Right | ResizeDirection::Down);
+        let (grow_idx, shrink_idx) = if is_positive {
+            if index + 1 < self.members.len() {
+                (index, index + 1)
+            } else if index > 0 {
+                (index - 1, index)
+            } else {
+                return false;
+            }
+        } else {
+            if index > 0 {
+                (index, index - 1)
+            } else if index + 1 < self.members.len() {
+                (index + 1, index)
+            } else {
+                return false;
+            }
+        };
+
+        let pair_total = self.flexes[grow_idx] + self.flexes[shrink_idx];
+        let step = pair_total * 0.05;
+        let min_flex = pair_total * 0.08;
+
+        let new_grow = (self.flexes[grow_idx] + step).min(pair_total - min_flex);
+        let new_shrink = pair_total - new_grow;
+
+        self.flexes[grow_idx] = new_grow;
+        self.flexes[shrink_idx] = new_shrink;
+        true
+    }
 }
 
 impl SplitGroup {
+    pub(crate) fn resize_pane(&mut self, target: EntityId, direction: ResizeDirection) -> bool {
+        self.root.resize_pane(target, direction)
+    }
+
     pub(crate) fn single(terminal: Entity<TerminalView>) -> Self {
         Self {
             root: SplitMember::Pane(terminal),
@@ -560,5 +637,39 @@ mod tests {
         let (first, second) = drag.flexes_for(0.0, 50.0);
         assert!((first * 100.0 - 200.0).abs() < 0.01);
         assert!((second * 100.0 - 200.0).abs() < 0.01);
+    }
+
+    #[gpui::test]
+    fn keyboard_resize_adjusts_horizontal_and_vertical_panes(cx: &mut gpui::TestAppContext) {
+        let (terminals, mut group) = group_with(cx, 1);
+        let second = cx.update(|cx| TerminalView::inert_test_view_entity(cx));
+        group.split_pane(terminals[0].entity_id(), second.clone(), Axis::Horizontal);
+
+        // Before resize, flexes are equal: [1.0, 1.0]
+        let SplitMember::Axis(axis) = &group.root else {
+            panic!("expected axis");
+        };
+        assert_eq!(axis.flexes, vec![1.0, 1.0]);
+
+        // Expanding the left pane to the right increases its flex and shrinks the right pane.
+        assert!(group.resize_pane(terminals[0].entity_id(), ResizeDirection::Right));
+        let SplitMember::Axis(axis) = &group.root else {
+            panic!("expected axis");
+        };
+        assert!(axis.flexes[0] > 1.0);
+        assert!(axis.flexes[1] < 1.0);
+        assert!((axis.flexes[0] + axis.flexes[1] - 2.0).abs() < 0.001);
+
+        // Shrinking the left pane to the left decreases its flex and grows the right pane.
+        assert!(group.resize_pane(terminals[0].entity_id(), ResizeDirection::Left));
+        let SplitMember::Axis(axis) = &group.root else {
+            panic!("expected axis");
+        };
+        assert!((axis.flexes[0] - 1.0).abs() < 0.001);
+        assert!((axis.flexes[1] - 1.0).abs() < 0.001);
+
+        // Vertical resize does nothing on a purely horizontal axis.
+        assert!(!group.resize_pane(terminals[0].entity_id(), ResizeDirection::Up));
+        assert!(!group.resize_pane(terminals[0].entity_id(), ResizeDirection::Down));
     }
 }

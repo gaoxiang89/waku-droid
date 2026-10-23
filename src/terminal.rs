@@ -1309,20 +1309,33 @@ impl TerminalView {
         {
             return;
         }
-        // Split and close-pane chords reach the panel's actions the same way:
+        // Split, close-pane, and resize chords reach the panel's actions the same way:
         // secondary+shift+d splits right, secondary+alt+shift+d splits down,
-        // and secondary+shift+w closes the focused pane.
-        if self.bottom_panel_tabs
-            && keystroke.modifiers.secondary()
-            && keystroke.modifiers.shift
-            && !keystroke.modifiers.function
-        {
-            let key = keystroke.key.as_str();
-            let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
-            let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
-            let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
-            if split_right || split_down || close_pane {
-                return;
+        // secondary+shift+w / ctrl+shift+w closes the focused pane,
+        // and Windows Terminal chords (alt+shift+plus/minus, alt+shift+arrows)
+        // split and resize.
+        if self.bottom_panel_tabs {
+            if (keystroke.modifiers.secondary() || keystroke.modifiers.control)
+                && keystroke.modifiers.shift
+                && !keystroke.modifiers.function
+            {
+                let key = keystroke.key.as_str();
+                let split_right = key.eq_ignore_ascii_case("d") && !keystroke.modifiers.alt;
+                let split_down = key.eq_ignore_ascii_case("d") && keystroke.modifiers.alt;
+                let close_pane = key.eq_ignore_ascii_case("w") && !keystroke.modifiers.alt;
+                if split_right || split_down || close_pane {
+                    return;
+                }
+            }
+            if keystroke.modifiers.alt && keystroke.modifiers.shift && !keystroke.modifiers.function
+            {
+                let key = keystroke.key.as_str();
+                let split_right = matches!(key, "+" | "=" | "plus" | "add");
+                let split_down = matches!(key, "-" | "_" | "minus" | "subtract");
+                let resize = matches!(key, "left" | "right" | "up" | "down");
+                if split_right || split_down || resize {
+                    return;
+                }
             }
         }
         if terminal_clipboard_modifier_pressed(&keystroke.modifiers)

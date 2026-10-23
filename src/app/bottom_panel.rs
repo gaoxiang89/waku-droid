@@ -167,6 +167,10 @@ impl Waku {
                 let split_right_pane = terminal.clone();
                 let split_down_pane = terminal.clone();
                 let close_pane = terminal.clone();
+                let resize_left_pane = terminal.clone();
+                let resize_right_pane = terminal.clone();
+                let resize_up_pane = terminal.clone();
+                let resize_down_pane = terminal.clone();
                 div()
                     .id(SharedString::from(format!(
                         "bottom-panel-pane-{:?}",
@@ -187,6 +191,24 @@ impl Waku {
                     }))
                     .on_action(cx.listener(move |this, _: &CloseTerminalPane, _, cx| {
                         this.close_bottom_panel_pane(&close_pane, cx);
+                    }))
+                    .on_action(cx.listener(move |this, _: &ResizeTerminalPaneLeft, _, cx| {
+                        this.resize_bottom_panel_pane(&resize_left_pane, ResizeDirection::Left, cx);
+                    }))
+                    .on_action(
+                        cx.listener(move |this, _: &ResizeTerminalPaneRight, _, cx| {
+                            this.resize_bottom_panel_pane(
+                                &resize_right_pane,
+                                ResizeDirection::Right,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(cx.listener(move |this, _: &ResizeTerminalPaneUp, _, cx| {
+                        this.resize_bottom_panel_pane(&resize_up_pane, ResizeDirection::Up, cx);
+                    }))
+                    .on_action(cx.listener(move |this, _: &ResizeTerminalPaneDown, _, cx| {
+                        this.resize_bottom_panel_pane(&resize_down_pane, ResizeDirection::Down, cx);
                     }))
                     .into_any_element()
             }
@@ -474,14 +496,18 @@ impl Waku {
             .child(
                 div()
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
                     .child(
                         icon_button("new-bottom-panel-terminal", "icons/plus.svg", theme)
-                            .tooltip(|window, cx| {
-                                Tooltip::new(tr!("bottom_panel.new_terminal")).build(window, cx)
-                            })
+                            .tooltip(Tooltip::with_shortcut(
+                                tr!("bottom_panel.new_terminal"),
+                                crate::platform::primary_shortcut("⇧⌘J", "Ctrl+Shift+J"),
+                            ))
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
                                 let _ = new_terminal_weak.update(cx, |this, cx| {
@@ -492,9 +518,10 @@ impl Waku {
                     .when_some(split_pane, |element, pane| {
                         element.child(
                             icon_button("split-bottom-panel-terminal", "icons/split.svg", theme)
-                                .tooltip(|window, cx| {
-                                    Tooltip::new(tr!("bottom_panel.split_right")).build(window, cx)
-                                })
+                                .tooltip(Tooltip::with_shortcut(
+                                    tr!("bottom_panel.split_right"),
+                                    crate::platform::primary_shortcut("⇧⌘D", "Ctrl+Shift+D"),
+                                ))
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     let _ = split_weak.update(cx, |this, cx| {
@@ -788,6 +815,25 @@ impl Waku {
             return;
         }
         self.close_bottom_panel_group(group_index, cx);
+    }
+
+    /// Resize one split pane along the chosen direction.
+    pub(super) fn resize_bottom_panel_pane(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group_index) = self
+            .bottom_panel_terminal_groups
+            .iter()
+            .position(|group| group.contains(pane.entity_id()))
+        else {
+            return;
+        };
+        if self.bottom_panel_terminal_groups[group_index].resize_pane(pane.entity_id(), direction) {
+            cx.notify();
+        }
     }
 
     /// Close one terminal tab, together with every pane it still shows.
