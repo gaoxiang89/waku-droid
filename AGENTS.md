@@ -7,6 +7,11 @@
   live on the fork, so query Actions runs with
   `gh run list --repo gaoxiang89/waku-droid` — not the upstream repo, where the
   runs do not exist or are not the relevant ones.
+- Never push changes under `.github/workflows` to the fork's `main` while a
+  Release run is in progress, and push them before tagging. GITHUB_TOKEN
+  cannot touch workflow files, so creating the release fails with 403
+  "Resource not accessible by integration" when the target commit's
+  workflows differ from `main`.
 
 ## Development runtime
 

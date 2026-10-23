@@ -260,23 +260,29 @@ jobs:
             );
           '
 
-      # softprops/action-gh-release@v3 kept hitting 403 "Resource not
-      # accessible by integration" on this repo even with the same
-      # GITHUB_TOKEN that succeeds via `gh api`, so create the release
-      # directly. `--target` only matters for a manual run with no tag yet;
-      # publishing the draft creates the tag at the commit that was built.
+      # GITHUB_TOKEN can never hold the `workflows` permission, so GitHub
+      # answers 403 "Resource not accessible by integration" whenever the
+      # release's target commit carries workflow files that differ from the
+      # default branch, even if the tag already exists. A tag push already
+      # pins the commit, so the target is only sent for a manual run that has
+      # no tag yet. Workflow edits pushed to main mid-run still break that
+      # manual case; land them before dispatching.
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
-        run: >
-          gh release create "$TAG"
-          --repo "$GITHUB_REPOSITORY"
-          --draft
-          --target "$GITHUB_SHA"
-          --title "$TAG"
-          --notes-file release-notes.md
-          artifacts/*.zip
-          artifacts/*.exe
-          artifacts/appcast-windows-*.xml
-          artifacts/latest-windows.txt
+        run: |
+          target=()
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            target=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            "${target[@]}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            artifacts/*.zip \
+            artifacts/*.exe \
+            artifacts/appcast-windows-*.xml \
+            artifacts/latest-windows.txt
