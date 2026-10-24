@@ -99,6 +99,23 @@ enum TranscriptLinkRoute {
 /// Directories that must be expanded so `relative_path` is visible in a
 /// working tree that starts collapsed. The file itself is not included.
 pub(super) fn ancestor_directories(workspace: &Path, relative_path: &str) -> Vec<PathBuf> {
+    if let Some(workspace) = posix_workspace(workspace) {
+        let mut directory = workspace.trim_end_matches('/').to_owned();
+        let mut ancestors = Vec::new();
+        let mut parts = relative_path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            directory.push('/');
+            directory.push_str(part);
+            ancestors.push(PathBuf::from(&directory));
+        }
+        return ancestors;
+    }
     let mut directory = workspace.to_path_buf();
     let mut ancestors = Vec::new();
     let mut components = Path::new(relative_path).components().peekable();
@@ -187,7 +204,75 @@ fn workspace_relative_file_path(workspace: &Path, target: &Path) -> Option<Strin
     relative(&workspace, &target)
 }
 
+/// A workspace path in POSIX form, as SSH and WSL hosts report it.
+///
+/// A Windows desktop's `std::path` reads `/home/me` as relative and joins
+/// with `\`, which a Linux daemon takes as part of a file name, so paths on
+/// these hosts are routed as strings instead.
+fn posix_workspace(workspace: &Path) -> Option<&str> {
+    workspace.to_str().filter(|path| path.starts_with('/'))
+}
+
+fn normalized_posix_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+fn posix_workspace_relative_file_path(workspace: &str, target: &str) -> Option<String> {
+    let workspace = normalized_posix_path(workspace);
+    let relative = if workspace == "/" {
+        target.strip_prefix('/')
+    } else {
+        target.strip_prefix(workspace.as_str())?.strip_prefix('/')
+    }?;
+    (!relative.is_empty()).then(|| relative.to_owned())
+}
+
+fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkRoute {
+    let trimmed = crate::md::parser::strip_file_location(target.trim());
+    let path = if trimmed
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        let Some(url) = url::Url::parse(trimmed)
+            .ok()
+            .filter(|url| matches!(url.host_str(), None | Some("" | "localhost")))
+        else {
+            return TranscriptLinkRoute::External;
+        };
+        percent_decode_file_path(url.path())
+    } else if trimmed.starts_with('/') {
+        percent_decode_file_path(trimmed)
+    } else {
+        let Some(reference) = crate::md::parser::file_reference_link(target) else {
+            return TranscriptLinkRoute::External;
+        };
+        let relative = percent_decode_file_path(crate::md::parser::strip_file_location(reference));
+        if relative.is_empty() {
+            return TranscriptLinkRoute::NoWorkspace;
+        }
+        format!("{workspace}/{relative}")
+    };
+    let path = normalized_posix_path(&path);
+    match posix_workspace_relative_file_path(workspace, &path) {
+        Some(relative_path) => TranscriptLinkRoute::ProjectFile(relative_path),
+        None => TranscriptLinkRoute::Finder(PathBuf::from(path)),
+    }
+}
+
 fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLinkRoute {
+    if let Some(workspace) = workspace.and_then(posix_workspace) {
+        return posix_transcript_link_route(target, workspace);
+    }
     if let Some(path) = markdown_file_link_path(target) {
         let path = normalized_path(&path);
         return if let Some(relative_path) =
@@ -1288,6 +1373,50 @@ mod tests {
         assert!(ancestor_directories(workspace, "README.md").is_empty());
     }
 
+    #[test]
+    fn remote_posix_workspaces_route_with_forward_slashes_on_every_desktop() {
+        let workspace = Path::new("/home/me/proj");
+
+        assert_eq!(
+            transcript_link_route("docs/guide.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile("docs/guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("/home/me/proj/docs/guide.md:12", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile("docs/guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("/home/me/proj/docs/My%20Guide.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile("docs/My Guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("file:///home/me/proj/docs/guide.md#L3", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile("docs/guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("../other/notes.md", Some(workspace)),
+            TranscriptLinkRoute::Finder(PathBuf::from("/home/me/other/notes.md"))
+        );
+        assert_eq!(
+            transcript_link_route("/home/me/proj", Some(workspace)),
+            TranscriptLinkRoute::Finder(PathBuf::from("/home/me/proj"))
+        );
+        assert_eq!(
+            transcript_link_route("https://example.com/guide.md", Some(workspace)),
+            TranscriptLinkRoute::External
+        );
+
+        // Expanded rows are keyed by the daemon's own absolute paths.
+        assert_eq!(
+            ancestor_directories(Path::new("/home/me/proj/"), "docs/api/guide.md"),
+            vec![
+                PathBuf::from("/home/me/proj/docs"),
+                PathBuf::from("/home/me/proj/docs/api"),
+            ]
+        );
+        assert!(ancestor_directories(workspace, "README.md").is_empty());
+    }
+
     /// Selection resolves rows by key, so a repeated key makes a drag jump
     /// between the duplicates. Numbered rows keep their number-derived keys
     /// (stable across Review's gap expansion); rows a provider never
@@ -2063,6 +2192,16 @@ impl Waku {
     /// workspace it opens in the file viewer; anywhere else it goes to the file
     /// manager, the same split a file link in the transcript takes.
     pub(super) fn open_activity_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.selected_workspace_path().and_then(posix_workspace) {
+            let path = path.trim();
+            let resolved = if path.starts_with('/') {
+                path.to_owned()
+            } else {
+                format!("{}/{path}", workspace.trim_end_matches('/'))
+            };
+            self.open_transcript_link(&resolved, cx);
+            return;
+        }
         let path = Path::new(path.trim());
         let resolved = if path.is_absolute() {
             path.to_path_buf()
