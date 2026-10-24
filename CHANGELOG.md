@@ -16,6 +16,12 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.33]
+
+- Expand any file in the Git graph's commit details to read its diff inline, and Ctrl/Cmd-click a second commit to compare the two
+- Right-click commits, uncommitted changes, and branch, remote, or tag labels in the Git graph to check out, create branches and tags, cherry-pick, revert, merge, rebase, reset, stash, discard, push, rename, or delete; anything destructive asks first, and Shift+F10 opens the menu from the keyboard
+- Report mouse clicks and scrolling to terminal apps that ask for them, support the kitty keyboard protocol and focus reports, answer color queries with the theme's real colors, and flag terminal panels that need attention when an agent there asks for it
+
 ## [0.1.32]
 
 - Keep the bottom panel's terminal buttons on one row instead of letting them stack and overflow, and light up the documented split, resize, and close shortcuts there on Windows, including Windows Terminal's Shift+Alt+=, Shift+Alt+-, and Shift+Alt+arrow chords
