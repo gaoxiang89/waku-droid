@@ -120,6 +120,10 @@ impl TaskSwitcherUi {
     }
 }
 
+fn task_switcher_session_visible(session: &AgentSession) -> bool {
+    session.has_started() && !session.archived
+}
+
 fn ordered_task_ids(current: Option<Uuid>, recent: &[Uuid], started_tasks: &[Uuid]) -> Vec<Uuid> {
     let valid = started_tasks.iter().copied().collect::<HashSet<_>>();
     let mut seen = HashSet::with_capacity(started_tasks.len());
@@ -308,7 +312,7 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| task_switcher_session_visible(session))
             .map(|session| session.id)
             .collect::<Vec<_>>();
         let ordered = ordered_task_ids(
@@ -417,7 +421,7 @@ impl Waku {
                 .state
                 .sessions
                 .iter()
-                .any(|session| session.id == selected && session.has_started())
+                .any(|session| session.id == selected && task_switcher_session_visible(session))
         {
             let was_in_settings = self.settings_page.is_some();
             self.settings_page = None;
@@ -791,6 +795,21 @@ mod tests {
             initial_highlight_index(&ordered, Some(draft), false),
             Some(0)
         );
+    }
+
+    #[test]
+    fn archived_tasks_are_not_switcher_candidates() {
+        let mut active = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        active.last_reply_at = Some(1);
+        active.detail_loaded = false;
+        let mut archived = active.clone();
+        archived.id = Uuid::new_v4();
+        archived.archived = true;
+        let draft = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+
+        assert!(task_switcher_session_visible(&active));
+        assert!(!task_switcher_session_visible(&archived));
+        assert!(!task_switcher_session_visible(&draft));
     }
 
     #[test]

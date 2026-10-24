@@ -975,6 +975,10 @@ pub struct AgentSession {
     /// first prompt until the provider reports a better one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_title: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub project_id: Uuid,
     /// Local project checkout or an isolated Git worktree for this task.
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
@@ -1060,6 +1064,8 @@ impl AgentSession {
             id: Uuid::new_v4(),
             title: Self::DEFAULT_TITLE.to_owned(),
             auto_title: None,
+            pinned: false,
+            archived: false,
             project_id,
             workspace: SessionWorkspace::Local,
             provider,
@@ -1097,6 +1103,8 @@ impl AgentSession {
             id: self.id,
             title: self.title.clone(),
             auto_title: self.auto_title.clone(),
+            pinned: self.pinned,
+            archived: self.archived,
             project_id: self.project_id,
             workspace: SessionWorkspace::Local,
             provider: self.provider,
@@ -1197,6 +1205,28 @@ impl AgentSession {
         }
         self.title = title.to_owned();
         self.updated_at = unix_time();
+        true
+    }
+
+    /// Pins or unpins this task in catalog order without touching its detail.
+    /// Returns whether the stored flag changed.
+    pub fn set_pinned(&mut self, pinned: bool) -> bool {
+        if self.pinned == pinned {
+            return false;
+        }
+        self.pinned = pinned;
+        self.updated_at = unix_time().max(self.updated_at.saturating_add(1));
+        true
+    }
+
+    /// Archives or restores this task without touching its detail.
+    /// Returns whether the stored flag changed.
+    pub fn set_archived(&mut self, archived: bool) -> bool {
+        if self.archived == archived {
+            return false;
+        }
+        self.archived = archived;
+        self.updated_at = unix_time().max(self.updated_at.saturating_add(1));
         true
     }
 
@@ -4551,6 +4581,30 @@ mod tests {
     }
 
     #[test]
+    fn organization_flags_default_for_legacy_sessions_and_setters_bump_updated_at() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("pinned");
+        object.remove("archived");
+        let legacy: AgentSession = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.pinned);
+        assert!(!legacy.archived);
+
+        session.updated_at = 100;
+        assert!(session.set_pinned(true));
+        assert!(session.pinned);
+        assert!(session.updated_at > 100);
+        let pinned_at = session.updated_at;
+        assert!(!session.set_pinned(true));
+        assert_eq!(session.updated_at, pinned_at);
+        assert!(session.set_archived(true));
+        assert!(session.archived);
+        assert!(session.updated_at > pinned_at);
+    }
+
+    #[test]
     fn planned_worktree_base_branch_is_optional_and_round_trips() {
         let legacy: SessionWorkspace =
             serde_json::from_value(serde_json::json!({ "kind": "newWorktree" })).unwrap();
@@ -4927,6 +4981,8 @@ mod tests {
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
         session.title = "Visible title".into();
         session.model = Some("gpt-5".into());
+        session.pinned = true;
+        session.archived = true;
         session.status = SessionStatus::Working;
         session.begin_turn("A large prompt");
         session.messages.push(Message::new(
@@ -4953,6 +5009,8 @@ mod tests {
         assert_eq!(projection.id, session.id);
         assert_eq!(projection.title, "Visible title");
         assert_eq!(projection.model.as_deref(), Some("gpt-5"));
+        assert!(projection.pinned);
+        assert!(projection.archived);
         assert_eq!(projection.status, SessionStatus::Working);
         assert!(!projection.detail_loaded);
         assert!(projection.messages.is_empty());

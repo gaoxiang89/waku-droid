@@ -1202,8 +1202,8 @@ impl StateStore {
         // how much history exists.
         let mut sessions = connection
             .prepare(
-                "SELECT id, project_id, title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                "SELECT id, project_id, title, auto_title, pinned, archived,
+                        provider, model, status, created_at, updated_at, last_reply_at
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1215,12 +1215,14 @@ impl StateStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1561,6 +1563,8 @@ type SessionColumns = (
     String,
     String,
     Option<String>,
+    i64,
+    i64,
     String,
     Option<String>,
     String,
@@ -1580,6 +1584,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         project_id,
         title,
         auto_title,
+        pinned,
+        archived,
         provider,
         model,
         status,
@@ -1591,6 +1597,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         id: Uuid::parse_str(&id).ok()?,
         title,
         auto_title,
+        pinned: pinned != 0,
+        archived: archived != 0,
         project_id: Uuid::parse_str(&project_id).ok()?,
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
@@ -1812,13 +1820,15 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// Columns the sidebar sorts and filters on are stored alongside the JSON so
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
-         id, project_id, title, auto_title, provider, model, status,
-         created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         id, project_id, title, auto_title, pinned, archived,
+         provider, model, status, created_at, updated_at, last_reply_at
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
          auto_title    = excluded.auto_title,
+         pinned        = excluded.pinned,
+         archived      = excluded.archived,
          provider      = excluded.provider,
          model         = excluded.model,
          status        = excluded.status,
@@ -1855,6 +1865,8 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         Value::Text(session.project_id.to_string()),
         Value::Text(session.title.clone()),
         session.auto_title.clone().map_or(Value::Null, Value::Text),
+        Value::Integer(i64::from(session.pinned)),
+        Value::Integer(i64::from(session.archived)),
         Value::Text(tag_of(session.provider)),
         session.model.clone().map_or(Value::Null, Value::Text),
         Value::Text(tag_of(session.status)),
@@ -2179,6 +2191,37 @@ mod tests {
         assert!(!removed.set(key, ComposerDraft::default()));
         store.save(removed, 3).unwrap();
         assert!(store.load().unwrap().get(key).is_none());
+    }
+
+    #[test]
+    fn session_organization_flags_round_trip_through_list_columns() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let id = state.sessions[0].id;
+        state.sessions[0].begin_turn("Persist organization flags");
+        assert!(state.sessions[0].set_pinned(true));
+        store.save(&mut state).unwrap();
+        assert!(state.sessions[0].set_archived(true));
+        state.mark_session_dirty(id);
+        store.save(&mut state).unwrap();
+
+        let connection = Connection::open(directory.join("app.db")).unwrap();
+        let (pinned, archived): (i64, i64) = connection
+            .query_row(
+                "SELECT pinned, archived FROM sessions WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pinned, archived), (1, 1));
+        drop(connection);
+
+        let restored = store_in(&directory).load().unwrap();
+        assert!(!restored.sessions[0].detail_loaded);
+        assert!(restored.sessions[0].pinned);
+        assert!(restored.sessions[0].archived);
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
@@ -3047,6 +3090,39 @@ mod tests {
             error.to_string().contains(last),
             "the failure names the migration: {error}"
         );
+    }
+
+    #[test]
+    fn organization_flag_migration_defaults_existing_sessions_to_false() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS_TABLE).unwrap();
+        connection.execute_batch(MIGRATIONS[0].1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO migrations(tag, applied_at) VALUES(?1, 0)",
+                params![MIGRATIONS[0].0],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(
+                    id, project_id, title, provider, model, status,
+                    created_at, updated_at, last_reply_at
+                 ) VALUES('session-1', 'project-1', 'Legacy session',
+                          'codex', NULL, 'idle', 1, 1, NULL)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(apply_migrations(&connection).unwrap(), MIGRATIONS.len() - 1);
+        let (pinned, archived): (i64, i64) = connection
+            .query_row(
+                "SELECT pinned, archived FROM sessions WHERE id = 'session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pinned, archived), (0, 0));
     }
 
     #[test]

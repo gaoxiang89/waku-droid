@@ -247,6 +247,8 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
     id: 'session',
     title: 'New task',
     auto_title: null,
+    pinned: false,
+    archived: false,
     project_id: 'p',
     workspace: { kind: 'local' },
     provider: 'codex',

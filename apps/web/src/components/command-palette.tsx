@@ -629,7 +629,7 @@ function buildItems({
         : t('sidebar.unknown_project')
       const match = matchBySession.get(session.id)
       const branch = session.workspace?.kind === 'worktree' ? session.workspace.branch : null
-      const detail = [projectName, branch ? `#${branch}` : null, session.id === selectedSessionId ? t('command_palette.current') : null].filter(Boolean).join(' · ')
+      const detail = [projectName, branch ? `#${branch}` : null, session.archived ? t('sidebar.archived') : null, session.id === selectedSessionId ? t('command_palette.current') : null].filter(Boolean).join(' · ')
       const keywords = `${displayTitle(session)} ${project?.name ?? ''} ${project?.path ?? ''} ${branch ?? ''} ${session.provider} ${session.model ?? ''} task session chat conversation`
       const metadataScore = fuzzyScore(query, keywords)
       const contentScore = match ? fuzzyScore(query, match.snippet) ?? 0 : null

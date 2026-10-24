@@ -1608,8 +1608,14 @@ pub struct Waku {
     /// One stable field reused across sidebar rows so virtualization never
     /// replaces the focused editor while a rename is in progress.
     session_rename_input: Entity<TextInput>,
-    /// Groups the user has folded in either sidebar view. This is
-    /// intentionally runtime-only, like transcript disclosure state.
+    /// A task deletion parked behind an explicit confirmation. The stable
+    /// button handles live on the window so rebuilding the sidebar cannot drop
+    /// keyboard focus while the dialog is open.
+    session_delete_confirm: Option<sidebar::SessionDeleteConfirm>,
+    session_delete_cancel_focus: FocusHandle,
+    session_delete_confirm_focus: FocusHandle,
+    /// Groups the user has folded in either sidebar view, mirrored into the
+    /// local AppState only when a disclosure action changes them.
     sidebar_collapsed_groups: HashSet<SidebarGroup>,
     /// Number of older sessions revealed inside each project section. This is
     /// runtime-only so every launch starts with the recent three-day view.
@@ -2339,6 +2345,9 @@ impl Waku {
         let composer_draft_store = ComposerDraftStore::remote(daemon.clone());
         let composer_drafts = composer_draft_store.load().unwrap_or_default();
         let mut state = store.load_or_fresh(cwd);
+        let collapsed_hosts = sidebar::restore_collapsed_hosts(&state.sidebar_collapsed_hosts);
+        let sidebar_collapsed_groups =
+            sidebar::restore_collapsed_groups(&state.sidebar_collapsed_groups);
         let pending_host_session = state
             .selected_session
             .filter(|id| !state.sessions.iter().any(|session| session.id == *id));
@@ -2722,6 +2731,8 @@ impl Waku {
             let onboarding_add_project_focus = cx.focus_handle();
             let onboarding_projectless_focus = cx.focus_handle();
             let updater_button_focus = cx.focus_handle();
+            let session_delete_cancel_focus = cx.focus_handle();
+            let session_delete_confirm_focus = cx.focus_handle();
             let model_picker_empty_focus = cx.focus_handle();
             let git_graph_focus = cx.focus_handle();
             let git_graph_refresh_focus = cx.focus_handle();
@@ -3245,7 +3256,7 @@ impl Waku {
                 remote_folder_picker_generation: 0,
                 host_sync_stops: HashMap::new(),
                 host_disconnected: HashSet::new(),
-                collapsed_hosts: HashSet::new(),
+                collapsed_hosts,
                 host_focuses: RefCell::new(HashMap::new()),
                 remote_folder_path_input,
                 settings_focus,
@@ -3404,10 +3415,13 @@ impl Waku {
                 session_navigation,
                 session_rename: None,
                 session_rename_input,
+                session_delete_confirm: None,
+                session_delete_cancel_focus,
+                session_delete_confirm_focus,
                 right_panel_file_rename: None,
                 right_panel_file_rename_input,
                 right_panel_delete_confirm: None,
-                sidebar_collapsed_groups: HashSet::new(),
+                sidebar_collapsed_groups,
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),
                 sidebar_group_compose_focuses: RefCell::new(HashMap::new()),

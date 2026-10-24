@@ -638,6 +638,8 @@ export function createSession(
     id: crypto.randomUUID(),
     title: 'New task',
     auto_title: null,
+    pinned: false,
+    archived: false,
     project_id: projectId,
     workspace: isolated ? { kind: 'newWorktree' } : { kind: 'local' },
     provider,

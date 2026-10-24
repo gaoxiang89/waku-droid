@@ -333,6 +333,12 @@ struct AppState {
     sidebar_width: f32,
     #[serde(default)]
     sidebar_ordering: SidebarOrdering,
+    #[serde(default)]
+    sidebar_show_archived: bool,
+    #[serde(default)]
+    sidebar_collapsed_hosts: Vec<String>,
+    #[serde(default)]
+    sidebar_collapsed_groups: Vec<String>,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
@@ -395,6 +401,12 @@ pub struct PersistedState {
     pub sidebar_width: f32,
     #[serde(default)]
     pub sidebar_ordering: SidebarOrdering,
+    #[serde(default)]
+    pub sidebar_show_archived: bool,
+    #[serde(default)]
+    pub sidebar_collapsed_hosts: Vec<String>,
+    #[serde(default)]
+    pub sidebar_collapsed_groups: Vec<String>,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
@@ -464,6 +476,9 @@ impl PersistedState {
             bottom_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_ordering: SidebarOrdering::Newest,
+            sidebar_show_archived: false,
+            sidebar_collapsed_hosts: Vec::new(),
+            sidebar_collapsed_groups: Vec::new(),
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
             markdown_preview: false,
@@ -609,6 +624,9 @@ impl PersistedState {
             bottom_panel_visible: self.bottom_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_ordering: self.sidebar_ordering,
+            sidebar_show_archived: self.sidebar_show_archived,
+            sidebar_collapsed_hosts: self.sidebar_collapsed_hosts.clone(),
+            sidebar_collapsed_groups: self.sidebar_collapsed_groups.clone(),
             right_panel_width: self.right_panel_width,
             bottom_panel_height: self.bottom_panel_height,
             markdown_preview: self.markdown_preview,
@@ -644,6 +662,9 @@ impl PersistedState {
         self.bottom_panel_visible = app_state.bottom_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
         self.sidebar_ordering = app_state.sidebar_ordering;
+        self.sidebar_show_archived = app_state.sidebar_show_archived;
+        self.sidebar_collapsed_hosts = app_state.sidebar_collapsed_hosts;
+        self.sidebar_collapsed_groups = app_state.sidebar_collapsed_groups;
         self.right_panel_width = app_state.right_panel_width;
         self.bottom_panel_height = app_state.bottom_panel_height;
         self.markdown_preview = app_state.markdown_preview;
@@ -1415,6 +1436,34 @@ mod tests {
 
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+        assert!(!state.sidebar_show_archived);
+        assert!(state.sidebar_collapsed_hosts.is_empty());
+        assert!(state.sidebar_collapsed_groups.is_empty());
+    }
+
+    #[test]
+    fn sidebar_view_and_collapsed_paths_roundtrip_through_app_state() {
+        let mut state = PersistedState::empty();
+        state.sidebar_show_archived = true;
+        state.sidebar_collapsed_hosts = vec!["local".to_owned(), "connection:ssh-1".to_owned()];
+        state.sidebar_collapsed_groups = vec![
+            "project:00000000-0000-0000-0000-000000000001".to_owned(),
+            "projectless:00000000-0000-0000-0000-000000000002".to_owned(),
+        ];
+
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+
+        assert!(restored.sidebar_show_archived);
+        assert_eq!(
+            restored.sidebar_collapsed_hosts,
+            state.sidebar_collapsed_hosts
+        );
+        assert_eq!(
+            restored.sidebar_collapsed_groups,
+            state.sidebar_collapsed_groups
+        );
     }
 
     #[test]

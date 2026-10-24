@@ -458,28 +458,16 @@ impl Waku {
             .child(add)
             .when_some(options, |row, options| row.child(options))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.collapsed_hosts.remove(&click_key) {
-                    this.collapsed_hosts.insert(click_key.clone());
-                }
-                cx.notify();
+                this.toggle_sidebar_host(click_key.clone(), cx);
             }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 match event.keystroke.key.as_str() {
-                    "enter" | "space" => {
-                        if !this.collapsed_hosts.remove(&key) {
-                            this.collapsed_hosts.insert(key.clone());
-                        }
-                    }
-                    "left" => {
-                        this.collapsed_hosts.insert(key.clone());
-                    }
-                    "right" => {
-                        this.collapsed_hosts.remove(&key);
-                    }
+                    "enter" | "space" => this.toggle_sidebar_host(key.clone(), cx),
+                    "left" => this.set_sidebar_host_collapsed(key.clone(), true, cx),
+                    "right" => this.set_sidebar_host_collapsed(key.clone(), false, cx),
                     _ => return,
                 }
                 cx.stop_propagation();
-                cx.notify();
             }));
         if index == 0 {
             return row.into_any_element();

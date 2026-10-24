@@ -911,6 +911,8 @@ fn session_projection_precedes(
 fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSession) {
     if incoming.updated_at >= existing.updated_at {
         existing.title = incoming.title;
+        existing.pinned = incoming.pinned;
+        existing.archived = incoming.archived;
         existing.project_id = incoming.project_id;
         existing.workspace = incoming.workspace;
         existing.provider = incoming.provider;
@@ -2123,6 +2125,8 @@ mod tests {
 
         let mut stale = existing.clone();
         stale.title = "Renamed elsewhere".into();
+        assert!(stale.set_pinned(true));
+        assert!(stale.set_archived(true));
         stale.messages.clear();
         stale.runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
             runtime_id,
@@ -2137,8 +2141,28 @@ mod tests {
         ));
         merge_stale_session_metadata(&mut existing, stale);
         assert_eq!(existing.title, "Renamed elsewhere");
+        assert!(existing.pinned);
+        assert!(existing.archived);
         assert_eq!(existing.messages.len(), 1);
         assert_eq!(existing.runtime_event_cursor.unwrap().sequence, 10);
+    }
+
+    #[test]
+    fn older_projection_cannot_overwrite_newer_organization_flags() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        assert!(existing.set_pinned(true));
+        assert!(existing.set_archived(true));
+        existing.updated_at = 100;
+        let mut older = existing.clone();
+        older.pinned = false;
+        older.archived = false;
+        older.updated_at = 99;
+
+        merge_stale_session_metadata(&mut existing, older);
+
+        assert!(existing.pinned);
+        assert!(existing.archived);
+        assert_eq!(existing.updated_at, 100);
     }
 
     #[test]

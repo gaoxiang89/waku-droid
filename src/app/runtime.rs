@@ -144,6 +144,8 @@ pub(super) fn merge_remote_session_catalog(
         if let Some(local) = local.iter_mut().find(|session| session.id == remote.id) {
             local.title = remote.title;
             local.auto_title = remote.auto_title;
+            local.pinned = remote.pinned;
+            local.archived = remote.archived;
             local.project_id = remote.project_id;
             local.provider = remote.provider;
             local.model = remote.model;
@@ -3876,7 +3878,7 @@ impl Waku {
 mod response_fork_title_tests {
     use super::{
         AgentSession, PersistedState, Project, ProviderKind, RemoteTaskStateSnapshot,
-        merge_host_task_state, next_response_fork_title,
+        merge_host_task_state, merge_remote_session_catalog, next_response_fork_title,
     };
 
     #[test]
@@ -3923,6 +3925,25 @@ mod response_fork_title_tests {
             vec![local_task.id]
         );
         assert_eq!(state.sessions[0].turns.len(), local_task.turns.len());
+    }
+
+    #[test]
+    fn remote_catalog_merges_organization_flags_without_replacing_detail() {
+        let project = Project::from_path("/remote/project".into());
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("Keep this transcript");
+        let local_updated_at = session.updated_at;
+        let mut remote = session.list_projection();
+        assert!(remote.set_pinned(true));
+        assert!(remote.set_archived(true));
+        let mut local = vec![session];
+
+        merge_remote_session_catalog(&mut local, vec![remote], |_| true);
+
+        assert!(local[0].pinned);
+        assert!(local[0].archived);
+        assert_eq!(local[0].turns.len(), 1);
+        assert_eq!(local[0].updated_at, local_updated_at);
     }
 
     #[test]

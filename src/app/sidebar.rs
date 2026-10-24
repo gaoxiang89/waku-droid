@@ -2,19 +2,49 @@ use gpui::{KeyBinding, actions};
 
 use super::*;
 
-actions!(waku_sidebar, [CancelSessionRename]);
+actions!(
+    waku_sidebar,
+    [
+        CancelSessionRename,
+        ConfirmSessionDelete,
+        DismissSessionDelete
+    ]
+);
 
 const SESSION_RENAME_PARENT_CONTEXT: &str = "SessionRename";
 const SESSION_RENAME_FIELD_CONTEXT: &str = "SessionRename > TextInput";
+const SESSION_DELETE_DIALOG_CONTEXT: &str = "SessionDeleteDialog";
 
 /// Keep Escape inside the focused inline editor so it cancels the rename,
 /// rather than falling through to the window-wide Stop action.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "escape",
-        CancelSessionRename,
-        Some(SESSION_RENAME_FIELD_CONTEXT),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new(
+            "escape",
+            CancelSessionRename,
+            Some(SESSION_RENAME_FIELD_CONTEXT),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            ConfirmSessionDelete,
+            Some(SESSION_DELETE_DIALOG_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            DismissSessionDelete,
+            Some(SESSION_DELETE_DIALOG_CONTEXT),
+        ),
+    ]);
+}
+
+/// The task whose destructive removal is awaiting explicit confirmation.
+/// `row_focus` belongs to the menu handle's stable trigger, so cancellation can
+/// return focus to the original virtualized row.
+#[derive(Clone)]
+pub(super) struct SessionDeleteConfirm {
+    session_id: Uuid,
+    title: String,
+    row_focus: FocusHandle,
 }
 
 /// Stable identity for a collapsible sidebar section under a host row.
@@ -34,11 +64,54 @@ impl SidebarGroup {
         }
     }
 
+    fn persistence_key(self) -> String {
+        match self {
+            Self::Project(project_id) => format!("project:{project_id}"),
+            Self::Projectless(workspace_id) => format!("projectless:{workspace_id}"),
+        }
+    }
+
+    fn from_persistence_key(key: &str) -> Option<Self> {
+        let (kind, id) = key.split_once(':')?;
+        let id = Uuid::parse_str(id).ok()?;
+        match kind {
+            "project" => Some(Self::Project(id)),
+            "projectless" => Some(Self::Projectless(id)),
+            _ => None,
+        }
+    }
+
     fn mix_fingerprint(self, fingerprint: u64) -> u64 {
         match self {
             Self::Project(project_id) => mix_uuid(mix(fingerprint, 0x100), project_id),
             Self::Projectless(workspace_id) => mix_uuid(mix(fingerprint, 0x300), workspace_id),
         }
+    }
+}
+
+pub(super) fn restore_collapsed_hosts(keys: &[String]) -> HashSet<waku_client::hosts::HostKey> {
+    keys.iter()
+        .filter_map(|key| {
+            (key == "local")
+                .then_some(waku_client::hosts::HostKey::Local)
+                .or_else(|| {
+                    key.strip_prefix("connection:")
+                        .map(|id| waku_client::hosts::HostKey::Connection(id.to_owned()))
+                })
+        })
+        .collect()
+}
+
+pub(super) fn restore_collapsed_groups(keys: &[String]) -> HashSet<SidebarGroup> {
+    keys.iter()
+        .filter_map(|key| SidebarGroup::from_persistence_key(key))
+        .collect()
+}
+
+fn sidebar_host_persistence_key(host: &waku_client::hosts::HostKey) -> String {
+    match host {
+        waku_client::hosts::HostKey::Local => "local".to_owned(),
+        waku_client::hosts::HostKey::Connection(id) => format!("connection:{id}"),
     }
 }
 
@@ -146,6 +219,36 @@ const SIDEBAR_SESSION_CARD_INSET: f32 = SIDEBAR_GROUP_GUIDE_X + 6.0;
 const SIDEBAR_GROUP_CHILD_PADDING: f32 = SIDEBAR_GROUP_HEADER_INDENT + 14.0 + 5.0;
 const SIDEBAR_PROJECT_RECENT_WINDOW_SECONDS: u64 = 3 * 24 * 60 * 60;
 const SIDEBAR_PROJECT_REVEAL_BATCH: usize = 30;
+const SIDEBAR_COMPACT_BRANCH_WIDTH: f32 = 240.0;
+
+fn sidebar_omits_host_row(host_count: usize, host: &waku_client::hosts::HostKey) -> bool {
+    host_count == 1 && *host == waku_client::hosts::HostKey::Local
+}
+
+fn sidebar_project_branch_visible(width: f32) -> bool {
+    width >= SIDEBAR_COMPACT_BRANCH_WIDTH
+}
+
+/// Attention statuses use a recognizable glyph rather than a color-only dot.
+/// Working and background states keep their existing spinner and hourglass.
+fn sidebar_status_icon(status: SessionStatus) -> Option<&'static str> {
+    match status {
+        SessionStatus::Waiting => Some("icons/alert.svg"),
+        SessionStatus::Failed => Some("icons/x.svg"),
+        SessionStatus::Idle
+        | SessionStatus::Connecting
+        | SessionStatus::Working
+        | SessionStatus::Background => None,
+    }
+}
+
+fn sidebar_status_tooltip(status: SessionStatus) -> Option<String> {
+    match status {
+        SessionStatus::Waiting => Some(tr!("sidebar.status_waiting")),
+        SessionStatus::Failed => Some(tr!("sidebar.status_failed")),
+        _ => None,
+    }
+}
 
 /// The session row's trailing time: how long the live turn has been working,
 /// or how long ago the agent last replied. A session that has never replied
@@ -188,6 +291,26 @@ fn sort_sidebar_sessions(sessions: &mut Vec<&AgentSession>, ordering: SidebarOrd
     }
 }
 
+fn prioritize_pinned_sessions(sessions: &mut [Uuid], pinned_sessions: &HashSet<Uuid>) {
+    // Stable sorting keeps the requested timestamp order inside both partitions
+    // without letting a pin in one project reorder the project groups themselves.
+    sessions.sort_by_key(|session_id| std::cmp::Reverse(pinned_sessions.contains(session_id)));
+}
+
+fn sidebar_session_in_view(session: &AgentSession, show_archived: bool) -> bool {
+    session.has_started() && session.archived == show_archived
+}
+
+fn nearest_active_session_in_project(sessions: &[AgentSession], project_id: Uuid) -> Option<Uuid> {
+    sessions
+        .iter()
+        .filter(|session| {
+            session.project_id == project_id && session.has_started() && !session.archived
+        })
+        .max_by_key(|session| sidebar_session_timestamp(session))
+        .map(|session| session.id)
+}
+
 fn project_sidebar_groups(
     sessions: &[&AgentSession],
     projectless_project_ids: &HashSet<Uuid>,
@@ -223,15 +346,17 @@ fn project_sidebar_groups(
 fn visible_project_sessions(
     sessions: &[Uuid],
     session_timestamps: &HashMap<Uuid, u64>,
+    pinned_sessions: &HashSet<Uuid>,
     recent_cutoff: u64,
     revealed_older_sessions: usize,
 ) -> (Vec<Uuid>, bool) {
     let mut visible = Vec::with_capacity(sessions.len());
     let mut older_seen = 0usize;
     for session_id in sessions {
-        let recent = session_timestamps
-            .get(session_id)
-            .is_some_and(|timestamp| *timestamp >= recent_cutoff);
+        let recent = pinned_sessions.contains(session_id)
+            || session_timestamps
+                .get(session_id)
+                .is_some_and(|timestamp| *timestamp >= recent_cutoff);
         if recent || older_seen < revealed_older_sessions {
             visible.push(*session_id);
         }
@@ -272,8 +397,6 @@ pub(super) fn format_time_ago(seconds: u64) -> String {
 /// One row of the virtualized sidebar session history.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SidebarRow {
-    /// Opens the window-wide command palette and scrolls with history.
-    Search,
     Host(usize),
     /// Workspace group header.
     Header(SidebarGroup),
@@ -296,7 +419,6 @@ fn sidebar_row_height(row: SidebarRow, session_has_detail: impl Fn(Uuid) -> bool
     px(match row {
         SidebarRow::Host(0) => SIDEBAR_HOST_ROW_HEIGHT,
         SidebarRow::Host(_) => SIDEBAR_HOST_DIVIDER_GAP + SIDEBAR_HOST_ROW_HEIGHT,
-        SidebarRow::Search => SIDEBAR_ACTION_ROW_HEIGHT + SIDEBAR_SEARCH_BOTTOM_GAP,
         SidebarRow::Header(_) => SIDEBAR_GROUP_HEADER_HEIGHT + SIDEBAR_GROUP_HEADER_BOTTOM_GAP,
         SidebarRow::Session(session_id) if session_has_detail(session_id) => {
             SIDEBAR_SESSION_DETAIL_ROW_HEIGHT
@@ -575,6 +697,7 @@ impl Waku {
         let menu_open = menu.is_open();
         let weak = cx.entity().downgrade();
         let ordering = self.state.sidebar_ordering;
+        let show_archived = self.state.sidebar_show_archived;
         let options = dropdown_menu(
             div()
                 .id("sidebar-options")
@@ -596,28 +719,46 @@ impl Waku {
             MenuAlign::BelowLeft,
             move |_| {
                 let ordering_weak = weak.clone();
-                vec![MenuItem::submenu_with_value(
-                    tr!("sidebar.ordering"),
-                    sidebar_ordering_label(ordering),
-                    move |_| {
-                        let newest_weak = ordering_weak.clone();
-                        let oldest_weak = ordering_weak.clone();
-                        vec![
-                            MenuItem::new(tr!("sidebar.ordering_newest"), move |_, cx| {
-                                let _ = newest_weak.update(cx, |this, cx| {
-                                    this.set_sidebar_ordering(SidebarOrdering::Newest, cx);
-                                });
-                            })
-                            .selected(ordering == SidebarOrdering::Newest),
-                            MenuItem::new(tr!("sidebar.ordering_oldest"), move |_, cx| {
-                                let _ = oldest_weak.update(cx, |this, cx| {
-                                    this.set_sidebar_ordering(SidebarOrdering::Oldest, cx);
-                                });
-                            })
-                            .selected(ordering == SidebarOrdering::Oldest),
-                        ]
-                    },
-                )]
+                let archive_view_weak = weak.clone();
+                vec![
+                    MenuItem::submenu_with_value(
+                        tr!("sidebar.ordering"),
+                        sidebar_ordering_label(ordering),
+                        move |_| {
+                            let newest_weak = ordering_weak.clone();
+                            let oldest_weak = ordering_weak.clone();
+                            vec![
+                                MenuItem::new(tr!("sidebar.ordering_newest"), move |_, cx| {
+                                    let _ = newest_weak.update(cx, |this, cx| {
+                                        this.set_sidebar_ordering(SidebarOrdering::Newest, cx);
+                                    });
+                                })
+                                .selected(ordering == SidebarOrdering::Newest),
+                                MenuItem::new(tr!("sidebar.ordering_oldest"), move |_, cx| {
+                                    let _ = oldest_weak.update(cx, |this, cx| {
+                                        this.set_sidebar_ordering(SidebarOrdering::Oldest, cx);
+                                    });
+                                })
+                                .selected(ordering == SidebarOrdering::Oldest),
+                            ]
+                        },
+                    ),
+                    MenuItem::Separator,
+                    MenuItem::new(
+                        tr!(if show_archived {
+                            "sidebar.show_active_tasks"
+                        } else {
+                            "sidebar.show_archived"
+                        }),
+                        move |_, cx| {
+                            let _ = archive_view_weak.update(cx, |this, cx| {
+                                this.set_sidebar_show_archived(!show_archived, cx);
+                            });
+                        },
+                    )
+                    .icon("icons/archive.svg")
+                    .selected(show_archived),
+                ]
             },
         );
         let add_project = div()
@@ -890,6 +1031,12 @@ impl Waku {
                     .child(icon("icons/settings.svg", 14.0, theme.text_tertiary))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_settings_action(&OpenSettings, window, cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.open_settings_action(&OpenSettings, window, cx);
+                            cx.stop_propagation();
+                        }
                     })),
             )
             .when_some(self.render_remote_connection_chip(cx), |footer, chip| {
@@ -1133,6 +1280,12 @@ impl Waku {
             )
             .child(
                 div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .child(self.render_sidebar_search(cx)),
+            )
+            .child(
+                div()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
@@ -1146,7 +1299,7 @@ impl Waku {
                                         .upgrade()
                                         .map(|entity| {
                                             entity.update(cx, |this, cx| {
-                                                this.sidebar_row(index, &rows, cx)
+                                                this.sidebar_row(index, &rows, width, cx)
                                             })
                                         })
                                         .unwrap_or_else(|| div().into_any_element())
@@ -1208,7 +1361,51 @@ impl Waku {
         changed |= self.sidebar_collapsed_groups.remove(&group);
         if changed {
             self.sidebar_rows_fingerprint.set(None);
+            self.save_sidebar_collapsed_state();
         }
+    }
+
+    pub(super) fn save_sidebar_collapsed_state(&mut self) {
+        self.state.sidebar_collapsed_hosts = self
+            .collapsed_hosts
+            .iter()
+            .map(sidebar_host_persistence_key)
+            .collect();
+        self.state.sidebar_collapsed_hosts.sort();
+        self.state.sidebar_collapsed_groups = self
+            .sidebar_collapsed_groups
+            .iter()
+            .map(|group| group.persistence_key())
+            .collect();
+        self.state.sidebar_collapsed_groups.sort();
+        self.save();
+    }
+
+    pub(super) fn set_sidebar_host_collapsed(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if collapsed {
+            self.collapsed_hosts.insert(host)
+        } else {
+            self.collapsed_hosts.remove(&host)
+        };
+        if changed {
+            self.sidebar_rows_fingerprint.set(None);
+            self.save_sidebar_collapsed_state();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_sidebar_host(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        let collapsed = !self.collapsed_hosts.contains(&host);
+        self.set_sidebar_host_collapsed(host, collapsed, cx);
     }
 
     /// Keep a newly selected task visible without disturbing the sidebar when
@@ -1250,6 +1447,8 @@ impl Waku {
                 SidebarOrdering::Oldest => 2,
             },
         );
+        fingerprint = mix(fingerprint, u64::from(self.state.sidebar_show_archived));
+        fingerprint = mix(fingerprint, self.hosts.hosts.len() as u64);
         for (index, host) in self.hosts.hosts.iter().enumerate() {
             fingerprint = mix(fingerprint, host.generation);
             fingerprint = mix(fingerprint, index as u64);
@@ -1264,6 +1463,8 @@ impl Waku {
             }
             fingerprint = mix_uuid(fingerprint, session.id);
             fingerprint = mix_uuid(fingerprint, session.project_id);
+            fingerprint = mix(fingerprint, u64::from(session.pinned));
+            fingerprint = mix(fingerprint, u64::from(session.archived));
             fingerprint = mix(fingerprint, sidebar_session_timestamp(session));
             fingerprint = mix(
                 fingerprint,
@@ -1306,15 +1507,15 @@ impl Waku {
     }
 
     /// Snapshot the session history as a flat list of lightweight rows in the
-    /// fixed host → workspace → session hierarchy. Every connected host —
-    /// including a lone local one — contributes a host row, then its workspace
-    /// groups in first-seen order with that host's projectless sessions last.
+    /// fixed host → workspace → session hierarchy. Remote and multi-host
+    /// windows keep their host rows; a lone local host goes straight to its
+    /// workspace groups in first-seen order with projectless sessions last.
     fn sidebar_rows(&self, now: u64) -> Vec<SidebarRow> {
         let mut sorted_sessions = self
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| sidebar_session_in_view(session, self.state.sidebar_show_archived))
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
@@ -1323,6 +1524,11 @@ impl Waku {
             .iter()
             .map(|session| (session.id, sidebar_session_timestamp(session)))
             .collect::<HashMap<_, _>>();
+        let pinned_sessions = sorted_sessions
+            .iter()
+            .filter(|session| session.pinned && !session.archived)
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
         let projectless_roots = crate::projectless::workspace_roots();
         let projectless_project_ids = self
             .state
@@ -1332,11 +1538,18 @@ impl Waku {
             .map(|project| project.id)
             .collect::<HashSet<_>>();
 
-        let mut rows = vec![SidebarRow::Search];
+        let mut rows = Vec::new();
+        let omit_host_row = self
+            .hosts
+            .hosts
+            .first()
+            .is_some_and(|host| sidebar_omits_host_row(self.hosts.hosts.len(), &host.key));
         for (index, host) in self.hosts.hosts.iter().enumerate() {
-            rows.push(SidebarRow::Host(index));
-            if self.collapsed_hosts.contains(&host.key) {
-                continue;
+            if !omit_host_row {
+                rows.push(SidebarRow::Host(index));
+                if self.collapsed_hosts.contains(&host.key) {
+                    continue;
+                }
             }
             let sessions = sorted_sessions
                 .iter()
@@ -1345,7 +1558,8 @@ impl Waku {
                 .collect::<Vec<_>>();
             let mut groups = project_sidebar_groups(&sessions, &projectless_project_ids);
             for project in &self.state.projects {
-                if self.hosts.ownership.project(project.id) == host.key
+                if !self.state.sidebar_show_archived
+                    && self.hosts.ownership.project(project.id) == host.key
                     && !projectless_project_ids.contains(&project.id)
                     && !groups
                         .iter()
@@ -1353,6 +1567,9 @@ impl Waku {
                 {
                     groups.push((SidebarGroup::Project(project.id), Vec::new()));
                 }
+            }
+            for (_, sessions) in &mut groups {
+                prioritize_pinned_sessions(sessions, &pinned_sessions);
             }
             for (group, sessions) in groups {
                 let revealed = self
@@ -1363,10 +1580,11 @@ impl Waku {
                 let (visible, show_more) = visible_project_sessions(
                     &sessions,
                     &session_timestamps,
+                    &pinned_sessions,
                     recent_cutoff,
                     revealed,
                 );
-                if visible.is_empty() {
+                if visible.is_empty() && !show_more {
                     // A workspace with no visible sessions still shows its
                     // header so the hierarchy and its actions stay reachable.
                     rows.push(SidebarRow::Header(group));
@@ -1414,19 +1632,29 @@ impl Waku {
         }
     }
 
-    fn sidebar_row(&self, index: usize, rows: &[SidebarRow], cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_row(
+        &self,
+        index: usize,
+        rows: &[SidebarRow],
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = rows.get(index) else {
             return div().into_any_element();
         };
         match *row {
-            SidebarRow::Search => self.render_sidebar_search(cx).into_any_element(),
             SidebarRow::Host(index) => self.render_sidebar_host(index, cx),
             SidebarRow::Header(group) => {
                 let has_expanded_children = rows.get(index + 1).is_some_and(|row| {
                     matches!(row, SidebarRow::Session(_) | SidebarRow::ShowMore(_))
                 });
-                self.render_sidebar_group_header(group, has_expanded_children, cx)
-                    .into_any_element()
+                self.render_sidebar_group_header(
+                    group,
+                    has_expanded_children,
+                    sidebar_project_branch_visible(width),
+                    cx,
+                )
+                .into_any_element()
             }
             SidebarRow::Session(session_id) => self
                 .render_sidebar_session_item(session_id, cx)
@@ -1445,6 +1673,7 @@ impl Waku {
         &self,
         group: SidebarGroup,
         has_expanded_children: bool,
+        show_branch: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
@@ -1482,12 +1711,15 @@ impl Waku {
                 .cloned(),
             SidebarGroup::Projectless(_) => None,
         };
+        let tooltip = branch.as_ref().map_or_else(
+            || label.clone(),
+            |branch| format!("{label} · #{}", branch.as_ref()),
+        );
         let empty = match group {
-            SidebarGroup::Project(project_id) => !self
-                .state
-                .sessions
-                .iter()
-                .any(|session| session.project_id == project_id && session.has_started()),
+            SidebarGroup::Project(project_id) => !self.state.sessions.iter().any(|session| {
+                session.project_id == project_id
+                    && sidebar_session_in_view(session, self.state.sidebar_show_archived)
+            }),
             SidebarGroup::Projectless(_) => false,
         };
         let label_color = if empty {
@@ -1568,6 +1800,7 @@ impl Waku {
             .focus_visible(|style| style.border_1().border_color(theme.accent))
             .hover(|style| style.bg(theme.sidebar_item_background))
             .active(|style| style.bg(theme.overlay_strong))
+            .tooltip(Tooltip::text(tooltip))
             .child(
                 div()
                     .flex_1()
@@ -1587,7 +1820,7 @@ impl Waku {
                             .child(div().min_w_0().truncate().child(label)),
                     )
                     .child(div().flex_1())
-                    .when_some(branch, |element, branch| {
+                    .when_some(branch.filter(|_| show_branch), |element, branch| {
                         element.child(
                             div()
                                 .flex_none()
@@ -1735,13 +1968,17 @@ impl Waku {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut changed = false;
+        let mut collapse_changed = false;
+        let mut reveal_changed = false;
         for group in groups {
-            changed |= self.sidebar_collapsed_groups.insert(group);
-            changed |= self.sidebar_project_reveal_counts.remove(&group).is_some();
+            collapse_changed |= self.sidebar_collapsed_groups.insert(group);
+            reveal_changed |= self.sidebar_project_reveal_counts.remove(&group).is_some();
         }
-        if changed {
+        if collapse_changed || reveal_changed {
             self.sidebar_rows_fingerprint.set(None);
+            if collapse_changed {
+                self.save_sidebar_collapsed_state();
+            }
             cx.notify();
         }
     }
@@ -1760,6 +1997,74 @@ impl Waku {
         let reveal_reset = collapsed && self.sidebar_project_reveal_counts.remove(&group).is_some();
         if collapse_changed || reveal_reset {
             self.sidebar_rows_fingerprint.set(None);
+            if collapse_changed {
+                self.save_sidebar_collapsed_state();
+            }
+            cx.notify();
+        }
+    }
+
+    fn set_sidebar_show_archived(&mut self, show_archived: bool, cx: &mut Context<Self>) {
+        if self.state.sidebar_show_archived == show_archived {
+            return;
+        }
+        self.state.sidebar_show_archived = show_archived;
+        self.sidebar_rows_fingerprint.set(None);
+        self.sidebar_list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: Pixels::ZERO,
+        });
+        self.save();
+        cx.notify();
+    }
+
+    fn set_session_pinned(&mut self, session_id: Uuid, pinned: bool, cx: &mut Context<Self>) {
+        if !self
+            .state
+            .session_mut(session_id)
+            .is_some_and(|session| session.set_pinned(pinned))
+        {
+            return;
+        }
+        self.sidebar_rows_fingerprint.set(None);
+        self.save();
+        cx.notify();
+    }
+
+    fn set_session_archived(&mut self, session_id: Uuid, archived: bool, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let project_id = session.project_id;
+        let was_selected = self.state.selected_session == Some(session_id);
+        if !self
+            .state
+            .session_mut(session_id)
+            .is_some_and(|session| session.set_archived(archived))
+        {
+            return;
+        }
+        self.sidebar_rows_fingerprint.set(None);
+        self.save();
+        self.show_success_toast(tr!(if archived {
+            "sidebar.archived_toast"
+        } else {
+            "sidebar.restored_toast"
+        }));
+
+        if was_selected && archived && !self.state.sidebar_show_archived {
+            if let Some(next) = nearest_active_session_in_project(&self.state.sessions, project_id)
+            {
+                self.select_session(next, cx);
+            } else {
+                self.create_session_for(project_id, self.state.last_provider, cx);
+            }
+        } else {
             cx.notify();
         }
     }
@@ -1841,6 +2146,187 @@ impl Waku {
         cx.notify();
     }
 
+    fn request_session_delete(
+        &mut self,
+        session_id: Uuid,
+        row_focus: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        self.session_delete_confirm = Some(SessionDeleteConfirm {
+            session_id,
+            title: localized_session_title(session),
+            row_focus,
+        });
+        let focus = self.session_delete_cancel_focus.clone();
+        // The context menu must leave the dispatch tree before the safe dialog
+        // action takes focus, just like the Git confirmation dialogs.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        });
+        cx.notify();
+    }
+
+    fn dismiss_session_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.session_delete_confirm.take() else {
+            return;
+        };
+        window.focus(&dialog.row_focus, cx);
+        cx.notify();
+    }
+
+    fn confirm_session_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.session_delete_confirm.take() else {
+            return;
+        };
+        self.remove_session(dialog.session_id, cx);
+    }
+
+    pub(super) fn render_session_delete_dialog(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let dialog = self.session_delete_confirm.clone()?;
+        let theme = Theme::current(cx);
+        let cancel = div()
+            .id("session-delete-cancel")
+            .track_focus(&self.session_delete_cancel_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_secondary)
+            .bg(theme.overlay)
+            .hover(|element| element.bg(theme.overlay_strong))
+            .child(tr_cow!("common.cancel"))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.dismiss_session_delete(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.dismiss_session_delete(window, cx);
+            }));
+        let confirm = div()
+            .id("session-delete-confirm")
+            .track_focus(&self.session_delete_confirm_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.danger))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.danger)
+            .bg(theme.danger_soft)
+            .hover(|element| element.bg(theme.danger.opacity(0.16)))
+            .child(icon("icons/trash.svg", 13.0, theme.danger))
+            .child(tr_cow!("sidebar.delete_task"))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.confirm_session_delete(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.confirm_session_delete(cx);
+            }));
+        let card = div()
+            .id("session-delete-dialog-card")
+            .key_context(SESSION_DELETE_DIALOG_CONTEXT)
+            .on_action(cx.listener(|this, _: &ConfirmSessionDelete, _, cx| {
+                this.confirm_session_delete(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DismissSessionDelete, window, cx| {
+                this.dismiss_session_delete(window, cx);
+            }))
+            .tab_group()
+            .tab_stop(false)
+            .w_full()
+            .max_w(px(420.0))
+            .overflow_hidden()
+            .rounded(px(18.0))
+            .bg(theme.composer)
+            .shadow_xl()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(48.0))
+                    .px(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .text_size(sp(14.0))
+                    .text_color(theme.text)
+                    .child(icon("icons/alert.svg", 15.0, theme.danger))
+                    .child(tr_cow!("sidebar.delete_confirm_title")),
+            )
+            .child(
+                div()
+                    .px(px(16.0))
+                    .pb(px(14.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(17.0))
+                    .text_color(theme.text_secondary)
+                    .whitespace_normal()
+                    .child(tr!("sidebar.delete_confirm_message", title = dialog.title)),
+            )
+            .child(div().mx(px(16.0)).h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(cancel)
+                    .child(confirm),
+            );
+        let scrim = if theme.is_dark {
+            gpui::hsla(0.0, 0.0, 0.0, 0.34)
+        } else {
+            gpui::hsla(0.0, 0.0, 0.0, 0.16)
+        };
+        let layer = div()
+            .id("session-delete-dialog-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(scrim)
+            .p(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.dismiss_session_delete(window, cx)),
+            )
+            .child(card);
+        Some(gpui::deferred(layer).with_priority(4).into_any_element())
+    }
+
     fn render_sidebar_session_item(&self, session_id: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let Some(session) = self
@@ -1867,17 +2353,19 @@ impl Waku {
         let detail_label = persisted_sidebar_branch_label(&session.workspace)
             .map(|branch| SharedString::from(branch.to_owned()));
         let detail_icon = "icons/git-branch.svg";
-        let status_dot = matches!(
-            session.status,
-            SessionStatus::Waiting | SessionStatus::Failed
-        )
-        .then(|| {
-            div()
-                .flex_none()
-                .size(px(6.0))
-                .rounded_full()
-                .bg(status_color(&theme, session.status))
-        });
+        let status_indicator = sidebar_status_icon(session.status)
+            .zip(sidebar_status_tooltip(session.status))
+            .map(|(path, tooltip)| {
+                div()
+                    .id(SharedString::from(format!("session-status-{session_id}")))
+                    .flex_none()
+                    .size(px(14.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(Tooltip::text(tooltip))
+                    .child(icon(path, 12.0, status_color(&theme, session.status)))
+            });
         let rename_input =
             (self.session_rename == Some(session_id)).then(|| self.session_rename_input.clone());
         let renaming = rename_input.is_some();
@@ -1916,6 +2404,8 @@ impl Waku {
                 .child(SharedString::from(localized_session_title(session)))
                 .into_any_element()
         };
+        let session_pinned = session.pinned;
+        let session_archived = session.archived;
         let waku = cx.entity().downgrade();
         let menu = self.menu_handle(format!("session-{session_id}"), cx);
         let row_focus = menu.trigger_focus_handle().clone();
@@ -1945,6 +2435,15 @@ impl Waku {
                     .overflow_hidden()
                     .line_height(sp(18.0))
                     .child(title)
+                    .when(session.pinned, |element| {
+                        element.child(
+                            div()
+                                .id(SharedString::from(format!("session-pinned-{session_id}")))
+                                .flex_none()
+                                .tooltip(Tooltip::text(tr!("sidebar.pinned")))
+                                .child(icon("icons/pin.svg", 11.0, theme.text_tertiary)),
+                        )
+                    })
                     .when(working, |element| {
                         element.child(motion::spin_slow(icon(
                             "icons/loader-circle.svg",
@@ -1959,7 +2458,9 @@ impl Waku {
                             status_color(&theme, session.status),
                         ))
                     })
-                    .when_some(status_dot, |element, dot| element.child(dot))
+                    .when_some(status_indicator, |element, indicator| {
+                        element.child(indicator)
+                    })
                     .when_some(
                         session_time_label(session, unix_time()),
                         |element, label| {
@@ -2032,19 +2533,71 @@ impl Waku {
                 &menu,
                 move |_| {
                     let rename_waku = waku.clone();
-                    let remove_waku = waku.clone();
-                    vec![
+                    let delete_waku = waku.clone();
+                    let pin_waku = waku.clone();
+                    let archive_waku = waku.clone();
+                    let delete_row_focus = row_focus.clone();
+                    let mut items = Vec::new();
+                    if session_archived {
+                        items.push(
+                            MenuItem::new(tr!("sidebar.unarchive"), move |_, cx| {
+                                let _ = archive_waku.update(cx, |waku, cx| {
+                                    waku.set_session_archived(session_id, false, cx);
+                                });
+                            })
+                            .icon("icons/rotate-cw.svg"),
+                        );
+                    } else {
+                        items.push(
+                            MenuItem::new(
+                                tr!(if session_pinned {
+                                    "sidebar.unpin"
+                                } else {
+                                    "sidebar.pin"
+                                }),
+                                move |_, cx| {
+                                    let _ = pin_waku.update(cx, |waku, cx| {
+                                        let pinned = waku
+                                            .state
+                                            .sessions
+                                            .iter()
+                                            .find(|session| session.id == session_id)
+                                            .is_some_and(|session| session.pinned);
+                                        waku.set_session_pinned(session_id, !pinned, cx);
+                                    });
+                                },
+                            )
+                            .icon("icons/pin.svg"),
+                        );
+                        items.push(
+                            MenuItem::new(tr!("sidebar.archive"), move |_, cx| {
+                                let _ = archive_waku.update(cx, |waku, cx| {
+                                    waku.set_session_archived(session_id, true, cx);
+                                });
+                            })
+                            .icon("icons/archive.svg"),
+                        );
+                    }
+                    items.extend([
+                        MenuItem::Separator,
                         MenuItem::new(tr!("common.rename"), move |window, cx| {
                             let _ = rename_waku.update(cx, |waku, cx| {
                                 waku.begin_session_rename(session_id, window, cx);
                             });
                         }),
-                        MenuItem::Separator,
-                        MenuItem::new(tr!("common.remove"), move |_, cx| {
-                            let _ = remove_waku
-                                .update(cx, |waku, cx| waku.remove_session(session_id, cx));
-                        }),
-                    ]
+                        MenuItem::new(tr!("sidebar.delete_task"), move |window, cx| {
+                            let _ = delete_waku.update(cx, |waku, cx| {
+                                waku.request_session_delete(
+                                    session_id,
+                                    delete_row_focus.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        })
+                        .icon("icons/trash.svg"),
+                    ]);
+                    items
                 },
             )
         };
@@ -2474,13 +3027,14 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let (initial, show_more) =
-            visible_project_sessions(&sessions, &timestamps, recent_cutoff, 0);
+            visible_project_sessions(&sessions, &timestamps, &HashSet::new(), recent_cutoff, 0);
         assert_eq!(initial, vec![sessions[0]]);
         assert!(show_more);
 
         let (first_batch, show_more) = visible_project_sessions(
             &sessions,
             &timestamps,
+            &HashSet::new(),
             recent_cutoff,
             SIDEBAR_PROJECT_REVEAL_BATCH,
         );
@@ -2490,6 +3044,7 @@ mod tests {
         let (all_sessions, show_more) = visible_project_sessions(
             &sessions,
             &timestamps,
+            &HashSet::new(),
             recent_cutoff,
             SIDEBAR_PROJECT_REVEAL_BATCH * 2,
         );
@@ -2629,18 +3184,172 @@ mod tests {
     }
 
     #[test]
-    fn selected_session_uses_nearest_bottom_edge_for_an_unmeasured_lower_row() {
+    fn pinned_sessions_lead_each_ordering_and_survive_the_recent_window() {
+        let project_id = Uuid::from_u128(1);
+        let mut pinned_old = AgentSession::new(project_id, ProviderKind::Codex);
+        pinned_old.created_at = 10;
+        pinned_old.pinned = true;
+        let mut newest = AgentSession::new(project_id, ProviderKind::Codex);
+        newest.created_at = 30;
+        let mut oldest = AgentSession::new(project_id, ProviderKind::Codex);
+        oldest.created_at = 5;
+        let mut archived_pinned = AgentSession::new(project_id, ProviderKind::Codex);
+        archived_pinned.created_at = 40;
+        archived_pinned.pinned = true;
+        archived_pinned.archived = true;
+
+        let mut newest_first = vec![&oldest, &archived_pinned, &newest, &pinned_old];
+        sort_sidebar_sessions(&mut newest_first, SidebarOrdering::Newest);
+        let mut newest_ids = newest_first
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        prioritize_pinned_sessions(&mut newest_ids, &HashSet::from([pinned_old.id]));
+        assert_eq!(
+            newest_ids,
+            vec![pinned_old.id, archived_pinned.id, newest.id, oldest.id]
+        );
+        let mut oldest_first = vec![&newest, &pinned_old, &oldest];
+        sort_sidebar_sessions(&mut oldest_first, SidebarOrdering::Oldest);
+        let mut oldest_ids = oldest_first
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        prioritize_pinned_sessions(&mut oldest_ids, &HashSet::from([pinned_old.id]));
+        assert_eq!(oldest_ids[0], pinned_old.id);
+        assert_eq!(oldest_ids[1], oldest.id);
+
+        let ids = vec![pinned_old.id, newest.id, oldest.id];
+        let timestamps = HashMap::from([(pinned_old.id, 10), (newest.id, 100), (oldest.id, 5)]);
+        let (visible, show_more) =
+            visible_project_sessions(&ids, &timestamps, &HashSet::from([pinned_old.id]), 50, 0);
+        assert_eq!(visible, vec![pinned_old.id, newest.id]);
+        assert!(show_more);
+    }
+
+    #[test]
+    fn archiving_keeps_history_and_falls_back_to_nearest_active_project_task() {
+        let project_id = Uuid::from_u128(1);
+        let other_project = Uuid::from_u128(2);
+        let mut older = AgentSession::new(project_id, ProviderKind::Codex);
+        older.last_reply_at = Some(10);
+        let mut nearest = AgentSession::new(project_id, ProviderKind::Codex);
+        nearest.last_reply_at = Some(20);
+        let mut archived = AgentSession::new(project_id, ProviderKind::Codex);
+        archived.last_reply_at = Some(30);
+        archived.archived = true;
+        let mut elsewhere = AgentSession::new(other_project, ProviderKind::Codex);
+        elsewhere.last_reply_at = Some(40);
+        let mut sessions = vec![older, nearest, archived, elsewhere];
+        for session in &mut sessions {
+            session.detail_loaded = false;
+        }
+        let original_len = sessions.len();
+        let archived_id = sessions[2].id;
+
+        assert_eq!(
+            nearest_active_session_in_project(&sessions, project_id),
+            Some(sessions[1].id)
+        );
+        sessions[1].archived = true;
+        assert_eq!(
+            nearest_active_session_in_project(&sessions, project_id),
+            Some(sessions[0].id)
+        );
+        sessions[0].archived = true;
+        assert_eq!(
+            nearest_active_session_in_project(&sessions, project_id),
+            None
+        );
+        assert_eq!(sessions.len(), original_len);
+        assert!(sessions.iter().any(|session| session.id == archived_id));
+        assert!(!sidebar_session_in_view(&sessions[2], false));
+        assert!(sidebar_session_in_view(&sessions[2], true));
+        sessions[2].archived = false;
+        assert!(sidebar_session_in_view(&sessions[2], false));
+        assert!(!sidebar_session_in_view(&sessions[2], true));
+    }
+
+    #[test]
+    fn collapsed_state_keys_are_stable_and_ignore_malformed_entries() {
+        let project = SidebarGroup::Project(Uuid::from_u128(1));
+        let projectless = SidebarGroup::Projectless(Uuid::from_u128(2));
+        let keys = vec![project.persistence_key(), projectless.persistence_key()];
+        assert_eq!(
+            restore_collapsed_groups(&keys),
+            HashSet::from([project, projectless])
+        );
+        assert!(restore_collapsed_groups(&["project:not-a-uuid".to_owned()]).is_empty());
+
+        let hosts = restore_collapsed_hosts(&[
+            "local".to_owned(),
+            "connection:ssh-1".to_owned(),
+            "unknown".to_owned(),
+        ]);
+        assert_eq!(
+            hosts,
+            HashSet::from([
+                waku_client::hosts::HostKey::Local,
+                waku_client::hosts::HostKey::Connection("ssh-1".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn only_a_lone_local_host_omits_its_host_row() {
+        assert!(sidebar_omits_host_row(
+            1,
+            &waku_client::hosts::HostKey::Local
+        ));
+        assert!(!sidebar_omits_host_row(
+            2,
+            &waku_client::hosts::HostKey::Local
+        ));
+        assert!(!sidebar_omits_host_row(
+            1,
+            &waku_client::hosts::HostKey::Connection("ssh".to_owned())
+        ));
+    }
+
+    #[test]
+    fn narrow_sidebars_hide_only_the_project_header_branch() {
+        assert!(!sidebar_project_branch_visible(239.0));
+        assert!(sidebar_project_branch_visible(240.0));
+    }
+
+    #[test]
+    fn attention_status_icons_are_mapped_without_changing_other_statuses() {
+        assert_eq!(
+            sidebar_status_icon(SessionStatus::Waiting),
+            Some("icons/alert.svg")
+        );
+        assert_eq!(
+            sidebar_status_icon(SessionStatus::Failed),
+            Some("icons/x.svg")
+        );
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Connecting,
+            SessionStatus::Working,
+            SessionStatus::Background,
+        ] {
+            assert_eq!(sidebar_status_icon(status), None);
+        }
+    }
+
+    #[test]
+    fn pinned_search_does_not_offset_session_rows_or_reveal_geometry() {
         let target = Uuid::from_u128(31);
         let group = SidebarGroup::Project(Uuid::from_u128(42));
-        let mut rows = vec![SidebarRow::Search, SidebarRow::Header(group)];
+        let mut rows = vec![SidebarRow::Header(group)];
         rows.extend((1..=40).map(|id| SidebarRow::Session(Uuid::from_u128(id))));
         rows.push(SidebarRow::GroupSpacer);
 
         let index = sidebar_session_row_index(&rows, target).unwrap();
         let offset = sidebar_bottom_aligned_offset(&rows, index, px(400.0), |_| true);
 
-        assert_eq!(index, 32);
-        assert_eq!(offset.item_ix, 25);
+        assert_eq!(index, 31);
+        assert_eq!(offset.item_ix, 24);
         assert_eq!(offset.offset_in_item, px(16.0));
         let visible_height = rows[offset.item_ix..=index]
             .iter()

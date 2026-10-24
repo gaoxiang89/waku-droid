@@ -259,6 +259,19 @@ common.rename: 名前を変更
 session.new_task: 新規タスク
 
 sidebar.search: 検索
+sidebar.pin: タスクをピン留め
+sidebar.unpin: ピン留めを解除
+sidebar.pinned: ピン留め済み
+sidebar.archive: タスクをアーカイブ
+sidebar.unarchive: タスクを復元
+sidebar.archived: アーカイブ済み
+sidebar.archived_toast: タスクをアーカイブしました
+sidebar.restored_toast: タスクを復元しました
+sidebar.show_archived: アーカイブ済みタスクを表示
+sidebar.show_active_tasks: アクティブなタスクに戻る
+sidebar.delete_task: タスクを削除
+sidebar.delete_confirm_title: タスクを削除しますか？
+sidebar.delete_confirm_message: 「%{title}」を削除しますか？セッション履歴と下書きは完全に削除されます。ワークスペース内のファイルは削除されません。
 sidebar.options: サイドバーオプション
 sidebar.ordering: 並び順
 sidebar.ordering_newest: 新しい順

@@ -416,6 +416,11 @@ impl CommandPaletteUi {
     }
 }
 
+fn command_palette_task_searchable(session: &AgentSession) -> bool {
+    // Archived tasks stay searchable and open without changing their flag.
+    session.has_started()
+}
+
 impl Waku {
     pub(super) fn open_resume_picker_action(
         &mut self,
@@ -1012,7 +1017,7 @@ impl Waku {
         self.state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| command_palette_task_searchable(session))
             .enumerate()
             .map(|(order, session)| {
                 let (project, project_path) = projects
@@ -1031,6 +1036,9 @@ impl Waku {
                 let mut details = vec![project.clone()];
                 if let Some(branch) = branch {
                     details.push(format!("#{branch}"));
+                }
+                if session.archived {
+                    details.push(tr!("sidebar.archived"));
                 }
                 if Some(session.id) == self.state.selected_session {
                     details.push(tr!("command_palette.current"));
@@ -2283,6 +2291,17 @@ mod tests {
                 .as_deref(),
             Some("019cfd7a-6942-78b1-9d47-30576c562321")
         );
+    }
+
+    #[test]
+    fn archived_tasks_remain_palette_and_message_search_candidates() {
+        let mut archived = AgentSession::new(Uuid::nil(), ProviderKind::Codex);
+        archived.detail_loaded = false;
+        archived.archived = true;
+        let draft = AgentSession::new(Uuid::nil(), ProviderKind::Codex);
+
+        assert!(command_palette_task_searchable(&archived));
+        assert!(!command_palette_task_searchable(&draft));
     }
 
     #[test]

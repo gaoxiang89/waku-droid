@@ -88,6 +88,8 @@ export function createSession(
     id: clock.randomUUID(),
     title: 'New task',
     auto_title: null,
+    pinned: false,
+    archived: false,
     project_id: projectId,
     workspace: isolated
       ? { kind: 'newWorktree', baseBranch: options.baseBranch ?? null }

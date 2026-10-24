@@ -370,6 +370,8 @@ function runningSession(): AgentSession {
   return {
     id: 'session',
     title: 'New task',
+    pinned: false,
+    archived: false,
     project_id: 'project',
     workspace: { kind: 'local' },
     provider: 'codex',

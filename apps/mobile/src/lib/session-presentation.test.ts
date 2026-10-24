@@ -40,6 +40,17 @@ describe('mobile session presentation', () => {
     ]);
   });
 
+  test('filters archived tasks and puts pinned tasks first within date groups', () => {
+    const now = new Date(2026, 7, 31, 12);
+    const projects: Project[] = [{ id: 'project', name: 'Waku', path: '/waku', created_at: 1 }];
+    const pinned = session({ id: 'pinned', pinned: true, last_reply_at: epoch(2026, 7, 31, 10) });
+    const newest = session({ id: 'newest', last_reply_at: epoch(2026, 7, 31, 11) });
+    const archived = session({ id: 'archived', archived: true, last_reply_at: epoch(2026, 7, 31, 12) });
+
+    const groups = groupSessions(projects, [newest, archived, pinned], now);
+    expect(groups[0]?.data.map((item) => item.session.id)).toEqual(['pinned', 'newest']);
+  });
+
   test('formats compact recency labels', () => {
     expect(relativeSessionTime(1_000, 1_030_000)).toBe('just now');
     expect(relativeSessionTime(1_000, 1_300_000)).toBe('5m');
@@ -336,6 +347,8 @@ function session(overrides: Partial<AgentSession>): AgentSession {
   return {
     id: 'session',
     title: 'Task',
+    pinned: false,
+    archived: false,
     project_id: 'project',
     provider: 'codex',
     runtime_mode: 'autoAcceptEdits',

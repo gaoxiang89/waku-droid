@@ -277,6 +277,8 @@ function transcriptSession(): AgentSession {
   return {
     id: 'session',
     title: 'New Task',
+    pinned: false,
+    archived: false,
     project_id: 'project',
     provider: 'codex',
     runtime_mode: 'fullAccess',

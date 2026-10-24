@@ -276,6 +276,7 @@ impl Render for Waku {
             let commit_dialog = self.render_commit_dialog(cx);
             let goal_dialog = self.render_goal_dialog(window, cx);
             let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
+            let session_delete_dialog = self.render_session_delete_dialog(cx);
             let git_graph_dialog = self.render_git_graph_dialog(cx);
             let remote_folder_picker = self.render_remote_folder_picker(window, cx);
             let toast = self.render_notifications(cx);
@@ -297,6 +298,7 @@ impl Render for Waku {
                 .children(commit_dialog)
                 .children(goal_dialog)
                 .children(right_panel_delete_confirm)
+                .children(session_delete_dialog)
                 .children(git_graph_dialog)
                 .children(remote_folder_picker)
                 .children(image_preview)
@@ -316,6 +318,7 @@ impl Render for Waku {
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
         let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
+        let session_delete_dialog = self.render_session_delete_dialog(cx);
         let git_graph_dialog = self.render_git_graph_dialog(cx);
         let remote_folder_picker = self.render_remote_folder_picker(window, cx);
         let toast = self.render_notifications(cx);
@@ -497,6 +500,7 @@ impl Render for Waku {
             .children(commit_dialog)
             .children(goal_dialog)
             .children(right_panel_delete_confirm)
+            .children(session_delete_dialog)
             .children(git_graph_dialog)
             .children(remote_folder_picker)
             .children(image_preview)

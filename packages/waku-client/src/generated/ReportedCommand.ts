@@ -7,4 +7,4 @@
  * descriptions. Sessions persisted by earlier builds stored plain strings,
  * which the untagged repr still accepts.
  */
-export type ReportedCommand = { name: string, description?: string, };
+export type ReportedCommand = { name: string, description?: string, argument_hint?: string | null, };

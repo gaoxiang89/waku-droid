@@ -397,6 +397,10 @@ settings.automatic_updates:
   en: Automatic updates
 settings.automatic_updates_description:
   en: Check for new versions in the background and offer to install them
+settings.check_for_updates:
+  en: Check for updates
+settings.check_for_updates_description:
+  en: Check GitHub Releases for the latest version of Waku
 settings.about:
   en: About
 settings.about_local_daemon:
@@ -502,6 +506,32 @@ session.new_task:
 
 sidebar.search:
   en: Search
+sidebar.pin:
+  en: Pin task
+sidebar.unpin:
+  en: Unpin task
+sidebar.pinned:
+  en: Pinned
+sidebar.archive:
+  en: Archive task
+sidebar.unarchive:
+  en: Restore task
+sidebar.archived:
+  en: Archived
+sidebar.archived_toast:
+  en: Task archived
+sidebar.restored_toast:
+  en: Task restored
+sidebar.show_archived:
+  en: Show archived tasks
+sidebar.show_active_tasks:
+  en: Back to active tasks
+sidebar.delete_task:
+  en: Delete task
+sidebar.delete_confirm_title:
+  en: Delete task?
+sidebar.delete_confirm_message:
+  en: Delete “%{title}”? Its session history and draft will be permanently deleted. Workspace files will not be deleted.
 sidebar.options:
   en: Sidebar options
 sidebar.ordering:

@@ -33,6 +33,8 @@ export const sessions = sqliteTable(
     title: text("title").notNull(),
     /** Provider-generated title, with the first prompt as a local fallback. */
     autoTitle: text("auto_title"),
+    pinned: integer("pinned", { mode: "boolean" }).notNull().default(false),
+    archived: integer("archived", { mode: "boolean" }).notNull().default(false),
     provider: text("provider").notNull(),
     model: text("model"),
     status: text("status").notNull(),

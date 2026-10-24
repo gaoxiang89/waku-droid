@@ -168,6 +168,8 @@ impl From<&Project> for ProjectCatalogEntry {
 struct SessionCatalogEntry {
     title: String,
     auto_title: Option<String>,
+    pinned: bool,
+    archived: bool,
     project_id: Uuid,
     provider: ProviderKind,
     model: Option<String>,
@@ -181,6 +183,8 @@ impl From<&AgentSession> for SessionCatalogEntry {
         Self {
             title: session.title.clone(),
             auto_title: session.auto_title.clone(),
+            pinned: session.pinned,
+            archived: session.archived,
             project_id: session.project_id,
             provider: session.provider,
             model: session.model.clone(),
@@ -1472,6 +1476,46 @@ mod tests {
                 .is_err()
         );
 
+        // Organization-only edits are catalog changes even though they do not
+        // touch the transcript. Each flag must wake the other client on its own.
+        let mut pinned = sessions[0].clone();
+        assert!(pinned.set_pinned(true));
+        source
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: Vec::new(),
+                    live_session_ids: vec![session_id],
+                    sessions: vec![pinned.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            observer_revisions.recv_timeout(Duration::from_secs(1)),
+            Ok(2)
+        );
+        assert!(source_revisions.try_recv().is_err());
+
+        let mut archived = pinned;
+        assert!(archived.set_archived(true));
+        source
+            .request(
+                Uuid::nil(),
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: Vec::new(),
+                    live_session_ids: vec![session_id],
+                    sessions: vec![archived],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            observer_revisions.recv_timeout(Duration::from_secs(1)),
+            Ok(3)
+        );
+        assert!(source_revisions.try_recv().is_err());
+
         // Desktop persistence uses fire-and-forget notifications, while Web
         // uses requests. Both directions must wake the other application's
         // catalog without echoing back to the source connection.
@@ -1488,7 +1532,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(source_revisions.recv_timeout(Duration::from_secs(1)), Ok(2));
+        assert_eq!(source_revisions.recv_timeout(Duration::from_secs(1)), Ok(4));
         assert!(observer_revisions.try_recv().is_err());
         let ResponsePayload::TaskState { sessions, .. } = source
             .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
