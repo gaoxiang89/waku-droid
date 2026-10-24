@@ -16,6 +16,15 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.34]
+
+- Right-click uncommitted files in the Git graph to stage, unstage, or discard them, see staged and unstaged badges on each file, and fetch, pull, or pop the last stash from the uncommitted-changes menu
+- Create files and folders inline from the Files panel
+- Open files at an exact spot: transcript links and the command palette's new Files section accept `:line`, `:line:column`, and `#L42C10` suffixes and land the caret there
+- Search workspace files from the command palette and open them in the Files panel
+- Keep the Skills and Usage settings pages per connected host, and scope workspace panel state (branches, git graph, files, terminal commands) to the host it belongs to
+- Split or close terminal panes from the terminal's right-click menu
+
 ## [0.1.33]
 
 - Expand any file in the Git graph's commit details to read its diff inline, and Ctrl/Cmd-click a second commit to compare the two
