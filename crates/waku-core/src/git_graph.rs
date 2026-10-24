@@ -108,7 +108,7 @@ fn clamped_limit(limit: u32) -> usize {
     }
 }
 
-fn is_commit_hash(hash: &str) -> bool {
+pub(crate) fn is_commit_hash(hash: &str) -> bool {
     matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -568,7 +568,7 @@ fn route_extra_parent(
         color,
     });
 }
-fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<Output> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<Output> {
     crate::command_env::plain_command("git")
         .arg("--no-pager")
         .args(args)
@@ -578,7 +578,7 @@ fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<Output> {
         .context("failed to execute git")
 }
 
-fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = git(cwd, args)?;
     if !output.status.success() {
         bail!("{}", command_error(&output));
@@ -586,7 +586,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn command_error(output: &Output) -> String {
+pub(crate) fn command_error(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if stderr.is_empty() {
         format!("git exited with {}", output.status)

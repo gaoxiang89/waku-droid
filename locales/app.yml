@@ -1591,6 +1591,166 @@ git_graph.no_files:
   en: No files
 git_graph.head:
   en: HEAD
+git_graph.show_diff:
+  en: Show changes
+git_graph.hide_diff:
+  en: Hide changes
+git_graph.no_textual_changes:
+  en: No textual changes
+git_graph.diff_truncated:
+  en: Diff truncated — showing the first part only
+git_graph.compare_title:
+  en: "Compare %{from} → %{to}"
+git_graph.compare_from:
+  en: From
+git_graph.compare_to:
+  en: To
+git_graph.compare_hint:
+  en: Press Escape or click a commit to leave the comparison
+git_graph.compare_badge:
+  en: Compare
+git_graph.copied_subject:
+  en: Copied commit subject
+git_graph.copied_name:
+  en: Copied name
+git_graph.action_failed:
+  en: "Git failed: %{error}"
+git_graph.menu.view_changes:
+  en: View changes
+git_graph.menu.compare_with_selected:
+  en: Compare with selected commit
+git_graph.menu.copy_subject:
+  en: Copy commit subject
+git_graph.menu.copy_name:
+  en: Copy name
+git_graph.menu.create_branch:
+  en: Create branch here…
+git_graph.menu.create_tag:
+  en: Create tag here…
+git_graph.menu.checkout_commit:
+  en: Check out (detached HEAD)
+git_graph.menu.cherry_pick:
+  en: Cherry-pick
+git_graph.menu.revert:
+  en: Revert
+git_graph.menu.merge_into_current:
+  en: Merge into current branch
+git_graph.menu.rebase_onto:
+  en: Rebase current branch onto this commit…
+git_graph.menu.rebase_confirm:
+  en: Rebase
+git_graph.menu.reset:
+  en: Reset current branch to this commit
+git_graph.menu.reset_soft:
+  en: Soft — keep index and working tree
+git_graph.menu.reset_mixed:
+  en: Mixed — keep working tree
+git_graph.menu.reset_hard:
+  en: Hard — discard all changes…
+git_graph.menu.reset_confirm:
+  en: Reset
+git_graph.menu.stash:
+  en: Stash all changes
+git_graph.menu.discard:
+  en: Discard all changes…
+git_graph.menu.discard_confirm:
+  en: Discard
+git_graph.menu.checkout_branch:
+  en: Check out branch
+git_graph.menu.checkout_remote:
+  en: Check out as local branch
+git_graph.menu.merge_branch_into_current:
+  en: "Merge %{name} into current branch"
+git_graph.menu.rebase_onto_branch:
+  en: "Rebase current branch onto %{name}…"
+git_graph.menu.push_branch:
+  en: Push branch
+git_graph.menu.rename_branch:
+  en: Rename branch…
+git_graph.menu.delete_branch:
+  en: Delete branch…
+git_graph.menu.delete_remote_branch:
+  en: Delete remote branch…
+git_graph.menu.push_tag:
+  en: Push tag
+git_graph.menu.delete_tag:
+  en: Delete tag…
+git_graph.menu.delete:
+  en: Delete
+git_graph.dialog.create:
+  en: Create
+git_graph.dialog.create_at:
+  en: "Starts at %{target}"
+git_graph.dialog.branch_name:
+  en: Branch name
+git_graph.dialog.tag_name:
+  en: Tag name
+git_graph.dialog.tag_message:
+  en: Message (optional, makes an annotated tag)
+git_graph.dialog.create_branch_title:
+  en: Create branch
+git_graph.dialog.create_tag_title:
+  en: Create tag
+git_graph.dialog.checkout_after_create:
+  en: Check out after creating
+git_graph.dialog.rename_branch_title:
+  en: Rename branch
+git_graph.dialog.rename_branch_message:
+  en: "New name for “%{name}”"
+git_graph.dialog.delete_branch_title:
+  en: Delete branch
+git_graph.dialog.delete_branch_message:
+  en: "Delete the local branch “%{name}”? Commits only it points at become unreachable."
+git_graph.dialog.force_delete:
+  en: Force delete even if not merged
+git_graph.dialog.delete_remote_title:
+  en: Delete remote branch
+git_graph.dialog.delete_remote_message:
+  en: "Delete “%{name}” from the remote? Everyone sharing the remote loses this branch."
+git_graph.dialog.delete_tag_title:
+  en: Delete tag
+git_graph.dialog.delete_tag_message:
+  en: "Delete the local tag “%{name}”? A copy already pushed stays on the remote."
+git_graph.dialog.rebase_title:
+  en: Rebase current branch
+git_graph.dialog.rebase_message:
+  en: "Replay the current branch's commits on top of %{target}? This rewrites history; conflicts must be resolved in a terminal."
+git_graph.dialog.reset_hard_title:
+  en: Hard reset
+git_graph.dialog.reset_hard_message:
+  en: "Move the current branch to %{target} and discard every uncommitted change? This cannot be undone."
+git_graph.dialog.discard_title:
+  en: Discard all changes
+git_graph.dialog.discard_message:
+  en: Reset tracked files to HEAD and delete untracked files? Ignored files are kept. This cannot be undone.
+git_graph.done.checked_out:
+  en: Checked out
+git_graph.done.branch_created:
+  en: "Created branch %{name}"
+git_graph.done.branch_renamed:
+  en: "Renamed branch to %{name}"
+git_graph.done.branch_deleted:
+  en: "Deleted %{name}"
+git_graph.done.pushed:
+  en: "Pushed %{name}"
+git_graph.done.tag_created:
+  en: "Created tag %{name}"
+git_graph.done.tag_deleted:
+  en: "Deleted tag %{name}"
+git_graph.done.merged:
+  en: Merged
+git_graph.done.rebased:
+  en: Rebased
+git_graph.done.cherry_picked:
+  en: Cherry-picked
+git_graph.done.reverted:
+  en: Reverted
+git_graph.done.reset:
+  en: Branch reset
+git_graph.done.stashed:
+  en: Changes stashed
+git_graph.done.discarded:
+  en: Changes discarded
 bottom_panel.toggle:
   en: Toggle bottom panel
 bottom_panel.resize:

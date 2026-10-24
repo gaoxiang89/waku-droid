@@ -298,6 +298,20 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         WorkspaceOperation::InspectGitCommit { cwd, hash } => WorkspaceResult::GitCommit {
             detail: crate::git_graph::commit_detail(&cwd, &hash)?,
         },
+        WorkspaceOperation::InspectGitCompare { cwd, from, to } => WorkspaceResult::GitCompare {
+            files: crate::git_graph_ops::compare_files(&cwd, &from, &to)?,
+        },
+        WorkspaceOperation::InspectGitFileDiff {
+            cwd,
+            spec,
+            path,
+            old_path,
+        } => WorkspaceResult::GitFileDiff {
+            diff: crate::git_graph_ops::file_diff(&cwd, &spec, &path, old_path.as_deref())?,
+        },
+        WorkspaceOperation::RunGitGraphAction { cwd, action } => WorkspaceResult::Branches {
+            snapshot: crate::git_graph_ops::run_action(&cwd, &action)?,
+        },
     })
 }
 

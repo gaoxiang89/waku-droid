@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::composer::{FileEntry, SlashCommand};
 use crate::git::{
-    AgentInvocation, BranchSnapshot, CommitSnapshot, CreatedWorktree, GitCommitDetail,
-    GitGraphSnapshot,
+    AgentInvocation, BranchSnapshot, CommitSnapshot, CreatedWorktree, GitCommitDetail, GitDiffSpec,
+    GitFileDiff, GitGraphAction, GitGraphFile, GitGraphSnapshot,
 };
 use crate::model::{Checkpoint, ProviderKind};
 
@@ -233,6 +233,29 @@ pub enum WorkspaceOperation {
         cwd: PathBuf,
         hash: String,
     },
+    /// Name-status between two commits, for the Git Graph's compare view.
+    InspectGitCompare {
+        #[ts(type = "string")]
+        cwd: PathBuf,
+        from: String,
+        to: String,
+    },
+    /// One file's patch for the Git Graph's inline diff. `old_path` is the
+    /// rename source, so the patch pairs both sides.
+    InspectGitFileDiff {
+        #[ts(type = "string")]
+        cwd: PathBuf,
+        spec: GitDiffSpec,
+        path: String,
+        old_path: Option<String>,
+    },
+    /// Runs one Git Graph context-menu action and answers with the fresh
+    /// branch snapshot, since most actions move `HEAD` or a branch.
+    RunGitGraphAction {
+        #[ts(type = "string")]
+        cwd: PathBuf,
+        action: GitGraphAction,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -305,5 +328,11 @@ pub enum WorkspaceResult {
     },
     GitCommit {
         detail: GitCommitDetail,
+    },
+    GitCompare {
+        files: Vec<GitGraphFile>,
+    },
+    GitFileDiff {
+        diff: GitFileDiff,
     },
 }

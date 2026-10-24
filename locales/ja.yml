@@ -817,6 +817,86 @@ git_graph.copied: コミットハッシュをコピーしました
 git_graph.parents: 親
 git_graph.no_files: ファイルなし
 git_graph.head: HEAD
+git_graph.show_diff: 変更を表示
+git_graph.hide_diff: 変更を隠す
+git_graph.no_textual_changes: テキストの変更なし
+git_graph.diff_truncated: 差分が長いため先頭のみ表示しています
+git_graph.compare_title: "比較 %{from} → %{to}"
+git_graph.compare_from: 比較元
+git_graph.compare_to: 比較先
+git_graph.compare_hint: Esc キーまたはコミットのクリックで比較を終了します
+git_graph.compare_badge: 比較
+git_graph.copied_subject: コミットの件名をコピーしました
+git_graph.copied_name: 名前をコピーしました
+git_graph.action_failed: "Git の操作に失敗しました: %{error}"
+git_graph.menu.view_changes: 変更を表示
+git_graph.menu.compare_with_selected: 選択中のコミットと比較
+git_graph.menu.copy_subject: コミットの件名をコピー
+git_graph.menu.copy_name: 名前をコピー
+git_graph.menu.create_branch: ここにブランチを作成…
+git_graph.menu.create_tag: ここにタグを作成…
+git_graph.menu.checkout_commit: チェックアウト（detached HEAD）
+git_graph.menu.cherry_pick: チェリーピック
+git_graph.menu.revert: リバート
+git_graph.menu.merge_into_current: 現在のブランチにマージ
+git_graph.menu.rebase_onto: 現在のブランチをこのコミットにリベース…
+git_graph.menu.rebase_confirm: リベース
+git_graph.menu.reset: 現在のブランチをこのコミットにリセット
+git_graph.menu.reset_soft: Soft — インデックスと作業ツリーを保持
+git_graph.menu.reset_mixed: Mixed — 作業ツリーを保持
+git_graph.menu.reset_hard: Hard — すべての変更を破棄…
+git_graph.menu.reset_confirm: リセット
+git_graph.menu.stash: すべての変更をスタッシュ
+git_graph.menu.discard: すべての変更を破棄…
+git_graph.menu.discard_confirm: 破棄
+git_graph.menu.checkout_branch: ブランチをチェックアウト
+git_graph.menu.checkout_remote: ローカルブランチとしてチェックアウト
+git_graph.menu.merge_branch_into_current: "%{name} を現在のブランチにマージ"
+git_graph.menu.rebase_onto_branch: "現在のブランチを %{name} にリベース…"
+git_graph.menu.push_branch: ブランチをプッシュ
+git_graph.menu.rename_branch: ブランチ名を変更…
+git_graph.menu.delete_branch: ブランチを削除…
+git_graph.menu.delete_remote_branch: リモートブランチを削除…
+git_graph.menu.push_tag: タグをプッシュ
+git_graph.menu.delete_tag: タグを削除…
+git_graph.menu.delete: 削除
+git_graph.dialog.create: 作成
+git_graph.dialog.create_at: "起点: %{target}"
+git_graph.dialog.branch_name: ブランチ名
+git_graph.dialog.tag_name: タグ名
+git_graph.dialog.tag_message: メッセージ（任意、注釈付きタグになります）
+git_graph.dialog.create_branch_title: ブランチを作成
+git_graph.dialog.create_tag_title: タグを作成
+git_graph.dialog.checkout_after_create: 作成後にチェックアウト
+git_graph.dialog.rename_branch_title: ブランチ名を変更
+git_graph.dialog.rename_branch_message: "「%{name}」の新しい名前"
+git_graph.dialog.delete_branch_title: ブランチを削除
+git_graph.dialog.delete_branch_message: "ローカルブランチ「%{name}」を削除しますか？このブランチだけが指すコミットは到達不能になります。"
+git_graph.dialog.force_delete: 未マージでも強制削除
+git_graph.dialog.delete_remote_title: リモートブランチを削除
+git_graph.dialog.delete_remote_message: "リモートから「%{name}」を削除しますか？リモートを共有する全員からこのブランチが消えます。"
+git_graph.dialog.delete_tag_title: タグを削除
+git_graph.dialog.delete_tag_message: "ローカルタグ「%{name}」を削除しますか？プッシュ済みのリモートのタグは残ります。"
+git_graph.dialog.rebase_title: 現在のブランチをリベース
+git_graph.dialog.rebase_message: "現在のブランチのコミットを %{target} の上に再適用しますか？履歴が書き換わり、競合はターミナルで解決する必要があります。"
+git_graph.dialog.reset_hard_title: ハードリセット
+git_graph.dialog.reset_hard_message: "現在のブランチを %{target} に移動し、未コミットの変更をすべて破棄しますか？元に戻せません。"
+git_graph.dialog.discard_title: すべての変更を破棄
+git_graph.dialog.discard_message: 追跡ファイルを HEAD に戻し、未追跡ファイルを削除しますか？無視されたファイルは残ります。元に戻せません。
+git_graph.done.checked_out: チェックアウトしました
+git_graph.done.branch_created: "ブランチ %{name} を作成しました"
+git_graph.done.branch_renamed: "ブランチ名を %{name} に変更しました"
+git_graph.done.branch_deleted: "%{name} を削除しました"
+git_graph.done.pushed: "%{name} をプッシュしました"
+git_graph.done.tag_created: "タグ %{name} を作成しました"
+git_graph.done.tag_deleted: "タグ %{name} を削除しました"
+git_graph.done.merged: マージしました
+git_graph.done.rebased: リベースしました
+git_graph.done.cherry_picked: チェリーピックしました
+git_graph.done.reverted: リバートしました
+git_graph.done.reset: ブランチをリセットしました
+git_graph.done.stashed: 変更をスタッシュしました
+git_graph.done.discarded: 変更を破棄しました
 bottom_panel.toggle: 下パネルの表示を切り替える
 bottom_panel.resize: 下パネルの高さを変更
 bottom_panel.new_terminal: 新規ターミナル

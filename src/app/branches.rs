@@ -308,6 +308,34 @@ impl Waku {
         }
     }
 
+    /// Adopt the branch snapshot a checkout (or any other `HEAD`-moving Git
+    /// operation) answered with, and refresh everything that reads the
+    /// working tree.
+    pub(super) fn apply_branch_change(
+        &mut self,
+        path: &Path,
+        snapshot: BranchSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let current = snapshot.current.clone();
+        let path_buf = path.to_path_buf();
+        self.cache_sidebar_branch_label(path, snapshot.display_branch());
+        self.visible_branch_snapshot = Some((path_buf.clone(), snapshot));
+        self.branch_snapshots.invalidate(&path_buf);
+        self.git_graph_snapshots.invalidate(&path_buf);
+        if self.selected_workspace_path() == Some(path) {
+            if let Some(current) = current
+                && let Some(session) = self.selected_session_mut()
+                && let SessionWorkspace::Worktree { branch, .. } = &mut session.workspace
+            {
+                *branch = current;
+            }
+            self.invalidate_workspace_queries(cx);
+            self.reload_clean_right_panel_file_editors(cx);
+            self.save();
+        }
+    }
+
     fn start_branch_operation(
         &mut self,
         path: PathBuf,
@@ -348,28 +376,7 @@ impl Waku {
             let _ = waku.update(cx, |waku, cx| {
                 waku.branch_operation_pending = false;
                 match result {
-                    Ok(snapshot) => {
-                        let current = snapshot.current.clone();
-                        waku.cache_sidebar_branch_label(&path, snapshot.display_branch());
-                        waku.visible_branch_snapshot = Some((path.clone(), snapshot));
-                        waku.branch_snapshots.invalidate(&path);
-                        waku.git_graph_snapshots.invalidate(&path);
-                        let selected_path = waku
-                            .selected_workspace_path()
-                            .map(std::path::Path::to_path_buf);
-                        if selected_path.as_ref() == Some(&path) {
-                            if let Some(current) = current
-                                && let Some(session) = waku.selected_session_mut()
-                                && let SessionWorkspace::Worktree { branch, .. } =
-                                    &mut session.workspace
-                            {
-                                *branch = current;
-                            }
-                            waku.invalidate_workspace_queries(cx);
-                            waku.reload_clean_right_panel_file_editors(cx);
-                            waku.save();
-                        }
-                    }
+                    Ok(snapshot) => waku.apply_branch_change(&path, snapshot, cx),
                     Err(error) => {
                         waku.show_toast(tr!("errors.change_branch", error = error));
                     }

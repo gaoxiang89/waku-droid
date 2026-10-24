@@ -1458,6 +1458,8 @@ pub struct Waku {
     git_graph_detail_scroll: ScrollHandle,
     /// Selected row, scoped to the workspace it was picked in.
     git_graph_cursor: Option<(PathBuf, usize)>,
+    /// Inline diffs, compare selection, and the action dialog.
+    git_graph_ui: git_graph_actions::GitGraphUi,
     branch_operation_pending: bool,
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
@@ -1911,6 +1913,7 @@ mod connections_page;
 mod drafts;
 mod file_search;
 mod git_graph;
+mod git_graph_actions;
 mod goal_dialog;
 mod hosts;
 mod image_preview;
@@ -2356,6 +2359,7 @@ impl Waku {
                 .clear_on_escape()
                 .placeholder(tr!("git_graph.search"))
         });
+        let git_graph_ui = git_graph_actions::GitGraphUi::new(window, cx);
         let branch_create_input = cx.new(|cx| {
             TextInput::new(window, cx)
                 .clear_on_escape()
@@ -3029,6 +3033,7 @@ impl Waku {
                 },
             )
             .detach();
+            git_graph_ui.subscribe(cx);
             cx.subscribe(
                 &right_panel_file_rename_input,
                 |this: &mut Self, _, event: &InputEvent, cx| match event {
@@ -3314,6 +3319,7 @@ impl Waku {
                 git_graph_copy_focus,
                 git_graph_detail_scroll: ScrollHandle::new(),
                 git_graph_cursor: None,
+                git_graph_ui,
                 branch_operation_pending: false,
                 commit_dialog: None,
                 goal_dialog: None,

@@ -154,3 +154,106 @@ pub struct GitCommitDetail {
     pub body: String,
     pub files: Vec<GitGraphFile>,
 }
+
+/// Which two trees a Git Graph diff compares. A commit compares against its
+/// first parent (or the empty tree for a root commit); `Uncommitted` compares
+/// the working tree, index included, against `HEAD`.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GitDiffSpec {
+    Uncommitted,
+    Commit {
+        hash: String,
+    },
+    /// `from` is the older side. Both are full object ids.
+    Compare {
+        from: String,
+        to: String,
+    },
+}
+
+/// One file's patch for the Git Graph's inline diff. Large patches are cut at
+/// a line budget so a generated file cannot flood the wire or the pane.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct GitFileDiff {
+    pub patch: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum GitResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+/// A repository change started from the Git Graph's context menus. Commit
+/// arguments are full object ids; ref arguments are short names exactly as
+/// the graph's capsules show them, and the daemon validates both before
+/// anything reaches `git`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GitGraphAction {
+    CheckoutCommit {
+        hash: String,
+    },
+    CheckoutBranch {
+        name: String,
+    },
+    /// Check out `remote/branch` as a local tracking branch, or switch to the
+    /// local branch of the same name when it already exists.
+    CheckoutRemoteBranch {
+        name: String,
+    },
+    CreateBranch {
+        name: String,
+        start: String,
+        checkout: bool,
+    },
+    RenameBranch {
+        from: String,
+        to: String,
+    },
+    DeleteBranch {
+        name: String,
+        force: bool,
+    },
+    DeleteRemoteBranch {
+        name: String,
+    },
+    PushBranch {
+        name: String,
+    },
+    CreateTag {
+        name: String,
+        target: String,
+        message: Option<String>,
+    },
+    DeleteTag {
+        name: String,
+    },
+    PushTag {
+        name: String,
+    },
+    /// Merge a commit or ref into the checked-out branch.
+    Merge {
+        rev: String,
+    },
+    /// Rebase the checked-out branch onto a commit or ref.
+    Rebase {
+        onto: String,
+    },
+    CherryPick {
+        hash: String,
+    },
+    Revert {
+        hash: String,
+    },
+    Reset {
+        hash: String,
+        mode: GitResetMode,
+    },
+    Stash,
+    DiscardUncommitted,
+}

@@ -780,6 +780,86 @@ git_graph.copied: 已复制提交哈希
 git_graph.parents: 父提交
 git_graph.no_files: 没有文件
 git_graph.head: HEAD
+git_graph.show_diff: 显示改动
+git_graph.hide_diff: 隐藏改动
+git_graph.no_textual_changes: 没有文本改动
+git_graph.diff_truncated: 差异过长，仅显示前一部分
+git_graph.compare_title: "比较 %{from} → %{to}"
+git_graph.compare_from: 从
+git_graph.compare_to: 到
+git_graph.compare_hint: 按 Esc 或单击任一提交即可退出比较
+git_graph.compare_badge: 比较
+git_graph.copied_subject: 已复制提交标题
+git_graph.copied_name: 已复制名称
+git_graph.action_failed: "Git 操作失败：%{error}"
+git_graph.menu.view_changes: 查看改动
+git_graph.menu.compare_with_selected: 与选中的提交比较
+git_graph.menu.copy_subject: 复制提交标题
+git_graph.menu.copy_name: 复制名称
+git_graph.menu.create_branch: 在此创建分支…
+git_graph.menu.create_tag: 在此创建标签…
+git_graph.menu.checkout_commit: 检出（分离 HEAD）
+git_graph.menu.cherry_pick: 拣选（Cherry-pick）
+git_graph.menu.revert: 还原（Revert）
+git_graph.menu.merge_into_current: 合并到当前分支
+git_graph.menu.rebase_onto: 将当前分支变基到此提交…
+git_graph.menu.rebase_confirm: 变基
+git_graph.menu.reset: 将当前分支重置到此提交
+git_graph.menu.reset_soft: Soft — 保留暂存区和工作区
+git_graph.menu.reset_mixed: Mixed — 保留工作区
+git_graph.menu.reset_hard: Hard — 丢弃所有改动…
+git_graph.menu.reset_confirm: 重置
+git_graph.menu.stash: 储藏（Stash）全部改动
+git_graph.menu.discard: 丢弃全部改动…
+git_graph.menu.discard_confirm: 丢弃
+git_graph.menu.checkout_branch: 检出分支
+git_graph.menu.checkout_remote: 检出为本地分支
+git_graph.menu.merge_branch_into_current: "将 %{name} 合并到当前分支"
+git_graph.menu.rebase_onto_branch: "将当前分支变基到 %{name}…"
+git_graph.menu.push_branch: 推送分支
+git_graph.menu.rename_branch: 重命名分支…
+git_graph.menu.delete_branch: 删除分支…
+git_graph.menu.delete_remote_branch: 删除远程分支…
+git_graph.menu.push_tag: 推送标签
+git_graph.menu.delete_tag: 删除标签…
+git_graph.menu.delete: 删除
+git_graph.dialog.create: 创建
+git_graph.dialog.create_at: "起点：%{target}"
+git_graph.dialog.branch_name: 分支名称
+git_graph.dialog.tag_name: 标签名称
+git_graph.dialog.tag_message: 说明（可选，填写后创建附注标签）
+git_graph.dialog.create_branch_title: 创建分支
+git_graph.dialog.create_tag_title: 创建标签
+git_graph.dialog.checkout_after_create: 创建后检出
+git_graph.dialog.rename_branch_title: 重命名分支
+git_graph.dialog.rename_branch_message: "为“%{name}”输入新名称"
+git_graph.dialog.delete_branch_title: 删除分支
+git_graph.dialog.delete_branch_message: "删除本地分支“%{name}”？仅由它指向的提交将变得不可达。"
+git_graph.dialog.force_delete: 即使未合并也强制删除
+git_graph.dialog.delete_remote_title: 删除远程分支
+git_graph.dialog.delete_remote_message: "从远程删除“%{name}”？共享该远程的所有人都会失去此分支。"
+git_graph.dialog.delete_tag_title: 删除标签
+git_graph.dialog.delete_tag_message: "删除本地标签“%{name}”？已推送到远程的副本不受影响。"
+git_graph.dialog.rebase_title: 变基当前分支
+git_graph.dialog.rebase_message: "将当前分支的提交重放到 %{target} 之上？这会改写历史；如有冲突需在终端中解决。"
+git_graph.dialog.reset_hard_title: 硬重置
+git_graph.dialog.reset_hard_message: "将当前分支移动到 %{target} 并丢弃所有未提交的改动？此操作无法撤销。"
+git_graph.dialog.discard_title: 丢弃全部改动
+git_graph.dialog.discard_message: 将已跟踪文件重置为 HEAD，并删除未跟踪文件？被忽略的文件会保留。此操作无法撤销。
+git_graph.done.checked_out: 已检出
+git_graph.done.branch_created: "已创建分支 %{name}"
+git_graph.done.branch_renamed: "分支已重命名为 %{name}"
+git_graph.done.branch_deleted: "已删除 %{name}"
+git_graph.done.pushed: "已推送 %{name}"
+git_graph.done.tag_created: "已创建标签 %{name}"
+git_graph.done.tag_deleted: "已删除标签 %{name}"
+git_graph.done.merged: 已合并
+git_graph.done.rebased: 已变基
+git_graph.done.cherry_picked: 已拣选
+git_graph.done.reverted: 已还原
+git_graph.done.reset: 分支已重置
+git_graph.done.stashed: 改动已储藏
+git_graph.done.discarded: 改动已丢弃
 bottom_panel.toggle: 显示或隐藏底部面板
 bottom_panel.resize: 调整底部面板高度
 bottom_panel.new_terminal: 新建终端

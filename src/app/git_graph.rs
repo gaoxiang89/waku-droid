@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    InteractiveElement, KeyBinding, PathBuilder, StatefulInteractiveElement, actions, hsla,
+    ClickEvent, InteractiveElement, KeyBinding, PathBuilder, StatefulInteractiveElement, actions,
+    hsla,
 };
 
 use super::*;
@@ -30,6 +31,7 @@ const LANE_HUES: [f32; 8] = [211.0, 28.0, 152.0, 274.0, 48.0, 332.0, 188.0, 12.0
 actions!(waku_git_graph, [GitGraphTop, GitGraphBottom]);
 
 pub(super) fn init(cx: &mut App) {
+    super::git_graph_actions::init(cx);
     // Home/End stay with the search field's caret; they only jump rows when
     // the list itself has focus.
     cx.bind_keys([
@@ -73,6 +75,9 @@ struct GitGraphRowContext {
     snapshot: Arc<waku_client::git::GitGraphSnapshot>,
     matches: Option<Rc<Vec<bool>>>,
     cursor: Option<usize>,
+    /// The selected commit's hash, offered as the other side of "compare".
+    cursor_hash: Option<String>,
+    compare: Option<String>,
     head_lane: u16,
     head_on_top: bool,
     graph_width: f32,
@@ -88,6 +93,7 @@ impl Waku {
         self.visible_git_graph = None;
         self.git_graph_cursor = None;
         self.git_graph_matches = None;
+        self.git_graph_ui.clear();
     }
 
     fn refresh_git_graph(&mut self, cx: &mut Context<Self>) {
@@ -220,6 +226,7 @@ impl Waku {
                 }
                 if let Ok(Some(snapshot)) = &result {
                     waku.remap_git_graph_cursor(&path, snapshot);
+                    waku.invalidate_git_graph_uncommitted_diffs(&path);
                     waku.visible_git_graph = Some((path, Arc::clone(snapshot)));
                 }
                 cx.notify();
@@ -228,7 +235,7 @@ impl Waku {
         .detach();
     }
 
-    fn git_commit_detail(
+    pub(super) fn git_commit_detail(
         &mut self,
         hash: &str,
         cx: &mut Context<Self>,
@@ -305,7 +312,7 @@ impl Waku {
             .map(|(_, snapshot)| git_graph_row_count(snapshot))
     }
 
-    fn focus_git_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn focus_git_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
             return;
         };
@@ -396,7 +403,11 @@ impl Waku {
                 }
             }))
             .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
-                this.git_graph_cursor = None;
+                // Escape steps back: first out of a comparison, then out of
+                // the selection.
+                if !this.clear_git_graph_compare() {
+                    this.git_graph_cursor = None;
+                }
                 cx.notify();
             }))
             .child(self.render_git_graph_toolbar(&theme, cx));
@@ -453,6 +464,21 @@ impl Waku {
                     .icon("icons/search.svg", 13.0)
                     .flex_1(),
             )
+            .when(self.git_graph_ui.pending(), |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .size(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(motion::spin(icon(
+                            "icons/loader-circle.svg",
+                            13.0,
+                            theme.text_tertiary,
+                        ))),
+                )
+            })
             .child(
                 icon_button("git-graph-refresh", "icons/rotate-cw.svg", *theme)
                     .track_focus(&refresh_focus)
@@ -508,9 +534,17 @@ impl Waku {
         let head = snapshot
             .head_row
             .and_then(|row| snapshot.rows.get(row as usize));
+        let cursor_hash = cursor
+            .and_then(|cursor| git_graph_row_key(&snapshot, cursor))
+            .and_then(|key| match key {
+                GitGraphRowKey::Commit(hash) => Some(hash),
+                GitGraphRowKey::Uncommitted => None,
+            });
         let context = GitGraphRowContext {
             matches: self.git_graph_row_matches(&snapshot, cx),
             cursor,
+            cursor_hash,
+            compare: self.git_graph_compare_hash().map(str::to_owned),
             head_lane: head.map_or(0, |row| row.node_lane),
             head_on_top: snapshot.head_row == Some(0),
             graph_width: graph_width(&snapshot),
@@ -528,6 +562,21 @@ impl Waku {
                 .tab_index(0)
                 .tab_stop(true)
                 .focus_visible(|style| style.border_1().border_color(theme.accent))
+                // Shift+F10 / the Menu key open the selected row's context
+                // menu, so every action stays reachable without a mouse.
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    let menu_key = (key == "f10" && event.keystroke.modifiers.shift)
+                        || (key == "menu" && !event.keystroke.modifiers.modified());
+                    if !menu_key {
+                        return;
+                    }
+                    if let Some(cursor) = this.selected_git_graph_cursor() {
+                        this.menu_handle(format!("git-graph-row-{cursor}"), cx)
+                            .open_context_menu(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     list(
                         self.git_graph_list_state.clone(),
@@ -601,8 +650,58 @@ impl Waku {
         // The dashed link from the uncommitted row can only be drawn when
         // HEAD is the row right below it.
         let connect_above = has_uncommitted && index == 1 && context.head_on_top;
+        let compared =
+            commit.is_some_and(|commit| context.compare.as_deref() == Some(commit.hash.as_str()));
+        let weak = cx.entity().downgrade();
+        let hash = commit.map(|commit| commit.hash.clone());
+        let chips = refs
+            .iter()
+            .take(MAX_REF_CHIPS)
+            .enumerate()
+            .map(|(position, git_ref)| {
+                let handle = self.menu_handle(format!("git-graph-ref-{index}-{position}"), cx);
+                let weak = weak.clone();
+                let menu_ref = git_ref.clone();
+                let menu_hash = hash.clone().unwrap_or_default();
+                context_menu(
+                    git_ref_chip(git_ref, &theme),
+                    SharedString::from(format!("git-graph-ref-menu-{index}-{position}")),
+                    &handle,
+                    move |_| Waku::git_graph_ref_menu(weak.clone(), &menu_ref, &menu_hash),
+                )
+            })
+            .collect::<Vec<_>>();
+        let overflow = (hidden_refs > 0).then(|| {
+            let handle = self.menu_handle(format!("git-graph-ref-{index}-more"), cx);
+            let weak = weak.clone();
+            let hidden = refs[MAX_REF_CHIPS..].to_vec();
+            let menu_hash = hash.clone().unwrap_or_default();
+            context_menu(
+                overflow_chip(hidden_refs, &theme),
+                SharedString::from(format!("git-graph-ref-menu-{index}-more")),
+                &handle,
+                move |_| {
+                    hidden
+                        .iter()
+                        .map(|git_ref| {
+                            let weak = weak.clone();
+                            let git_ref = git_ref.clone();
+                            let menu_hash = menu_hash.clone();
+                            MenuItem::Submenu {
+                                label: git_ref.name.clone().into(),
+                                value: None,
+                                items: Rc::new(move |_| {
+                                    Waku::git_graph_ref_menu(weak.clone(), &git_ref, &menu_hash)
+                                }),
+                            }
+                        })
+                        .collect()
+                },
+            )
+        });
+        let click_hash = hash.clone();
 
-        div()
+        let element = div()
             .id(SharedString::from(format!("git-graph-row-{index}")))
             .h(px(ROW_HEIGHT))
             .w_full()
@@ -613,7 +712,8 @@ impl Waku {
             .cursor_default()
             .when(!matched, |element| element.opacity(0.38))
             .when(selected, |element| element.bg(theme.overlay_strong))
-            .when(!selected, |element| {
+            .when(compared && !selected, |element| element.bg(theme.overlay))
+            .when(!selected && !compared, |element| {
                 element.hover(|element| element.bg(theme.overlay))
             })
             .child(git_graph_lanes(
@@ -655,14 +755,8 @@ impl Waku {
                                     .truncate()
                                     .child(label),
                             )
-                            .children(
-                                refs.iter()
-                                    .take(MAX_REF_CHIPS)
-                                    .map(|git_ref| git_ref_chip(git_ref, &theme)),
-                            )
-                            .when(hidden_refs > 0, |element| {
-                                element.child(overflow_chip(hidden_refs, &theme))
-                            }),
+                            .children(chips)
+                            .children(overflow),
                     )
                     .when_some(secondary, |element, secondary| {
                         element.child(
@@ -675,144 +769,61 @@ impl Waku {
                         )
                     }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.focus_git_graph_row(index, cx);
-                window.focus(&this.git_graph_focus, cx);
-            }))
-            .into_any_element()
-    }
-
-    fn render_git_graph_detail(
-        &mut self,
-        index: usize,
-        snapshot: &waku_client::git::GitGraphSnapshot,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let uncommitted = !snapshot.uncommitted.is_empty();
-        if uncommitted && index == 0 {
-            return self.render_git_graph_uncommitted_detail(snapshot, theme);
-        }
-        let Some(commit) = snapshot
-            .commits
-            .get(index.saturating_sub(usize::from(uncommitted)))
-        else {
-            return div().id("git-graph-detail-empty");
-        };
-        let hash = commit.hash.clone();
-        let detail = self.git_commit_detail(&hash, cx);
-        let authored = DateTime::<Utc>::from_timestamp(commit.authored_at, 0)
-            .map(|time| {
-                time.with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()
+            // Compared rows say so in text too, not only with a tint.
+            .when(compared, |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .h(px(16.0))
+                        .px(px(5.0))
+                        .rounded(px(4.0))
+                        .bg(theme.accent.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .text_size(sp(10.0))
+                        .text_color(theme.accent)
+                        .child(tr!("git_graph.compare_badge")),
+                )
             })
-            .unwrap_or_default();
-        let mut body = vertical_scroll(
-            div()
-                .flex_none()
-                .max_h(px(240.0))
-                .border_t_1()
-                .border_color(theme.border),
-        )
-        .track_scroll(&self.git_graph_detail_scroll)
-        .px(px(12.0))
-        .py(px(10.0))
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .text_size(sp(12.5))
-                .line_height(sp(17.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .whitespace_normal()
-                .child(commit.subject.clone()),
-        )
-        .child(
-            div()
-                .text_size(sp(11.5))
-                .text_color(theme.text_tertiary)
-                .child(format!("{} · {}", commit.author, authored)),
-        )
-        .child(self.render_git_graph_hash(&hash, theme, cx));
-        if !commit.parents.is_empty() {
-            body = body.child(
-                div()
-                    .text_size(sp(11.5))
-                    .text_color(theme.text_secondary)
-                    .child(format!(
-                        "{} {}",
-                        tr!("git_graph.parents"),
-                        short_hashes(&commit.parents)
-                    )),
-            );
-        }
-        match detail.as_deref() {
-            Some(Ok(detail)) => {
-                let extra = message_body(&commit.subject, &detail.body);
-                if let Some(extra) = extra {
-                    body = body.child(
-                        div()
-                            .text_size(sp(12.0))
-                            .line_height(sp(17.0))
-                            .text_color(theme.text_secondary)
-                            .whitespace_normal()
-                            .child(extra.to_owned()),
-                    );
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // The primary modifier picks a second commit to compare with
+                // the selected one, as in the Git Graph extension.
+                if event.modifiers().secondary()
+                    && let Some(hash) = &click_hash
+                    && this
+                        .selected_git_graph_cursor()
+                        .is_some_and(|cursor| cursor != index)
+                {
+                    this.toggle_git_graph_compare(hash.clone(), cx);
+                } else {
+                    this.clear_git_graph_compare();
+                    this.focus_git_graph_row(index, cx);
                 }
-                body = body.child(git_graph_files(&detail.files, theme));
-            }
-            Some(Err(error)) => {
-                body = body.child(
-                    div()
-                        .text_size(sp(12.0))
-                        .text_color(theme.danger)
-                        .child(error.clone()),
-                );
-            }
-            None => {
-                body = body.child(
-                    div()
-                        .text_size(sp(12.0))
-                        .text_color(theme.text_tertiary)
-                        .child(tr!("git_graph.loading")),
-                );
-            }
-        }
-        body
+                window.focus(&this.git_graph_focus, cx);
+            }));
+
+        let handle = self.menu_handle(format!("git-graph-row-{index}"), cx);
+        let target = commit.map(|commit| super::git_graph_actions::CommitMenuTarget {
+            index,
+            hash: commit.hash.clone(),
+            subject: commit.subject.clone(),
+            compare_with: context
+                .cursor_hash
+                .clone()
+                .filter(|cursor| *cursor != commit.hash),
+        });
+        context_menu(
+            element,
+            SharedString::from(format!("git-graph-row-menu-{index}")),
+            &handle,
+            move |_| match &target {
+                Some(target) => Waku::git_graph_commit_menu(weak.clone(), target.clone()),
+                None => Waku::git_graph_uncommitted_menu(weak.clone()),
+            },
+        )
     }
 
-    fn render_git_graph_uncommitted_detail(
-        &self,
-        snapshot: &waku_client::git::GitGraphSnapshot,
-        theme: &Theme,
-    ) -> Stateful<Div> {
-        vertical_scroll(
-            div()
-                .flex_none()
-                .max_h(px(240.0))
-                .border_t_1()
-                .border_color(theme.border),
-        )
-        .track_scroll(&self.git_graph_detail_scroll)
-        .px(px(12.0))
-        .py(px(10.0))
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .text_size(sp(12.5))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(tr!("git_graph.uncommitted")),
-        )
-        .child(git_graph_files(&snapshot.uncommitted, theme))
-    }
-
-    fn render_git_graph_hash(
+    pub(super) fn render_git_graph_hash(
         &self,
         hash: &str,
         theme: &Theme,
@@ -899,12 +910,6 @@ impl Waku {
                 }
             }))
     }
-}
-
-fn vertical_scroll(element: Div) -> Stateful<Div> {
-    // `overflow_y_scroll` and `track_scroll` live on `StatefulInteractiveElement`,
-    // so the pane needs an element id before it can scroll.
-    element.id("git-graph-detail-scroll").overflow_y_scroll()
 }
 
 fn git_graph_row_count(snapshot: &waku_client::git::GitGraphSnapshot) -> usize {
@@ -1017,57 +1022,7 @@ fn overflow_chip(hidden: usize, theme: &Theme) -> Div {
         .child(format!("+{hidden}"))
 }
 
-fn git_graph_files(files: &[waku_client::git::GitGraphFile], theme: &Theme) -> Div {
-    if files.is_empty() {
-        return div()
-            .text_size(sp(12.0))
-            .text_color(theme.text_tertiary)
-            .child(tr!("git_graph.no_files"));
-    }
-    let mut list = div().flex().flex_col().gap(px(2.0));
-    for file in files {
-        let color = match file.status {
-            waku_client::git::GitGraphFileStatus::Added => theme.success,
-            waku_client::git::GitGraphFileStatus::Deleted => theme.danger,
-            waku_client::git::GitGraphFileStatus::Modified
-            | waku_client::git::GitGraphFileStatus::TypeChanged => theme.warning,
-            _ => theme.text_secondary,
-        };
-        let path = match &file.old_path {
-            Some(old) => format!("{old} → {}", file.path),
-            None => file.path.clone(),
-        };
-        list = list.child(
-            div()
-                .h(px(20.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .min_w_0()
-                .child(
-                    div()
-                        .w(px(14.0))
-                        .flex_none()
-                        .text_size(sp(11.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(color)
-                        .child(status_letter(file.status)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .text_size(sp(12.0))
-                        .text_color(theme.text)
-                        .truncate()
-                        .child(path),
-                ),
-        );
-    }
-    list
-}
-
-fn status_letter(status: waku_client::git::GitGraphFileStatus) -> &'static str {
+pub(super) fn status_letter(status: waku_client::git::GitGraphFileStatus) -> &'static str {
     match status {
         waku_client::git::GitGraphFileStatus::Added => "A",
         waku_client::git::GitGraphFileStatus::Modified => "M",
@@ -1079,17 +1034,17 @@ fn status_letter(status: waku_client::git::GitGraphFileStatus) -> &'static str {
     }
 }
 
-fn message_body<'a>(subject: &str, body: &'a str) -> Option<&'a str> {
+pub(super) fn message_body<'a>(subject: &str, body: &'a str) -> Option<&'a str> {
     let body = body.trim();
     let rest = body.strip_prefix(subject).unwrap_or(body).trim();
     if rest.is_empty() { None } else { Some(rest) }
 }
 
-fn short_hash(hash: &str) -> &str {
+pub(super) fn short_hash(hash: &str) -> &str {
     &hash[..hash.len().min(7)]
 }
 
-fn short_hashes(parents: &[String]) -> String {
+pub(super) fn short_hashes(parents: &[String]) -> String {
     parents
         .iter()
         .map(|hash| short_hash(hash))
