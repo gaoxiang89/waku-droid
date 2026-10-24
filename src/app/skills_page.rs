@@ -72,6 +72,32 @@ pub(super) enum SkillsRow {
 impl Waku {
     // ── Catalog ────────────────────────────────────────────────────────────
 
+    pub(super) fn effective_skills_host(&self) -> waku_client::hosts::HostKey {
+        if self.hosts.get(&self.skills_settings_host).is_some() {
+            self.skills_settings_host.clone()
+        } else {
+            waku_client::hosts::HostKey::Local
+        }
+    }
+
+    pub(super) fn set_skills_settings_host(
+        &mut self,
+        key: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        if key == self.skills_settings_host || self.hosts.get(&key).is_none() {
+            return;
+        }
+        self.skills_settings_host = key;
+        self.skills_selected = None;
+        self.skills_delete_arming = None;
+        self.skills_detail_scroll.set_offset(gpui::Point::default());
+        self.skills_scan_generation += 1;
+        self.skills_scan_pending = false;
+        self.ensure_skills_catalog(true, cx);
+        cx.notify();
+    }
+
     /// Start a background library scan unless a current-enough catalog (or an
     /// in-flight scan) already covers it. Results from superseded scans are
     /// discarded by generation.
@@ -79,7 +105,9 @@ impl Waku {
         if self.skills_scan_pending {
             return;
         }
+        let host = self.effective_skills_host();
         let fresh = self.skills_catalog.is_some()
+            && self.skills_catalog_host.as_ref() == Some(&host)
             && self
                 .skills_scanned_at
                 .is_some_and(|scanned| scanned.elapsed() < SKILLS_RESCAN_AFTER);
@@ -89,8 +117,12 @@ impl Waku {
         self.skills_scan_pending = true;
         self.skills_scan_generation += 1;
         let generation = self.skills_scan_generation;
-        let projects = self.skill_scan_projects();
-        let daemon = self.daemon.client();
+        let projects = self.skill_scan_projects(&host);
+        let daemon = self
+            .hosts
+            .get(&host)
+            .map(|entry| entry.daemon.client())
+            .unwrap_or_else(|| self.daemon.client());
         cx.spawn(async move |this, cx| {
             let catalog = cx
                 .background_executor()
@@ -115,6 +147,7 @@ impl Waku {
                 match catalog {
                     Ok(catalog) => {
                         this.skills_catalog = Some(Rc::new(catalog));
+                        this.skills_catalog_host = Some(host);
                         this.skills_scanned_at = Some(Instant::now());
                     }
                     Err(error) => this.show_toast(error.to_string()),
@@ -134,13 +167,15 @@ impl Waku {
         self.ensure_skills_catalog(true, cx);
     }
 
-    /// `(display name, path)` per scannable project. Projectless workspaces
-    /// are generated directories that never hold curated skills.
-    fn skill_scan_projects(&self) -> Vec<(String, PathBuf)> {
+    /// `(display name, path)` per scannable project on `host`. Projectless
+    /// workspaces are generated directories that never hold curated skills.
+    fn skill_scan_projects(&self, host: &waku_client::hosts::HostKey) -> Vec<(String, PathBuf)> {
         self.state
             .projects
             .iter()
-            .filter(|project| !project.is_projectless())
+            .filter(|project| {
+                !project.is_projectless() && &self.hosts.ownership.project(project.id) == host
+            })
             .map(|project| (project.display_name(), project.path.clone()))
             .collect()
     }
@@ -193,7 +228,12 @@ impl Waku {
         }
         self.skills_scan_generation += 1;
         self.skills_scan_pending = false;
-        let daemon = self.daemon.client();
+        let host = self.effective_skills_host();
+        let daemon = self
+            .hosts
+            .get(&host)
+            .map(|entry| entry.daemon.client())
+            .unwrap_or_else(|| self.daemon.client());
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -257,7 +297,12 @@ impl Waku {
         self.skills_delete_arming = None;
         self.skills_scan_generation += 1;
         self.skills_scan_pending = false;
-        let daemon = self.daemon.client();
+        let host = self.effective_skills_host();
+        let daemon = self
+            .hosts
+            .get(&host)
+            .map(|entry| entry.daemon.client())
+            .unwrap_or_else(|| self.daemon.client());
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -338,19 +383,47 @@ impl Waku {
 
     pub(super) fn render_skills_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
-        let catalog = self.skills_catalog.clone();
+        let host = self.effective_skills_host();
+        let host_tabs = self
+            .render_settings_host_tabs("skills", &host, &theme, cx, Self::set_skills_settings_host)
+            .map(|tabs| {
+                div()
+                    .px(px(18.0))
+                    .pt(px(14.0))
+                    .pb(px(10.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(tabs)
+            });
+        let catalog = self
+            .skills_catalog
+            .clone()
+            .filter(|_| self.skills_catalog_host.as_ref() == Some(&host));
         let query = self.skills_search.read(cx).content().trim().to_lowercase();
 
         let Some(catalog) = catalog else {
             // The startup prefetch makes this a first-frames-only state.
             return div()
                 .size_full()
-                .pt(px(12.0))
-                .child(skills_status_row(&theme, tr!("skills.scanning")))
+                .flex()
+                .flex_col()
+                .when_some(host_tabs, |element, tabs| element.child(tabs))
+                .child(
+                    div()
+                        .size_full()
+                        .pt(px(12.0))
+                        .child(skills_status_row(&theme, tr!("skills.scanning"))),
+                )
                 .into_any_element();
         };
         if catalog.skills.is_empty() {
-            return skills_empty_state(&theme).into_any_element();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .when_some(host_tabs, |element, tabs| element.child(tabs))
+                .child(div().flex_1().min_h_0().child(skills_empty_state(&theme)))
+                .into_any_element();
         }
 
         let indices = self.visible_skill_indices(&catalog, &query);
@@ -393,8 +466,16 @@ impl Waku {
             .size_full()
             .min_h_0()
             .flex()
-            .child(self.render_skills_list_column(&catalog, &query, &rows, &theme, cx))
-            .child(div().flex_1().min_w_0().flex().flex_col().child(detail))
+            .flex_col()
+            .when_some(host_tabs, |element, tabs| element.child(tabs))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.render_skills_list_column(&catalog, &query, &rows, &theme, cx))
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(detail)),
+            )
             .into_any_element()
     }
 
@@ -989,7 +1070,9 @@ impl Waku {
         .on_click(cx.listener({
             let skill_file = skill_file.clone();
             move |this, _, _, cx| {
-                if this.daemon.is_remote() {
+                if this.effective_skills_host() != waku_client::hosts::HostKey::Local
+                    || this.daemon.is_remote()
+                {
                     this.show_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {
@@ -1006,7 +1089,9 @@ impl Waku {
         .on_click(cx.listener({
             let skill_file = skill_file.clone();
             move |this, _, _, cx| {
-                if this.daemon.is_remote() {
+                if this.effective_skills_host() != waku_client::hosts::HostKey::Local
+                    || this.daemon.is_remote()
+                {
                     this.show_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {

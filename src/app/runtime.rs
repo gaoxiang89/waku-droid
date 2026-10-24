@@ -1369,6 +1369,13 @@ impl Waku {
         self.workspace_path_for_session(session)
     }
 
+    pub(super) fn selected_panel_scope(&self) -> Option<PanelScope> {
+        Some(PanelScope {
+            host: self.selected_host_key(),
+            workspace: self.selected_workspace_path()?.to_path_buf(),
+        })
+    }
+
     /// The panel scope a session belongs to: its host plus the directory its
     /// panels read. Sessions opening into the same directory share Files,
     /// Terminal, and GitGraph state; a materialized worktree is its own

@@ -58,6 +58,30 @@ impl Waku {
         cx.notify();
     }
 
+    pub(super) fn effective_usage_host(&self) -> waku_client::hosts::HostKey {
+        if self.hosts.get(&self.usage_settings_host).is_some() {
+            self.usage_settings_host.clone()
+        } else {
+            waku_client::hosts::HostKey::Local
+        }
+    }
+
+    pub(super) fn set_usage_settings_host(
+        &mut self,
+        key: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        if key == self.usage_settings_host || self.hosts.get(&key).is_none() {
+            return;
+        }
+        self.usage_settings_host = key;
+        self.usage_chart_hover = None;
+        self.usage_months_scroll.set_offset(gpui::Point::default());
+        self.usage_projects_list.reset(0);
+        self.ensure_usage_history(true, cx);
+        cx.notify();
+    }
+
     /// The scan window the active view needs: the statement view always
     /// covers a year of calendar months; the daily and project views share
     /// the trailing-days selector.
@@ -73,31 +97,38 @@ impl Waku {
     /// is the refresh button. Results from superseded scans are discarded by
     /// generation, so a window change mid-scan cannot land stale data.
     pub(super) fn ensure_usage_history(&mut self, force: bool, cx: &mut Context<Self>) {
+        let host = self.effective_usage_host();
         let window = self.effective_usage_window();
         let satisfied = self
             .usage_history
             .as_ref()
             .is_some_and(|history| history.window == window)
+            && self.usage_history_host.as_ref() == Some(&host)
             && self
                 .usage_history_scanned_at
                 .is_some_and(|scanned| scanned.elapsed() < USAGE_RESCAN_AFTER);
         // A scan for this window already inbound absorbs even a forced
         // refresh — it only just started reading the same files, and a
         // duplicate would burn a background pass to produce the same answer.
-        if self.usage_history_pending_for == Some(window) {
+        if self.usage_history_pending_for.as_ref() == Some(&(host.clone(), window)) {
             return;
         }
         if !force && satisfied {
             return;
         }
-        self.usage_history_pending_for = Some(window);
+        self.usage_history_pending_for = Some((host.clone(), window));
         self.usage_history_generation += 1;
         let generation = self.usage_history_generation;
-        let daemon = self.daemon.client();
+        let daemon = self
+            .hosts
+            .get(&host)
+            .map(|entry| entry.daemon.client())
+            .unwrap_or_else(|| self.daemon.client());
         let project_roots: Vec<PathBuf> = self
             .state
             .projects
             .iter()
+            .filter(|project| &self.hosts.ownership.project(project.id) == &host)
             .map(|project| project.path.clone())
             .collect();
         cx.spawn(async move |this, cx| {
@@ -128,6 +159,7 @@ impl Waku {
                 match history {
                     Ok(history) => {
                         this.usage_history_scanned_at = Some(Instant::now());
+                        this.usage_history_host = Some(host);
                         this.usage_history = Some(history);
                     }
                     Err(error) => this.show_toast(error.to_string()),
@@ -160,6 +192,10 @@ impl Waku {
 
     pub(super) fn render_usage_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
+        let host = self.effective_usage_host();
+        let host_tabs = self
+            .render_settings_host_tabs("usage", &host, &theme, cx, Self::set_usage_settings_host)
+            .map(|tabs| tabs.mt(px(10.0)).mb(px(4.0)));
         let pending = self.usage_history_pending_for.is_some();
         let expected = self.effective_usage_window();
         // A snapshot of the other shape (statement months vs trailing days)
@@ -169,13 +205,17 @@ impl Waku {
         // replacement scans: the range caption names what is actually shown,
         // and swapping to a spinner on every window click would blink away a
         // page that is still substantially right.
-        let history = self.usage_history.as_ref().filter(|history| {
-            matches!(
-                (history.window, expected),
-                (UsageWindow::TrailingDays(_), UsageWindow::TrailingDays(_))
-                    | (UsageWindow::Months(_), UsageWindow::Months(_))
-            )
-        });
+        let history = self
+            .usage_history
+            .as_ref()
+            .filter(|_| self.usage_history_host.as_ref() == Some(&host))
+            .filter(|history| {
+                matches!(
+                    (history.window, expected),
+                    (UsageWindow::TrailingDays(_), UsageWindow::TrailingDays(_))
+                        | (UsageWindow::Months(_), UsageWindow::Months(_))
+                )
+            });
         let range = history
             .map(|history| (history.since_day, history.until_day))
             .unwrap_or_else(|| expected.bounds(Local::now().date_naive()));
@@ -194,6 +234,7 @@ impl Waku {
                     element.flex_1().min_h_0().pb(px(16.0))
                 },
             )
+            .when_some(host_tabs, |element, tabs| element.child(tabs))
             .child(self.render_usage_header(range, pending, &theme, cx));
 
         let Some(history) = history else {

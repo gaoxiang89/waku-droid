@@ -682,45 +682,49 @@ fn push_file_reference_run(mut run: InlineRun, pieces: &mut Vec<InlinePiece>) {
     pieces.push(InlinePiece::Run(run));
 }
 
-fn positive_number(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-        && value.parse::<usize>().is_ok_and(|value| value > 0)
+fn positive_usize(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
-fn line_fragment(fragment: &str) -> bool {
-    let Some(location) = fragment.strip_prefix('L') else {
-        return false;
-    };
+fn parse_line_fragment(fragment: &str) -> Option<(usize, Option<usize>)> {
+    let location = fragment.strip_prefix('L')?;
     match location.split_once('C') {
-        Some((line, column)) => positive_number(line) && positive_number(column),
-        None => positive_number(location),
+        Some((line, column)) => Some((positive_usize(line)?, Some(positive_usize(column)?))),
+        None => Some((positive_usize(location)?, None)),
+    }
+}
+
+/// Splits the `:line`, `:line:column`, or `#LlineCcolumn` suffix providers
+/// attach to file references into `(path, Some((line, column)))`.
+pub(crate) fn parse_file_location(target: &str) -> (&str, Option<(usize, Option<usize>)>) {
+    if let Some((path, fragment)) = target.rsplit_once('#')
+        && let Some(location) = parse_line_fragment(fragment)
+    {
+        return (path, Some(location));
+    }
+
+    let Some((before_last, last)) = target.rsplit_once(':') else {
+        return (target, None);
+    };
+    let Some(last_num) = positive_usize(last) else {
+        return (target, None);
+    };
+    if let Some((path, line)) = before_last.rsplit_once(':')
+        && let Some(line_num) = positive_usize(line)
+    {
+        (path, Some((line_num, Some(last_num))))
+    } else {
+        (before_last, Some((last_num, None)))
     }
 }
 
 /// Removes the `:line`, `:line:column`, or `#LlineCcolumn` suffixes providers
-/// attach to file references. The location is not yet consumed by the editor,
-/// but it must not become part of the filesystem path.
+/// attach to file references.
 pub(crate) fn strip_file_location(target: &str) -> &str {
-    if let Some((path, fragment)) = target.rsplit_once('#')
-        && line_fragment(fragment)
-    {
-        return path;
-    }
-
-    let Some((before_last, last)) = target.rsplit_once(':') else {
-        return target;
-    };
-    if !positive_number(last) {
-        return target;
-    }
-    if let Some((path, line)) = before_last.rsplit_once(':')
-        && positive_number(line)
-    {
-        path
-    } else {
-        before_last
-    }
+    parse_file_location(target).0
 }
 
 /// The file reference inside `text`, when the whole span is one path.
@@ -1554,5 +1558,26 @@ mod tests {
         let mut parser = IncrementalParser::new();
         parser.set_text("```rust\nlet a = **b;\n");
         assert_eq!(parser.display_tree(), *parser.tree());
+    }
+
+    #[test]
+    fn parse_file_location_extracts_line_and_column_suffixes() {
+        assert_eq!(
+            parse_file_location("src/app.rs:120"),
+            ("src/app.rs", Some((120, None)))
+        );
+        assert_eq!(
+            parse_file_location("src/app.rs:120:8"),
+            ("src/app.rs", Some((120, Some(8))))
+        );
+        assert_eq!(
+            parse_file_location("src/app.rs#L42"),
+            ("src/app.rs", Some((42, None)))
+        );
+        assert_eq!(
+            parse_file_location("src/app.rs#L42C10"),
+            ("src/app.rs", Some((42, Some(10))))
+        );
+        assert_eq!(parse_file_location("src/app.rs"), ("src/app.rs", None));
     }
 }

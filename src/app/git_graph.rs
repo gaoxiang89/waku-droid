@@ -86,60 +86,53 @@ struct GitGraphRowContext {
 }
 
 impl Waku {
-    pub(super) fn clear_git_graph_cache(&mut self) {
-        self.git_graph_snapshots.clear();
-        self.git_commit_details.clear();
-        self.git_graph_limits.clear();
-        self.visible_git_graph = None;
-        self.git_graph_cursor = None;
-        self.git_graph_matches = None;
-        self.git_graph_ui.clear();
-    }
-
     fn refresh_git_graph(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.selected_workspace_path() {
-            let path = path.to_path_buf();
-            self.git_graph_snapshots.invalidate(&path);
+        if let Some(scope) = self.selected_panel_scope() {
+            self.git_graph_snapshots.invalidate(&scope);
         }
         cx.notify();
     }
 
     fn load_more_git_graph(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return;
         };
-        let limit = self.git_graph_limits.entry(path.clone()).or_insert(PAGE);
+        let limit = self.git_graph_limits.entry(scope.clone()).or_insert(PAGE);
         if *limit >= MAX_LIMIT {
             return;
         }
         *limit = limit.saturating_add(PAGE).min(MAX_LIMIT);
-        self.git_graph_snapshots.invalidate(&path);
+        self.git_graph_snapshots.invalidate(&scope);
         cx.notify();
     }
 
-    fn git_graph_page_limit(&self, path: &Path) -> u32 {
-        self.git_graph_limits.get(path).copied().unwrap_or(PAGE)
+    fn git_graph_page_limit(&self, scope: &PanelScope) -> u32 {
+        self.git_graph_limits.get(scope).copied().unwrap_or(PAGE)
     }
 
-    fn git_graph_cursor_in(&self, path: &Path) -> Option<usize> {
+    fn git_graph_cursor_in(&self, scope: &PanelScope) -> Option<usize> {
         self.git_graph_cursor
             .as_ref()
-            .filter(|(cursor_path, _)| cursor_path == path)
+            .filter(|(cursor_scope, _)| cursor_scope == scope)
             .map(|(_, index)| *index)
     }
 
     fn selected_git_graph_cursor(&self) -> Option<usize> {
-        self.git_graph_cursor_in(self.selected_workspace_path()?)
+        self.git_graph_cursor_in(&self.selected_panel_scope()?)
     }
 
     /// Carry the selection from the snapshot on screen to one that just
     /// arrived for the same workspace.
-    fn remap_git_graph_cursor(&mut self, path: &Path, next: &waku_client::git::GitGraphSnapshot) {
-        let Some(index) = self.git_graph_cursor_in(path) else {
+    fn remap_git_graph_cursor(
+        &mut self,
+        scope: &PanelScope,
+        next: &waku_client::git::GitGraphSnapshot,
+    ) {
+        let Some(index) = self.git_graph_cursor_in(scope) else {
             return;
         };
         let previous = match &self.visible_git_graph {
-            Some((visible, snapshot)) if visible == path => Arc::clone(snapshot),
+            Some((visible, snapshot)) if visible == scope => Arc::clone(snapshot),
             _ => {
                 self.git_graph_cursor = None;
                 return;
@@ -147,55 +140,59 @@ impl Waku {
         };
         self.git_graph_cursor = git_graph_row_key(&previous, index)
             .and_then(|key| git_graph_row_index(next, &key))
-            .map(|index| (path.to_path_buf(), index));
+            .map(|index| (scope.clone(), index));
     }
 
     /// The graph for the selected workspace. A miss starts one daemon fetch.
     fn git_graph_view(&mut self, cx: &mut Context<Self>) -> GitGraphView {
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return GitGraphView::NoProject;
         };
-        let limit = self.git_graph_page_limit(&path);
-        let read = match self.git_graph_snapshots.read(&path) {
+        let limit = self.git_graph_page_limit(&scope);
+        let read = match self.git_graph_snapshots.read(&scope) {
             Query::Ready(value) => Some(value),
             Query::Pending => None,
             Query::Missing(token) => {
-                self.spawn_git_graph(path.clone(), limit, token, cx);
+                self.spawn_git_graph(scope.clone(), limit, token, cx);
                 None
             }
         };
         if let Some(value) = read {
             return match value.as_ref() {
                 Ok(Some(snapshot)) => {
-                    self.visible_git_graph = Some((path, Arc::clone(snapshot)));
+                    self.visible_git_graph = Some((scope, Arc::clone(snapshot)));
                     GitGraphView::Ready(Arc::clone(snapshot))
                 }
                 Ok(None) => GitGraphView::NotARepository,
-                Err(error) => self.stale_or_error(&path, error),
+                Err(error) => self.stale_or_error(&scope, error),
             };
         }
-        self.stale_or_loading(&path)
+        self.stale_or_loading(&scope)
     }
 
-    fn stale_or_error(&self, path: &Path, error: &str) -> GitGraphView {
+    fn stale_or_error(&self, scope: &PanelScope, error: &str) -> GitGraphView {
         match &self.visible_git_graph {
-            Some((cached, snapshot)) if cached == path => GitGraphView::Ready(Arc::clone(snapshot)),
+            Some((cached, snapshot)) if cached == scope => {
+                GitGraphView::Ready(Arc::clone(snapshot))
+            }
             _ => GitGraphView::Error(error.to_owned()),
         }
     }
 
-    fn stale_or_loading(&self, path: &Path) -> GitGraphView {
+    fn stale_or_loading(&self, scope: &PanelScope) -> GitGraphView {
         match &self.visible_git_graph {
-            Some((cached, snapshot)) if cached == path => GitGraphView::Ready(Arc::clone(snapshot)),
+            Some((cached, snapshot)) if cached == scope => {
+                GitGraphView::Ready(Arc::clone(snapshot))
+            }
             _ => GitGraphView::Loading,
         }
     }
 
     fn spawn_git_graph(
         &self,
-        path: PathBuf,
+        scope: PanelScope,
         limit: u32,
-        token: crate::query::FetchToken<PathBuf>,
+        token: crate::query::FetchToken<PanelScope>,
         cx: &mut Context<Self>,
     ) {
         let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
@@ -203,7 +200,7 @@ impl Waku {
             let result = cx
                 .background_executor()
                 .spawn({
-                    let path = path.clone();
+                    let path = scope.workspace.clone();
                     async move {
                         match workspace.request(waku_client::WorkspaceOperation::InspectGitGraph {
                             cwd: path,
@@ -225,9 +222,9 @@ impl Waku {
                     return;
                 }
                 if let Ok(Some(snapshot)) = &result {
-                    waku.remap_git_graph_cursor(&path, snapshot);
-                    waku.invalidate_git_graph_uncommitted_diffs(&path);
-                    waku.visible_git_graph = Some((path, Arc::clone(snapshot)));
+                    waku.remap_git_graph_cursor(&scope, snapshot);
+                    waku.invalidate_git_graph_uncommitted_diffs(&scope);
+                    waku.visible_git_graph = Some((scope, Arc::clone(snapshot)));
                 }
                 cx.notify();
             });
@@ -240,13 +237,13 @@ impl Waku {
         hash: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<Result<waku_client::git::GitCommitDetail, String>>> {
-        let path = self.selected_workspace_path()?.to_path_buf();
-        let key = (path.clone(), hash.to_owned());
+        let scope = self.selected_panel_scope()?;
+        let key = (scope.clone(), hash.to_owned());
         match self.git_commit_details.read(&key) {
             Query::Ready(value) => Some(value),
             Query::Pending => None,
             Query::Missing(token) => {
-                self.spawn_git_commit_detail(path, hash.to_owned(), token, cx);
+                self.spawn_git_commit_detail(scope, hash.to_owned(), token, cx);
                 None
             }
         }
@@ -254,9 +251,9 @@ impl Waku {
 
     fn spawn_git_commit_detail(
         &self,
-        path: PathBuf,
+        scope: PanelScope,
         hash: String,
-        token: crate::query::FetchToken<(PathBuf, String)>,
+        token: crate::query::FetchToken<(PanelScope, String)>,
         cx: &mut Context<Self>,
     ) {
         let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
@@ -264,7 +261,7 @@ impl Waku {
             let result = cx
                 .background_executor()
                 .spawn({
-                    let path = path.clone();
+                    let path = scope.workspace.clone();
                     let hash = hash.clone();
                     async move {
                         match workspace.request(waku_client::WorkspaceOperation::InspectGitCommit {
@@ -305,22 +302,22 @@ impl Waku {
     }
 
     fn selected_git_graph_row_count(&self) -> Option<usize> {
-        let selected = self.selected_workspace_path()?;
+        let selected = self.selected_panel_scope()?;
         self.visible_git_graph
             .as_ref()
-            .filter(|(path, _)| path == selected)
+            .filter(|(scope, _)| scope == &selected)
             .map(|(_, snapshot)| git_graph_row_count(snapshot))
     }
 
     pub(super) fn focus_git_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return;
         };
-        if self.git_graph_cursor_in(&path) != Some(index) {
+        if self.git_graph_cursor_in(&scope) != Some(index) {
             self.git_graph_detail_scroll
                 .set_offset(point(px(0.0), px(0.0)));
         }
-        self.git_graph_cursor = Some((path, index));
+        self.git_graph_cursor = Some((scope, index));
         self.git_graph_list_state.scroll_to_reveal_item(index);
         cx.notify();
     }
@@ -480,6 +477,26 @@ impl Waku {
                 )
             })
             .child(
+                icon_button("git-graph-fetch", "icons/download.svg", *theme)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .tooltip(Tooltip::text(tr!("git_graph.fetch")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.run_git_graph_action(waku_client::git::GitGraphAction::Fetch, cx);
+                    })),
+            )
+            .child(
+                icon_button("git-graph-pull", "icons/arrow-down.svg", *theme)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .tooltip(Tooltip::text(tr!("git_graph.pull")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.run_git_graph_action(waku_client::git::GitGraphAction::Pull, cx);
+                    })),
+            )
+            .child(
                 icon_button("git-graph-refresh", "icons/rotate-cw.svg", *theme)
                     .track_focus(&refresh_focus)
                     .tab_index(0)
@@ -506,31 +523,31 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let path = self
-            .selected_workspace_path()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        let scope = self.selected_panel_scope().unwrap_or_else(|| PanelScope {
+            host: waku_client::hosts::HostKey::Local,
+            workspace: PathBuf::new(),
+        });
         let rows = git_graph_row_count(&snapshot);
         if self
-            .git_graph_cursor_in(&path)
+            .git_graph_cursor_in(&scope)
             .is_some_and(|cursor| cursor >= rows)
         {
             self.git_graph_cursor = None;
         }
-        let same_path = self.git_graph_list_path.as_deref() == Some(path.as_path());
+        let same_path = self.git_graph_list_path.as_ref() == Some(&scope);
         if self.git_graph_list_rows != rows || !same_path {
             // A reset scrolls to the top; keep the reader's place when the
             // same history only grew or shrank (load more, a new commit).
             let keep = same_path.then(|| self.git_graph_list_state.logical_scroll_top());
             self.git_graph_list_rows = rows;
-            self.git_graph_list_path = Some(path.clone());
+            self.git_graph_list_path = Some(scope.clone());
             self.git_graph_list_state
                 .reset_with_uniform_height(rows, px(ROW_HEIGHT));
             if let Some(top) = keep {
                 self.git_graph_list_state.scroll_to(top);
             }
         }
-        let cursor = self.git_graph_cursor_in(&path);
+        let cursor = self.git_graph_cursor_in(&scope);
         let head = snapshot
             .head_row
             .and_then(|row| snapshot.rows.get(row as usize));
@@ -601,7 +618,7 @@ impl Waku {
         if let Some(cursor) = cursor {
             body = body.child(self.render_git_graph_detail(cursor, &snapshot, theme, cx));
         }
-        if snapshot.truncated && self.git_graph_page_limit(&path) < MAX_LIMIT {
+        if snapshot.truncated && self.git_graph_page_limit(&scope) < MAX_LIMIT {
             body = body.child(self.render_git_graph_load_more(theme, cx));
         }
         body

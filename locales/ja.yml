@@ -46,6 +46,7 @@ command_palette.sessions: ターミナルセッション
 command_palette.providers: プロバイダー
 command_palette.commands: コマンド
 command_palette.settings: 設定
+command_palette.files: ファイル
 command_palette.new_task: 新規タスク
 command_palette.resume: 再開…
 command_palette.change_provider: プロバイダーを変更
@@ -810,6 +811,10 @@ git_graph.empty: コミットがありません
 git_graph.empty_description: このリポジトリにはまだコミットがありません
 git_graph.error: Git グラフを読み取れませんでした
 git_graph.refresh: 更新
+git_graph.fetch: フェッチ
+git_graph.pull: プル
+git_graph.staged_badge: ステージ済
+git_graph.unstaged_badge: 未ステージ
 git_graph.search: コミットを絞り込む
 git_graph.load_more: さらにコミットを読み込む
 git_graph.copy_hash: コミットハッシュをコピー
@@ -847,6 +852,11 @@ git_graph.menu.reset_mixed: Mixed — 作業ツリーを保持
 git_graph.menu.reset_hard: Hard — すべての変更を破棄…
 git_graph.menu.reset_confirm: リセット
 git_graph.menu.stash: すべての変更をスタッシュ
+git_graph.menu.stash_pop: 最新のスタッシュを適用して削除（Pop）
+git_graph.menu.open_file: ファイルを開く
+git_graph.menu.stage_file: 変更をステージ
+git_graph.menu.unstage_file: ステージを解除
+git_graph.menu.discard_file: ファイルの変更を破棄…
 git_graph.menu.discard: すべての変更を破棄…
 git_graph.menu.discard_confirm: 破棄
 git_graph.menu.checkout_branch: ブランチをチェックアウト
@@ -883,6 +893,8 @@ git_graph.dialog.reset_hard_title: ハードリセット
 git_graph.dialog.reset_hard_message: "現在のブランチを %{target} に移動し、未コミットの変更をすべて破棄しますか？元に戻せません。"
 git_graph.dialog.discard_title: すべての変更を破棄
 git_graph.dialog.discard_message: 追跡ファイルを HEAD に戻し、未追跡ファイルを削除しますか？無視されたファイルは残ります。元に戻せません。
+git_graph.dialog.discard_file_title: ファイルの変更を破棄
+git_graph.dialog.discard_file_message: "「%{name}」の未コミットの変更をすべて破棄しますか？元に戻せません。"
 git_graph.done.checked_out: チェックアウトしました
 git_graph.done.branch_created: "ブランチ %{name} を作成しました"
 git_graph.done.branch_renamed: "ブランチ名を %{name} に変更しました"
@@ -896,6 +908,12 @@ git_graph.done.cherry_picked: チェリーピックしました
 git_graph.done.reverted: リバートしました
 git_graph.done.reset: ブランチをリセットしました
 git_graph.done.stashed: 変更をスタッシュしました
+git_graph.done.stash_popped: スタッシュを適用しました
+git_graph.done.fetched: リモートからフェッチしました
+git_graph.done.pulled: 最新の変更をプルしました
+git_graph.done.file_staged: "%{name} をステージしました"
+git_graph.done.file_unstaged: "%{name} のステージを解除しました"
+git_graph.done.file_discarded: "%{name} の変更を破棄しました"
 git_graph.done.discarded: 変更を破棄しました
 bottom_panel.toggle: 下パネルの表示を切り替える
 bottom_panel.resize: 下パネルの高さを変更
@@ -991,6 +1009,14 @@ files.delete_confirm_message: "「%{name}」は完全に削除されます。こ
 files.delete_confirm_message_dir: "「%{name}」とその中身すべてが完全に削除されます。この操作は元に戻せません。"
 files.delete_failed: "%{path} を削除できませんでした：%{error}"
 files.rename_failed: "%{path} の名前を変更できませんでした：%{error}"
+files.create_failed: "%{path} を作成できませんでした：%{error}"
+files.new_file: 新規ファイル…
+files.new_folder: 新規フォルダ…
+files.new_file_placeholder: ファイル名…
+files.new_folder_placeholder: フォルダ名…
+files.copy_path: パスをコピー
+files.copy_relative_path: 相対パスをコピー
+files.path_copied: パスをコピーしました
 files.invalid_name: "名前を空にすること、パス区切り文字を含めることはできません"
 files.preview_markdown: Markdown をプレビュー
 files.edit_markdown_source: ソースを編集

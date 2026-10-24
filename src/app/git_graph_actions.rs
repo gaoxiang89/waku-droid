@@ -45,21 +45,21 @@ pub(super) struct InlineDiff {
     truncated: bool,
 }
 
-type FileDiffKey = (PathBuf, GitDiffSpec, String);
+type FileDiffKey = (PanelScope, GitDiffSpec, String);
 
 pub(super) struct GitGraphUi {
     /// Files opened in the detail pane, for the diff spec in `expanded_spec`.
     /// Selecting something else closes them.
     expanded: HashSet<String>,
-    expanded_spec: Option<(PathBuf, GitDiffSpec)>,
+    expanded_spec: Option<(PanelScope, GitDiffSpec)>,
     file_diffs: QueryCache<FileDiffKey, Result<InlineDiff, String>>,
     /// The last diff drawn per expanded file, kept while an uncommitted diff
     /// refetches so the pane does not flash a loading line on every refresh.
     shown_diffs: HashMap<String, Arc<Result<InlineDiff, String>>>,
-    compare_files: QueryCache<(PathBuf, String, String), Result<Vec<GitGraphFile>, String>>,
+    compare_files: QueryCache<(PanelScope, String, String), Result<Vec<GitGraphFile>, String>>,
     /// Second commit picked with the primary modifier; the detail pane then
     /// compares it with the selected row.
-    compare: Option<(PathBuf, String)>,
+    compare: Option<(PanelScope, String)>,
     dialog: Option<GitGraphDialog>,
     name_input: Entity<TextInput>,
     message_input: Entity<TextInput>,
@@ -99,13 +99,27 @@ impl GitGraphUi {
         }
     }
 
-    pub(super) fn clear(&mut self) {
-        self.expanded.clear();
-        self.expanded_spec = None;
-        self.file_diffs.clear();
-        self.shown_diffs.clear();
-        self.compare_files.clear();
-        self.compare = None;
+    pub(super) fn retain_host(&mut self, keep_host: impl Fn(&waku_client::hosts::HostKey) -> bool) {
+        if self
+            .expanded_spec
+            .as_ref()
+            .is_some_and(|(scope, _)| !keep_host(&scope.host))
+        {
+            self.expanded.clear();
+            self.expanded_spec = None;
+            self.shown_diffs.clear();
+        }
+        self.file_diffs
+            .retain(|(scope, _, _)| keep_host(&scope.host));
+        self.compare_files
+            .retain(|(scope, _, _)| keep_host(&scope.host));
+        if self
+            .compare
+            .as_ref()
+            .is_some_and(|(scope, _)| !keep_host(&scope.host))
+        {
+            self.compare = None;
+        }
     }
 
     pub(super) fn pending(&self) -> bool {
@@ -183,12 +197,12 @@ impl Waku {
         }
         let position = index - usize::from(uncommitted);
         let commit = snapshot.commits.get(position)?;
-        let path = self.selected_workspace_path()?;
+        let scope = self.selected_panel_scope()?;
         let other = self
             .git_graph_ui
             .compare
             .as_ref()
-            .filter(|(compare_path, hash)| compare_path == path && *hash != commit.hash)
+            .filter(|(compare_scope, hash)| compare_scope == &scope && *hash != commit.hash)
             .and_then(|(_, hash)| {
                 snapshot
                     .commits
@@ -212,24 +226,24 @@ impl Waku {
     }
 
     pub(super) fn git_graph_compare_hash(&self) -> Option<&str> {
-        let path = self.selected_workspace_path()?;
+        let scope = self.selected_panel_scope()?;
         self.git_graph_ui
             .compare
             .as_ref()
-            .filter(|(compare_path, _)| compare_path == path)
+            .filter(|(compare_scope, _)| compare_scope == &scope)
             .map(|(_, hash)| hash.as_str())
     }
 
     /// Primary-modifier click: compare `hash` with the selected row, or drop
     /// the comparison when the same commit is picked again.
     pub(super) fn toggle_git_graph_compare(&mut self, hash: String, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return;
         };
         if self.git_graph_compare_hash() == Some(hash.as_str()) {
             self.git_graph_ui.compare = None;
         } else {
-            self.git_graph_ui.compare = Some((path, hash));
+            self.git_graph_ui.compare = Some((scope, hash));
         }
         self.git_graph_detail_scroll
             .set_offset(point(px(0.0), px(0.0)));
@@ -242,19 +256,20 @@ impl Waku {
 
     fn git_graph_compare_files(
         &mut self,
-        path: &Path,
+        scope: &PanelScope,
         from: &str,
         to: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<Result<Vec<GitGraphFile>, String>>> {
-        let key = (path.to_path_buf(), from.to_owned(), to.to_owned());
+        let key = (scope.clone(), from.to_owned(), to.to_owned());
         match self.git_graph_ui.compare_files.read(&key) {
             Query::Ready(value) => Some(value),
             Query::Pending => None,
             Query::Missing(token) => {
                 let workspace =
                     waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
-                let (cwd, from, to) = key;
+                let (scope, from, to) = key;
+                let cwd = scope.workspace;
                 cx.spawn(async move |waku, cx| {
                     let result = cx
                         .background_executor()
@@ -291,16 +306,16 @@ impl Waku {
 
     /// Called once per detail render: a different spec closes every file
     /// opened for the previous one.
-    fn sync_git_graph_expanded(&mut self, path: &Path, spec: &GitDiffSpec) {
+    fn sync_git_graph_expanded(&mut self, scope: &PanelScope, spec: &GitDiffSpec) {
         let current = self
             .git_graph_ui
             .expanded_spec
             .as_ref()
-            .is_some_and(|(expanded_path, expanded)| expanded_path == path && expanded == spec);
+            .is_some_and(|(expanded_scope, expanded)| expanded_scope == scope && expanded == spec);
         if !current {
             self.git_graph_ui.expanded.clear();
             self.git_graph_ui.shown_diffs.clear();
-            self.git_graph_ui.expanded_spec = Some((path.to_path_buf(), spec.clone()));
+            self.git_graph_ui.expanded_spec = Some((scope.clone(), spec.clone()));
         }
     }
 
@@ -315,17 +330,17 @@ impl Waku {
 
     /// A fresh graph means the working tree may have moved; refetch the
     /// uncommitted diffs that are open. Commit diffs never change.
-    pub(super) fn invalidate_git_graph_uncommitted_diffs(&mut self, path: &Path) {
-        let Some((expanded_path, GitDiffSpec::Uncommitted)) = &self.git_graph_ui.expanded_spec
+    pub(super) fn invalidate_git_graph_uncommitted_diffs(&mut self, scope: &PanelScope) {
+        let Some((expanded_scope, GitDiffSpec::Uncommitted)) = &self.git_graph_ui.expanded_spec
         else {
             return;
         };
-        if expanded_path != path {
+        if expanded_scope != scope {
             return;
         }
         for file in &self.git_graph_ui.expanded {
             self.git_graph_ui.file_diffs.invalidate(&(
-                path.to_path_buf(),
+                scope.clone(),
                 GitDiffSpec::Uncommitted,
                 file.clone(),
             ));
@@ -334,12 +349,12 @@ impl Waku {
 
     fn git_graph_file_diff(
         &mut self,
-        path: &Path,
+        scope: &PanelScope,
         spec: &GitDiffSpec,
         file: &GitGraphFile,
         cx: &mut Context<Self>,
     ) -> Option<Arc<Result<InlineDiff, String>>> {
-        let key = (path.to_path_buf(), spec.clone(), file.path.clone());
+        let key = (scope.clone(), spec.clone(), file.path.clone());
         let value = match self.git_graph_ui.file_diffs.read(&key) {
             Query::Ready(value) => Some(value),
             Query::Pending => None,
@@ -367,7 +382,8 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
-        let (cwd, spec, path) = key;
+        let (scope, spec, path) = key;
+        let cwd = scope.workspace;
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -420,13 +436,13 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return div().id("git-graph-detail-empty");
         };
         let Some(spec) = self.git_graph_detail_spec(index, snapshot) else {
             return div().id("git-graph-detail-empty");
         };
-        self.sync_git_graph_expanded(&path, &spec);
+        self.sync_git_graph_expanded(&scope, &spec);
         let expanded = !self.git_graph_ui.expanded.is_empty();
         let mut body = div()
             .id("git-graph-detail-scroll")
@@ -527,7 +543,10 @@ impl Waku {
                             .text_color(theme.text_tertiary)
                             .child(tr!("git_graph.compare_hint")),
                     );
-                match self.git_graph_compare_files(&path, from, to, cx).as_deref() {
+                match self
+                    .git_graph_compare_files(&scope, from, to, cx)
+                    .as_deref()
+                {
                     Some(Ok(files)) => Ok(Some(files.clone())),
                     Some(Err(error)) => Err(error.clone()),
                     None => Ok(None),
@@ -537,7 +556,7 @@ impl Waku {
 
         body = match files {
             Ok(Some(files)) => {
-                body.child(self.render_git_graph_files(&path, &spec, &files, theme, cx))
+                body.child(self.render_git_graph_files(&scope, &spec, &files, theme, cx))
             }
             Ok(None) => body.child(
                 div()
@@ -613,7 +632,7 @@ impl Waku {
 
     fn render_git_graph_files(
         &mut self,
-        path: &Path,
+        scope: &PanelScope,
         spec: &GitDiffSpec,
         files: &[GitGraphFile],
         theme: &Theme,
@@ -625,12 +644,20 @@ impl Waku {
                 .text_color(theme.text_tertiary)
                 .child(tr!("git_graph.no_files"));
         }
+        let uncommitted = matches!(spec, GitDiffSpec::Uncommitted);
         let mut list = div().flex().flex_col().gap(px(1.0)).min_w_0();
         for (position, file) in files.iter().enumerate() {
             let open = self.git_graph_ui.expanded.contains(&file.path);
-            list = list.child(self.render_git_graph_file_row(position, file, open, theme, cx));
+            list = list.child(self.render_git_graph_file_row(
+                position,
+                file,
+                open,
+                uncommitted,
+                theme,
+                cx,
+            ));
             if open {
-                let diff = self.git_graph_file_diff(path, spec, file, cx);
+                let diff = self.git_graph_file_diff(scope, spec, file, cx);
                 list = list.child(self.render_git_graph_inline_diff(position, diff, theme));
             }
         }
@@ -642,9 +669,10 @@ impl Waku {
         position: usize,
         file: &GitGraphFile,
         open: bool,
+        uncommitted: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         let color = match file.status {
             waku_client::git::GitGraphFileStatus::Added => theme.success,
             waku_client::git::GitGraphFileStatus::Deleted => theme.danger,
@@ -656,10 +684,24 @@ impl Waku {
             Some(old) => format!("{old} → {}", file.path),
             None => file.path.clone(),
         };
+        let stage_badge = if uncommitted && file.staged && file.unstaged {
+            Some((
+                format!(
+                    "{} · {}",
+                    tr!("git_graph.staged_badge"),
+                    tr!("git_graph.unstaged_badge")
+                ),
+                theme.warning,
+            ))
+        } else if uncommitted && file.staged {
+            Some((tr!("git_graph.staged_badge"), theme.success))
+        } else {
+            None
+        };
         let focus = self.transcript_control_focus(format!("git-graph-file-{position}"), cx);
         let click_path = file.path.clone();
         let key_path = file.path.clone();
-        div()
+        let row = div()
             .id(SharedString::from(format!("git-graph-file-{position}")))
             .track_focus(&focus)
             .tab_index(0)
@@ -707,6 +749,18 @@ impl Waku {
                     .truncate()
                     .child(label),
             )
+            .when_some(stage_badge, |element, (badge, badge_color)| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(4.0))
+                        .rounded(px(3.0))
+                        .bg(badge_color.opacity(0.14))
+                        .text_size(sp(10.0))
+                        .text_color(badge_color)
+                        .child(badge),
+                )
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_git_graph_file(click_path.clone(), cx);
             }))
@@ -718,7 +772,18 @@ impl Waku {
                     this.toggle_git_graph_file(key_path.clone(), cx);
                     cx.stop_propagation();
                 }
-            }))
+            }));
+
+        let menu = self.menu_handle(format!("git-graph-file-menu-{position}"), cx);
+        let weak = cx.entity().downgrade();
+        let menu_file = file.clone();
+        context_menu(
+            div().w_full().child(row),
+            SharedString::from(format!("git-graph-file-menu-{position}")),
+            &menu,
+            move |_| Waku::git_graph_file_menu(weak.clone(), &menu_file, uncommitted),
+        )
+        .into_any_element()
     }
 
     fn render_git_graph_inline_diff(
@@ -799,7 +864,7 @@ impl Waku {
         if self.git_graph_ui.pending {
             return;
         }
-        let Some(path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+        let Some(scope) = self.selected_panel_scope() else {
             return;
         };
         self.git_graph_ui.pending = true;
@@ -810,7 +875,7 @@ impl Waku {
             let result = cx
                 .background_executor()
                 .spawn({
-                    let path = path.clone();
+                    let path = scope.workspace.clone();
                     async move {
                         match workspace.request(
                             waku_client::WorkspaceOperation::RunGitGraphAction {
@@ -830,9 +895,9 @@ impl Waku {
                 match result {
                     Ok(snapshot) => {
                         match snapshot {
-                            Some(snapshot) => waku.apply_branch_change(&path, snapshot, cx),
+                            Some(snapshot) => waku.apply_branch_change(&scope, snapshot, cx),
                             None => {
-                                waku.git_graph_snapshots.invalidate(&path);
+                                waku.git_graph_snapshots.invalidate(&scope);
                                 waku.invalidate_workspace_queries(cx);
                             }
                         }
@@ -841,7 +906,7 @@ impl Waku {
                     Err(error) => {
                         // A failed merge or rebase can still leave the tree
                         // changed (conflicts), so redraw from Git either way.
-                        waku.git_graph_snapshots.invalidate(&path);
+                        waku.git_graph_snapshots.invalidate(&scope);
                         waku.invalidate_workspace_queries(cx);
                         waku.show_toast(tr!("git_graph.action_failed", error = error));
                     }
@@ -1204,9 +1269,78 @@ impl Waku {
 
     // ── Context menus ───────────────────────────────────────────────────
 
+    pub(super) fn git_graph_file_menu(
+        weak: WeakEntity<Waku>,
+        file: &GitGraphFile,
+        uncommitted: bool,
+    ) -> Vec<MenuItem> {
+        let mut items = Vec::new();
+        let can_open = file.status != waku_client::git::GitGraphFileStatus::Deleted;
+        {
+            let weak = weak.clone();
+            let path = file.path.clone();
+            items.push(
+                MenuItem::new(tr!("git_graph.menu.open_file"), move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.open_right_panel_file(path.clone(), cx);
+                    });
+                })
+                .icon("icons/file.svg")
+                .disabled(!can_open),
+            );
+        }
+        if uncommitted {
+            items.push(MenuItem::Separator);
+            if file.unstaged {
+                items.push(
+                    action_item(
+                        &weak,
+                        tr!("git_graph.menu.stage_file"),
+                        GitGraphAction::StageFile {
+                            path: file.path.clone(),
+                        },
+                    )
+                    .icon("icons/plus.svg"),
+                );
+            }
+            if file.staged {
+                items.push(
+                    action_item(
+                        &weak,
+                        tr!("git_graph.menu.unstage_file"),
+                        GitGraphAction::UnstageFile {
+                            path: file.path.clone(),
+                        },
+                    )
+                    .icon("icons/x.svg"),
+                );
+            }
+            items.push(
+                confirm_item(
+                    &weak,
+                    tr!("git_graph.menu.discard_file"),
+                    tr!("git_graph.dialog.discard_file_title"),
+                    tr!(
+                        "git_graph.dialog.discard_file_message",
+                        name = file.path.clone()
+                    ),
+                    tr!("git_graph.menu.discard_confirm"),
+                    GitGraphAction::DiscardFile {
+                        path: file.path.clone(),
+                        old_path: file.old_path.clone(),
+                        untracked: file.status == waku_client::git::GitGraphFileStatus::Untracked,
+                    },
+                )
+                .icon("icons/trash.svg"),
+            );
+        }
+        items
+    }
+
     pub(super) fn git_graph_uncommitted_menu(weak: WeakEntity<Waku>) -> Vec<MenuItem> {
         let view = weak.clone();
         let stash = weak.clone();
+        let stash_pop = weak.clone();
         let discard = weak;
         vec![
             MenuItem::new(tr!("git_graph.menu.view_changes"), move |window, cx| {
@@ -1223,6 +1357,12 @@ impl Waku {
                 });
             })
             .icon("icons/archive.svg"),
+            MenuItem::new(tr!("git_graph.menu.stash_pop"), move |_, cx| {
+                let _ = stash_pop.update(cx, |this, cx| {
+                    this.run_git_graph_action(GitGraphAction::StashPop, cx)
+                });
+            })
+            .icon("icons/rotate-cw.svg"),
             MenuItem::new(tr!("git_graph.menu.discard"), move |window, cx| {
                 let _ = discard.update(cx, |this, cx| {
                     this.open_git_graph_dialog(
@@ -1668,7 +1808,19 @@ fn action_success_message(action: &GitGraphAction) -> String {
         GitGraphAction::CherryPick { .. } => tr!("git_graph.done.cherry_picked"),
         GitGraphAction::Revert { .. } => tr!("git_graph.done.reverted"),
         GitGraphAction::Reset { .. } => tr!("git_graph.done.reset"),
+        GitGraphAction::Fetch => tr!("git_graph.done.fetched"),
+        GitGraphAction::Pull => tr!("git_graph.done.pulled"),
         GitGraphAction::Stash => tr!("git_graph.done.stashed"),
+        GitGraphAction::StashPop => tr!("git_graph.done.stash_popped"),
+        GitGraphAction::StageFile { path } => {
+            tr!("git_graph.done.file_staged", name = path.clone())
+        }
+        GitGraphAction::UnstageFile { path } => {
+            tr!("git_graph.done.file_unstaged", name = path.clone())
+        }
+        GitGraphAction::DiscardFile { path, .. } => {
+            tr!("git_graph.done.file_discarded", name = path.clone())
+        }
         GitGraphAction::DiscardUncommitted => tr!("git_graph.done.discarded"),
     }
 }

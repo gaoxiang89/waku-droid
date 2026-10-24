@@ -233,8 +233,75 @@ pub fn run_action(cwd: &Path, action: &GitGraphAction) -> anyhow::Result<Option<
             };
             run(cwd, &["reset", mode, hash])?;
         }
+        GitGraphAction::Fetch => {
+            run(cwd, &["fetch", "--all", "--prune"])?;
+        }
+        GitGraphAction::Pull => {
+            run(cwd, &["pull", "--ff-only"])?;
+        }
         GitGraphAction::Stash => {
             run(cwd, &["stash", "push", "--include-untracked"])?;
+        }
+        GitGraphAction::StashPop => {
+            run(cwd, &["stash", "pop"])?;
+        }
+        GitGraphAction::StageFile { path } => {
+            ensure_relative_path(path)?;
+            run(cwd, &["add", "--", path])?;
+        }
+        GitGraphAction::UnstageFile { path } => {
+            ensure_relative_path(path)?;
+            if has_head(cwd) {
+                run(cwd, &["reset", "-q", "HEAD", "--", path])?;
+            } else {
+                run(
+                    cwd,
+                    &[
+                        "rm",
+                        "-r",
+                        "--cached",
+                        "--quiet",
+                        "--ignore-unmatch",
+                        "--",
+                        path,
+                    ],
+                )?;
+            }
+        }
+        GitGraphAction::DiscardFile {
+            path,
+            old_path,
+            untracked,
+        } => {
+            ensure_relative_path(path)?;
+            if let Some(old_path) = old_path.as_deref().filter(|old| !old.is_empty()) {
+                ensure_relative_path(old_path)?;
+            }
+            if *untracked || is_untracked(cwd, path)? {
+                run(cwd, &["clean", "-fd", "--", path])?;
+            } else if has_head(cwd) {
+                if let Some(old_path) = old_path
+                    .as_deref()
+                    .filter(|old| !old.is_empty() && *old != path)
+                {
+                    run(cwd, &["reset", "-q", "HEAD", "--", old_path, path])?;
+                    let _ = std::fs::remove_file(cwd.join(path));
+                    run(cwd, &["checkout", "HEAD", "--", old_path])?;
+                } else {
+                    run(cwd, &["reset", "-q", "HEAD", "--", path])?;
+                    if has_path_in_head(cwd, path) {
+                        run(cwd, &["checkout", "HEAD", "--", path])?;
+                    } else {
+                        run(cwd, &["clean", "-fd", "--", path])?;
+                    }
+                }
+            } else {
+                run(
+                    cwd,
+                    &["rm", "-f", "--quiet", "--ignore-unmatch", "--", path],
+                )?;
+                run(cwd, &["clean", "-fd", "--", path])?;
+            }
         }
         GitGraphAction::DiscardUncommitted => {
             if has_head(cwd) {
@@ -367,6 +434,23 @@ fn has_ref(cwd: &Path, full_name: &str) -> bool {
 fn has_head(cwd: &Path) -> bool {
     git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"])
         .is_ok_and(|output| output.status.success())
+}
+
+fn has_path_in_head(cwd: &Path, path: &str) -> bool {
+    git(cwd, &["cat-file", "-e", &format!("HEAD:{path}")])
+        .is_ok_and(|output| output.status.success())
+}
+
+fn ensure_relative_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("invalid file path");
+    }
+    Ok(())
 }
 
 fn is_untracked(cwd: &Path, path: &str) -> anyhow::Result<bool> {
@@ -591,5 +675,82 @@ mod tests {
         assert_eq!(head, first);
         assert_eq!(tagged, first);
         assert_eq!(topic, first);
+    }
+
+    #[test]
+    fn actions_stage_unstage_discard_and_stash_pop() {
+        let root = repository();
+        commit(&root, "a.txt", "one\n", "first");
+        fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        fs::write(root.join("b.txt"), "new\n").unwrap();
+
+        run_action(
+            &root,
+            &GitGraphAction::StageFile {
+                path: "a.txt".into(),
+            },
+        )
+        .unwrap();
+        let staged = crate::git_graph::inspect(&root, 10)
+            .unwrap()
+            .unwrap()
+            .uncommitted;
+        let a_entry = staged.iter().find(|f| f.path == "a.txt").unwrap();
+        assert!(a_entry.staged);
+        assert!(!a_entry.unstaged);
+
+        run_action(
+            &root,
+            &GitGraphAction::UnstageFile {
+                path: "a.txt".into(),
+            },
+        )
+        .unwrap();
+        let unstaged = crate::git_graph::inspect(&root, 10)
+            .unwrap()
+            .unwrap()
+            .uncommitted;
+        let a_entry = unstaged.iter().find(|f| f.path == "a.txt").unwrap();
+        assert!(!a_entry.staged);
+        assert!(a_entry.unstaged);
+
+        run_action(&root, &GitGraphAction::Stash).unwrap();
+        assert!(
+            crate::git_graph::inspect(&root, 10)
+                .unwrap()
+                .unwrap()
+                .uncommitted
+                .is_empty()
+        );
+        run_action(&root, &GitGraphAction::StashPop).unwrap();
+        assert!(root.join("b.txt").exists());
+
+        run_action(
+            &root,
+            &GitGraphAction::DiscardFile {
+                path: "b.txt".into(),
+                old_path: None,
+                untracked: true,
+            },
+        )
+        .unwrap();
+        assert!(!root.join("b.txt").exists());
+
+        run_action(
+            &root,
+            &GitGraphAction::DiscardFile {
+                path: "a.txt".into(),
+                old_path: None,
+                untracked: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "one\n"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

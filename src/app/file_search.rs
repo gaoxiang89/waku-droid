@@ -512,7 +512,7 @@ impl Waku {
     /// Scrolls the shared editor viewport so the match at `offset` is
     /// visible. Uses the last painted layout, so right after an edit it can
     /// land a line off; the next navigation corrects it.
-    fn reveal_file_search_match(
+    pub(super) fn reveal_file_search_match(
         &self,
         editor: &Entity<TextInput>,
         offset: usize,

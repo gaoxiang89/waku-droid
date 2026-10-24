@@ -506,6 +506,7 @@ impl Waku {
 
         let new_terminal_weak = cx.entity().downgrade();
         let split_weak = cx.entity().downgrade();
+        let split_down_weak = cx.entity().downgrade();
         let split_pane = self.active_bottom_panel_terminal();
         div()
             .id("bottom-panel-tab-strip")
@@ -572,8 +573,14 @@ impl Waku {
                             }),
                     )
                     .when_some(split_pane, |element, pane| {
-                        element.child(
-                            icon_button("split-bottom-panel-terminal", "icons/split.svg", theme)
+                        let down_pane = pane.clone();
+                        element
+                            .child(
+                                icon_button(
+                                    "split-bottom-panel-terminal",
+                                    "icons/split.svg",
+                                    theme,
+                                )
                                 .tooltip(Tooltip::with_shortcut(
                                     tr!("bottom_panel.split_right"),
                                     crate::platform::primary_shortcut("⇧⌘D", "Ctrl+Shift+D"),
@@ -584,7 +591,28 @@ impl Waku {
                                         this.split_bottom_panel_pane(&pane, Axis::Horizontal, cx);
                                     });
                                 }),
-                        )
+                            )
+                            .child(
+                                icon_button(
+                                    "split-down-bottom-panel-terminal",
+                                    "icons/panel-bottom.svg",
+                                    theme,
+                                )
+                                .tooltip(Tooltip::with_shortcut(
+                                    tr!("bottom_panel.split_down"),
+                                    crate::platform::primary_shortcut("⇧⌘E", "Shift+Alt+-"),
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = split_down_weak.update(cx, |this, cx| {
+                                        this.split_bottom_panel_pane(
+                                            &down_pane,
+                                            Axis::Vertical,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            )
                     }),
             )
     }

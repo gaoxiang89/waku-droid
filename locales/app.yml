@@ -90,6 +90,8 @@ command_palette.commands:
   en: Commands
 command_palette.settings:
   en: Settings
+command_palette.files:
+  en: Files
 command_palette.new_task:
   en: New task
 command_palette.resume:
@@ -1577,6 +1579,14 @@ git_graph.error:
   en: Could not read the Git graph
 git_graph.refresh:
   en: Refresh
+git_graph.fetch:
+  en: Fetch
+git_graph.pull:
+  en: Pull
+git_graph.staged_badge:
+  en: Staged
+git_graph.unstaged_badge:
+  en: Unstaged
 git_graph.search:
   en: Filter commits
 git_graph.load_more:
@@ -1651,6 +1661,16 @@ git_graph.menu.reset_confirm:
   en: Reset
 git_graph.menu.stash:
   en: Stash all changes
+git_graph.menu.stash_pop:
+  en: Pop latest stash
+git_graph.menu.open_file:
+  en: Open file
+git_graph.menu.stage_file:
+  en: Stage changes
+git_graph.menu.unstage_file:
+  en: Unstage changes
+git_graph.menu.discard_file:
+  en: Discard file changes…
 git_graph.menu.discard:
   en: Discard all changes…
 git_graph.menu.discard_confirm:
@@ -1723,6 +1743,10 @@ git_graph.dialog.discard_title:
   en: Discard all changes
 git_graph.dialog.discard_message:
   en: Reset tracked files to HEAD and delete untracked files? Ignored files are kept. This cannot be undone.
+git_graph.dialog.discard_file_title:
+  en: Discard file changes
+git_graph.dialog.discard_file_message:
+  en: "Discard all uncommitted changes to “%{name}”? This cannot be undone."
 git_graph.done.checked_out:
   en: Checked out
 git_graph.done.branch_created:
@@ -1749,6 +1773,18 @@ git_graph.done.reset:
   en: Branch reset
 git_graph.done.stashed:
   en: Changes stashed
+git_graph.done.stash_popped:
+  en: Applied and dropped stash
+git_graph.done.fetched:
+  en: Fetched from remote
+git_graph.done.pulled:
+  en: Pulled latest changes
+git_graph.done.file_staged:
+  en: "Staged %{name}"
+git_graph.done.file_unstaged:
+  en: "Unstaged %{name}"
+git_graph.done.file_discarded:
+  en: "Discarded changes to %{name}"
 git_graph.done.discarded:
   en: Changes discarded
 bottom_panel.toggle:
@@ -1934,6 +1970,22 @@ files.delete_failed:
   en: "Could not delete %{path}: %{error}"
 files.rename_failed:
   en: "Could not rename %{path}: %{error}"
+files.create_failed:
+  en: "Could not create %{path}: %{error}"
+files.new_file:
+  en: New file…
+files.new_folder:
+  en: New folder…
+files.new_file_placeholder:
+  en: File name…
+files.new_folder_placeholder:
+  en: Folder name…
+files.copy_path:
+  en: Copy path
+files.copy_relative_path:
+  en: Copy relative path
+files.path_copied:
+  en: Copied path
 files.invalid_name:
   en: "Names cannot be empty or contain path separators"
 files.preview_markdown:

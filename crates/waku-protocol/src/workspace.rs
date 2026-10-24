@@ -94,6 +94,18 @@ pub enum WorkspaceOperation {
         #[ts(type = "string")]
         to_relative_path: PathBuf,
     },
+    CreateFile {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+    },
+    CreateDirectory {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+    },
     DeletePath {
         #[ts(type = "string")]
         root: PathBuf,

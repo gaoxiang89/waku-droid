@@ -1035,6 +1035,32 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Byte range for a 1-based `line` and optional 1-based character `column`.
+    /// Without a column, selects the line's text so the target row stands out;
+    /// with a column, places the caret at that character offset.
+    pub fn line_column_range(&self, line: usize, column: Option<usize>) -> Range<usize> {
+        let target_line = line.saturating_sub(1);
+        let mut line_start = 0;
+        for (index, text) in self.content.split('\n').enumerate() {
+            let line_trimmed = text.strip_suffix('\r').unwrap_or(text);
+            let line_end = line_start + line_trimmed.len();
+            if index == target_line {
+                if let Some(col) = column {
+                    let char_offset = line_trimmed
+                        .char_indices()
+                        .nth(col.saturating_sub(1))
+                        .map_or(line_trimmed.len(), |(offset, _)| offset);
+                    let pos = line_start + char_offset;
+                    return pos..pos;
+                }
+                return line_start..line_end;
+            }
+            line_start += text.len() + 1;
+        }
+        let end = self.content.len();
+        end..end
+    }
+
     /// Where `offset` sits in the window as of the last paint, with the line
     /// height, so a find bar can scroll a match into view. `None` until the
     /// field has painted once.

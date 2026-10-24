@@ -44,6 +44,7 @@ command_palette.sessions: 终端会话
 command_palette.providers: 服务商
 command_palette.commands: 命令
 command_palette.settings: 设置
+command_palette.files: 文件
 command_palette.new_task: 新建任务
 command_palette.resume: 恢复…
 command_palette.change_provider: 更改服务商
@@ -773,6 +774,10 @@ git_graph.empty: 还没有提交
 git_graph.empty_description: 此仓库还没有任何提交
 git_graph.error: 无法读取 Git 图谱
 git_graph.refresh: 刷新
+git_graph.fetch: 获取（Fetch）
+git_graph.pull: 拉取（Pull）
+git_graph.staged_badge: 已暂存
+git_graph.unstaged_badge: 未暂存
 git_graph.search: 筛选提交
 git_graph.load_more: 加载更多提交
 git_graph.copy_hash: 复制提交哈希
@@ -810,6 +815,11 @@ git_graph.menu.reset_mixed: Mixed — 保留工作区
 git_graph.menu.reset_hard: Hard — 丢弃所有改动…
 git_graph.menu.reset_confirm: 重置
 git_graph.menu.stash: 储藏（Stash）全部改动
+git_graph.menu.stash_pop: 弹出最近储藏（Stash Pop）
+git_graph.menu.open_file: 打开文件
+git_graph.menu.stage_file: 暂存更改
+git_graph.menu.unstage_file: 取消暂存
+git_graph.menu.discard_file: 丢弃文件更改…
 git_graph.menu.discard: 丢弃全部改动…
 git_graph.menu.discard_confirm: 丢弃
 git_graph.menu.checkout_branch: 检出分支
@@ -846,6 +856,8 @@ git_graph.dialog.reset_hard_title: 硬重置
 git_graph.dialog.reset_hard_message: "将当前分支移动到 %{target} 并丢弃所有未提交的改动？此操作无法撤销。"
 git_graph.dialog.discard_title: 丢弃全部改动
 git_graph.dialog.discard_message: 将已跟踪文件重置为 HEAD，并删除未跟踪文件？被忽略的文件会保留。此操作无法撤销。
+git_graph.dialog.discard_file_title: 丢弃文件更改
+git_graph.dialog.discard_file_message: "丢弃对“%{name}”的所有未提交更改？此操作无法撤销。"
 git_graph.done.checked_out: 已检出
 git_graph.done.branch_created: "已创建分支 %{name}"
 git_graph.done.branch_renamed: "分支已重命名为 %{name}"
@@ -859,6 +871,12 @@ git_graph.done.cherry_picked: 已拣选
 git_graph.done.reverted: 已还原
 git_graph.done.reset: 分支已重置
 git_graph.done.stashed: 改动已储藏
+git_graph.done.stash_popped: 已恢复并移除储藏
+git_graph.done.fetched: 已从远程获取
+git_graph.done.pulled: 已拉取最新更改
+git_graph.done.file_staged: "已暂存 %{name}"
+git_graph.done.file_unstaged: "已取消暂存 %{name}"
+git_graph.done.file_discarded: "已丢弃 %{name} 的更改"
 git_graph.done.discarded: 改动已丢弃
 bottom_panel.toggle: 显示或隐藏底部面板
 bottom_panel.resize: 调整底部面板高度
@@ -949,6 +967,14 @@ files.delete_confirm_message: "“%{name}”将被永久删除,此操作无法�
 files.delete_confirm_message_dir: "“%{name}”及其中的所有内容将被永久删除,此操作无法撤销。"
 files.delete_failed: "无法删除 %{path}：%{error}"
 files.rename_failed: "无法重命名 %{path}：%{error}"
+files.create_failed: "无法创建 %{path}：%{error}"
+files.new_file: 新建文件…
+files.new_folder: 新建文件夹…
+files.new_file_placeholder: 文件名称…
+files.new_folder_placeholder: 文件夹名称…
+files.copy_path: 复制绝对路径
+files.copy_relative_path: 复制相对路径
+files.path_copied: 已复制路径
 files.invalid_name: "名称不能为空,也不能包含路径分隔符"
 files.preview_markdown: 预览 Markdown
 files.edit_markdown_source: 编辑源码

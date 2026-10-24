@@ -28,6 +28,7 @@ actions!(
 
 const SEARCH_CONTEXT: &str = "CommandPalette > TextInput";
 const MAX_TASK_RESULTS: usize = 12;
+const MAX_FILE_RESULTS: usize = 10;
 const MAX_RESUME_RESULTS: usize = 30;
 const PROVIDER_SESSION_CATALOG_LIMIT: usize = 250;
 const MESSAGE_SEARCH_LIMIT: usize = 50;
@@ -69,6 +70,7 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PaletteSection {
     Suggested,
+    Files,
     Tasks,
     Sessions,
     Providers,
@@ -80,6 +82,7 @@ impl PaletteSection {
     fn label(self) -> String {
         crate::i18n::translate(match self {
             Self::Suggested => "command_palette.suggested",
+            Self::Files => "command_palette.files",
             Self::Tasks => "command_palette.tasks",
             Self::Sessions => "command_palette.sessions",
             Self::Providers => "command_palette.providers",
@@ -91,8 +94,9 @@ impl PaletteSection {
     fn query_rank(self) -> usize {
         match self {
             Self::Commands | Self::Suggested | Self::Sessions | Self::Providers => 0,
-            Self::Tasks => 1,
-            Self::Settings => 2,
+            Self::Files => 1,
+            Self::Tasks => 2,
+            Self::Settings => 3,
         }
     }
 }
@@ -166,6 +170,10 @@ enum PaletteAction {
     CheckForUpdates,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
+    OpenFile {
+        relative_path: String,
+        location: Option<(usize, Option<usize>)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -473,6 +481,7 @@ impl Waku {
         self.command_palette
             .search
             .update(cx, |input, cx| input.clear(cx));
+        self.refresh_composer_sources(cx);
         self.refresh_command_palette_results("", false, cx);
 
         // Closing an open GPUI menu can call its toggle observers back into
@@ -932,6 +941,59 @@ impl Waku {
         commands
     }
 
+    fn command_palette_file_candidates(&mut self, query: &str) -> Vec<ScoredPaletteItem> {
+        let (file_query, location) = crate::md::parser::parse_file_location(query.trim());
+        let file_query = file_query.trim();
+        if file_query.is_empty() || self.mention_file_index.is_empty() {
+            return Vec::new();
+        }
+        let pattern = Pattern::parse(file_query, CaseMatching::Ignore, Normalization::Smart);
+        let mut utf32 = Vec::new();
+        let mut files = self
+            .mention_file_index
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .enumerate()
+            .filter_map(|(order, entry)| {
+                let score = pattern.score(
+                    Utf32Str::new(&entry.path, &mut utf32),
+                    &mut self.command_palette.matcher,
+                )?;
+                let file_name = entry.path.rsplit(['/', '\\']).next().unwrap_or(&entry.path);
+                let label = match location {
+                    Some((line, Some(col))) => format!("{file_name}:{line}:{col}"),
+                    Some((line, None)) => format!("{file_name}:{line}"),
+                    None => file_name.to_owned(),
+                };
+                let detail = entry
+                    .path
+                    .rfind(['/', '\\'])
+                    .map(|idx| entry.path[..idx].to_owned());
+                Some(ScoredPaletteItem {
+                    score,
+                    item: CommandPaletteItem {
+                        section: PaletteSection::Files,
+                        label,
+                        detail,
+                        icon: PaletteIcon::Asset("icons/file.svg"),
+                        shortcut: None,
+                        action: PaletteAction::OpenFile {
+                            relative_path: entry.path.clone(),
+                            location,
+                        },
+                        content_match: None,
+                        search_text: entry.path.clone(),
+                        order,
+                        recency: 0,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| b.score.cmp(&a.score).then(a.item.order.cmp(&b.item.order)));
+        files.truncate(MAX_FILE_RESULTS);
+        files
+    }
+
     fn command_palette_task_candidates(&self) -> Vec<CommandPaletteItem> {
         let projects = self
             .state
@@ -1294,8 +1356,10 @@ impl Waku {
                 .get(self.command_palette.selected)
                 .map(|item| item.action.clone())
         });
-        let mut scored_results = tasks;
-        scored_results.extend(commands);
+        let files = self.command_palette_file_candidates(query);
+        let mut scored_results = commands;
+        scored_results.extend(files);
+        scored_results.extend(tasks);
         // Stable sorting keeps each section's existing score/recency order.
         scored_results.sort_by_key(|scored| scored.item.section.query_rank());
         let next_results = scored_results
@@ -1693,6 +1757,21 @@ impl Waku {
                 self.select_session(session_id, cx);
                 let focus = self.composer_focus(cx);
                 window.focus(&focus, cx);
+            }
+            PaletteAction::OpenFile {
+                relative_path,
+                location,
+            } => {
+                self.settings_page = None;
+                if let Some(workspace) = self.selected_workspace_path().map(Path::to_path_buf) {
+                    for directory in
+                        super::right_panel::ancestor_directories(&workspace, &relative_path)
+                    {
+                        self.right_panel_expanded_paths.insert(directory);
+                    }
+                }
+                self.open_right_panel_surface(RightPanelSurface::Files, cx);
+                self.open_right_panel_file_at(relative_path, location, cx);
             }
             PaletteAction::ChooseModel | PaletteAction::ToggleUsage => {
                 // These popovers are rendered by the composer. If the command

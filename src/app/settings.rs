@@ -1746,6 +1746,59 @@ impl Waku {
             .reset(self.skills_rows.borrow().len());
     }
 
+    pub(super) fn render_settings_host_tabs(
+        &self,
+        id_prefix: &'static str,
+        selected_host: &waku_client::hosts::HostKey,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        on_select: fn(&mut Self, waku_client::hosts::HostKey, &mut Context<Self>),
+    ) -> Option<Div> {
+        (self.hosts.hosts.len() > 1).then(|| {
+            let mut tabs = div()
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .overflow_hidden();
+            for (index, host) in self.hosts.hosts.iter().enumerate() {
+                let key = host.key.clone();
+                let label: SharedString = if key == waku_client::hosts::HostKey::Local {
+                    tr!("connections.local").into()
+                } else {
+                    host.name.clone().into()
+                };
+                let selected = &key == selected_host;
+                tabs = tabs.child(
+                    div()
+                        .id(SharedString::from(format!("{id_prefix}-host-tab-{index}")))
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .h(px(26.0))
+                        .px(px(11.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |element| element.bg(theme.overlay))
+                        .when(!selected, |element| {
+                            element.hover(|element| element.text_color(theme.text))
+                        })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            on_select(this, key.clone(), cx);
+                        })),
+                );
+            }
+            div().flex().child(tabs)
+        })
+    }
+
     fn render_providers_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         // The page is scoped to one host's daemon: detection, binary
@@ -1804,54 +1857,15 @@ impl Waku {
                 cx.notify();
             }));
 
-        // One tab per connected host, following the usage page's segmented
-        // switcher. Hidden while the desktop is the only host, so the page
-        // reads exactly as it did before hosts existed.
-        let host_tabs = (self.hosts.hosts.len() > 1).then(|| {
-            let mut tabs = div()
-                .rounded(px(7.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .flex()
-                .overflow_hidden();
-            for (index, host) in self.hosts.hosts.iter().enumerate() {
-                let key = host.key.clone();
-                let label: SharedString = if key == waku_client::hosts::HostKey::Local {
-                    tr!("connections.local").into()
-                } else {
-                    host.name.clone().into()
-                };
-                let selected = key == host_key;
-                tabs = tabs.child(
-                    div()
-                        .id(SharedString::from(format!("provider-host-tab-{index}")))
-                        .tab_index(0)
-                        .focus_visible(|style| style.border_1().border_color(theme.accent))
-                        .h(px(26.0))
-                        .px(px(11.0))
-                        .flex()
-                        .items_center()
-                        .cursor_default()
-                        .text_size(sp(12.5))
-                        .text_color(if selected {
-                            theme.text
-                        } else {
-                            theme.text_secondary
-                        })
-                        .when(selected, |element| element.bg(theme.overlay))
-                        .when(!selected, |element| {
-                            element.hover(|element| element.text_color(theme.text))
-                        })
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_provider_settings_host(key.clone(), cx);
-                        })),
-                );
-            }
-            // A flex row lets the segmented control shrink-wrap its tabs
-            // instead of stretching the border across the page.
-            div().mt(px(10.0)).mb(px(-2.0)).flex().child(tabs)
-        });
+        let host_tabs = self
+            .render_settings_host_tabs(
+                "provider",
+                &host_key,
+                &theme,
+                cx,
+                Self::set_provider_settings_host,
+            )
+            .map(|tabs| tabs.mt(px(10.0)).mb(px(-2.0)));
 
         let mut rows = div().mt(px(4.0)).flex().flex_col();
         let provider_count = ProviderKind::ALL.len();

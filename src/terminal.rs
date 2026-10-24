@@ -851,8 +851,8 @@ impl TerminalSession {
             cursor_style,
             hovered_link: hovered_link.cloned(),
         };
-        let dirty = self.dirty.load(Ordering::Acquire)
-            || self.snapshot_dirty.swap(false, Ordering::AcqRel);
+        let dirty =
+            self.dirty.load(Ordering::Acquire) || self.snapshot_dirty.swap(false, Ordering::AcqRel);
         if !dirty
             && let Some((cached_key, cached_snapshot)) = self.cached_snapshot.lock().as_ref()
             && *cached_key == key
@@ -2468,11 +2468,12 @@ impl Render for TerminalView {
                     .as_ref()
                     .is_some_and(clipboard_has_paste_content);
                 let has_session = context_terminal.read(cx).session.is_some();
+                let bottom_panel_tabs = context_terminal.read(cx).bottom_panel_tabs;
 
                 let copy_terminal = context_terminal.clone();
                 let paste_terminal = context_terminal.clone();
                 let select_all_terminal = context_terminal.clone();
-                vec![
+                let mut items = vec![
                     MenuItem::new(tr!("menu.copy"), move |_, cx| {
                         let selected_text = { copy_terminal.read(cx).selected_text() };
                         if let Some(text) = selected_text {
@@ -2489,7 +2490,34 @@ impl Render for TerminalView {
                         select_all_terminal.update(cx, |terminal, cx| terminal.select_all(cx));
                     })
                     .disabled(!has_session),
-                ]
+                ];
+                if bottom_panel_tabs {
+                    let split_right_terminal = context_terminal.clone();
+                    let split_down_terminal = context_terminal.clone();
+                    let close_pane_terminal = context_terminal.clone();
+                    items.extend([
+                        MenuItem::Separator,
+                        MenuItem::new(tr!("bottom_panel.split_right"), move |window, cx| {
+                            let focus = split_right_terminal.read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                            cx.dispatch_action(&crate::SplitTerminalRight);
+                        })
+                        .icon("icons/split.svg"),
+                        MenuItem::new(tr!("bottom_panel.split_down"), move |window, cx| {
+                            let focus = split_down_terminal.read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                            cx.dispatch_action(&crate::SplitTerminalDown);
+                        })
+                        .icon("icons/panel-bottom.svg"),
+                        MenuItem::new(tr!("bottom_panel.close_pane"), move |window, cx| {
+                            let focus = close_pane_terminal.read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                            cx.dispatch_action(&crate::CloseTerminalPane);
+                        })
+                        .icon("icons/x.svg"),
+                    ]);
+                }
+                items
             },
         );
 

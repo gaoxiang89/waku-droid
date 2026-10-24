@@ -197,11 +197,7 @@ impl Waku {
                 self.store_selected_bottom_panel_state();
             }
         }
-        let old_host = self.selected_host_key();
         self.state.selected_session = Some(session_id);
-        if old_host != self.selected_host_key() {
-            self.clear_host_workspace_caches();
-        }
         self.task_switcher.record_access(session_id);
         if let Some((
             project_id,
@@ -276,14 +272,11 @@ impl Waku {
     /// expire on a timer, they are dropped at the moments the answer plausibly
     /// moved — coming back to the window, or a turn finishing.
     pub(super) fn invalidate_workspace_queries(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace_path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             return;
         };
-        self.branch_snapshots.invalidate(&workspace_path);
-        self.git_graph_snapshots.invalidate(&workspace_path);
+        self.branch_snapshots.invalidate(&scope);
+        self.git_graph_snapshots.invalidate(&scope);
         self.sidebar_branch_scan_fingerprint.set(None);
         self.sidebar_branch_scan_generation
             .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));

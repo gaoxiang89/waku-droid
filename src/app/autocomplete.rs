@@ -112,10 +112,7 @@ impl Waku {
     /// background executor and re-runs this when it arrives. Nothing here may
     /// touch the filesystem directly.
     pub(super) fn refresh_composer_sources(&mut self, cx: &mut Context<Self>) {
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             self.slash_command_index = Rc::new(Vec::new());
             self.slash_command_index_key = None;
             self.slash_command_index_loading = false;
@@ -132,9 +129,16 @@ impl Waku {
             .selected_session()
             .map(|session| session.available_commands.clone())
             .unwrap_or_default();
-        let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
+        let binary_override = self
+            .provider_override_for_host(&scope.host, provider)
+            .cloned();
 
-        let command_key = (provider, project_path.clone(), binary_override.clone());
+        let command_key = (
+            scope.host.clone(),
+            provider,
+            scope.workspace.clone(),
+            binary_override.clone(),
+        );
         match self.slash_commands.read(&command_key) {
             Query::Ready(commands) => {
                 self.slash_command_index = Rc::new(composer_complete::merge_reported_commands(
@@ -158,7 +162,7 @@ impl Waku {
                     self.slash_command_index = Rc::new(Vec::new());
                     self.slash_command_index_key = None;
                 }
-                let path = project_path.clone();
+                let path = scope.workspace.clone();
                 let workspace =
                     waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
@@ -191,26 +195,26 @@ impl Waku {
             }
         }
 
-        match self.mention_files.read(&project_path) {
+        match self.mention_files.read(&scope) {
             Query::Ready(files) => {
                 self.mention_file_index = files.as_ref().clone().into();
-                self.mention_file_index_path = Some(project_path);
+                self.mention_file_index_path = Some(scope);
                 self.mention_file_index_loading = false;
             }
             Query::Pending => {
                 self.mention_file_index_loading = true;
-                if self.mention_file_index_path.as_ref() != Some(&project_path) {
+                if self.mention_file_index_path.as_ref() != Some(&scope) {
                     self.mention_file_index = Rc::new(Vec::new());
                     self.mention_file_index_path = None;
                 }
             }
             Query::Missing(token) => {
                 self.mention_file_index_loading = true;
-                if self.mention_file_index_path.as_ref() != Some(&project_path) {
+                if self.mention_file_index_path.as_ref() != Some(&scope) {
                     self.mention_file_index = Rc::new(Vec::new());
                     self.mention_file_index_path = None;
                 }
-                let path = project_path.clone();
+                let path = scope.workspace.clone();
                 let workspace =
                     waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
@@ -245,18 +249,21 @@ impl Waku {
 
     /// Invalidate and re-request both indexes for the selected workspace.
     pub(super) fn invalidate_composer_sources(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        {
+        if let Some(scope) = self.selected_panel_scope() {
             let provider = self
                 .selected_session()
                 .map(|session| session.provider)
                 .unwrap_or(self.state.last_provider);
-            let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
-            self.slash_commands
-                .invalidate(&(provider, path.clone(), binary_override));
-            self.mention_files.invalidate(&path);
+            let binary_override = self
+                .provider_override_for_host(&scope.host, provider)
+                .cloned();
+            self.slash_commands.invalidate(&(
+                scope.host.clone(),
+                provider,
+                scope.workspace.clone(),
+                binary_override,
+            ));
+            self.mention_files.invalidate(&scope);
         }
         self.refresh_composer_sources(cx);
     }

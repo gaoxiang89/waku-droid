@@ -75,6 +75,10 @@ pub struct GitGraphFile {
     pub path: String,
     pub old_path: Option<String>,
     pub status: GitGraphFileStatus,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub unstaged: bool,
 }
 
 /// A ref painted as a capsule on a commit. `current` is also written out as
@@ -254,6 +258,20 @@ pub enum GitGraphAction {
         hash: String,
         mode: GitResetMode,
     },
+    Fetch,
+    Pull,
     Stash,
+    StashPop,
+    StageFile {
+        path: String,
+    },
+    UnstageFile {
+        path: String,
+    },
+    DiscardFile {
+        path: String,
+        old_path: Option<String>,
+        untracked: bool,
+    },
     DiscardUncommitted,
 }

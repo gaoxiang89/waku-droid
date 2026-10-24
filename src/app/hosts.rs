@@ -524,16 +524,66 @@ impl Waku {
         }
     }
 
-    pub(super) fn clear_host_workspace_caches(&mut self) {
-        self.branch_snapshots.clear();
-        self.clear_git_graph_cache();
-        self.slash_commands.clear();
-        self.mention_files.clear();
-        self.working_trees.clear();
-        self.slash_command_index = Rc::new(Vec::new());
-        self.slash_command_index_key = None;
-        self.mention_file_index = Rc::new(Vec::new());
-        self.mention_file_index_path = None;
+    pub(super) fn clear_host_workspace_caches_for(&mut self, removed_host: &HostKey) {
+        self.branch_snapshots
+            .retain(|scope| &scope.host != removed_host);
+        if self
+            .visible_branch_snapshot
+            .as_ref()
+            .is_some_and(|(scope, _)| &scope.host == removed_host)
+        {
+            self.visible_branch_snapshot = None;
+        }
+        self.git_graph_snapshots
+            .retain(|scope| &scope.host != removed_host);
+        if self
+            .visible_git_graph
+            .as_ref()
+            .is_some_and(|(scope, _)| &scope.host == removed_host)
+        {
+            self.visible_git_graph = None;
+        }
+        self.git_graph_limits
+            .retain(|scope, _| &scope.host != removed_host);
+        self.git_commit_details
+            .retain(|(scope, _)| &scope.host != removed_host);
+        if self
+            .git_graph_list_path
+            .as_ref()
+            .is_some_and(|scope| &scope.host == removed_host)
+        {
+            self.git_graph_list_path = None;
+        }
+        if self
+            .git_graph_cursor
+            .as_ref()
+            .is_some_and(|(scope, _)| &scope.host == removed_host)
+        {
+            self.git_graph_cursor = None;
+        }
+        self.git_graph_ui.retain_host(|host| host != removed_host);
+        self.slash_commands
+            .retain(|(host, _, _, _)| host != removed_host);
+        if self
+            .slash_command_index_key
+            .as_ref()
+            .is_some_and(|(host, _, _, _)| host == removed_host)
+        {
+            self.slash_command_index = Rc::new(Vec::new());
+            self.slash_command_index_key = None;
+        }
+        self.mention_files
+            .retain(|scope| &scope.host != removed_host);
+        if self
+            .mention_file_index_path
+            .as_ref()
+            .is_some_and(|scope| &scope.host == removed_host)
+        {
+            self.mention_file_index = Rc::new(Vec::new());
+            self.mention_file_index_path = None;
+        }
+        self.working_trees
+            .retain(|scope| &scope.host != removed_host);
     }
 
     pub(super) fn disconnect_host(&mut self, key: &HostKey, cx: &mut Context<Self>) {
@@ -628,12 +678,37 @@ impl Waku {
         self.pending_queue_drains
             .retain(|id| !sessions.contains(id));
         self.collapsed_hosts.remove(key);
+        self.clear_host_workspace_caches_for(key);
+        if &self.provider_settings_host == key {
+            self.provider_settings_host = HostKey::Local;
+        }
+        if &self.skills_settings_host == key {
+            self.skills_settings_host = HostKey::Local;
+            if self.skills_catalog_host.as_ref() == Some(key) {
+                self.skills_catalog = None;
+                self.skills_catalog_host = None;
+                self.skills_scanned_at = None;
+            }
+            if self.settings_page == Some(SettingsPage::Skills) {
+                self.ensure_skills_catalog(true, cx);
+            }
+        }
+        if &self.usage_settings_host == key {
+            self.usage_settings_host = HostKey::Local;
+            if self.usage_history_host.as_ref() == Some(key) {
+                self.usage_history = None;
+                self.usage_history_host = None;
+                self.usage_history_scanned_at = None;
+            }
+            if self.settings_page == Some(SettingsPage::Usage) {
+                self.ensure_usage_history(true, cx);
+            }
+        }
         if self
             .state
             .selected_session
             .is_some_and(|id| sessions.contains(&id))
         {
-            self.clear_host_workspace_caches();
             self.state.selected_session = None;
             self.state.selected_project = None;
             self.restore_selected_composer_draft(cx);

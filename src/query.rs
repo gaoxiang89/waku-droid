@@ -182,6 +182,13 @@ impl<K: Clone + Eq + Hash, V> QueryCache<K, V> {
         self.entries.clear();
     }
 
+    /// Retains only entries whose keys satisfy `predicate` and invalidates any
+    /// removed in-flight fetches.
+    pub fn retain(&mut self, mut predicate: impl FnMut(&K) -> bool) {
+        self.generation += 1;
+        self.entries.retain(|key, _| predicate(key));
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()

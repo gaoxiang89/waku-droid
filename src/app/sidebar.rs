@@ -1048,14 +1048,18 @@ impl Waku {
         .detach();
     }
 
-    pub(super) fn cache_sidebar_branch_label(&self, path: &Path, branch: Option<&str>) {
+    pub(super) fn cache_sidebar_branch_label(
+        &self,
+        host: &waku_client::hosts::HostKey,
+        path: &Path,
+        branch: Option<&str>,
+    ) {
         let Some(project_id) = self
             .state
             .projects
             .iter()
             .find(|project| {
-                project.path == path
-                    && self.hosts.ownership.project(project.id) == self.selected_host_key()
+                project.path == path && &self.hosts.ownership.project(project.id) == host
             })
             .map(|project| project.id)
         else {

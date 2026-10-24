@@ -310,13 +310,26 @@ pub(crate) fn parse_status_z(raw: &str) -> Vec<GitGraphFile> {
         if path.is_empty() {
             continue;
         }
+        let (staged, unstaged) = status_stage_flags(status);
         files.push(GitGraphFile {
             path,
             old_path,
             status: status_from_xy(status),
+            staged,
+            unstaged,
         });
     }
     files
+}
+
+fn status_stage_flags(status: &str) -> (bool, bool) {
+    if status.contains('?') {
+        return (false, true);
+    }
+    let mut chars = status.chars();
+    let index = chars.next().unwrap_or(' ');
+    let worktree = chars.next().unwrap_or(' ');
+    (!matches!(index, ' ' | '?'), worktree != ' ')
 }
 
 fn status_from_xy(status: &str) -> GitGraphFileStatus {
@@ -379,6 +392,8 @@ pub(crate) fn parse_name_status_z(raw: &str) -> Vec<GitGraphFile> {
                 'T' => GitGraphFileStatus::TypeChanged,
                 _ => GitGraphFileStatus::Modified,
             },
+            staged: false,
+            unstaged: false,
         });
     }
     files

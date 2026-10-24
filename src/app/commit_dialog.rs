@@ -42,7 +42,7 @@ enum CommitPending {
 
 pub(super) struct CommitOperationState {
     id: Uuid,
-    workspace: PathBuf,
+    scope: PanelScope,
     pending: CommitPending,
 }
 
@@ -65,7 +65,7 @@ fn commit_pending_status_label(pending: CommitPending) -> String {
 
 pub(super) struct CommitDialogState {
     id: Uuid,
-    workspace: PathBuf,
+    scope: PanelScope,
     invocation: Option<crate::git_commit::AgentInvocation>,
     message: Entity<TextInput>,
     include_unstaged: bool,
@@ -135,10 +135,14 @@ impl Waku {
                 model,
                 reasoning_effort,
             });
+        let scope = PanelScope {
+            host: self.selected_host_key(),
+            workspace: workspace.clone(),
+        };
         let cached_branch = self
             .visible_branch_snapshot
             .as_ref()
-            .filter(|(path, _)| path == &workspace)
+            .filter(|(cached_scope, _)| cached_scope == &scope)
             .map(|(_, snapshot)| snapshot);
         let snapshot = crate::git_commit::Snapshot {
             branch: cached_branch
@@ -158,7 +162,7 @@ impl Waku {
         let id = Uuid::new_v4();
         self.commit_dialog = Some(CommitDialogState {
             id,
-            workspace: workspace.clone(),
+            scope,
             invocation,
             message,
             include_unstaged: true,
@@ -253,7 +257,7 @@ impl Waku {
         }
 
         let id = dialog.id;
-        let workspace = dialog.workspace.clone();
+        let scope = dialog.scope.clone();
         let include_unstaged = dialog.include_unstaged;
         let invocation = dialog.invocation.clone();
         let message = dialog.message.read(cx).content().trim().to_owned();
@@ -275,13 +279,13 @@ impl Waku {
             }
             self.commit_operation = Some(CommitOperationState {
                 id,
-                workspace: workspace.clone(),
+                scope: scope.clone(),
                 pending: CommitPending::Generating(action),
             });
             self.spawn_commit_message_generation(
                 id,
                 action,
-                workspace,
+                scope,
                 include_unstaged,
                 invocation,
                 window_handle,
@@ -299,13 +303,13 @@ impl Waku {
         }
         self.commit_operation = Some(CommitOperationState {
             id,
-            workspace: workspace.clone(),
+            scope: scope.clone(),
             pending: CommitPending::Git(action),
         });
         self.spawn_git_action(
             id,
             action,
-            workspace,
+            scope,
             message,
             include_unstaged,
             window_handle,
@@ -318,7 +322,7 @@ impl Waku {
         &mut self,
         id: Uuid,
         action: CommitAction,
-        workspace: PathBuf,
+        scope: PanelScope,
         include_unstaged: bool,
         invocation: crate::git_commit::AgentInvocation,
         window_handle: gpui::AnyWindowHandle,
@@ -327,7 +331,7 @@ impl Waku {
         let workspace_client =
             waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
-            let generation_workspace = workspace.clone();
+            let generation_workspace = scope.workspace.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -349,7 +353,7 @@ impl Waku {
             let _ = waku.update(cx, |waku, cx| {
                 let current = waku.commit_operation.as_ref().is_some_and(|operation| {
                     operation.id == id
-                        && operation.workspace == workspace
+                        && operation.scope == scope
                         && operation.pending == CommitPending::Generating(action)
                 });
                 if !current {
@@ -370,7 +374,7 @@ impl Waku {
                         waku.spawn_git_action(
                             id,
                             action,
-                            workspace,
+                            scope,
                             message,
                             include_unstaged,
                             window_handle,
@@ -401,7 +405,7 @@ impl Waku {
         &mut self,
         id: Uuid,
         action: CommitAction,
-        workspace: PathBuf,
+        scope: PanelScope,
         message: String,
         include_unstaged: bool,
         window_handle: gpui::AnyWindowHandle,
@@ -410,7 +414,7 @@ impl Waku {
         let workspace_client =
             waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
-            let operation_workspace = workspace.clone();
+            let operation_workspace = scope.workspace.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -456,7 +460,7 @@ impl Waku {
             let focus = waku.update(cx, |waku, cx| {
                 let current = waku.commit_operation.as_ref().is_some_and(|operation| {
                     operation.id == id
-                        && operation.workspace == workspace
+                        && operation.scope == scope
                         && operation.pending == CommitPending::Git(action)
                 });
                 if !current {
@@ -464,14 +468,11 @@ impl Waku {
                 }
                 let (result, refreshed_snapshot) = result;
                 waku.commit_operation = None;
-                if waku
-                    .selected_workspace_path()
-                    .is_some_and(|path| path == workspace)
-                {
+                if waku.selected_panel_scope().as_ref() == Some(&scope) {
                     waku.invalidate_workspace_queries(cx);
                 } else {
-                    waku.branch_snapshots.invalidate(&workspace);
-                    waku.git_graph_snapshots.invalidate(&workspace);
+                    waku.branch_snapshots.invalidate(&scope);
+                    waku.git_graph_snapshots.invalidate(&scope);
                 }
                 let focus = match result {
                     Ok(()) => {

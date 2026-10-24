@@ -62,12 +62,18 @@ pub(super) struct WorkingTreeEntry {
     depth: usize,
 }
 
-/// The working-tree row an inline rename is editing. Renames stay inside the
-/// entry's directory: only the new name travels over the wire.
+/// The working-tree row an inline rename or create is editing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct RightPanelFileRename {
-    pub(super) relative_path: String,
-    pub(super) absolute_path: PathBuf,
+pub(super) enum RightPanelFileRename {
+    Rename {
+        relative_path: String,
+        absolute_path: PathBuf,
+    },
+    Create {
+        parent_relative_path: String,
+        depth: usize,
+        is_dir: bool,
+    },
 }
 
 /// A delete parked behind the confirm dialog until the user approves it.
@@ -2018,6 +2024,8 @@ mod tests {
 
 impl Waku {
     pub(super) fn open_transcript_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        let location =
+            crate::md::parser::parse_file_location(target.trim().trim_matches(['"', '\'', '`'])).1;
         match transcript_link_route(target, self.selected_workspace_path()) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
                 // Files may never have been opened. Create that surface, expand
@@ -2029,7 +2037,7 @@ impl Waku {
                     }
                 }
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);
-                self.open_right_panel_file(relative_path, cx);
+                self.open_right_panel_file_at(relative_path, location, cx);
             }
             TranscriptLinkRoute::Finder(path) => {
                 if self.selected_daemon().is_remote() {
@@ -2302,10 +2310,9 @@ impl Waku {
             self.refresh_right_panel_diff(cx);
         }
         if surface == RightPanelSurface::GitGraph
-            && let Some(path) = self.selected_workspace_path()
+            && let Some(scope) = self.selected_panel_scope()
         {
-            let path = path.to_path_buf();
-            self.git_graph_snapshots.invalidate(&path);
+            self.git_graph_snapshots.invalidate(&scope);
         }
         if matches!(
             surface,
@@ -2370,8 +2377,35 @@ impl Waku {
         self.open_right_panel_surface(RightPanelSurface::Diff, cx);
     }
 
-    fn open_right_panel_file(&mut self, relative_path: String, cx: &mut Context<Self>) {
+    pub(super) fn open_right_panel_file(&mut self, relative_path: String, cx: &mut Context<Self>) {
+        self.open_right_panel_file_at(relative_path, None, cx);
+    }
+
+    pub(super) fn open_right_panel_file_at(
+        &mut self,
+        relative_path: String,
+        location: Option<(usize, Option<usize>)>,
+        cx: &mut Context<Self>,
+    ) {
         self.ensure_initial_right_panel_file_editor_width();
+        if let Some(location) = location {
+            if self.state.markdown_preview
+                && file_highlighter_language(&relative_path) == "markdown"
+            {
+                self.state.markdown_preview = false;
+            }
+            if let Some(editor) = self.right_panel_file_editors.get_mut(&relative_path) {
+                editor.pending_goto = Some(location);
+                if !editor.reading {
+                    let state = editor.state.clone();
+                    let range = state.read(cx).line_column_range(location.0, location.1);
+                    state.update(cx, |state, cx| state.select_range(range.clone(), cx));
+                    self.reveal_file_search_match(&state, range.start, cx);
+                }
+            } else {
+                self.right_panel_pending_goto = Some((relative_path.clone(), location));
+            }
+        }
         let Some(active) = self.right_panel_active_surface else {
             self.open_right_panel_surface(RightPanelSurface::File(relative_path), cx);
             return;
@@ -3400,16 +3434,30 @@ impl Waku {
         let entries = self.right_panel_working_tree.clone();
 
         let mut list = div().flex().flex_col().py(px(6.0));
+        if let Some(RightPanelFileRename::Create {
+            parent_relative_path,
+            depth,
+            is_dir,
+        }) = &self.right_panel_file_rename
+            && parent_relative_path.is_empty()
+        {
+            list = list
+                .child(self.render_right_panel_file_create_row("", *depth, *is_dir, &theme, cx));
+        }
         for entry in entries {
             let relative_path = entry.relative_path.clone();
             let absolute_path = entry.absolute_path.clone();
             let name = entry.name.clone();
             let is_dir = entry.is_dir;
+            let entry_depth = entry.depth;
             let selected = selected_path == Some(relative_path.as_str());
-            let renaming = self
-                .right_panel_file_rename
-                .as_ref()
-                .is_some_and(|rename| rename.relative_path == relative_path);
+            let renaming = matches!(
+                self.right_panel_file_rename.as_ref(),
+                Some(RightPanelFileRename::Rename {
+                    relative_path: target,
+                    ..
+                }) if target == &relative_path
+            );
             let rename_input = renaming.then(|| self.right_panel_file_rename_input.clone());
             let waku = cx.entity().downgrade();
             let menu = self.menu_handle(
@@ -3422,6 +3470,7 @@ impl Waku {
             let click_relative_path = relative_path.clone();
             let click_absolute_path = absolute_path.clone();
             let menu_relative_path = relative_path.clone();
+            let menu_absolute_path = absolute_path.clone();
             let row_focus = menu.trigger_focus_handle().clone();
             let row = div()
                 .id(SharedString::from(format!(
@@ -3527,16 +3576,19 @@ impl Waku {
                             }
                         }))
                 });
+            let row_relative = relative_path.clone();
             let row = if renaming {
                 div()
                     .w_full()
                     .child(row)
                     .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                        if this
-                            .right_panel_file_rename
-                            .as_ref()
-                            .is_some_and(|rename| rename.relative_path == relative_path)
-                        {
+                        if matches!(
+                            this.right_panel_file_rename.as_ref(),
+                            Some(RightPanelFileRename::Rename {
+                                relative_path: target,
+                                ..
+                            }) if target == &row_relative
+                        ) {
                             this.commit_right_panel_file_rename(cx);
                         }
                     }))
@@ -3547,10 +3599,90 @@ impl Waku {
                     SharedString::from(format!("right-panel-file-menu-{relative_path}")),
                     &menu,
                     move |_| {
+                        let new_file_waku = waku.clone();
+                        let new_folder_waku = waku.clone();
+                        let copy_rel_waku = waku.clone();
+                        let copy_abs_waku = waku.clone();
                         let download_waku = waku.clone();
                         let rename_waku = waku.clone();
                         let delete_waku = waku.clone();
+                        let parent_for_create = if is_dir {
+                            menu_relative_path.clone()
+                        } else {
+                            menu_relative_path
+                                .rfind(['/', '\\'])
+                                .map(|idx| menu_relative_path[..idx].to_owned())
+                                .unwrap_or_default()
+                        };
+                        let create_depth = if is_dir { entry_depth + 1 } else { entry_depth };
+                        let expand_dir = is_dir.then(|| menu_absolute_path.clone());
                         let mut items = Vec::new();
+                        {
+                            let parent = parent_for_create.clone();
+                            let expand = expand_dir.clone();
+                            items.push(
+                                MenuItem::new(tr!("files.new_file"), move |window, cx| {
+                                    let _ = new_file_waku.update(cx, |waku, cx| {
+                                        waku.begin_right_panel_file_create(
+                                            parent.clone(),
+                                            create_depth,
+                                            false,
+                                            expand.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                })
+                                .icon("icons/file.svg"),
+                            );
+                        }
+                        {
+                            let parent = parent_for_create;
+                            let expand = expand_dir;
+                            items.push(
+                                MenuItem::new(tr!("files.new_folder"), move |window, cx| {
+                                    let _ = new_folder_waku.update(cx, |waku, cx| {
+                                        waku.begin_right_panel_file_create(
+                                            parent.clone(),
+                                            create_depth,
+                                            true,
+                                            expand.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                })
+                                .icon("icons/folder-new.svg"),
+                            );
+                        }
+                        items.push(MenuItem::Separator);
+                        {
+                            let rel = menu_relative_path.clone();
+                            items.push(
+                                MenuItem::new(tr!("files.copy_relative_path"), move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
+                                    let _ = copy_rel_waku.update(cx, |waku, cx| {
+                                        waku.show_success_toast(tr!("files.path_copied"));
+                                        cx.notify();
+                                    });
+                                })
+                                .icon("icons/copy.svg"),
+                            );
+                        }
+                        {
+                            let abs = menu_absolute_path.to_string_lossy().into_owned();
+                            items.push(
+                                MenuItem::new(tr!("files.copy_path"), move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
+                                    let _ = copy_abs_waku.update(cx, |waku, cx| {
+                                        waku.show_success_toast(tr!("files.path_copied"));
+                                        cx.notify();
+                                    });
+                                })
+                                .icon("icons/copy.svg"),
+                            );
+                        }
+                        items.push(MenuItem::Separator);
                         if !is_dir {
                             let relative_path = menu_relative_path.clone();
                             let item_name = name.clone();
@@ -3603,6 +3735,22 @@ impl Waku {
                 .into_any_element()
             };
             list = list.child(row);
+            if let Some(RightPanelFileRename::Create {
+                parent_relative_path,
+                depth,
+                is_dir: create_is_dir,
+            }) = &self.right_panel_file_rename
+                && is_dir
+                && parent_relative_path == &relative_path
+            {
+                list = list.child(self.render_right_panel_file_create_row(
+                    parent_relative_path,
+                    *depth,
+                    *create_is_dir,
+                    &theme,
+                    cx,
+                ));
+            }
         }
 
         div()
@@ -3617,7 +3765,7 @@ impl Waku {
                     .px(px(16.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .border_b_1()
                     .border_color(theme.border)
                     .child(icon("icons/folder.svg", 13.0, theme.text_tertiary))
@@ -3630,6 +3778,38 @@ impl Waku {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.text_secondary)
                             .child(project_name),
+                    )
+                    .child(
+                        icon_button("files-new-file", "icons/file.svg", theme)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_1().border_color(theme.accent))
+                            .tooltip(Tooltip::text(tr!("files.new_file")))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_right_panel_file_create(
+                                    String::new(),
+                                    0,
+                                    false,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        icon_button("files-new-folder", "icons/folder-new.svg", theme)
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_1().border_color(theme.accent))
+                            .tooltip(Tooltip::text(tr!("files.new_folder")))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_right_panel_file_create(
+                                    String::new(),
+                                    0,
+                                    true,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            })),
                     ),
             )
             .child(
@@ -3650,6 +3830,79 @@ impl Waku {
                         &self.right_panel_files_scrollbar,
                     )),
             )
+    }
+
+    fn render_right_panel_file_create_row(
+        &self,
+        parent_relative_path: &str,
+        depth: usize,
+        is_dir: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let create_input = self.right_panel_file_rename_input.clone();
+        let parent_owned = parent_relative_path.to_owned();
+        let row = div()
+            .id(SharedString::from(format!(
+                "right-panel-file-create-{parent_relative_path}"
+            )))
+            .h(px(30.0))
+            .mx(px(8.0))
+            .pl(px(8.0 + depth as f32 * 16.0))
+            .pr(px(8.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(icon(
+                if is_dir {
+                    "icons/folder-new.svg"
+                } else {
+                    "icons/file.svg"
+                },
+                12.0,
+                theme.text_tertiary,
+            ))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "right-panel-file-create-field-{parent_relative_path}"
+                    )))
+                    .key_context(FILE_RENAME_PARENT_CONTEXT)
+                    .on_action(
+                        cx.listener(|this, _: &CancelRightPanelFileRename, window, cx| {
+                            this.cancel_right_panel_file_rename(window, cx);
+                        }),
+                    )
+                    .h(px(18.0))
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(4.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(theme.accent)
+                    .bg(theme.inset)
+                    .flex()
+                    .items_center()
+                    .text_size(sp(12.0))
+                    .text_color(theme.text)
+                    .child(create_input),
+            );
+        div()
+            .w_full()
+            .child(row)
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if matches!(
+                    this.right_panel_file_rename.as_ref(),
+                    Some(RightPanelFileRename::Create {
+                        parent_relative_path: target,
+                        ..
+                    }) if target == &parent_owned
+                ) {
+                    this.commit_right_panel_file_rename(cx);
+                }
+            }))
+            .into_any_element()
     }
 
     /// The delete confirm dialog: a deferred scrim layer, so a destructive
@@ -3966,6 +4219,14 @@ impl Waku {
                 .read_only(true)
         });
 
+        let pending_goto = self
+            .right_panel_pending_goto
+            .as_ref()
+            .filter(|(path, _)| path == relative_path)
+            .map(|(_, location)| *location);
+        if pending_goto.is_some() {
+            self.right_panel_pending_goto = None;
+        }
         self.right_panel_file_editors.insert(
             relative_path.to_owned(),
             RightPanelFileEditor {
@@ -3975,6 +4236,7 @@ impl Waku {
                 dirty: false,
                 reading: false,
                 read_epoch: 0,
+                pending_goto,
             },
         );
 
@@ -4101,10 +4363,15 @@ impl Waku {
                 editor.disk_content = content.clone();
                 editor.writable = writable;
                 editor.dirty = false;
+                let pending_goto = editor.pending_goto;
                 let state = editor.state.clone();
                 state.update(cx, |state, cx| {
                     state.set_read_only(!writable);
                     state.set_content(content, cx);
+                    if let Some((line, column)) = pending_goto {
+                        let range = state.line_column_range(line, column);
+                        state.select_range(range, cx);
+                    }
                 });
                 cx.notify();
             })
@@ -4143,6 +4410,32 @@ impl Waku {
         // visible file actually changes.
         self.sync_file_search_target(relative_path, cx);
         let find_bar = self.render_file_search_bar(pane_width, writable, window, cx);
+        if self
+            .right_panel_file_editors
+            .get(relative_path)
+            .is_some_and(|editor| !editor.reading && editor.pending_goto.is_some())
+        {
+            let target_path = relative_path.to_owned();
+            let weak = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let Some((state, location)) = this
+                        .right_panel_file_editors
+                        .get_mut(&target_path)
+                        .filter(|editor| !editor.reading)
+                        .and_then(|editor| {
+                            Some((editor.state.clone(), editor.pending_goto.take()?))
+                        })
+                    else {
+                        return;
+                    };
+                    let range = state.read(cx).line_column_range(location.0, location.1);
+                    state.update(cx, |state, cx| state.select_range(range.clone(), cx));
+                    this.reveal_file_search_match(&state, range.start, cx);
+                    cx.notify();
+                });
+            });
+        }
 
         let theme = Theme::current(cx);
         let field = editor_state.read(cx);
@@ -4449,6 +4742,39 @@ impl Waku {
         .detach();
     }
 
+    pub(super) fn begin_right_panel_file_create(
+        &mut self,
+        parent_relative_path: String,
+        depth: usize,
+        is_dir: bool,
+        expand_directory: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(dir) = expand_directory
+            && self.right_panel_expanded_paths.insert(dir)
+        {
+            self.refresh_right_panel_working_tree(cx);
+        }
+        self.right_panel_file_rename = Some(RightPanelFileRename::Create {
+            parent_relative_path,
+            depth,
+            is_dir,
+        });
+        let placeholder = if is_dir {
+            tr!("files.new_folder_placeholder")
+        } else {
+            tr!("files.new_file_placeholder")
+        };
+        self.right_panel_file_rename_input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, cx);
+            input.clear(cx);
+        });
+        let focus = self.right_panel_file_rename_input.read(cx).focus();
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        cx.notify();
+    }
+
     /// Starts the inline rename for a working-tree row. Renaming stays inside
     /// the entry's directory: the field edits the name only.
     pub(super) fn begin_right_panel_file_rename(
@@ -4465,7 +4791,7 @@ impl Waku {
         else {
             return;
         };
-        self.right_panel_file_rename = Some(RightPanelFileRename {
+        self.right_panel_file_rename = Some(RightPanelFileRename::Rename {
             relative_path,
             absolute_path: entry.absolute_path,
         });
@@ -4479,7 +4805,7 @@ impl Waku {
     }
 
     pub(super) fn commit_right_panel_file_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(rename) = self.right_panel_file_rename.take() else {
+        let Some(edit) = self.right_panel_file_rename.take() else {
             return;
         };
         let new_name = self
@@ -4488,80 +4814,181 @@ impl Waku {
             .content()
             .trim()
             .to_owned();
-        let old_name = rename
-            .relative_path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        if new_name.is_empty() || new_name == old_name {
-            cx.notify();
-            return;
-        }
-        if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
-            self.show_toast(tr!("files.invalid_name"));
-            cx.notify();
-            return;
-        }
-        // Preserve whatever separator convention the tree itself carries.
-        let to_relative = match rename.relative_path.rfind(['/', '\\']) {
-            Some(index) => format!("{}{}", &rename.relative_path[..=index], new_name),
-            None => new_name.clone(),
-        };
-
-        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
-            return;
-        };
-        let Some(session_id) = self.state.selected_session else {
-            return;
-        };
-        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
-        let from_relative = rename.relative_path.clone();
-        cx.spawn(async move |waku, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let project_path = project_path.clone();
-                    let from_relative = from_relative.clone();
-                    let to_relative = to_relative.clone();
-                    async move {
-                        match workspace.request(waku_client::WorkspaceOperation::RenamePath {
-                            root: project_path,
-                            from_relative_path: PathBuf::from(from_relative),
-                            to_relative_path: PathBuf::from(to_relative),
-                        })? {
-                            waku_client::WorkspaceResult::Ack => Ok(()),
-                            _ => anyhow::bail!("the daemon returned an invalid rename response"),
-                        }
-                    }
-                })
-                .await;
-            let _ = waku.update(cx, |waku, cx| {
-                if waku.state.selected_session != Some(session_id)
-                    || waku
-                        .selected_workspace_path()
-                        .is_none_or(|path| path != project_path)
-                {
+        match edit {
+            RightPanelFileRename::Create {
+                parent_relative_path,
+                is_dir,
+                ..
+            } => {
+                if new_name.is_empty() {
+                    cx.notify();
                     return;
                 }
-                match result {
-                    Ok(()) => {
-                        waku.retarget_right_panel_file_paths(&from_relative, &to_relative);
-                        waku.refresh_right_panel_working_tree(cx);
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        waku.show_toast(tr!(
-                            "files.rename_failed",
-                            path = from_relative,
-                            error = error.to_string()
-                        ));
-                        cx.notify();
-                    }
+                if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
+                    self.show_toast(tr!("files.invalid_name"));
+                    cx.notify();
+                    return;
                 }
-            });
-        })
-        .detach();
+                let relative_path = if parent_relative_path.is_empty() {
+                    new_name
+                } else {
+                    let sep = if parent_relative_path.contains('\\') {
+                        '\\'
+                    } else {
+                        '/'
+                    };
+                    format!("{parent_relative_path}{sep}{new_name}")
+                };
+                let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf)
+                else {
+                    return;
+                };
+                let Some(session_id) = self.state.selected_session else {
+                    return;
+                };
+                let workspace =
+                    waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+                cx.spawn(async move |waku, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn({
+                            let project_path = project_path.clone();
+                            let relative_path = relative_path.clone();
+                            async move {
+                                let op = if is_dir {
+                                    waku_client::WorkspaceOperation::CreateDirectory {
+                                        root: project_path,
+                                        relative_path: PathBuf::from(relative_path),
+                                    }
+                                } else {
+                                    waku_client::WorkspaceOperation::CreateFile {
+                                        root: project_path,
+                                        relative_path: PathBuf::from(relative_path),
+                                    }
+                                };
+                                match workspace.request(op)? {
+                                    waku_client::WorkspaceResult::Ack => Ok(()),
+                                    _ => anyhow::bail!("the daemon returned an invalid response"),
+                                }
+                            }
+                        })
+                        .await;
+                    let _ = waku.update(cx, |waku, cx| {
+                        if waku.state.selected_session != Some(session_id)
+                            || waku
+                                .selected_workspace_path()
+                                .is_none_or(|path| path != project_path)
+                        {
+                            return;
+                        }
+                        match result {
+                            Ok(()) => {
+                                if is_dir {
+                                    waku.right_panel_expanded_paths
+                                        .insert(project_path.join(&relative_path));
+                                }
+                                waku.refresh_right_panel_working_tree(cx);
+                                waku.invalidate_composer_sources(cx);
+                                if !is_dir {
+                                    waku.open_right_panel_file(relative_path, cx);
+                                }
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                waku.show_toast(tr!(
+                                    "files.create_failed",
+                                    path = relative_path,
+                                    error = error.to_string()
+                                ));
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+            RightPanelFileRename::Rename { relative_path, .. } => {
+                let old_name = relative_path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                if new_name.is_empty() || new_name == old_name {
+                    cx.notify();
+                    return;
+                }
+                if new_name.contains(['/', '\\', '\0']) || new_name == "." || new_name == ".." {
+                    self.show_toast(tr!("files.invalid_name"));
+                    cx.notify();
+                    return;
+                }
+                // Preserve whatever separator convention the tree itself carries.
+                let to_relative = match relative_path.rfind(['/', '\\']) {
+                    Some(index) => format!("{}{}", &relative_path[..=index], new_name),
+                    None => new_name.clone(),
+                };
+
+                let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf)
+                else {
+                    return;
+                };
+                let Some(session_id) = self.state.selected_session else {
+                    return;
+                };
+                let workspace =
+                    waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+                let from_relative = relative_path;
+                cx.spawn(async move |waku, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn({
+                            let project_path = project_path.clone();
+                            let from_relative = from_relative.clone();
+                            let to_relative = to_relative.clone();
+                            async move {
+                                match workspace.request(
+                                    waku_client::WorkspaceOperation::RenamePath {
+                                        root: project_path,
+                                        from_relative_path: PathBuf::from(from_relative),
+                                        to_relative_path: PathBuf::from(to_relative),
+                                    },
+                                )? {
+                                    waku_client::WorkspaceResult::Ack => Ok(()),
+                                    _ => anyhow::bail!(
+                                        "the daemon returned an invalid rename response"
+                                    ),
+                                }
+                            }
+                        })
+                        .await;
+                    let _ = waku.update(cx, |waku, cx| {
+                        if waku.state.selected_session != Some(session_id)
+                            || waku
+                                .selected_workspace_path()
+                                .is_none_or(|path| path != project_path)
+                        {
+                            return;
+                        }
+                        match result {
+                            Ok(()) => {
+                                waku.retarget_right_panel_file_paths(&from_relative, &to_relative);
+                                waku.refresh_right_panel_working_tree(cx);
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                waku.show_toast(tr!(
+                                    "files.rename_failed",
+                                    path = from_relative,
+                                    error = error.to_string()
+                                ));
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     pub(super) fn cancel_right_panel_file_rename(
@@ -4620,14 +5047,16 @@ impl Waku {
         {
             *selected = retargeted;
         }
-        if let Some(rename) = self.right_panel_file_rename.as_ref()
-            && let Some(retargeted) = retarget(&rename.relative_path, from_relative, to_relative)
+        if let Some(RightPanelFileRename::Rename {
+            relative_path,
+            absolute_path,
+        }) = self.right_panel_file_rename.as_ref()
+            && let Some(retargeted) = retarget(relative_path, from_relative, to_relative)
         {
-            let renamed = RightPanelFileRename {
+            self.right_panel_file_rename = Some(RightPanelFileRename::Rename {
                 relative_path: retargeted,
-                absolute_path: rename.absolute_path.clone(),
-            };
-            self.right_panel_file_rename = Some(renamed);
+                absolute_path: absolute_path.clone(),
+            });
         }
         let absolute_moves: Vec<(PathBuf, PathBuf)> = self
             .right_panel_expanded_paths
@@ -5835,9 +6264,8 @@ impl Waku {
         match self.active_right_panel_surface() {
             Some(RightPanelSurface::Diff) => self.refresh_right_panel_diff(cx),
             Some(RightPanelSurface::GitGraph) => {
-                if let Some(path) = self.selected_workspace_path() {
-                    let path = path.to_path_buf();
-                    self.git_graph_snapshots.invalidate(&path);
+                if let Some(scope) = self.selected_panel_scope() {
+                    self.git_graph_snapshots.invalidate(&scope);
                 }
                 cx.notify();
             }
@@ -5855,17 +6283,14 @@ impl Waku {
     /// the panel keeps drawing the previous listing until the result lands.
     /// Called when the tree's inputs change, never from a frame.
     fn refresh_right_panel_working_tree(&mut self, cx: &mut Context<Self>) {
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             self.right_panel_working_tree.clear();
             return;
         };
         // The tree on disk moves under us, and the expanded set may just have
         // changed, so a cached listing is only good until something asks again.
-        self.working_trees.invalidate(&project_path);
-        match self.working_trees.read(&project_path) {
+        self.working_trees.invalidate(&scope);
+        match self.working_trees.read(&scope) {
             Query::Ready(entries) => self.right_panel_working_tree = (*entries).clone(),
             Query::Pending => {}
             Query::Missing(token) => {
@@ -5876,7 +6301,7 @@ impl Waku {
                     let entries = cx
                         .background_executor()
                         .spawn({
-                            let path = project_path.clone();
+                            let path = scope.workspace.clone();
                             async move {
                                 match workspace.request(waku_client::WorkspaceOperation::ListTree {
                                     root: path,
@@ -5904,9 +6329,7 @@ impl Waku {
                         .await;
                     waku.update(cx, |waku, cx| {
                         if waku.working_trees.fulfill(token, entries.clone())
-                            && waku
-                                .selected_workspace_path()
-                                .is_some_and(|path| path == project_path)
+                            && waku.selected_panel_scope().as_ref() == Some(&scope)
                         {
                             waku.right_panel_working_tree = entries;
                             cx.notify();

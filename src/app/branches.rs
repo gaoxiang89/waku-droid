@@ -24,27 +24,34 @@ impl Waku {
         workspace_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) -> Option<BranchSnapshot> {
-        let workspace_path = workspace_path.to_path_buf();
+        let scope = PanelScope {
+            host: self.selected_host_key(),
+            workspace: workspace_path.to_path_buf(),
+        };
         let fallback = self
             .visible_branch_snapshot
             .as_ref()
-            .filter(|(path, _)| path == &workspace_path)
+            .filter(|(cached, _)| cached == &scope)
             .map(|(_, snapshot)| snapshot.clone());
 
-        match self.branch_snapshots.read(&workspace_path) {
+        match self.branch_snapshots.read(&scope) {
             Query::Ready(result) => match result.as_ref() {
                 Ok(Some(snapshot)) => {
                     let snapshot = snapshot.clone();
-                    self.cache_sidebar_branch_label(&workspace_path, snapshot.display_branch());
-                    self.visible_branch_snapshot = Some((workspace_path, snapshot.clone()));
+                    self.cache_sidebar_branch_label(
+                        &scope.host,
+                        &scope.workspace,
+                        snapshot.display_branch(),
+                    );
+                    self.visible_branch_snapshot = Some((scope, snapshot.clone()));
                     Some(snapshot)
                 }
                 Ok(None) => {
-                    self.cache_sidebar_branch_label(&workspace_path, None);
+                    self.cache_sidebar_branch_label(&scope.host, &scope.workspace, None);
                     if self
                         .visible_branch_snapshot
                         .as_ref()
-                        .is_some_and(|(path, _)| path == &workspace_path)
+                        .is_some_and(|(cached, _)| cached == &scope)
                     {
                         self.visible_branch_snapshot = None;
                     }
@@ -54,18 +61,18 @@ impl Waku {
             },
             Query::Pending => fallback,
             Query::Missing(token) => {
-                let fetch_path = workspace_path.clone();
+                let fetch_scope = scope.clone();
                 let workspace =
                     waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
                     let result = cx
                         .background_executor()
                         .spawn({
-                            let fetch_path = fetch_path.clone();
+                            let fetch_path = fetch_scope.workspace.clone();
                             async move {
                                 match workspace.request(
                                     waku_client::WorkspaceOperation::InspectBranches {
-                                        cwd: fetch_path.clone(),
+                                        cwd: fetch_path,
                                     },
                                 ) {
                                     Ok(waku_client::WorkspaceResult::Branches { snapshot }) => {
@@ -85,14 +92,19 @@ impl Waku {
                             return;
                         }
                         match &result {
-                            Ok(Some(snapshot)) => waku
-                                .cache_sidebar_branch_label(&fetch_path, snapshot.display_branch()),
-                            Ok(None) => waku.cache_sidebar_branch_label(&fetch_path, None),
+                            Ok(Some(snapshot)) => waku.cache_sidebar_branch_label(
+                                &fetch_scope.host,
+                                &fetch_scope.workspace,
+                                snapshot.display_branch(),
+                            ),
+                            Ok(None) => waku.cache_sidebar_branch_label(
+                                &fetch_scope.host,
+                                &fetch_scope.workspace,
+                                None,
+                            ),
                             Err(_) => {}
                         }
-                        let selected = waku
-                            .selected_workspace_path()
-                            .is_some_and(|path| path == fetch_path);
+                        let selected = waku.selected_panel_scope().as_ref() == Some(&fetch_scope);
                         if selected {
                             match result {
                                 Ok(Some(snapshot)) => {
@@ -106,7 +118,7 @@ impl Waku {
                                         *branch = current.to_owned();
                                         persisted_branch_changed = true;
                                     }
-                                    waku.visible_branch_snapshot = Some((fetch_path, snapshot));
+                                    waku.visible_branch_snapshot = Some((fetch_scope, snapshot));
                                     if persisted_branch_changed {
                                         waku.save();
                                     }
@@ -125,15 +137,12 @@ impl Waku {
     }
 
     pub(super) fn refresh_selected_branch_snapshot(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             self.visible_branch_snapshot = None;
             return;
         };
-        self.branch_snapshots.invalidate(&path);
-        self.git_graph_snapshots.invalidate(&path);
+        self.branch_snapshots.invalidate(&scope);
+        self.git_graph_snapshots.invalidate(&scope);
         cx.notify();
     }
 
@@ -173,22 +182,19 @@ impl Waku {
             return true;
         }
 
-        let Some(path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             return false;
         };
         if self
             .visible_branch_snapshot
             .as_ref()
-            .filter(|(snapshot_path, _)| snapshot_path == &path)
+            .filter(|(snapshot_scope, _)| snapshot_scope == &scope)
             .and_then(|(_, snapshot)| snapshot.current.as_deref())
             == Some(branch.as_str())
         {
             return true;
         }
-        self.start_branch_operation(path, BranchOperation::Checkout(branch), cx);
+        self.start_branch_operation(scope, BranchOperation::Checkout(branch), cx);
         true
     }
 
@@ -241,13 +247,10 @@ impl Waku {
         if branch.is_empty() {
             return false;
         }
-        let Some(path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             return false;
         };
-        self.start_branch_operation(path, BranchOperation::Create(branch), cx);
+        self.start_branch_operation(scope, BranchOperation::Create(branch), cx);
         true
     }
 
@@ -313,17 +316,16 @@ impl Waku {
     /// working tree.
     pub(super) fn apply_branch_change(
         &mut self,
-        path: &Path,
+        scope: &PanelScope,
         snapshot: BranchSnapshot,
         cx: &mut Context<Self>,
     ) {
         let current = snapshot.current.clone();
-        let path_buf = path.to_path_buf();
-        self.cache_sidebar_branch_label(path, snapshot.display_branch());
-        self.visible_branch_snapshot = Some((path_buf.clone(), snapshot));
-        self.branch_snapshots.invalidate(&path_buf);
-        self.git_graph_snapshots.invalidate(&path_buf);
-        if self.selected_workspace_path() == Some(path) {
+        self.cache_sidebar_branch_label(&scope.host, &scope.workspace, snapshot.display_branch());
+        self.visible_branch_snapshot = Some((scope.clone(), snapshot));
+        self.branch_snapshots.invalidate(scope);
+        self.git_graph_snapshots.invalidate(scope);
+        if self.selected_panel_scope().as_ref() == Some(scope) {
             if let Some(current) = current
                 && let Some(session) = self.selected_session_mut()
                 && let SessionWorkspace::Worktree { branch, .. } = &mut session.workspace
@@ -338,7 +340,7 @@ impl Waku {
 
     fn start_branch_operation(
         &mut self,
-        path: PathBuf,
+        scope: PanelScope,
         operation: BranchOperation,
         cx: &mut Context<Self>,
     ) {
@@ -352,7 +354,7 @@ impl Waku {
             let result = cx
                 .background_executor()
                 .spawn({
-                    let path = path.clone();
+                    let path = scope.workspace.clone();
                     async move {
                         let (branch, create) = match operation {
                             BranchOperation::Checkout(branch) => (branch, false),
@@ -376,7 +378,7 @@ impl Waku {
             let _ = waku.update(cx, |waku, cx| {
                 waku.branch_operation_pending = false;
                 match result {
-                    Ok(snapshot) => waku.apply_branch_change(&path, snapshot, cx),
+                    Ok(snapshot) => waku.apply_branch_change(&scope, snapshot, cx),
                     Err(error) => {
                         waku.show_toast(tr!("errors.change_branch", error = error));
                     }

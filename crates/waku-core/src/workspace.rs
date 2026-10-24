@@ -127,6 +127,37 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
                 .with_context(|| format!("could not rename {}", from.display()))?;
             WorkspaceResult::Ack
         }
+        WorkspaceOperation::CreateFile {
+            root,
+            relative_path,
+        } => {
+            let path = resolve_workspace_path(&root, &relative_path)?;
+            if fs::symlink_metadata(&path).is_ok() {
+                bail!("{} already exists", path.display());
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("could not create directory {}", parent.display()))?;
+            }
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("could not create file {}", path.display()))?;
+            WorkspaceResult::Ack
+        }
+        WorkspaceOperation::CreateDirectory {
+            root,
+            relative_path,
+        } => {
+            let path = resolve_workspace_path(&root, &relative_path)?;
+            if fs::symlink_metadata(&path).is_ok() {
+                bail!("{} already exists", path.display());
+            }
+            fs::create_dir_all(&path)
+                .with_context(|| format!("could not create directory {}", path.display()))?;
+            WorkspaceResult::Ack
+        }
         WorkspaceOperation::DeletePath {
             root,
             relative_path,

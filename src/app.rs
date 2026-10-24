@@ -765,6 +765,9 @@ struct RightPanelFileEditor {
     /// started earlier cannot apply over a newer truth — a save in particular,
     /// which makes any read already in flight describe the pre-save file.
     read_epoch: u64,
+    /// Line and optional column to select and scroll into view once the file
+    /// content and layout are ready.
+    pending_goto: Option<(usize, Option<usize>)>,
 }
 
 /// The identity panels hang off: a directory on a host. Sessions opened into
@@ -773,9 +776,9 @@ struct RightPanelFileEditor {
 /// with its own materialized worktree is a separate scope, because its tree
 /// and terminals point somewhere else.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PanelScope {
-    host: HostKey,
-    workspace: PathBuf,
+pub(super) struct PanelScope {
+    pub(super) host: HostKey,
+    pub(super) workspace: PathBuf,
 }
 
 struct RightPanelWorkspaceState {
@@ -1360,9 +1363,17 @@ pub struct Waku {
     /// The settings Usage page's snapshot: historical token/cost usage
     /// scanned from provider transcripts off-thread. Frames read only this.
     usage_history: Option<crate::usage_history::UsageHistory>,
-    /// The window a scan is currently in flight for, so a repeat request for
-    /// the same window coalesces while a changed window supersedes it.
-    usage_history_pending_for: Option<crate::usage_history::UsageWindow>,
+    /// Which host `usage_history` belongs to.
+    usage_history_host: Option<waku_client::hosts::HostKey>,
+    /// Which host the Usage settings page is currently viewing.
+    usage_settings_host: waku_client::hosts::HostKey,
+    /// The (host, window) a scan is currently in flight for, so a repeat
+    /// request for the same target coalesces while a changed target supersedes
+    /// it.
+    usage_history_pending_for: Option<(
+        waku_client::hosts::HostKey,
+        crate::usage_history::UsageWindow,
+    )>,
     /// Bumped per scan; a result from a superseded scan is discarded.
     usage_history_generation: u64,
     /// When the current snapshot landed, for the reopen-staleness check.
@@ -1430,24 +1441,24 @@ pub struct Waku {
     project_picker_row_cache: RefCell<Vec<Uuid>>,
     project_picker_scrollbar: Rc<ScrollbarState>,
     project_picker_matcher: RefCell<nucleo_matcher::Matcher>,
-    /// Git subprocess results per concrete workspace path. Render only reads
+    /// Git subprocess results per concrete workspace scope. Render only reads
     /// this in-memory cache; misses are fulfilled on the background executor.
-    branch_snapshots: QueryCache<PathBuf, Result<Option<BranchSnapshot>, String>>,
-    /// Stale-while-revalidate value for the selected path, avoiding label
+    branch_snapshots: QueryCache<PanelScope, Result<Option<BranchSnapshot>, String>>,
+    /// Stale-while-revalidate value for the selected scope, avoiding label
     /// flicker when app activation invalidates the query.
-    visible_branch_snapshot: Option<(PathBuf, BranchSnapshot)>,
-    /// Commit graph per workspace. Render reads this; a miss fetches on the
-    /// daemon. The visible copy stays up while a refresh is in flight.
+    visible_branch_snapshot: Option<(PanelScope, BranchSnapshot)>,
+    /// Commit graph per workspace scope. Render reads this; a miss fetches on
+    /// the daemon. The visible copy stays up while a refresh is in flight.
     git_graph_snapshots:
-        QueryCache<PathBuf, Result<Option<Arc<waku_client::git::GitGraphSnapshot>>, String>>,
-    visible_git_graph: Option<(PathBuf, Arc<waku_client::git::GitGraphSnapshot>)>,
-    git_graph_limits: HashMap<PathBuf, u32>,
+        QueryCache<PanelScope, Result<Option<Arc<waku_client::git::GitGraphSnapshot>>, String>>,
+    visible_git_graph: Option<(PanelScope, Arc<waku_client::git::GitGraphSnapshot>)>,
+    git_graph_limits: HashMap<PanelScope, u32>,
     git_commit_details:
-        QueryCache<(PathBuf, String), Result<waku_client::git::GitCommitDetail, String>>,
+        QueryCache<(PanelScope, String), Result<waku_client::git::GitCommitDetail, String>>,
     git_graph_list_state: ListState,
     git_graph_list_rows: usize,
-    /// Workspace the list state was last sized for; a switch resets scroll.
-    git_graph_list_path: Option<PathBuf>,
+    /// Workspace scope the list state was last sized for; a switch resets scroll.
+    git_graph_list_path: Option<PanelScope>,
     git_graph_matches: Option<git_graph::GitGraphMatches>,
     git_graph_scrollbar: Rc<ScrollbarState>,
     git_graph_search: Entity<TextInput>,
@@ -1457,7 +1468,7 @@ pub struct Waku {
     git_graph_copy_focus: FocusHandle,
     git_graph_detail_scroll: ScrollHandle,
     /// Selected row, scoped to the workspace it was picked in.
-    git_graph_cursor: Option<(PathBuf, usize)>,
+    git_graph_cursor: Option<(PanelScope, usize)>,
     /// Inline diffs, compare selection, and the action dialog.
     git_graph_ui: git_graph_actions::GitGraphUi,
     branch_operation_pending: bool,
@@ -1482,19 +1493,32 @@ pub struct Waku {
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
     commit_operation: Option<commit_dialog::CommitOperationState>,
-    /// Slash commands discovered per (provider, project root, CLI override).
+    /// Slash commands discovered per (host, provider, project root, CLI override).
     /// Filesystem and CLI probes live off the UI thread; frames read this cache.
-    slash_commands: QueryCache<(ProviderKind, PathBuf, Option<String>), Vec<SlashCommand>>,
+    slash_commands: QueryCache<
+        (
+            waku_client::hosts::HostKey,
+            ProviderKind,
+            PathBuf,
+            Option<String>,
+        ),
+        Vec<SlashCommand>,
+    >,
     /// The merged command list the autocomplete popup draws, and the key it
     /// was built for — a stale key means "no commands", never another
     /// provider's list.
     slash_command_index: Rc<Vec<SlashCommand>>,
-    slash_command_index_key: Option<(ProviderKind, PathBuf, Option<String>)>,
+    slash_command_index_key: Option<(
+        waku_client::hosts::HostKey,
+        ProviderKind,
+        PathBuf,
+        Option<String>,
+    )>,
     slash_command_index_loading: bool,
-    /// Workspace file index per project root, for `@` mentions.
-    mention_files: QueryCache<PathBuf, Vec<FileEntry>>,
+    /// Workspace file index per project scope, for `@` mentions.
+    mention_files: QueryCache<PanelScope, Vec<FileEntry>>,
     mention_file_index: Rc<Vec<FileEntry>>,
-    mention_file_index_path: Option<PathBuf>,
+    mention_file_index_path: Option<PanelScope>,
     mention_file_index_loading: bool,
     /// Set when a driver reports its command registry mid-drain; the drain
     /// has no `Context` to rebuild the drawn index itself.
@@ -1649,8 +1673,10 @@ pub struct Waku {
     right_panel_files_selected_path: Option<String>,
     right_panel_file_tree_width: f32,
     right_panel_file_editors: HashMap<String, RightPanelFileEditor>,
-    /// Working-tree row currently showing its inline rename field. One target
-    /// at a time; the field itself is the shared `right_panel_file_rename_input`.
+    /// Line/column navigation requested for a file before its editor entity was
+    /// created by `ensure_right_panel_file_editor`.
+    right_panel_pending_goto: Option<(String, (usize, Option<usize>))>,
+    /// Working-tree row currently showing its inline rename or create field.
     right_panel_file_rename: Option<right_panel::RightPanelFileRename>,
     /// One stable field reused across working-tree rows so redraws never
     /// replace the focused editor mid-rename, mirroring `session_rename_input`.
@@ -1673,9 +1699,9 @@ pub struct Waku {
     /// The working tree as currently drawn. Held so a refresh can redraw the
     /// previous listing instead of blanking the panel.
     right_panel_working_tree: Vec<right_panel::WorkingTreeEntry>,
-    /// Working tree per project path. Walking it is filesystem I/O and must
+    /// Working tree per project scope. Walking it is filesystem I/O and must
     /// never happen in a frame.
-    working_trees: QueryCache<PathBuf, Vec<right_panel::WorkingTreeEntry>>,
+    working_trees: QueryCache<PanelScope, Vec<right_panel::WorkingTreeEntry>>,
     /// Set when a turn finishes; the drain loop drops the workspace queries,
     /// since the event handler has no `Context` to refresh them itself.
     workspace_queries_stale: bool,
@@ -1707,6 +1733,10 @@ pub struct Waku {
     /// The Skills page's library snapshot, scanned off-thread. Frames read
     /// only this; `None` means the first scan has not landed yet.
     skills_catalog: Option<Rc<crate::skills::SkillsCatalog>>,
+    /// Which host `skills_catalog` belongs to.
+    skills_catalog_host: Option<waku_client::hosts::HostKey>,
+    /// Which host the Skills settings page is currently viewing.
+    skills_settings_host: waku_client::hosts::HostKey,
     /// Bumped per scan; a result from a superseded scan is discarded.
     skills_scan_generation: u64,
     skills_scan_pending: bool,
@@ -3266,6 +3296,8 @@ impl Waku {
                 plan_usage_checked_at: HashMap::new(),
                 plan_usage_stale: HashSet::new(),
                 usage_history: None,
+                usage_history_host: None,
+                usage_settings_host: waku_client::hosts::HostKey::Local,
                 usage_history_pending_for: None,
                 usage_history_generation: 0,
                 usage_history_scanned_at: None,
@@ -3431,6 +3463,7 @@ impl Waku {
                 right_panel_files_selected_path: None,
                 right_panel_file_tree_width: DEFAULT_FILE_TREE_WIDTH,
                 right_panel_file_editors: HashMap::new(),
+                right_panel_pending_goto: None,
                 file_search: None,
                 right_panel_diff_source: ReviewDiffSource::default(),
                 right_panel_diff_snapshot: None,
@@ -3450,6 +3483,8 @@ impl Waku {
                 scene_overlay_enabled,
                 settings_page: None,
                 skills_catalog: None,
+                skills_catalog_host: None,
+                skills_settings_host: waku_client::hosts::HostKey::Local,
                 skills_scan_generation: 0,
                 skills_scan_pending: false,
                 skills_scanned_at: None,
