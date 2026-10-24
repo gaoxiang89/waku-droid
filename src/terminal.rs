@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -338,9 +338,66 @@ struct TerminalEventProxy {
     sender: Arc<OnceLock<PtyInput>>,
     ui_events: Sender<TerminalUiEvent>,
     window_size: Arc<Mutex<WindowSize>>,
-    /// Palette OSC replies run on the PTY thread; `snapshot` refreshes this
+    /// Palette OSC replies run on the PTY thread; `snapshot` refreshes them
     /// so they track the active theme.
-    dark_theme: Arc<AtomicBool>,
+    reply_colors: TerminalReplyColors,
+}
+
+/// The dynamic colors a program can query with OSC 10/11/12. Some TUIs pick
+/// between their light and dark palettes from the reported background, so a
+/// reply that does not match the surface makes them paint near-black text
+/// onto a dark terminal, where it only shows once selected.
+#[derive(Clone)]
+struct TerminalReplyColors {
+    is_dark: Arc<AtomicBool>,
+    foreground: Arc<AtomicU32>,
+    background: Arc<AtomicU32>,
+    cursor: Arc<AtomicU32>,
+}
+
+impl TerminalReplyColors {
+    fn new() -> Self {
+        let colors = Self {
+            is_dark: Arc::new(AtomicBool::new(true)),
+            foreground: Arc::new(AtomicU32::new(0)),
+            background: Arc::new(AtomicU32::new(0)),
+            cursor: Arc::new(AtomicU32::new(0)),
+        };
+        colors.store(&Theme::dark());
+        colors
+    }
+
+    fn store(&self, theme: &Theme) {
+        self.is_dark.store(theme.is_dark, Ordering::Release);
+        self.foreground
+            .store(pack_hsla(theme.text), Ordering::Release);
+        self.background
+            .store(pack_hsla(theme.terminal), Ordering::Release);
+        self.cursor.store(pack_hsla(theme.text), Ordering::Release);
+    }
+
+    fn is_dark(&self) -> bool {
+        self.is_dark.load(Ordering::Acquire)
+    }
+
+    /// Named colors owned by the theme; ANSI indices still resolve through
+    /// [`terminal_rgb`].
+    fn color(&self, index: usize) -> Option<Rgb> {
+        let load = |value: &AtomicU32| unpack_rgb(value.load(Ordering::Acquire));
+        match index {
+            i if i == NamedColor::Foreground as usize
+                || i == NamedColor::BrightForeground as usize =>
+            {
+                Some(load(&self.foreground))
+            }
+            i if i == NamedColor::Background as usize => Some(load(&self.background)),
+            i if i == NamedColor::Cursor as usize => Some(load(&self.cursor)),
+            i if i == NamedColor::DimForeground as usize => {
+                Some(dim_rgb(load(&self.foreground), self.is_dark()))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl TerminalEventProxy {
@@ -373,8 +430,11 @@ impl EventListener for TerminalEventProxy {
             }
             Event::PtyWrite(text) => self.write_pty(text.into_bytes()),
             Event::ColorRequest(index, formatter) => {
-                let is_dark = self.dark_theme.load(Ordering::Acquire);
-                self.write_pty(formatter(terminal_rgb(index, is_dark)).into_bytes());
+                let color = self
+                    .reply_colors
+                    .color(index)
+                    .unwrap_or_else(|| terminal_rgb(index, self.reply_colors.is_dark()));
+                self.write_pty(formatter(color).into_bytes());
             }
             Event::TextAreaSizeRequest(formatter) => {
                 self.write_pty(formatter(*self.window_size.lock()).into_bytes());
@@ -414,7 +474,7 @@ struct TerminalSession {
     ui_events: Receiver<TerminalUiEvent>,
     window_size: Arc<Mutex<WindowSize>>,
     grid_size: (usize, usize),
-    dark_theme: Arc<AtomicBool>,
+    reply_colors: TerminalReplyColors,
     url_regex: RegexSearch,
 }
 
@@ -436,7 +496,7 @@ impl TerminalSession {
         let shared_window_size = Arc::new(Mutex::new(window_size));
         let dirty = Arc::new(AtomicBool::new(true));
         let sender_slot = Arc::new(OnceLock::new());
-        let dark_theme = Arc::new(AtomicBool::new(true));
+        let reply_colors = TerminalReplyColors::new();
         let (ui_event_tx, ui_events) = unbounded();
         let url_regex = RegexSearch::new(TERMINAL_LINK_REGEX)
             .map_err(|error| anyhow::anyhow!("compile terminal link regex: {error}"))?;
@@ -445,7 +505,7 @@ impl TerminalSession {
             sender: sender_slot.clone(),
             ui_events: ui_event_tx.clone(),
             window_size: shared_window_size.clone(),
-            dark_theme: dark_theme.clone(),
+            reply_colors: reply_colors.clone(),
         };
 
         let config = Config {
@@ -479,7 +539,7 @@ impl TerminalSession {
                 ui_events,
                 window_size: shared_window_size,
                 grid_size: (columns, rows),
-                dark_theme,
+                reply_colors,
                 url_regex,
             });
         }
@@ -517,7 +577,7 @@ impl TerminalSession {
             ui_events,
             window_size: shared_window_size,
             grid_size: (columns, rows),
-            dark_theme,
+            reply_colors,
             url_regex,
         })
     }
@@ -583,7 +643,7 @@ impl TerminalSession {
         cursor_style: TerminalCursorStyle,
         hovered_link: Option<&Match>,
     ) -> TerminalSnapshot {
-        self.dark_theme.store(theme.is_dark, Ordering::Release);
+        self.reply_colors.store(&theme);
         let term = self.term.lock();
         let content = term.renderable_content();
         let columns = self.grid_size.0;
@@ -2656,6 +2716,36 @@ fn rgb_to_hsla(color: Rgb) -> Hsla {
     rgb((u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)).into()
 }
 
+fn pack_hsla(color: Hsla) -> u32 {
+    let color = color.to_rgb();
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
+}
+
+fn unpack_rgb(value: u32) -> Rgb {
+    Rgb {
+        r: (value >> 16) as u8,
+        g: (value >> 8) as u8,
+        b: value as u8,
+    }
+}
+
+fn dim_rgb(color: Rgb, is_dark: bool) -> Rgb {
+    // Faint fades toward the surface: black on dark, white on light.
+    let dim = |channel: u8| {
+        if is_dark {
+            channel * 2 / 3
+        } else {
+            channel + (255 - channel) / 3
+        }
+    };
+    Rgb {
+        r: dim(color.r),
+        g: dim(color.g),
+        b: dim(color.b),
+    }
+}
+
 fn terminal_rgb(index: usize, is_dark: bool) -> Rgb {
     // Tomorrow Night on dark surfaces, Tomorrow on light — same hues tuned
     // for the opposite background so ANSI text stays legible on white.
@@ -2692,15 +2782,15 @@ fn terminal_rgb(index: usize, is_dark: bool) -> Rgb {
             if value >= NamedColor::DimBlack as usize && value <= NamedColor::DimWhite as usize =>
         {
             let base = ansi[value - NamedColor::DimBlack as usize];
-            // Faint fades toward the surface: black on dark, white on light.
-            let dim = |channel: u32| {
-                if is_dark {
-                    channel * 2 / 3
-                } else {
-                    channel + (255 - channel) / 3
-                }
-            };
-            (dim((base >> 16) & 0xff) << 16) | (dim((base >> 8) & 0xff) << 8) | dim(base & 0xff)
+            let dim = dim_rgb(
+                Rgb {
+                    r: (base >> 16) as u8,
+                    g: (base >> 8) as u8,
+                    b: base as u8,
+                },
+                is_dark,
+            );
+            (u32::from(dim.r) << 16) | (u32::from(dim.g) << 8) | u32::from(dim.b)
         }
         _ => {
             if is_dark {
@@ -2723,6 +2813,45 @@ mod tests {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
     use gpui::{ExternalPaths, Image, Modifiers, point, size};
+
+    /// TUIs pick their palette from the reported background, so the reply has
+    /// to match the surface or dark text lands on the dark terminal.
+    #[test]
+    fn palette_queries_report_the_active_theme_surface() {
+        let (sender, written) = unbounded();
+        let sender_slot = Arc::new(OnceLock::new());
+        assert!(sender_slot.set(PtyInput::Test(sender)).is_ok());
+        let (ui_tx, _ui_events) = unbounded();
+        let reply_colors = TerminalReplyColors::new();
+        let proxy = TerminalEventProxy {
+            dirty: Arc::new(AtomicBool::new(false)),
+            sender: sender_slot,
+            ui_events: ui_tx,
+            window_size: Arc::new(Mutex::new(WindowSize {
+                num_cols: 40,
+                num_lines: 8,
+                cell_width: 8,
+                cell_height: 18,
+            })),
+            reply_colors: reply_colors.clone(),
+        };
+        let query = |index: usize| {
+            proxy.send_event(Event::ColorRequest(
+                index,
+                Arc::new(|color: Rgb| format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b)),
+            ));
+            String::from_utf8(written.recv().unwrap()).unwrap()
+        };
+
+        reply_colors.store(&Theme::dark());
+        assert_eq!(query(NamedColor::Background as usize), "151515");
+        assert_eq!(query(NamedColor::Foreground as usize), "e2e2e2");
+        assert_eq!(query(NamedColor::Cursor as usize), "e2e2e2");
+
+        reply_colors.store(&Theme::light());
+        assert_eq!(query(NamedColor::Background as usize), "ffffff");
+        assert_eq!(query(NamedColor::Foreground as usize), "242424");
+    }
 
     #[test]
     fn printable_keys_use_platform_text_input_but_terminal_controls_do_not() {
@@ -2811,13 +2940,13 @@ mod tests {
                 cell_width: 8,
                 cell_height: 18,
             }));
-            let dark_theme = Arc::new(AtomicBool::new(true));
+            let reply_colors = TerminalReplyColors::new();
             let proxy = TerminalEventProxy {
                 dirty: dirty.clone(),
                 sender: Arc::new(OnceLock::new()),
                 ui_events: ui_tx,
                 window_size: window_size.clone(),
-                dark_theme: dark_theme.clone(),
+                reply_colors: reply_colors.clone(),
             };
             let view = cx.new(|cx| TerminalView {
                 session: Some(TerminalSession {
@@ -2834,7 +2963,7 @@ mod tests {
                     ui_events,
                     window_size,
                     grid_size: (40, 8),
-                    dark_theme,
+                    reply_colors,
                     url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
                 }),
                 launcher: TerminalLauncher::Local,
