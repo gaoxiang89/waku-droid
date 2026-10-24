@@ -227,6 +227,24 @@ fn normalized_posix_path(path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// The path after `~/` (or `~\`) when `text` names a user's home. Such
+/// references must be expanded against a home directory, never joined onto
+/// the workspace.
+fn home_relative_path(text: &str) -> Option<&str> {
+    text.strip_prefix("~/")
+        .or_else(|| text.strip_prefix("~\\"))
+        .filter(|rest| !rest.is_empty())
+}
+
+/// Home directory of a POSIX daemon host, derived from a registered
+/// projectless root on that host.
+fn daemon_posix_home() -> Option<PathBuf> {
+    crate::projectless::workspace_roots()
+        .into_iter()
+        .find(|root| root.to_string_lossy().starts_with('/'))
+        .and_then(|root| root.parent().and_then(Path::parent).map(Path::to_path_buf))
+}
+
 fn posix_workspace_relative_file_path(workspace: &str, target: &str) -> Option<String> {
     let workspace = normalized_posix_path(workspace);
     let relative = if workspace == "/" {
@@ -260,6 +278,24 @@ fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkR
         if relative.is_empty() {
             return TranscriptLinkRoute::NoWorkspace;
         }
+        // `~/x` names the daemon user's home. Joining it under the workspace
+        // would open a nonexistent `<workspace>/~/x`; expand it against the
+        // home derived from a registered projectless root instead.
+        if let Some(rest) = home_relative_path(&relative) {
+            return match daemon_posix_home() {
+                Some(home) => {
+                    let home = home.to_string_lossy().trim_end_matches('/').to_owned();
+                    let path = normalized_posix_path(&format!("{home}/{rest}"));
+                    match posix_workspace_relative_file_path(workspace, &path) {
+                        Some(relative_path) => TranscriptLinkRoute::ProjectFile(relative_path),
+                        None => TranscriptLinkRoute::Finder(PathBuf::from(path)),
+                    }
+                }
+                // The daemon's home is unknown; admit it rather than open a
+                // bogus workspace-relative path.
+                None => TranscriptLinkRoute::Finder(PathBuf::from(relative)),
+            };
+        }
         format!("{workspace}/{relative}")
     };
     let path = normalized_posix_path(&path);
@@ -287,12 +323,25 @@ fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLi
     let Some(reference) = crate::md::parser::file_reference_link(target) else {
         return TranscriptLinkRoute::External;
     };
+    let stripped = percent_decode_file_path(crate::md::parser::strip_file_location(reference));
+    // `~/x` names the user's home, not a workspace-relative path; joining it
+    // onto the workspace opens a nonexistent `<workspace>/~/x`.
+    if let Some(rest) = home_relative_path(&stripped)
+        && let Some(home) = dirs::home_dir()
+    {
+        let joined = normalized_path(&home.join(rest));
+        return if let Some(relative_path) =
+            workspace.and_then(|workspace| workspace_relative_file_path(workspace, &joined))
+        {
+            TranscriptLinkRoute::ProjectFile(relative_path)
+        } else {
+            TranscriptLinkRoute::Finder(joined)
+        };
+    }
     let Some(workspace) = workspace else {
         return TranscriptLinkRoute::NoWorkspace;
     };
-    let relative = PathBuf::from(percent_decode_file_path(
-        crate::md::parser::strip_file_location(reference),
-    ));
+    let relative = PathBuf::from(stripped);
     if relative.as_os_str().is_empty() {
         return TranscriptLinkRoute::NoWorkspace;
     }
@@ -1374,6 +1423,20 @@ mod tests {
     }
 
     #[test]
+    fn home_references_expand_to_the_user_home_not_the_workspace() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let home = dirs::home_dir().expect("a home directory");
+        let dotfile = normalized_path(&home.join(".zshrc"));
+
+        for reference in ["~/.zshrc", "~/.zshrc:12", "`~/.zshrc`"] {
+            assert_eq!(
+                transcript_link_route(reference, Some(workspace)),
+                TranscriptLinkRoute::Finder(dotfile.clone())
+            );
+        }
+    }
+
+    #[test]
     fn remote_posix_workspaces_route_with_forward_slashes_on_every_desktop() {
         let workspace = Path::new("/home/me/proj");
 
@@ -1404,6 +1467,18 @@ mod tests {
         assert_eq!(
             transcript_link_route("https://example.com/guide.md", Some(workspace)),
             TranscriptLinkRoute::External
+        );
+        // `~/x` names the daemon user's home; it must never be joined onto
+        // the workspace as a relative path.
+        #[cfg(windows)]
+        assert_eq!(
+            transcript_link_route("~/.zshrc", Some(workspace)),
+            TranscriptLinkRoute::Finder(PathBuf::from("~/.zshrc"))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            transcript_link_route("~/.zshrc", Some(workspace)),
+            TranscriptLinkRoute::Finder(dirs::home_dir().unwrap().join(".zshrc"))
         );
 
         // Expanded rows are keyed by the daemon's own absolute paths.
