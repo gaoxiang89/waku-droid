@@ -2066,6 +2066,17 @@ impl Waku {
         self.open_transcript_link(&resolved.to_string_lossy(), cx);
     }
 
+    /// Route a file path clicked in a terminal: files inside the workspace
+    /// open in the Files panel; directories or external paths open in the
+    /// system file manager.
+    pub(super) fn open_terminal_file(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !path.is_dir() && self.selected_workspace_path().is_some() {
+            self.open_activity_file(&path.to_string_lossy(), cx);
+        } else {
+            crate::platform::reveal_in_file_manager(path, cx);
+        }
+    }
+
     /// Park the selected workspace's panel state under its scope. Terminal
     /// and browser entities move into the map, so their processes keep
     /// running off screen while another workspace is shown.
@@ -2514,11 +2525,27 @@ impl Waku {
                 self.active_right_panel_surface(),
                 Some(RightPanelSurface::Terminal(_))
             );
+        let needs_attention = !active
+            && self
+                .right_panel_surfaces
+                .iter()
+                .filter_map(RightPanelSurface::terminal_id)
+                .any(|id| self.right_panel_terminal_needs_attention(id, cx));
+        let tooltip_label = if needs_attention {
+            format!(
+                "{} · {}",
+                tr!("right_panel.toggle_terminal"),
+                tr!("terminal.needs_attention")
+            )
+        } else {
+            tr!("right_panel.toggle_terminal")
+        };
         let focus = self.transcript_control_focus("header-right-terminal-button", cx);
         div()
             .id("header-right-terminal-button")
             .track_focus(&focus)
             .tab_index(0)
+            .relative()
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -2547,7 +2574,19 @@ impl Waku {
                     theme.text_tertiary
                 },
             ))
-            .tooltip(Tooltip::text(tr!("right_panel.toggle_terminal")))
+            .when(needs_attention, |element| {
+                element.child(
+                    div()
+                        .id("header-right-terminal-attention")
+                        .absolute()
+                        .top(px(3.0))
+                        .right(px(3.0))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(theme.warning),
+                )
+            })
+            .tooltip(Tooltip::text(tooltip_label))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -2563,6 +2602,15 @@ impl Waku {
                     cx.stop_propagation();
                 }
             }))
+    }
+
+    fn right_panel_terminal_needs_attention(&self, terminal_id: Uuid, cx: &App) -> bool {
+        self.right_panel_terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| {
+                let terminal = terminal.read(cx);
+                !terminal.exited() && terminal.needs_attention()
+            })
     }
 
     pub(super) fn toggle_right_panel_terminal(&mut self, cx: &mut Context<Self>) {
@@ -2953,6 +3001,9 @@ impl Waku {
         for (index, surface) in self.right_panel_surfaces.iter().cloned().enumerate() {
             let active = active_surface == Some(index);
             let dirty = self.right_panel_surface_is_dirty(&surface);
+            let needs_attention = surface
+                .terminal_id()
+                .is_some_and(|id| self.right_panel_terminal_needs_attention(id, cx));
             let label = SharedString::from(match &surface {
                 // Browser tabs read like browser tabs: the page title once
                 // known, the address until then.
@@ -3025,6 +3076,23 @@ impl Waku {
                                             crate::platform::primary_shortcut("⌘S", "Ctrl+S")
                                     ))
                                     .build(window, cx)
+                                }),
+                        )
+                    })
+                    .when(needs_attention, |element| {
+                        element.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "right-panel-tab-attention-{index}"
+                                )))
+                                .size(px(10.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(theme.warning)
+                                .border_2()
+                                .border_color(theme.warning.opacity(0.35))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(tr!("terminal.needs_attention")).build(window, cx)
                                 }),
                         )
                     })

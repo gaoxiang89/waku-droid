@@ -15,11 +15,22 @@ impl Waku {
     pub(super) fn render_bottom_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
         let active = self.bottom_panel_visible;
+        let needs_attention = !active && self.bottom_panel_needs_attention(cx);
+        let tooltip_label = if needs_attention {
+            format!(
+                "{} · {}",
+                tr!("bottom_panel.toggle"),
+                tr!("terminal.needs_attention")
+            )
+        } else {
+            tr!("bottom_panel.toggle")
+        };
         let focus = self.transcript_control_focus("toggle-bottom-panel", cx);
         div()
             .id("toggle-bottom-panel")
             .track_focus(&focus)
             .tab_index(0)
+            .relative()
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -48,8 +59,20 @@ impl Waku {
                     theme.text_tertiary
                 },
             ))
+            .when(needs_attention, |element| {
+                element.child(
+                    div()
+                        .id("bottom-panel-toggle-attention")
+                        .absolute()
+                        .top(px(3.0))
+                        .right(px(3.0))
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(theme.warning),
+                )
+            })
             .tooltip(Tooltip::with_shortcut(
-                tr!("bottom_panel.toggle"),
+                tooltip_label,
                 crate::platform::primary_shortcut("⌘J", "Ctrl+J"),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -67,6 +90,15 @@ impl Waku {
                     cx.stop_propagation();
                 }
             }))
+    }
+
+    fn bottom_panel_needs_attention(&self, cx: &App) -> bool {
+        self.bottom_panel_terminal_groups.iter().any(|group| {
+            group.panes().iter().any(|pane| {
+                let terminal = pane.read(cx);
+                !terminal.exited() && terminal.needs_attention()
+            })
+        })
     }
 
     /// One terminal tab behind a 34 px strip that replaces the terminal's own
@@ -698,6 +730,13 @@ impl Waku {
                     );
                 }
                 cx.notify();
+            },
+        )
+        .detach();
+        cx.subscribe(
+            terminal,
+            |this, _, open_file: &crate::terminal::TerminalOpenFile, cx| {
+                this.open_terminal_file(&open_file.0, cx);
             },
         )
         .detach();

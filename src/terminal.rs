@@ -642,6 +642,10 @@ struct TerminalSession {
     term: Arc<FairMutex<Term<TerminalEventProxy>>>,
     sender: PtyInput,
     dirty: Arc<AtomicBool>,
+    /// Latched by [`Self::take_dirty`] so the next [`Self::snapshot`] rebuilds
+    /// even after [`TerminalView::poll`] has cleared `dirty`.
+    snapshot_dirty: AtomicBool,
+    cached_snapshot: Mutex<Option<(TerminalSnapshotKey, Arc<TerminalSnapshot>)>>,
     ui_events: Receiver<TerminalUiEvent>,
     window_size: Arc<Mutex<WindowSize>>,
     grid_size: (usize, usize),
@@ -710,6 +714,8 @@ impl TerminalSession {
                 term,
                 sender,
                 dirty,
+                snapshot_dirty: AtomicBool::new(true),
+                cached_snapshot: Mutex::new(None),
                 ui_events,
                 window_size: shared_window_size,
                 grid_size: (columns, rows),
@@ -757,6 +763,8 @@ impl TerminalSession {
             term,
             sender,
             dirty,
+            snapshot_dirty: AtomicBool::new(true),
+            cached_snapshot: Mutex::new(None),
             ui_events,
             window_size: shared_window_size,
             grid_size: (columns, rows),
@@ -806,7 +814,11 @@ impl TerminalSession {
     }
 
     fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::AcqRel)
+        let dirty = self.dirty.swap(false, Ordering::AcqRel);
+        if dirty {
+            self.snapshot_dirty.store(true, Ordering::Release);
+        }
+        dirty
     }
 
     fn link_at(&mut self, point: TerminalPoint) -> Option<TerminalLink> {
@@ -825,12 +837,31 @@ impl TerminalSession {
         selection_color: Hsla,
         cursor_style: TerminalCursorStyle,
         hovered_link: Option<&Match>,
-    ) -> TerminalSnapshot {
+    ) -> Arc<TerminalSnapshot> {
         self.reply_colors.store(&theme);
-        let term = self.term.lock();
-        let content = term.renderable_content();
         let columns = self.grid_size.0;
         let rows = self.grid_size.1;
+        let key = TerminalSnapshotKey {
+            columns,
+            rows,
+            is_dark: theme.is_dark,
+            text_color: pack_hsla(theme.text),
+            terminal_color: pack_hsla(theme.terminal),
+            selection_color: pack_hsla(selection_color),
+            cursor_style,
+            hovered_link: hovered_link.cloned(),
+        };
+        let dirty = self.dirty.load(Ordering::Acquire)
+            || self.snapshot_dirty.swap(false, Ordering::AcqRel);
+        if !dirty
+            && let Some((cached_key, cached_snapshot)) = self.cached_snapshot.lock().as_ref()
+            && *cached_key == key
+        {
+            return cached_snapshot.clone();
+        }
+
+        let term = self.term.lock();
+        let content = term.renderable_content();
         let selection = content.selection;
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
         let cursor_column = content.cursor.point.column.0;
@@ -927,15 +958,20 @@ impl TerminalSession {
                     runs.push(TerminalRun { len, style });
                 }
             }
-            rendered_rows.push(TerminalRow { text, runs });
+            rendered_rows.push(TerminalRow {
+                text: SharedString::from(text),
+                runs,
+            });
         }
 
-        TerminalSnapshot {
+        let snapshot = Arc::new(TerminalSnapshot {
             rows: rendered_rows,
             outline_cursor,
             cursor_position: ((0..rows as i32).contains(&cursor_row) && cursor_column < columns)
                 .then_some((cursor_row as usize, cursor_column)),
-        }
+        });
+        *self.cached_snapshot.lock() = Some((key, snapshot.clone()));
+        snapshot
     }
 }
 
@@ -1026,7 +1062,7 @@ struct TerminalRun {
 }
 
 struct TerminalRow {
-    text: String,
+    text: SharedString,
     runs: Vec<TerminalRun>,
 }
 
@@ -1034,6 +1070,18 @@ struct TerminalSnapshot {
     rows: Vec<TerminalRow>,
     outline_cursor: Option<(usize, usize)>,
     cursor_position: Option<(usize, usize)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalSnapshotKey {
+    columns: usize,
+    rows: usize,
+    is_dark: bool,
+    text_color: u32,
+    terminal_color: u32,
+    selection_color: u32,
+    cursor_style: TerminalCursorStyle,
+    hovered_link: Option<Match>,
 }
 
 struct TerminalComposition {
@@ -1053,7 +1101,7 @@ enum TerminalLinkTarget {
     File(PathBuf),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalCursorStyle {
     Solid,
     Outline,
@@ -1340,6 +1388,12 @@ pub struct TerminalAttention {
 
 impl EventEmitter<TerminalAttention> for TerminalView {}
 
+/// A file path link clicked in the terminal; the app opens workspace files
+/// in its Files panel and reveals anything else in the system file manager.
+pub struct TerminalOpenFile(pub PathBuf);
+
+impl EventEmitter<TerminalOpenFile> for TerminalView {}
+
 pub struct TerminalView {
     session: Option<TerminalSession>,
     launcher: TerminalLauncher,
@@ -1363,6 +1417,9 @@ pub struct TerminalView {
     cursor_position: Option<(usize, usize)>,
     composition: Option<TerminalComposition>,
     selecting: bool,
+    /// Viewport `(column, row)` last sent for an active mouse-reported press
+    /// or drag when the running TUI has enabled [`TermMode::MOUSE_MODE`].
+    mouse_reported_cell: Option<(usize, usize)>,
     hovered_link: Option<TerminalLink>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
@@ -1444,6 +1501,7 @@ impl TerminalView {
             cursor_position: None,
             composition: None,
             selecting: false,
+            mouse_reported_cell: None,
             hovered_link: None,
             cursor_blink,
             cursor_focus_tracking_started: false,
@@ -1476,6 +1534,7 @@ impl TerminalView {
             cursor_position: None,
             composition: None,
             selecting: false,
+            mouse_reported_cell: None,
             hovered_link: None,
             cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
             cursor_focus_tracking_started: false,
@@ -1677,6 +1736,25 @@ impl TerminalView {
         )
     }
 
+    fn viewport_cell_for_position(
+        &self,
+        position: Point<Pixels>,
+        clamp_to_grid: bool,
+    ) -> Option<(usize, usize)> {
+        let bounds = self.grid_bounds.get()?;
+        let session = self.session.as_ref()?;
+        terminal_grid_point(
+            bounds,
+            position,
+            self.cell_width(),
+            session.grid_size.0,
+            session.grid_size.1,
+            0,
+            clamp_to_grid,
+        )
+        .map(|(point, _)| (point.column.0, point.line.0.max(0) as usize))
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1704,16 +1782,28 @@ impl TerminalView {
                 terminal_link_target(&link.value, self.working_directory.as_path())
         {
             self.selecting = false;
+            self.mouse_reported_cell = None;
             self.hovered_link = Some(link);
             match target {
                 TerminalLinkTarget::Url(url) => cx.open_url(&url),
-                TerminalLinkTarget::File(path) => {
-                    crate::platform::reveal_in_file_manager(&path, cx)
-                }
+                TerminalLinkTarget::File(path) => cx.emit(TerminalOpenFile(path)),
             }
             window.prevent_default();
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+
+        if let Some(cell) = self.viewport_cell_for_position(event.position, false)
+            && let Some(session) = &self.session
+            && let Some(bytes) =
+                terminal_mouse_button_input(0, true, cell, &event.modifiers, session.mode())
+        {
+            self.selecting = false;
+            self.mouse_reported_cell = Some(cell);
+            session.write(bytes);
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
 
@@ -1737,12 +1827,31 @@ impl TerminalView {
         drop(term);
 
         self.selecting = true;
+        self.mouse_reported_cell = None;
         session.dirty.store(true, Ordering::Release);
         cx.stop_propagation();
         cx.notify();
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mouse_reported_cell.is_some() {
+            if event.pressed_button == Some(MouseButton::Left)
+                && let Some(cell) = self.viewport_cell_for_position(event.position, true)
+                && let Some(session) = &self.session
+            {
+                if self.mouse_reported_cell != Some(cell) {
+                    self.mouse_reported_cell = Some(cell);
+                    if let Some(bytes) =
+                        terminal_mouse_move_input(0, cell, &event.modifiers, session.mode())
+                    {
+                        session.write(bytes);
+                    }
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         let hover_changed = if self.selecting {
             self.set_hovered_link(None)
         } else {
@@ -1771,8 +1880,20 @@ impl TerminalView {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.selecting = false;
+        if let Some(last_cell) = self.mouse_reported_cell.take()
+            && let Some(session) = &self.session
+        {
+            let cell = self
+                .viewport_cell_for_position(event.position, true)
+                .unwrap_or(last_cell);
+            if let Some(bytes) =
+                terminal_mouse_button_input(0, false, cell, &event.modifiers, session.mode())
+            {
+                session.write(bytes);
+            }
+        }
     }
 
     fn on_mouse_exit(&mut self, _: &MouseExitEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1839,6 +1960,36 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn paste_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() || self.session.is_none() {
+            return;
+        }
+        if matches!(self.launcher, TerminalLauncher::Local) {
+            self.paste(join_shell_paths(&paths), cx);
+            return;
+        }
+        self.pause_cursor_blink(cx);
+        let launcher = self.launcher.clone();
+        cx.spawn(async move |this, cx| {
+            let uploaded = cx
+                .background_executor()
+                .spawn(async move { upload_pasted_paths(launcher, paths) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !uploaded.paths.is_empty() {
+                    this.paste(join_shell_paths(&uploaded.paths), cx);
+                }
+                if uploaded.skipped > 0 {
+                    cx.emit(TerminalNotice(tr!(
+                        "terminal.paste_files_skipped",
+                        count = uploaded.skipped
+                    )));
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
         if self.session.is_none() {
             return;
@@ -1855,30 +2006,7 @@ impl TerminalView {
                 self.paste(text, cx);
             }
             TerminalPasteContent::Paths(paths) => {
-                if matches!(self.launcher, TerminalLauncher::Local) {
-                    self.paste(join_shell_paths(&paths), cx);
-                    return;
-                }
-                self.pause_cursor_blink(cx);
-                let launcher = self.launcher.clone();
-                cx.spawn(async move |this, cx| {
-                    let uploaded = cx
-                        .background_executor()
-                        .spawn(async move { upload_pasted_paths(launcher, paths) })
-                        .await;
-                    let _ = this.update(cx, |this, cx| {
-                        if !uploaded.paths.is_empty() {
-                            this.paste(join_shell_paths(&uploaded.paths), cx);
-                        }
-                        if uploaded.skipped > 0 {
-                            cx.emit(TerminalNotice(tr!(
-                                "terminal.paste_files_skipped",
-                                count = uploaded.skipped
-                            )));
-                        }
-                    });
-                })
-                .detach();
+                self.paste_paths(paths, cx);
             }
             TerminalPasteContent::Image { format, bytes } => {
                 self.pause_cursor_blink(cx);
@@ -1933,18 +2061,7 @@ impl TerminalView {
         let lines = self.scroll_accumulator.trunc() as i32;
         if lines != 0 {
             self.scroll_accumulator -= lines as f32;
-            let cell = self.grid_bounds.get().and_then(|bounds| {
-                terminal_grid_point(
-                    bounds,
-                    event.position,
-                    self.cell_width(),
-                    session.grid_size.0,
-                    session.grid_size.1,
-                    0,
-                    true,
-                )
-                .map(|(point, _)| (point.column.0, point.line.0.max(0) as usize))
-            });
+            let cell = self.viewport_cell_for_position(event.position, true);
             match terminal_wheel_input(lines, cell, &event.modifiers, session.mode()) {
                 Some(bytes) => session.write(bytes),
                 None => session.scroll(lines),
@@ -2221,11 +2338,11 @@ impl Render for TerminalView {
                 rows: snapshot_rows,
                 outline_cursor,
                 cursor_position,
-            } = snapshot;
+            } = &*snapshot;
             for row in snapshot_rows {
                 let runs = row
                     .runs
-                    .into_iter()
+                    .iter()
                     .map(|run| {
                         let mut run_font = terminal_font();
                         if run.style.bold {
@@ -2259,10 +2376,10 @@ impl Render for TerminalView {
                         .whitespace_nowrap()
                         .text_size(px(TERMINAL_FONT_SIZE))
                         .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text).with_runs(runs)),
+                        .child(StyledText::new(row.text.clone()).with_runs(runs)),
                 );
             }
-            if let Some((row, column)) = outline_cursor {
+            if let Some((row, column)) = *outline_cursor {
                 screen = screen.child(
                     div()
                         .absolute()
@@ -2276,7 +2393,7 @@ impl Render for TerminalView {
             }
             if terminal_focused
                 && let Some(ime) = &self.composition
-                && let Some((row, column)) = cursor_position
+                && let Some((row, column)) = *cursor_position
             {
                 screen = screen.child(
                     div()
@@ -2455,6 +2572,15 @@ impl Render for TerminalView {
                 )
             })
             .child(grid)
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                style.bg(theme.accent.opacity(0.08))
+            })
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.paste_paths(paths.paths().to_vec(), cx);
+                }),
+            )
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
     }
@@ -2701,9 +2827,56 @@ fn terminal_wheel_input(
     None
 }
 
+/// Mouse click and release sequences for TUIs that enable mouse reporting.
+/// Shift bypasses reporting so the user can still select text locally.
+fn terminal_mouse_button_input(
+    button: u8,
+    pressed: bool,
+    (column, row): (usize, usize),
+    modifiers: &Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if modifiers.shift || !mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    let mods = if modifiers.alt { 8 } else { 0 } + if modifiers.control { 16 } else { 0 };
+    let code = if pressed || mode.contains(TermMode::SGR_MOUSE) {
+        button + mods
+    } else {
+        3 + mods
+    };
+    mouse_report_with_state(code, pressed, column, row, mode)
+}
+
+/// Mouse drag sequences for TUIs that enable button-drag or any-motion
+/// reporting (`1002` / `1003`).
+fn terminal_mouse_move_input(
+    button: u8,
+    (column, row): (usize, usize),
+    modifiers: &Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if modifiers.shift || !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+        return None;
+    }
+    let mods = if modifiers.alt { 8 } else { 0 } + if modifiers.control { 16 } else { 0 };
+    mouse_report_with_state(button + 32 + mods, true, column, row, mode)
+}
+
 fn mouse_report(button: u8, column: usize, row: usize, mode: TermMode) -> Option<Vec<u8>> {
+    mouse_report_with_state(button, true, column, row, mode)
+}
+
+fn mouse_report_with_state(
+    button: u8,
+    pressed: bool,
+    column: usize,
+    row: usize,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
     if mode.contains(TermMode::SGR_MOUSE) {
-        return Some(format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes());
+        let suffix = if pressed { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{button};{};{}{suffix}", column + 1, row + 1).into_bytes());
     }
 
     let utf8 = mode.contains(TermMode::UTF8_MOUSE);
@@ -3358,6 +3531,8 @@ mod tests {
                     ))),
                     sender: PtyInput::Test(sender),
                     dirty,
+                    snapshot_dirty: AtomicBool::new(true),
+                    cached_snapshot: Mutex::new(None),
                     ui_events,
                     window_size,
                     grid_size: (40, 8),
@@ -3382,6 +3557,7 @@ mod tests {
                 cursor_position: Some((2, 3)),
                 composition: None,
                 selecting: false,
+                mouse_reported_cell: None,
                 hovered_link: None,
                 cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
                 cursor_focus_tracking_started: false,
@@ -3823,6 +3999,98 @@ mod tests {
             terminal_wheel_input(1, None, &plain, TermMode::ALT_SCREEN),
             None
         );
+    }
+
+    #[test]
+    fn mouse_clicks_and_drags_report_to_tuis_unless_shift_selects() {
+        let plain = Modifiers::default();
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let sgr_drag = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+
+        assert_eq!(
+            terminal_mouse_button_input(0, true, (4, 1), &plain, TermMode::default()),
+            None
+        );
+        assert_eq!(
+            terminal_mouse_button_input(0, true, (4, 1), &plain, sgr_drag),
+            Some(b"\x1b[<0;5;2M".to_vec())
+        );
+        assert_eq!(
+            terminal_mouse_move_input(0, (6, 2), &plain, sgr_drag),
+            Some(b"\x1b[<32;7;3M".to_vec())
+        );
+        assert_eq!(
+            terminal_mouse_button_input(0, false, (6, 2), &plain, sgr_drag),
+            Some(b"\x1b[<0;7;3m".to_vec())
+        );
+        // Legacy X10 release encodes button 3.
+        assert_eq!(
+            terminal_mouse_button_input(0, false, (0, 0), &plain, TermMode::MOUSE_REPORT_CLICK),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 33, 33])
+        );
+        // Shift forces local selection instead of reporting to the TUI.
+        assert_eq!(
+            terminal_mouse_button_input(0, true, (4, 1), &shift, sgr_drag),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_clean_frames_and_invalidates_on_dirty_or_style_change() {
+        let (sender, _written) = unbounded();
+        let dirty = Arc::new(AtomicBool::new(true));
+        let (ui_tx, ui_events) = unbounded();
+        let window_size = Arc::new(Mutex::new(WindowSize {
+            num_cols: 20,
+            num_lines: 4,
+            cell_width: 8,
+            cell_height: 18,
+        }));
+        let reply_colors = TerminalReplyColors::new();
+        let proxy = TerminalEventProxy {
+            dirty: dirty.clone(),
+            sender: Arc::new(OnceLock::new()),
+            ui_events: ui_tx,
+            window_size: window_size.clone(),
+            reply_colors: reply_colors.clone(),
+        };
+        let session = TerminalSession {
+            term: Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TerminalDimensions {
+                    columns: 20,
+                    rows: 4,
+                },
+                proxy,
+            ))),
+            sender: PtyInput::Test(sender),
+            dirty,
+            snapshot_dirty: AtomicBool::new(true),
+            cached_snapshot: Mutex::new(None),
+            ui_events,
+            window_size,
+            grid_size: (20, 4),
+            reply_colors,
+            url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+        };
+        let theme = Theme::dark();
+        assert!(session.take_dirty());
+
+        let first = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        let second = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // Cursor style or dirty flag invalidates the cached snapshot.
+        let solid = session.snapshot(theme, theme.selection, TerminalCursorStyle::Solid, None);
+        assert!(!Arc::ptr_eq(&first, &solid));
+
+        session.dirty.store(true, Ordering::Release);
+        assert!(session.take_dirty());
+        let rebuilt = session.snapshot(theme, theme.selection, TerminalCursorStyle::Solid, None);
+        assert!(!Arc::ptr_eq(&solid, &rebuilt));
     }
 
     #[test]
