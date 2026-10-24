@@ -12,6 +12,7 @@ menu.undo: 撤销
 menu.redo: 重做
 menu.cut: 剪切
 menu.copy: 复制
+menu.add_to_composer: 添加到输入框
 menu.paste: 粘贴
 menu.select_all: 全选
 menu.view: 显示

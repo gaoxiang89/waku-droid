@@ -2290,9 +2290,17 @@ impl Waku {
 
     /// Route a file path clicked in a terminal: files inside the workspace
     /// open in the Files panel; directories or external paths open in the
-    /// system file manager.
-    pub(super) fn open_terminal_file(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if !path.is_dir() && self.selected_workspace_path().is_some() {
+    /// system file manager. A daemon terminal has already resolved the path
+    /// against its own host, so never apply local filesystem semantics to it.
+    pub(super) fn open_terminal_file(
+        &mut self,
+        path: &Path,
+        local_terminal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !local_terminal {
+            self.open_transcript_link(&path.to_string_lossy(), cx);
+        } else if !path.is_dir() && self.selected_workspace_path().is_some() {
             self.open_activity_file(&path.to_string_lossy(), cx);
         } else {
             crate::platform::reveal_in_file_manager(path, cx);

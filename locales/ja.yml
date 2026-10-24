@@ -12,6 +12,7 @@ menu.undo: 取り消す
 menu.redo: やり直す
 menu.cut: カット
 menu.copy: コピー
+menu.add_to_composer: 入力欄に追加
 menu.paste: ペースト
 menu.select_all: すべてを選択
 menu.view: 表示

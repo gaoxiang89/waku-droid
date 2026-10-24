@@ -26,11 +26,11 @@ use gpui::{
     Action, App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, ElementInputHandler,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight,
     Hsla, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyContext, KeyDownEvent,
-    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task,
-    TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font, is_no_action,
-    prelude::FluentBuilder, px, rgb,
+    KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText,
+    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font,
+    is_no_action, prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -369,6 +369,7 @@ impl RemoteTerminal {
         term: Arc<FairMutex<Term<TerminalEventProxy>>>,
         dirty: Arc<AtomicBool>,
         ui_events: Sender<TerminalUiEvent>,
+        sender_slot: Arc<OnceLock<PtyInput>>,
     ) -> Result<Arc<Self>> {
         let remote = Arc::new(Self {
             daemon,
@@ -396,6 +397,15 @@ impl RemoteTerminal {
                     working_directory.display()
                 )
             });
+        }
+        if sender_slot.set(PtyInput::Remote(remote.clone())).is_err() {
+            let _ = client.notify(
+                remote.session_id,
+                remote.runtime_id,
+                waku_client::Command::CloseTerminal,
+            );
+            client.unsubscribe(remote.session_id, remote.runtime_id);
+            return Err(anyhow::anyhow!("initialize remote terminal input"));
         }
         let reader = remote.clone();
         std::thread::Builder::new()
@@ -525,14 +535,14 @@ struct TerminalReplyColors {
 }
 
 impl TerminalReplyColors {
-    fn new() -> Self {
+    fn new(theme: Theme) -> Self {
         let colors = Self {
             is_dark: Arc::new(AtomicBool::new(true)),
             foreground: Arc::new(AtomicU32::new(0)),
             background: Arc::new(AtomicU32::new(0)),
             cursor: Arc::new(AtomicU32::new(0)),
         };
-        colors.store(&Theme::dark());
+        colors.store(&theme);
         colors
     }
 
@@ -659,6 +669,7 @@ impl TerminalSession {
         columns: usize,
         rows: usize,
         launcher: TerminalLauncher,
+        reply_colors: TerminalReplyColors,
     ) -> Result<Self> {
         let columns = columns.max(TERMINAL_MIN_COLUMNS);
         let rows = rows.max(TERMINAL_MIN_ROWS);
@@ -671,7 +682,6 @@ impl TerminalSession {
         let shared_window_size = Arc::new(Mutex::new(window_size));
         let dirty = Arc::new(AtomicBool::new(true));
         let sender_slot = Arc::new(OnceLock::new());
-        let reply_colors = TerminalReplyColors::new();
         let (ui_event_tx, ui_events) = unbounded();
         let url_regex = RegexSearch::new(TERMINAL_LINK_REGEX)
             .map_err(|error| anyhow::anyhow!("compile terminal link regex: {error}"))?;
@@ -705,11 +715,9 @@ impl TerminalSession {
                 term.clone(),
                 dirty.clone(),
                 ui_event_tx,
+                sender_slot,
             )?;
             let sender = PtyInput::Remote(remote);
-            sender_slot
-                .set(sender.clone())
-                .map_err(|_| anyhow::anyhow!("initialize remote terminal input"))?;
             return Ok(Self {
                 term,
                 sender,
@@ -1390,7 +1398,11 @@ impl EventEmitter<TerminalAttention> for TerminalView {}
 
 /// A file path link clicked in the terminal; the app opens workspace files
 /// in its Files panel and reveals anything else in the system file manager.
-pub struct TerminalOpenFile(pub PathBuf);
+/// `local_terminal` pins which filesystem semantics produced the path.
+pub struct TerminalOpenFile {
+    pub path: PathBuf,
+    pub local_terminal: bool,
+}
 
 impl EventEmitter<TerminalOpenFile> for TerminalView {}
 
@@ -1399,6 +1411,17 @@ impl EventEmitter<TerminalOpenFile> for TerminalView {}
 pub struct TerminalFocused;
 
 impl EventEmitter<TerminalFocused> for TerminalView {}
+
+/// A selected terminal excerpt handed to the composer as agent context.
+#[derive(Clone)]
+pub struct TerminalSelectionContext {
+    pub label: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
+}
+
+impl EventEmitter<TerminalSelectionContext> for TerminalView {}
 
 pub struct TerminalView {
     session: Option<TerminalSession>,
@@ -1426,7 +1449,15 @@ pub struct TerminalView {
     /// Viewport `(column, row)` last sent for an active mouse-reported press
     /// or drag when the running TUI has enabled [`TermMode::MOUSE_MODE`].
     mouse_reported_cell: Option<(usize, usize)>,
+    /// Last cell reported for button-less motion under `1003`, so moving
+    /// within one cell does not flood the PTY.
+    mouse_motion_cell: Option<(usize, usize)>,
     hovered_link: Option<TerminalLink>,
+    /// Keys whose kitty press/repeat reached the shell; only those keys may
+    /// send a release, so an app shortcut does not leave an unmatched release.
+    /// Keyed by key name, not the whole keystroke: releasing a modifier before
+    /// the key must not lose its release event.
+    kitty_reported_keys: HashSet<String>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
     /// Window active and this terminal focused, as last reported to the
@@ -1451,10 +1482,13 @@ impl TerminalView {
     ) -> Self {
         let terminal_cwd = working_directory.clone();
         let session_launcher = launcher.clone();
+        let reply_colors = TerminalReplyColors::new(Theme::current(cx));
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
-                .spawn(async move { TerminalSession::new(&terminal_cwd, 52, 36, session_launcher) })
+                .spawn(async move {
+                    TerminalSession::new(&terminal_cwd, 52, 36, session_launcher, reply_colors)
+                })
                 .await;
             if this
                 .update(cx, |this, cx| {
@@ -1508,7 +1542,9 @@ impl TerminalView {
             composition: None,
             selecting: false,
             mouse_reported_cell: None,
+            mouse_motion_cell: None,
             hovered_link: None,
+            kitty_reported_keys: HashSet::new(),
             cursor_blink,
             cursor_focus_tracking_started: false,
             focused: false,
@@ -1541,7 +1577,9 @@ impl TerminalView {
             composition: None,
             selecting: false,
             mouse_reported_cell: None,
+            mouse_motion_cell: None,
             hovered_link: None,
+            kitty_reported_keys: HashSet::new(),
             cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
             cursor_focus_tracking_started: false,
             focused: false,
@@ -1640,9 +1678,17 @@ impl TerminalView {
         let keystroke = &event.keystroke;
 
         // The platform owns candidate navigation/confirmation while composing.
-        // Printable input must also reach its text handler, otherwise dead keys
-        // and IMEs are bypassed (or ordinary characters get sent twice).
-        if self.composition.is_some() || terminal_uses_text_input(event) {
+        // Printable input otherwise reaches its text handler; only a TUI that
+        // asked for all keys as escape codes receives CSI u for text. Event
+        // reporting alone does not turn text keys into key events.
+        if self.composition.is_some() {
+            return;
+        }
+        let all_keys_as_escapes = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        if terminal_uses_text_input(event) && !all_keys_as_escapes {
             return;
         }
 
@@ -1709,12 +1755,35 @@ impl TerminalView {
         }
 
         let mode = session.mode();
-        if let Some(bytes) = kitty_key_bytes(keystroke, event.is_held, mode)
-            .or_else(|| terminal_key_bytes(keystroke, mode))
-        {
+        if let Some(bytes) = kitty_key_bytes(keystroke, event.is_held, mode) {
+            self.kitty_reported_keys.insert(keystroke.key.clone());
             session.term.lock().selection = None;
             session.write(bytes);
             session.dirty.store(true, Ordering::Release);
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(bytes) = terminal_key_bytes(keystroke, mode) {
+            session.term.lock().selection = None;
+            session.write(bytes);
+            session.dirty.store(true, Ordering::Release);
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composition.is_some() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        if self.kitty_reported_keys.remove(&event.keystroke.key)
+            && let Some(bytes) = kitty_key_release_bytes(&event.keystroke, session.mode())
+        {
+            session.write(bytes);
             window.prevent_default();
             cx.stop_propagation();
         }
@@ -1775,6 +1844,7 @@ impl TerminalView {
         if self.scrollbar_state.engaged() {
             return;
         }
+        self.mouse_motion_cell = None;
         window.focus(&self.focus_handle, cx);
         let Some((point, side)) = self.grid_point_for_position(event.position, false) else {
             return;
@@ -1785,15 +1855,21 @@ impl TerminalView {
                 .session
                 .as_mut()
                 .and_then(|session| session.link_at(point))
-            && let Some(target) =
-                terminal_link_target(&link.value, self.working_directory.as_path())
+            && let Some(target) = terminal_link_target(
+                &link.value,
+                self.working_directory.as_path(),
+                matches!(self.launcher, TerminalLauncher::Local),
+            )
         {
             self.selecting = false;
             self.mouse_reported_cell = None;
             self.hovered_link = Some(link);
             match target {
                 TerminalLinkTarget::Url(url) => cx.open_url(&url),
-                TerminalLinkTarget::File(path) => cx.emit(TerminalOpenFile(path)),
+                TerminalLinkTarget::File(path) => cx.emit(TerminalOpenFile {
+                    path,
+                    local_terminal: matches!(self.launcher, TerminalLauncher::Local),
+                }),
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -1841,6 +1917,28 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button.is_none()
+            && let Some(session) = &self.session
+            && session.mode().contains(TermMode::MOUSE_MOTION)
+        {
+            if let Some(cell) = self.viewport_cell_for_position(event.position, true)
+                && self.mouse_motion_cell != Some(cell)
+                && let Some(bytes) =
+                    terminal_mouse_move_input(None, cell, &event.modifiers, session.mode())
+            {
+                self.mouse_motion_cell = Some(cell);
+                session.write(bytes);
+                cx.stop_propagation();
+                return;
+            }
+            // Shift remains the local-selection escape hatch; other motion in
+            // a TUI tracking hover belongs to the program even inside one cell.
+            if !event.modifiers.shift {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if self.mouse_reported_cell.is_some() {
             if event.pressed_button == Some(MouseButton::Left)
                 && let Some(cell) = self.viewport_cell_for_position(event.position, true)
@@ -1849,7 +1947,7 @@ impl TerminalView {
                 if self.mouse_reported_cell != Some(cell) {
                     self.mouse_reported_cell = Some(cell);
                     if let Some(bytes) =
-                        terminal_mouse_move_input(0, cell, &event.modifiers, session.mode())
+                        terminal_mouse_move_input(Some(0), cell, &event.modifiers, session.mode())
                     {
                         session.write(bytes);
                     }
@@ -1889,6 +1987,7 @@ impl TerminalView {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.selecting = false;
+        self.mouse_motion_cell = None;
         if let Some(last_cell) = self.mouse_reported_cell.take()
             && let Some(session) = &self.session
         {
@@ -1904,6 +2003,7 @@ impl TerminalView {
     }
 
     fn on_mouse_exit(&mut self, _: &MouseExitEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.mouse_motion_cell = None;
         if self.set_hovered_link(None) {
             cx.notify();
         }
@@ -1948,6 +2048,29 @@ impl TerminalView {
             .lock()
             .selection_to_string()
             .filter(|text| !text.is_empty())
+    }
+
+    /// The current selection plus its scrollback line numbers, for the
+    /// composer's context block. `None` when nothing useful is selected.
+    fn selection_context(&self) -> Option<TerminalSelectionContext> {
+        let session = self.session.as_ref()?;
+        let term = session.term.lock();
+        let selection = term.selection.clone()?;
+        let range = selection.to_range(&term)?;
+        let text = term
+            .selection_to_string()
+            .filter(|text| !text.trim().is_empty())?;
+        // Line zero is the top of the live screen; history sits at negative
+        // lines, so scrollback numbering starts above it.
+        let history = term.grid().history_size();
+        let line_start = scrollback_line_number(range.start.line.0, history);
+        let line_end = scrollback_line_number(range.end.line.0, history).max(line_start);
+        Some(TerminalSelectionContext {
+            label: self.title.clone(),
+            line_start,
+            line_end,
+            text,
+        })
     }
 
     fn copy_selection(&self, cx: &mut App) {
@@ -2094,6 +2217,7 @@ impl TerminalView {
             }),
             cx.on_blur(&focus_handle, window, |terminal, window, cx| {
                 terminal.composition = None;
+                terminal.kitty_reported_keys.clear();
                 terminal.update_cursor_blinking(window, cx);
                 cx.notify();
             }),
@@ -2481,6 +2605,7 @@ impl Render for TerminalView {
                 let bottom_panel_tabs = context_terminal.read(cx).bottom_panel_tabs;
 
                 let copy_terminal = context_terminal.clone();
+                let context_selection_terminal = context_terminal.clone();
                 let paste_terminal = context_terminal.clone();
                 let select_all_terminal = context_terminal.clone();
                 let mut items = vec![
@@ -2489,6 +2614,14 @@ impl Render for TerminalView {
                         if let Some(text) = selected_text {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                         }
+                    })
+                    .disabled(!has_selection),
+                    MenuItem::new(tr!("menu.add_to_composer"), move |_, cx| {
+                        context_selection_terminal.update(cx, |terminal, cx| {
+                            if let Some(context) = terminal.selection_context() {
+                                cx.emit(context);
+                            }
+                        });
                     })
                     .disabled(!has_selection),
                     MenuItem::new(tr!("menu.paste"), move |_, cx| {
@@ -2620,6 +2753,7 @@ impl Render for TerminalView {
                 }),
             )
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
     }
 }
@@ -2787,8 +2921,12 @@ fn hyperlink_at<T: EventListener>(term: &Term<T>, point: TerminalPoint) -> Optio
     Some((hyperlink.uri().to_owned(), start..=end))
 }
 
-fn terminal_link_target(value: &str, working_directory: &Path) -> Option<TerminalLinkTarget> {
-    if let Some(path) = existing_terminal_file_path(value, working_directory) {
+fn terminal_link_target(
+    value: &str,
+    working_directory: &Path,
+    local_terminal: bool,
+) -> Option<TerminalLinkTarget> {
+    if let Some(path) = terminal_file_path(value, working_directory, local_terminal) {
         return Some(TerminalLinkTarget::File(path));
     }
 
@@ -2799,32 +2937,82 @@ fn terminal_link_target(value: &str, working_directory: &Path) -> Option<Termina
     Some(TerminalLinkTarget::Url(url.to_string()))
 }
 
-fn existing_terminal_file_path(value: &str, working_directory: &Path) -> Option<PathBuf> {
+fn terminal_file_path(
+    value: &str,
+    working_directory: &Path,
+    local_terminal: bool,
+) -> Option<PathBuf> {
     let mut path = match url::Url::parse(value) {
-        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+        Ok(url) if url.scheme() == "file" => {
+            if !matches!(url.host_str(), None | Some("" | "localhost")) {
+                return None;
+            }
+            if local_terminal {
+                url.to_file_path().ok()?
+            } else {
+                PathBuf::from(url.path())
+            }
+        }
         Ok(_) => return None,
         Err(_) => {
             if let Some(relative) = value.strip_prefix("~/") {
-                dirs::home_dir()?.join(relative)
+                if local_terminal {
+                    dirs::home_dir()?.join(relative)
+                } else {
+                    // The POSIX workspace route expands the daemon's home.
+                    PathBuf::from(value)
+                }
             } else {
                 let path = Path::new(value);
-                if path.is_absolute() {
-                    path.to_path_buf()
+                if local_terminal {
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        working_directory.join(path)
+                    }
+                } else if value.starts_with('/') {
+                    PathBuf::from(value)
                 } else {
-                    working_directory.join(path)
+                    let pathlike =
+                        value.starts_with("./") || value.starts_with("../") || value.contains('/');
+                    if !pathlike {
+                        return None;
+                    }
+                    // Remote paths always use forward slashes: PathBuf::join
+                    // would insert the desktop's separator and break routing.
+                    PathBuf::from(format!(
+                        "{}/{}",
+                        working_directory
+                            .to_string_lossy()
+                            .trim_end_matches(|character| character == '/' || character == '\\'),
+                        value
+                    ))
                 }
             }
         }
     };
 
-    loop {
-        if path.exists() {
-            return Some(path);
+    if local_terminal {
+        loop {
+            if path.exists() {
+                return Some(path);
+            }
+            let value = path.to_string_lossy();
+            let (prefix, suffix) = value.rsplit_once(':')?;
+            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            path = PathBuf::from(prefix);
         }
+    }
+
+    loop {
         let value = path.to_string_lossy();
-        let (prefix, suffix) = value.rsplit_once(':')?;
+        let Some((prefix, suffix)) = value.rsplit_once(':') else {
+            return Some(path);
+        };
         if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
+            return Some(path);
         }
         path = PathBuf::from(prefix);
     }
@@ -2889,14 +3077,20 @@ fn terminal_mouse_button_input(
 /// Mouse drag sequences for TUIs that enable button-drag or any-motion
 /// reporting (`1002` / `1003`).
 fn terminal_mouse_move_input(
-    button: u8,
+    button: Option<u8>,
     (column, row): (usize, usize),
     modifiers: &Modifiers,
     mode: TermMode,
 ) -> Option<Vec<u8>> {
-    if modifiers.shift || !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+    let wanted = match button {
+        // 1003 reports motion with no button; 1002 must not.
+        None => TermMode::MOUSE_MOTION,
+        Some(_) => TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+    };
+    if modifiers.shift || !mode.intersects(wanted) {
         return None;
     }
+    let button = button.unwrap_or(3);
     let mods = if modifiers.alt { 8 } else { 0 } + if modifiers.control { 16 } else { 0 };
     mouse_report_with_state(button + 32 + mods, true, column, row, mode)
 }
@@ -2954,6 +3148,44 @@ fn terminal_uses_text_input(event: &KeyDownEvent) -> bool {
             && !modifiers.control
             && !modifiers.alt
             && !modifiers.platform)
+}
+
+/// The composer block for a terminal excerpt. Output is fenced, and the
+/// fence grows past any backtick run in the text so shell output cannot
+/// close the block early.
+pub(crate) fn terminal_context_block(context: &TerminalSelectionContext) -> String {
+    let label = context
+        .label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let label = if label.is_empty() {
+        tr!("right_panel.terminal")
+    } else {
+        label
+    };
+    let range = if context.line_start == context.line_end {
+        format!("line {}", context.line_start)
+    } else {
+        format!("lines {}-{}", context.line_start, context.line_end)
+    };
+    let text = context.text.trim_end();
+    let fence = "`".repeat(longest_backtick_run(text).saturating_add(1).max(3));
+    format!("Terminal output from \"{label}\" ({range}):\n{fence}text\n{text}\n{fence}")
+}
+
+fn longest_backtick_run(text: &str) -> usize {
+    text.split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// One-based line number counted from the oldest scrollback line. Grid line
+/// zero is the top of the live screen and history occupies negative lines.
+fn scrollback_line_number(line: i32, history: usize) -> usize {
+    let history = i32::try_from(history).unwrap_or(i32::MAX);
+    line.saturating_add(history).saturating_add(1).max(1) as usize
 }
 
 /// A split, close, or resize chord for the bottom panel's pane tree.
@@ -3134,16 +3366,40 @@ fn terminal_claims_keystroke(keystroke: &Keystroke) -> bool {
     terminal_key_bytes(keystroke, TermMode::empty()).is_some()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KittyKeyEvent {
+    Press,
+    Repeat,
+    Release,
+}
+
 /// The kitty keyboard protocol's `CSI code ; modifiers u` form for keys whose
 /// legacy bytes are ambiguous, once a program has pushed the protocol;
 /// `None` leaves the key to the legacy encoding, which the protocol keeps for
 /// cursor and function keys and plain Enter/Tab/Backspace.
-///
-/// Implements disambiguation (flag 1), repeat events (2), shifted alternate
-/// keys (4), and all-keys-as-escapes (8) for keys that reach `on_key_down`.
-/// Plain printable keys still arrive as text through the input handler (so
-/// IMEs keep working), and release events are not reported.
 fn kitty_key_bytes(keystroke: &Keystroke, repeat: bool, mode: TermMode) -> Option<Vec<u8>> {
+    let event = if repeat {
+        KittyKeyEvent::Repeat
+    } else {
+        KittyKeyEvent::Press
+    };
+    kitty_key_event_bytes(keystroke, event, mode)
+}
+
+fn kitty_key_release_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    // Without event reporting there is no release event in the protocol;
+    // encoding one here would replay the press bytes a second time.
+    if !mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        return None;
+    }
+    kitty_key_event_bytes(keystroke, KittyKeyEvent::Release, mode)
+}
+
+fn kitty_key_event_bytes(
+    keystroke: &Keystroke,
+    event: KittyKeyEvent,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
     if !mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL) {
         return None;
     }
@@ -3175,8 +3431,11 @@ fn kitty_key_bytes(keystroke: &Keystroke, repeat: bool, mode: TermMode) -> Optio
                 };
                 character
             };
-            // Shift alone still types text; only Ctrl/Alt chords are ambiguous.
-            if !all_as_escapes && !modifiers.control && !modifiers.alt {
+            // Shift alone still types text unless the program asked for every
+            // key or the key is a chord; event reporting alone does not turn
+            // text keys into escape sequences.
+            let report_text_key = all_as_escapes || modifiers.control || modifiers.alt;
+            if !report_text_key {
                 return None;
             }
             u32::from(character.to_ascii_lowercase())
@@ -3192,7 +3451,12 @@ fn kitty_key_bytes(keystroke: &Keystroke, repeat: bool, mode: TermMode) -> Optio
                 _ => None,
             }
         });
-    let event_type = (repeat && mode.contains(TermMode::REPORT_EVENT_TYPES)).then_some(":2");
+    let event_type = match event {
+        KittyKeyEvent::Press => None,
+        KittyKeyEvent::Repeat if mode.contains(TermMode::REPORT_EVENT_TYPES) => Some(":2"),
+        KittyKeyEvent::Release if mode.contains(TermMode::REPORT_EVENT_TYPES) => Some(":3"),
+        _ => None,
+    };
 
     let mut sequence = format!("\x1b[{code}");
     if let Some(shifted) = shifted {
@@ -3483,7 +3747,7 @@ mod tests {
         let sender_slot = Arc::new(OnceLock::new());
         assert!(sender_slot.set(PtyInput::Test(sender)).is_ok());
         let (ui_tx, _ui_events) = unbounded();
-        let reply_colors = TerminalReplyColors::new();
+        let reply_colors = TerminalReplyColors::new(Theme::dark());
         let proxy = TerminalEventProxy {
             dirty: Arc::new(AtomicBool::new(false)),
             sender: sender_slot,
@@ -3601,7 +3865,7 @@ mod tests {
                 cell_width: 8,
                 cell_height: 18,
             }));
-            let reply_colors = TerminalReplyColors::new();
+            let reply_colors = TerminalReplyColors::new(Theme::dark());
             let proxy = TerminalEventProxy {
                 dirty: dirty.clone(),
                 sender: Arc::new(OnceLock::new()),
@@ -3648,7 +3912,9 @@ mod tests {
                 composition: None,
                 selecting: false,
                 mouse_reported_cell: None,
+                mouse_motion_cell: None,
                 hovered_link: None,
+                kitty_reported_keys: HashSet::new(),
                 cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
                 cursor_focus_tracking_started: false,
                 focused: false,
@@ -3744,6 +4010,171 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn kitty_release_only_follows_keys_reported_to_the_shell(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let (sender, written) = unbounded();
+            let dirty = Arc::new(AtomicBool::new(false));
+            let (ui_tx, ui_events) = unbounded();
+            let window_size = Arc::new(Mutex::new(WindowSize {
+                num_cols: 40,
+                num_lines: 8,
+                cell_width: 8,
+                cell_height: 18,
+            }));
+            let reply_colors = TerminalReplyColors::new(Theme::dark());
+            let proxy = TerminalEventProxy {
+                dirty: dirty.clone(),
+                sender: Arc::new(OnceLock::new()),
+                ui_events: ui_tx,
+                window_size: window_size.clone(),
+                reply_colors: reply_colors.clone(),
+            };
+            let view = cx.new(|cx| TerminalView {
+                session: Some(TerminalSession {
+                    term: Arc::new(FairMutex::new(Term::new(
+                        Config {
+                            kitty_keyboard: true,
+                            ..Default::default()
+                        },
+                        &TerminalDimensions {
+                            columns: 40,
+                            rows: 8,
+                        },
+                        proxy,
+                    ))),
+                    sender: PtyInput::Test(sender),
+                    dirty,
+                    snapshot_dirty: AtomicBool::new(true),
+                    cached_snapshot: Mutex::new(None),
+                    ui_events,
+                    window_size,
+                    grid_size: (40, 8),
+                    reply_colors,
+                    url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+                }),
+                launcher: TerminalLauncher::Local,
+                error: None,
+                focus_handle: cx.focus_handle(),
+                working_directory: PathBuf::new(),
+                title: String::new(),
+                exited: false,
+                scroll_accumulator: 0.0,
+                panel_width: 320.0,
+                panel_height: Some(160.0),
+                measured_cell_width: Some(8.0),
+                scrollbar_state: ScrollbarState::new(),
+                grid_bounds: Rc::new(Cell::new(Some(Bounds::new(
+                    point(px(10.), px(20.)),
+                    size(px(320.), px(144.)),
+                )))),
+                cursor_position: Some((2, 3)),
+                composition: None,
+                selecting: false,
+                mouse_reported_cell: None,
+                mouse_motion_cell: None,
+                hovered_link: None,
+                kitty_reported_keys: HashSet::new(),
+                cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
+                cursor_focus_tracking_started: false,
+                focused: false,
+                needs_attention: false,
+                context_menu: ContextMenuHandle::new(cx),
+                bottom_panel_tabs: false,
+                _subscriptions: Vec::new(),
+            });
+            view.update(cx, |view, cx| {
+                {
+                    let session = view.session.as_ref().unwrap();
+                    let mut term = session.term.lock();
+                    let mut parser: alacritty_terminal::vte::ansi::Processor =
+                        alacritty_terminal::vte::ansi::Processor::new();
+                    // Disambiguate and report event types: text keys still
+                    // arrive as text, and have no release of their own.
+                    parser.advance(&mut *term, b"\x1b[>3u");
+                }
+
+                let plain_a = key("a", Some("a"), Modifiers::default());
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: plain_a.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(written.is_empty());
+                assert!(!view.kitty_reported_keys.contains("a"));
+                view.on_key_up(
+                    &KeyUpEvent {
+                        keystroke: plain_a.clone(),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(written.is_empty());
+
+                {
+                    let session = view.session.as_ref().unwrap();
+                    let mut term = session.term.lock();
+                    let mut parser: alacritty_terminal::vte::ansi::Processor =
+                        alacritty_terminal::vte::ansi::Processor::new();
+                    // Report every key as an escape code: text keys now pair
+                    // with releases.
+                    parser.advance(&mut *term, b"\x1b[>11u");
+                }
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: plain_a.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(written.try_recv().unwrap(), b"\x1b[97u");
+                assert!(view.kitty_reported_keys.contains("a"));
+                assert!(
+                    view.session
+                        .as_ref()
+                        .unwrap()
+                        .mode()
+                        .contains(TermMode::REPORT_EVENT_TYPES)
+                );
+                view.on_key_up(&KeyUpEvent { keystroke: plain_a }, window, cx);
+                assert_eq!(written.try_recv().unwrap(), b"\x1b[97;1:3u");
+
+                let copy_modifiers = if cfg!(target_os = "macos") {
+                    Modifiers {
+                        platform: true,
+                        ..Default::default()
+                    }
+                } else {
+                    Modifiers {
+                        control: true,
+                        shift: true,
+                        ..Default::default()
+                    }
+                };
+                let copy = key("c", Some("C"), copy_modifiers);
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: copy.clone(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(written.is_empty());
+                view.on_key_up(&KeyUpEvent { keystroke: copy }, window, cx);
+                assert!(written.is_empty());
+            });
+        });
+    }
+
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
             key: key.into(),
@@ -3812,19 +4243,71 @@ mod tests {
     fn resolves_terminal_urls_and_existing_project_paths() {
         let working_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(
-            terminal_link_target("https://example.com/docs", working_directory),
+            terminal_link_target("https://example.com/docs", working_directory, true),
             Some(TerminalLinkTarget::Url(
                 "https://example.com/docs".to_owned()
             ))
         );
         assert_eq!(
-            terminal_link_target("src/terminal.rs:42:8", working_directory),
+            terminal_link_target("src/terminal.rs:42:8", working_directory, true),
             Some(TerminalLinkTarget::File(
                 working_directory.join("src/terminal.rs")
             ))
         );
         assert_eq!(
-            terminal_link_target("src/does-not-exist.rs", working_directory),
+            terminal_link_target("src/does-not-exist.rs", working_directory, true),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_remote_terminal_paths_without_local_filesystem_checks() {
+        let working_directory = Path::new("/home/waku/project");
+        assert_eq!(
+            terminal_link_target(
+                "/home/waku/project/src/main.rs:42:8",
+                working_directory,
+                false
+            ),
+            Some(TerminalLinkTarget::File(PathBuf::from(
+                "/home/waku/project/src/main.rs"
+            )))
+        );
+        let remote_relative = terminal_link_target("src/main.rs:42", working_directory, false)
+            .expect("remote relative path resolves");
+        let TerminalLinkTarget::File(remote_relative) = remote_relative else {
+            panic!("expected a file link");
+        };
+        // PathBuf equality treats both separators alike on Windows, so pin
+        // the string the remote route actually receives.
+        assert_eq!(
+            remote_relative.to_string_lossy(),
+            "/home/waku/project/src/main.rs"
+        );
+        assert_eq!(
+            terminal_link_target(
+                "file:///home/waku/project/src/main.rs",
+                working_directory,
+                false
+            ),
+            Some(TerminalLinkTarget::File(PathBuf::from(
+                "/home/waku/project/src/main.rs"
+            )))
+        );
+        assert_eq!(
+            terminal_link_target("~/src/main.rs", working_directory, false),
+            Some(TerminalLinkTarget::File(PathBuf::from("~/src/main.rs")))
+        );
+        assert_eq!(
+            terminal_link_target(
+                "file://otherhost/home/waku/main.rs",
+                working_directory,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_link_target("README.md", working_directory, false),
             None
         );
     }
@@ -3933,10 +4416,43 @@ mod tests {
 
         let all = flag1 | TermMode::REPORT_ALL_KEYS_AS_ESC;
         assert_eq!(bytes("enter", plain, all), Some(b"\x1b[13u".to_vec()));
-        let repeat = flag1 | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(bytes("a", plain, all), Some(b"\x1b[97u".to_vec()));
+        assert_eq!(bytes("space", plain, all), Some(b"\x1b[32u".to_vec()));
+        let events = flag1 | TermMode::REPORT_EVENT_TYPES;
         assert_eq!(
-            kitty_key_bytes(&key("escape", None, plain), true, repeat),
+            kitty_key_bytes(&key("escape", None, plain), true, events),
             Some(b"\x1b[27;1:2u".to_vec())
+        );
+        // Event reporting alone leaves text keys on the text path and gives
+        // Enter/Tab/Backspace no release; flag 8 is what pairs all of them.
+        assert_eq!(
+            kitty_key_bytes(&key("a", Some("a"), plain), false, events),
+            None
+        );
+        assert_eq!(
+            kitty_key_release_bytes(&key("a", Some("a"), plain), events),
+            None
+        );
+        assert_eq!(
+            kitty_key_release_bytes(&key("enter", Some("\n"), plain), events),
+            None
+        );
+        let events_all = events | TermMode::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(
+            kitty_key_bytes(&key("a", Some("a"), plain), false, events_all),
+            Some(b"\x1b[97u".to_vec())
+        );
+        assert_eq!(
+            kitty_key_release_bytes(&key("a", Some("a"), plain), events_all),
+            Some(b"\x1b[97;1:3u".to_vec())
+        );
+        assert_eq!(
+            kitty_key_release_bytes(&key("enter", Some("\n"), plain), events_all),
+            Some(b"\x1b[13;1:3u".to_vec())
+        );
+        assert_eq!(
+            kitty_key_release_bytes(&key("escape", None, plain), flag1),
+            None
         );
         let alternate = flag1 | TermMode::REPORT_ALTERNATE_KEYS;
         let control_shift = Modifiers {
@@ -4109,8 +4625,18 @@ mod tests {
             Some(b"\x1b[<0;5;2M".to_vec())
         );
         assert_eq!(
-            terminal_mouse_move_input(0, (6, 2), &plain, sgr_drag),
+            terminal_mouse_move_input(Some(0), (6, 2), &plain, sgr_drag),
             Some(b"\x1b[<32;7;3M".to_vec())
+        );
+        let sgr_any_motion = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+        assert_eq!(
+            terminal_mouse_move_input(None, (6, 2), &plain, sgr_any_motion),
+            Some(b"\x1b[<35;7;3M".to_vec())
+        );
+        // 1002 reports motion only while a button is held.
+        assert_eq!(
+            terminal_mouse_move_input(None, (6, 2), &plain, sgr_drag),
+            None
         );
         assert_eq!(
             terminal_mouse_button_input(0, false, (6, 2), &plain, sgr_drag),
@@ -4139,7 +4665,7 @@ mod tests {
             cell_width: 8,
             cell_height: 18,
         }));
-        let reply_colors = TerminalReplyColors::new();
+        let reply_colors = TerminalReplyColors::new(Theme::dark());
         let proxy = TerminalEventProxy {
             dirty: dirty.clone(),
             sender: Arc::new(OnceLock::new()),
@@ -4515,5 +5041,37 @@ mod tests {
                 ])
             );
         }
+    }
+
+    #[test]
+    fn terminal_context_block_fences_selected_output() {
+        let block = terminal_context_block(&TerminalSelectionContext {
+            label: "zsh\n~/project".into(),
+            line_start: 12,
+            line_end: 14,
+            text: "one\n```\ntwo\n".into(),
+        });
+        assert!(block.starts_with("Terminal output from \"zsh ~/project\" (lines 12-14):\n"));
+        assert!(block.contains("\n````text\none\n```\ntwo\n````"));
+    }
+
+    #[test]
+    fn terminal_context_block_names_a_single_line() {
+        let block = terminal_context_block(&TerminalSelectionContext {
+            label: String::new(),
+            line_start: 7,
+            line_end: 7,
+            text: "only".into(),
+        });
+        assert!(block.contains("(line 7):"));
+        assert!(block.ends_with("```text\nonly\n```"));
+    }
+
+    #[test]
+    fn scrollback_line_numbers_start_above_the_live_screen() {
+        assert_eq!(scrollback_line_number(-3, 3), 1);
+        assert_eq!(scrollback_line_number(0, 3), 4);
+        assert_eq!(scrollback_line_number(5, 0), 6);
+        assert_eq!(scrollback_line_number(-10, 0), 1);
     }
 }

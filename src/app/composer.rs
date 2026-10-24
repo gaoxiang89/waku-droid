@@ -2315,6 +2315,33 @@ impl Waku {
         })
     }
 
+    /// Append a terminal excerpt to the draft and focus the composer so the
+    /// user can send or adjust it. The excerpt stays editable text: drafts,
+    /// transcript rendering, and provider prompts already carry it.
+    pub(super) fn add_terminal_context(
+        &mut self,
+        context: crate::terminal::TerminalSelectionContext,
+        cx: &mut Context<Self>,
+    ) {
+        let block = crate::terminal::terminal_context_block(&context);
+        let (insert_at, separator) = {
+            let content = self.composer.read(cx).content(cx);
+            (
+                content.len(),
+                if content.trim().is_empty() {
+                    ""
+                } else {
+                    "\n\n"
+                },
+            )
+        };
+        self.composer.update(cx, |composer, cx| {
+            composer.replace_range(insert_at..insert_at, &format!("{separator}{block}"), cx);
+        });
+        self.composer_focus_pending = true;
+        cx.notify();
+    }
+
     pub(super) fn execute_local_composer_command(
         &mut self,
         prompt: &str,

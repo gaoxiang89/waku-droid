@@ -249,6 +249,10 @@ impl Waku {
 
 impl Render for Waku {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.composer_focus_pending) {
+            let focus = self.composer_focus(cx);
+            window.focus(&focus, cx);
+        }
         // Panel geometry first: the browser sync right below reads whether a
         // panel is mid-slide, and settling here rather than at the point of
         // use keeps the pane islands and the transcript on one set of widths.

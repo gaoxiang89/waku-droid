@@ -1246,6 +1246,9 @@ pub struct Waku {
     /// session id, while blank New Task pages key by project id.
     composer_drafts: ComposerDrafts,
     composer_draft_save_generation: u64,
+    /// A terminal selection just landed in the composer; focus it on the
+    /// next frame, when a window is available.
+    composer_focus_pending: bool,
     command_palette: command_palette::CommandPaletteUi,
     task_switcher: task_switcher::TaskSwitcherUi,
     model_search: Entity<TextInput>,
@@ -3373,6 +3376,7 @@ impl Waku {
                 composer_sources_stale: false,
                 composer_autocomplete: autocomplete::AutocompleteUi::new(),
                 composer_attachments,
+                composer_focus_pending: false,
                 image_preview: None,
                 image_preview_generation: 0,
                 remote_images: RefCell::new(HashMap::new()),

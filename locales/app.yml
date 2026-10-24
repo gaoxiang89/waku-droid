@@ -24,6 +24,8 @@ menu.cut:
   en: Cut
 menu.copy:
   en: Copy
+menu.add_to_composer:
+  en: Add to Composer
 menu.paste:
   en: Paste
 menu.select_all:

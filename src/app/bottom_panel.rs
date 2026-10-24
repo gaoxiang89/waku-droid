@@ -345,7 +345,7 @@ impl Waku {
             )
         };
         drag.id(SharedString::from(format!(
-            "bottom-panel-divider-{group_index}-{}",
+            "bottom-panel-divider-{group_index}-{}-{divider_after}",
             path.iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
@@ -793,8 +793,15 @@ impl Waku {
         .detach();
         cx.subscribe(
             terminal,
+            |this, _, context: &crate::terminal::TerminalSelectionContext, cx| {
+                this.add_terminal_context(context.clone(), cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            terminal,
             |this, _, open_file: &crate::terminal::TerminalOpenFile, cx| {
-                this.open_terminal_file(&open_file.0, cx);
+                this.open_terminal_file(&open_file.path, open_file.local_terminal, cx);
             },
         )
         .detach();
