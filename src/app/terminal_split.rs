@@ -615,9 +615,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn closing_a_pane_tracks_the_neighbor_that_inherited_its_slot(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn closing_a_pane_tracks_the_neighbor_that_inherited_its_slot(cx: &mut gpui::TestAppContext) {
         let (terminals, mut group) = group_with(cx, 3);
 
         // Closing the rightmost pane tracks its left neighbor, not the first.
@@ -637,13 +635,14 @@ mod tests {
 
         // Closing a pane that is not tracked leaves the tracked pane alone.
         let second = cx.update(|cx| TerminalView::inert_test_view_entity(cx));
+        let third = cx.update(|cx| TerminalView::inert_test_view_entity(cx));
+        let (second_id, third_id) = (second.entity_id(), third.entity_id());
         assert!(group.split_pane(terminals[0].entity_id(), second, Axis::Horizontal));
-        group.set_active(terminals[0].entity_id());
-        assert!(group.remove_pane(terminals[1].entity_id()));
-        assert_eq!(
-            group.active_or_first().unwrap().entity_id(),
-            terminals[0].entity_id()
-        );
+        assert!(group.split_pane(second_id, third, Axis::Horizontal));
+        group.set_active(second_id);
+        assert!(group.remove_pane(third_id));
+        assert_eq!(group.pane_count(), 2);
+        assert_eq!(group.active_or_first().unwrap().entity_id(), second_id);
     }
 
     #[gpui::test]
