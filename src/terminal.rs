@@ -1394,6 +1394,12 @@ pub struct TerminalOpenFile(pub PathBuf);
 
 impl EventEmitter<TerminalOpenFile> for TerminalView {}
 
+/// The terminal gained focus. The bottom panel listens to keep its tracked
+/// pane in step with the pane the user actually clicked.
+pub struct TerminalFocused;
+
+impl EventEmitter<TerminalFocused> for TerminalView {}
+
 pub struct TerminalView {
     session: Option<TerminalSession>,
     launcher: TerminalLauncher,
@@ -1633,9 +1639,17 @@ impl TerminalView {
         self.pause_cursor_blink(cx);
         let keystroke = &event.keystroke;
 
+        // The platform owns candidate navigation/confirmation while composing.
+        // Printable input must also reach its text handler, otherwise dead keys
+        // and IMEs are bypassed (or ordinary characters get sent twice).
+        if self.composition.is_some() || terminal_uses_text_input(event) {
+            return;
+        }
+
         // Split, close-pane, and resize chords reach the panel's actions from
         // the focused pane. Only the bottom panel can split, so other
-        // terminals leave these chords to the shell.
+        // terminals leave these chords to the shell. The chords stay behind
+        // the composition check: an IME owns its keys while composing.
         if self.bottom_panel_tabs
             && let Some(chord) = bottom_panel_pane_chord(keystroke)
         {
@@ -1652,16 +1666,9 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-
-        // The platform owns candidate navigation/confirmation while composing.
-        // Printable input must also reach its text handler, otherwise dead keys
-        // and IMEs are bypassed (or ordinary characters get sent twice).
-        if self.composition.is_some() || terminal_uses_text_input(event) {
-            return;
-        }
         // The bottom panel's terminals leave ctrl+pageup/pagedown unhandled so
-        // the panel's tab-cycle key bindings (bound in the `Terminal` context)
-        // receive them instead of the shell.
+        // the panel's tab-cycle key bindings (bound in the
+        // `BottomPanelTerminal` context) receive them instead of the shell.
         if self.bottom_panel_tabs
             && keystroke.modifiers.control
             && !keystroke.modifiers.alt
@@ -2098,6 +2105,9 @@ impl TerminalView {
         let focused = window.is_window_active() && self.focus_handle.is_focused(window);
         if focused != self.focused {
             self.focused = focused;
+            if focused {
+                cx.emit(TerminalFocused);
+            }
             if focused && self.needs_attention {
                 self.needs_attention = false;
                 cx.notify();
@@ -3015,6 +3025,54 @@ fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
         };
     }
     None
+}
+
+/// The keymap sources every pane chord is bound to, kept next to
+/// `bottom_panel_pane_chord` — the chord a keydown dispatches must stay in
+/// step with the binding that claims the same keystroke.
+const PANE_CHORD_SOURCES: &[(&str, PaneChord)] = &[
+    ("secondary-shift-d", PaneChord::SplitRight),
+    ("secondary-alt-shift-d", PaneChord::SplitDown),
+    ("secondary-shift-w", PaneChord::ClosePane),
+    ("ctrl-shift-w", PaneChord::ClosePane),
+    ("alt-shift-=", PaneChord::SplitRight),
+    ("alt-shift--", PaneChord::SplitDown),
+    ("alt-shift-left", PaneChord::ResizeLeft),
+    ("alt-shift-right", PaneChord::ResizeRight),
+    ("alt-shift-up", PaneChord::ResizeUp),
+    ("alt-shift-down", PaneChord::ResizeDown),
+];
+
+pub(crate) const BOTTOM_PANEL_TERMINAL_CONTEXT: &str = "BottomPanelTerminal";
+
+/// The keymap bindings for the pane chords, on the bottom panel's key
+/// context so terminals elsewhere never match them.
+pub(crate) fn pane_chord_bindings() -> Vec<KeyBinding> {
+    let mut bindings = PANE_CHORD_SOURCES
+        .iter()
+        .map(|(source, chord)| pane_chord_binding(source, *chord))
+        .collect::<Vec<_>>();
+    if cfg!(windows) {
+        // Windows folds shift into the produced character and clears the
+        // modifier, so shift+= arrives as "+" and shift+- as "_"; elsewhere
+        // the shift stays on the keystroke and alt-shift-= covers the chord.
+        bindings.push(pane_chord_binding("alt-+", PaneChord::SplitRight));
+        bindings.push(pane_chord_binding("alt-_", PaneChord::SplitDown));
+    }
+    bindings
+}
+
+fn pane_chord_binding(source: &str, chord: PaneChord) -> KeyBinding {
+    let context = Some(BOTTOM_PANEL_TERMINAL_CONTEXT);
+    match chord {
+        PaneChord::SplitRight => KeyBinding::new(source, crate::SplitTerminalRight, context),
+        PaneChord::SplitDown => KeyBinding::new(source, crate::SplitTerminalDown, context),
+        PaneChord::ClosePane => KeyBinding::new(source, crate::CloseTerminalPane, context),
+        PaneChord::ResizeLeft => KeyBinding::new(source, crate::ResizeTerminalPaneLeft, context),
+        PaneChord::ResizeRight => KeyBinding::new(source, crate::ResizeTerminalPaneRight, context),
+        PaneChord::ResizeUp => KeyBinding::new(source, crate::ResizeTerminalPaneUp, context),
+        PaneChord::ResizeDown => KeyBinding::new(source, crate::ResizeTerminalPaneDown, context),
+    }
 }
 
 /// Key bindings outrank key-down listeners, so an app shortcut on a key the
@@ -4418,5 +4476,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(bottom_panel_pane_chord(&key("left", None, alt)), None);
+    }
+
+    #[test]
+    fn pane_chord_keymap_sources_match_the_chord_recognizer() {
+        // Every binding `pane_chord_bindings` registers must be a keystroke
+        // the keydown fallback recognizes as the same chord, so the two
+        // dispatch paths cannot drift apart.
+        for (source, chord) in PANE_CHORD_SOURCES {
+            let keystroke =
+                Keystroke::parse(source).unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert_eq!(
+                bottom_panel_pane_chord(&keystroke),
+                Some(*chord),
+                "{source}"
+            );
+        }
+        for (source, chord) in [
+            ("alt-+", PaneChord::SplitRight),
+            ("alt-_", PaneChord::SplitDown),
+        ] {
+            let keystroke =
+                Keystroke::parse(source).unwrap_or_else(|error| panic!("{source:?}: {error}"));
+            assert_eq!(
+                bottom_panel_pane_chord(&keystroke),
+                cfg!(windows).then_some(chord),
+                "{source}"
+            );
+        }
+        // And every binding lands on the bottom panel's own key context.
+        for binding in pane_chord_bindings() {
+            let context = binding
+                .predicate()
+                .expect("pane chord bindings are context-scoped");
+            assert!(
+                context.eval(&[
+                    KeyContext::parse(BOTTOM_PANEL_TERMINAL_CONTEXT).expect("valid context")
+                ])
+            );
+        }
     }
 }

@@ -209,10 +209,10 @@ impl Waku {
                         terminal.entity_id()
                     )))
                     // The split/close/resize chords are bound to this context
-                    // (see `bind_keys`); the right panel's terminals only
-                    // carry `Terminal`, so these chords stay available there
-                    // for the shell.
-                    .key_context("BottomPanelTerminal")
+                    // (see `pane_chord_bindings`); the right panel's terminals
+                    // only carry `Terminal`, so these chords stay available
+                    // there for the shell.
+                    .key_context(crate::terminal::BOTTOM_PANEL_TERMINAL_CONTEXT)
                     .relative()
                     .overflow_hidden()
                     .flex_grow(flex)
@@ -736,6 +736,29 @@ impl Waku {
             TerminalView::new(working_directory.to_path_buf(), launcher, cx)
                 .with_bottom_panel_tabs()
         });
+        // Clicking a pane makes it the tracked one, so the tab bar's split
+        // button and the pane chords act on the pane being looked at rather
+        // than the one that happened to be tracked.
+        cx.subscribe(
+            &terminal,
+            |this, terminal, _: &crate::terminal::TerminalFocused, cx| {
+                let focused = terminal.entity_id();
+                for group in &mut this.bottom_panel_terminal_groups {
+                    if !group.contains(focused) {
+                        continue;
+                    }
+                    // The tab strip shows the tracked pane's title, so only a
+                    // change of the shown pane needs a repaint.
+                    let shown = group.active_or_first().map(|pane| pane.entity_id());
+                    group.set_active(focused);
+                    if shown != Some(focused) {
+                        cx.notify();
+                    }
+                    break;
+                }
+            },
+        )
+        .detach();
         Self::show_terminal_notices(&terminal, cx);
         terminal
     }
