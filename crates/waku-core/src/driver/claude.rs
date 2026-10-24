@@ -1323,6 +1323,7 @@ fn handle_message(
                     .map(|name| crate::model::ReportedCommand {
                         name: name.to_owned(),
                         description: String::new(),
+                        argument_hint: None,
                     })
                     .collect::<Vec<_>>();
                 if !commands.is_empty() {

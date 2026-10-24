@@ -157,8 +157,19 @@ fn format_output(value: &Value) -> Option<String> {
     if is_image_item(value) {
         return None;
     }
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("diff" | "terminal")
+    ) {
+        return None;
+    }
     if value.get("type").and_then(Value::as_str) == Some("text")
         && let Some(text) = value.get("text").and_then(Value::as_str)
+    {
+        return non_empty_text(text.to_owned());
+    }
+    if value.get("type").and_then(Value::as_str) == Some("resource")
+        && let Some(text) = value.pointer("/resource/text").and_then(Value::as_str)
     {
         return non_empty_text(text.to_owned());
     }

@@ -13,7 +13,7 @@ mod pi;
 mod support;
 mod title_refresh;
 
-pub(crate) use acp::catalog_agent;
+pub(crate) use acp::{build_tool_activity_item, catalog_agent, plan_activity};
 pub(crate) use activity::unwrap_legacy_output;
 
 use std::path::PathBuf;

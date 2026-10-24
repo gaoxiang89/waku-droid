@@ -396,12 +396,15 @@ pub fn merge_reported_commands(
             if known.description.is_empty() {
                 known.description = report.description.clone();
             }
+            if known.argument_hint.is_none() {
+                known.argument_hint = report.argument_hint.clone();
+            }
         } else {
             merged.push(SlashCommand {
                 name: report.name.clone(),
                 description: report.description.clone(),
                 scope: CommandScope::Builtin,
-                argument_hint: None,
+                argument_hint: report.argument_hint.clone(),
                 template: None,
             });
         }
@@ -1125,14 +1128,17 @@ mod tests {
             ReportedCommand {
                 name: "compact".into(),
                 description: "Provider copy".into(),
+                argument_hint: Some("[instructions]".into()),
             },
             ReportedCommand {
                 name: "bare".into(),
                 description: "Filled in".into(),
+                argument_hint: Some("<file>".into()),
             },
             ReportedCommand {
                 name: "statusline".into(),
                 description: String::new(),
+                argument_hint: Some("<mode>".into()),
             },
         ];
         let merged = merge_reported_commands(&discovered, &reported);

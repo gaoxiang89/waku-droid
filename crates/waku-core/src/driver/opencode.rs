@@ -891,6 +891,7 @@ fn reported_commands(commands: Vec<opencode_api::CommandInfo>) -> Vec<ReportedCo
         .map(|command| ReportedCommand {
             name: command.name,
             description: command.description.unwrap_or_default(),
+            argument_hint: None,
         })
         .filter(|command| !command.name.is_empty() && seen.insert(command.name.clone()))
         .collect()

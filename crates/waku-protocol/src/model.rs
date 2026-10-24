@@ -907,6 +907,8 @@ impl ProviderSessionSummary {
 pub struct ProviderSessionHistory {
     #[serde(default)]
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_blocks: Vec<TranscriptBlock>,
     #[serde(default)]
     pub turns: Vec<AgentTurn>,
 }
@@ -2111,6 +2113,8 @@ pub struct ReportedCommand {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2121,6 +2125,8 @@ enum ReportedCommandRepr {
         name: String,
         #[serde(default)]
         description: String,
+        #[serde(default)]
+        argument_hint: Option<String>,
     },
 }
 
@@ -2130,8 +2136,17 @@ impl From<ReportedCommandRepr> for ReportedCommand {
             ReportedCommandRepr::Name(name) => Self {
                 name,
                 description: String::new(),
+                argument_hint: None,
             },
-            ReportedCommandRepr::Full { name, description } => Self { name, description },
+            ReportedCommandRepr::Full {
+                name,
+                description,
+                argument_hint,
+            } => Self {
+                name,
+                description,
+                argument_hint,
+            },
         }
     }
 }
@@ -2752,6 +2767,7 @@ fn find_activity_string(value: &serde_json::Value, keys: &[&str], depth: usize) 
                 "arguments",
                 "args",
                 "input",
+                "locations",
                 "params",
                 "rawInput",
                 "raw_input",
@@ -2856,6 +2872,7 @@ fn extract_file_changes_from_value(
                 "arguments",
                 "args",
                 "input",
+                "locations",
                 "rawInput",
                 "raw_input",
                 "toolInput",
@@ -2864,6 +2881,12 @@ fn extract_file_changes_from_value(
                 if let Some(nested) = object.get(key) {
                     extract_file_changes_from_value(nested, changes, depth + 1);
                 }
+            }
+            if let Some(nested) = object
+                .get("content")
+                .filter(|value| value.is_array() || value.is_object())
+            {
+                extract_file_changes_from_value(nested, changes, depth + 1);
             }
         }
         _ => {}
@@ -2901,16 +2924,6 @@ fn structured_file_change(
                 .or_else(|| kind.get("type").and_then(serde_json::Value::as_str))
         })
         .or_else(|| object.get("type").and_then(serde_json::Value::as_str));
-    let status = match change_type {
-        Some("add" | "create" | "added" | "write") => Some(ActivityFileChangeStatus::Added),
-        Some("delete" | "deleted" | "remove") => Some(ActivityFileChangeStatus::Deleted),
-        Some("update" | "edit" | "modify" | "modified") => Some(ActivityFileChangeStatus::Modified),
-        _ => None,
-    };
-
-    let patch = ["diff", "unifiedDiff", "unified_diff"]
-        .into_iter()
-        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str));
     let old = [
         "oldString",
         "old_string",
@@ -2939,6 +2952,23 @@ fn structured_file_change(
     ]
     .into_iter()
     .find_map(|key| object.get(key).and_then(serde_json::Value::as_str));
+    let status = match change_type {
+        Some("add" | "create" | "added" | "write") => Some(ActivityFileChangeStatus::Added),
+        Some("delete" | "deleted" | "remove") => Some(ActivityFileChangeStatus::Deleted),
+        Some("update" | "edit" | "modify" | "modified") => Some(ActivityFileChangeStatus::Modified),
+        Some("diff") => {
+            if old.is_some() {
+                Some(ActivityFileChangeStatus::Modified)
+            } else {
+                Some(ActivityFileChangeStatus::Added)
+            }
+        }
+        _ => None,
+    };
+
+    let patch = ["diff", "unifiedDiff", "unified_diff"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(serde_json::Value::as_str));
     // A provider that reports an add or a delete puts the whole file where an
     // update would carry a patch, so read that key as content rather than as
     // hunks. Codex's `fileChange` item is the case in the field.
@@ -2969,6 +2999,8 @@ fn structured_file_change(
         normalize_unified_diff(patch)
     } else if let (Some(old), Some(new)) = (old, new) {
         replacement_diff(old, new)
+    } else if let Some(new) = new {
+        whole_file_diff(new, true)
     } else if let Some(edits) = object.get("edits").and_then(serde_json::Value::as_array) {
         edits_diff(edits)
     } else if let Some(content) = object.get("content").and_then(serde_json::Value::as_str) {

@@ -40,6 +40,10 @@ pub(super) enum HeadlessComputerUseConfig {
         auth_path: Option<PathBuf>,
         rules: String,
     },
+    AcpMcp {
+        base: computer_use_runtime::ComputerUseConfig,
+        rules: String,
+    },
 }
 
 pub(super) struct HeadlessComputerUseRuntime {
@@ -52,6 +56,10 @@ impl HeadlessComputerUseRuntime {
         let runtime = computer_use_runtime::ComputerUseRuntime::start(events)?;
         let config = match provider {
             ProviderKind::Grok => build_grok_computer_use_config(runtime.config.clone())?,
+            ProviderKind::Cursor
+            | ProviderKind::Droid
+            | ProviderKind::Fx
+            | ProviderKind::Kimi => build_acp_mcp_computer_use_config(runtime.config.clone())?,
             _ => return Err(anyhow!("Computer Use is not supported by this driver")),
         };
         Ok(Self { runtime, config })
@@ -64,8 +72,49 @@ impl HeadlessComputerUseRuntime {
     pub(super) fn grok_home(&self) -> Option<&Path> {
         match &self.config {
             HeadlessComputerUseConfig::Grok { grok_home, .. } => Some(grok_home),
+            HeadlessComputerUseConfig::AcpMcp { .. } => None,
         }
     }
+
+    pub(super) fn acp_mcp_server(&self) -> Option<agent_client_protocol::schema::v1::McpServer> {
+        match &self.config {
+            HeadlessComputerUseConfig::Grok { .. } => None,
+            HeadlessComputerUseConfig::AcpMcp { base, .. } => {
+                use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
+                Some(McpServer::Stdio(
+                    McpServerStdio::new("waku_js_repl", base.repl_path.clone()).env(vec![
+                        EnvVariable::new(
+                            "WAKU_COMPUTER_USE_SERVER",
+                            base.server_path.display().to_string(),
+                        ),
+                        EnvVariable::new(
+                            "WAKU_COMPUTER_USE_PROCESS_DIRECTORY",
+                            base.process_directory.display().to_string(),
+                        ),
+                    ]),
+                ))
+            }
+        }
+    }
+
+    pub(super) fn acp_prompt_instructions(&self) -> Option<&str> {
+        match &self.config {
+            HeadlessComputerUseConfig::Grok { .. } => None,
+            HeadlessComputerUseConfig::AcpMcp { rules, .. } => Some(rules.as_str()),
+        }
+    }
+}
+
+fn build_acp_mcp_computer_use_config(
+    base: computer_use_runtime::ComputerUseConfig,
+) -> anyhow::Result<HeadlessComputerUseConfig> {
+    let rules = fs::read_to_string(&base.skill_path).with_context(|| {
+        format!(
+            "could not read Waku Computer Use skill {}",
+            base.skill_path.display()
+        )
+    })?;
+    Ok(HeadlessComputerUseConfig::AcpMcp { base, rules })
 }
 
 fn build_grok_computer_use_config(

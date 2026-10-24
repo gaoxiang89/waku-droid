@@ -1237,6 +1237,7 @@ fn fetch_commands(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                argument_hint: None,
             })
         })
         .collect())

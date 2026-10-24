@@ -1537,6 +1537,7 @@ fn publish_commands(
         .map(|command| ReportedCommand {
             name: command.name,
             description: command.description,
+            argument_hint: command.argument_hint,
         })
         .collect();
     let _ = events.send(DriverEvent::AvailableCommands(commands));

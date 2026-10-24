@@ -1562,7 +1562,9 @@ impl Waku {
             summary.created_at
         };
         let updated_at = summary.updated_at.max(created_at);
-        let has_history = !history.messages.is_empty() || !history.turns.is_empty();
+        let has_history = !history.messages.is_empty()
+            || !history.transcript_blocks.is_empty()
+            || !history.turns.is_empty();
         let mut session = AgentSession::new(project_id, provider);
         session.runtime_mode = runtime_mode;
         session.auto_title = Some(summary.title);
@@ -1571,6 +1573,7 @@ impl Waku {
         session.updated_at = updated_at;
         session.last_reply_at = has_history.then_some(updated_at);
         session.messages = history.messages;
+        session.transcript_blocks = history.transcript_blocks;
         session.turns = history.turns;
         let session_id = session.id;
         self.hosts

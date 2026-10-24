@@ -14,21 +14,29 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest,
-    CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
-    ElicitationContentValue, ElicitationFormCapabilities, ElicitationMode,
-    ElicitationPropertySchema, EnumOption, Implementation, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, MultiSelectItems, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
+    CreateElicitationResponse, CreateTerminalRequest, CreateTerminalResponse,
+    ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
+    ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, EmbeddedResource,
+    EmbeddedResourceResource, EnumOption, FileSystemCapabilities, ForkSessionRequest, ImageContent,
+    Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    KillTerminalResponse, LoadSessionRequest, McpServer, MultiSelectItems, NewSessionRequest,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalExitStatus,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
     UntypedMessage,
 };
 use anyhow::{Context as _, anyhow};
+use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
@@ -37,8 +45,10 @@ use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
 use crate::model::{
-    ActivityKind, DriverEvent, PermissionOption, ProviderKind, ProviderResumeCursor, RuntimeMode,
-    UserInputAnswer, UserInputOption, UserInputQuestion,
+    ActivityItem, ActivityKind, BackgroundWorkEvent, BackgroundWorkItem, BackgroundWorkKey,
+    BackgroundWorkKind, BackgroundWorkStatus, DriverEvent, PermissionOption, ProviderKind,
+    ProviderResumeCursor, RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
+    unix_time_millis,
 };
 use waku_protocol::model_catalog::{
     CursorModelSelection, cursor_suffix_has, normalize_cursor_reasoning_effort,
@@ -49,6 +59,11 @@ enum CommandMessage {
     Prompt(String),
     Steer(String),
     Cancel,
+    RefreshBackgroundWork,
+    StopBackgroundWork {
+        key: BackgroundWorkKey,
+        control_id: String,
+    },
     Respond {
         request_id: String,
         option_id: String,
@@ -62,6 +77,10 @@ enum CommandMessage {
     Options {
         options: SessionOptions,
         mode_applied: Option<smol::channel::Sender<bool>>,
+    },
+    Fork {
+        turns_to_remove: usize,
+        reply: smol::channel::Sender<anyhow::Result<ProviderResumeCursor>>,
     },
     Shutdown,
 }
@@ -166,9 +185,18 @@ impl AcpDriver {
         };
 
         let launch = launch_for(provider, reasoning_effort.as_deref())?;
-        let computer_use = (provider == ProviderKind::Grok && computer_use_enabled)
+        let computer_use = computer_use_enabled
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
             .transpose()?;
+        let acp_mcp_servers = computer_use
+            .as_ref()
+            .and_then(super::support::HeadlessComputerUseRuntime::acp_mcp_server)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let computer_use_instructions = computer_use
+            .as_ref()
+            .and_then(super::support::HeadlessComputerUseRuntime::acp_prompt_instructions)
+            .map(ToOwned::to_owned);
         let grok_title_home = computer_use
             .as_ref()
             .and_then(super::support::HeadlessComputerUseRuntime::grok_home)
@@ -206,6 +234,8 @@ impl AcpDriver {
                     context_window,
                     resume_session_id,
                     fork_context,
+                    acp_mcp_servers,
+                    computer_use_instructions,
                     grok_title_home,
                     command_rx,
                     thread_events.clone(),
@@ -491,12 +521,18 @@ async fn run_sdk_connection(
     context_window: Option<String>,
     resume_session_id: Option<String>,
     fork_context: Option<String>,
+    acp_mcp_servers: Vec<McpServer>,
+    computer_use_instructions: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
     let suppress_session_updates = Arc::new(AtomicBool::new(false));
-    let stream_state = Arc::new(Mutex::new(AcpStreamState::default()));
+    let terminals = Arc::new(AcpTerminalRegistry::default());
+    let stream_state = Arc::new(Mutex::new(AcpStreamState {
+        terminals: terminals.clone(),
+        ..AcpStreamState::default()
+    }));
     let pending_permissions: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_user_inputs: PendingAcpUserInputs = Arc::new(Mutex::new(HashMap::new()));
     let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
@@ -508,8 +544,20 @@ async fn run_sdk_connection(
     // Set once the session's own autonomy has been written, so drift
     // correction never races the initial write.
     let droid_autonomy_ready = Arc::new(AtomicBool::new(false));
+    let fs_read_cwd = cwd.clone();
+    let fs_write_cwd = cwd.clone();
+    let terminal_cwd = cwd.clone();
+    let terminal_create_registry = terminals.clone();
+    let terminal_create_events = events.clone();
+    let terminal_output_registry = terminals.clone();
+    let terminal_wait_registry = terminals.clone();
+    let terminal_kill_registry = terminals.clone();
+    let terminal_kill_events = events.clone();
+    let terminal_release_registry = terminals.clone();
+    let terminal_release_events = events.clone();
+    let cleanup_terminals = terminals.clone();
 
-    Client
+    let result = Client
         .builder()
         .name("waku")
         .on_receive_notification(
@@ -589,6 +637,86 @@ async fn run_sdk_connection(
                         &pending_permissions,
                         &events,
                     )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: ReadTextFileRequest, responder, _connection| {
+                    match handle_read_text_file(request, &fs_read_cwd) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: WriteTextFileRequest, responder, _connection| {
+                    match handle_write_text_file(request, &fs_write_cwd) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: CreateTerminalRequest, responder, _connection| {
+                    match terminal_create_registry.create_terminal(
+                        request,
+                        &terminal_cwd,
+                        &terminal_create_events,
+                    ) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: TerminalOutputRequest, responder, _connection| {
+                    match terminal_output_registry.terminal_output(request) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: WaitForTerminalExitRequest, responder, _connection| {
+                    terminal_wait_registry.wait_for_exit(request, responder)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: KillTerminalRequest, responder, _connection| {
+                    match terminal_kill_registry.kill_terminal(request, &terminal_kill_events) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                async move |request: ReleaseTerminalRequest, responder, _connection| {
+                    match terminal_release_registry
+                        .release_terminal(request, &terminal_release_events)
+                    {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -687,9 +815,14 @@ async fn run_sdk_connection(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
-            let mut client_capabilities = ClientCapabilities::new().terminal(false).elicitation(
-                ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
-            );
+            let mut client_capabilities = ClientCapabilities::new()
+                .fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true))
+                .terminal(true)
+                .elicitation(
+                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
+                );
             if provider == ProviderKind::Cursor {
                 // Cursor only exposes its parameterized model controls to
                 // clients that opt in. Waku applies the returned config option
@@ -706,11 +839,18 @@ async fn run_sdk_connection(
                 )
                 .block_task()
                 .await?;
+            let prompt_capabilities = initialize.agent_capabilities.prompt_capabilities.clone();
+            let supports_fork = initialize
+                .agent_capabilities
+                .session_capabilities
+                .fork
+                .is_some();
             let (session_id, modes, initial_config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
                 &cwd,
+                &acp_mcp_servers,
                 &suppress_session_updates,
             )
             .await?;
@@ -767,6 +907,7 @@ async fn run_sdk_connection(
             )
             .await;
             let mut fork_context = fork_context;
+            let mut computer_use_instructions = computer_use_instructions;
 
             while let Ok(command) = commands.recv().await {
                 match command {
@@ -777,11 +918,17 @@ async fn run_sdk_connection(
                                 crate::cursor_session::prompt_with_fork_context(&context, &text)
                             })
                             .unwrap_or(text);
+                        let text = computer_use_instructions
+                            .take()
+                            .map(|instructions| format!("{instructions}\n\n{text}"))
+                            .unwrap_or(text);
                         let _ = events.send(DriverEvent::TurnStarted);
                         if let Err(error) = send_prompt(
                             &connection,
                             &session_id,
                             text,
+                            &cwd,
+                            &prompt_capabilities,
                             &prompt_requests,
                             &events,
                             provider,
@@ -812,6 +959,8 @@ async fn run_sdk_connection(
                             &connection,
                             &session_id,
                             text.clone(),
+                            &cwd,
+                            &prompt_capabilities,
                             &prompt_requests,
                             &events,
                             provider,
@@ -836,6 +985,17 @@ async fn run_sdk_connection(
                             .send_notification(CancelNotification::new(session_id.clone()));
                         cancel_pending_permissions(&pending_permissions);
                         cancel_pending_user_inputs(&pending_user_inputs);
+                    }
+                    CommandMessage::RefreshBackgroundWork => {
+                        terminals.emit_reconcile(&events);
+                    }
+                    CommandMessage::StopBackgroundWork { key, control_id } => {
+                        let id = if control_id.is_empty() {
+                            &key.provider_id
+                        } else {
+                            &control_id
+                        };
+                        terminals.stop_by_id(id, &key, &events);
                     }
                     CommandMessage::Respond {
                         request_id,
@@ -934,6 +1094,39 @@ async fn run_sdk_connection(
                             .await;
                         }
                     }
+                    CommandMessage::Fork {
+                        turns_to_remove,
+                        reply,
+                    } => {
+                        let outcome = if turns_to_remove > 0 {
+                            Err(anyhow!(
+                                "{} ACP session/fork only supports branching the full conversation",
+                                provider.display_name()
+                            ))
+                        } else if !supports_fork {
+                            Err(anyhow!(
+                                "{} did not advertise ACP session/fork support",
+                                provider.display_name()
+                            ))
+                        } else {
+                            let mut request = ForkSessionRequest::new(session_id.clone(), &cwd);
+                            if !acp_mcp_servers.is_empty() {
+                                request = request.mcp_servers(acp_mcp_servers.clone());
+                            }
+                            connection
+                                .send_request(request)
+                                .block_task()
+                                .await
+                                .map(|response| {
+                                    ProviderResumeCursor::from_session_id(
+                                        provider,
+                                        response.session_id.to_string(),
+                                    )
+                                })
+                                .map_err(|error| anyhow!(error.to_string()))
+                        };
+                        let _ = reply.try_send(outcome);
+                    }
                     CommandMessage::Shutdown => break,
                 }
             }
@@ -941,7 +1134,9 @@ async fn run_sdk_connection(
             cancel_pending_user_inputs(&pending_user_inputs);
             Ok(())
         })
-        .await
+        .await;
+    cleanup_terminals.shutdown_all();
+    result
 }
 
 async fn establish_session(
@@ -949,6 +1144,7 @@ async fn establish_session(
     initialize: &InitializeResponse,
     resume_session_id: Option<&str>,
     cwd: &Path,
+    mcp_servers: &[McpServer],
     suppress_session_updates: &AtomicBool,
 ) -> agent_client_protocol::Result<(
     SessionId,
@@ -961,24 +1157,27 @@ async fn establish_session(
             .session_capabilities
             .resume
             .is_some()
-            && let Ok(response) = connection
-                .send_request(ResumeSessionRequest::new(existing.to_owned(), cwd))
-                .block_task()
-                .await
         {
-            return Ok((
-                SessionId::new(existing.to_owned()),
-                response.modes,
-                response.config_options,
-            ));
+            let mut request = ResumeSessionRequest::new(existing.to_owned(), cwd);
+            if !mcp_servers.is_empty() {
+                request = request.mcp_servers(mcp_servers.to_vec());
+            }
+            if let Ok(response) = connection.send_request(request).block_task().await {
+                return Ok((
+                    SessionId::new(existing.to_owned()),
+                    response.modes,
+                    response.config_options,
+                ));
+            }
         }
 
         if initialize.agent_capabilities.load_session {
             suppress_session_updates.store(true, Ordering::Release);
-            let response = connection
-                .send_request(LoadSessionRequest::new(existing.to_owned(), cwd))
-                .block_task()
-                .await;
+            let mut request = LoadSessionRequest::new(existing.to_owned(), cwd);
+            if !mcp_servers.is_empty() {
+                request = request.mcp_servers(mcp_servers.to_vec());
+            }
+            let response = connection.send_request(request).block_task().await;
             suppress_session_updates.store(false, Ordering::Release);
             if let Ok(response) = response {
                 return Ok((
@@ -990,10 +1189,11 @@ async fn establish_session(
         }
     }
 
-    let response = connection
-        .send_request(NewSessionRequest::new(cwd))
-        .block_task()
-        .await?;
+    let mut request = NewSessionRequest::new(cwd);
+    if !mcp_servers.is_empty() {
+        request = request.mcp_servers(mcp_servers.to_vec());
+    }
+    let response = connection.send_request(request).block_task().await?;
     Ok((response.session_id, response.modes, response.config_options))
 }
 
@@ -1856,6 +2056,8 @@ fn send_prompt(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
     text: String,
+    cwd: &Path,
+    prompt_capabilities: &PromptCapabilities,
     prompt_requests: &PendingPromptRequests,
     events: &DriverEventSender,
     provider: ProviderKind,
@@ -1871,10 +2073,8 @@ fn send_prompt(
         .then(|| crate::kimi_session::wire_offset(native_session_id));
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
-    let mut request = PromptRequest::new(
-        session_id.clone(),
-        vec![ContentBlock::Text(TextContent::new(text))],
-    );
+    let content_blocks = build_prompt_content_blocks(&text, cwd, prompt_capabilities);
+    let mut request = PromptRequest::new(session_id.clone(), content_blocks);
     if let Some(extension_id) = extension_id.as_ref() {
         let mut meta = serde_json::Map::new();
         meta.insert("promptId".into(), Value::String(extension_id.clone()));
@@ -1915,6 +2115,625 @@ fn send_prompt(
         prompt_requests.lock().settle_request(&request_id);
     }
     registered
+}
+
+const MAX_PROMPT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_PROMPT_TEXT_RESOURCE_BYTES: u64 = 256 * 1024;
+
+pub(crate) fn build_prompt_content_blocks(
+    text: &str,
+    cwd: &Path,
+    capabilities: &PromptCapabilities,
+) -> Vec<ContentBlock> {
+    let mut blocks = vec![ContentBlock::Text(TextContent::new(text.to_owned()))];
+    if !capabilities.image && !capabilities.embedded_context {
+        return blocks;
+    }
+
+    let mut seen_paths = HashSet::new();
+    for token in text.split_whitespace() {
+        let Some(raw_mention) = token.strip_prefix('@') else {
+            continue;
+        };
+        let mention = raw_mention.trim_end_matches([',', ';', ':', '.', ')', ']', '"', '\'']);
+        if mention.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(mention);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            cwd.join(candidate)
+        };
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if !metadata.is_file() || !seen_paths.insert(resolved.clone()) {
+            continue;
+        }
+
+        if let Some(mime_type) = image_mime_type(&resolved) {
+            if capabilities.image
+                && metadata.len() <= MAX_PROMPT_IMAGE_BYTES
+                && let Ok(bytes) = std::fs::read(&resolved)
+            {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let mut image = ImageContent::new(encoded, mime_type);
+                if let Ok(uri) = url::Url::from_file_path(&resolved) {
+                    image = image.uri(uri.to_string());
+                }
+                blocks.push(ContentBlock::Image(image));
+            }
+            continue;
+        }
+
+        if capabilities.embedded_context
+            && let Ok(uri) = url::Url::from_file_path(&resolved)
+        {
+            if metadata.len() <= MAX_PROMPT_TEXT_RESOURCE_BYTES
+                && let Ok(contents) = std::fs::read_to_string(&resolved)
+            {
+                let resource = TextResourceContents::new(contents, uri.to_string());
+                blocks.push(ContentBlock::Resource(EmbeddedResource::new(
+                    EmbeddedResourceResource::TextResourceContents(resource),
+                )));
+            } else {
+                let name = resolved
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(mention)
+                    .to_owned();
+                blocks.push(ContentBlock::ResourceLink(
+                    ResourceLink::new(name, uri.to_string()).size(metadata.len() as i64),
+                ));
+            }
+        }
+    }
+    blocks
+}
+
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "ico" => Some("image/x-icon"),
+        "tif" | "tiff" => Some("image/tiff"),
+        _ => None,
+    }
+}
+
+pub(crate) fn handle_read_text_file(
+    request: ReadTextFileRequest,
+    default_cwd: &Path,
+) -> agent_client_protocol::Result<ReadTextFileResponse> {
+    let path = if request.path.is_absolute() {
+        request.path
+    } else {
+        default_cwd.join(request.path)
+    };
+    let raw = std::fs::read_to_string(&path).map_err(|error| {
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to read {}: {error}",
+            path.display()
+        ))
+    })?;
+    let content = if request.line.is_some() || request.limit.is_some() {
+        let start_index = request.line.unwrap_or(1).saturating_sub(1) as usize;
+        let limit = request.limit.map_or(usize::MAX, |limit| limit as usize);
+        raw.lines()
+            .skip(start_index)
+            .take(limit)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw
+    };
+    Ok(ReadTextFileResponse::new(content))
+}
+
+pub(crate) fn handle_write_text_file(
+    request: WriteTextFileRequest,
+    default_cwd: &Path,
+) -> agent_client_protocol::Result<WriteTextFileResponse> {
+    let path = if request.path.is_absolute() {
+        request.path
+    } else {
+        default_cwd.join(request.path)
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to create parent directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::write(&path, &request.content).map_err(|error| {
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to write {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(WriteTextFileResponse::new())
+}
+
+const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT: usize = 1_048_576;
+
+struct AcpTerminalProcess {
+    id: String,
+    title: String,
+    command_display: String,
+    cwd_display: String,
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    output: String,
+    output_truncated: bool,
+    output_byte_limit: usize,
+    exit_status: Option<TerminalExitStatus>,
+    killed: bool,
+    child_pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+    waiters: Vec<Responder<WaitForTerminalExitResponse>>,
+}
+
+impl AcpTerminalProcess {
+    fn append_output(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.updated_at_ms = unix_time_millis();
+        if self.output_byte_limit == 0 {
+            self.output.clear();
+            self.output_truncated = true;
+            return;
+        }
+        self.output.push_str(chunk);
+        if self.output.len() > self.output_byte_limit {
+            let excess = self.output.len() - self.output_byte_limit;
+            let mut boundary = excess;
+            while boundary < self.output.len() && !self.output.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+            self.output.drain(..boundary);
+            self.output_truncated = true;
+        }
+    }
+
+    fn background_work_status(&self) -> BackgroundWorkStatus {
+        match &self.exit_status {
+            None => BackgroundWorkStatus::Running,
+            Some(_) if self.killed => BackgroundWorkStatus::Stopped,
+            Some(status) if status.exit_code == Some(0) && status.signal.is_none() => {
+                BackgroundWorkStatus::Completed
+            }
+            Some(_) => BackgroundWorkStatus::Failed,
+        }
+    }
+
+    fn to_background_work_item(&self) -> BackgroundWorkItem {
+        let status = self.background_work_status();
+        let duration_ms = self
+            .exit_status
+            .as_ref()
+            .map(|_| self.updated_at_ms.saturating_sub(self.started_at_ms));
+        let exit_code = self
+            .exit_status
+            .as_ref()
+            .and_then(|status| status.exit_code)
+            .and_then(|code| i32::try_from(code).ok());
+        BackgroundWorkItem {
+            key: BackgroundWorkKey::new(BackgroundWorkKind::Process, self.id.clone()),
+            title: self.title.clone(),
+            detail: None,
+            command: Some(self.command_display.clone()),
+            cwd: Some(self.cwd_display.clone()),
+            output: (!self.output.is_empty()).then(|| self.output.clone()),
+            output_truncated: self.output_truncated,
+            started_at_ms: self.started_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            duration_ms,
+            exit_code,
+            background: true,
+            can_stop: status.is_stoppable(),
+            control_id: Some(self.id.clone()),
+            origin_activity_id: None,
+            role: None,
+            model: None,
+            parent_id: None,
+            status,
+        }
+    }
+
+    fn kill_process_tree(&mut self) {
+        self.killed = true;
+        #[cfg(windows)]
+        {
+            drop(self.job.take());
+            unsafe {
+                use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::{
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                };
+                let process = OpenProcess(PROCESS_TERMINATE, 0, self.child_pid);
+                if !process.is_null() {
+                    let _ = TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            unsafe {
+                let _ = libc::kill(-(self.child_pid as i32), libc::SIGKILL);
+                let _ = libc::kill(self.child_pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AcpTerminalRegistry {
+    terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>,
+}
+
+impl AcpTerminalRegistry {
+    fn spawn_command(
+        request: &CreateTerminalRequest,
+        work_dir: &Path,
+    ) -> std::io::Result<std::process::Child> {
+        let configure = |cmd: &mut std::process::Command| {
+            cmd.current_dir(work_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .envs(crate::command_env::shell_environment());
+            for env_var in &request.env {
+                cmd.env(&env_var.name, &env_var.value);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+        };
+
+        let mut direct = std::process::Command::new(&request.command);
+        direct.args(&request.args);
+        configure(&mut direct);
+        match direct.spawn() {
+            Ok(child) => Ok(child),
+            Err(error)
+                if request.args.is_empty() && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                #[cfg(windows)]
+                let mut fallback = {
+                    let mut cmd = std::process::Command::new("cmd.exe");
+                    cmd.args(["/C", &request.command]);
+                    cmd
+                };
+                #[cfg(not(windows))]
+                let mut fallback = {
+                    let mut cmd = std::process::Command::new("/bin/sh");
+                    cmd.args(["-c", &request.command]);
+                    cmd
+                };
+                configure(&mut fallback);
+                fallback.spawn()
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn create_terminal(
+        &self,
+        request: CreateTerminalRequest,
+        default_cwd: &Path,
+        events: &DriverEventSender,
+    ) -> agent_client_protocol::Result<CreateTerminalResponse> {
+        let work_dir = match request.cwd.as_deref() {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => default_cwd.join(path),
+            None => default_cwd.to_path_buf(),
+        };
+        let mut child = Self::spawn_command(&request, &work_dir).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to spawn terminal command `{}`: {error}",
+                request.command
+            ))
+        })?;
+        let child_pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child_pid).ok();
+
+        let id = format!("term-{}", uuid::Uuid::new_v4());
+        let command_display = if request.args.is_empty() {
+            request.command.clone()
+        } else {
+            format!("{} {}", request.command, request.args.join(" "))
+        };
+        let title = truncate(&command_display, 80);
+        let output_byte_limit = request
+            .output_byte_limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT);
+        let now = unix_time_millis();
+        let entry = Arc::new(Mutex::new(AcpTerminalProcess {
+            id: id.clone(),
+            title,
+            command_display,
+            cwd_display: work_dir.display().to_string(),
+            started_at_ms: now,
+            updated_at_ms: now,
+            output: String::new(),
+            output_truncated: false,
+            output_byte_limit,
+            exit_status: None,
+            killed: false,
+            child_pid,
+            #[cfg(windows)]
+            job,
+            waiters: Vec::new(),
+        }));
+        self.terminals.lock().insert(id.clone(), entry.clone());
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            entry.lock().to_background_work_item(),
+        )));
+
+        if let Some(stdout) = child.stdout.take() {
+            Self::spawn_output_reader(id.clone(), stdout, entry.clone(), events.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            Self::spawn_output_reader(id.clone(), stderr, entry.clone(), events.clone());
+        }
+        let wait_entry = entry;
+        let wait_events = events.clone();
+        let _ = thread::Builder::new()
+            .name("waku-acp-term-wait".into())
+            .spawn(move || {
+                let status = match child.wait() {
+                    Ok(exit) => {
+                        let code = exit.code().and_then(|code| u32::try_from(code).ok());
+                        #[cfg(unix)]
+                        let signal = {
+                            use std::os::unix::process::ExitStatusExt as _;
+                            exit.signal().map(|sig| sig.to_string())
+                        };
+                        #[cfg(not(unix))]
+                        let signal: Option<String> = None;
+                        TerminalExitStatus::new().exit_code(code).signal(signal)
+                    }
+                    Err(_) => TerminalExitStatus::new(),
+                };
+                let (item, waiters) = {
+                    let mut proc = wait_entry.lock();
+                    proc.updated_at_ms = unix_time_millis();
+                    proc.exit_status = Some(status.clone());
+                    let waiters = std::mem::take(&mut proc.waiters);
+                    (proc.to_background_work_item(), waiters)
+                };
+                for waiter in waiters {
+                    let _ = waiter.respond(WaitForTerminalExitResponse::new(status.clone()));
+                }
+                let _ = wait_events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+                    item,
+                )));
+            });
+
+        Ok(CreateTerminalResponse::new(id))
+    }
+
+    fn spawn_output_reader<R: std::io::Read + Send + 'static>(
+        terminal_id: String,
+        mut reader: R,
+        entry: Arc<Mutex<AcpTerminalProcess>>,
+        events: DriverEventSender,
+    ) {
+        let _ = thread::Builder::new()
+            .name("waku-acp-term-out".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let delta = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                            entry.lock().append_output(&delta);
+                            let _ = events.send(DriverEvent::BackgroundWork(
+                                BackgroundWorkEvent::OutputDelta {
+                                    key: BackgroundWorkKey::new(
+                                        BackgroundWorkKind::Process,
+                                        terminal_id.clone(),
+                                    ),
+                                    delta,
+                                },
+                            ));
+                        }
+                    }
+                }
+            });
+    }
+
+    pub(crate) fn terminal_output(
+        &self,
+        request: TerminalOutputRequest,
+    ) -> agent_client_protocol::Result<TerminalOutputResponse> {
+        let terminal_id = request.terminal_id.to_string();
+        let entry = self
+            .terminals
+            .lock()
+            .get(&terminal_id)
+            .cloned()
+            .ok_or_else(|| {
+                agent_client_protocol::util::internal_error(format!(
+                    "Unknown terminal ID `{terminal_id}`"
+                ))
+            })?;
+        let proc = entry.lock();
+        Ok(
+            TerminalOutputResponse::new(proc.output.clone(), proc.output_truncated)
+                .exit_status(proc.exit_status.clone()),
+        )
+    }
+
+    pub(crate) fn output_text(&self, terminal_id: &str) -> Option<String> {
+        let entry = self.terminals.lock().get(terminal_id).cloned()?;
+        let proc = entry.lock();
+        let trimmed = proc.output.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    pub(crate) fn wait_for_exit(
+        &self,
+        request: WaitForTerminalExitRequest,
+        responder: Responder<WaitForTerminalExitResponse>,
+    ) -> agent_client_protocol::Result<()> {
+        let terminal_id = request.terminal_id.to_string();
+        let Some(entry) = self.terminals.lock().get(&terminal_id).cloned() else {
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("Unknown terminal ID `{terminal_id}`"),
+            ));
+        };
+        let mut proc = entry.lock();
+        if let Some(status) = proc.exit_status.clone() {
+            drop(proc);
+            return responder.respond(WaitForTerminalExitResponse::new(status));
+        }
+        proc.waiters.push(responder);
+        Ok(())
+    }
+
+    pub(crate) fn kill_terminal(
+        &self,
+        request: KillTerminalRequest,
+        events: &DriverEventSender,
+    ) -> agent_client_protocol::Result<KillTerminalResponse> {
+        let terminal_id = request.terminal_id.to_string();
+        let entry = self
+            .terminals
+            .lock()
+            .get(&terminal_id)
+            .cloned()
+            .ok_or_else(|| {
+                agent_client_protocol::util::internal_error(format!(
+                    "Unknown terminal ID `{terminal_id}`"
+                ))
+            })?;
+        let item = {
+            let mut proc = entry.lock();
+            proc.kill_process_tree();
+            proc.updated_at_ms = unix_time_millis();
+            proc.to_background_work_item()
+        };
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            item,
+        )));
+        Ok(KillTerminalResponse::new())
+    }
+
+    pub(crate) fn release_terminal(
+        &self,
+        request: ReleaseTerminalRequest,
+        events: &DriverEventSender,
+    ) -> agent_client_protocol::Result<ReleaseTerminalResponse> {
+        let terminal_id = request.terminal_id.to_string();
+        if let Some(entry) = self.terminals.lock().remove(&terminal_id) {
+            let (item, waiters) = {
+                let mut proc = entry.lock();
+                if proc.exit_status.is_none() {
+                    proc.kill_process_tree();
+                    proc.exit_status = Some(TerminalExitStatus::new());
+                }
+                proc.updated_at_ms = unix_time_millis();
+                let waiters = std::mem::take(&mut proc.waiters);
+                (proc.to_background_work_item(), waiters)
+            };
+            for waiter in waiters {
+                let _ = waiter.respond(WaitForTerminalExitResponse::new(TerminalExitStatus::new()));
+            }
+            let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+                item,
+            )));
+        }
+        Ok(ReleaseTerminalResponse::new())
+    }
+
+    pub(crate) fn emit_reconcile(&self, events: &DriverEventSender) {
+        let items = self
+            .terminals
+            .lock()
+            .values()
+            .map(|entry| entry.lock().to_background_work_item())
+            .collect::<Vec<_>>();
+        let _ = events.send(DriverEvent::BackgroundWork(
+            BackgroundWorkEvent::ReconcileProcesses { items },
+        ));
+    }
+
+    pub(crate) fn stop_by_id(
+        &self,
+        terminal_id: &str,
+        key: &BackgroundWorkKey,
+        events: &DriverEventSender,
+    ) {
+        let _ = events.send(DriverEvent::BackgroundWork(
+            BackgroundWorkEvent::StopRequested(key.clone()),
+        ));
+        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
+            let _ = events.send(DriverEvent::BackgroundWork(
+                BackgroundWorkEvent::StopFailed {
+                    key: key.clone(),
+                    message: format!("Terminal `{terminal_id}` is no longer active"),
+                },
+            ));
+            return;
+        };
+        let item = {
+            let mut proc = entry.lock();
+            proc.kill_process_tree();
+            if proc.exit_status.is_none() {
+                proc.exit_status = Some(TerminalExitStatus::new());
+            }
+            proc.updated_at_ms = unix_time_millis();
+            proc.to_background_work_item()
+        };
+        let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
+            item,
+        )));
+    }
+
+    pub(crate) fn shutdown_all(&self) {
+        let entries = self
+            .terminals
+            .lock()
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let waiters = {
+                let mut proc = entry.lock();
+                if proc.exit_status.is_none() {
+                    proc.kill_process_tree();
+                    proc.exit_status = Some(TerminalExitStatus::new());
+                }
+                std::mem::take(&mut proc.waiters)
+            };
+            for waiter in waiters {
+                let _ = waiter.respond(WaitForTerminalExitResponse::new(TerminalExitStatus::new()));
+            }
+        }
+    }
 }
 
 fn settle_prompt_request(prompt_requests: &Mutex<PendingPrompts>, request_id: &RequestId) -> bool {
@@ -2742,17 +3561,7 @@ fn handle_session_update(
         // Each update carries the whole plan, so it replaces the previous one
         // in place and is already settled when it arrives.
         Some("plan") => {
-            let steps = plan_steps_text(&update);
-            let item = activity::tool_activity(
-                Some("acp-plan".into()),
-                ActivityKind::Plan,
-                tr!("activity.plan_updated"),
-                None,
-                steps.as_ref(),
-                None,
-                false,
-                true,
-            );
+            let item = plan_activity(&update);
             let _ = events.send(DriverEvent::RichActivity(item));
         }
         Some("available_commands_update") => {
@@ -2763,6 +3572,12 @@ fn handle_session_update(
                     list.iter()
                         .filter_map(|command| {
                             let name = command.get("name").and_then(Value::as_str)?;
+                            let argument_hint = command
+                                .pointer("/input/hint")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|hint| !hint.is_empty())
+                                .map(str::to_owned);
                             Some(crate::model::ReportedCommand {
                                 name: name.to_owned(),
                                 description: command
@@ -2770,6 +3585,7 @@ fn handle_session_update(
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
                                     .to_owned(),
+                                argument_hint,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -2811,6 +3627,20 @@ fn handle_session_update(
     Ok(())
 }
 
+pub(crate) fn plan_activity(update: &Value) -> ActivityItem {
+    let steps = plan_steps_text(update);
+    activity::tool_activity(
+        Some("acp-plan".into()),
+        ActivityKind::Plan,
+        tr!("activity.plan_updated"),
+        None,
+        steps.as_ref(),
+        None,
+        false,
+        true,
+    )
+}
+
 /// An ACP plan's entries as one line per step, marked by status.
 fn plan_steps_text(update: &Value) -> Option<Value> {
     let steps = update
@@ -2837,16 +3667,19 @@ fn fx_context_notice(text: &str) -> bool {
 }
 
 #[derive(Clone)]
-struct StoredToolCall {
+pub(crate) struct StoredToolCall {
     kind: ActivityKind,
     title: String,
     raw_input: Option<Value>,
+    locations: Option<Value>,
+    content: Option<Value>,
     tool_name: Option<String>,
 }
 
 #[derive(Default)]
 struct AcpStreamState {
     tools: HashMap<String, StoredToolCall>,
+    terminals: Arc<AcpTerminalRegistry>,
     /// Whether the running turn has produced anything visible. A turn that
     /// ends having produced nothing is the shape a swallowed provider error
     /// takes, which is what makes a native failure worth looking up.
@@ -2883,7 +3716,38 @@ fn truncate(text: &str, max_chars: usize) -> String {
         .collect()
 }
 
-fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpStreamState) {
+fn content_has_diff(content: Option<&Value>) -> bool {
+    let Some(items) = content.and_then(Value::as_array) else {
+        return false;
+    };
+    items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("diff"))
+}
+
+fn resolve_terminal_content_output(
+    content: Option<&Value>,
+    terminals: &AcpTerminalRegistry,
+) -> Option<String> {
+    let items = content?.as_array()?;
+    let outputs = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("terminal"))
+        .filter_map(|item| {
+            item.get("terminalId")
+                .or_else(|| item.get("terminal_id"))
+                .and_then(Value::as_str)
+        })
+        .filter_map(|terminal_id| terminals.output_text(terminal_id))
+        .collect::<Vec<_>>();
+    (!outputs.is_empty()).then(|| outputs.join("\n\n"))
+}
+
+pub(crate) fn build_tool_activity_item(
+    update: &Value,
+    tools: &mut HashMap<String, StoredToolCall>,
+    terminals: Option<&AcpTerminalRegistry>,
+) -> ActivityItem {
     let id = update
         .get("toolCallId")
         .and_then(Value::as_str)
@@ -2899,9 +3763,9 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
     let wire_title = update.get("title").and_then(Value::as_str);
     let stored = id.as_ref().and_then(|id| {
         if complete {
-            state.tools.remove(id)
+            tools.remove(id)
         } else {
-            state.tools.get(id).cloned()
+            tools.get(id).cloned()
         }
     });
     let mut kind = wire_kind
@@ -2920,6 +3784,17 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
         .get("rawInput")
         .filter(|value| !value.is_null())
         .or_else(|| stored.as_ref().and_then(|tool| tool.raw_input.as_ref()));
+    let locations = update
+        .get("locations")
+        .filter(|value| !value.is_null())
+        .or_else(|| stored.as_ref().and_then(|tool| tool.locations.as_ref()));
+    let content = update
+        .get("content")
+        .filter(|value| !value.is_null())
+        .or_else(|| stored.as_ref().and_then(|tool| tool.content.as_ref()));
+    if kind == ActivityKind::Tool && content_has_diff(content) {
+        kind = ActivityKind::FileChange;
+    }
     let title = activity::input_title(arguments)
         .or_else(|| {
             wire_title
@@ -2927,7 +3802,13 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
                 .map(str::to_owned)
         })
         .or_else(|| stored.as_ref().map(|tool| tool.title.clone()))
-        .unwrap_or_else(|| "Tool".to_owned());
+        .unwrap_or_else(|| {
+            if kind == ActivityKind::FileChange {
+                tr!("activity.edit_file")
+            } else {
+                "Tool".to_owned()
+            }
+        });
     let tool_name = arguments
         .and_then(|input| input.get("tool_name"))
         .and_then(Value::as_str)
@@ -2935,24 +3816,47 @@ fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpS
         .or_else(|| stored.as_ref().and_then(|tool| tool.tool_name.as_deref()))
         .map(str::to_owned);
     if !complete && let Some(id) = id.as_ref() {
-        state.tools.insert(
+        tools.insert(
             id.clone(),
             StoredToolCall {
                 kind,
                 title: title.clone(),
                 raw_input: arguments.cloned(),
+                locations: locations.cloned(),
+                content: content.cloned(),
                 tool_name: tool_name.clone(),
             },
         );
     }
 
-    let output = update
-        .get("content")
-        .filter(|value| !value.is_null())
-        .or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
-    let item =
+    let output = content.or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
+    let mut item =
         activity::tool_activity(id, kind, title, arguments, output, output, failed, complete)
             .with_tool_name(tool_name.as_deref());
+    if locations.is_some() || content.is_some() {
+        let mut source = Map::new();
+        if let Some(arguments) = arguments {
+            source.insert("rawInput".to_owned(), arguments.clone());
+        }
+        if let Some(locations) = locations {
+            source.insert("locations".to_owned(), locations.clone());
+        }
+        if let Some(content) = content {
+            source.insert("content".to_owned(), content.clone());
+        }
+        item = item.with_activity_source(Some(&Value::Object(source)));
+    }
+    if item.output.is_none()
+        && let Some(terminals) = terminals
+        && let Some(terminal_output) = resolve_terminal_content_output(content, terminals)
+    {
+        item.output = Some(terminal_output);
+    }
+    item
+}
+
+fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpStreamState) {
+    let item = build_tool_activity_item(update, &mut state.tools, Some(&state.terminals));
     let _ = events.send(DriverEvent::RichActivity(item));
 }
 
@@ -2988,6 +3892,16 @@ impl DriverControl for AcpDriver {
         if let Some(computer_use) = self.computer_use.as_ref() {
             computer_use.stop();
         }
+    }
+
+    fn refresh_background_work(&self) {
+        let _ = self.commands.try_send(CommandMessage::RefreshBackgroundWork);
+    }
+
+    fn stop_background_work(&self, key: BackgroundWorkKey, control_id: String) {
+        let _ = self
+            .commands
+            .try_send(CommandMessage::StopBackgroundWork { key, control_id });
     }
 
     fn respond(&self, request_id: String, option_id: String) {
@@ -3047,6 +3961,27 @@ impl DriverControl for AcpDriver {
     fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
         Err(anyhow!(
             "conversation rollback is not supported by this provider transport"
+        ))
+    }
+
+    fn fork(&self, turns_to_remove: usize) -> anyhow::Result<ProviderResumeCursor> {
+        let (tx, rx) = smol::channel::bounded(1);
+        self.commands
+            .try_send(CommandMessage::Fork {
+                turns_to_remove,
+                reply: tx,
+            })
+            .map_err(|_| anyhow!("ACP runtime is no longer running"))?;
+        smol::block_on(smol::future::or(
+            async {
+                rx.recv()
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("ACP runtime closed before fork completed")))
+            },
+            async {
+                smol::Timer::after(MODE_SWITCH_TIMEOUT).await;
+                Err(anyhow!("timed out waiting for ACP session/fork"))
+            },
         ))
     }
 }
@@ -3974,6 +4909,174 @@ mod tests {
         assert_eq!(completed.file_changes[0].additions, Some(2));
         assert_eq!(completed.file_changes[0].deletions, Some(1));
         assert!(completed.file_changes[0].diff.is_some());
+    }
+
+    #[test]
+    fn tool_activity_handles_acp_diff_content_and_locations() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+
+        tool_activity(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "acp-edit-diff",
+                "title": "apply_patch",
+                "status": "in_progress",
+                "locations": [{"path": "src/lib.rs", "line": 10}]
+            }),
+            &events,
+            &mut state,
+        );
+        tool_activity(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "acp-edit-diff",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "diff",
+                        "path": "src/lib.rs",
+                        "oldText": "fn old() {}\n",
+                        "newText": "fn new_one() {}\nfn new_two() {}\n"
+                    }
+                ]
+            }),
+            &events,
+            &mut state,
+        );
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        let DriverEvent::RichActivity(completed) = &seen[1] else {
+            panic!("expected completed RichActivity");
+        };
+        assert_eq!(completed.kind, ActivityKind::FileChange);
+        assert!(completed.complete);
+        assert_eq!(completed.file_changes.len(), 1);
+        assert_eq!(completed.file_changes[0].path, "src/lib.rs");
+        assert_eq!(completed.file_changes[0].additions, Some(2));
+        assert_eq!(completed.file_changes[0].deletions, Some(1));
+        // ToolCallContent::Diff should never leak raw JSON into output
+        assert_eq!(completed.output, None);
+    }
+
+    #[test]
+    fn tool_activity_handles_acp_diff_for_newly_added_file() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+
+        tool_activity(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "acp-new-diff",
+                "title": "create_file",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "diff",
+                        "path": "src/new.rs",
+                        "oldText": null,
+                        "newText": "line 1\nline 2\nline 3\n"
+                    }
+                ]
+            }),
+            &events,
+            &mut state,
+        );
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 1);
+        let DriverEvent::RichActivity(completed) = &seen[0] else {
+            panic!("expected completed RichActivity");
+        };
+        assert_eq!(completed.kind, ActivityKind::FileChange);
+        assert_eq!(completed.file_changes.len(), 1);
+        assert_eq!(completed.file_changes[0].path, "src/new.rs");
+        assert_eq!(
+            completed.file_changes[0].status,
+            Some(crate::model::ActivityFileChangeStatus::Added)
+        );
+        assert_eq!(completed.file_changes[0].additions, Some(3));
+        assert_eq!(completed.file_changes[0].deletions, Some(0));
+    }
+
+    #[test]
+    fn acp_fs_read_and_write_text_file_handlers() {
+        let temp_dir = std::env::temp_dir().join(format!("waku-acp-fs-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let write_req = WriteTextFileRequest::new("session-1", "nested/test.txt", "1\n2\n3\n4\n5");
+        let write_res = handle_write_text_file(write_req, &temp_dir);
+        assert!(write_res.is_ok());
+
+        let read_req = ReadTextFileRequest::new("session-1", "nested/test.txt")
+            .line(2)
+            .limit(3);
+        let read_res = handle_read_text_file(read_req, &temp_dir).unwrap();
+        assert_eq!(read_res.content, "2\n3\n4");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn acp_prompt_content_blocks_attaches_images_and_resources() {
+        let temp_dir = std::env::temp_dir().join(format!("waku-acp-prompt-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let image_file = temp_dir.join("test.png");
+        std::fs::write(&image_file, b"\x89PNG\r\n\x1a\nfakeimagebytes").unwrap();
+        let doc_file = temp_dir.join("notes.txt");
+        std::fs::write(&doc_file, "Project documentation").unwrap();
+
+        let prompt = "Please check @test.png and @notes.txt";
+        let capabilities = PromptCapabilities::new()
+            .image(true)
+            .embedded_context(true);
+        let blocks = build_prompt_content_blocks(prompt, &temp_dir, &capabilities);
+
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+        assert!(matches!(&blocks[1], ContentBlock::Image(_)));
+        assert!(matches!(&blocks[2], ContentBlock::Resource(_)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn available_commands_update_captures_input_argument_hint() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+        let update = serde_json::from_value(json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                {
+                    "name": "review",
+                    "description": "Code review",
+                    "input": {
+                        "hint": "[branch]"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        handle_session_update(
+            ProviderKind::Droid,
+            SessionNotification::new("s", update),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 1);
+        let DriverEvent::AvailableCommands(commands) = &seen[0] else {
+            panic!("expected AvailableCommands event");
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "review");
+        assert_eq!(commands[0].description, "Code review");
+        assert_eq!(commands[0].argument_hint.as_deref(), Some("[branch]"));
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:

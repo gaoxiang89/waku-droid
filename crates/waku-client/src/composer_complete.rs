@@ -66,12 +66,15 @@ pub fn merge_reported_commands(
             if known.description.is_empty() {
                 known.description = report.description.clone();
             }
+            if known.argument_hint.is_none() {
+                known.argument_hint = report.argument_hint.clone();
+            }
         } else {
             merged.push(SlashCommand {
                 name: report.name.clone(),
                 description: report.description.clone(),
                 scope: CommandScope::Builtin,
-                argument_hint: None,
+                argument_hint: report.argument_hint.clone(),
                 template: None,
             });
         }
@@ -388,6 +391,7 @@ mod tests {
         let reported = vec![ReportedCommand {
             name: "compact".into(),
             description: "Free up context".into(),
+            argument_hint: None,
         }];
 
         let merged = merge_reported_commands(&discovered, &reported);
