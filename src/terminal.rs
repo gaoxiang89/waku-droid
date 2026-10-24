@@ -2962,9 +2962,9 @@ enum PaneChord {
 ///
 /// Windows folds a shifted punctuation key into the character it produces and
 /// clears the shift flag before the event reaches us: shift+= arrives as `+`
-/// and shift+- as `_`, both without a shift modifier. Those shifted
-/// characters therefore count as the chord on their own, while the unshifted
-/// `=` and `-` stay with the shell.
+/// and shift+- as `_`, both without a shift modifier. Only that platform may
+/// treat the unshifted `+`/`_` as the chord; on other layouts they are plain
+/// shell input. Everywhere, the unshifted `=` and `-` stay with the shell.
 fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
     let modifiers = keystroke.modifiers;
     if modifiers.function {
@@ -2991,9 +2991,13 @@ fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
     }
 
     let shifted = modifiers.shift;
-    let split_right = matches!(key, "+" | "plus" | "add")
+    // Only Windows folds a shifted punctuation key into an unshifted "+"/"_"
+    // keystroke; on other layouts those keys are legitimate shell input
+    // (e.g. alt+plus is a plain meta key on layouts where + is unshifted).
+    let folded = cfg!(windows);
+    let split_right = folded && matches!(key, "+" | "plus" | "add")
         || (shifted && (matches!(key, "=" | "equal") || key_char == "+"));
-    let split_down = matches!(key, "_" | "underscore")
+    let split_down = folded && matches!(key, "_" | "underscore")
         || (shifted && (matches!(key, "-" | "minus" | "subtract") || key_char == "_"));
     if split_right {
         return Some(PaneChord::SplitRight);
@@ -4340,14 +4344,17 @@ mod tests {
             ..Default::default()
         };
         // gpui_windows reports shift+= as "+" and shift+- as "_" with the
-        // shift flag cleared; those must still split.
+        // shift flag cleared; those must still split there. Other platforms
+        // keep the shift flag, so an unshifted "+"/"_" is real shell input.
+        let folded_right = cfg!(windows).then_some(PaneChord::SplitRight);
+        let folded_down = cfg!(windows).then_some(PaneChord::SplitDown);
         assert_eq!(
             bottom_panel_pane_chord(&key("+", Some("+"), alt)),
-            Some(PaneChord::SplitRight)
+            folded_right
         );
         assert_eq!(
             bottom_panel_pane_chord(&key("_", Some("_"), alt)),
-            Some(PaneChord::SplitDown)
+            folded_down
         );
         // The unshifted keys stay with the shell.
         assert_eq!(bottom_panel_pane_chord(&key("=", Some("="), alt)), None);

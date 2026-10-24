@@ -208,6 +208,11 @@ impl Waku {
                         "bottom-panel-pane-{:?}",
                         terminal.entity_id()
                     )))
+                    // The split/close/resize chords are bound to this context
+                    // (see `bind_keys`); the right panel's terminals only
+                    // carry `Terminal`, so these chords stay available there
+                    // for the shell.
+                    .key_context("BottomPanelTerminal")
                     .relative()
                     .overflow_hidden()
                     .flex_grow(flex)
@@ -600,7 +605,9 @@ impl Waku {
                                 )
                                 .tooltip(Tooltip::with_shortcut(
                                     tr!("bottom_panel.split_down"),
-                                    crate::platform::primary_shortcut("⇧⌘E", "Shift+Alt+-"),
+                                    // alt-shift-- on both platforms;
+                                    // secondary-shift-e is the Files toggle.
+                                    crate::platform::primary_shortcut("⇧⌥-", "Shift+Alt+-"),
                                 ))
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();

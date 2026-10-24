@@ -265,21 +265,19 @@ pub fn run() {
                 // Split the focused terminal pane; the down chord stacks,
                 // the plain chord goes side by side. The close chord shuts
                 // the focused pane, and the tab with it when it was the
-                // last pane.
-                KeyBinding::new("secondary-shift-d", SplitTerminalRight, Some("Terminal")),
-                KeyBinding::new("secondary-alt-shift-d", SplitTerminalDown, Some("Terminal")),
-                KeyBinding::new("secondary-shift-w", CloseTerminalPane, Some("Terminal")),
-                KeyBinding::new("ctrl-shift-w", CloseTerminalPane, Some("Terminal")),
-                KeyBinding::new("alt-shift-=", SplitTerminalRight, Some("Terminal")),
-                // Windows folds the shift into the produced character and
-                // clears the modifier, so shift+= arrives as "+".
-                KeyBinding::new("alt-+", SplitTerminalRight, Some("Terminal")),
-                KeyBinding::new("alt-shift--", SplitTerminalDown, Some("Terminal")),
-                KeyBinding::new("alt-_", SplitTerminalDown, Some("Terminal")),
-                KeyBinding::new("alt-shift-left", ResizeTerminalPaneLeft, Some("Terminal")),
-                KeyBinding::new("alt-shift-right", ResizeTerminalPaneRight, Some("Terminal")),
-                KeyBinding::new("alt-shift-up", ResizeTerminalPaneUp, Some("Terminal")),
-                KeyBinding::new("alt-shift-down", ResizeTerminalPaneDown, Some("Terminal")),
+                // last pane. These chords live on the bottom panel's own
+                // key context so terminals elsewhere (the right panel)
+                // never see them — there they must reach the shell.
+                KeyBinding::new("secondary-shift-d", SplitTerminalRight, Some("BottomPanelTerminal")),
+                KeyBinding::new("secondary-alt-shift-d", SplitTerminalDown, Some("BottomPanelTerminal")),
+                KeyBinding::new("secondary-shift-w", CloseTerminalPane, Some("BottomPanelTerminal")),
+                KeyBinding::new("ctrl-shift-w", CloseTerminalPane, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift-=", SplitTerminalRight, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift--", SplitTerminalDown, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift-left", ResizeTerminalPaneLeft, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift-right", ResizeTerminalPaneRight, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift-up", ResizeTerminalPaneUp, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-shift-down", ResizeTerminalPaneDown, Some("BottomPanelTerminal")),
                 KeyBinding::new("secondary-k", ToggleCommandPalette, None),
                 KeyBinding::new("secondary-alt-shift-f", ToggleFpsCounter, None),
                 KeyBinding::new("secondary-[", NavigateBack, Some("Waku")),
@@ -350,6 +348,14 @@ pub fn run() {
                 KeyBinding::new("secondary-v", WebviewPaste, Some("Browser")),
                 KeyBinding::new("secondary-a", WebviewSelectAll, Some("Browser")),
                 KeyBinding::new("escape", BrowserAddressCancel, Some("BrowserAddress")),
+            ]);
+            // Windows folds the shift into the produced character and clears
+            // the modifier, so shift+= arrives as "+"; elsewhere the shift
+            // stays on the keystroke and alt-shift-= covers the chord.
+            #[cfg(windows)]
+            cx.bind_keys([
+                KeyBinding::new("alt-+", SplitTerminalRight, Some("BottomPanelTerminal")),
+                KeyBinding::new("alt-_", SplitTerminalDown, Some("BottomPanelTerminal")),
             ]);
             // Must run after every binding above: it hands the terminal any
             // app shortcut the shell would otherwise receive, except these.
