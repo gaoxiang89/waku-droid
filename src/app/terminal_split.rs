@@ -436,7 +436,21 @@ impl SplitGroup {
     /// Remove `pane`. Returns false when the group emptied, in which case the
     /// caller drops the whole tab; the tree itself is emptied too so queries
     /// cannot see the removed pane.
+    ///
+    /// The tracked pane survives the removal of a different pane; when the
+    /// tracked pane itself is removed, the pane that inherited its slot — the
+    /// neighbor at the removed position, or the last one when it was
+    /// rightmost — becomes the tracked pane.
     pub(crate) fn remove_pane(&mut self, pane: EntityId) -> bool {
+        let removed_index = self
+            .root
+            .panes()
+            .iter()
+            .position(|terminal| terminal.entity_id() == pane);
+        let rehome_active = self.active_pane == Some(pane)
+            || self
+                .active_pane
+                .is_some_and(|active| !self.root.contains(active));
         if !self.root.remove_pane(pane) {
             return true;
         }
@@ -451,8 +465,15 @@ impl SplitGroup {
             });
             return false;
         }
-        if let Some(first) = self.root.first_pane() {
-            self.set_active(first.entity_id());
+        if rehome_active {
+            let panes = self.root.panes();
+            let last = panes.len().saturating_sub(1);
+            let next = removed_index
+                .map(|index| index.min(last))
+                .and_then(|index| panes.get(index));
+            if let Some(next) = next {
+                self.set_active(next.entity_id());
+            }
         }
         true
     }
@@ -591,6 +612,38 @@ mod tests {
         let (terminals, mut group) = group_with(cx, 1);
         assert!(!group.remove_pane(terminals[0].entity_id()));
         assert_eq!(group.pane_count(), 0);
+    }
+
+    #[gpui::test]
+    fn closing_a_pane_tracks_the_neighbor_that_inherited_its_slot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (terminals, mut group) = group_with(cx, 3);
+
+        // Closing the rightmost pane tracks its left neighbor, not the first.
+        group.set_active(terminals[2].entity_id());
+        assert!(group.remove_pane(terminals[2].entity_id()));
+        assert_eq!(
+            group.active_or_first().unwrap().entity_id(),
+            terminals[1].entity_id()
+        );
+
+        // Closing a middle pane tracks the pane that slid into its slot.
+        assert!(group.remove_pane(terminals[1].entity_id()));
+        assert_eq!(
+            group.active_or_first().unwrap().entity_id(),
+            terminals[0].entity_id()
+        );
+
+        // Closing a pane that is not tracked leaves the tracked pane alone.
+        let second = cx.update(|cx| TerminalView::inert_test_view_entity(cx));
+        assert!(group.split_pane(terminals[0].entity_id(), second, Axis::Horizontal));
+        group.set_active(terminals[0].entity_id());
+        assert!(group.remove_pane(terminals[1].entity_id()));
+        assert_eq!(
+            group.active_or_first().unwrap().entity_id(),
+            terminals[0].entity_id()
+        );
     }
 
     #[gpui::test]
