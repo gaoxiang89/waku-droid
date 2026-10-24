@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,13 +23,14 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gpui::{
-    App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, ElementInputHandler,
+    Action, App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, ElementInputHandler,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontFallbacks, FontStyle, FontWeight,
-    Hsla, ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task, TextRun,
-    UTF16Selection, UnderlineStyle, Window, canvas, div, font, prelude::FluentBuilder, px, rgb,
+    Hsla, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyContext, KeyDownEvent,
+    Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText, Subscription, Task,
+    TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font, is_no_action,
+    prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -2568,6 +2570,65 @@ fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
     None
 }
 
+/// Key bindings outrank key-down listeners, so an app shortcut on a key the
+/// shell also uses (Escape for vim, Ctrl-L, Ctrl-W, Ctrl-[ ...) would never
+/// reach the terminal. Unbind every such shortcut inside the `Terminal`
+/// context, except the actions in `keep`, so the terminal's own key handler
+/// sees them. Call it once, after all other bindings are registered.
+pub fn shield_shell_keystrokes(cx: &mut App, keep: &[&dyn Action]) {
+    let shields = shell_keystroke_shields(cx.key_bindings().borrow().bindings(), keep);
+    cx.bind_keys(shields);
+}
+
+fn shell_keystroke_shields<'a>(
+    bindings: impl IntoIterator<Item = &'a KeyBinding>,
+    keep: &[&dyn Action],
+) -> Vec<KeyBinding> {
+    // Bindings scoped to the terminal itself (or deeper) were written for it;
+    // only the ones that already apply above it can shadow the shell.
+    let ancestors = [KeyContext::parse("Waku").expect("valid key context")];
+    let mut seen = HashSet::new();
+    bindings
+        .into_iter()
+        .filter_map(|binding| {
+            let [keystroke] = binding.keystrokes() else {
+                return None;
+            };
+            let keystroke = keystroke.inner();
+            let shadows_shell = binding
+                .predicate()
+                .is_none_or(|predicate| predicate.eval(&ancestors))
+                && !is_no_action(binding.action())
+                && !keep
+                    .iter()
+                    .any(|action| action.partial_eq(binding.action()))
+                && terminal_claims_keystroke(keystroke);
+            let source = keystroke.unparse();
+            (shadows_shell && seen.insert(source.clone()))
+                .then(|| KeyBinding::new(&source, NoAction, Some("Terminal")))
+        })
+        .collect()
+}
+
+/// Whether the focused terminal would act on `keystroke` itself: its
+/// clipboard chords, or any key it encodes for the shell.
+fn terminal_claims_keystroke(keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    if terminal_clipboard_modifier_pressed(&modifiers)
+        && ["a", "c", "v"]
+            .iter()
+            .any(|key| keystroke.key.eq_ignore_ascii_case(key))
+    {
+        return true;
+    }
+    // Ctrl+Shift+key reaches the shell as plain Ctrl+key, so off macOS those
+    // chords stay app shortcuts, as in Windows Terminal and VS Code.
+    if !cfg!(target_os = "macos") && modifiers.control && modifiers.shift {
+        return false;
+    }
+    terminal_key_bytes(keystroke, TermMode::empty()).is_some()
+}
+
 fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let modifiers = keystroke.modifiers;
     let key = keystroke.key.as_str();
@@ -2590,18 +2651,36 @@ fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> 
         + u8::from(modifiers.alt) * 2
         + u8::from(modifiers.control) * 4;
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    // Alone, each of Shift, Alt, and Ctrl gives Enter and Backspace the
+    // distinct byte xterm and Alacritty send, so readline and TUIs can tell
+    // them apart (Shift-Enter newline, Alt/Ctrl-Backspace word delete).
+    let only = (modifiers.shift, modifiers.alt, modifiers.control);
     let special = match key {
-        "enter" | "return" => Some("\r".to_owned()),
+        "enter" | "return" => Some(
+            match only {
+                (true, false, false) => "\n",
+                (false, true, false) => "\x1b\r",
+                _ => "\r",
+            }
+            .to_owned(),
+        ),
         "tab" if modifiers.shift => Some("\x1b[Z".to_owned()),
         "tab" => Some("\t".to_owned()),
-        "backspace" => Some("\x7f".to_owned()),
+        "backspace" => Some(
+            match only {
+                (false, true, false) => "\x1b\x7f",
+                (false, false, true) => "\x08",
+                _ => "\x7f",
+            }
+            .to_owned(),
+        ),
         "escape" => Some("\x1b".to_owned()),
         "up" => Some(cursor_sequence('A', modifier, app_cursor)),
         "down" => Some(cursor_sequence('B', modifier, app_cursor)),
         "right" => Some(cursor_sequence('C', modifier, app_cursor)),
         "left" => Some(cursor_sequence('D', modifier, app_cursor)),
-        "home" => Some(csi_sequence('H', modifier)),
-        "end" => Some(csi_sequence('F', modifier)),
+        "home" => Some(cursor_sequence('H', modifier, app_cursor)),
+        "end" => Some(cursor_sequence('F', modifier, app_cursor)),
         "insert" => Some(tilde_sequence(2, modifier)),
         "delete" | "forwarddelete" => Some(tilde_sequence(3, modifier)),
         "pageup" => Some(tilde_sequence(5, modifier)),
@@ -2618,15 +2697,26 @@ fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> 
         "f10" => Some(tilde_sequence(21, modifier)),
         "f11" => Some(tilde_sequence(23, modifier)),
         "f12" => Some(tilde_sequence(24, modifier)),
+        "f13" => Some(tilde_sequence(25, modifier)),
+        "f14" => Some(tilde_sequence(26, modifier)),
+        "f15" => Some(tilde_sequence(28, modifier)),
+        "f16" => Some(tilde_sequence(29, modifier)),
+        "f17" => Some(tilde_sequence(31, modifier)),
+        "f18" => Some(tilde_sequence(32, modifier)),
+        "f19" => Some(tilde_sequence(33, modifier)),
+        "f20" => Some(tilde_sequence(34, modifier)),
         _ => None,
     };
     if let Some(special) = special {
         return Some(special.into_bytes());
     }
 
+    // Parsed keystrokes (key bindings) carry no key_char; spell out space so
+    // Ctrl-Space still encodes as NUL.
     let text = keystroke
         .key_char
         .as_deref()
+        .or_else(|| (key == "space").then_some(" "))
         .or_else(|| (key.chars().count() == 1).then_some(key))?;
     let mut bytes = if modifiers.control {
         control_bytes(text)?
@@ -2658,14 +2748,6 @@ fn control_bytes(text: &str) -> Option<Vec<u8>> {
 fn cursor_sequence(final_byte: char, modifier: u8, app_cursor: bool) -> String {
     if modifier == 1 {
         format!("\x1b{}{}", if app_cursor { 'O' } else { '[' }, final_byte)
-    } else {
-        format!("\x1b[1;{modifier}{final_byte}")
-    }
-}
-
-fn csi_sequence(final_byte: char, modifier: u8) -> String {
-    if modifier == 1 {
-        format!("\x1b[{final_byte}")
     } else {
         format!("\x1b[1;{modifier}{final_byte}")
     }
@@ -2812,7 +2894,7 @@ mod tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
-    use gpui::{ExternalPaths, Image, Modifiers, point, size};
+    use gpui::{ExternalPaths, Image, Modifiers, actions, point, size};
 
     /// TUIs pick their palette from the reported background, so the reply has
     /// to match the surface or dark text lands on the dark terminal.
@@ -3197,6 +3279,87 @@ mod tests {
             ),
             Some(b"\x1b[1;5D".to_vec())
         );
+    }
+
+    #[test]
+    fn encodes_modified_enter_backspace_and_app_cursor_home() {
+        let bytes = |name: &str, modifiers: Modifiers, mode: TermMode| {
+            terminal_key_bytes(&key(name, None, modifiers), mode)
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let control = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let plain = Modifiers::default();
+        let none = TermMode::empty();
+
+        assert_eq!(bytes("enter", plain, none), Some(b"\r".to_vec()));
+        assert_eq!(bytes("enter", shift, none), Some(b"\n".to_vec()));
+        assert_eq!(bytes("enter", alt, none), Some(b"\x1b\r".to_vec()));
+        assert_eq!(bytes("backspace", plain, none), Some(b"\x7f".to_vec()));
+        assert_eq!(bytes("backspace", alt, none), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(bytes("backspace", control, none), Some(b"\x08".to_vec()));
+        assert_eq!(bytes("home", plain, none), Some(b"\x1b[H".to_vec()));
+        assert_eq!(
+            bytes("end", plain, TermMode::APP_CURSOR),
+            Some(b"\x1bOF".to_vec())
+        );
+        assert_eq!(
+            bytes("home", shift, TermMode::APP_CURSOR),
+            Some(b"\x1b[1;2H".to_vec())
+        );
+        assert_eq!(bytes("f13", plain, none), Some(b"\x1b[25~".to_vec()));
+        assert_eq!(bytes("space", control, none), Some(vec![0]));
+    }
+
+    /// App shortcuts must not swallow keys the shell needs (Escape for vim,
+    /// Ctrl-L, Ctrl-[), while deliberate app chords keep working in the pane.
+    #[test]
+    fn terminal_shields_shell_keys_from_app_shortcuts() {
+        actions!(terminal_shield_test, [AppWide, Kept, TerminalOnly]);
+        let bindings = [
+            KeyBinding::new("escape", AppWide, Some("Waku")),
+            KeyBinding::new("secondary-c", AppWide, Some("Waku")),
+            KeyBinding::new("ctrl-l", AppWide, None),
+            KeyBinding::new("ctrl-[", AppWide, Some("Waku")),
+            KeyBinding::new("ctrl-escape", AppWide, Some("Waku")),
+            KeyBinding::new("ctrl-j", Kept, None),
+            KeyBinding::new("ctrl-shift-e", AppWide, None),
+            KeyBinding::new("secondary-,", AppWide, None),
+            KeyBinding::new("alt-shift-left", TerminalOnly, Some("Terminal")),
+            KeyBinding::new("escape", AppWide, Some("Browser")),
+            KeyBinding::new("escape", AppWide, Some("Waku > TextInput")),
+        ];
+        let shielded = shell_keystroke_shields(&bindings, &[&Kept])
+            .iter()
+            .map(|binding| {
+                assert!(is_no_action(binding.action()));
+                binding.keystrokes()[0].inner().unparse()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = vec!["escape", "ctrl-l", "ctrl-[", "ctrl-escape"];
+        // Cmd-C is the terminal's own copy on macOS; elsewhere Ctrl-C is SIGINT.
+        expected.insert(
+            1,
+            if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-c"
+            },
+        );
+        if cfg!(target_os = "macos") {
+            // Ctrl-Shift-E is plain Ctrl-E to the shell, which owns it on macOS.
+            expected.push("ctrl-shift-e");
+        }
+        assert_eq!(shielded, expected);
     }
 
     #[cfg(target_os = "linux")]

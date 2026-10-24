@@ -351,6 +351,19 @@ pub fn run() {
                 KeyBinding::new("secondary-a", WebviewSelectAll, Some("Browser")),
                 KeyBinding::new("escape", BrowserAddressCancel, Some("BrowserAddress")),
             ]);
+            // Must run after every binding above: it hands the terminal any
+            // app shortcut the shell would otherwise receive, except these.
+            // The VS Code-style panel toggle and the task switcher (whose
+            // Ctrl-Tab carries nothing a shell uses) stay app-wide.
+            crate::terminal::shield_shell_keystrokes(
+                cx,
+                &[
+                    &ToggleBottomPanel,
+                    &SwitchTaskForward,
+                    &SwitchTaskBackward,
+                    &CancelTaskSwitch,
+                ],
+            );
 
             cx.on_action(|_: &Quit, cx| cx.quit());
 
