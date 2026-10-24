@@ -2378,6 +2378,18 @@ impl Waku {
             self.right_panel_workspace_states.remove(&scope)
         };
         let Some(mut state) = state else {
+            // Nothing parked under the scope: its state is live on screen
+            // for another session of the same workspace, so the map held
+            // nothing to take. The deleted session's share of the live
+            // state — a review pinned to one of its turns, background work
+            // it reported — would otherwise survive there as an orphan tab.
+            let live_scope = self
+                .state
+                .selected_session
+                .and_then(|id| self.panel_scope_for_session(id));
+            if workspace_still_open && live_scope.as_ref() == Some(&scope) {
+                self.close_live_session_surfaces(session_id, &work_keys);
+            }
             return;
         };
         if workspace_still_open {
@@ -2393,6 +2405,28 @@ impl Waku {
                 }
             }
         }
+    }
+
+    /// `close_session_surfaces` on the state that is live on screen. Only the
+    /// tab strip moves through it: a full take/replace would also abandon an
+    /// open rename, drop an in-flight diff load and reset the diff view of a
+    /// session the user is still looking at.
+    fn close_live_session_surfaces(
+        &mut self,
+        session_id: Uuid,
+        work_keys: &HashSet<BackgroundWorkKey>,
+    ) {
+        let mut tabs = RightPanelWorkspaceState::empty(self.right_panel_visible);
+        tabs.surfaces = std::mem::take(&mut self.right_panel_surfaces);
+        tabs.active_surface = self.right_panel_active_surface;
+        tabs.pending_tab_reveal = self.right_panel_pending_tab_reveal;
+        tabs.diff_source = self.right_panel_diff_source;
+        tabs.close_session_surfaces(session_id, work_keys);
+        self.right_panel_surfaces = tabs.surfaces;
+        self.right_panel_active_surface = tabs.active_surface;
+        self.right_panel_pending_tab_reveal = tabs.pending_tab_reveal;
+        self.right_panel_visible = tabs.visible;
+        self.state.right_panel_visible = self.right_panel_visible;
     }
 
     fn take_active_right_panel_state(&mut self) -> RightPanelWorkspaceState {
