@@ -360,6 +360,11 @@ impl Waku {
             };
             let terminal = reference.read(cx);
             let exited = terminal.exited();
+            let needs_attention = !exited
+                && group
+                    .panes()
+                    .iter()
+                    .any(|pane| pane.read(cx).needs_attention());
             let pane_count = group.pane_count();
             let mut label = bottom_panel_tab_label(terminal.title(), terminal.working_directory());
             if pane_count > 1 {
@@ -395,10 +400,29 @@ impl Waku {
                             .size(px(6.0))
                             .flex_none()
                             .rounded_full()
-                            .bg(if exited { theme.danger } else { theme.accent })
+                            .bg(if exited {
+                                theme.danger
+                            } else if needs_attention {
+                                theme.warning
+                            } else {
+                                theme.accent
+                            })
+                            // Attention also rings the dot so it reads
+                            // without telling the colors apart.
+                            .when(needs_attention, |element| {
+                                element
+                                    .border_2()
+                                    .border_color(theme.warning.opacity(0.35))
+                                    .size(px(10.0))
+                            })
                             .when(exited, |element| {
                                 element.tooltip(|window, cx| {
                                     Tooltip::new(tr!("terminal.process_exited")).build(window, cx)
+                                })
+                            })
+                            .when(needs_attention, |element| {
+                                element.tooltip(|window, cx| {
+                                    Tooltip::new(tr!("terminal.needs_attention")).build(window, cx)
                                 })
                             }),
                     )
@@ -655,6 +679,24 @@ impl Waku {
             terminal,
             |this, _, notice: &crate::terminal::TerminalNotice, cx| {
                 this.show_toast(notice.0.clone());
+                cx.notify();
+            },
+        )
+        .detach();
+        // An agent finishing or waiting in a terminal the user is not
+        // watching: the tab shows it, and a background window also gets a
+        // system notification, as task turns do.
+        cx.subscribe(
+            terminal,
+            |_, terminal, attention: &crate::terminal::TerminalAttention, cx| {
+                if cx.active_window().is_none() {
+                    crate::platform::show_task_notification(
+                        &format!("waku-terminal-{}", terminal.entity_id()),
+                        &attention.title,
+                        &attention.body,
+                        cx,
+                    );
+                }
                 cx.notify();
             },
         )

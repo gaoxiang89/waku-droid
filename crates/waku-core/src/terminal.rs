@@ -88,6 +88,13 @@ mod platform {
             }
             options.env.insert("TERM".into(), "xterm-256color".into());
             options.env.insert("COLORTERM".into(), "truecolor".into());
+            // Same identity as a local terminal: the app's own emulator
+            // renders this PTY, so programs may rely on its features.
+            options.env.insert("TERM_PROGRAM".into(), "waku".into());
+            options.env.insert(
+                "TERM_PROGRAM_VERSION".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            );
 
             let size = window_size(cols, rows);
             let pty = tty::new(&options, size, 0)

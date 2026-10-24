@@ -62,7 +62,9 @@ const TERMINAL_PADDING_Y: f32 = 8.0;
 const TERMINAL_TOOLBAR_HEIGHT: f32 = 34.0;
 const TERMINAL_MIN_COLUMNS: usize = 20;
 const TERMINAL_MIN_ROWS: usize = 8;
-const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
+/// Coding agents print long transcripts into the main screen, so keep more
+/// than Alacritty's 10k default. Rows are allocated only as history fills.
+const TERMINAL_SCROLLBACK_LINES: usize = 30_000;
 const TERMINAL_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const TERMINAL_CURSOR_BLINK_PAUSE: Duration = Duration::from_millis(300);
 
@@ -93,7 +95,168 @@ enum TerminalUiEvent {
     ResetTitle,
     ClipboardStore(String),
     ClipboardLoad(Arc<dyn Fn(&str) -> String + Send + Sync>),
+    /// BEL, or an OSC 9 / OSC 777 desktop notification (`None` for BEL).
+    Alert(Option<TerminalAlert>),
     Exited,
+}
+
+/// A desktop notification a program asked for, as coding agents do when a
+/// turn finishes or an approval is waiting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalAlert {
+    title: Option<String>,
+    body: String,
+}
+
+/// Finds OSC 9 (iTerm2) and OSC 777 (rxvt `notify`) notifications in PTY
+/// output. Alacritty's parser drops both, so the bytes are scanned before
+/// they reach it; state carries across reads so a split sequence still
+/// matches.
+#[derive(Default)]
+struct OscAlertScanner {
+    state: OscScanState,
+    payload: Vec<u8>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+    /// An OSC longer than any notification; skip to its terminator.
+    Overflow,
+}
+
+impl OscAlertScanner {
+    const MAX_PAYLOAD: usize = 4096;
+
+    fn feed(&mut self, bytes: &[u8], mut alert: impl FnMut(TerminalAlert)) {
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (OscScanState::Ground, 0x1b) => OscScanState::Escape,
+                (OscScanState::Ground, _) => OscScanState::Ground,
+                (OscScanState::Escape, b']') => {
+                    self.payload.clear();
+                    OscScanState::Osc
+                }
+                (OscScanState::Escape, 0x1b) => OscScanState::Escape,
+                (OscScanState::Escape, _) => OscScanState::Ground,
+                (OscScanState::Osc | OscScanState::OscEscape, 0x07)
+                | (OscScanState::OscEscape, b'\\') => {
+                    if let Some(found) = osc_alert(&self.payload) {
+                        alert(found);
+                    }
+                    OscScanState::Ground
+                }
+                (OscScanState::Osc | OscScanState::OscEscape, 0x1b) => OscScanState::OscEscape,
+                // Any other byte after ESC inside an OSC aborts it, as in VT parsers.
+                (OscScanState::OscEscape, _) => OscScanState::Ground,
+                (OscScanState::Osc, _) if self.payload.len() >= Self::MAX_PAYLOAD => {
+                    OscScanState::Overflow
+                }
+                (OscScanState::Osc, _) => {
+                    self.payload.push(byte);
+                    OscScanState::Osc
+                }
+                (OscScanState::Overflow, 0x07) => OscScanState::Ground,
+                (OscScanState::Overflow, 0x1b) => OscScanState::Escape,
+                (OscScanState::Overflow, _) => OscScanState::Overflow,
+            };
+        }
+    }
+}
+
+fn osc_alert(payload: &[u8]) -> Option<TerminalAlert> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    if let Some(body) = payload.strip_prefix("9;") {
+        // ConEmu reuses OSC 9 with a numeric subcommand (9;4 progress, 9;9
+        // working directory); only free text is an iTerm2 notification.
+        let first = body.split(';').next().unwrap_or_default();
+        if body.is_empty() || first.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        return Some(TerminalAlert {
+            title: None,
+            body: body.to_owned(),
+        });
+    }
+    let rest = payload.strip_prefix("777;notify;")?;
+    let (title, body) = rest.split_once(';').unwrap_or((rest, ""));
+    Some(TerminalAlert {
+        title: (!title.is_empty()).then(|| title.to_owned()),
+        body: body.to_owned(),
+    })
+}
+
+/// The local PTY with its output passed through an [`OscAlertScanner`] on the
+/// way to Alacritty's event loop.
+struct AlertScanningPty {
+    pty: tty::Pty,
+    scanner: OscAlertScanner,
+    ui_events: Sender<TerminalUiEvent>,
+}
+
+impl std::io::Read for AlertScanningPty {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use alacritty_terminal::tty::EventedReadWrite as _;
+        let read = self.pty.reader().read(buf)?;
+        let ui_events = &self.ui_events;
+        self.scanner.feed(&buf[..read], |alert| {
+            let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
+        });
+        Ok(read)
+    }
+}
+
+impl alacritty_terminal::tty::EventedReadWrite for AlertScanningPty {
+    type Reader = Self;
+    type Writer = <tty::Pty as alacritty_terminal::tty::EventedReadWrite>::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> std::io::Result<()> {
+        // SAFETY: the wrapped PTY lives exactly as long as this wrapper,
+        // which the event loop keeps registered for its whole lifetime.
+        unsafe { self.pty.register(poll, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> std::io::Result<()> {
+        self.pty.reregister(poll, interest, mode)
+    }
+
+    fn deregister(&mut self, poll: &Arc<polling::Poller>) -> std::io::Result<()> {
+        self.pty.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.pty.writer()
+    }
+}
+
+impl alacritty_terminal::tty::EventedPty for AlertScanningPty {
+    fn next_child_event(&mut self) -> Option<alacritty_terminal::tty::ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl alacritty_terminal::event::OnResize for AlertScanningPty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.pty.on_resize(window_size);
+    }
 }
 
 /// Where keystrokes, resizes, and terminal replies go: a local PTY's event
@@ -253,6 +416,7 @@ impl RemoteTerminal {
         use base64::Engine as _;
         let mut parser: alacritty_terminal::vte::ansi::Processor =
             alacritty_terminal::vte::ansi::Processor::new();
+        let mut alerts = OscAlertScanner::default();
         let exited = |ui_events: &Sender<TerminalUiEvent>| {
             let _ = ui_events.send(TerminalUiEvent::Exited);
             dirty.store(true, Ordering::Release);
@@ -272,6 +436,9 @@ impl RemoteTerminal {
                         else {
                             continue;
                         };
+                        alerts.feed(&bytes, |alert| {
+                            let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
+                        });
                         parser.advance(&mut *term.lock(), &bytes);
                         dirty.store(true, Ordering::Release);
                     }
@@ -441,7 +608,9 @@ impl EventListener for TerminalEventProxy {
             Event::TextAreaSizeRequest(formatter) => {
                 self.write_pty(formatter(*self.window_size.lock()).into_bytes());
             }
-            Event::Bell => {}
+            Event::Bell => {
+                let _ = self.ui_events.send(TerminalUiEvent::Alert(None));
+            }
             Event::Exit | Event::ChildExit(_) => {
                 let _ = self.ui_events.send(TerminalUiEvent::Exited);
                 self.dirty.store(true, Ordering::Release);
@@ -512,6 +681,9 @@ impl TerminalSession {
 
         let config = Config {
             scrolling_history: TERMINAL_SCROLLBACK_LINES,
+            // Agent TUIs (Codex, Claude Code) push the kitty keyboard
+            // protocol to tell Shift-Enter from Enter; see `kitty_key_bytes`.
+            kitty_keyboard: true,
             ..Default::default()
         };
         let dimensions = TerminalDimensions { columns, rows };
@@ -556,14 +728,23 @@ impl TerminalSession {
         };
         options.env.insert("TERM".into(), "xterm-256color".into());
         options.env.insert("COLORTERM".into(), "truecolor".into());
+        options.env.insert("TERM_PROGRAM".into(), "waku".into());
+        options.env.insert(
+            "TERM_PROGRAM_VERSION".into(),
+            env!("CARGO_PKG_VERSION").into(),
+        );
         if let Some(path) = crate::command_env::executable_search_path() {
             options
                 .env
                 .insert("PATH".into(), path.to_string_lossy().into_owned());
         }
 
-        let pty = tty::new(&options, window_size, 0)
-            .with_context(|| format!("spawn terminal in {}", working_directory.display()))?;
+        let pty = AlertScanningPty {
+            pty: tty::new(&options, window_size, 0)
+                .with_context(|| format!("spawn terminal in {}", working_directory.display()))?,
+            scanner: OscAlertScanner::default(),
+            ui_events: ui_event_tx,
+        };
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
             .context("create Alacritty PTY event loop")?;
         let sender = PtyInput::Local(event_loop.channel());
@@ -1150,6 +1331,15 @@ pub struct TerminalNotice(pub String);
 
 impl EventEmitter<TerminalNotice> for TerminalView {}
 
+/// A program in an unfocused terminal rang the bell or posted a desktop
+/// notification; the app relays it as a system notification.
+pub struct TerminalAttention {
+    pub title: String,
+    pub body: String,
+}
+
+impl EventEmitter<TerminalAttention> for TerminalView {}
+
 pub struct TerminalView {
     session: Option<TerminalSession>,
     launcher: TerminalLauncher,
@@ -1176,6 +1366,11 @@ pub struct TerminalView {
     hovered_link: Option<TerminalLink>,
     cursor_blink: gpui::Entity<TerminalCursorBlink>,
     cursor_focus_tracking_started: bool,
+    /// Window active and this terminal focused, as last reported to the
+    /// program through focus events (`CSI I` / `CSI O`).
+    focused: bool,
+    /// A bell or notification arrived while unfocused; cleared on focus.
+    needs_attention: bool,
     context_menu: ContextMenuHandle,
     /// The bottom panel hosts this terminal behind its own tab strip: the
     /// built-in toolbar is dropped (the tab carries status and title) and
@@ -1252,6 +1447,8 @@ impl TerminalView {
             hovered_link: None,
             cursor_blink,
             cursor_focus_tracking_started: false,
+            focused: false,
+            needs_attention: false,
             context_menu,
             bottom_panel_tabs: false,
             _subscriptions: subscriptions,
@@ -1282,6 +1479,8 @@ impl TerminalView {
             hovered_link: None,
             cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
             cursor_focus_tracking_started: false,
+            focused: false,
+            needs_attention: false,
             context_menu: ContextMenuHandle::new(cx),
             bottom_panel_tabs: true,
             _subscriptions: Vec::new(),
@@ -1306,6 +1505,12 @@ impl TerminalView {
 
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// Whether a bell or notification arrived since the terminal last had
+    /// focus.
+    pub fn needs_attention(&self) -> bool {
+        self.needs_attention
     }
 
     pub fn set_panel_width(&mut self, width: f32) {
@@ -1342,6 +1547,22 @@ impl TerminalView {
                         .and_then(|item| item.text())
                         .unwrap_or_default();
                     session.write(formatter(&text).into_bytes());
+                }
+                TerminalUiEvent::Alert(alert) => {
+                    // Programs ring and notify for whoever is not watching;
+                    // repeated bells while already flagged stay quiet.
+                    if self.focused || (alert.is_none() && self.needs_attention) {
+                        continue;
+                    }
+                    self.needs_attention = true;
+                    let alert = alert.unwrap_or_else(|| TerminalAlert {
+                        title: None,
+                        body: tr!("terminal.needs_attention"),
+                    });
+                    cx.emit(TerminalAttention {
+                        title: alert.title.unwrap_or_else(|| self.title.clone()),
+                        body: alert.body,
+                    });
                 }
                 TerminalUiEvent::Exited => self.exited = true,
             }
@@ -1421,7 +1642,10 @@ impl TerminalView {
             return;
         }
 
-        if let Some(bytes) = terminal_key_bytes(keystroke, session.mode()) {
+        let mode = session.mode();
+        if let Some(bytes) = kitty_key_bytes(keystroke, event.is_held, mode)
+            .or_else(|| terminal_key_bytes(keystroke, mode))
+        {
             session.term.lock().selection = None;
             session.write(bytes);
             session.dirty.store(true, Ordering::Release);
@@ -1755,6 +1979,22 @@ impl TerminalView {
 
     fn update_cursor_blinking(&mut self, window: &Window, cx: &mut Context<Self>) {
         let focused = window.is_window_active() && self.focus_handle.is_focused(window);
+        if focused != self.focused {
+            self.focused = focused;
+            if focused && self.needs_attention {
+                self.needs_attention = false;
+                cx.notify();
+            }
+            if let Some(session) = &self.session
+                && session.mode().contains(TermMode::FOCUS_IN_OUT)
+            {
+                session.write(if focused {
+                    &b"\x1b[I"[..]
+                } else {
+                    &b"\x1b[O"[..]
+                });
+            }
+        }
         self.cursor_blink.update(cx, |cursor, cx| {
             if focused {
                 cursor.start(cx);
@@ -2190,6 +2430,8 @@ impl Render for TerminalView {
                                 .rounded_full()
                                 .bg(if self.exited {
                                     theme.danger
+                                } else if self.needs_attention {
+                                    theme.warning
                                 } else {
                                     theme.accent
                                 }),
@@ -2627,6 +2869,80 @@ fn terminal_claims_keystroke(keystroke: &Keystroke) -> bool {
         return false;
     }
     terminal_key_bytes(keystroke, TermMode::empty()).is_some()
+}
+
+/// The kitty keyboard protocol's `CSI code ; modifiers u` form for keys whose
+/// legacy bytes are ambiguous, once a program has pushed the protocol;
+/// `None` leaves the key to the legacy encoding, which the protocol keeps for
+/// cursor and function keys and plain Enter/Tab/Backspace.
+///
+/// Implements disambiguation (flag 1), repeat events (2), shifted alternate
+/// keys (4), and all-keys-as-escapes (8) for keys that reach `on_key_down`.
+/// Plain printable keys still arrive as text through the input handler (so
+/// IMEs keep working), and release events are not reported.
+fn kitty_key_bytes(keystroke: &Keystroke, repeat: bool, mode: TermMode) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL) {
+        return None;
+    }
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform || modifiers.function {
+        return None;
+    }
+    let all_as_escapes = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let modifier_value = 1
+        + u32::from(modifiers.shift)
+        + u32::from(modifiers.alt) * 2
+        + u32::from(modifiers.control) * 4;
+    let key = keystroke.key.as_str();
+    let code = match key {
+        "escape" => 27,
+        "enter" | "return" | "tab" | "backspace" if modifier_value == 1 && !all_as_escapes => {
+            return None;
+        }
+        "enter" | "return" => 13,
+        "tab" => 9,
+        "backspace" => 127,
+        _ => {
+            let character = if key == "space" {
+                ' '
+            } else {
+                let mut chars = key.chars();
+                let (Some(character), None) = (chars.next(), chars.next()) else {
+                    return None;
+                };
+                character
+            };
+            // Shift alone still types text; only Ctrl/Alt chords are ambiguous.
+            if !all_as_escapes && !modifiers.control && !modifiers.alt {
+                return None;
+            }
+            u32::from(character.to_ascii_lowercase())
+        }
+    };
+    let shifted = (mode.contains(TermMode::REPORT_ALTERNATE_KEYS) && modifiers.shift)
+        .then_some(keystroke.key_char.as_deref())
+        .flatten()
+        .and_then(|text| {
+            let mut chars = text.chars();
+            match (chars.next(), chars.next()) {
+                (Some(character), None) if u32::from(character) != code => Some(character),
+                _ => None,
+            }
+        });
+    let event_type = (repeat && mode.contains(TermMode::REPORT_EVENT_TYPES)).then_some(":2");
+
+    let mut sequence = format!("\x1b[{code}");
+    if let Some(shifted) = shifted {
+        sequence.push_str(&format!(":{}", u32::from(shifted)));
+    }
+    if modifier_value != 1 || event_type.is_some() {
+        sequence.push_str(&format!(
+            ";{modifier_value}{}",
+            event_type.unwrap_or_default()
+        ));
+    }
+    sequence.push('u');
+    Some(sequence.into_bytes())
 }
 
 fn terminal_key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
@@ -3069,6 +3385,8 @@ mod tests {
                 hovered_link: None,
                 cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
                 cursor_focus_tracking_started: false,
+                focused: false,
+                needs_attention: false,
                 context_menu: ContextMenuHandle::new(cx),
                 bottom_panel_tabs: true,
                 _subscriptions: Vec::new(),
@@ -3318,6 +3636,78 @@ mod tests {
         );
         assert_eq!(bytes("f13", plain, none), Some(b"\x1b[25~".to_vec()));
         assert_eq!(bytes("space", control, none), Some(vec![0]));
+    }
+
+    #[test]
+    fn kitty_protocol_disambiguates_only_ambiguous_keys() {
+        let bytes = |name: &str, modifiers: Modifiers, mode: TermMode| {
+            kitty_key_bytes(&key(name, None, modifiers), false, mode)
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let control = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let plain = Modifiers::default();
+        let flag1 = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Off until a program pushes the protocol.
+        assert_eq!(bytes("escape", plain, TermMode::empty()), None);
+        assert_eq!(bytes("escape", plain, flag1), Some(b"\x1b[27u".to_vec()));
+        assert_eq!(bytes("enter", shift, flag1), Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(bytes("c", control, flag1), Some(b"\x1b[99;5u".to_vec()));
+        // Unambiguous keys keep their legacy bytes.
+        assert_eq!(bytes("enter", plain, flag1), None);
+        assert_eq!(bytes("a", shift, flag1), None);
+        assert_eq!(bytes("space", plain, flag1), None);
+        assert_eq!(bytes("up", control, flag1), None);
+
+        let all = flag1 | TermMode::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(bytes("enter", plain, all), Some(b"\x1b[13u".to_vec()));
+        let repeat = flag1 | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(
+            kitty_key_bytes(&key("escape", None, plain), true, repeat),
+            Some(b"\x1b[27;1:2u".to_vec())
+        );
+        let alternate = flag1 | TermMode::REPORT_ALTERNATE_KEYS;
+        let control_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            kitty_key_bytes(&key("a", Some("A"), control_shift), false, alternate),
+            Some(b"\x1b[97:65;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn scans_osc_notifications_across_reads_and_skips_conemu() {
+        let mut scanner = OscAlertScanner::default();
+        let mut found = Vec::new();
+        for chunk in [
+            &b"out\x1b]9;Agent turn com"[..],
+            b"plete\x07\x1b]9;4;3;0\x07\x1b]9;9;C:\\\x1b\\",
+            b"\x1b]777;notify;Codex;Approval needed\x1b\\\x1b]0;title\x07",
+        ] {
+            scanner.feed(chunk, |alert| found.push(alert));
+        }
+        assert_eq!(
+            found,
+            vec![
+                TerminalAlert {
+                    title: None,
+                    body: "Agent turn complete".to_owned(),
+                },
+                TerminalAlert {
+                    title: Some("Codex".to_owned()),
+                    body: "Approval needed".to_owned(),
+                },
+            ]
+        );
     }
 
     /// App shortcuts must not swallow keys the shell needs (Escape for vim,

@@ -946,6 +946,7 @@ diff.rows_hidden_one: 还有 1 行 · 打开审阅查看完整更改
 diff.rows_hidden: "还有 %{count} 行 · 打开审阅查看完整更改"
 terminal.transport_failed: 终端传输失败
 terminal.no_workspace_description: 请先选择一个任务，再打开终端。
+terminal.needs_attention: 终端需要你的处理
 terminal.process_exited: 进程已退出
 browser.back: 后退（%{shortcut}）
 browser.forward: 前进（%{shortcut}）

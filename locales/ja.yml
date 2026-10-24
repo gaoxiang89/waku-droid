@@ -989,6 +989,7 @@ diff.rows_hidden_one: 残り 1 行 · レビューを開くと変更全体を読
 diff.rows_hidden: "残り %{count} 行 · レビューを開くと変更全体を読めます"
 terminal.transport_failed: ターミナル転送に失敗しました
 terminal.no_workspace_description: ターミナルを開く前にタスクを選択してください。
+terminal.needs_attention: ターミナルが対応を待っています
 terminal.process_exited: プロセスが終了しました
 
 browser.back: 戻る（%{shortcut}）

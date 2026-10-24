@@ -1931,6 +1931,8 @@ terminal.transport_failed:
   en: Terminal transport failed
 terminal.no_workspace_description:
   en: Select a task before opening a terminal.
+terminal.needs_attention:
+  en: Terminal needs your attention
 terminal.process_exited:
   en: Process exited
 
