@@ -894,15 +894,18 @@ impl TerminalSession {
                 continue;
             }
             let cell = indexed.cell;
-            let mut text = if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-                || cell.flags.contains(Flags::HIDDEN)
-            {
-                " ".to_owned()
+            // Wide-char spacers and hidden cells still own a column, but no
+            // glyph: emitting a space for them would add a full monospace
+            // advance on top of the wide glyph's own advance.
+            let skip_glyph = cell.flags.intersects(
+                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
+            );
+            let mut text = if skip_glyph {
+                String::new()
             } else {
                 cell.c.to_string()
             };
-            if let Some(zerowidth) = cell.zerowidth() {
+            if !skip_glyph && let Some(zerowidth) = cell.zerowidth() {
                 text.extend(zerowidth);
             }
 
@@ -935,6 +938,7 @@ impl TerminalSession {
 
             cells[row as usize * columns + column] = TerminalCell {
                 text,
+                glyph: !skip_glyph,
                 foreground,
                 background,
                 bold: cell.flags.contains(Flags::BOLD),
@@ -947,11 +951,58 @@ impl TerminalSession {
 
         let mut rendered_rows = Vec::with_capacity(rows);
         for row in cells.chunks(columns) {
-            let mut text = String::new();
             let mut runs: Vec<TerminalRun> = Vec::new();
-            for cell in row {
+            let mut batches: Vec<TerminalBatch> = Vec::new();
+            let mut backgrounds: Vec<TerminalBackground> = Vec::new();
+            let mut batch_text = String::new();
+            // Column a single-cell glyph run reaches: monospace glyphs advance
+            // exactly one cell, so consecutive ones can share one positioned
+            // batch. A wide glyph, an icon from a fallback font, or a combining
+            // cluster ends the run — its advance is the font's, not the grid's,
+            // so the next cell must be placed at its own column instead.
+            let mut monospace_end: Option<usize> = None;
+            for (column, cell) in row.iter().enumerate() {
+                match backgrounds.last_mut() {
+                    Some(span)
+                        if span.color == cell.background
+                            && span.column as usize + span.columns as usize == column =>
+                    {
+                        span.columns += 1;
+                    }
+                    _ => backgrounds.push(TerminalBackground {
+                        column: column as u16,
+                        columns: 1,
+                        color: cell.background,
+                    }),
+                }
+                if !cell.glyph {
+                    continue;
+                }
                 let len = cell.text.len();
-                text.push_str(&cell.text);
+                let single_cell = cell
+                    .text
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_graphic() || *byte == b' ')
+                    && len == 1;
+                let batch = if single_cell && monospace_end == Some(column) {
+                    batches.len() - 1
+                } else {
+                    // `SharedString` is cheap to clone, so each batch keeps its
+                    // own slice rather than indexing into the row per frame.
+                    if let Some(last) = batches.last_mut() {
+                        last.text = SharedString::from(batch_text.as_str());
+                        batch_text.clear();
+                    }
+                    batches.push(TerminalBatch {
+                        column: column as u16,
+                        text: SharedString::default(),
+                        run_start: runs.len(),
+                        run_len: 0,
+                    });
+                    batches.len() - 1
+                };
+                batch_text.push_str(&cell.text);
                 let style = TerminalRunStyle {
                     foreground: cell.foreground,
                     background: cell.background,
@@ -960,15 +1011,29 @@ impl TerminalSession {
                     underline: cell.underline,
                     strikeout: cell.strikeout,
                 };
-                if let Some(run) = runs.last_mut().filter(|run| run.style == style) {
-                    run.len += len;
+                // Runs are scoped to their batch: the last run only grows when
+                // it belongs to the batch being extended.
+                let batch = &mut batches[batch];
+                let extends_last =
+                    batch.run_len > 0 && runs[batch.run_start + batch.run_len - 1].style == style;
+                if extends_last {
+                    runs[batch.run_start + batch.run_len - 1].len += len;
                 } else {
                     runs.push(TerminalRun { len, style });
+                    batch.run_len += 1;
                 }
+                monospace_end = single_cell.then_some(column + 1);
             }
+            if let Some(last) = batches.last_mut() {
+                last.text = SharedString::from(batch_text.as_str());
+            }
+            // The panel behind the grid already paints the terminal
+            // background; only cells that differ need their own rectangle.
+            backgrounds.retain(|span| span.color != theme.terminal);
             rendered_rows.push(TerminalRow {
-                text: SharedString::from(text),
                 runs,
+                batches,
+                backgrounds,
             });
         }
 
@@ -1032,6 +1097,10 @@ impl scrollbar::Scrollable for TerminalScrollbarTarget {
 #[derive(Clone)]
 struct TerminalCell {
     text: String,
+    /// Wide-char spacers and hidden cells take a column but own no glyph, so
+    /// the row builder leaves them out of the text and paints only their
+    /// background.
+    glyph: bool,
     foreground: Hsla,
     background: Hsla,
     bold: bool,
@@ -1044,6 +1113,7 @@ impl TerminalCell {
     fn blank(theme: Theme) -> Self {
         Self {
             text: " ".into(),
+            glyph: true,
             foreground: theme.text,
             background: theme.terminal,
             bold: false,
@@ -1064,14 +1134,36 @@ struct TerminalRunStyle {
     strikeout: bool,
 }
 
+/// A styled span of one batch's text. `len` counts bytes inside that batch, so
+/// runs never straddle two batches.
 struct TerminalRun {
     len: usize,
     style: TerminalRunStyle,
 }
 
-struct TerminalRow {
+/// One horizontally positioned piece of a row. Every cell is drawn at its own
+/// column offset, and a batch is a run of glyphs that can share one offset
+/// because each advances exactly one cell. A glyph whose advance is the font's
+/// rather than the grid's gets a batch of its own, which keeps the rest of the
+/// row on the grid instead of drifting by the difference.
+struct TerminalBatch {
+    column: u16,
     text: SharedString,
+    run_start: usize,
+    run_len: usize,
+}
+
+/// A rectangle of cell background, merged across adjacent cells of one color.
+struct TerminalBackground {
+    column: u16,
+    columns: u16,
+    color: Hsla,
+}
+
+struct TerminalRow {
     runs: Vec<TerminalRun>,
+    batches: Vec<TerminalBatch>,
+    backgrounds: Vec<TerminalBackground>,
 }
 
 struct TerminalSnapshot {
@@ -2407,9 +2499,9 @@ impl Render for TerminalView {
             Some(height) => (height - toolbar_height).max(120.0),
             None => (f32::from(viewport.height) - 48.0 - toolbar_height).max(120.0),
         };
-        // The rows are laid out by `StyledText` at the font's own advance, so
-        // the grid must be sized from that same measured advance or the text
-        // wraps short of (or past) the panel edge.
+        // Every cell is painted at its own column offset, so the advance
+        // measured here defines the grid the text is drawn into: it has to be
+        // the terminal font's own advance, not a nominal cell size.
         let cell_width = *self.measured_cell_width.get_or_insert_with(|| {
             let text_system = cx.text_system();
             let font_id = text_system.resolve_font(&terminal_font());
@@ -2485,44 +2577,68 @@ impl Render for TerminalView {
                 cursor_position,
             } = &*snapshot;
             for row in snapshot_rows {
-                let runs = row
-                    .runs
-                    .iter()
-                    .map(|run| {
-                        let mut run_font = terminal_font();
-                        if run.style.bold {
-                            run_font.weight = FontWeight::BOLD;
-                        }
-                        if run.style.italic {
-                            run_font.style = FontStyle::Italic;
-                        }
-                        TextRun {
-                            len: run.len,
-                            font: run_font,
-                            color: run.style.foreground,
-                            background_color: Some(run.style.background),
-                            underline: run.style.underline.then_some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: Some(run.style.foreground),
-                                wavy: false,
-                            }),
-                            strikethrough: run.style.strikeout.then_some(StrikethroughStyle {
-                                thickness: px(1.0),
-                                color: Some(run.style.foreground),
-                            }),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                screen = screen.child(
-                    div()
-                        .h(px(TERMINAL_CELL_HEIGHT))
-                        .flex_none()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(TERMINAL_FONT_SIZE))
-                        .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text.clone()).with_runs(runs)),
-                );
+                let mut row_element = div()
+                    .relative()
+                    .w_full()
+                    .h(px(TERMINAL_CELL_HEIGHT))
+                    .flex_none()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(TERMINAL_FONT_SIZE))
+                    .line_height(px(TERMINAL_CELL_HEIGHT));
+                for span in &row.backgrounds {
+                    row_element = row_element.child(
+                        div()
+                            .absolute()
+                            .left(px(span.column as f32 * cell_width))
+                            .top(px(0.0))
+                            .w(px(span.columns as f32 * cell_width))
+                            .h(px(TERMINAL_CELL_HEIGHT))
+                            .bg(span.color),
+                    );
+                }
+                for batch in &row.batches {
+                    let runs = row.runs[batch.run_start..batch.run_start + batch.run_len]
+                        .iter()
+                        .map(|run| {
+                            let mut run_font = terminal_font();
+                            if run.style.bold {
+                                run_font.weight = FontWeight::BOLD;
+                            }
+                            if run.style.italic {
+                                run_font.style = FontStyle::Italic;
+                            }
+                            TextRun {
+                                len: run.len,
+                                font: run_font,
+                                color: run.style.foreground,
+                                // Backgrounds are drawn as grid rects above,
+                                // which stay exact for glyphs the font
+                                // advances wider than their cells.
+                                background_color: None,
+                                underline: run.style.underline.then_some(UnderlineStyle {
+                                    thickness: px(1.0),
+                                    color: Some(run.style.foreground),
+                                    wavy: false,
+                                }),
+                                strikethrough: run.style.strikeout.then_some(StrikethroughStyle {
+                                    thickness: px(1.0),
+                                    color: Some(run.style.foreground),
+                                }),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    row_element = row_element.child(
+                        div()
+                            .absolute()
+                            .left(px(batch.column as f32 * cell_width))
+                            .top(px(0.0))
+                            .h(px(TERMINAL_CELL_HEIGHT))
+                            .whitespace_nowrap()
+                            .child(StyledText::new(batch.text.clone()).with_runs(runs)),
+                    );
+                }
+                screen = screen.child(row_element);
             }
             if let Some((row, column)) = *outline_cursor {
                 screen = screen.child(
@@ -4670,14 +4786,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn snapshot_cache_reuses_clean_frames_and_invalidates_on_dirty_or_style_change() {
+    /// A session over an in-memory terminal: no PTY and no event loop, so a
+    /// test can decide exactly what the grid holds.
+    fn test_session(columns: usize, rows: usize) -> TerminalSession {
         let (sender, _written) = unbounded();
         let dirty = Arc::new(AtomicBool::new(true));
         let (ui_tx, ui_events) = unbounded();
         let window_size = Arc::new(Mutex::new(WindowSize {
-            num_cols: 20,
-            num_lines: 4,
+            num_cols: columns as u16,
+            num_lines: rows as u16,
             cell_width: 8,
             cell_height: 18,
         }));
@@ -4689,13 +4806,10 @@ mod tests {
             window_size: window_size.clone(),
             reply_colors: reply_colors.clone(),
         };
-        let session = TerminalSession {
+        TerminalSession {
             term: Arc::new(FairMutex::new(Term::new(
                 Config::default(),
-                &TerminalDimensions {
-                    columns: 20,
-                    rows: 4,
-                },
+                &TerminalDimensions { columns, rows },
                 proxy,
             ))),
             sender: PtyInput::Test(sender),
@@ -4704,10 +4818,77 @@ mod tests {
             cached_snapshot: Mutex::new(None),
             ui_events,
             window_size,
-            grid_size: (20, 4),
+            grid_size: (columns, rows),
             reply_colors,
             url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
-        };
+        }
+    }
+
+    fn feed(session: &TerminalSession, input: &[u8]) {
+        let mut term = session.term.lock();
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *term, input);
+    }
+
+    /// A wide glyph advances by its own font width, not by the two cells the
+    /// grid gave it. Each batch is painted at its own column so the rest of the
+    /// row stays on the grid, and the spacer cell contributes no glyph of its
+    /// own — an extra space there is what made CJK text look double-spaced.
+    #[test]
+    fn wide_glyphs_keep_the_grid_instead_of_drifting() {
+        let session = test_session(10, 2);
+        feed(&session, "a分b".as_bytes());
+        let theme = Theme::dark();
+        let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        let batches = snapshot.rows[0]
+            .batches
+            .iter()
+            .map(|batch| (batch.column, batch.text.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            vec![
+                (0, "a".to_owned()),
+                (1, "分".to_owned()),
+                (3, format!("b{}", " ".repeat(6))),
+            ]
+        );
+    }
+
+    #[test]
+    fn styled_runs_stay_inside_their_batch() {
+        let session = test_session(10, 2);
+        feed(&session, b"\x1b[31mabc\x1b[0mdef");
+        let theme = Theme::dark();
+        let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        let row = &snapshot.rows[0];
+        assert_eq!(row.batches.len(), 1);
+        assert_eq!(row.batches[0].run_len, 2);
+        assert_eq!(row.runs[0].len, 3);
+        assert_eq!(row.runs[1].len, 7);
+        assert_ne!(row.runs[0].style.foreground, row.runs[1].style.foreground);
+    }
+
+    /// Backgrounds are grid rectangles, so they cover exactly the cells that
+    /// carry them instead of following a glyph run's advance.
+    #[test]
+    fn backgrounds_are_painted_as_cell_exact_spans() {
+        let session = test_session(10, 2);
+        feed(&session, b"\x1b[41mAB\x1b[0mCD");
+        let theme = Theme::dark();
+        let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        let spans = &snapshot.rows[0].backgrounds;
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].column, spans[0].columns), (0, 2));
+        assert_ne!(spans[0].color, theme.terminal);
+        // Cells keeping the terminal background need no rectangle: the panel
+        // behind the grid already paints it.
+        assert!(snapshot.rows[1].backgrounds.is_empty());
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_clean_frames_and_invalidates_on_dirty_or_style_change() {
+        let session = test_session(20, 4);
         let theme = Theme::dark();
         assert!(session.take_dirty());
 
