@@ -2677,7 +2677,8 @@ impl Waku {
                     .items_center()
                     .gap(px(4.0))
                     .child(self.render_bottom_panel_toggle(cx))
-                    .child(self.render_header_surface_buttons(cx)),
+                    .child(self.render_header_surface_buttons(cx))
+                    .child(self.render_notifications_control(cx)),
             )
             .child(div().w(px(1.0)).h(px(18.0)).flex_none().bg(theme.border))
             .children(self.render_client_window_controls(
@@ -2713,7 +2714,7 @@ impl Waku {
                 cx,
             ))
             .child(div().flex_1())
-            .child(self.render_notifications_control(cx))
+            .child(self.render_workspace_controls(cx))
     }
 
     // ── Empty states ───────────────────────────────────────────────────────

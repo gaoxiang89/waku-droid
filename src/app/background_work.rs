@@ -681,34 +681,20 @@ impl Waku {
         self.open_right_panel_surface(RightPanelSurface::BackgroundWork { key, title }, cx);
     }
 
+    /// The global notification bell for the window title bar. The queue is
+    /// app-wide: any session's completed or waiting turn and any terminal's
+    /// attention event lands here, and the pulse dot reflects live background
+    /// work across every session, not just the selected one.
     pub(super) fn render_notifications_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let session = self.selected_session();
-        let session_id = session.map(|session| session.id);
-        let workspace_path = session
-            .and_then(|session| self.workspace_path_for_session(session))
-            .or_else(|| {
-                self.selected_project()
-                    .map(|project| project.path.as_path())
-            });
-        let host = self.selected_host_key();
-        let snapshot = workspace_path.and_then(|path| {
-            self.visible_branch_snapshot
-                .as_ref()
-                .filter(|(scope, _)| scope.host == host && scope.workspace == path)
-                .map(|(_, snapshot)| snapshot)
-        });
-        let change_counts = snapshot
-            .map(|snapshot| (snapshot.additions, snapshot.deletions))
-            .filter(|(additions, deletions)| *additions > 0 || *deletions > 0);
         let environment = Some(EnvironmentSummary {
             commit_status: self.commit_operation_status_label(),
             commit_focus: self.transcript_control_focus("environment-summary-commit", cx),
             compare_focus: self.transcript_control_focus("environment-summary-compare", cx),
         });
-        let (processes, agents) = session_id
-            .map(|session_id| self.background_work_counts(session_id))
-            .unwrap_or_default();
-        let has_live_work = processes > 0 || agents > 0;
+        let has_live_work = self
+            .background_work
+            .values()
+            .any(BackgroundWorkRegistry::has_live);
         let unread_count = self.app_notification_count();
         let theme = Theme::current(cx);
         let refresh_weak = cx.entity().downgrade();
@@ -784,6 +770,46 @@ impl Waku {
                         .child(pulse_dot(5.0, theme.accent)),
                 )
             });
+        let clear_focus = self.transcript_control_focus("notification-queue-clear", cx);
+        let weak = cx.entity().downgrade();
+        popover(
+            trigger,
+            &handle,
+            MenuAlign::BelowRight,
+            move |handle, _, cx| {
+                render_notification_queue_card(
+                    handle,
+                    environment.clone(),
+                    rows.clone(),
+                    clear_focus.clone(),
+                    weak.clone(),
+                    cx,
+                )
+            },
+        )
+    }
+
+    /// The selected workspace's change-count chip and "open in" control for
+    /// the conversation toolbar.
+    pub(super) fn render_workspace_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let session = self.selected_session();
+        let workspace_path = session
+            .and_then(|session| self.workspace_path_for_session(session))
+            .or_else(|| {
+                self.selected_project()
+                    .map(|project| project.path.as_path())
+            });
+        let host = self.selected_host_key();
+        let snapshot = workspace_path.and_then(|path| {
+            self.visible_branch_snapshot
+                .as_ref()
+                .filter(|(scope, _)| scope.host == host && scope.workspace == path)
+                .map(|(_, snapshot)| snapshot)
+        });
+        let change_counts = snapshot
+            .map(|snapshot| (snapshot.additions, snapshot.deletions))
+            .filter(|(additions, deletions)| *additions > 0 || *deletions > 0);
+        let theme = Theme::current(cx);
         let git_status = change_counts.map(|(additions, deletions)| {
             let focus = self.transcript_control_focus("header-git-status", cx);
             div()
@@ -839,23 +865,6 @@ impl Waku {
                 .into_any_element()
         });
         let open_in = self.render_open_in_control(workspace_path, cx);
-        let clear_focus = self.transcript_control_focus("notification-queue-clear", cx);
-        let weak = cx.entity().downgrade();
-        let info = popover(
-            trigger,
-            &handle,
-            MenuAlign::BelowRight,
-            move |handle, _, cx| {
-                render_notification_queue_card(
-                    handle,
-                    environment.clone(),
-                    rows.clone(),
-                    clear_focus.clone(),
-                    weak.clone(),
-                    cx,
-                )
-            },
-        );
         div()
             .id("header-environment-controls")
             .tab_group()
@@ -866,7 +875,6 @@ impl Waku {
             .gap(px(8.0))
             .children(git_status)
             .children(open_in)
-            .child(info)
             .into_any_element()
     }
 
