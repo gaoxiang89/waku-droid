@@ -20,7 +20,9 @@ const DIALOG_FIELD_CONTEXT: &str = "GitGraphDialog > TextInput";
 /// Rows drawn for one expanded file. The detail pane is not virtualized, so a
 /// generated file must not turn into thousands of elements per frame.
 const MAX_INLINE_LINES: usize = 800;
-const FILE_ROW_HEIGHT: f32 = 30.0;
+/// Height of one changed-file row, shared with the commit page's virtualized
+/// file list so its uniform item height cannot drift from the painted row.
+pub(super) const FILE_ROW_HEIGHT: f32 = 30.0;
 
 actions!(
     waku_git_graph_dialog,

@@ -1555,8 +1555,6 @@ right_panel.files:
   en: Files
 right_panel.diff:
   en: Review
-right_panel.toggle:
-  en: Toggle right panel
 right_panel.toggle_terminal:
   en: Toggle right terminal
 right_panel.open_surface:

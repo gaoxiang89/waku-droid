@@ -797,7 +797,6 @@ right_panel.browser: ブラウザ
 right_panel.terminal: ターミナル
 right_panel.files: ファイル
 right_panel.diff: レビュー
-right_panel.toggle: 右パネルの表示を切り替える
 right_panel.toggle_terminal: 右パネルのターミナルを切り替える
 right_panel.open_surface: パネルを開く
 right_panel.choose_surface: 右パネルに表示する内容を選択します

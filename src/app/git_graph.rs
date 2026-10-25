@@ -425,16 +425,18 @@ impl Waku {
                 }
             }))
             .on_action(cx.listener(|this, _: &ConfirmEntry, _, cx| {
-                if !this.git_commit_page_open()
-                    && let Some(cursor) = this.selected_git_graph_cursor()
-                {
+                // The commit page owns the keyboard while it is open: Enter
+                // must not reopen the first row underneath it.
+                if this.git_commit_page_open() {
+                    return;
+                }
+                if let Some(cursor) = this.selected_git_graph_cursor() {
                     this.open_git_graph_row(cursor, cx);
                     return;
                 }
-                if this.selected_git_graph_cursor().is_none()
-                    && this
-                        .selected_git_graph_row_count()
-                        .is_some_and(|count| count > 0)
+                if this
+                    .selected_git_graph_row_count()
+                    .is_some_and(|count| count > 0)
                 {
                     this.open_git_graph_row(0, cx);
                 }

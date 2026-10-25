@@ -3032,7 +3032,7 @@ impl Waku {
             .border_l_1()
             .border_color(theme.border_strong)
             .bg(theme.surface)
-            .child(self.render_right_panel_working_tree(selected_path.as_deref(), cx))
+            .child(self.render_right_panel_working_tree(selected_path.as_deref(), true, cx))
             .child(
                 self.render_panel_resize_handle(
                     "files-panel-resize-handle",
@@ -3907,22 +3907,137 @@ impl Waku {
         if let Some(relative_path) = self.right_panel_files_selected_path.clone() {
             self.render_right_panel_file(relative_path, panel_width, window, cx)
         } else {
-            self.render_right_panel_working_tree(None, cx)
+            self.render_right_panel_working_tree(None, false, cx)
         }
+    }
+
+    /// The header above the file tree: the project, the create actions, and —
+    /// for the standalone Files pane only — its close button. As a right-panel
+    /// tab the tab strip already closes it, so `closable` stays false there.
+    fn render_files_panel_header(
+        &self,
+        title: SharedString,
+        closable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut header = div()
+            .h(px(PANEL_TOOLBAR_HEIGHT))
+            .flex_none()
+            .px(px(16.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(icon("icons/folder.svg", 13.0, theme.text_tertiary))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_size(sp(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text_secondary)
+                    .child(title),
+            )
+            .child(
+                icon_button("files-new-file", "icons/file.svg", *theme)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .tooltip(Tooltip::text(tr!("files.new_file")))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.begin_right_panel_file_create(
+                            String::new(),
+                            0,
+                            false,
+                            None,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                icon_button("files-new-folder", "icons/folder-new.svg", *theme)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .tooltip(Tooltip::text(tr!("files.new_folder")))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.begin_right_panel_file_create(
+                            String::new(),
+                            0,
+                            true,
+                            None,
+                            window,
+                            cx,
+                        );
+                    })),
+            );
+        if closable {
+            let focus = self.transcript_control_focus("close-files-panel", cx);
+            header = header.child(
+                div()
+                    .id("close-files-panel")
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .size(px(22.0))
+                    .flex_none()
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_default()
+                    .hover(|style| style.bg(theme.overlay))
+                    .active(|style| style.bg(theme.overlay_strong))
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .child(icon("icons/x.svg", 13.0, theme.text_tertiary))
+                    .tooltip(Tooltip::with_shortcut(
+                        tr!("right_panel.close_tab", title = tr!("right_panel.files")),
+                        crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
+                    ))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_files_panel_visible(false, cx);
+                        window.focus(&this.composer_focus(cx), cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.set_files_panel_visible(false, cx);
+                            window.focus(&this.composer_focus(cx), cx);
+                            cx.stop_propagation();
+                        }
+                    })),
+            );
+        }
+        header
     }
 
     fn render_right_panel_working_tree(
         &self,
         selected_path: Option<&str>,
+        closable: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
         let Some(project) = self.selected_project() else {
-            return self.render_right_panel_empty_message(
-                tr!("files.no_project_open"),
-                tr!("files.no_project_open_description"),
-                cx,
-            );
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(self.render_files_panel_header(
+                    SharedString::from(tr!("right_panel.files")),
+                    closable,
+                    &theme,
+                    cx,
+                ))
+                .child(self.render_right_panel_empty_message(
+                    tr!("files.no_project_open"),
+                    tr!("files.no_project_open_description"),
+                    cx,
+                ));
         };
         let project_name = project.display_name();
         // Read only. The walk is filesystem I/O, so it happens in
@@ -4254,60 +4369,12 @@ impl Waku {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(PANEL_TOOLBAR_HEIGHT))
-                    .flex_none()
-                    .px(px(16.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(icon("icons/folder.svg", 13.0, theme.text_tertiary))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(sp(12.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text_secondary)
-                            .child(project_name),
-                    )
-                    .child(
-                        icon_button("files-new-file", "icons/file.svg", theme)
-                            .tab_index(0)
-                            .focus_visible(|style| style.border_1().border_color(theme.accent))
-                            .tooltip(Tooltip::text(tr!("files.new_file")))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.begin_right_panel_file_create(
-                                    String::new(),
-                                    0,
-                                    false,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        icon_button("files-new-folder", "icons/folder-new.svg", theme)
-                            .tab_index(0)
-                            .focus_visible(|style| style.border_1().border_color(theme.accent))
-                            .tooltip(Tooltip::text(tr!("files.new_folder")))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.begin_right_panel_file_create(
-                                    String::new(),
-                                    0,
-                                    true,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    ),
-            )
+            .child(self.render_files_panel_header(
+                SharedString::from(project_name),
+                closable,
+                &theme,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()

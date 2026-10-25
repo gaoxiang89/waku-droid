@@ -1,10 +1,14 @@
 //! A commit is a page, not an accordion below the history list.
 //! Both collections are virtualized; diff parsing stays on the background executor.
-use super::git_graph_actions::InlineDiff;
+use super::git_graph_actions::{FILE_ROW_HEIGHT, InlineDiff};
 use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
 use gpui::relative;
 use waku_client::git::{GitCommitDetail, GitDiffSpec, GitGraphCommit};
+
+/// The strip that titles the file list and the one that names the diff's
+/// file, so both sections line up across the split.
+const COMMIT_SECTION_HEADER_HEIGHT: f32 = 36.0;
 
 pub(super) struct GitCommitView {
     pub(super) scope: Option<PanelScope>,
@@ -185,7 +189,7 @@ impl Waku {
                     .map_or(0, |detail| detail.files.len());
                 self.git_commit_view
                     .files
-                    .reset_with_uniform_height(count, px(30.0));
+                    .reset_with_uniform_height(count, px(FILE_ROW_HEIGHT));
                 self.git_commit_view.selected =
                     self.git_commit_view.selected.min(count.saturating_sub(1));
                 self.git_commit_view.detail = Some(detail.clone());
@@ -304,7 +308,7 @@ impl Waku {
                             .border_color(theme.border)
                             .child(
                                 div()
-                                    .h(px(36.0))
+                                    .h(px(COMMIT_SECTION_HEADER_HEIGHT))
                                     .flex_none()
                                     .px(px(10.0))
                                     .flex()
@@ -329,7 +333,7 @@ impl Waku {
                             .flex_col()
                             .child(
                                 div()
-                                    .h(px(36.0))
+                                    .h(px(COMMIT_SECTION_HEADER_HEIGHT))
                                     .flex_none()
                                     .px(px(12.0))
                                     .flex()
