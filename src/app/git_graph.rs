@@ -322,6 +322,24 @@ impl Waku {
         cx.notify();
     }
 
+    pub(super) fn open_git_graph_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.focus_git_graph_row(index, cx);
+        let Some(scope) = self.selected_panel_scope() else {
+            return;
+        };
+        if let Some((_, snapshot)) = self
+            .visible_git_graph
+            .as_ref()
+            .filter(|(shown, _)| shown == &scope)
+            && let Some(GitGraphRowKey::Commit(hash)) = git_graph_row_key(snapshot, index)
+            && let Some(commit) = snapshot.commits.iter().find(|commit| commit.hash == hash)
+        {
+            self.git_commit_view.open(scope.clone(), commit.clone());
+            self.right_panel_width = widened_panel_width_for_review(self.right_panel_width);
+        }
+        cx.notify();
+    }
+
     fn git_graph_query(&self, cx: &App) -> String {
         self.git_graph_search
             .read(cx)
@@ -370,12 +388,24 @@ impl Waku {
             .flex()
             .flex_col()
             .on_action(cx.listener(|this, _: &SelectNextEntry, _, cx| {
-                this.step_git_graph(1, cx);
+                if this.git_commit_page_open() {
+                    this.step_git_commit_file(1, cx);
+                } else {
+                    this.step_git_graph(1, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &SelectPreviousEntry, _, cx| {
-                this.step_git_graph(-1, cx);
+                if this.git_commit_page_open() {
+                    this.step_git_commit_file(-1, cx);
+                } else {
+                    this.step_git_graph(-1, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &GitGraphTop, _, cx| {
+                if this.git_commit_page_open() {
+                    this.step_git_commit_file(isize::MIN, cx);
+                    return;
+                }
                 if this
                     .selected_git_graph_row_count()
                     .is_some_and(|count| count > 0)
@@ -384,6 +414,10 @@ impl Waku {
                 }
             }))
             .on_action(cx.listener(|this, _: &GitGraphBottom, _, cx| {
+                if this.git_commit_page_open() {
+                    this.step_git_commit_file(isize::MAX, cx);
+                    return;
+                }
                 if let Some(count) = this.selected_git_graph_row_count()
                     && count > 0
                 {
@@ -391,23 +425,39 @@ impl Waku {
                 }
             }))
             .on_action(cx.listener(|this, _: &ConfirmEntry, _, cx| {
+                if !this.git_commit_page_open()
+                    && let Some(cursor) = this.selected_git_graph_cursor()
+                {
+                    this.open_git_graph_row(cursor, cx);
+                    return;
+                }
                 if this.selected_git_graph_cursor().is_none()
                     && this
                         .selected_git_graph_row_count()
                         .is_some_and(|count| count > 0)
                 {
-                    this.focus_git_graph_row(0, cx);
+                    this.open_git_graph_row(0, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &DismissMenu, _, cx| {
+            .on_action(cx.listener(|this, _: &DismissMenu, window, cx| {
+                if this.git_commit_page_open() {
+                    this.close_git_commit_page(window, cx);
+                    return;
+                }
                 // Escape steps back: first out of a comparison, then out of
                 // the selection.
                 if !this.clear_git_graph_compare() {
                     this.git_graph_cursor = None;
                 }
                 cx.notify();
-            }))
-            .child(self.render_git_graph_toolbar(&theme, cx));
+            }));
+
+        if self.git_commit_page_open() {
+            return column
+                .child(self.render_git_commit_page(cx))
+                .into_any_element();
+        }
+        column = column.child(self.render_git_graph_toolbar(&theme, cx));
 
         column = match view {
             GitGraphView::NoProject => column.child(self.render_right_panel_empty_message(
@@ -615,7 +665,13 @@ impl Waku {
                     &self.git_graph_scrollbar,
                 )),
         );
-        if let Some(cursor) = cursor {
+        if let Some(cursor) = cursor
+            && (self.git_graph_compare_hash().is_some()
+                || matches!(
+                    git_graph_row_key(&snapshot, cursor),
+                    Some(GitGraphRowKey::Uncommitted)
+                ))
+        {
             body = body.child(self.render_git_graph_detail(cursor, &snapshot, theme, cx));
         }
         if snapshot.truncated && self.git_graph_page_limit(&scope) < MAX_LIMIT {
@@ -814,7 +870,7 @@ impl Waku {
                     this.toggle_git_graph_compare(hash.clone(), cx);
                 } else {
                     this.clear_git_graph_compare();
-                    this.focus_git_graph_row(index, cx);
+                    this.open_git_graph_row(index, cx);
                 }
                 window.focus(&this.git_graph_focus, cx);
             }));

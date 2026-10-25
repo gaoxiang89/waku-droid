@@ -696,7 +696,7 @@ impl Waku {
     /// counts as on screen and keeps its full height.
     pub(super) fn effective_bottom_panel_height(&self, window: &Window) -> f32 {
         fitted_bottom_panel_height(
-            f32::from(window.viewport_size().height),
+            f32::from(window.viewport_size().height) - PANEL_TOOLBAR_HEIGHT,
             self.bottom_panel_height,
         )
     }
@@ -790,7 +790,8 @@ impl Waku {
                 self.right_panel_width = width;
             }
             PanelResizeTarget::BottomPanel => {
-                let viewport_height = f32::from(window.viewport_size().height);
+                let viewport_height =
+                    f32::from(window.viewport_size().height) - PANEL_TOOLBAR_HEIGHT;
                 // The panel grows upward from the bottom, so dragging its top
                 // edge down shrinks it.
                 let delta_y = f32::from(event.position.y) - drag.start_mouse_y;

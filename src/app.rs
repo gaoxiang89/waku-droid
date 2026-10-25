@@ -98,6 +98,8 @@ const SIDEBAR_MAX_WIDTH: f32 = 420.0;
 const UPDATER_BUTTON_COLLAPSED_WIDTH: f32 = 20.0;
 const UPDATER_BUTTON_EXPANDED_WIDTH: f32 = 58.0;
 const RIGHT_PANEL_MIN_WIDTH: f32 = 280.0;
+const WINDOW_HEADER_HEIGHT: f32 = 48.0;
+const PANEL_TOOLBAR_HEIGHT: f32 = 40.0;
 const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
 /// Kept for the header, composer, and workspace footer when the bottom panel
 /// claims height, so it can never squeeze the chat column out of the window.
@@ -1503,6 +1505,7 @@ pub struct Waku {
     git_graph_cursor: Option<(PanelScope, usize)>,
     /// Inline diffs, compare selection, and the action dialog.
     git_graph_ui: git_graph_actions::GitGraphUi,
+    git_commit_view: git_commit_view::GitCommitView,
     branch_operation_pending: bool,
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
@@ -1983,6 +1986,7 @@ mod composer;
 mod connections_page;
 mod drafts;
 mod file_search;
+mod git_commit_view;
 mod git_graph;
 mod git_graph_actions;
 mod goal_dialog;
@@ -3406,6 +3410,7 @@ impl Waku {
                 git_graph_detail_scroll: ScrollHandle::new(),
                 git_graph_cursor: None,
                 git_graph_ui,
+                git_commit_view: git_commit_view::GitCommitView::new(),
                 branch_operation_pending: false,
                 commit_dialog: None,
                 goal_dialog: None,

@@ -611,8 +611,13 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus(id, cx);
         div()
             .id(id)
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(enabled)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
             .w(px(26.0))
             .h(px(26.0))
             .flex_none()
@@ -637,58 +642,20 @@ impl Waku {
                             this.navigate_forward_action(&NavigateForward, window, cx);
                         }
                     }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            if navigate_back {
+                                this.navigate_back_action(&NavigateBack, window, cx);
+                            } else {
+                                this.navigate_forward_action(&NavigateForward, window, cx);
+                            }
+                            cx.stop_propagation();
+                        }
+                    }))
             })
             .child(icon(icon_path, 14.0, theme.text_tertiary))
-    }
-
-    fn render_sidebar_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id("sidebar-titlebar")
-            .h(px(48.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .children(self.render_client_window_controls(
-                super::window_chrome::WindowControlSide::Left,
-                window,
-                cx,
-            ))
-            .child(
-                self.window_drag_region(
-                    div()
-                        .id("sidebar-traffic-light-drag-region")
-                        .w(px(TRAFFIC_LIGHT_CLEARANCE))
-                        .h_full()
-                        .flex_none(),
-                    cx,
-                ),
-            )
-            .child(self.render_sidebar_toggle(cx))
-            .child(
-                div()
-                    .ml(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .child(self.render_history_button(
-                        "navigate-back",
-                        "icons/arrow-left.svg",
-                        !self.session_navigation.back.is_empty(),
-                        true,
-                        cx,
-                    ))
-                    .child(self.render_history_button(
-                        "navigate-forward",
-                        "icons/arrow-right.svg",
-                        !self.session_navigation.forward.is_empty(),
-                        false,
-                        cx,
-                    )),
-            )
-            .child(self.window_drag_region(
-                div().id("sidebar-titlebar-drag-region").h_full().flex_1(),
-                cx,
-            ))
     }
 
     fn render_sidebar_header_actions(&self, cx: &mut Context<Self>) -> Div {
@@ -1271,11 +1238,15 @@ impl Waku {
             } else {
                 theme.sidebar
             })
-            .child(self.render_sidebar_titlebar(window, cx))
             .child(
                 div()
                     .flex_none()
                     .px(px(10.0))
+                    .h(px(PANEL_TOOLBAR_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(self.render_sidebar_new_session(cx)),
             )
             .child(
@@ -2635,90 +2606,41 @@ impl Waku {
         let agent_preset_label = session
             .filter(|session| session.provider == ProviderKind::DeepSeek && session.has_started())
             .and_then(|session| self.agent_preset_label_for_session(session));
-        let left_window_controls = (!self.sidebar_visible)
-            .then(|| {
-                self.render_client_window_controls(
-                    super::window_chrome::WindowControlSide::Left,
-                    window,
-                    cx,
-                )
-            })
-            .flatten();
-        let right_window_controls = (!self.right_panel_visible && !self.files_panel_visible)
-            .then(|| {
-                self.render_client_window_controls(
-                    super::window_chrome::WindowControlSide::Right,
-                    window,
-                    cx,
-                )
-            })
-            .flatten();
         div()
             .id("window-header")
-            .h(px(48.0))
+            .h(px(WINDOW_HEADER_HEIGHT))
+            .w_full()
             .flex_none()
             .flex()
             .items_center()
             .gap(px(8.0))
-            .children(left_window_controls)
-            // The header starts where the sidebar ends, so until the sidebar
-            // is wide enough to host the traffic lights itself the header has
-            // to clear them. Steady state with the sidebar open adds nothing;
-            // a sidebar sliding in shrinks the inset as it takes the lights
-            // over, which is what keeps the title from passing under them.
-            .pl(if self.sidebar_visible {
-                px(14.0 + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
-            } else {
-                px(0.0)
-            })
-            .pr(px(14.0))
-            .when(!self.sidebar_visible, |element| {
-                element
-                    .child(
-                        self.window_drag_region(
-                            div()
-                                .id("header-traffic-light-drag-region")
-                                .w(px(TRAFFIC_LIGHT_CLEARANCE - 8.0))
-                                .h_full()
-                                .flex_none(),
-                            cx,
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(self.render_sidebar_toggle(cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(2.0))
-                                    .child(self.render_history_button(
-                                        "navigate-back",
-                                        "icons/arrow-left.svg",
-                                        !self.session_navigation.back.is_empty(),
-                                        true,
-                                        cx,
-                                    ))
-                                    .child(self.render_history_button(
-                                        "navigate-forward",
-                                        "icons/arrow-right.svg",
-                                        !self.session_navigation.forward.is_empty(),
-                                        false,
-                                        cx,
-                                    )),
-                            ),
-                    )
-            })
+            .pr(px(6.0))
+            .bg(theme.surface)
+            .border_b_1()
+            .border_color(theme.border)
+            .children(self.render_client_window_controls(
+                super::window_chrome::WindowControlSide::Left,
+                window,
+                cx,
+            ))
+            .child(
+                self.window_drag_region(
+                    div()
+                        .id("header-traffic-light-drag-region")
+                        .w(px(TRAFFIC_LIGHT_CLEARANCE))
+                        .h_full()
+                        .flex_none(),
+                    cx,
+                ),
+            )
+            .child(self.render_sidebar_toggle(cx))
             .child(
                 self.window_drag_region(
                     div()
                         .id("header-title-drag-region")
                         .h_full()
                         .min_w_0()
-                        .flex_shrink(1.0)
+                        .flex_1()
                         .flex()
                         .items_center()
                         .gap(px(7.0))
@@ -2728,36 +2650,20 @@ impl Waku {
                                 .truncate()
                                 .text_size(sp(13.0))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text)
                                 .child(SharedString::from(title)),
                         )
                         .children(agent_preset_label.map(|label| {
                             div()
-                                .h(px(22.0))
                                 .max_w(px(180.0))
-                                .px(px(6.0))
-                                .rounded(px(6.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .bg(theme.overlay)
+                                .min_w_0()
+                                .truncate()
                                 .text_size(sp(12.5))
-                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_secondary)
-                                .child(icon("icons/bot.svg", 10.5, theme.text_tertiary))
-                                .child(div().min_w_0().truncate().child(SharedString::from(label)))
+                                .child(SharedString::from(label))
                         })),
                     cx,
                 ),
             )
-            .child(
-                self.window_drag_region(
-                    div().id("header-center-drag-region").h_full().flex_1(),
-                    cx,
-                ),
-            )
-            .child(self.render_background_work_summary(cx))
             .when(self.fps_counter_visible, |element| {
                 element.child(self.render_fps_counter(cx))
             })
@@ -2769,18 +2675,45 @@ impl Waku {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(2.0))
-                    // The bottom terminal is the leftmost control in this cluster.
-                    // Files and Git follow; the right-panel terminal sits immediately
-                    // after Git. The bottom panel has no chrome of its own, so its
-                    // toggle stays up whether that panel is open or closed.
+                    .gap(px(4.0))
                     .child(self.render_bottom_panel_toggle(cx))
-                    .child(self.render_header_surface_buttons(cx))
-                    .when(!self.right_panel_visible, |element| {
-                        element.child(self.render_right_panel_toggle(cx))
-                    }),
+                    .child(self.render_header_surface_buttons(cx)),
             )
-            .children(right_window_controls)
+            .child(div().w(px(1.0)).h(px(18.0)).flex_none().bg(theme.border))
+            .children(self.render_client_window_controls(
+                super::window_chrome::WindowControlSide::Right,
+                window,
+                cx,
+            ))
+    }
+
+    pub(super) fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
+        div()
+            .h(px(PANEL_TOOLBAR_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(10.0))
+            .gap(px(2.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(self.render_history_button(
+                "navigate-back",
+                "icons/arrow-left.svg",
+                !self.session_navigation.back.is_empty(),
+                true,
+                cx,
+            ))
+            .child(self.render_history_button(
+                "navigate-forward",
+                "icons/arrow-right.svg",
+                !self.session_navigation.forward.is_empty(),
+                false,
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(self.render_background_work_summary(cx))
     }
 
     // ── Empty states ───────────────────────────────────────────────────────

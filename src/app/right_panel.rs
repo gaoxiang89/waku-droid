@@ -52,7 +52,7 @@ pub(super) const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
 const REVIEW_DIFF_FILE_HEADER_HEIGHT: f32 = 36.0;
 /// The tab strip above every right panel surface. Terminal panes size their
 /// grids from the room left below it.
-const RIGHT_PANEL_HEADER_HEIGHT: f32 = 48.0;
+const RIGHT_PANEL_HEADER_HEIGHT: f32 = PANEL_TOOLBAR_HEIGHT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WorkingTreeEntry {
@@ -2787,13 +2787,7 @@ impl Waku {
             .flex()
             .items_center()
             .gap(px(2.0))
-            .child(self.render_header_surface_button(
-                "header-files-button",
-                RightPanelSurface::Files,
-                "right_panel.files",
-                crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
-                cx,
-            ))
+            .child(self.render_header_right_terminal_button(cx))
             .child(self.render_header_surface_button(
                 "header-git-graph-button",
                 RightPanelSurface::GitGraph,
@@ -2801,7 +2795,20 @@ impl Waku {
                 crate::platform::primary_shortcut("⇧⌘G", "Ctrl+Shift+G"),
                 cx,
             ))
-            .child(self.render_header_right_terminal_button(cx))
+            .child(self.render_header_surface_button(
+                "header-diff-button",
+                RightPanelSurface::Diff,
+                "right_panel.diff",
+                "",
+                cx,
+            ))
+            .child(self.render_header_surface_button(
+                "header-files-button",
+                RightPanelSurface::Files,
+                "right_panel.files",
+                crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
+                cx,
+            ))
     }
 
     /// The header shortcut for the right panel's terminal. Unlike Files and
@@ -2973,7 +2980,12 @@ impl Waku {
                     theme.text_tertiary
                 },
             ))
-            .tooltip(Tooltip::with_shortcut(tr!(tooltip_key), shortcut))
+            .when(shortcut.is_empty(), |element| {
+                element.tooltip(Tooltip::text(tr!(tooltip_key)))
+            })
+            .when(!shortcut.is_empty(), |element| {
+                element.tooltip(Tooltip::with_shortcut(tr!(tooltip_key), shortcut))
+            })
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -2991,63 +3003,6 @@ impl Waku {
             }))
     }
 
-    pub(super) fn render_right_panel_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = Theme::current(cx);
-        let active = self.right_panel_visible;
-        let focus = self.transcript_control_focus("toggle-right-panel", cx);
-        div()
-            .id("toggle-right-panel")
-            .track_focus(&focus)
-            .tab_index(0)
-            .w(px(26.0))
-            .h(px(26.0))
-            .flex_none()
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_default()
-            .focus_visible(|style| {
-                style
-                    .bg(theme.overlay)
-                    .border_1()
-                    .border_color(theme.accent)
-            })
-            .when(active, |element| element.bg(theme.overlay_strong))
-            .when(!active, |element| {
-                element.hover(|element| element.bg(theme.overlay))
-            })
-            .active(|element| element.bg(theme.overlay_strong))
-            .child(icon(
-                "icons/panel-right.svg",
-                14.0,
-                if active {
-                    theme.text
-                } else {
-                    theme.text_tertiary
-                },
-            ))
-            .tooltip(Tooltip::with_shortcut(
-                tr!("right_panel.toggle"),
-                crate::platform::primary_shortcut("⇧⌘B", "Ctrl+Shift+B"),
-            ))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
-            })
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.set_right_panel_visible(!this.right_panel_visible, cx);
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if !event.keystroke.modifiers.modified()
-                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                {
-                    this.set_right_panel_visible(!this.right_panel_visible, cx);
-                    cx.stop_propagation();
-                }
-            }))
-    }
-
     pub(super) fn set_files_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if visible {
             self.refresh_right_panel_working_tree(cx);
@@ -3060,74 +3015,11 @@ impl Waku {
         cx.notify();
     }
 
-    pub(super) fn render_files_panel(
-        &self,
-        width: f32,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    pub(super) fn render_files_panel(&self, width: f32, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let focus = self.transcript_control_focus("close-files-panel", cx);
         let selected_path = self
             .visible_right_panel_file_path()
             .or_else(|| self.right_panel_files_selected_path.clone());
-        let close = div()
-            .id("close-files-panel")
-            .track_focus(&focus)
-            .tab_index(0)
-            .size(px(26.0))
-            .flex_none()
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .hover(|style| style.bg(theme.overlay))
-            .child(icon("icons/x.svg", 14.0, theme.text_tertiary))
-            .tooltip(Tooltip::with_shortcut(
-                tr!("right_panel.close_tab", title = tr!("right_panel.files")),
-                crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
-            ))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.set_files_panel_visible(false, cx);
-                window.focus(&this.composer_focus(cx), cx);
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if !event.keystroke.modifiers.modified()
-                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                {
-                    this.set_files_panel_visible(false, cx);
-                    window.focus(&this.composer_focus(cx), cx);
-                    cx.stop_propagation();
-                }
-            }));
-        let header = div()
-            .id("files-panel-header")
-            .tab_group()
-            .tab_stop(false)
-            .h(px(RIGHT_PANEL_HEADER_HEIGHT))
-            .flex_none()
-            .px(px(4.0))
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(sp(12.5))
-                    .child(tr!("right_panel.files")),
-            )
-            .child(close)
-            .children(self.render_client_window_controls(
-                super::window_chrome::WindowControlSide::Right,
-                window,
-                cx,
-            ));
         div()
             .id("files-panel")
             .w(px(width))
@@ -3140,7 +3032,6 @@ impl Waku {
             .border_l_1()
             .border_color(theme.border_strong)
             .bg(theme.surface)
-            .child(self.window_drag_region(header, cx))
             .child(self.render_right_panel_working_tree(selected_path.as_deref(), cx))
             .child(
                 self.render_panel_resize_handle(
@@ -3208,8 +3099,10 @@ impl Waku {
                 .into_any_element(),
             Some(RightPanelSurface::GitGraph) => self.render_git_graph(cx),
             Some(RightPanelSurface::Terminal(terminal_id)) => {
-                let content_height =
-                    (f32::from(window.viewport_size().height) - RIGHT_PANEL_HEADER_HEIGHT).max(0.0);
+                let content_height = (f32::from(window.viewport_size().height)
+                    - WINDOW_HEADER_HEIGHT
+                    - RIGHT_PANEL_HEADER_HEIGHT)
+                    .max(0.0);
                 match self.right_panel_terminal_groups.get(&terminal_id) {
                     Some(group) => {
                         let member = &group.root;
@@ -3260,7 +3153,7 @@ impl Waku {
             .border_color(theme.border_strong)
             .bg(theme.surface)
             .relative()
-            .child(self.render_right_panel_header(window, cx))
+            .child(self.render_right_panel_header(cx))
             .child(body)
             .child(self.render_panel_resize_handle(
                 "right-panel-resize-handle",
@@ -3540,7 +3433,7 @@ impl Waku {
         }
     }
 
-    fn render_right_panel_header(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_right_panel_header(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
         let active_surface = self.right_panel_active_surface;
         let mut tabs = div()
@@ -3700,12 +3593,17 @@ impl Waku {
             .gap(px(6.0))
             .pl(px(10.0))
             .pr(px(14.0))
+            .border_b_1()
+            .border_color(theme.border)
             .child(
                 div()
                     .relative()
                     .h_full()
                     .min_w_0()
                     .flex_1()
+                    .max_w(px(
+                        self.right_panel_surfaces.len() as f32 * 180.0 + TAB_SCROLL_FADE_WIDTH
+                    ))
                     .overflow_hidden()
                     .child(tabs)
                     .when_some(self.right_panel_pending_tab_reveal, |element, tab_index| {
@@ -3773,6 +3671,8 @@ impl Waku {
             );
         }
 
+        header = header.child(div().flex_1());
+
         // Splitting mirrors the bottom panel's tab strip: the buttons act on
         // the pane the user is looking at, and only a terminal tab has panes
         // to split.
@@ -3790,20 +3690,7 @@ impl Waku {
                 header.child(self.render_right_panel_split_buttons(terminal_id, pane, theme, cx));
         }
 
-        self.window_drag_region(
-            header.child(self.render_right_panel_toggle(cx)).children(
-                (!self.files_panel_visible)
-                    .then(|| {
-                        self.render_client_window_controls(
-                            super::window_chrome::WindowControlSide::Right,
-                            window,
-                            cx,
-                        )
-                    })
-                    .flatten(),
-            ),
-            cx,
-        )
+        header
     }
 
     /// The split buttons for the active terminal tab — the same pair, order,
@@ -4369,7 +4256,7 @@ impl Waku {
             .flex_col()
             .child(
                 div()
-                    .h(px(42.0))
+                    .h(px(PANEL_TOOLBAR_HEIGHT))
                     .flex_none()
                     .px(px(16.0))
                     .flex()
@@ -4758,7 +4645,7 @@ impl Waku {
             .flex_col()
             .child(
                 div()
-                    .h(px(42.0))
+                    .h(px(PANEL_TOOLBAR_HEIGHT))
                     .flex_none()
                     .px(px(16.0))
                     .flex()

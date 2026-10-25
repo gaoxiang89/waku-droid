@@ -97,9 +97,16 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
         .ancestors()
         .find(|candidate| candidate.file_name().is_some_and(|name| name == "debug"))
     {
-        let external = debug_directory.join(&executable);
-        if external.is_file() {
-            return Ok(external);
+        // Match scripts/dev.ts: its rebuild target is the feature-gated
+        // debug daemon. A stale regular daemon may also live beside it.
+        for name in [
+            format!("waku-debug-daemon{}", std::env::consts::EXE_SUFFIX),
+            executable.clone(),
+        ] {
+            let external = debug_directory.join(name);
+            if external.is_file() {
+                return Ok(external);
+            }
         }
     }
 

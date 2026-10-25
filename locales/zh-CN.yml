@@ -1287,3 +1287,6 @@ remote_folder.loading: 正在加载…
 remote_folder.invalid_response: 守护进程返回了无效的目录列表
 remote_folder.cancel: 取消
 remote_folder.add: 添加项目
+
+git_graph.back_to_history: 返回历史
+git_graph.changed_files_count: '变更文件（%{count}）'

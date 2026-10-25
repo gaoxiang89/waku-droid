@@ -20,7 +20,7 @@ const DIALOG_FIELD_CONTEXT: &str = "GitGraphDialog > TextInput";
 /// Rows drawn for one expanded file. The detail pane is not virtualized, so a
 /// generated file must not turn into thousands of elements per frame.
 const MAX_INLINE_LINES: usize = 800;
-const FILE_ROW_HEIGHT: f32 = 22.0;
+const FILE_ROW_HEIGHT: f32 = 30.0;
 
 actions!(
     waku_git_graph_dialog,
@@ -41,8 +41,8 @@ pub(super) fn init(cx: &mut App) {
 
 /// A parsed, syntax-tokenized patch for one file, built off the UI thread.
 pub(super) struct InlineDiff {
-    lines: Vec<crate::review_diff::Line>,
-    truncated: bool,
+    pub(super) lines: Vec<crate::review_diff::Line>,
+    pub(super) truncated: bool,
 }
 
 type FileDiffKey = (PanelScope, GitDiffSpec, String);
@@ -63,7 +63,7 @@ pub(super) struct GitGraphUi {
     dialog: Option<GitGraphDialog>,
     name_input: Entity<TextInput>,
     message_input: Entity<TextInput>,
-    selection: TranscriptSelection,
+    pub(super) selection: TranscriptSelection,
     pending: bool,
 }
 
@@ -306,7 +306,7 @@ impl Waku {
 
     /// Called once per detail render: a different spec closes every file
     /// opened for the previous one.
-    fn sync_git_graph_expanded(&mut self, scope: &PanelScope, spec: &GitDiffSpec) {
+    pub(super) fn sync_git_graph_expanded(&mut self, scope: &PanelScope, spec: &GitDiffSpec) {
         let current = self
             .git_graph_ui
             .expanded_spec
@@ -320,6 +320,10 @@ impl Waku {
     }
 
     fn toggle_git_graph_file(&mut self, file: String, cx: &mut Context<Self>) {
+        if self.git_commit_page_open() {
+            self.select_git_commit_path(&file, cx);
+            return;
+        }
         if !self.git_graph_ui.expanded.remove(&file) {
             self.git_graph_ui.expanded.insert(file);
         } else {
@@ -347,7 +351,7 @@ impl Waku {
         }
     }
 
-    fn git_graph_file_diff(
+    pub(super) fn git_graph_file_diff(
         &mut self,
         scope: &PanelScope,
         spec: &GitDiffSpec,
@@ -584,7 +588,7 @@ impl Waku {
         )
     }
 
-    fn render_git_graph_commit_header(
+    pub(super) fn render_git_graph_commit_header(
         &self,
         mut body: Stateful<Div>,
         commit: &waku_client::git::GitGraphCommit,
@@ -664,7 +668,7 @@ impl Waku {
         list
     }
 
-    fn render_git_graph_file_row(
+    pub(super) fn render_git_graph_file_row(
         &self,
         position: usize,
         file: &GitGraphFile,
@@ -717,13 +721,17 @@ impl Waku {
             .when(open, |element| element.bg(theme.overlay))
             .hover(|element| element.bg(theme.overlay))
             .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .tooltip(Tooltip::text(if open {
+            .tooltip(Tooltip::text(if self.git_commit_page_open() {
+                label.clone()
+            } else if open {
                 tr!("git_graph.hide_diff")
             } else {
                 tr!("git_graph.show_diff")
             }))
             .child(icon(
-                if open {
+                if self.git_commit_page_open() {
+                    "icons/file.svg"
+                } else if open {
                     "icons/chevron-down.svg"
                 } else {
                     "icons/chevron-right.svg"
@@ -1394,7 +1402,7 @@ impl Waku {
                 MenuItem::new(tr!("git_graph.menu.view_changes"), move |window, cx| {
                     let _ = weak.update(cx, |this, cx| {
                         this.clear_git_graph_compare();
-                        this.focus_git_graph_row(index, cx);
+                        this.open_git_graph_row(index, cx);
                         window.focus(&this.git_graph_focus, cx);
                     });
                 })

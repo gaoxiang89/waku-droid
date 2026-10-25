@@ -243,7 +243,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_files_panel(self.effective_files_panel_width(window), window, cx)
+        self.render_files_panel(self.effective_files_panel_width(window), cx)
             .into_any_element()
     }
 
@@ -392,133 +392,144 @@ impl Render for Waku {
             .size_full()
             .relative()
             .flex()
+            .flex_col()
             .text_color(theme.text)
             .font_family(".SystemUIFont")
-            // Both panels slide through a container that narrows while their
-            // content keeps its full width and is clipped: the sidebar list
-            // and the right panel's surfaces never reflow on the way in or
-            // out, and their bounds stay put so only the clip moves.
-            .when(panels.sidebar > 0.0, |root| {
-                root.child(
-                    div()
-                        .h_full()
-                        .flex_none()
-                        .w(px(panels.sidebar))
-                        .when(panels.sidebar_sliding, |element| element.overflow_hidden())
-                        .child(
-                            self.sidebar_pane.clone().cached(
-                                StyleRefinement::default()
-                                    .w(px(panels.sidebar_content))
-                                    .h_full()
-                                    .flex_none(),
-                            ),
-                        ),
-                )
-            })
+            .child(self.render_header(window, cx))
             .child(
                 div()
                     .flex_1()
-                    .h_full()
-                    .min_w_0()
+                    .min_h_0()
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .bg(theme.surface)
-                    .when(panels.sidebar > 0.0, |element| {
-                        element.border_l_1().border_color(theme.sidebar_border)
+                    // Both panels slide through a container that narrows while their
+                    // content keeps its full width and is clipped: the sidebar list
+                    // and the right panel's surfaces never reflow on the way in or
+                    // out, and their bounds stay put so only the clip moves.
+                    .when(panels.sidebar > 0.0, |root| {
+                        root.child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .w(px(panels.sidebar))
+                                .when(panels.sidebar_sliding, |element| element.overflow_hidden())
+                                .child(
+                                    self.sidebar_pane.clone().cached(
+                                        StyleRefinement::default()
+                                            .w(px(panels.sidebar_content))
+                                            .h_full()
+                                            .flex_none(),
+                                    ),
+                                ),
+                        )
                     })
-                    .child(self.render_header(window, cx))
-                    .child(if empty {
-                        self.render_empty_state(cx).into_any_element()
-                    } else {
-                        self.transcript_pane
-                            .clone()
-                            .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
-                            .into_any_element()
-                    })
-                    .children(permission)
-                    .when(self.selected_project().is_some(), |element| {
-                        element
-                            .children(self.render_queued_messages(cx))
-                            .child(self.render_composer(window, cx))
-                            // The bottom panel sits between the composer and
-                            // the workspace footer. It slides through the same
-                            // narrowing-container trick as the side panels,
-                            // flipped: the content stays pinned to the column's
-                            // bottom edge and only the clip moves.
-                            .when(panels.bottom_panel > 0.0, |element| {
-                                element.child(
-                                    div()
-                                        .w_full()
-                                        .flex_none()
-                                        .h(px(panels.bottom_panel))
-                                        .relative()
-                                        .when(panels.bottom_panel_sliding, |element| {
-                                            element.overflow_hidden()
-                                        })
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .bottom_0()
-                                                .left_0()
-                                                .w_full()
-                                                .h(px(panels.bottom_panel_content))
-                                                .child(self.render_bottom_panel(
-                                                    panels.bottom_panel_content,
-                                                    self.chat_viewport_width(window),
-                                                    window,
-                                                    cx,
-                                                )),
-                                        ),
-                                )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .bg(theme.surface)
+                            .when(panels.sidebar > 0.0, |element| {
+                                element.border_l_1().border_color(theme.sidebar_border)
                             })
-                            .child(self.render_workspace_footer(cx))
+                            .child(self.render_conversation_toolbar(cx))
+                            .child(if empty {
+                                self.render_empty_state(cx).into_any_element()
+                            } else {
+                                self.transcript_pane
+                                    .clone()
+                                    .cached(
+                                        StyleRefinement::default().flex_1().min_h(px(0.0)).w_full(),
+                                    )
+                                    .into_any_element()
+                            })
+                            .children(permission)
+                            .when(self.selected_project().is_some(), |element| {
+                                element
+                                    .children(self.render_queued_messages(cx))
+                                    .child(self.render_composer(window, cx))
+                                    // The bottom panel sits between the composer and
+                                    // the workspace footer. It slides through the same
+                                    // narrowing-container trick as the side panels,
+                                    // flipped: the content stays pinned to the column's
+                                    // bottom edge and only the clip moves.
+                                    .when(panels.bottom_panel > 0.0, |element| {
+                                        element.child(
+                                            div()
+                                                .w_full()
+                                                .flex_none()
+                                                .h(px(panels.bottom_panel))
+                                                .relative()
+                                                .when(panels.bottom_panel_sliding, |element| {
+                                                    element.overflow_hidden()
+                                                })
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .bottom_0()
+                                                        .left_0()
+                                                        .w_full()
+                                                        .h(px(panels.bottom_panel_content))
+                                                        .child(self.render_bottom_panel(
+                                                            panels.bottom_panel_content,
+                                                            self.chat_viewport_width(window),
+                                                            window,
+                                                            cx,
+                                                        )),
+                                                ),
+                                        )
+                                    })
+                                    .child(self.render_workspace_footer(cx))
+                            })
+                            .relative()
+                            .children(toast)
+                            .when(self.sidebar_visible, |element| {
+                                element.child(self.render_panel_resize_handle(
+                                    "sidebar-resize-handle",
+                                    PanelResizeTarget::Sidebar,
+                                    cx,
+                                ))
+                            }),
+                    )
+                    .when(panels.right_panel > 0.0, |root| {
+                        root.child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .w(px(panels.right_panel))
+                                .flex()
+                                .relative()
+                                .when(panels.right_panel_sliding, |element| {
+                                    element.overflow_hidden()
+                                })
+                                // Pinned to the window's right edge, so the panel is
+                                // uncovered from that edge inward rather than dragged
+                                // across the screen.
+                                .child(
+                                    self.right_panel_pane.clone().cached(
+                                        StyleRefinement::default()
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .w(px(panels.right_panel_content))
+                                            .h_full(),
+                                    ),
+                                ),
+                        )
                     })
-                    .relative()
-                    .children(toast)
-                    .when(self.sidebar_visible, |element| {
-                        element.child(self.render_panel_resize_handle(
-                            "sidebar-resize-handle",
-                            PanelResizeTarget::Sidebar,
-                            cx,
-                        ))
+                    .when(panels.files_panel > 0.0, |root| {
+                        root.child(
+                            self.files_panel_pane.clone().cached(
+                                StyleRefinement::default()
+                                    .w(px(panels.files_panel))
+                                    .h_full()
+                                    .flex_none(),
+                            ),
+                        )
                     }),
             )
-            .when(panels.right_panel > 0.0, |root| {
-                root.child(
-                    div()
-                        .h_full()
-                        .flex_none()
-                        .w(px(panels.right_panel))
-                        .flex()
-                        .relative()
-                        .when(panels.right_panel_sliding, |element| {
-                            element.overflow_hidden()
-                        })
-                        // Pinned to the window's right edge, so the panel is
-                        // uncovered from that edge inward rather than dragged
-                        // across the screen.
-                        .child(
-                            self.right_panel_pane.clone().cached(
-                                StyleRefinement::default()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .w(px(panels.right_panel_content))
-                                    .h_full(),
-                            ),
-                        ),
-                )
-            })
-            .when(panels.files_panel > 0.0, |root| {
-                root.child(
-                    self.files_panel_pane.clone().cached(
-                        StyleRefinement::default()
-                            .w(px(panels.files_panel))
-                            .h_full()
-                            .flex_none(),
-                    ),
-                )
-            })
             .children(computer_use)
             .children(command_palette)
             .children(commit_dialog)
