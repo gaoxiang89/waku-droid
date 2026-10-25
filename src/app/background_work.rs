@@ -279,18 +279,6 @@ impl BackgroundWorkRegistry {
             .any(|item| item.background && item.status.is_live())
     }
 
-    fn counts(&self) -> (usize, usize) {
-        self.items
-            .values()
-            .filter(|item| item.status.is_live())
-            .fold((0, 0), |(processes, agents), item| match item.key.kind {
-                BackgroundWorkKind::Subagent => (processes, agents + 1),
-                BackgroundWorkKind::Process | BackgroundWorkKind::Monitor => {
-                    (processes + 1, agents)
-                }
-            })
-    }
-
     pub(super) fn selected_text(&self) -> Option<String> {
         self.selection.selection.borrow().selected_text()
     }
@@ -528,13 +516,6 @@ impl Waku {
         self.background_work
             .get(&session_id)
             .is_some_and(BackgroundWorkRegistry::has_live_detached)
-    }
-
-    pub(super) fn background_work_counts(&self, session_id: Uuid) -> (usize, usize) {
-        self.background_work
-            .get(&session_id)
-            .map(BackgroundWorkRegistry::counts)
-            .unwrap_or_default()
     }
 
     /// The work keys a session's provider has reported, so a deleted
