@@ -1471,6 +1471,7 @@ pub struct TerminalView {
     /// ctrl+pageup/pagedown cycle the panel's terminals instead of reaching
     /// the shell.
     bottom_panel_tabs: bool,
+    can_split: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1551,6 +1552,7 @@ impl TerminalView {
             needs_attention: false,
             context_menu,
             bottom_panel_tabs: false,
+            can_split: false,
             _subscriptions: subscriptions,
         }
     }
@@ -1586,13 +1588,21 @@ impl TerminalView {
             needs_attention: false,
             context_menu: ContextMenuHandle::new(cx),
             bottom_panel_tabs: true,
+            can_split: true,
             _subscriptions: Vec::new(),
         })
+    }
+
+    /// Enable splitting actions and chords for this terminal.
+    pub fn with_can_split(mut self) -> Self {
+        self.can_split = true;
+        self
     }
 
     /// Let the bottom panel's tab strip own this terminal's chrome.
     pub fn with_bottom_panel_tabs(mut self) -> Self {
         self.bottom_panel_tabs = true;
+        self.can_split = true;
         self
     }
 
@@ -1693,11 +1703,12 @@ impl TerminalView {
         }
 
         // Split, close-pane, and resize chords reach the panel's actions from
-        // the focused pane. Only the bottom panel can split, so other
-        // terminals leave these chords to the shell. The chords stay behind
-        // the composition check: an IME owns its keys while composing.
-        if self.bottom_panel_tabs
-            && let Some(chord) = bottom_panel_pane_chord(keystroke)
+        // the focused pane. Only terminals that live in a split tree claim
+        // them, so other terminals leave these chords to the shell. The
+        // chords stay behind the composition check: an IME owns its keys
+        // while composing.
+        if self.can_split
+            && let Some(chord) = terminal_pane_chord(keystroke)
         {
             match chord {
                 PaneChord::SplitRight => cx.dispatch_action(&crate::SplitTerminalRight),
@@ -2602,6 +2613,7 @@ impl Render for TerminalView {
                     .as_ref()
                     .is_some_and(clipboard_has_paste_content);
                 let has_session = context_terminal.read(cx).session.is_some();
+                let can_split = context_terminal.read(cx).can_split;
                 let bottom_panel_tabs = context_terminal.read(cx).bottom_panel_tabs;
 
                 let copy_terminal = context_terminal.clone();
@@ -2634,7 +2646,7 @@ impl Render for TerminalView {
                     })
                     .disabled(!has_session),
                 ];
-                if bottom_panel_tabs {
+                if bottom_panel_tabs || can_split {
                     let split_right_terminal = context_terminal.clone();
                     let split_down_terminal = context_terminal.clone();
                     let close_pane_terminal = context_terminal.clone();
@@ -3188,7 +3200,7 @@ fn scrollback_line_number(line: i32, history: usize) -> usize {
     line.saturating_add(history).saturating_add(1).max(1) as usize
 }
 
-/// A split, close, or resize chord for the bottom panel's pane tree.
+/// A split, close, or resize chord for a terminal pane tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneChord {
     SplitRight,
@@ -3207,7 +3219,7 @@ enum PaneChord {
 /// and shift+- as `_`, both without a shift modifier. Only that platform may
 /// treat the unshifted `+`/`_` as the chord; on other layouts they are plain
 /// shell input. Everywhere, the unshifted `=` and `-` stay with the shell.
-fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
+fn terminal_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
     let modifiers = keystroke.modifiers;
     if modifiers.function {
         return None;
@@ -3260,7 +3272,7 @@ fn bottom_panel_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
 }
 
 /// The keymap sources every pane chord is bound to, kept next to
-/// `bottom_panel_pane_chord` — the chord a keydown dispatches must stay in
+/// `terminal_pane_chord` — the chord a keydown dispatches must stay in
 /// step with the binding that claims the same keystroke.
 const PANE_CHORD_SOURCES: &[(&str, PaneChord)] = &[
     ("secondary-shift-d", PaneChord::SplitRight),
@@ -3275,10 +3287,11 @@ const PANE_CHORD_SOURCES: &[(&str, PaneChord)] = &[
     ("alt-shift-down", PaneChord::ResizeDown),
 ];
 
+pub(crate) const TERMINAL_PANE_CONTEXT: &str = "TerminalPane";
 pub(crate) const BOTTOM_PANEL_TERMINAL_CONTEXT: &str = "BottomPanelTerminal";
 
-/// The keymap bindings for the pane chords, on the bottom panel's key
-/// context so terminals elsewhere never match them.
+/// The keymap bindings for the pane chords, on the terminal pane key
+/// context so terminals outside a splittable pane never match them.
 pub(crate) fn pane_chord_bindings() -> Vec<KeyBinding> {
     let mut bindings = PANE_CHORD_SOURCES
         .iter()
@@ -3295,7 +3308,7 @@ pub(crate) fn pane_chord_bindings() -> Vec<KeyBinding> {
 }
 
 fn pane_chord_binding(source: &str, chord: PaneChord) -> KeyBinding {
-    let context = Some(BOTTOM_PANEL_TERMINAL_CONTEXT);
+    let context = Some(TERMINAL_PANE_CONTEXT);
     match chord {
         PaneChord::SplitRight => KeyBinding::new(source, crate::SplitTerminalRight, context),
         PaneChord::SplitDown => KeyBinding::new(source, crate::SplitTerminalDown, context),
@@ -3734,6 +3747,7 @@ fn terminal_rgb(index: usize, is_dark: bool) -> Rgb {
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_pane_chord as bottom_panel_pane_chord;
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::vte::ansi::Processor;
@@ -3921,6 +3935,7 @@ mod tests {
                 needs_attention: false,
                 context_menu: ContextMenuHandle::new(cx),
                 bottom_panel_tabs: true,
+                can_split: true,
                 _subscriptions: Vec::new(),
             });
             view.update(cx, |view, cx| {
@@ -4082,6 +4097,7 @@ mod tests {
                 needs_attention: false,
                 context_menu: ContextMenuHandle::new(cx),
                 bottom_panel_tabs: false,
+                can_split: false,
                 _subscriptions: Vec::new(),
             });
             view.update(cx, |view, cx| {
@@ -5030,15 +5046,13 @@ mod tests {
                 "{source}"
             );
         }
-        // And every binding lands on the bottom panel's own key context.
+        // And every binding lands on the terminal pane key context.
         for binding in pane_chord_bindings() {
             let context = binding
                 .predicate()
                 .expect("pane chord bindings are context-scoped");
             assert!(
-                context.eval(&[
-                    KeyContext::parse(BOTTOM_PANEL_TERMINAL_CONTEXT).expect("valid context")
-                ])
+                context.eval(&[KeyContext::parse(TERMINAL_PANE_CONTEXT).expect("valid context")])
             );
         }
     }

@@ -5,6 +5,7 @@
 //! same numbers.
 
 use gpui::{Axis, Entity, EntityId};
+use uuid::Uuid;
 
 use crate::terminal::TerminalView;
 
@@ -83,11 +84,17 @@ pub(crate) struct PaneSize {
     pub(crate) height: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitTarget {
+    Bottom(usize),
+    Right(Uuid),
+}
+
 /// State of a divider drag, held by `Waku` between the divider's mouse-down
 /// and the next left mouse-up anywhere.
 #[derive(Clone)]
 pub(crate) struct SplitDividerDrag {
-    pub(crate) group_index: usize,
+    pub(crate) target: SplitTarget,
     /// Path of member indexes from the root to the axis owning the divider;
     /// empty addresses the root when the root is an axis.
     pub(crate) path: Vec<usize>,
@@ -106,7 +113,7 @@ impl SplitDividerDrag {
     /// drag start, from the same mirrored arithmetic that sizes their grids.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        group_index: usize,
+        target: SplitTarget,
         path: Vec<usize>,
         divider_after: usize,
         axis: Axis,
@@ -117,7 +124,7 @@ impl SplitDividerDrag {
         space_per_flex: f32,
     ) -> Self {
         Self {
-            group_index,
+            target,
             path,
             divider_after,
             axis,
@@ -382,6 +389,10 @@ impl SplitGroup {
             root: SplitMember::Pane(terminal),
             active_pane: None,
         }
+    }
+
+    pub(crate) fn first_pane(&self) -> Option<Entity<TerminalView>> {
+        self.root.first_pane()
     }
 
     pub(crate) fn pane_count(&self) -> usize {
@@ -671,7 +682,7 @@ mod tests {
     #[test]
     fn divider_drag_transfers_flex_within_min_pane_bounds() {
         let drag = SplitDividerDrag::new(
-            0,
+            SplitTarget::Bottom(0),
             Vec::new(),
             0,
             Axis::Horizontal,

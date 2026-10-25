@@ -50,6 +50,9 @@ pub fn init(cx: &mut App) {
 
 pub(super) const TAB_SCROLL_FADE_WIDTH: f32 = 24.0;
 const REVIEW_DIFF_FILE_HEADER_HEIGHT: f32 = 36.0;
+/// The tab strip above every right panel surface. Terminal panes size their
+/// grids from the room left below it.
+const RIGHT_PANEL_HEADER_HEIGHT: f32 = 48.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WorkingTreeEntry {
@@ -2406,7 +2409,7 @@ impl Waku {
         } else {
             for surface in &state.surfaces {
                 if let Some(terminal_id) = surface.terminal_id() {
-                    self.right_panel_terminals.remove(&terminal_id);
+                    self.right_panel_terminal_groups.remove(&terminal_id);
                 }
                 if let Some(browser_id) = surface.browser_id() {
                     self.right_panel_browsers.remove(&browser_id);
@@ -2721,7 +2724,7 @@ impl Waku {
             return;
         }
         if let Some(terminal_id) = self.right_panel_surfaces[index].terminal_id() {
-            self.right_panel_terminals.remove(&terminal_id);
+            self.right_panel_terminal_groups.remove(&terminal_id);
         }
         if let Some(browser_id) = self.right_panel_surfaces[index].browser_id() {
             self.right_panel_browsers.remove(&browser_id);
@@ -2895,11 +2898,13 @@ impl Waku {
     }
 
     fn right_panel_terminal_needs_attention(&self, terminal_id: Uuid, cx: &App) -> bool {
-        self.right_panel_terminals
+        self.right_panel_terminal_groups
             .get(&terminal_id)
-            .is_some_and(|terminal| {
-                let terminal = terminal.read(cx);
-                !terminal.exited() && terminal.needs_attention()
+            .is_some_and(|group| {
+                group.panes().iter().any(|pane| {
+                    let terminal = pane.read(cx);
+                    !terminal.exited() && terminal.needs_attention()
+                })
             })
     }
 
@@ -3055,7 +3060,10 @@ impl Waku {
             .and_then(RightPanelSurface::terminal_id);
         if self.right_panel_pending_terminal_focus == active_terminal_id
             && let Some(terminal_id) = active_terminal_id
-            && let Some(terminal) = self.right_panel_terminals.get(&terminal_id)
+            && let Some(terminal) = self
+                .right_panel_terminal_groups
+                .get(&terminal_id)
+                .and_then(SplitGroup::active_or_first)
         {
             let focus_handle = terminal.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
@@ -3073,22 +3081,31 @@ impl Waku {
                 .render_right_panel_diff(width, window, cx)
                 .into_any_element(),
             Some(RightPanelSurface::GitGraph) => self.render_git_graph(cx),
-            Some(RightPanelSurface::Terminal(terminal_id)) => self
-                .right_panel_terminals
-                .get(&terminal_id)
-                .cloned()
-                .inspect(|terminal| {
-                    terminal.update(cx, |terminal, _| terminal.set_panel_width(width));
-                })
-                .map(IntoElement::into_any_element)
-                .unwrap_or_else(|| {
-                    self.render_right_panel_empty_message(
-                        tr!("right_panel.terminal_unavailable"),
-                        tr!("right_panel.terminal_unavailable_description"),
-                        cx,
-                    )
-                    .into_any_element()
-                }),
+            Some(RightPanelSurface::Terminal(terminal_id)) => {
+                let content_height =
+                    (f32::from(window.viewport_size().height) - RIGHT_PANEL_HEADER_HEIGHT).max(0.0);
+                match self.right_panel_terminal_groups.get(&terminal_id) {
+                    Some(group) => {
+                        let member = &group.root;
+                        self.render_terminal_split(
+                            SplitTarget::Right(terminal_id),
+                            member,
+                            1.0,
+                            width,
+                            content_height,
+                            &[],
+                            cx,
+                        )
+                    }
+                    None => self
+                        .render_right_panel_empty_message(
+                            tr!("right_panel.terminal_unavailable"),
+                            tr!("right_panel.terminal_unavailable_description"),
+                            cx,
+                        )
+                        .into_any_element(),
+                }
+            }
             Some(RightPanelSurface::File(path)) => self
                 .render_right_panel_file(path, width, window, cx)
                 .into_any_element(),
@@ -3226,25 +3243,147 @@ impl Waku {
             .selected_workspace_path()
             .map(std::path::Path::to_path_buf)
         else {
-            self.right_panel_terminals.remove(&terminal_id);
+            self.right_panel_terminal_groups.remove(&terminal_id);
             return;
         };
         let matches_project = self
-            .right_panel_terminals
+            .right_panel_terminal_groups
             .get(&terminal_id)
+            .and_then(SplitGroup::first_pane)
             .is_some_and(|terminal| terminal.read(cx).working_directory() == working_directory);
         if !matches_project {
-            // A desktop PTY would interpret a remote daemon's working
-            // directory on the wrong machine, so remote windows run the shell
-            // on the daemon host.
-            let launcher = if self.selected_daemon().is_remote() {
-                crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
-            } else {
-                crate::terminal::TerminalLauncher::Local
-            };
-            let terminal = cx.new(|cx| TerminalView::new(working_directory.clone(), launcher, cx));
-            Self::show_terminal_notices(&terminal, cx);
-            self.right_panel_terminals.insert(terminal_id, terminal);
+            let mut group =
+                SplitGroup::single(self.new_right_panel_terminal(&working_directory, cx));
+            if let Some(first) = group.first_pane() {
+                group.set_active(first.entity_id());
+            }
+            self.right_panel_terminal_groups.insert(terminal_id, group);
+        }
+    }
+
+    /// A terminal for a right panel tab. Unlike the bottom panel's, it keeps
+    /// its own toolbar — the right panel's tab strip names the tab, not each
+    /// pane — and tracks the pane the user clicked, so the split chords act
+    /// on the pane being looked at.
+    fn new_right_panel_terminal(
+        &self,
+        working_directory: &Path,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
+        // A desktop PTY would interpret a remote daemon's working directory on
+        // the wrong machine, so remote windows run the shell on the daemon
+        // host.
+        let launcher = if self.selected_daemon().is_remote() {
+            crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
+        } else {
+            crate::terminal::TerminalLauncher::Local
+        };
+        let terminal = cx.new(|cx| {
+            TerminalView::new(working_directory.to_path_buf(), launcher, cx).with_can_split()
+        });
+        cx.subscribe(
+            &terminal,
+            |this, terminal, _: &crate::terminal::TerminalFocused, cx| {
+                let focused = terminal.entity_id();
+                for group in this.right_panel_terminal_groups.values_mut() {
+                    if !group.contains(focused) {
+                        continue;
+                    }
+                    // The tab label names the tracked pane, so only a change
+                    // of the shown pane needs a repaint.
+                    let shown = group.active_or_first().map(|pane| pane.entity_id());
+                    group.set_active(focused);
+                    if shown != Some(focused) {
+                        cx.notify();
+                    }
+                    break;
+                }
+            },
+        )
+        .detach();
+        Self::show_terminal_notices(&terminal, cx);
+        terminal
+    }
+
+    /// Split one right panel tab's pane in two, the way the bottom panel
+    /// does. The new pane takes the focus so consecutive splits stack where
+    /// the user is looking.
+    pub(super) fn split_right_panel_terminal_pane(
+        &mut self,
+        terminal_id: Uuid,
+        pane: &Entity<TerminalView>,
+        axis: Axis,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(working_directory) = self
+            .selected_workspace_path()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let can_split = self
+            .right_panel_terminal_groups
+            .get(&terminal_id)
+            .is_some_and(|group| {
+                group.pane_count() < MAX_SPLIT_PANES && group.contains(pane.entity_id())
+            });
+        if !can_split {
+            return;
+        }
+        let new_pane = self.new_right_panel_terminal(&working_directory, cx);
+        let Some(group) = self.right_panel_terminal_groups.get_mut(&terminal_id) else {
+            return;
+        };
+        if !group.split_pane(pane.entity_id(), new_pane, axis) {
+            return;
+        }
+        self.right_panel_pending_terminal_focus = Some(terminal_id);
+        cx.notify();
+    }
+
+    /// Close one pane of a right panel tab. Closing the last pane closes the
+    /// tab, the way the bottom panel closes the tab with its last pane.
+    pub(super) fn close_right_panel_terminal_pane(
+        &mut self,
+        terminal_id: Uuid,
+        pane: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let removed = self
+            .right_panel_terminal_groups
+            .get_mut(&terminal_id)
+            .map(|group| group.remove_pane(pane.entity_id()));
+        match removed {
+            Some(true) => {
+                self.right_panel_pending_terminal_focus = Some(terminal_id);
+                cx.notify();
+            }
+            _ => {
+                if let Some(index) = self
+                    .right_panel_surfaces
+                    .iter()
+                    .position(|surface| surface.terminal_id() == Some(terminal_id))
+                {
+                    self.close_right_panel_surface(index, cx);
+                }
+            }
+        }
+    }
+
+    /// Resize one split pane along the chosen direction.
+    pub(super) fn resize_right_panel_terminal_pane(
+        &mut self,
+        terminal_id: Uuid,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .right_panel_terminal_groups
+            .get_mut(&terminal_id)
+            .is_some_and(|group| group.resize_pane(pane.entity_id(), direction))
+        {
+            cx.notify();
         }
     }
 
@@ -3268,7 +3407,7 @@ impl Waku {
                     }),
             )
             .collect::<HashSet<_>>();
-        self.right_panel_terminals
+        self.right_panel_terminal_groups
             .retain(|terminal_id, _| retained_terminal_ids.contains(terminal_id));
         for terminal_id in active_terminal_ids {
             self.ensure_right_panel_terminal(terminal_id, cx);
@@ -3294,7 +3433,7 @@ impl Waku {
             let needs_attention = surface
                 .terminal_id()
                 .is_some_and(|id| self.right_panel_terminal_needs_attention(id, cx));
-            let label = SharedString::from(match &surface {
+            let mut label = match &surface {
                 // Browser tabs read like browser tabs: the page title once
                 // known, the address until then.
                 RightPanelSurface::Browser(browser_id) => self
@@ -3305,7 +3444,17 @@ impl Waku {
                 _ => {
                     right_panel_tab_label(&surface, self.right_panel_files_selected_path.as_deref())
                 }
-            });
+            };
+            // A split terminal tab names how many panes it holds, as the
+            // bottom panel's tabs do.
+            let pane_count = surface
+                .terminal_id()
+                .and_then(|id| self.right_panel_terminal_groups.get(&id))
+                .map_or(0, SplitGroup::pane_count);
+            if pane_count > 1 {
+                label.push_str(&format!(" · {pane_count}"));
+            }
+            let label = SharedString::from(label);
             let icon_path =
                 right_panel_tab_icon(&surface, self.right_panel_files_selected_path.as_deref());
             let uses_file_icon = matches!(&surface, RightPanelSurface::File(_))
@@ -3418,7 +3567,7 @@ impl Waku {
 
         let mut header = div()
             .id("right-panel-header")
-            .h(px(48.0))
+            .h(px(RIGHT_PANEL_HEADER_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
@@ -3499,6 +3648,23 @@ impl Waku {
             );
         }
 
+        // Splitting mirrors the bottom panel's tab strip: the buttons act on
+        // the pane the user is looking at, and only a terminal tab has panes
+        // to split.
+        if let Some((terminal_id, pane)) = self
+            .active_right_panel_surface()
+            .and_then(RightPanelSurface::terminal_id)
+            .and_then(|terminal_id| {
+                self.right_panel_terminal_groups
+                    .get(&terminal_id)
+                    .and_then(SplitGroup::active_or_first)
+                    .map(|pane| (terminal_id, pane))
+            })
+        {
+            header =
+                header.child(self.render_right_panel_split_buttons(terminal_id, pane, theme, cx));
+        }
+
         self.window_drag_region(
             header.child(self.render_right_panel_toggle(cx)).children(
                 self.render_client_window_controls(
@@ -3509,6 +3675,64 @@ impl Waku {
             ),
             cx,
         )
+    }
+
+    /// The split buttons for the active terminal tab — the same pair, order,
+    /// and shortcuts as the bottom panel's tab strip. Both act on the tracked
+    /// pane, so consecutive splits stack where the user is looking.
+    fn render_right_panel_split_buttons(
+        &self,
+        terminal_id: Uuid,
+        pane: Entity<TerminalView>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let down_pane = pane.clone();
+        div()
+            .id("right-panel-terminal-splits")
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                icon_button("split-right-panel-terminal", "icons/split.svg", theme)
+                    .tooltip(Tooltip::with_shortcut(
+                        tr!("bottom_panel.split_right"),
+                        crate::platform::primary_shortcut("⇧⌘D", "Ctrl+Shift+D"),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.split_right_panel_terminal_pane(
+                            terminal_id,
+                            &pane,
+                            Axis::Horizontal,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                icon_button(
+                    "split-down-right-panel-terminal",
+                    "icons/panel-bottom.svg",
+                    theme,
+                )
+                .tooltip(Tooltip::with_shortcut(
+                    tr!("bottom_panel.split_down"),
+                    crate::platform::primary_shortcut("⇧⌥-", "Shift+Alt+-"),
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.split_right_panel_terminal_pane(
+                        terminal_id,
+                        &down_pane,
+                        Axis::Vertical,
+                        cx,
+                    );
+                })),
+            )
     }
 
     fn render_right_panel_chooser(&self, cx: &mut Context<Self>) -> Stateful<Div> {

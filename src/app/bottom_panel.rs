@@ -128,8 +128,8 @@ impl Waku {
             Some(group_index) => {
                 let content_height = (height - BOTTOM_PANEL_TAB_STRIP_HEIGHT).max(0.0);
                 let member = &self.bottom_panel_terminal_groups[group_index].root;
-                let splits = self.render_bottom_panel_split(
-                    group_index,
+                let splits = self.render_terminal_split(
+                    SplitTarget::Bottom(group_index),
                     member,
                     1.0,
                     width,
@@ -139,6 +139,7 @@ impl Waku {
                 );
                 div()
                     .id("bottom-panel-body")
+                    .key_context(crate::terminal::BOTTOM_PANEL_TERMINAL_CONTEXT)
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -172,14 +173,16 @@ impl Waku {
             .child(self.render_bottom_panel_resize_handle(cx))
     }
 
-    /// The active tab's split tree. Pane wrappers carry the split and close
-    /// actions so they run against the focused pane — the key chords only
-    /// reach the keymap from a bottom-panel terminal, and the action rides
-    /// the same focus path back down.
+    /// One tab's split tree, shared by both panels: the bottom panel's tab
+    /// strip and the right panel's terminal tabs draw the same tree. Pane
+    /// wrappers carry the split and close actions so they run against the
+    /// focused pane — the key chords only reach the keymap from a terminal
+    /// inside `target`'s context, and the action rides the same focus path
+    /// back down.
     #[allow(clippy::too_many_arguments)]
-    fn render_bottom_panel_split(
+    pub(super) fn render_terminal_split(
         &self,
-        group_index: usize,
+        target: SplitTarget,
         member: &SplitMember,
         flex: f32,
         width: f32,
@@ -205,14 +208,14 @@ impl Waku {
                 let resize_down_pane = terminal.clone();
                 div()
                     .id(SharedString::from(format!(
-                        "bottom-panel-pane-{:?}",
+                        "terminal-pane-{:?}",
                         terminal.entity_id()
                     )))
                     // The split/close/resize chords are bound to this context
-                    // (see `pane_chord_bindings`); the right panel's terminals
-                    // only carry `Terminal`, so these chords stay available
-                    // there for the shell.
-                    .key_context(crate::terminal::BOTTOM_PANEL_TERMINAL_CONTEXT)
+                    // (see `pane_chord_bindings`). Every panel's panes share
+                    // it; the listener below routes the action back to the
+                    // panel and pane it was rendered for.
+                    .key_context(crate::terminal::TERMINAL_PANE_CONTEXT)
                     .relative()
                     .overflow_hidden()
                     .flex_grow(flex)
@@ -221,20 +224,26 @@ impl Waku {
                     .min_h_0()
                     .child(terminal.clone())
                     .on_action(cx.listener(move |this, _: &SplitTerminalRight, _, cx| {
-                        this.split_bottom_panel_pane(&split_right_pane, Axis::Horizontal, cx);
+                        this.split_terminal_pane(target, &split_right_pane, Axis::Horizontal, cx);
                     }))
                     .on_action(cx.listener(move |this, _: &SplitTerminalDown, _, cx| {
-                        this.split_bottom_panel_pane(&split_down_pane, Axis::Vertical, cx);
+                        this.split_terminal_pane(target, &split_down_pane, Axis::Vertical, cx);
                     }))
                     .on_action(cx.listener(move |this, _: &CloseTerminalPane, _, cx| {
-                        this.close_bottom_panel_pane(&close_pane, cx);
+                        this.close_terminal_pane(target, &close_pane, cx);
                     }))
                     .on_action(cx.listener(move |this, _: &ResizeTerminalPaneLeft, _, cx| {
-                        this.resize_bottom_panel_pane(&resize_left_pane, ResizeDirection::Left, cx);
+                        this.resize_terminal_pane(
+                            target,
+                            &resize_left_pane,
+                            ResizeDirection::Left,
+                            cx,
+                        );
                     }))
                     .on_action(
                         cx.listener(move |this, _: &ResizeTerminalPaneRight, _, cx| {
-                            this.resize_bottom_panel_pane(
+                            this.resize_terminal_pane(
+                                target,
                                 &resize_right_pane,
                                 ResizeDirection::Right,
                                 cx,
@@ -242,10 +251,15 @@ impl Waku {
                         }),
                     )
                     .on_action(cx.listener(move |this, _: &ResizeTerminalPaneUp, _, cx| {
-                        this.resize_bottom_panel_pane(&resize_up_pane, ResizeDirection::Up, cx);
+                        this.resize_terminal_pane(target, &resize_up_pane, ResizeDirection::Up, cx);
                     }))
                     .on_action(cx.listener(move |this, _: &ResizeTerminalPaneDown, _, cx| {
-                        this.resize_bottom_panel_pane(&resize_down_pane, ResizeDirection::Down, cx);
+                        this.resize_terminal_pane(
+                            target,
+                            &resize_down_pane,
+                            ResizeDirection::Down,
+                            cx,
+                        );
                     }))
                     .into_any_element()
             }
@@ -279,8 +293,8 @@ impl Waku {
                     let mut child_path = path.to_vec();
                     child_path.push(index);
                     if index > 0 {
-                        container = container.child(self.render_bottom_panel_divider(
-                            group_index,
+                        container = container.child(self.render_terminal_split_divider(
+                            target,
                             path.to_vec(),
                             index - 1,
                             axis.axis,
@@ -290,8 +304,8 @@ impl Waku {
                             cx,
                         ));
                     }
-                    container = container.child(self.render_bottom_panel_split(
-                        group_index,
+                    container = container.child(self.render_terminal_split(
+                        target,
                         child,
                         axis.flexes.get(index).copied().unwrap_or(1.0),
                         child_width,
@@ -308,9 +322,9 @@ impl Waku {
     /// The draggable seam between two panes: a flex-none strip wider than
     /// its 1 px paint so the grab area is humane.
     #[allow(clippy::too_many_arguments)]
-    fn render_bottom_panel_divider(
+    fn render_terminal_split_divider(
         &self,
-        group_index: usize,
+        target: SplitTarget,
         path: Vec<usize>,
         divider_after: usize,
         axis: Axis,
@@ -344,8 +358,12 @@ impl Waku {
                 div().h(px(SPLIT_DIVIDER_SIZE)).w_full().cursor_row_resize(),
             )
         };
+        let target_id = match target {
+            SplitTarget::Bottom(index) => format!("bottom-{index}"),
+            SplitTarget::Right(terminal_id) => format!("right-{terminal_id}"),
+        };
         drag.id(SharedString::from(format!(
-            "bottom-panel-divider-{group_index}-{}-{divider_after}",
+            "terminal-split-divider-{target_id}-{}-{divider_after}",
             path.iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
@@ -358,7 +376,7 @@ impl Waku {
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.split_divider_drag = Some(SplitDividerDrag::new(
-                    group_index,
+                    target,
                     path.clone(),
                     divider_after,
                     axis,
@@ -908,6 +926,53 @@ impl Waku {
         self.bottom_panel_tabs_scroll_handle.scroll_to_item(index);
     }
 
+    /// Route a pane chord dispatched from one pane wrapper back to the panel
+    /// that rendered it. The wrapper knows its panel, so a right panel tab
+    /// splits its own tree without depending on which panel has focus.
+    fn split_terminal_pane(
+        &mut self,
+        target: SplitTarget,
+        pane: &Entity<TerminalView>,
+        axis: Axis,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SplitTarget::Bottom(_) => self.split_bottom_panel_pane(pane, axis, cx),
+            SplitTarget::Right(terminal_id) => {
+                self.split_right_panel_terminal_pane(terminal_id, pane, axis, cx);
+            }
+        }
+    }
+
+    fn close_terminal_pane(
+        &mut self,
+        target: SplitTarget,
+        pane: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SplitTarget::Bottom(_) => self.close_bottom_panel_pane(pane, cx),
+            SplitTarget::Right(terminal_id) => {
+                self.close_right_panel_terminal_pane(terminal_id, pane, cx);
+            }
+        }
+    }
+
+    fn resize_terminal_pane(
+        &mut self,
+        target: SplitTarget,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SplitTarget::Bottom(_) => self.resize_bottom_panel_pane(pane, direction, cx),
+            SplitTarget::Right(terminal_id) => {
+                self.resize_right_panel_terminal_pane(terminal_id, pane, direction, cx);
+            }
+        }
+    }
+
     /// Split one pane in two. The new pane takes the focus so consecutive
     /// splits stack where the user is looking.
     pub(super) fn split_bottom_panel_pane(
@@ -1020,16 +1085,28 @@ impl Waku {
         let Some(drag) = self.split_divider_drag.clone() else {
             return;
         };
-        let resized = self
-            .bottom_panel_terminal_groups
-            .get_mut(drag.group_index)
-            .is_some_and(|group| {
-                group.resize_divider(
-                    &drag,
-                    f32::from(event.position.x),
-                    f32::from(event.position.y),
-                )
-            });
+        let resized = match drag.target {
+            SplitTarget::Bottom(group_index) => self
+                .bottom_panel_terminal_groups
+                .get_mut(group_index)
+                .is_some_and(|group| {
+                    group.resize_divider(
+                        &drag,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    )
+                }),
+            SplitTarget::Right(terminal_id) => self
+                .right_panel_terminal_groups
+                .get_mut(&terminal_id)
+                .is_some_and(|group| {
+                    group.resize_divider(
+                        &drag,
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    )
+                }),
+        };
         if !resized {
             self.split_divider_drag = None;
         }

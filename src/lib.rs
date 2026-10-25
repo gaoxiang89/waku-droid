@@ -344,11 +344,11 @@ pub fn run() {
             // Split the focused terminal pane; the down chord stacks, the
             // plain chord goes side by side. The close chord shuts the
             // focused pane, and the tab with it when it was the last pane.
-            // These chords live on the bottom panel's own key context so
-            // terminals elsewhere (the right panel) never see them — there
-            // they must reach the shell. The sources live next to the chord
-            // recognizer so the keymap and the keydown fallback cannot drift
-            // apart.
+            // These chords live on the terminal pane key context, which the
+            // bottom panel's and the right panel's pane wrappers both carry;
+            // terminals outside a split pane never see them and hand the keys
+            // to the shell. The sources live next to the chord recognizer so
+            // the keymap and the keydown fallback cannot drift apart.
             cx.bind_keys(crate::terminal::pane_chord_bindings());
             // Must run after every binding above: it hands the terminal any
             // app shortcut the shell would otherwise receive, except these.

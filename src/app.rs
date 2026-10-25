@@ -80,7 +80,7 @@ use crate::{
 };
 use terminal_split::{
     MAX_SPLIT_PANES, ResizeDirection, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup,
-    SplitMember, axis_child_sizes,
+    SplitMember, SplitTarget, axis_child_sizes,
 };
 
 #[cfg(target_os = "macos")]
@@ -1714,7 +1714,7 @@ pub struct Waku {
     /// Set when a turn finishes; the drain loop drops the workspace queries,
     /// since the event handler has no `Context` to refresh them itself.
     workspace_queries_stale: bool,
-    right_panel_terminals: HashMap<Uuid, Entity<TerminalView>>,
+    right_panel_terminal_groups: HashMap<Uuid, SplitGroup>,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
     /// The bottom panel's terminal tabs, in tab order — the selected
     /// session's. Each tab is a split group: one pane at first, more as the
@@ -3495,7 +3495,7 @@ impl Waku {
                 right_panel_working_tree: Vec::new(),
                 working_trees: QueryCache::new(MAX_CACHED_WORKSPACES),
                 workspace_queries_stale: false,
-                right_panel_terminals: HashMap::new(),
+                right_panel_terminal_groups: HashMap::new(),
                 right_panel_browsers: HashMap::new(),
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
