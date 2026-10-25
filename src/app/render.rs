@@ -30,7 +30,9 @@ impl Waku {
         // conventional straddle.
         let (strip_left, strip_width) = match target {
             PanelResizeTarget::RightPanel => (-7.0, 8.0),
-            PanelResizeTarget::Sidebar | PanelResizeTarget::FileTree => (-5.0, 10.0),
+            PanelResizeTarget::Sidebar
+            | PanelResizeTarget::FileTree
+            | PanelResizeTarget::FilesPanel => (-5.0, 10.0),
             // The bottom panel's edge is horizontal, so it renders its own
             // handle; this vertical bar is never built for it.
             PanelResizeTarget::BottomPanel => (-5.0, 10.0),
@@ -80,6 +82,7 @@ struct PanelFrame {
     /// Width each panel occupies on screen: the eased slide while one runs.
     sidebar: f32,
     right_panel: f32,
+    files_panel: f32,
     /// Height the bottom panel occupies on screen this frame.
     bottom_panel: f32,
     /// Which edge is mid-slide. The clip that keeps a sliding panel inside its
@@ -174,6 +177,7 @@ impl Waku {
             bottom_panel_content,
             sidebar,
             right_panel,
+            files_panel: self.effective_files_panel_width(window),
             bottom_panel,
             sidebar_sliding: self.sidebar_slide.is_some(),
             right_panel_sliding: self.right_panel_slide.is_some(),
@@ -189,6 +193,7 @@ impl Waku {
         f32::from(window.viewport_size().width)
             - self.sidebar_rendered_width
             - self.right_panel_rendered_width
+            - self.effective_files_panel_width(window)
     }
 
     /// [`WakuPane`] delegate for the sidebar island.
@@ -230,6 +235,15 @@ impl Waku {
     ) -> AnyElement {
         let (_, right_panel_width) = self.effective_panel_widths(window);
         self.render_right_panel(right_panel_width, window, cx)
+            .into_any_element()
+    }
+
+    pub(super) fn files_panel_pane_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_files_panel(self.effective_files_panel_width(window), window, cx)
             .into_any_element()
     }
 
@@ -493,6 +507,16 @@ impl Render for Waku {
                                     .h_full(),
                             ),
                         ),
+                )
+            })
+            .when(panels.files_panel > 0.0, |root| {
+                root.child(
+                    self.files_panel_pane.clone().cached(
+                        StyleRefinement::default()
+                            .w(px(panels.files_panel))
+                            .h_full()
+                            .flex_none(),
+                    ),
                 )
             })
             .children(computer_use)

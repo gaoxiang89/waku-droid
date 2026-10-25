@@ -105,6 +105,8 @@ const BOTTOM_PANEL_MIN_HEIGHT: f32 = 140.0;
 /// this reserve, but never below `BOTTOM_PANEL_MIN_HEIGHT`.
 const BOTTOM_PANEL_HEIGHT_RESERVE: f32 = 280.0;
 const DEFAULT_FILE_TREE_WIDTH: f32 = 184.0;
+const DEFAULT_FILES_PANEL_WIDTH: f32 = 240.0;
+const FILES_PANEL_MIN_WIDTH: f32 = 180.0;
 const FILE_TREE_MIN_WIDTH: f32 = 140.0;
 const FILE_TREE_MAX_WIDTH: f32 = 360.0;
 const FILE_EDITOR_MIN_WIDTH: f32 = 140.0;
@@ -274,6 +276,7 @@ enum PanelResizeTarget {
     RightPanel,
     BottomPanel,
     FileTree,
+    FilesPanel,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -459,7 +462,7 @@ fn fitted_file_tree_width(panel_width: f32, file_tree_width: f32) -> f32 {
     )
 }
 
-fn widened_panel_width_for_file_editor(panel_width: f32, file_tree_width: f32) -> f32 {
+fn widened_panel_width_for_file_editor(panel_width: f32) -> f32 {
     // No fixed ceiling: a panel widened on a large display keeps that width,
     // and layout-time fitting (`fitted_panel_widths`) clamps it against the
     // live viewport when the window is smaller.
@@ -469,13 +472,39 @@ fn widened_panel_width_for_file_editor(panel_width: f32, file_tree_width: f32) -
         RIGHT_PANEL_MIN_WIDTH,
         f32::INFINITY,
     );
-    let file_tree_width = sanitize_panel_width(
-        file_tree_width,
-        DEFAULT_FILE_TREE_WIDTH,
-        FILE_TREE_MIN_WIDTH,
+    panel_width.max(FILE_EDITOR_INITIAL_WIDTH)
+}
+
+/// Reserve the independent Files column before fitting the other panels.
+/// Preserve their minima when possible and keep chat usable on small windows.
+fn fitted_files_panel_width(
+    viewport_width: f32,
+    visible: bool,
+    sidebar_visible: bool,
+    right_panel_visible: bool,
+    width: f32,
+) -> f32 {
+    if !visible {
+        return 0.0;
+    }
+    let reserved = MAIN_PANEL_MIN_WIDTH
+        + if sidebar_visible {
+            SIDEBAR_MIN_WIDTH
+        } else {
+            0.0
+        }
+        + if right_panel_visible {
+            RIGHT_PANEL_MIN_WIDTH
+        } else {
+            0.0
+        };
+    sanitize_panel_width(
+        width,
+        DEFAULT_FILES_PANEL_WIDTH,
+        FILES_PANEL_MIN_WIDTH,
         FILE_TREE_MAX_WIDTH,
-    );
-    panel_width.max(file_tree_width + FILE_EDITOR_INITIAL_WIDTH)
+    )
+    .min((viewport_width - reserved).max(0.0))
 }
 
 fn widened_panel_width_for_review(panel_width: f32) -> f32 {
@@ -1630,6 +1659,8 @@ pub struct Waku {
     sidebar_width: f32,
     right_panel_visible: bool,
     right_panel_width: f32,
+    files_panel_visible: bool,
+    files_panel_width: f32,
     bottom_panel_visible: bool,
     bottom_panel_height: f32,
     /// The show/hide slide each panel is in the middle of, if any. Driven by
@@ -1928,6 +1959,7 @@ pub struct Waku {
     sidebar_pane: Entity<WakuPane>,
     transcript_pane: Entity<WakuPane>,
     right_panel_pane: Entity<WakuPane>,
+    files_panel_pane: Entity<WakuPane>,
     /// The unix second the pending time-label wake-up targets, or `None` when
     /// none is armed. See `schedule_time_label_wake`.
     time_label_wake: Cell<Option<u64>>,
@@ -2455,6 +2487,7 @@ impl Waku {
         let sidebar_pane = WakuPane::new(Waku::sidebar_pane_content, cx);
         let transcript_pane = WakuPane::new(Waku::transcript_pane_content, cx);
         let right_panel_pane = WakuPane::new(Waku::right_panel_pane_content, cx);
+        let files_panel_pane = WakuPane::new(Waku::files_panel_pane_content, cx);
         let workspace_client = waku_client::WorkspaceClient::new(daemon.client());
         let (projectless_migrated, projectless_migration_error) =
             migrate_legacy_projectless_projects(&mut state, &workspace_client);
@@ -2469,6 +2502,13 @@ impl Waku {
             });
         let sidebar_visible = state.sidebar_visible;
         let right_panel_visible = state.right_panel_visible;
+        let files_panel_visible = state.files_panel_visible;
+        let files_panel_width = sanitize_panel_width(
+            state.files_panel_width,
+            DEFAULT_FILES_PANEL_WIDTH,
+            FILES_PANEL_MIN_WIDTH,
+            FILE_TREE_MAX_WIDTH,
+        );
         let bottom_panel_visible = state.bottom_panel_visible;
         let sidebar_width = sanitize_panel_width(
             state.sidebar_width,
@@ -3430,6 +3470,8 @@ impl Waku {
                 sidebar_width,
                 right_panel_visible,
                 right_panel_width,
+                files_panel_visible,
+                files_panel_width,
                 bottom_panel_visible,
                 bottom_panel_height,
                 bottom_panel_terminal_groups: Vec::new(),
@@ -3589,6 +3631,7 @@ impl Waku {
                 sidebar_pane: sidebar_pane.clone(),
                 transcript_pane: transcript_pane.clone(),
                 right_panel_pane: right_panel_pane.clone(),
+                files_panel_pane: files_panel_pane.clone(),
                 time_label_wake: Cell::new(None),
                 time_label_wake_generation: Cell::new(0),
                 fps_last_frame: Instant::now(),
@@ -3597,7 +3640,12 @@ impl Waku {
             }
         });
         navigation_rail.update(cx, |rail, _| rail.set_waku(entity.downgrade()));
-        for pane in [&sidebar_pane, &transcript_pane, &right_panel_pane] {
+        for pane in [
+            &sidebar_pane,
+            &transcript_pane,
+            &right_panel_pane,
+            &files_panel_pane,
+        ] {
             pane.update(cx, |pane, cx| pane.bind(&entity, cx));
         }
         let initial_row_count = entity.read(cx).transcript_row_count();
@@ -3615,6 +3663,7 @@ impl Waku {
             // The autocomplete indexes prefetch alongside, so typing `/` or
             // `@` into the very first prompt already has data to draw.
             this.refresh_composer_sources(cx);
+            this.refresh_workspace_surfaces(cx);
             // Re-detect providers after resolving the user's login-shell
             // environment off-thread. Detection then starts model and version
             // discovery for every CLI it finds, including nvm/fnm-managed

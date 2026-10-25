@@ -2644,7 +2644,7 @@ impl Waku {
                 )
             })
             .flatten();
-        let right_window_controls = (!self.right_panel_visible)
+        let right_window_controls = (!self.right_panel_visible && !self.files_panel_visible)
             .then(|| {
                 self.render_client_window_controls(
                     super::window_chrome::WindowControlSide::Right,

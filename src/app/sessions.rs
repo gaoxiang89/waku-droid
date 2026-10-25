@@ -541,10 +541,13 @@ impl Waku {
     pub(super) fn toggle_files_surface_action(
         &mut self,
         _: &ToggleFilesSurface,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.toggle_right_panel_surface(RightPanelSurface::Files, cx);
+        if !self.files_panel_visible {
+            window.focus(&self.composer_focus(cx), cx);
+        }
     }
 
     pub(super) fn toggle_git_graph_surface_action(
@@ -629,6 +632,8 @@ impl Waku {
         self.state.bottom_panel_visible = self.bottom_panel_visible;
         self.state.sidebar_width = self.sidebar_width;
         self.state.right_panel_width = self.right_panel_width;
+        self.state.files_panel_visible = self.files_panel_visible;
+        self.state.files_panel_width = self.files_panel_width;
         self.state.bottom_panel_height = self.bottom_panel_height;
         self.save();
     }
@@ -668,11 +673,21 @@ impl Waku {
     /// [`Waku::sidebar_rendered_width`] / [`Waku::right_panel_rendered_width`].
     pub(super) fn effective_panel_widths(&self, window: &Window) -> (f32, f32) {
         fitted_panel_widths(
-            f32::from(window.viewport_size().width),
+            f32::from(window.viewport_size().width) - self.effective_files_panel_width(window),
             self.sidebar_visible || self.sidebar_slide.is_some(),
             self.right_panel_visible || self.right_panel_slide.is_some(),
             self.sidebar_width,
             self.right_panel_width,
+        )
+    }
+
+    pub(super) fn effective_files_panel_width(&self, window: &Window) -> f32 {
+        fitted_files_panel_width(
+            f32::from(window.viewport_size().width),
+            self.files_panel_visible,
+            self.sidebar_visible || self.sidebar_slide.is_some(),
+            self.right_panel_visible || self.right_panel_slide.is_some(),
+            self.files_panel_width,
         )
     }
 
@@ -697,6 +712,11 @@ impl Waku {
         // A drag tracks the pointer directly; whatever slide was still
         // finishing would fight it for the same edge.
         let start_size = match target {
+            PanelResizeTarget::FilesPanel => {
+                let width = self.effective_files_panel_width(window);
+                self.files_panel_width = width;
+                width
+            }
             PanelResizeTarget::Sidebar => {
                 self.sidebar_slide = None;
                 self.sidebar_width = sidebar_width;
@@ -740,10 +760,15 @@ impl Waku {
         let Some(drag) = self.panel_resize_drag else {
             return;
         };
-        let viewport_width = f32::from(window.viewport_size().width);
+        let viewport_width =
+            f32::from(window.viewport_size().width) - self.effective_files_panel_width(window);
         let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
         let delta = f32::from(event.position.x) - drag.start_mouse_x;
         match drag.target {
+            PanelResizeTarget::FilesPanel => {
+                self.files_panel_width =
+                    (drag.start_size - delta).clamp(FILES_PANEL_MIN_WIDTH, FILE_TREE_MAX_WIDTH);
+            }
             PanelResizeTarget::Sidebar => {
                 let maximum = SIDEBAR_MAX_WIDTH
                     .min(viewport_width - MAIN_PANEL_MIN_WIDTH - right_panel_width)

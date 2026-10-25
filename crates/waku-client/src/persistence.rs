@@ -89,6 +89,10 @@ fn default_right_panel_width() -> f32 {
     DEFAULT_RIGHT_PANEL_WIDTH
 }
 
+fn default_files_panel_width() -> f32 {
+    240.0
+}
+
 fn default_bottom_panel_height() -> f32 {
     DEFAULT_BOTTOM_PANEL_HEIGHT
 }
@@ -327,6 +331,10 @@ struct AppState {
     sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     right_panel_visible: bool,
+    #[serde(default)]
+    files_panel_visible: bool,
+    #[serde(default = "default_files_panel_width")]
+    files_panel_width: f32,
     #[serde(default = "default_bottom_panel_visibility")]
     bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
@@ -395,6 +403,10 @@ pub struct PersistedState {
     pub sidebar_visible: bool,
     #[serde(default = "default_right_panel_visibility")]
     pub right_panel_visible: bool,
+    #[serde(default)]
+    pub files_panel_visible: bool,
+    #[serde(default = "default_files_panel_width")]
+    pub files_panel_width: f32,
     #[serde(default = "default_bottom_panel_visibility")]
     pub bottom_panel_visible: bool,
     #[serde(default = "default_sidebar_width")]
@@ -473,6 +485,8 @@ impl PersistedState {
             open_in_app: None,
             sidebar_visible: true,
             right_panel_visible: false,
+            files_panel_visible: false,
+            files_panel_width: default_files_panel_width(),
             bottom_panel_visible: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_ordering: SidebarOrdering::Newest,
@@ -621,6 +635,8 @@ impl PersistedState {
             remembered_model_traits: self.remembered_model_traits.clone(),
             sidebar_visible: self.sidebar_visible,
             right_panel_visible: self.right_panel_visible,
+            files_panel_visible: self.files_panel_visible,
+            files_panel_width: self.files_panel_width,
             bottom_panel_visible: self.bottom_panel_visible,
             sidebar_width: self.sidebar_width,
             sidebar_ordering: self.sidebar_ordering,
@@ -659,6 +675,8 @@ impl PersistedState {
         self.remembered_model_traits = app_state.remembered_model_traits;
         self.sidebar_visible = app_state.sidebar_visible;
         self.right_panel_visible = app_state.right_panel_visible;
+        self.files_panel_visible = app_state.files_panel_visible;
+        self.files_panel_width = app_state.files_panel_width;
         self.bottom_panel_visible = app_state.bottom_panel_visible;
         self.sidebar_width = app_state.sidebar_width;
         self.sidebar_ordering = app_state.sidebar_ordering;
@@ -1439,6 +1457,22 @@ mod tests {
         assert!(!state.sidebar_show_archived);
         assert!(state.sidebar_collapsed_hosts.is_empty());
         assert!(state.sidebar_collapsed_groups.is_empty());
+        assert!(!state.files_panel_visible);
+        assert_eq!(state.files_panel_width, default_files_panel_width());
+    }
+
+    #[test]
+    fn independent_files_panel_layout_roundtrips() {
+        let mut state = PersistedState::empty();
+        state.files_panel_visible = true;
+        state.files_panel_width = 310.0;
+        state.right_panel_visible = false;
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+        assert!(restored.files_panel_visible);
+        assert_eq!(restored.files_panel_width, 310.0);
+        assert!(!restored.right_panel_visible);
     }
 
     #[test]

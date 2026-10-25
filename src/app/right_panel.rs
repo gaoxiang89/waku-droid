@@ -2235,9 +2235,8 @@ impl Waku {
             crate::md::parser::parse_file_location(target.trim().trim_matches(['"', '\'', '`'])).1;
         match transcript_link_route(target, self.selected_workspace_path()) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
-                // Files may never have been opened. Create that surface, expand
-                // every parent so the row exists in the first tree walk, then
-                // select the file inside it.
+                // Reveal the independent tree and expand every parent, then
+                // open the file in the neighboring work panel.
                 if let Some(workspace) = self.selected_workspace_path().map(Path::to_path_buf) {
                     for directory in ancestor_directories(&workspace, &relative_path) {
                         self.right_panel_expanded_paths.insert(directory);
@@ -2353,10 +2352,12 @@ impl Waku {
         if self.active_right_panel_surface() == Some(&RightPanelSurface::Diff) {
             self.refresh_right_panel_diff(cx);
         }
-        if matches!(
-            self.active_right_panel_surface(),
-            Some(RightPanelSurface::Files | RightPanelSurface::File(_))
-        ) {
+        if self.files_panel_visible
+            || matches!(
+                self.active_right_panel_surface(),
+                Some(RightPanelSurface::Files | RightPanelSurface::File(_))
+            )
+        {
             self.refresh_right_panel_working_tree(cx);
         }
         self.ensure_right_panel_terminals(cx);
@@ -2462,6 +2463,9 @@ impl Waku {
     }
 
     fn replace_active_right_panel_state(&mut self, state: RightPanelWorkspaceState) {
+        // The pinned tree must never show paths from the workspace we left
+        // while the new workspace's background read is in flight.
+        self.right_panel_working_tree.clear();
         self.right_panel_visible = state.visible;
         self.right_panel_surfaces = state.surfaces;
         self.right_panel_active_surface = state.active_surface;
@@ -2546,10 +2550,7 @@ impl Waku {
 
     fn ensure_initial_right_panel_file_editor_width(&mut self) {
         if self.right_panel_file_editors.is_empty() {
-            self.right_panel_width = widened_panel_width_for_file_editor(
-                self.right_panel_width,
-                self.right_panel_file_tree_width,
-            );
+            self.right_panel_width = widened_panel_width_for_file_editor(self.right_panel_width);
         }
     }
 
@@ -2558,6 +2559,13 @@ impl Waku {
         surface: RightPanelSurface,
         cx: &mut Context<Self>,
     ) {
+        if surface == RightPanelSurface::Files {
+            self.set_files_panel_visible(true, cx);
+            return;
+        }
+        if let RightPanelSurface::File(path) = &surface {
+            self.right_panel_files_selected_path = Some(path.clone());
+        }
         let reusable_index = reusable_surface_index(&self.right_panel_surfaces, &surface);
         if matches!(&surface, RightPanelSurface::File(_)) {
             self.ensure_initial_right_panel_file_editor_width();
@@ -2606,6 +2614,10 @@ impl Waku {
         surface: RightPanelSurface,
         cx: &mut Context<Self>,
     ) {
+        if surface == RightPanelSurface::Files {
+            self.set_files_panel_visible(!self.files_panel_visible, cx);
+            return;
+        }
         let showing =
             self.right_panel_visible && self.active_right_panel_surface() == Some(&surface);
         if showing {
@@ -2646,6 +2658,7 @@ impl Waku {
         location: Option<(usize, Option<usize>)>,
         cx: &mut Context<Self>,
     ) {
+        self.right_panel_files_selected_path = Some(relative_path.clone());
         self.ensure_initial_right_panel_file_editor_width();
         if let Some(location) = location {
             if self.state.markdown_preview
@@ -2670,25 +2683,9 @@ impl Waku {
             return;
         };
         match self.right_panel_surfaces.get(active).cloned() {
-            Some(RightPanelSurface::Files) => {
-                let dirty_file_would_be_replaced = self
-                    .right_panel_files_selected_path
-                    .as_deref()
-                    .is_some_and(|current_path| {
-                        current_path != relative_path
-                            && self.right_panel_file_is_dirty(current_path)
-                    });
-                if dirty_file_would_be_replaced {
-                    self.open_right_panel_surface(RightPanelSurface::File(relative_path), cx);
-                    return;
-                }
-
-                self.right_panel_files_selected_path = Some(relative_path);
-                self.set_right_panel_visible(true, cx);
-                cx.notify();
-            }
             Some(RightPanelSurface::File(current_path)) => {
                 if current_path == relative_path {
+                    self.set_right_panel_visible(true, cx);
                     return;
                 }
                 if self.right_panel_file_is_dirty(&current_path) {
@@ -2937,8 +2934,11 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let active =
-            self.right_panel_visible && self.active_right_panel_surface() == Some(&surface);
+        let active = if surface == RightPanelSurface::Files {
+            self.files_panel_visible
+        } else {
+            self.right_panel_visible && self.active_right_panel_surface() == Some(&surface)
+        };
         let focus = self.transcript_control_focus(id, cx);
         let key_surface = surface.clone();
         div()
@@ -3046,6 +3046,132 @@ impl Waku {
                     cx.stop_propagation();
                 }
             }))
+    }
+
+    pub(super) fn set_files_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible {
+            self.refresh_right_panel_working_tree(cx);
+        }
+        if self.files_panel_visible == visible {
+            return;
+        }
+        self.files_panel_visible = visible;
+        self.persist_panel_layout();
+        cx.notify();
+    }
+
+    pub(super) fn render_files_panel(
+        &self,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus("close-files-panel", cx);
+        let selected_path = self
+            .visible_right_panel_file_path()
+            .or_else(|| self.right_panel_files_selected_path.clone());
+        let close = div()
+            .id("close-files-panel")
+            .track_focus(&focus)
+            .tab_index(0)
+            .size(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .hover(|style| style.bg(theme.overlay))
+            .child(icon("icons/x.svg", 14.0, theme.text_tertiary))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("right_panel.close_tab", title = tr!("right_panel.files")),
+                crate::platform::primary_shortcut("⇧⌘E", "Ctrl+Shift+E"),
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.set_files_panel_visible(false, cx);
+                window.focus(&this.composer_focus(cx), cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.set_files_panel_visible(false, cx);
+                    window.focus(&this.composer_focus(cx), cx);
+                    cx.stop_propagation();
+                }
+            }));
+        let header = div()
+            .id("files-panel-header")
+            .tab_group()
+            .tab_stop(false)
+            .h(px(RIGHT_PANEL_HEADER_HEIGHT))
+            .flex_none()
+            .px(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(sp(12.5))
+                    .child(tr!("right_panel.files")),
+            )
+            .child(close)
+            .children(self.render_client_window_controls(
+                super::window_chrome::WindowControlSide::Right,
+                window,
+                cx,
+            ));
+        div()
+            .id("files-panel")
+            .w(px(width))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .relative()
+            .border_l_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface)
+            .child(self.window_drag_region(header, cx))
+            .child(self.render_right_panel_working_tree(selected_path.as_deref(), cx))
+            .child(
+                self.render_panel_resize_handle(
+                    "files-panel-resize-handle",
+                    PanelResizeTarget::FilesPanel,
+                    cx,
+                )
+                .track_focus(&self.transcript_control_focus("files-panel-resize-handle", cx))
+                .tab_index(0)
+                .focus_visible(|style| style.bg(theme.resize_handle))
+                .on_key_down(cx.listener(
+                    |this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        let width = this.effective_files_panel_width(window);
+                        let width = match event.keystroke.key.as_str() {
+                            "left" => width + 16.0,
+                            "right" => width - 16.0,
+                            "home" => FILES_PANEL_MIN_WIDTH,
+                            "end" => FILE_TREE_MAX_WIDTH,
+                            _ => return,
+                        };
+                        this.files_panel_width =
+                            width.clamp(FILES_PANEL_MIN_WIDTH, FILE_TREE_MAX_WIDTH);
+                        this.persist_panel_layout();
+                        cx.notify();
+                        cx.stop_propagation();
+                    },
+                )),
+            )
     }
 
     pub(super) fn render_right_panel(
@@ -3608,7 +3734,6 @@ impl Waku {
             let options = [
                 RightPanelSurface::new_browser(),
                 RightPanelSurface::new_terminal(),
-                RightPanelSurface::Files,
                 RightPanelSurface::Diff,
                 RightPanelSurface::GitGraph,
             ];
@@ -3667,11 +3792,15 @@ impl Waku {
 
         self.window_drag_region(
             header.child(self.render_right_panel_toggle(cx)).children(
-                self.render_client_window_controls(
-                    super::window_chrome::WindowControlSide::Right,
-                    window,
-                    cx,
-                ),
+                (!self.files_panel_visible)
+                    .then(|| {
+                        self.render_client_window_controls(
+                            super::window_chrome::WindowControlSide::Right,
+                            window,
+                            cx,
+                        )
+                    })
+                    .flatten(),
             ),
             cx,
         )
@@ -4571,7 +4700,6 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
-        let file_tree_width = fitted_file_tree_width(panel_width, self.right_panel_file_tree_width);
         let (editor_state, writable, _) =
             self.ensure_right_panel_file_editor(&relative_path, window, cx);
 
@@ -4585,7 +4713,7 @@ impl Waku {
             self.render_file_editor_body(
                 &relative_path,
                 &editor_state,
-                panel_width - file_tree_width,
+                panel_width,
                 writable,
                 window,
                 cx,
@@ -4652,30 +4780,7 @@ impl Waku {
             )
             .child(body);
 
-        div()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .flex()
-            .child(editor)
-            .child(
-                div()
-                    .w(px(file_tree_width))
-                    .min_w(px(FILE_TREE_MIN_WIDTH))
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .relative()
-                    .border_l_1()
-                    .border_color(theme.border_strong)
-                    .child(self.render_right_panel_working_tree(Some(&relative_path), cx))
-                    .child(self.render_panel_resize_handle(
-                        "right-panel-file-tree-resize-handle",
-                        PanelResizeTarget::FileTree,
-                        cx,
-                    )),
-            )
+        div().flex_1().min_h_0().min_w_0().flex().child(editor)
     }
 
     fn ensure_right_panel_file_editor(
@@ -6741,6 +6846,9 @@ impl Waku {
 
     /// Re-reads whichever workspace surface is on screen.
     pub(super) fn refresh_workspace_surfaces(&mut self, cx: &mut Context<Self>) {
+        if self.files_panel_visible {
+            self.refresh_right_panel_working_tree(cx);
+        }
         match self.active_right_panel_surface() {
             Some(RightPanelSurface::Diff) => self.refresh_right_panel_diff(cx),
             Some(RightPanelSurface::GitGraph) => {
@@ -6749,7 +6857,9 @@ impl Waku {
                 }
                 cx.notify();
             }
-            Some(RightPanelSurface::Files | RightPanelSurface::File(_)) => {
+            Some(RightPanelSurface::Files | RightPanelSurface::File(_))
+                if !self.files_panel_visible =>
+            {
                 self.refresh_right_panel_working_tree(cx)
             }
             _ => {}

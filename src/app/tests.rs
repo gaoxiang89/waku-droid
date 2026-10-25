@@ -10,17 +10,18 @@ use super::{
     StreamDeltaKind, TranscriptRowKind::*, active_navigation_turn_index,
     append_text_delta_to_session, assistant_response_footer, assistant_response_footer_index,
     assistant_response_footer_time, compact_driver_error, disclosure_leading_space, fenced_code,
-    fitted_bottom_panel_height, fitted_file_tree_width, fitted_panel_widths,
-    folded_transcript_row_kinds, format_worked_duration, format_working_elapsed,
-    maintain_transcript_anchor, message_opens_turn, message_starts_followup_turn,
-    navigation_preview_snippet, navigation_rail_fade_visibility, navigation_rail_height,
-    navigation_rail_scale, paused_toast_duration, pop_stream_batch, push_transcript_activity,
-    response_footer_message_index, response_row_turn_id, session_accepts_turn_output,
-    session_is_reapable, should_refresh_branch_after_activity, should_show_navigation_rail,
-    should_show_scroll_to_bottom, task_id_from_notification_tag, task_notification_tag,
-    transcript_anchor_end_space, transcript_navigation_turns, transcript_rests_at_tail,
-    transcript_row_kinds, transcript_row_splice, transcript_rows_fingerprint,
-    user_input_choice_label, widened_panel_width_for_file_editor, widened_panel_width_for_review,
+    fitted_bottom_panel_height, fitted_file_tree_width, fitted_files_panel_width,
+    fitted_panel_widths, folded_transcript_row_kinds, format_worked_duration,
+    format_working_elapsed, maintain_transcript_anchor, message_opens_turn,
+    message_starts_followup_turn, navigation_preview_snippet, navigation_rail_fade_visibility,
+    navigation_rail_height, navigation_rail_scale, paused_toast_duration, pop_stream_batch,
+    push_transcript_activity, response_footer_message_index, response_row_turn_id,
+    session_accepts_turn_output, session_is_reapable, should_refresh_branch_after_activity,
+    should_show_navigation_rail, should_show_scroll_to_bottom, task_id_from_notification_tag,
+    task_notification_tag, transcript_anchor_end_space, transcript_navigation_turns,
+    transcript_rests_at_tail, transcript_row_kinds, transcript_row_splice,
+    transcript_rows_fingerprint, user_input_choice_label, widened_panel_width_for_file_editor,
+    widened_panel_width_for_review,
 };
 use crate::git_branch::BranchEntry;
 use crate::model::{
@@ -637,9 +638,28 @@ fn file_tree_width_preserves_a_usable_editor() {
 
 #[test]
 fn first_file_editor_opening_reserves_500_pixels() {
-    assert_eq!(widened_panel_width_for_file_editor(460.0, 184.0), 684.0);
-    assert_eq!(widened_panel_width_for_file_editor(720.0, 184.0), 720.0);
-    assert_eq!(widened_panel_width_for_file_editor(460.0, 360.0), 860.0);
+    assert_eq!(widened_panel_width_for_file_editor(460.0), 500.0);
+    assert_eq!(widened_panel_width_for_file_editor(720.0), 720.0);
+}
+
+#[test]
+fn independent_files_panel_preserves_chat_and_other_panel_minima() {
+    for viewport in [980.0, 1200.0, 1920.0] {
+        let files = fitted_files_panel_width(viewport, true, true, true, 360.0);
+        let (sidebar, work) = fitted_panel_widths(viewport - files, true, true, 420.0, 820.0);
+        assert!(files > 0.0);
+        assert!(sidebar >= super::SIDEBAR_MIN_WIDTH);
+        assert!(work >= super::RIGHT_PANEL_MIN_WIDTH);
+        assert!(viewport - files - sidebar - work >= super::MAIN_PANEL_MIN_WIDTH);
+    }
+    assert_eq!(
+        fitted_files_panel_width(1200.0, false, true, true, 240.0),
+        0.0
+    );
+    assert_eq!(
+        fitted_files_panel_width(1200.0, true, true, false, 240.0),
+        240.0
+    );
 }
 
 #[test]
