@@ -16,6 +16,17 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.35]
+
+- Collect the sidebar, bottom terminal, and right panel toggles into a single title bar, and give the Files tree a pane of its own beside the workspace
+- Open a commit from the Git graph as a full page — its message, changed files, and diff — with the arrow keys walking the files and Escape or Back returning to history
+- Split the right panel's terminal into panes with the same chords, dividers, and context menu as the bottom panel, and keep the pane you clicked as the one splits and closes act on, focusing its neighbor rather than the first pane
+- Add terminal output to the composer from the terminal's context menu, carrying the scrollback line numbers the selection came from
+- Pin, archive, and collapse tasks in the sidebar, with archived tasks staying searchable
+- Update ACP agents for structured diffs, images and other multimodal input, MCP servers, file and terminal access, and forking a session into a new one
+- Resolve `~/` links in the transcript against your home directory instead of the workspace
+- Close a deleted task's review and background-work tabs from the panel that is currently open
+
 ## [0.1.34]
 
 - Right-click uncommitted files in the Git graph to stage, unstage, or discard them, see staged and unstaged badges on each file, and fetch, pull, or pop the last stash from the uncommitted-changes menu
