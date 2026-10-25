@@ -2713,7 +2713,7 @@ impl Waku {
                 cx,
             ))
             .child(div().flex_1())
-            .child(self.render_background_work_summary(cx))
+            .child(self.render_notifications_control(cx))
     }
 
     // ── Empty states ───────────────────────────────────────────────────────

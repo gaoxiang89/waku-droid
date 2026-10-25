@@ -1,3 +1,4 @@
+use super::notifications::{AppNotificationKind, AppNotificationTarget};
 use super::*;
 
 impl Waku {
@@ -354,24 +355,26 @@ impl Waku {
                 }
                 self.settle_foreground_work(session_id, BackgroundWorkStatus::Completed);
                 let previous_kinds = self.snapshot_selected_transcript_rows(session_id);
-                let announce = cx.active_window().is_none()
-                    && !runtime.park_announced
-                    && self.active_turn_has_user_message(session_id);
-                let task_notification = announce
-                    .then(|| {
-                        self.state
-                            .sessions
-                            .iter()
-                            .find(|session| session.id == session_id)
-                            .map(|session| {
-                                if session.display_title() == AgentSession::DEFAULT_TITLE {
-                                    tr!("session.new_task")
-                                } else {
-                                    session.display_title().to_owned()
-                                }
-                            })
-                    })
-                    .flatten();
+                // The wait is announced once per park: to the system for a
+                // backgrounded window, and to the in-app queue for a session
+                // the user is not currently looking at.
+                let park_text = (!runtime.park_announced
+                    && self.active_turn_has_user_message(session_id))
+                .then(|| {
+                    self.state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| {
+                            if session.display_title() == AgentSession::DEFAULT_TITLE {
+                                tr!("session.new_task")
+                            } else {
+                                session.display_title().to_owned()
+                            }
+                        })
+                })
+                .flatten();
+                let session_away = self.state.selected_session != Some(session_id);
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
@@ -383,13 +386,24 @@ impl Waku {
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
-                if let Some(title) = task_notification {
-                    crate::platform::show_task_notification(
-                        &task_notification_tag(session_id),
-                        &title,
-                        &tr!("session.turn_waiting_background"),
-                        cx,
-                    );
+                if let Some(title) = park_text {
+                    if session_away {
+                        self.push_app_notification(
+                            AppNotificationTarget::Session(session_id),
+                            AppNotificationKind::Waiting,
+                            title.clone(),
+                            tr!("session.turn_waiting_background"),
+                            cx,
+                        );
+                    }
+                    if cx.active_window().is_none() {
+                        crate::platform::show_task_notification(
+                            &task_notification_tag(session_id),
+                            &title,
+                            &tr!("session.turn_waiting_background"),
+                            cx,
+                        );
+                    }
                 }
             }
             DriverEvent::TextDelta(delta) => {
@@ -634,25 +648,33 @@ impl Waku {
                 {
                     return true;
                 }
-                let task_notification = cx.active_window().is_none().then(|| {
-                    self.state
-                        .sessions
-                        .iter()
-                        .find(|session| session.id == session_id)
-                        .map(|session| {
-                            let title = if session.display_title() == AgentSession::DEFAULT_TITLE {
-                                tr!("session.new_task")
-                            } else {
-                                session.display_title().to_owned()
-                            };
-                            let body = if success {
-                                tr!("session.turn_completed")
-                            } else {
-                                tr!("session.stopped")
-                            };
-                            (title, body)
-                        })
-                });
+                // The turn's outcome is announced two ways: the system
+                // notification for a backgrounded window, and the in-app
+                // queue for a session the user is not currently looking at.
+                let session_away = self.state.selected_session != Some(session_id);
+                let system_announce = cx.active_window().is_none();
+                let task_notification = (system_announce || session_away)
+                    .then(|| {
+                        self.state
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == session_id)
+                            .map(|session| {
+                                let title =
+                                    if session.display_title() == AgentSession::DEFAULT_TITLE {
+                                        tr!("session.new_task")
+                                    } else {
+                                        session.display_title().to_owned()
+                                    };
+                                let body = if success {
+                                    tr!("session.turn_completed")
+                                } else {
+                                    tr!("session.stopped")
+                                };
+                                (title, body)
+                            })
+                    })
+                    .flatten();
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
@@ -712,13 +734,28 @@ impl Waku {
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
-                if let Some(Some((title, body))) = task_notification {
-                    crate::platform::show_task_notification(
-                        &task_notification_tag(session_id),
-                        &title,
-                        &body,
-                        cx,
-                    );
+                if let Some((title, body)) = task_notification {
+                    if session_away {
+                        self.push_app_notification(
+                            AppNotificationTarget::Session(session_id),
+                            if success {
+                                AppNotificationKind::Completed
+                            } else {
+                                AppNotificationKind::Failed
+                            },
+                            title.clone(),
+                            body.clone(),
+                            cx,
+                        );
+                    }
+                    if system_announce {
+                        crate::platform::show_task_notification(
+                            &task_notification_tag(session_id),
+                            &title,
+                            &body,
+                            cx,
+                        );
+                    }
                 }
             }
             DriverEvent::Error(error) => {

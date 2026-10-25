@@ -901,13 +901,14 @@ bottom_panel.tabs: 终端标签页
 bottom_panel.close_tab: 关闭%{title}
 open_in.open: 用%{app}打开项目
 open_in.choose: 选择打开项目的应用…
+notifications.title: 通知
+notifications.count: "%{count} 条通知"
+notifications.clear: 清除
+notifications.empty: 暂无通知
 environment.title: 环境
-environment.summary: 环境和后台工作
 environment.changes: 更改
 environment.commit_or_push: 提交或推送
 environment.compare_branch: 比较分支
-environment.task_id: 任务 ID
-environment.agent_cli_thread_id: 智能体 CLI 线程 ID
 commit.message_placeholder: 提交信息（留空以自动生成）…
 commit.message: 提交信息
 commit.include_unstaged: 包含未暂存的更改
@@ -927,8 +928,6 @@ commit.committed_and_pushed: 已提交并推送更改
 commit.pushed: 已推送更改
 background.title: 后台工作
 background.description: 查看智能体启动的进程和子智能体
-background.processes: 后台进程
-background.agents: 子智能体
 background.process: 进程
 background.monitor: 监控
 background.subagent: 子智能体
@@ -949,10 +948,6 @@ background.model: 模型
 background.latest_update: 最新进展
 background.exit_code: 退出码
 background.output_truncated: 较早的输出已截断
-background.process_count: "%{count} 个后台进程"
-background.process_count_one: 1 个后台进程
-background.agent_count: "%{count} 个子智能体"
-background.agent_count_one: 1 个子智能体
 background.status.starting: 正在启动
 background.status.running: 正在运行
 background.status.monitoring: 正在监控

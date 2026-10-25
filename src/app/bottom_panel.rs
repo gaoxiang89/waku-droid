@@ -1,3 +1,4 @@
+use super::notifications::{AppNotificationKind, AppNotificationTarget};
 use super::right_panel::{
     PanelTabs, TAB_SCROLL_FADE_WIDTH, TabScrollFadeSide, tab_scroll_fade, tab_scroll_reveal_guard,
 };
@@ -792,11 +793,11 @@ impl Waku {
         )
         .detach();
         // An agent finishing or waiting in a terminal the user is not
-        // watching: the tab shows it, and a background window also gets a
-        // system notification, as task turns do.
+        // watching: the tab shows it, the in-app queue records it, and a
+        // background window also gets a system notification, as task turns do.
         cx.subscribe(
             terminal,
-            |_, terminal, attention: &crate::terminal::TerminalAttention, cx| {
+            |this, terminal, attention: &crate::terminal::TerminalAttention, cx| {
                 if cx.active_window().is_none() {
                     crate::platform::show_task_notification(
                         &format!("waku-terminal-{}", terminal.entity_id()),
@@ -805,6 +806,13 @@ impl Waku {
                         cx,
                     );
                 }
+                this.push_app_notification(
+                    AppNotificationTarget::Terminal(terminal.entity_id()),
+                    AppNotificationKind::Terminal,
+                    attention.title.clone(),
+                    attention.body.clone(),
+                    cx,
+                );
                 cx.notify();
             },
         )
@@ -921,7 +929,7 @@ impl Waku {
         cx.notify();
     }
 
-    fn reveal_bottom_panel_tab(&mut self, index: usize) {
+    pub(super) fn reveal_bottom_panel_tab(&mut self, index: usize) {
         self.bottom_panel_pending_tab_reveal = Some(index);
         self.bottom_panel_tabs_scroll_handle.scroll_to_item(index);
     }

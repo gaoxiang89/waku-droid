@@ -1839,20 +1839,23 @@ open_in.open:
 open_in.choose:
   en: Open project in…
 
+notifications.title:
+  en: Notifications
+notifications.count:
+  en: "%{count} notifications"
+notifications.clear:
+  en: Clear
+notifications.empty:
+  en: No notifications
+
 environment.title:
   en: Environment
-environment.summary:
-  en: Environment and background work
 environment.changes:
   en: Changes
 environment.commit_or_push:
   en: Commit or push
 environment.compare_branch:
   en: Compare branch
-environment.task_id:
-  en: Task ID
-environment.agent_cli_thread_id:
-  en: Agent CLI thread ID
 
 commit.message_placeholder:
   en: Commit message (leave blank to generate)…
@@ -1893,10 +1896,6 @@ background.title:
   en: Background
 background.description:
   en: Inspect agent-started processes and subagents
-background.processes:
-  en: Background processes
-background.agents:
-  en: Subagents
 background.process:
   en: Process
 background.monitor:
@@ -1937,14 +1936,6 @@ background.exit_code:
   en: Exit code
 background.output_truncated:
   en: Earlier output was truncated
-background.process_count:
-  en: "%{count} background processes"
-background.process_count_one:
-  en: 1 background process
-background.agent_count:
-  en: "%{count} subagents"
-background.agent_count_one:
-  en: 1 subagent
 background.status.starting:
   en: Starting
 background.status.running:

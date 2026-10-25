@@ -1757,6 +1757,9 @@ pub struct Waku {
     /// ends the process.
     bottom_panel_terminal_groups: Vec<SplitGroup>,
     bottom_panel_active_group: Option<usize>,
+    /// The in-app notification queue shown by the toolbar's bell popover.
+    /// Newest first; bounded and coalesced in `app::notifications`.
+    app_notifications: notifications::AppNotificationQueue,
     /// A split divider is being dragged; pointer moves re-weigh its panes.
     split_divider_drag: Option<SplitDividerDrag>,
     bottom_panel_tabs_scroll_handle: ScrollHandle,
@@ -1992,6 +1995,7 @@ mod git_graph_actions;
 mod goal_dialog;
 mod hosts;
 mod image_preview;
+mod notifications;
 mod project_picker;
 mod remote_folder_picker;
 mod render;
@@ -3481,6 +3485,7 @@ impl Waku {
                 bottom_panel_height,
                 bottom_panel_terminal_groups: Vec::new(),
                 bottom_panel_active_group: None,
+                app_notifications: notifications::AppNotificationQueue::default(),
                 split_divider_drag: None,
                 bottom_panel_tabs_scroll_handle: ScrollHandle::new(),
                 bottom_panel_pending_tab_reveal: None,

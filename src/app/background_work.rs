@@ -1,3 +1,4 @@
+use super::notifications::AppNotificationRow;
 use super::*;
 
 const MAX_BACKGROUND_OUTPUT_BYTES: usize = 512 * 1024;
@@ -7,10 +8,8 @@ const OUTPUT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 /// last detached work settled. Claude re-enters the model a few seconds after
 /// the settle; a first token that slow is a wake in progress, not a no-show.
 const BACKGROUND_RESUME_GRACE: Duration = Duration::from_secs(30);
-const BACKGROUND_SUMMARY_MENU_ID: &str = "background-work-summary";
+const NOTIFICATION_MENU_ID: &str = "notification-queue";
 const OPEN_IN_MENU_ID: &str = "open-in-app";
-const TASK_ID_COPY_CONTROL_ID: &str = "background-summary-copy-task-id";
-const AGENT_THREAD_ID_COPY_CONTROL_ID: &str = "background-summary-copy-agent-thread-id";
 
 #[derive(Default)]
 pub(super) struct BackgroundWorkRegistry {
@@ -41,41 +40,10 @@ impl Default for BackgroundOutputViewport {
 }
 
 #[derive(Clone)]
-struct BackgroundSummaryEntry {
-    item: BackgroundWorkItem,
-    row_focus: FocusHandle,
-    stop_focus: FocusHandle,
-}
-
-#[derive(Clone)]
 struct EnvironmentSummary {
     commit_status: Option<String>,
     commit_focus: FocusHandle,
     compare_focus: FocusHandle,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TaskIdentifiers {
-    task_id: Uuid,
-    agent_cli_thread_id: Option<String>,
-}
-
-#[derive(Clone)]
-struct TaskIdentifierSection {
-    values: TaskIdentifiers,
-    task_id_copy_focus: FocusHandle,
-    agent_cli_thread_id_copy_focus: FocusHandle,
-    task_id_copied: bool,
-    agent_cli_thread_id_copied: bool,
-}
-
-impl From<&AgentSession> for TaskIdentifiers {
-    fn from(session: &AgentSession) -> Self {
-        Self {
-            task_id: session.id,
-            agent_cli_thread_id: session.provider_native_id().map(str::to_owned),
-        }
-    }
 }
 
 impl BackgroundWorkRegistry {
@@ -323,14 +291,6 @@ impl BackgroundWorkRegistry {
             })
     }
 
-    fn ordered_items(&self) -> Vec<&BackgroundWorkItem> {
-        self.order
-            .iter()
-            .rev()
-            .filter_map(|key| self.items.get(key))
-            .collect()
-    }
-
     pub(super) fn selected_text(&self) -> Option<String> {
         self.selection.selection.borrow().selected_text()
     }
@@ -427,27 +387,6 @@ fn work_status_icon(status: BackgroundWorkStatus) -> &'static str {
         BackgroundWorkStatus::Completed => "icons/check.svg",
         BackgroundWorkStatus::Failed => "icons/x.svg",
         BackgroundWorkStatus::Lost => "icons/alert.svg",
-    }
-}
-
-fn background_summary_process_status_icon(
-    kind: BackgroundWorkKind,
-    status: BackgroundWorkStatus,
-) -> Option<&'static str> {
-    if !matches!(
-        kind,
-        BackgroundWorkKind::Process | BackgroundWorkKind::Monitor
-    ) {
-        return None;
-    }
-
-    match status {
-        BackgroundWorkStatus::Starting
-        | BackgroundWorkStatus::Running
-        | BackgroundWorkStatus::Monitoring
-        | BackgroundWorkStatus::Completed
-        | BackgroundWorkStatus::Failed => Some(work_status_icon(status)),
-        _ => None,
     }
 }
 
@@ -742,42 +681,9 @@ impl Waku {
         self.open_right_panel_surface(RightPanelSurface::BackgroundWork { key, title }, cx);
     }
 
-    pub(super) fn render_background_work_summary(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_notifications_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let session = self.selected_session();
         let session_id = session.map(|session| session.id);
-        let identifiers = session.map(|session| TaskIdentifierSection {
-            values: TaskIdentifiers::from(session),
-            task_id_copy_focus: self.transcript_control_focus(TASK_ID_COPY_CONTROL_ID, cx),
-            agent_cli_thread_id_copy_focus: self
-                .transcript_control_focus(AGENT_THREAD_ID_COPY_CONTROL_ID, cx),
-            task_id_copied: self.control_was_copied(TASK_ID_COPY_CONTROL_ID),
-            agent_cli_thread_id_copied: self.control_was_copied(AGENT_THREAD_ID_COPY_CONTROL_ID),
-        });
-        let entries = session_id
-            .and_then(|session_id| self.background_work.get(&session_id))
-            .map(|registry| {
-                registry
-                    .ordered_items()
-                    .into_iter()
-                    .cloned()
-                    .map(|item| {
-                        let kind = item.key.kind as u8;
-                        let provider_id = &item.key.provider_id;
-                        BackgroundSummaryEntry {
-                            row_focus: self.transcript_control_focus(
-                                format!("background-summary-row-{provider_id}-{kind}"),
-                                cx,
-                            ),
-                            stop_focus: self.transcript_control_focus(
-                                format!("background-summary-stop-{provider_id}-{kind}"),
-                                cx,
-                            ),
-                            item,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let workspace_path = session
             .and_then(|session| self.workspace_path_for_session(session))
             .or_else(|| {
@@ -803,18 +709,30 @@ impl Waku {
             .map(|session_id| self.background_work_counts(session_id))
             .unwrap_or_default();
         let has_live_work = processes > 0 || agents > 0;
-        let summary = background_work_count_summary(processes, agents);
+        let unread_count = self.app_notification_count();
         let theme = Theme::current(cx);
         let refresh_weak = cx.entity().downgrade();
-        let handle = self.menu_handle_with(BACKGROUND_SUMMARY_MENU_ID, cx, move |open, _, cx| {
+        let handle = self.menu_handle_with(NOTIFICATION_MENU_ID, cx, move |open, _, cx| {
             if open {
                 let _ = refresh_weak.update(cx, |this, cx| {
                     this.refresh_selected_branch_snapshot(cx);
                 });
             }
         });
+        // Row snapshots allocate per notification, so they are only built
+        // for the frames the popover is actually open.
+        let rows = Rc::new(if handle.is_open() {
+            self.app_notification_rows(cx)
+        } else {
+            Vec::new()
+        });
+        let tooltip = if unread_count == 0 {
+            tr!("notifications.title")
+        } else {
+            tr!("notifications.count", count = unread_count)
+        };
         let trigger = div()
-            .id("environment-summary-trigger")
+            .id("notification-queue-trigger")
             .size(px(28.0))
             .relative()
             .rounded(px(7.0))
@@ -831,13 +749,33 @@ impl Waku {
             })
             .hover(|style| style.bg(theme.overlay))
             .when(handle.is_open(), |style| style.bg(theme.overlay_strong))
-            .tooltip(Tooltip::text(if summary.is_empty() {
-                tr!("environment.summary")
-            } else {
-                summary
-            }))
-            .child(icon("icons/info.svg", 15.0, theme.text_tertiary))
-            .when(has_live_work, |trigger| {
+            .tooltip(Tooltip::text(tooltip))
+            .child(icon("icons/bell.svg", 15.0, theme.text_tertiary))
+            .when(unread_count > 0, |trigger| {
+                trigger.child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .right(px(2.0))
+                        .min_w(px(14.0))
+                        .h(px(14.0))
+                        .px(px(4.0))
+                        .rounded_full()
+                        .bg(theme.accent)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(sp(8.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.raised)
+                        .child(if unread_count > 9 {
+                            "9+".to_owned()
+                        } else {
+                            unread_count.to_string()
+                        }),
+                )
+            })
+            .when(unread_count == 0 && has_live_work, |trigger| {
                 trigger.child(
                     div()
                         .absolute()
@@ -901,19 +839,18 @@ impl Waku {
                 .into_any_element()
         });
         let open_in = self.render_open_in_control(workspace_path, cx);
-        let entries = Rc::new(entries);
+        let clear_focus = self.transcript_control_focus("notification-queue-clear", cx);
         let weak = cx.entity().downgrade();
         let info = popover(
             trigger,
             &handle,
             MenuAlign::BelowRight,
             move |handle, _, cx| {
-                render_background_summary_card(
+                render_notification_queue_card(
                     handle,
-                    session_id.unwrap_or_else(Uuid::nil),
-                    identifiers.clone(),
                     environment.clone(),
-                    entries.clone(),
+                    rows.clone(),
+                    clear_focus.clone(),
                     weak.clone(),
                     cx,
                 )
@@ -1426,95 +1363,95 @@ fn background_work_selection_input(selection: TranscriptSelection) -> impl IntoE
     .h(px(0.0))
 }
 
-fn background_work_count_summary(processes: usize, agents: usize) -> String {
-    let mut parts = Vec::new();
-    if processes > 0 {
-        parts.push(if processes == 1 {
-            tr!("background.process_count_one")
-        } else {
-            tr!("background.process_count", count = processes)
-        });
-    }
-    if agents > 0 {
-        parts.push(if agents == 1 {
-            tr!("background.agent_count_one")
-        } else {
-            tr!("background.agent_count", count = agents)
-        });
-    }
-    parts.join(" · ")
-}
-
-fn render_background_summary_card(
+fn render_notification_queue_card(
     handle: &ContextMenuHandle,
-    session_id: Uuid,
-    identifiers: Option<TaskIdentifierSection>,
     environment: Option<EnvironmentSummary>,
-    entries: Rc<Vec<BackgroundSummaryEntry>>,
+    rows: Rc<Vec<AppNotificationRow>>,
+    clear_focus: FocusHandle,
     weak: WeakEntity<Waku>,
     cx: &mut App,
 ) -> AnyElement {
     let theme = Theme::current(cx);
-    let processes = entries
-        .iter()
-        .filter(|entry| entry.item.key.kind != BackgroundWorkKind::Subagent)
-        .cloned()
-        .collect::<Vec<_>>();
-    let agents = entries
-        .iter()
-        .filter(|entry| entry.item.key.kind == BackgroundWorkKind::Subagent)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut content = div()
-        .id("background-summary-scroll")
+    let mut list = div()
+        .id("notification-queue-scroll")
         .max_h(px(420.0))
         .overflow_y_scroll()
         .p(px(8.0))
         .flex()
         .flex_col()
-        .gap(px(8.0));
-    let has_environment = environment.is_some();
-    let has_background = !processes.is_empty() || !agents.is_empty();
-    let has_identifiers = identifiers.is_some();
-    if let Some(environment) = environment {
-        content = content.child(render_environment_summary_section(
-            environment,
-            handle.clone(),
-            weak.clone(),
-            &theme,
-        ));
+        .gap(px(2.0));
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .w_full()
+                .py(px(18.0))
+                .flex()
+                .justify_center()
+                .text_size(sp(12.5))
+                .text_color(theme.text_tertiary)
+                .child(tr!("notifications.empty")),
+        );
+    } else {
+        for row in rows.iter() {
+            list = list.child(render_notification_row(row, &theme, weak.clone()));
+        }
     }
-    if has_environment && has_background {
-        content = content.child(div().mx(px(8.0)).h(px(1.0)).bg(theme.border));
-    }
-    if !processes.is_empty() {
-        content = content.child(render_background_summary_section(
-            tr!("background.processes"),
-            processes,
-            session_id,
-            handle.clone(),
-            weak.clone(),
-            &theme,
-        ));
-    }
-    if !agents.is_empty() {
-        content = content.child(render_background_summary_section(
-            tr!("background.agents"),
-            agents,
-            session_id,
-            handle.clone(),
-            weak.clone(),
-            &theme,
-        ));
-    }
-    if has_identifiers && (has_environment || has_background) {
-        content = content.child(div().mx(px(8.0)).h(px(1.0)).bg(theme.border));
-    }
-    if let Some(identifiers) = identifiers {
-        content = content.child(render_task_identifiers_section(identifiers, weak, &theme));
-    }
-    div()
-        .id("background-summary-card")
+    let clear_weak = weak.clone();
+    let clear = div()
+        .id("notification-queue-clear")
+        .track_focus(&clear_focus)
+        .tab_index(0)
+        .h(px(22.0))
+        .px(px(6.0))
+        .rounded(px(6.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .text_size(sp(11.5))
+        .text_color(theme.text_tertiary)
+        .focus_visible(|style| {
+            style
+                .bg(theme.overlay)
+                .border_1()
+                .border_color(theme.accent)
+        })
+        .hover(|style| style.bg(theme.overlay))
+        .active(|style| style.bg(theme.overlay_strong))
+        .child(tr!("notifications.clear"))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click({
+            let clear_weak = clear_weak.clone();
+            move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = clear_weak.update(cx, |this, cx| this.clear_app_notifications(cx));
+            }
+        })
+        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                cx.stop_propagation();
+                let _ = clear_weak.update(cx, |this, cx| this.clear_app_notifications(cx));
+            }
+        });
+    let header = div()
+        .h(px(30.0))
+        .px(px(8.0))
+        .flex()
+        .items_center()
+        .flex_none()
+        .child(
+            div()
+                .text_size(sp(13.5))
+                .text_color(theme.text_tertiary)
+                .child(tr!("notifications.title")),
+        )
+        .child(div().flex_1())
+        .when(!rows.is_empty(), |header| header.child(clear));
+    let mut card = div()
+        .id("notification-queue-card")
         .track_focus(handle.focus_handle())
         .w(px(300.0))
         .rounded(px(12.0))
@@ -1523,79 +1460,43 @@ fn render_background_summary_card(
         .overflow_hidden()
         .bg(theme.raised)
         .shadow_lg()
-        .child(content)
-        .into_any_element()
-}
-
-fn render_task_identifiers_section(
-    section: TaskIdentifierSection,
-    weak: WeakEntity<Waku>,
-    theme: &Theme,
-) -> Div {
-    let mut rows = vec![render_task_identifier_row(
-        tr!("environment.task_id"),
-        section.values.task_id.to_string(),
-        TASK_ID_COPY_CONTROL_ID,
-        &section.task_id_copy_focus,
-        section.task_id_copied,
-        weak.clone(),
-        theme,
-    )];
-    if let Some(thread_id) = section.values.agent_cli_thread_id {
-        rows.push(render_task_identifier_row(
-            tr!("environment.agent_cli_thread_id"),
-            thread_id,
-            AGENT_THREAD_ID_COPY_CONTROL_ID,
-            &section.agent_cli_thread_id_copy_focus,
-            section.agent_cli_thread_id_copied,
-            weak,
-            theme,
-        ));
+        .child(header)
+        .child(list);
+    if let Some(environment) = environment {
+        card = card
+            .child(div().mx(px(8.0)).h(px(1.0)).bg(theme.border))
+            .child(render_environment_summary_section(
+                environment,
+                handle.clone(),
+                weak,
+                &theme,
+            ));
     }
-
-    div()
-        .w_full()
-        .tab_group()
-        .tab_stop(false)
-        .flex()
-        .flex_col()
-        .gap(px(7.0))
-        .children(rows)
+    card.into_any_element()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_task_identifier_row(
-    label: String,
-    value: String,
-    control_id: &'static str,
-    focus: &FocusHandle,
-    copied: bool,
-    weak: WeakEntity<Waku>,
+fn render_notification_row(
+    row: &AppNotificationRow,
     theme: &Theme,
-) -> Div {
-    let tooltip = Tooltip::text(if copied {
-        tr!("common.copied")
-    } else {
-        tr!("common.copy_named", name = label.clone())
-    });
-    let copy_value = value.clone();
-    let copy_action = Rc::new(move |cx: &mut App| {
-        cx.write_to_clipboard(ClipboardItem::new_string(copy_value.clone()));
-        let _ = weak.update(cx, |this, cx| {
-            this.show_control_copied(control_id, cx);
-        });
-    });
-    let key_copy_action = copy_action.clone();
-    let copy_button = div()
-        .id(control_id)
-        .track_focus(focus)
+    weak: WeakEntity<Waku>,
+) -> Stateful<Div> {
+    let open_notification = move |weak: &WeakEntity<Waku>, id: u64, cx: &mut App| {
+        let _ = weak.update(cx, |this, cx| this.open_app_notification(id, cx));
+    };
+    let id = row.id;
+    let click_weak = weak.clone();
+    let key_weak = weak;
+    div()
+        .id(row.id as usize)
+        .track_focus(&row.focus)
         .tab_index(0)
-        .size(px(24.0))
+        .w_full()
+        .h(px(30.0))
+        .px(px(6.0))
         .rounded(px(6.0))
-        .flex_none()
         .flex()
         .items_center()
-        .justify_center()
+        .gap(px(7.0))
         .cursor_default()
         .focus_visible(|style| {
             style
@@ -1603,66 +1504,53 @@ fn render_task_identifier_row(
                 .border_1()
                 .border_color(theme.accent)
         })
-        .hover(|style| style.bg(theme.overlay_strong))
-        .active(|style| style.bg(theme.overlay))
-        .tooltip(tooltip)
-        .child(icon(
-            if copied {
-                "icons/check.svg"
-            } else {
-                "icons/copy.svg"
-            },
-            12.0,
-            theme.text_tertiary,
-        ))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(move |_, _, cx| {
-            copy_action(cx);
+        .hover(|style| style.bg(theme.overlay))
+        .active(|style| style.bg(theme.overlay_strong))
+        .child(icon(row.kind.icon_path(), 13.0, row.kind.color(*theme)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(single_line_label(&row.title)),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(sp(11.5))
+                        .text_color(theme.text_secondary)
+                        .child(single_line_label(&row.body)),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(sp(11.0))
+                .text_color(theme.text_tertiary)
+                .child(row.age.clone()),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
+        })
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            open_notification(&click_weak, id, cx);
         })
         .on_key_down(move |event: &KeyDownEvent, _, cx| {
             if !event.keystroke.modifiers.modified()
                 && matches!(event.keystroke.key.as_str(), "enter" | "space")
             {
-                key_copy_action(cx);
                 cx.stop_propagation();
+                open_notification(&key_weak, id, cx);
             }
-        });
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(3.0))
-        .child(
-            div().h(px(20.0)).px(px(8.0)).flex().items_center().child(
-                div()
-                    .text_size(sp(12.0))
-                    .text_color(theme.text_tertiary)
-                    .child(label),
-            ),
-        )
-        .child(
-            div()
-                .w_full()
-                .h(px(28.0))
-                .pl(px(8.0))
-                .rounded(px(6.0))
-                .bg(theme.inset)
-                .flex()
-                .items_center()
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_size(sp(11.5))
-                        .font_family(md::render::MONO_FAMILY)
-                        .text_color(theme.text_secondary)
-                        .child(value),
-                )
-                .child(copy_button),
-        )
+        })
 }
 
 fn render_environment_summary_section(
@@ -1801,185 +1689,6 @@ fn render_environment_action_row(
         })
 }
 
-fn render_background_summary_section(
-    label: String,
-    entries: Vec<BackgroundSummaryEntry>,
-    session_id: Uuid,
-    handle: ContextMenuHandle,
-    weak: WeakEntity<Waku>,
-    theme: &Theme,
-) -> Div {
-    let mut rows = div().w_full().flex().flex_col().gap(px(2.0));
-    for entry in entries {
-        rows = rows.child(render_background_summary_row(
-            entry,
-            session_id,
-            handle.clone(),
-            weak.clone(),
-            theme,
-        ));
-    }
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(5.0))
-        .child(
-            div()
-                .px(px(8.0))
-                .text_size(sp(13.0))
-                .text_color(theme.text_tertiary)
-                .child(label),
-        )
-        .child(rows)
-}
-
-fn render_background_summary_row(
-    entry: BackgroundSummaryEntry,
-    session_id: Uuid,
-    handle: ContextMenuHandle,
-    weak: WeakEntity<Waku>,
-    theme: &Theme,
-) -> Stateful<Div> {
-    let item = entry.item;
-    let group_name = SharedString::from(format!(
-        "background-summary-group-{}-{}",
-        item.key.provider_id, item.key.kind as u8
-    ));
-    let status = background_summary_process_status_icon(item.key.kind, item.status).map(|_| {
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(item.status.is_stoppable() && item.can_stop, |status| {
-                status.group_hover(group_name.clone(), |style| style.invisible())
-            })
-            .child(rendered_work_status_icon(
-                item.status,
-                12.0,
-                work_status_color(item.status, *theme),
-            ))
-    });
-    let stop = (item.status.is_stoppable() && item.can_stop).then(|| {
-        let click_key = item.key.clone();
-        let click_weak = weak.clone();
-        let key_key = item.key.clone();
-        let key_weak = weak.clone();
-        div()
-            .id(SharedString::from(format!(
-                "background-summary-stop-{}-{}",
-                item.key.provider_id, item.key.kind as u8
-            )))
-            .track_focus(&entry.stop_focus)
-            .tab_index(0)
-            .size(px(24.0))
-            .rounded(px(6.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_default()
-            .opacity(0.0)
-            .group_hover(group_name.clone(), |style| style.opacity(1.0))
-            .hover(|style| style.bg(theme.overlay_strong))
-            .focus_visible(|style| {
-                style
-                    .opacity(1.0)
-                    .bg(theme.raised)
-                    .border_1()
-                    .border_color(theme.accent)
-            })
-            .tooltip(Tooltip::text(tr!("background.stop")))
-            .child(icon("icons/stop-filled.svg", 12.0, theme.text_tertiary))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                let _ = click_weak.update(cx, |this, cx| {
-                    this.stop_background_work(session_id, click_key.clone(), cx);
-                });
-            })
-            .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    let _ = key_weak.update(cx, |this, cx| {
-                        this.stop_background_work(session_id, key_key.clone(), cx);
-                    });
-                    cx.stop_propagation();
-                }
-            })
-    });
-    let trailing = (status.is_some() || stop.is_some()).then(|| {
-        div()
-            .relative()
-            .size(px(24.0))
-            .flex_none()
-            .children(status)
-            .children(stop)
-    });
-    let is_process = item.key.kind != BackgroundWorkKind::Subagent;
-    let open_key = item.key.clone();
-    let key_key = open_key.clone();
-    let click_handle = handle.clone();
-    let click_weak = weak.clone();
-    let key_handle = handle;
-    let key_weak = weak;
-    div()
-        .id(SharedString::from(format!(
-            "background-summary-row-{}-{}",
-            item.key.provider_id, item.key.kind as u8
-        )))
-        .group(group_name)
-        .track_focus(&entry.row_focus)
-        .tab_index(0)
-        .h(px(32.0))
-        .w_full()
-        .px(px(8.0))
-        .rounded(px(8.0))
-        .flex()
-        .items_center()
-        .gap(px(9.0))
-        .cursor_default()
-        .focus_visible(|style| style.border_1().border_color(theme.accent))
-        .hover(|style| style.bg(theme.overlay_strong))
-        .child(icon(
-            work_kind_icon(item.key.kind),
-            14.0,
-            theme.text_secondary,
-        ))
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_size(px(if is_process { 12.5 } else { 13.5 }))
-                .text_color(if is_process {
-                    theme.text_secondary
-                } else {
-                    theme.text
-                })
-                .child(single_line_label(&item.title)),
-        )
-        .children(trailing)
-        .on_click(move |_, window, cx| {
-            click_handle.close(window, cx);
-            window.refresh();
-            let _ = click_weak.update(cx, |this, cx| {
-                this.open_background_work_surface(session_id, open_key.clone(), cx);
-            });
-        })
-        .on_key_down(move |event: &KeyDownEvent, window, cx| {
-            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                key_handle.close(window, cx);
-                window.refresh();
-                let _ = key_weak.update(cx, |this, cx| {
-                    this.open_background_work_surface(session_id, key_key.clone(), cx);
-                });
-                cx.stop_propagation();
-            }
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1996,72 +1705,22 @@ mod tests {
     }
 
     #[test]
-    fn info_popover_uses_distinct_process_status_icons() {
-        assert_eq!(
-            background_summary_process_status_icon(
-                BackgroundWorkKind::Process,
-                BackgroundWorkStatus::Completed,
-            ),
-            Some("icons/check.svg")
-        );
-        assert_eq!(
-            background_summary_process_status_icon(
-                BackgroundWorkKind::Monitor,
-                BackgroundWorkStatus::Failed,
-            ),
-            Some("icons/x.svg")
-        );
-        assert_eq!(
-            background_summary_process_status_icon(
-                BackgroundWorkKind::Process,
-                BackgroundWorkStatus::Running,
-            ),
-            Some("icons/loader-circle.svg")
-        );
-        assert_eq!(
-            background_summary_process_status_icon(
-                BackgroundWorkKind::Subagent,
-                BackgroundWorkStatus::Completed,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn info_popover_background_titles_stay_on_one_line() {
+    fn notification_rows_stay_on_one_line() {
         let source = include_str!("background_work.rs");
         let row = source
-            .split_once("\nfn render_background_summary_row(")
-            .expect("background summary row renderer")
+            .split_once("\nfn render_notification_row(")
+            .expect("notification row renderer")
             .1
-            .split_once("\n#[cfg(test)]")
-            .expect("background summary row renderer end")
+            .split_once("\nfn render_environment_summary_section(")
+            .expect("notification row renderer end")
             .0;
 
         assert!(row.contains(".truncate()"));
-        assert!(row.contains(".child(single_line_label(&item.title))"));
+        assert!(row.contains(".child(single_line_label(&row.title))"));
         assert!(!row.contains(".line_clamp(1)"));
         assert_eq!(
-            single_line_label("/bin/zsh -lc 'set -euo pipefail\n  for n in one two'"),
-            "/bin/zsh -lc 'set -euo pipefail for n in one two'"
-        );
-    }
-
-    #[test]
-    fn info_popover_uses_waku_task_and_native_agent_ids() {
-        let task_id = Uuid::parse_str("ed28ee51-43cf-4a83-a52f-04c509ca2c09").unwrap();
-        let mut session = AgentSession::new(Uuid::nil(), ProviderKind::Codex);
-        session.id = task_id;
-        session.provider_cursor = Some(ProviderResumeCursor::Codex {
-            thread_id: "019cfd7a-6942-78b1-9d47-30576c562321".into(),
-        });
-
-        assert_eq!(
-            TaskIdentifiers::from(&session),
-            TaskIdentifiers {
-                task_id,
-                agent_cli_thread_id: Some("019cfd7a-6942-78b1-9d47-30576c562321".into()),
-            }
+            single_line_label("Fix auth flow\n  then rebuild"),
+            "Fix auth flow then rebuild"
         );
     }
 

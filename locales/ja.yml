@@ -940,13 +940,15 @@ bottom_panel.close_tab: "%{title} を閉じる"
 open_in.open: "プロジェクトを %{app} で開く"
 open_in.choose: プロジェクトを開くアプリを選択…
 
+notifications.title: 通知
+notifications.count: "%{count} 件の通知"
+notifications.clear: クリア
+notifications.empty: 通知はありません
+
 environment.title: 環境
-environment.summary: 環境とバックグラウンド作業
 environment.changes: 変更
 environment.commit_or_push: コミットまたはプッシュ
 environment.compare_branch: ブランチを比較
-environment.task_id: タスク ID
-environment.agent_cli_thread_id: エージェント CLI スレッド ID
 
 commit.message_placeholder: コミットメッセージ（空欄の場合は自動生成）…
 commit.message: コミットメッセージ
@@ -968,8 +970,6 @@ commit.pushed: 変更をプッシュしました
 
 background.title: バックグラウンド
 background.description: エージェントが起動したプロセスとサブエージェントを確認します
-background.processes: バックグラウンドプロセス
-background.agents: サブエージェント
 background.process: プロセス
 background.monitor: モニター
 background.subagent: サブエージェント
@@ -990,10 +990,6 @@ background.model: モデル
 background.latest_update: 最新の更新
 background.exit_code: 終了コード
 background.output_truncated: 以前の出力は省略されました
-background.process_count: "バックグラウンドプロセス %{count} 件"
-background.process_count_one: バックグラウンドプロセス 1 件
-background.agent_count: "サブエージェント %{count} 件"
-background.agent_count_one: サブエージェント 1 件
 background.status.starting: 起動中
 background.status.running: 実行中
 background.status.monitoring: 監視中
