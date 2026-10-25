@@ -1406,6 +1406,7 @@ impl Waku {
         } else if let Some(runtime) = runtime {
             runtime.driver.close();
         }
+        self.reconcile_session_notifications(session_id);
         self.remeasure_transcript_tail();
         self.save();
         cx.notify();
@@ -1457,6 +1458,7 @@ impl Waku {
         if let Some(session) = self.selected_session_mut() {
             session.status = SessionStatus::Working;
         }
+        self.reconcile_session_notifications(session_id);
         cx.notify();
     }
 
@@ -1588,6 +1590,7 @@ impl Waku {
             self.state.mark_session_dirty(session_id);
         }
         self.clear_user_input_fields(session_id);
+        self.reconcile_session_notifications(session_id);
         cx.notify();
     }
 
@@ -1653,6 +1656,7 @@ impl Waku {
                 },
             });
         self.runtimes.insert(session_id, runtime);
+        self.reconcile_session_notifications(session_id);
         cx.notify();
     }
 

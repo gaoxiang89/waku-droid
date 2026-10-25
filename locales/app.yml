@@ -1844,7 +1844,7 @@ notifications.title:
 notifications.count:
   en: "%{count} notifications"
 notifications.clear:
-  en: Clear
+  en: Clear history
 notifications.empty:
   en: No notifications
 
@@ -2623,3 +2623,8 @@ git_graph.back_to_history:
   en: Back to history
 git_graph.changed_files_count:
   en: 'Changed files (%{count})'
+
+notifications.approval:
+  en: Approval needed
+notifications.input:
+  en: Answer needed

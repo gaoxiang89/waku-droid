@@ -903,7 +903,7 @@ open_in.open: 用%{app}打开项目
 open_in.choose: 选择打开项目的应用…
 notifications.title: 通知
 notifications.count: "%{count} 条通知"
-notifications.clear: 清除
+notifications.clear: 清除历史通知
 notifications.empty: 暂无通知
 environment.title: 环境
 environment.changes: 更改
@@ -1284,3 +1284,6 @@ remote_folder.add: 添加项目
 
 git_graph.back_to_history: 返回历史
 git_graph.changed_files_count: '变更文件（%{count}）'
+
+notifications.approval: 待确认
+notifications.input: 待回答

@@ -459,6 +459,18 @@ impl Waku {
                 options,
             } => {
                 if self.accepts_turn_output(session_id) {
+                    let fresh = runtime
+                        .pending_permission
+                        .as_ref()
+                        .is_none_or(|pending| pending.request_id != request_id);
+                    if fresh {
+                        self.notify_session_attention(
+                            session_id,
+                            AppNotificationKind::Approval,
+                            format!("{}: {}", tr!("notifications.approval"), title),
+                            cx,
+                        );
+                    }
                     runtime.pending_permission = Some(PendingPermission {
                         request_id,
                         title,
@@ -475,6 +487,22 @@ impl Waku {
                 questions,
             } => {
                 if self.accepts_turn_output(session_id) && !questions.is_empty() {
+                    let fresh = runtime
+                        .pending_user_input
+                        .as_ref()
+                        .is_none_or(|pending| pending.request_id != request_id);
+                    if fresh {
+                        self.notify_session_attention(
+                            session_id,
+                            AppNotificationKind::Input,
+                            format!(
+                                "{}: {}",
+                                tr!("notifications.input"),
+                                questions[0].question.chars().take(160).collect::<String>()
+                            ),
+                            cx,
+                        );
+                    }
                     self.clear_user_input_fields(session_id);
                     runtime.pending_user_input = Some(PendingUserInput::new(request_id, questions));
                     if let Some(session) = self.state.session_mut(session_id) {
@@ -735,7 +763,7 @@ impl Waku {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
                 if let Some((title, body)) = task_notification {
-                    if session_away {
+                    if session_away || system_announce {
                         self.push_app_notification(
                             AppNotificationTarget::Session(session_id),
                             if success {

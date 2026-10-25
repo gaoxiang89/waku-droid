@@ -16,6 +16,8 @@ pub(super) enum AppNotificationKind {
     Completed,
     Failed,
     Waiting,
+    Approval,
+    Input,
     Terminal,
 }
 
@@ -25,6 +27,7 @@ impl AppNotificationKind {
             Self::Completed => "icons/check.svg",
             Self::Failed => "icons/x.svg",
             Self::Waiting => "icons/hourglass.svg",
+            Self::Approval | Self::Input => "icons/alert.svg",
             Self::Terminal => "icons/terminal-square.svg",
         }
     }
@@ -34,6 +37,7 @@ impl AppNotificationKind {
             Self::Completed => theme.success,
             Self::Failed => theme.danger,
             Self::Waiting => theme.warning,
+            Self::Approval | Self::Input => theme.warning,
             Self::Terminal => theme.text_secondary,
         }
     }
@@ -59,6 +63,11 @@ pub(super) struct AppNotificationQueue {
 }
 
 impl AppNotificationQueue {
+    fn dismiss_kind(&mut self, target: AppNotificationTarget, kind: AppNotificationKind) {
+        self.items
+            .retain(|item| item.target != target || item.kind != kind);
+    }
+
     pub(super) fn push(
         &mut self,
         target: AppNotificationTarget,
@@ -101,12 +110,14 @@ impl AppNotificationQueue {
     }
 
     pub(super) fn clear(&mut self) -> bool {
-        if self.items.is_empty() {
-            false
-        } else {
-            self.items.clear();
-            true
-        }
+        let before = self.items.len();
+        self.items.retain(|item| {
+            matches!(
+                item.kind,
+                AppNotificationKind::Approval | AppNotificationKind::Input
+            )
+        });
+        before != self.items.len()
     }
 
     pub(super) fn find(&self, id: u64) -> Option<&AppNotification> {
@@ -145,6 +156,63 @@ pub(super) fn notification_age(created_at_ms: u64) -> String {
 }
 
 impl Waku {
+    pub(super) fn notify_session_attention(
+        &mut self,
+        session_id: Uuid,
+        kind: AppNotificationKind,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.state.sessions.iter().find(|s| s.id == session_id) else {
+            return;
+        };
+        let title = if session.display_title() == AgentSession::DEFAULT_TITLE {
+            tr!("session.new_task")
+        } else {
+            session.display_title().to_owned()
+        };
+        if cx.active_window().is_none() {
+            crate::platform::show_task_notification(
+                &task_notification_tag(session_id),
+                &title,
+                &body,
+                cx,
+            );
+        }
+        self.push_app_notification(
+            AppNotificationTarget::Session(session_id),
+            kind,
+            title,
+            body,
+            cx,
+        );
+    }
+
+    /// Reconcile after state changes, never from render. Opening a request
+    /// does not resolve it; only the provider/request state can do that.
+    pub(super) fn reconcile_session_notifications(&mut self, session_id: Uuid) {
+        let runtime = self.runtimes.get(&session_id);
+        let approval = runtime.is_some_and(|r| {
+            r.pending_permission.is_some() || r.pending_computer_approval.is_some()
+        });
+        let input = runtime.is_some_and(|r| r.pending_user_input.is_some());
+        let background = self
+            .state
+            .sessions
+            .iter()
+            .any(|s| s.id == session_id && s.status == SessionStatus::Background);
+        let target = AppNotificationTarget::Session(session_id);
+        for (kind, live) in [
+            (AppNotificationKind::Approval, approval),
+            (AppNotificationKind::Input, input),
+            (AppNotificationKind::Waiting, background),
+        ] {
+            if !live {
+                self.app_notifications.dismiss_kind(target, kind);
+            }
+        }
+    }
+
     /// Queue an in-app notification.
     pub(super) fn push_app_notification(
         &mut self,
@@ -176,7 +244,12 @@ impl Waku {
         let Some(notification) = self.app_notifications.find(id).cloned() else {
             return;
         };
-        self.dismiss_app_notification(id, cx);
+        if !matches!(
+            notification.kind,
+            AppNotificationKind::Approval | AppNotificationKind::Input
+        ) {
+            self.dismiss_app_notification(id, cx);
+        }
         match notification.target {
             AppNotificationTarget::Session(session_id) => self.select_session(session_id, cx),
             AppNotificationTarget::Terminal(terminal) => self.reveal_terminal(terminal, cx),
@@ -261,6 +334,34 @@ impl Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_history_preserves_unresolved_requests() {
+        let target = AppNotificationTarget::Session(Uuid::new_v4());
+        let mut queue = queue_with(target, AppNotificationKind::Completed);
+        queue.push(
+            target,
+            AppNotificationKind::Approval,
+            "approve".into(),
+            "".into(),
+        );
+        queue.push(
+            target,
+            AppNotificationKind::Input,
+            "answer".into(),
+            "".into(),
+        );
+        assert!(queue.clear());
+        assert_eq!(queue.iter().count(), 2);
+        assert!(!queue.clear());
+        queue.dismiss_kind(target, AppNotificationKind::Approval);
+        assert_eq!(
+            queue.iter().next().unwrap().kind,
+            AppNotificationKind::Input
+        );
+        queue.dismiss_kind(target, AppNotificationKind::Input);
+        assert_eq!(queue.iter().count(), 0);
+    }
 
     fn queue_with(
         target: AppNotificationTarget,

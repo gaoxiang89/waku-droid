@@ -2676,6 +2676,7 @@ impl Waku {
             runtime.pending_computer_approval = None;
         }
         self.clear_user_input_fields(session_id);
+        self.reconcile_session_notifications(session_id);
         self.invalidate_checkpoint_refs();
         if self
             .message_edit
@@ -3105,6 +3106,7 @@ impl Waku {
                     .unwrap_or_else(Instant::now),
             },
         );
+        self.reconcile_session_notifications(session_id);
         // Startup can emit before the background task hands this receiver to
         // the runtime map. Wake once after installation so those buffered
         // events cannot be stranded behind an already-consumed edge.
@@ -3625,6 +3627,7 @@ impl Waku {
             runtime.last_active_at = Instant::now();
         }
         self.clear_user_input_fields(session_id);
+        self.reconcile_session_notifications(session_id);
         // The transcript already shows the turn — the prompt message, its
         // anchor, and the working indicator all landed at accept time. Only
         // preparation's own output surfaces here.
@@ -3838,6 +3841,7 @@ impl Waku {
             if keep_runtime {
                 self.runtimes.insert(session_id, runtime);
             }
+            self.reconcile_session_notifications(session_id);
             changed |= runtime_changed || background_changed;
             persisted_state_changed |= runtime_changed;
             if self.state.selected_session == Some(session_id)

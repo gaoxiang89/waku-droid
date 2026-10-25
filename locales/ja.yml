@@ -942,7 +942,7 @@ open_in.choose: プロジェクトを開くアプリを選択…
 
 notifications.title: 通知
 notifications.count: "%{count} 件の通知"
-notifications.clear: クリア
+notifications.clear: 履歴をクリア
 notifications.empty: 通知はありません
 
 environment.title: 環境
@@ -1337,3 +1337,6 @@ remote_folder.add: プロジェクトを追加
 
 git_graph.back_to_history: 履歴に戻る
 git_graph.changed_files_count: '変更ファイル（%{count}）'
+
+notifications.approval: 承認が必要です
+notifications.input: 回答が必要です
