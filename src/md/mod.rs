@@ -1,4 +1,5 @@
 pub mod highlight;
+pub mod image_path;
 mod math;
 pub mod mend;
 pub mod mermaid;

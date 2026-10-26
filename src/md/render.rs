@@ -35,6 +35,7 @@ use gpui::{
 use regex::Regex;
 
 use super::highlight::{self, Lang, TokenClass};
+use super::image_path::{self, ImageBase, ImagePath, ImageTarget};
 use super::mend::PENDING_LINK_URL;
 use super::mermaid;
 use super::parser::{Block, IncrementalParser, InlineRun, ListItem, TableAlign, TopBlock};
@@ -87,6 +88,11 @@ pub type TranscriptSelection = SelectionState<TextGeometry>;
 /// callers that do have that context can intercept a link, while every other
 /// markdown view continues to use GPUI's ordinary URL opener.
 pub type LinkHandler = Rc<dyn Fn(&str, &mut Window, &mut gpui::App)>;
+
+/// Turns a resolved image path into the source that reads its bytes from the
+/// document's host. Like [`LinkHandler`], it keeps the renderer unaware of
+/// daemons: a view without one shows file images as their caption.
+pub type ImageLoader = Rc<dyn Fn(&ImagePath) -> gpui::ImageSource>;
 
 // ── Layout metrics ─────────────────────────────────────────────────────────
 //
@@ -610,6 +616,8 @@ pub struct Ctx<'a> {
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
     link_handler: Option<LinkHandler>,
+    image_base: ImageBase,
+    image_loader: Option<ImageLoader>,
     /// Cross-frame flatten cache, when this render has one to consult.
     cache: Option<&'a MarkdownView>,
     next_ordinal: Cell<usize>,
@@ -639,6 +647,8 @@ impl<'a> Ctx<'a> {
             selection,
             search: None,
             link_handler: None,
+            image_base: ImageBase::default(),
+            image_loader: None,
             cache: None,
             next_ordinal: Cell::new(0),
             starts_block: Cell::new(true),
@@ -658,6 +668,14 @@ impl<'a> Ctx<'a> {
 
     pub fn with_link_handler(mut self, handler: LinkHandler) -> Self {
         self.link_handler = Some(handler);
+        self
+    }
+
+    /// Load file images through `loader`, resolving relative paths against
+    /// `base`.
+    pub fn with_images(mut self, base: ImageBase, loader: ImageLoader) -> Self {
+        self.image_base = base;
+        self.image_loader = Some(loader);
         self
     }
 
@@ -698,6 +716,8 @@ impl<'a> Ctx<'a> {
             selection: self.selection.clone(),
             search: self.search.clone(),
             link_handler: self.link_handler.clone(),
+            image_base: self.image_base.clone(),
+            image_loader: self.image_loader.clone(),
             cache: Some(view),
             next_ordinal: Cell::new(self.next_ordinal.get()),
             starts_block: Cell::new(self.starts_block.get()),
@@ -1647,17 +1667,63 @@ fn checkbox(checked: bool, ctx: &Ctx) -> AnyElement {
         .into_any_element()
 }
 
-/// An inline image. Data URLs decode in place; anything else is handed to GPUI
-/// to load. The alt text renders beneath as a caption when there is one, so a
-/// failed or slow load still says what it was.
+/// An inline image. Data URLs decode in place; file paths load through the
+/// view's [`ImageLoader`] from the host that owns the document. Network URLs
+/// are never fetched. The alt text renders beneath as a caption when there is
+/// one, and an image that cannot be drawn shows its URL in its place.
 fn render_image(url: &str, alt: &str, ctx: &Ctx) -> AnyElement {
     const MAX_HEIGHT: f32 = 320.0;
 
     let key = ctx.next_key();
     let id = SharedString::from(format!("image-{}-{}", key.row, key.index));
-    let image = match decode_data_url(url) {
-        Some(decoded) => img(decoded).id(id),
-        None => img(url.to_owned()).id(id),
+    let source: Option<gpui::ImageSource> = match image_path::classify(url, &ctx.image_base) {
+        ImageTarget::Data(url) => decode_data_url(url).map(Into::into),
+        ImageTarget::Path(path) => ctx.image_loader.as_ref().map(|load| load(&path)),
+        ImageTarget::Unsupported => None,
+    };
+
+    // The fallback outlives this frame's `Ctx`, so it carries owned copies.
+    let palette = *ctx.palette;
+    let unavailable = {
+        let url = SharedString::from(url.to_owned());
+        let text_size = px((ctx.metrics.text_size - 2.0).max(12.5));
+        let line_height = px(ctx.metrics.line_height - 4.0);
+        move || {
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(text_size)
+                .line_height(line_height)
+                .text_color(palette.ghost)
+                .child(crate::ui::icon(
+                    "icons/file-types/image.svg",
+                    14.0,
+                    palette.ghost,
+                ))
+                .child(div().min_w_0().child(url.clone()))
+                .into_any_element()
+        }
+    };
+    let image = match source {
+        Some(source) => img(source)
+            .id(id)
+            .max_w(relative(1.0))
+            .max_h(px(MAX_HEIGHT))
+            .rounded(px(6.0))
+            .object_fit(gpui::ObjectFit::ScaleDown)
+            .with_loading(move || {
+                div()
+                    .w(px(160.0))
+                    .h(px(80.0))
+                    .rounded(px(6.0))
+                    .bg(palette.inset)
+                    .into_any_element()
+            })
+            .with_fallback(unavailable)
+            .into_any_element(),
+        None => unavailable(),
     };
     div()
         .w_full()
@@ -1665,13 +1731,7 @@ fn render_image(url: &str, alt: &str, ctx: &Ctx) -> AnyElement {
         .flex()
         .flex_col()
         .gap(px(4.0))
-        .child(
-            image
-                .max_w(relative(1.0))
-                .max_h(px(MAX_HEIGHT))
-                .rounded(px(6.0))
-                .object_fit(gpui::ObjectFit::ScaleDown),
-        )
+        .child(image)
         .when(!alt.trim().is_empty(), |element| {
             element.child(
                 div()

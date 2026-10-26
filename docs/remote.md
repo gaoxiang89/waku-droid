@@ -140,6 +140,26 @@ Every provider CLI the remote tasks use — `claude`, `pi`, `codex`, and so on
 — must be installed and signed in **on the remote host**. The daemon resolves
 them from the remote login shell's `PATH`.
 
+### Markdown images
+
+Markdown images load from the host that owns the document, the way VS Code's
+Markdown preview loads them over Remote-SSH. `src/md/image_path.rs` resolves
+the URL to a path in that host's syntax, and `src/app/markdown_images.rs` reads
+the bytes with the daemon's `ReadFileChunk` as a GPUI asset load, so nothing is
+read from the desktop's disk and no frame waits on the network.
+
+| Surface | Relative path | `/`-leading path |
+|---|---|---|
+| Transcript | task workspace | absolute on the host |
+| File preview | the file's directory | workspace root, then absolute |
+| Skills page | the skill's directory (this computer) | absolute |
+
+`file://` URLs and Windows drive paths are absolute paths. `data:` URLs decode
+in place. `http(s)` images are never fetched, and neither are `~` paths; they
+show their URL instead, as does any image that fails to load or exceeds
+20 MB. Loads are cached per host connection, so an image that changes on disk,
+or appears after a failed load, shows again after a reconnect or relaunch.
+
 ## Development
 
 On Windows, `bun ./scripts/dev.ts` also builds a Linux daemon inside WSL

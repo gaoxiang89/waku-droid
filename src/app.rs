@@ -1995,6 +1995,7 @@ mod git_graph_actions;
 mod goal_dialog;
 mod hosts;
 mod image_preview;
+mod markdown_images;
 mod notifications;
 mod project_picker;
 mod remote_folder_picker;

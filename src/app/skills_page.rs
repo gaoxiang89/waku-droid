@@ -1204,6 +1204,14 @@ impl Waku {
             )
             .with_math_enabled(self.state.render_math)
             .with_math_context_menu(self.menu_handle("skill-detail-math", cx));
+            // Skills are managed on this computer, so their images are too.
+            let ctx = match self.markdown_image_loader(&HostKey::Local) {
+                Some(loader) => ctx.with_images(
+                    md::image_path::ImageBase::directory(&skill.primary().dir.to_string_lossy()),
+                    loader,
+                ),
+                None => ctx,
+            };
             div()
                 .mt(px(18.0))
                 .pt(px(14.0))

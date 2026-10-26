@@ -1174,10 +1174,20 @@ impl Waku {
         metrics: MarkdownMetrics,
         animate_streaming: bool,
     ) -> MarkdownCtx<'a> {
-        MarkdownCtx::new(row, palette, metrics, self.transcript_selection.clone())
+        let ctx = MarkdownCtx::new(row, palette, metrics, self.transcript_selection.clone())
             .with_math_enabled(self.state.render_math)
             .with_link_handler(self.markdown_link_handler.clone())
-            .with_streaming_animation(animate_streaming)
+            .with_streaming_animation(animate_streaming);
+        // Agents write images relative to the task's workspace, or as real
+        // absolute paths on the task's host.
+        let base = self
+            .selected_workspace_path()
+            .map(|workspace| md::image_path::ImageBase::directory(&workspace.to_string_lossy()))
+            .unwrap_or_default();
+        match self.markdown_image_loader(&self.selected_host_key()) {
+            Some(loader) => ctx.with_images(base, loader),
+            None => ctx,
+        }
     }
 
     /// The menu handle for `id`, created on first use.

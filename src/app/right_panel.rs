@@ -5122,6 +5122,19 @@ impl Waku {
         .with_math_enabled(self.state.render_math)
         .with_math_context_menu(self.menu_handle("file-preview-math", cx))
         .with_link_handler(self.markdown_link_handler.clone());
+        // Images resolve the way VS Code's preview resolves them: next to the
+        // file, and `/`-leading against the workspace root.
+        let images = self.selected_workspace_path().and_then(|workspace| {
+            let loader = self.markdown_image_loader(&self.selected_host_key())?;
+            Some((
+                md::image_path::ImageBase::document(&workspace.to_string_lossy(), relative_path),
+                loader,
+            ))
+        });
+        let ctx = match images {
+            Some((base, loader)) => ctx.with_images(base, loader),
+            None => ctx,
+        };
         let document = md::render::markdown(view, &ctx);
 
         let selection_input = {
