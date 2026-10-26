@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.36]
+
+- Collect finished, failed, and waiting tasks, approval and input requests, and terminal alerts in a notification bell in the title bar; click an entry to jump to its task or terminal
+- Show images in Markdown — transcripts, the file preview, and skills — loaded from the host the document lives on, so relative, workspace-root, and absolute paths work for SSH and WSL tasks too; web images are not fetched
+
 ## [0.1.35]
 
 - Collect the sidebar, bottom terminal, and right panel toggles into a single title bar, and give the Files tree a pane of its own beside the workspace
