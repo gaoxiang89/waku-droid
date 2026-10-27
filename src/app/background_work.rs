@@ -39,13 +39,6 @@ impl Default for BackgroundOutputViewport {
     }
 }
 
-#[derive(Clone)]
-struct EnvironmentSummary {
-    commit_status: Option<String>,
-    commit_focus: FocusHandle,
-    compare_focus: FocusHandle,
-}
-
 impl BackgroundWorkRegistry {
     fn apply(&mut self, event: BackgroundWorkEvent) {
         match event {
@@ -667,25 +660,13 @@ impl Waku {
     /// attention event lands here, and the pulse dot reflects live background
     /// work across every session, not just the selected one.
     pub(super) fn render_notifications_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let environment = Some(EnvironmentSummary {
-            commit_status: self.commit_operation_status_label(),
-            commit_focus: self.transcript_control_focus("environment-summary-commit", cx),
-            compare_focus: self.transcript_control_focus("environment-summary-compare", cx),
-        });
         let has_live_work = self
             .background_work
             .values()
             .any(BackgroundWorkRegistry::has_live);
         let unread_count = self.app_notification_count();
         let theme = Theme::current(cx);
-        let refresh_weak = cx.entity().downgrade();
-        let handle = self.menu_handle_with(NOTIFICATION_MENU_ID, cx, move |open, _, cx| {
-            if open {
-                let _ = refresh_weak.update(cx, |this, cx| {
-                    this.refresh_selected_branch_snapshot(cx);
-                });
-            }
-        });
+        let handle = self.menu_handle(NOTIFICATION_MENU_ID, cx);
         // Row snapshots allocate per notification, so they are only built
         // for the frames the popover is actually open.
         let rows = Rc::new(if handle.is_open() {
@@ -760,7 +741,6 @@ impl Waku {
             move |handle, _, cx| {
                 render_notification_queue_card(
                     handle,
-                    environment.clone(),
                     rows.clone(),
                     clear_focus.clone(),
                     weak.clone(),
@@ -1354,7 +1334,6 @@ fn background_work_selection_input(selection: TranscriptSelection) -> impl IntoE
 
 fn render_notification_queue_card(
     handle: &ContextMenuHandle,
-    environment: Option<EnvironmentSummary>,
     rows: Rc<Vec<AppNotificationRow>>,
     clear_focus: FocusHandle,
     weak: WeakEntity<Waku>,
@@ -1439,7 +1418,7 @@ fn render_notification_queue_card(
         )
         .child(div().flex_1())
         .when(!rows.is_empty(), |header| header.child(clear));
-    let mut card = div()
+    div()
         .id("notification-queue-card")
         .track_focus(handle.focus_handle())
         .w(px(300.0))
@@ -1450,18 +1429,8 @@ fn render_notification_queue_card(
         .bg(theme.raised)
         .shadow_lg()
         .child(header)
-        .child(list);
-    if let Some(environment) = environment {
-        card = card
-            .child(div().mx(px(8.0)).h(px(1.0)).bg(theme.border))
-            .child(render_environment_summary_section(
-                environment,
-                handle.clone(),
-                weak,
-                &theme,
-            ));
-    }
-    card.into_any_element()
+        .child(list)
+        .into_any_element()
 }
 
 fn render_notification_row(
@@ -1542,142 +1511,6 @@ fn render_notification_row(
         })
 }
 
-fn render_environment_summary_section(
-    environment: EnvironmentSummary,
-    handle: ContextMenuHandle,
-    weak: WeakEntity<Waku>,
-    theme: &Theme,
-) -> Div {
-    let commit_handle = handle.clone();
-    let commit_weak = weak.clone();
-    let commit_pending = environment.commit_status.is_some();
-    let commit = render_environment_action_row(
-        "environment-summary-commit",
-        &environment.commit_focus,
-        "icons/git-commit-horizontal.svg",
-        environment
-            .commit_status
-            .unwrap_or_else(|| tr!("environment.commit_or_push")),
-        !commit_pending,
-        commit_pending,
-        None,
-        theme,
-        move |window, cx| {
-            commit_handle.close(window, cx);
-            window.refresh();
-            let _ = commit_weak.update(cx, |this, cx| {
-                this.open_commit_dialog(window, cx);
-            });
-        },
-    );
-
-    let compare_handle = handle;
-    let compare_weak = weak;
-    let compare = render_environment_action_row(
-        "environment-summary-compare",
-        &environment.compare_focus,
-        "icons/github.svg",
-        tr!("environment.compare_branch"),
-        true,
-        false,
-        Some(icon("icons/arrow-up-right.svg", 13.0, theme.text_tertiary).into_any_element()),
-        theme,
-        move |window, cx| {
-            compare_handle.close(window, cx);
-            window.refresh();
-            let _ = compare_weak.update(cx, |this, cx| {
-                this.set_right_panel_diff_source(ReviewDiffSource::Branch, cx);
-            });
-        },
-    );
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_0()
-        .child(
-            div()
-                .h(px(30.0))
-                .px(px(8.0))
-                .flex()
-                .items_center()
-                .text_size(sp(13.5))
-                .text_color(theme.text_tertiary)
-                .child(tr!("environment.title")),
-        )
-        .child(commit)
-        .child(compare)
-}
-
-fn render_environment_action_row(
-    id: &'static str,
-    focus: &FocusHandle,
-    icon_path: &'static str,
-    label: String,
-    enabled: bool,
-    active: bool,
-    trailing: Option<AnyElement>,
-    theme: &Theme,
-    action: impl Fn(&mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let foreground = if enabled {
-        theme.text
-    } else if active {
-        theme.text_secondary
-    } else {
-        theme.text_ghost
-    };
-    let icon_foreground = if enabled || active {
-        theme.text_secondary
-    } else {
-        theme.text_ghost
-    };
-    let indicator = if active {
-        motion::spin_slow(icon("icons/loader-circle.svg", 14.0, theme.text_secondary))
-    } else {
-        icon(icon_path, 14.0, icon_foreground).into_any_element()
-    };
-    let action: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(action);
-    let key_action = action.clone();
-    div()
-        .id(id)
-        .track_focus(focus)
-        .when(enabled, |row| row.tab_index(0))
-        .min_h(px(32.0))
-        .w_full()
-        .px(px(8.0))
-        .rounded(px(8.0))
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .cursor_default()
-        .focus_visible(|style| style.border_1().border_color(theme.accent))
-        .when(enabled, |row| {
-            row.hover(|style| style.bg(theme.overlay_strong))
-        })
-        .child(indicator)
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_size(sp(13.5))
-                .text_color(foreground)
-                .child(label),
-        )
-        .children(trailing)
-        .when(enabled, |row| {
-            row.on_click(move |_, window, cx| action(window, cx))
-                .on_key_down(move |event: &KeyDownEvent, window, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        key_action(window, cx);
-                        cx.stop_propagation();
-                    }
-                })
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,7 +1533,7 @@ mod tests {
             .split_once("\nfn render_notification_row(")
             .expect("notification row renderer")
             .1
-            .split_once("\nfn render_environment_summary_section(")
+            .split_once("\n#[cfg(test)]")
             .expect("notification row renderer end")
             .0;
 
