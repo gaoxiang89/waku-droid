@@ -16,6 +16,13 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.37]
+
+- Restore terminal sessions across reconnects and desktop restarts, keeping their running processes, output, and pane layout
+- Move the New Task button to the conversation toolbar
+- Improve Markdown rendering and text selection, including streamed formatting, tables, linked images, and math
+- Remove the Environment section and its Git actions from the notification panel
+
 ## [0.1.36]
 
 - Collect finished, failed, and waiting tasks, approval and input requests, and terminal alerts in a notification bell in the title bar; click an entry to jump to its task or terminal
