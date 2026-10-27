@@ -167,6 +167,8 @@ enum PaletteAction {
     ToggleFilesSurface,
     ToggleGitGraphSurface,
     NewTerminal,
+    RestoreTerminals,
+    EndTerminal(Uuid),
     CheckForUpdates,
     OpenSettings(SettingsPage),
     SelectTask(Uuid),
@@ -697,7 +699,7 @@ impl Waku {
         .detach();
     }
 
-    fn command_palette_commands(&self, searching: bool) -> Vec<CommandPaletteItem> {
+    fn command_palette_commands(&self, searching: bool, cx: &App) -> Vec<CommandPaletteItem> {
         let display_section = |suggested| {
             if searching {
                 PaletteSection::Commands
@@ -858,6 +860,15 @@ impl Waku {
             ),
             CommandPaletteItem::command(
                 PaletteSection::Commands,
+                tr!("terminal.restore_sessions"),
+                "icons/terminal.svg",
+                None,
+                PaletteAction::RestoreTerminals,
+                "restore recover attach detached terminal sessions",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
                 tr!("command_palette.new_terminal"),
                 "icons/terminal.svg",
                 Some(crate::platform::primary_shortcut("⇧⌘J", "Ctrl+Shift+J")),
@@ -866,6 +877,38 @@ impl Waku {
                 next(),
             ),
         ]);
+
+        for pane in self
+            .bottom_panel_terminal_groups
+            .iter()
+            .flat_map(SplitGroup::panes)
+            .chain(
+                self.right_panel_surfaces
+                    .iter()
+                    .filter_map(RightPanelSurface::terminal_id)
+                    .filter_map(|id| self.right_panel_terminal_groups.get(&id))
+                    .flat_map(SplitGroup::panes),
+            )
+        {
+            let terminal = pane.read(cx);
+            if terminal.exited() {
+                continue;
+            }
+            commands.push(CommandPaletteItem::command(
+                PaletteSection::Commands,
+                format!(
+                    "{}: {} ({})",
+                    tr!("terminal.end_session"),
+                    terminal.title(),
+                    &terminal.persistent_id.to_string()[..8]
+                ),
+                "icons/terminal.svg",
+                None,
+                PaletteAction::EndTerminal(terminal.persistent_id),
+                "end stop terminate terminal session",
+                next(),
+            ));
+        }
 
         if self.updater_available {
             commands.push(CommandPaletteItem::command(
@@ -1274,7 +1317,7 @@ impl Waku {
         &mut self,
         query: &str,
         preserve_selection: bool,
-        _cx: &App,
+        cx: &App,
     ) {
         match self.command_palette.view {
             CommandPaletteView::Resume => {
@@ -1289,7 +1332,7 @@ impl Waku {
         }
         let query = query.trim();
         if query.is_empty() {
-            self.command_palette.results = self.command_palette_commands(false);
+            self.command_palette.results = self.command_palette_commands(false, cx);
             self.command_palette.selected = 0;
             self.command_palette.scroll.scroll_to_item(0);
             return;
@@ -1338,7 +1381,7 @@ impl Waku {
         tasks.truncate(MAX_TASK_RESULTS);
 
         let mut commands = self
-            .command_palette_commands(true)
+            .command_palette_commands(true, cx)
             .into_iter()
             .filter_map(|item| {
                 pattern
@@ -1750,6 +1793,18 @@ impl Waku {
                 self.toggle_git_graph_surface_action(&ToggleGitGraphSurface, window, cx)
             }
             PaletteAction::NewTerminal => self.new_terminal_action(&NewTerminal, window, cx),
+            PaletteAction::RestoreTerminals => self.restore_detached_terminals(cx),
+            PaletteAction::EndTerminal(id) => {
+                let pane = self
+                    .bottom_panel_terminal_groups
+                    .iter()
+                    .chain(self.right_panel_terminal_groups.values())
+                    .flat_map(SplitGroup::panes)
+                    .find(|p| p.read(cx).persistent_id == id);
+                if let Some(pane) = pane {
+                    pane.update(cx, |terminal, cx| terminal.terminate(cx));
+                }
+            }
             PaletteAction::CheckForUpdates => {
                 if let Some(updater) = cx
                     .try_global::<crate::updater::UpdaterState>()

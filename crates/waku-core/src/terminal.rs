@@ -4,15 +4,6 @@
 //! stream and send input/resize controls, so a browser can operate against a
 //! daemon on another machine without interpreting any daemon-side paths.
 
-#[cfg(not(unix))]
-use std::path::Path;
-
-#[cfg(not(unix))]
-use anyhow::bail;
-
-#[cfg(not(unix))]
-use crate::EventSink;
-
 #[cfg(unix)]
 mod platform {
     use std::io::{Read as _, Write as _};
@@ -44,6 +35,7 @@ mod platform {
     }
 
     pub struct DaemonTerminal {
+        output: crate::terminal_state::TerminalEvents,
         pty: Arc<Mutex<tty::Pty>>,
         stopped: Arc<AtomicBool>,
         reader_poller: Arc<Poller>,
@@ -78,6 +70,7 @@ mod platform {
             events: EventSink,
             shell: Shell,
         ) -> anyhow::Result<Self> {
+            let events = crate::terminal_state::TerminalEvents::new(events, cols, rows);
             if !cwd.is_dir() {
                 bail!(
                     "terminal working directory does not exist: {}",
@@ -182,6 +175,7 @@ mod platform {
             let reader_stopped = stopped.clone();
             let reader_events = events.clone();
             let reader_poller_thread = reader_poller.clone();
+            let reply_tx = input_tx.clone();
             let reader = match std::thread::Builder::new()
                 .name("waku-daemon-terminal-output".into())
                 .spawn(move || {
@@ -225,6 +219,10 @@ mod platform {
                                         "terminalOutput",
                                         json!({ "data": data }),
                                     ));
+                                    let replies = reader_events.state.lock().take_replies();
+                                    if !replies.is_empty() {
+                                        let _ = reply_tx.send(DaemonTerminalInput::Write(replies));
+                                    }
                                 }
                                 Err(error)
                                     if matches!(
@@ -289,6 +287,7 @@ mod platform {
             };
 
             Ok(Self {
+                output: events,
                 pty,
                 stopped,
                 reader_poller,
@@ -310,7 +309,15 @@ mod platform {
                 .context("terminal input writer is not running")
         }
 
+        pub fn snapshot(&self, after: Option<u64>) -> waku_protocol::TerminalOutput {
+            self.output.state.lock().snapshot(after)
+        }
+        pub fn exited(&self) -> bool {
+            self.output.state.lock().exited()
+        }
+
         pub fn resize(&self, cols: u16, rows: u16) {
+            self.output.state.lock().resize(cols, rows);
             if let Some(input_tx) = &self.input_tx {
                 let _ = input_tx.send(DaemonTerminalInput::Resize(window_size(cols, rows)));
             }
@@ -488,17 +495,6 @@ mod platform {
 pub use platform::DaemonTerminal;
 
 #[cfg(not(unix))]
-pub struct DaemonTerminal;
-
+mod windows;
 #[cfg(not(unix))]
-impl DaemonTerminal {
-    pub fn open(_cwd: &Path, _cols: u16, _rows: u16, _events: EventSink) -> anyhow::Result<Self> {
-        bail!("daemon terminals are not supported on this platform")
-    }
-
-    pub fn write(&self, _data: Vec<u8>) -> anyhow::Result<()> {
-        bail!("daemon terminals are not supported on this platform")
-    }
-
-    pub fn resize(&self, _cols: u16, _rows: u16) {}
-}
+pub use windows::DaemonTerminal;

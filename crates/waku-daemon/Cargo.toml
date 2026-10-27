@@ -27,6 +27,7 @@ dirs = "6.0"
 serde_json = "1.0"
 uuid = { version = "1.18", features = ["v4"] }
 waku-core = { path = "../waku-core" }
+waku-client = { path = "../waku-client" }
 waku-protocol = { path = "../waku-protocol" }
 
 [target.'cfg(unix)'.dependencies]

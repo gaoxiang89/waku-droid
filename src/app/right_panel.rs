@@ -1072,7 +1072,7 @@ impl RightPanelSurface {
         Self::Terminal(Uuid::new_v4())
     }
 
-    fn terminal_id(&self) -> Option<Uuid> {
+    pub(super) fn terminal_id(&self) -> Option<Uuid> {
         match self {
             Self::Terminal(id) => Some(*id),
             _ => None,
@@ -3258,6 +3258,9 @@ impl Waku {
     }
 
     fn ensure_right_panel_terminal(&mut self, terminal_id: Uuid, cx: &mut Context<Self>) {
+        if !self.terminal_layouts.loaded {
+            return;
+        }
         let Some(working_directory) = self
             .selected_workspace_path()
             .map(std::path::Path::to_path_buf)
@@ -3289,16 +3292,27 @@ impl Waku {
         working_directory: &Path,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
+        self.right_terminal_with_identity(working_directory, None, cx)
+    }
+
+    pub(super) fn right_terminal_with_identity(
+        &self,
+        working_directory: &Path,
+        id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
         // A desktop PTY would interpret a remote daemon's working directory on
         // the wrong machine, so remote windows run the shell on the daemon
         // host.
-        let launcher = if self.selected_daemon().is_remote() {
-            crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
-        } else {
-            crate::terminal::TerminalLauncher::Local
-        };
+        let launcher = crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone());
         let terminal = cx.new(|cx| {
-            TerminalView::new(working_directory.to_path_buf(), launcher, cx).with_can_split()
+            match id {
+                Some(id) => {
+                    TerminalView::restore(working_directory.to_path_buf(), launcher, id, cx)
+                }
+                None => TerminalView::new(working_directory.to_path_buf(), launcher, cx),
+            }
+            .with_can_split()
         });
         cx.subscribe(
             &terminal,

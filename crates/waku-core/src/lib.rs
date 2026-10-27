@@ -57,6 +57,7 @@ pub mod settings;
 pub mod skills;
 mod slash_command_catalog;
 pub mod terminal;
+mod terminal_state;
 pub mod theme;
 pub mod usage;
 pub mod usage_history;

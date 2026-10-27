@@ -38,8 +38,6 @@ fn main() -> anyhow::Result<()> {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
     };
-    println!("{}", serde_json::to_string(&ready)?);
-    std::io::stdout().flush()?;
     if let Some(state_file) = &arguments.state_file {
         bridge::write_state(
             state_file,
@@ -52,6 +50,8 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
     }
+    println!("{}", serde_json::to_string(&ready)?);
+    std::io::stdout().flush()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Some(parent_pid) = arguments.parent_pid {
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
         shutdown,
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
-            allow_shutdown: arguments.parent_pid.is_some(),
+            allow_shutdown: arguments.parent_pid.is_some() || arguments.allow_shutdown,
             idle_exit: arguments.idle_exit,
         },
     )
@@ -99,6 +99,7 @@ fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow:
 }
 
 struct Arguments {
+    allow_shutdown: bool,
     bind: String,
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
@@ -110,6 +111,7 @@ struct Arguments {
 impl Arguments {
     fn parse(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
         let mut bind = "127.0.0.1:0".to_owned();
+        let mut allow_shutdown = false;
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
@@ -118,6 +120,7 @@ impl Arguments {
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "--allow-shutdown" => allow_shutdown = true,
                 "--bind" => {
                     bind = arguments
                         .next()
@@ -169,6 +172,7 @@ impl Arguments {
             }
         }
         Ok(Self {
+            allow_shutdown,
             bind,
             parent_pid,
             allowed_origins,

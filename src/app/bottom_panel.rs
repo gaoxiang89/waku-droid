@@ -723,6 +723,9 @@ impl Waku {
     /// are never recreated or dropped here: they belong to the session they
     /// were opened in and die only when their tab closes.
     pub(super) fn ensure_bottom_panel_terminal(&mut self, cx: &mut Context<Self>) {
+        if !self.terminal_layouts.loaded {
+            return;
+        }
         if !self.bottom_panel_terminal_groups.is_empty() {
             return;
         }
@@ -743,17 +746,27 @@ impl Waku {
         working_directory: &Path,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
+        self.bottom_terminal_with_identity(working_directory, None, cx)
+    }
+
+    pub(super) fn bottom_terminal_with_identity(
+        &self,
+        working_directory: &Path,
+        id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalView> {
         // A desktop PTY would interpret a remote daemon's working directory on
         // the wrong machine, so remote windows run the shell on the daemon
         // host.
-        let launcher = if self.selected_daemon().is_remote() {
-            crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone())
-        } else {
-            crate::terminal::TerminalLauncher::Local
-        };
+        let launcher = crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone());
         let terminal = cx.new(|cx| {
-            TerminalView::new(working_directory.to_path_buf(), launcher, cx)
-                .with_bottom_panel_tabs()
+            match id {
+                Some(id) => {
+                    TerminalView::restore(working_directory.to_path_buf(), launcher, id, cx)
+                }
+                None => TerminalView::new(working_directory.to_path_buf(), launcher, cx),
+            }
+            .with_bottom_panel_tabs()
         });
         // Clicking a pane makes it the tracked one, so the tab bar's split
         // button and the pane chords act on the pane being looked at rather
@@ -1056,8 +1069,8 @@ impl Waku {
     }
 
     /// Close one terminal tab, together with every pane it still shows.
-    /// Dropping the entities is what shuts the PTYs down, locally and on a
-    /// remote daemon alike.
+    /// Dropping the entities detaches their views; daemon sessions remain available
+    /// through Restore workspace terminals.
     pub(super) fn close_bottom_panel_group(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.bottom_panel_terminal_groups.len() {
             return;

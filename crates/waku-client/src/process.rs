@@ -25,11 +25,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound between attempts to reach an unreachable remote host.
 const MAX_REMOTE_BACKOFF: Duration = Duration::from_secs(30);
-/// How long the desktop keeps re-dialing its own daemon process before it
-/// concludes the process is hung (alive but not answering) and replaces it
-/// the way a crash is replaced. Generous on purpose: replacing kills live
-/// provider runtimes, so only a daemon unreachable for minutes qualifies.
-const LOCAL_RECONNECT_PATIENCE: Duration = Duration::from_secs(60);
 pub const DEFAULT_EXPOSED_DAEMON_PORT: u16 = 34_123;
 
 /// Desktop-owned launch configuration for the daemon it supervises.
@@ -140,7 +135,9 @@ pub struct DaemonProcess {
     /// dropped WebSocket; the port is chosen by the daemon at spawn time.
     address: String,
     token: String,
-    child: Child,
+    child: Option<Child>,
+    state_file: PathBuf,
+    pid: u32,
 }
 
 impl DaemonProcess {
@@ -154,6 +151,52 @@ impl DaemonProcess {
     ) -> anyhow::Result<Self> {
         let settings = settings.validate()?;
         let token = settings.token.clone();
+        let state_file =
+            crate::persistence::StateStore::default_path().with_file_name("resident-daemon.json");
+        if let Some(parent) = state_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let launch_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state_file.with_extension("lock"))?;
+        launch_lock.lock().context("lock resident daemon startup")?;
+        if let Ok(bytes) = std::fs::read(&state_file)
+            && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
+            && resident_process_alive(record.pid)
+            && (record.protocol_version != PROTOCOL_VERSION || record.token != token)
+        {
+            bail!(
+                "a resident daemon is still running with different protocol or credentials; end its sessions before replacing it"
+            );
+        }
+        if let Ok(bytes) = std::fs::read(&state_file)
+            && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
+            && record.protocol_version == PROTOCOL_VERSION
+            && record.token == token
+            && let Ok(address) = desktop_client_address(&record.address)
+            && let Ok(client) = DaemonClient::connect(&address, token.clone())
+        {
+            return Ok(Self {
+                client: Mutex::new(client),
+                address,
+                token,
+                child: None,
+                state_file,
+                pid: record.pid,
+            });
+        }
+        if let Ok(bytes) = std::fs::read(&state_file)
+            && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
+            && resident_process_alive(record.pid)
+        {
+            bail!("resident daemon is running but unreachable; leaving its sessions intact");
+        }
+        if let Some(parent) = state_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let app_executable = std::env::current_exe().context("could not locate Waku executable")?;
         let mut command = ProcessCommand::new(executable);
         // The desktop is a GUI-subsystem binary on Windows, so a console
@@ -169,8 +212,23 @@ impl DaemonProcess {
         command
             .arg("--bind")
             .arg(settings.bind_address())
-            .arg("--parent-pid")
-            .arg(std::process::id().to_string());
+            .arg("--state-file")
+            .arg(&state_file)
+            .arg("--allow-shutdown")
+            .arg("--idle-exit-secs")
+            .arg("1800");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         if settings.enabled {
             command.arg("--allow-non-loopback");
         }
@@ -182,7 +240,12 @@ impl DaemonProcess {
             .env(APP_EXECUTABLE_ENV, app_executable)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(state_file.with_extension("log"))?,
+            ))
             .spawn()
             .with_context(|| format!("could not launch {}", executable.display()))?;
         let stdout = child
@@ -248,7 +311,9 @@ impl DaemonProcess {
             client: Mutex::new(client),
             address: client_address,
             token,
-            child,
+            child: Some(child),
+            state_file,
+            pid: ready.pid,
         })
     }
 
@@ -272,27 +337,37 @@ impl DaemonProcess {
     }
 
     fn has_exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        match self.child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            None => !resident_process_alive(self.pid),
+        }
     }
 
     fn stop(&mut self) {
         self.client.lock().shutdown();
+        let _ = std::fs::remove_file(&self.state_file);
+        let Some(child) = self.child.as_mut() else {
+            std::thread::sleep(SHUTDOWN_TIMEOUT);
+            return;
+        };
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         while Instant::now() < deadline {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) => std::thread::sleep(Duration::from_millis(25)),
                 Err(_) => break,
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
 impl Drop for DaemonProcess {
     fn drop(&mut self) {
-        self.stop();
+        // The resident daemon owns terminal processes. A client exiting is
+        // not a request to terminate them; explicit replacement calls stop.
+        self.client.lock().disconnect();
     }
 }
 
@@ -661,7 +736,7 @@ fn monitor_daemon(
     let mut next_remote_attempt = Instant::now();
     let mut local_backoff = REBUILD_POLL_INTERVAL;
     let mut next_local_attempt = Instant::now();
-    let mut local_down_since: Option<Instant> = None;
+    let mut next_upgrade_attempt = Instant::now();
     loop {
         std::thread::sleep(REBUILD_POLL_INTERVAL);
         let Some(inner) = weak_inner.upgrade() else {
@@ -698,7 +773,6 @@ fn monitor_daemon(
         if reconnect.is_none() {
             local_backoff = REBUILD_POLL_INTERVAL;
             next_local_attempt = Instant::now();
-            local_down_since = None;
         }
         match reconnect {
             Some(DisconnectedTarget::Remote {
@@ -767,28 +841,9 @@ fn monitor_daemon(
                         // Another path already replaced the target.
                         local_backoff = REBUILD_POLL_INTERVAL;
                         next_local_attempt = Instant::now();
-                        local_down_since = None;
                     }
                     Some((address, token, resume_from)) => {
-                        local_down_since.get_or_insert_with(Instant::now);
-                        if local_down_since
-                            .is_some_and(|since| since.elapsed() >= LOCAL_RECONNECT_PATIENCE)
                         {
-                            // The process lives but stopped answering; treat
-                            // it like a crash and replace it. Killing live
-                            // runtimes is deliberate: a daemon this
-                            // unreachable could not serve them anyway.
-                            local_backoff = REBUILD_POLL_INTERVAL;
-                            next_local_attempt = Instant::now();
-                            local_down_since = None;
-                            if let Some(executable) = inner.executable.as_ref()
-                                && let Some(exposure) = inner.exposure.lock().clone()
-                                && let Err(error) =
-                                    replace_local_daemon(&inner, executable, &exposure)
-                            {
-                                eprintln!("could not restart the hung Waku daemon: {error:#}");
-                            }
-                        } else {
                             // The target lock is released here: dialing a
                             // wedged daemon can block for seconds, and
                             // UI-side `client()` calls must not wait.
@@ -796,7 +851,6 @@ fn monitor_daemon(
                                 Ok(replacement) => {
                                     local_backoff = REBUILD_POLL_INTERVAL;
                                     next_local_attempt = Instant::now();
-                                    local_down_since = None;
                                     let mut target = inner.target.lock();
                                     let replaced = match &mut *target {
                                         DaemonTarget::Local(process)
@@ -841,6 +895,9 @@ fn monitor_daemon(
         if !process_exited && !executable_changed {
             continue;
         }
+        if !process_exited && Instant::now() < next_upgrade_attempt {
+            continue;
+        }
         let _restart = inner.restart.lock();
         let Some(exposure) = inner.exposure.lock().clone() else {
             return;
@@ -849,6 +906,7 @@ fn monitor_daemon(
             Ok(()) => {}
             Err(error) => {
                 eprintln!("could not restart rebuilt Waku daemon: {error:#}");
+                next_upgrade_attempt = Instant::now() + MAX_REMOTE_BACKOFF;
                 continue;
             }
         }
@@ -866,6 +924,26 @@ fn replace_local_daemon(
     executable: &Path,
     exposure: &DaemonExposureSettings,
 ) -> anyhow::Result<()> {
+    let client = inner.target.lock().client();
+    if client.is_disconnected() {
+        let mut target = inner.target.lock();
+        let running = match &mut *target {
+            DaemonTarget::Local(process) => !process.has_exited(),
+            _ => false,
+        };
+        if running {
+            bail!("resident daemon is unreachable; leaving its sessions intact");
+        }
+    }
+    if !client.is_disconnected() {
+        if let ResponsePayload::Terminals { terminals } =
+            client.request(Uuid::nil(), Uuid::nil(), Command::ListTerminals)?
+        {
+            if terminals.iter().any(|terminal| !terminal.exited) {
+                bail!("daemon restart deferred while terminal sessions are running");
+            }
+        }
+    }
     let previous = {
         let mut target = inner.target.lock();
         match &*target {
@@ -886,7 +964,9 @@ fn replace_local_daemon(
     };
     // Dropping can wait briefly for graceful shutdown, but the target lock is
     // already released so UI actions never block behind process teardown.
-    drop(previous);
+    if let Some(mut previous) = previous {
+        previous.stop();
+    }
     let replacement = DaemonProcess::spawn_configured(executable, exposure.clone())?;
     let client = replacement.client();
     *inner.target.lock() = DaemonTarget::Local(replacement);
@@ -895,6 +975,31 @@ fn replace_local_daemon(
         .lock()
         .retain(|subscriber| subscriber.send(client.clone()).is_ok());
     Ok(())
+}
+
+#[cfg(unix)]
+fn resident_process_alive(pid: u32) -> bool {
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+#[cfg(windows)]
+fn resident_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let result = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        result == 0 || code == STILL_ACTIVE as u32
+    }
 }
 
 fn queue_settings_refresh(inner: &SupervisorInner) {

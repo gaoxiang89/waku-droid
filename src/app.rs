@@ -806,7 +806,7 @@ struct RightPanelFileEditor {
 /// sessions there keeps Files, Terminal, and GitGraph on screen; a session
 /// with its own materialized worktree is a separate scope, because its tree
 /// and terminals point somewhere else.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PanelScope {
     pub(super) host: HostKey,
     pub(super) workspace: PathBuf,
@@ -1749,12 +1749,12 @@ pub struct Waku {
     /// since the event handler has no `Context` to refresh them itself.
     workspace_queries_stale: bool,
     right_panel_terminal_groups: HashMap<Uuid, SplitGroup>,
+    terminal_layouts: terminal_persistence::TerminalLayouts,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
     /// The bottom panel's terminal tabs, in tab order — the selected
     /// session's. Each tab is a split group: one pane at first, more as the
     /// user splits. Each terminal keeps the directory and host it was opened
-    /// with, and only closing its tab (or deleting its session, or quitting)
-    /// ends the process.
+    /// with, and closing a tab only detaches its view; ending a session stops the process.
     bottom_panel_terminal_groups: Vec<SplitGroup>,
     bottom_panel_active_group: Option<usize>,
     /// The in-app notification queue shown by the toolbar's bell popover.
@@ -2008,6 +2008,7 @@ mod sidebar;
 mod skills_page;
 mod streaming;
 mod task_switcher;
+mod terminal_persistence;
 mod terminal_split;
 mod transcript;
 mod transcript_search;
@@ -2942,12 +2943,15 @@ impl Waku {
             // made inside the debounce window is durable before the process
             // exits. Filesystem work still stays off the UI thread.
             cx.on_app_quit(|this, cx| {
+                let (terminal_done, terminal_wait) = crossbeam_channel::bounded(1);
+                this.save_terminal_layouts(cx, Some(terminal_done));
                 this.capture_current_composer_draft(cx);
                 this.composer_draft_save_generation =
                     this.composer_draft_save_generation.saturating_add(1);
                 let generation = this.composer_draft_save_generation;
                 let saves = this.hosts.draft_saves(&this.composer_drafts);
                 let save = cx.background_executor().spawn(async move {
+                    let _ = terminal_wait.recv_timeout(Duration::from_secs(3));
                     for (store, drafts) in saves {
                         let _ = store.save(drafts, generation);
                     }
@@ -3549,6 +3553,7 @@ impl Waku {
                 working_trees: QueryCache::new(MAX_CACHED_WORKSPACES),
                 workspace_queries_stale: false,
                 right_panel_terminal_groups: HashMap::new(),
+                terminal_layouts: terminal_persistence::TerminalLayouts::default(),
                 right_panel_browsers: HashMap::new(),
                 right_panel_pending_browser_focus: None,
                 scene_overlay_enabled,
@@ -3665,6 +3670,7 @@ impl Waku {
         // that there is an entity to notify and deliberately not before the
         // first frame.
         entity.update(cx, |this, cx| {
+            this.start_terminal_persistence(cx);
             this.restart_task_state_sync();
             this.reconnect_saved_hosts(cx);
             for session_id in startup_live_session_ids {

@@ -10,7 +10,7 @@ use crate::DaemonSupervisor;
 use crate::model::{AgentSession, Project};
 use crate::persistence::{ComposerDraftStore, ComposerDrafts, PersistedState, StateStore};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum HostKey {
     Local,
     Connection(String),

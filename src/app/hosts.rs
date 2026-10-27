@@ -578,6 +578,7 @@ impl Waku {
         if *key == HostKey::Local || self.hosts.get(key).is_none() {
             return;
         }
+        self.detach_host_terminals(key, cx);
         self.capture_and_save_current_composer_draft(cx);
         self.save();
         self.composer_draft_save_generation = self.composer_draft_save_generation.saturating_add(1);

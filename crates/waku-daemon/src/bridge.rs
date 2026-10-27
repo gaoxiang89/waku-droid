@@ -94,7 +94,7 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
 
     let (state, stream) = {
         let _lock = platform::lock(&state_dir.join(LOCK_FILE))?;
-        match reusable_daemon(&state_dir, &fingerprint) {
+        match reusable_daemon(&state_dir, &fingerprint)? {
             Some(reused) => reused,
             None => {
                 let state = start_daemon(&executable, &state_dir, &fingerprint)?;
@@ -119,25 +119,63 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
 
 /// The running daemon from this build, already connected. The probe socket
 /// becomes the relayed one, so the daemon never sees an abandoned handshake.
-fn reusable_daemon(state_dir: &Path, fingerprint: &str) -> Option<(BridgeState, TcpStream)> {
+fn reusable_daemon(
+    state_dir: &Path,
+    fingerprint: &str,
+) -> anyhow::Result<Option<(BridgeState, TcpStream)>> {
+    let Some(state) = reusable_daemon_checked(state_dir, fingerprint)? else {
+        return Ok(None);
+    };
+    let address = state.address.parse()?;
+    let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+        .context("resident daemon is unreachable; leaving its sessions intact")?;
+    Ok(Some((state, stream)))
+}
+
+fn reusable_daemon_checked(
+    state_dir: &Path,
+    fingerprint: &str,
+) -> anyhow::Result<Option<BridgeState>> {
+    let Some(state) = read_live_state(state_dir) else {
+        return Ok(None);
+    };
+    if state.protocol_version != PROTOCOL_VERSION {
+        bail!(
+            "running daemon uses protocol {}; stop its sessions before upgrading to protocol {}",
+            state.protocol_version,
+            PROTOCOL_VERSION
+        );
+    }
+    if state.fingerprint != fingerprint {
+        let client = waku_client::DaemonClient::connect(&state.address, state.token.clone())?;
+        let result = client.request(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            waku_protocol::Command::ListTerminals,
+        );
+        client.disconnect();
+        match result? {
+            waku_protocol::ResponsePayload::Terminals { terminals }
+                if terminals.iter().any(|t| !t.exited) =>
+            {
+                return Ok(Some(state));
+            }
+            waku_protocol::ResponsePayload::Terminals { .. } => {}
+            _ => bail!("could not verify terminal sessions before daemon upgrade"),
+        }
+        platform::terminate(state.pid);
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+fn read_live_state(state_dir: &Path) -> Option<BridgeState> {
     let text = fs::read_to_string(state_dir.join(STATE_FILE)).ok()?;
     let state = serde_json::from_str::<BridgeState>(&text).ok()?;
     if !platform::process_is_alive(state.pid) {
         return None;
     }
-    if state.fingerprint != fingerprint || state.protocol_version != PROTOCOL_VERSION {
-        // Two daemons must never share one task database. A daemon from a
-        // different build is retired before the current one starts.
-        eprintln!(
-            "waku-daemon bridge: replacing daemon {} from another build",
-            state.pid
-        );
-        platform::terminate(state.pid);
-        return None;
-    }
-    let address = state.address.parse().ok()?;
-    let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).ok()?;
-    Some((state, stream))
+    Some(state)
 }
 
 fn start_daemon(

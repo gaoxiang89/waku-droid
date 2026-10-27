@@ -38,6 +38,7 @@ const HEARTBEAT_DEAD_TIMEOUT: Duration = Duration::from_secs(75);
 enum Outgoing {
     Message(ClientMessage),
     Shutdown,
+    Disconnect,
 }
 
 struct ClientInner {
@@ -274,6 +275,11 @@ impl DaemonClient {
     pub fn shutdown(&self) {
         let _ = self.inner.outgoing.send(Outgoing::Shutdown);
     }
+
+    /// Close only this transport. Resident terminals remain on the daemon.
+    pub fn disconnect(&self) {
+        let _ = self.inner.outgoing.send(Outgoing::Disconnect);
+    }
 }
 
 fn daemon_url(address: &str) -> anyhow::Result<String> {
@@ -318,6 +324,11 @@ fn run_client(
                         close_reason = format!("a write to the daemon failed: {error}");
                         break 'connection;
                     }
+                }
+                Outgoing::Disconnect => {
+                    let _ = socket.close(None);
+                    close_reason = "the client detached".into();
+                    break 'connection;
                 }
                 Outgoing::Shutdown => {
                     let _ = write_json(&mut socket, &ClientMessage::Shutdown);

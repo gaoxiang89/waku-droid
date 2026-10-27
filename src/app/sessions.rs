@@ -246,6 +246,7 @@ impl Waku {
         } else {
             self.ensure_right_panel_terminals(cx);
         }
+        self.restore_persistent_terminals(cx);
         self.reset_visible_state();
         if session_changed {
             // Each materialized worktree has its own cache entry. A task that

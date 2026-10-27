@@ -44,7 +44,7 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
-    terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
+    terminals: Mutex<HashMap<Uuid, (Uuid, PathBuf, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
     settings: DaemonSettingsStore,
@@ -724,17 +724,56 @@ impl Backend for WakuBackend {
                 result: crate::workspace::execute(operation)?,
             }),
             Command::OpenTerminal { cwd, cols, rows } => {
+                anyhow::ensure!(
+                    (2..=1000).contains(&cols) && (1..=500).contains(&rows),
+                    "terminal dimensions out of range"
+                );
+                // A retried create must never replace a live shell.
+                let mut terminals = self.terminals.lock();
+                if let Some((owner, directory, _)) = terminals.get(&session_id) {
+                    anyhow::ensure!(
+                        *owner == runtime_id && *directory == cwd,
+                        "terminal identity already exists"
+                    );
+                    return Ok(ResponsePayload::Ack);
+                }
+                anyhow::ensure!(
+                    terminals.len() < 256,
+                    "too many terminal sessions; end unused sessions first"
+                );
                 let terminal = self.open_terminal(&cwd, cols, rows, events)?;
-                let previous = self
+                terminals.insert(session_id, (runtime_id, cwd, terminal));
+                Ok(ResponsePayload::Ack)
+            }
+            Command::ListTerminals => {
+                let terminals = self
                     .terminals
                     .lock()
-                    .insert(session_id, (runtime_id, terminal));
-                drop(previous);
-                Ok(ResponsePayload::Ack)
+                    .iter()
+                    .map(
+                        |(id, (runtime, cwd, terminal))| waku_protocol::TerminalInfo {
+                            session_id: *id,
+                            runtime_id: *runtime,
+                            cwd: cwd.clone(),
+                            exited: terminal.exited(),
+                        },
+                    )
+                    .collect();
+                Ok(ResponsePayload::Terminals { terminals })
+            }
+            Command::AttachTerminal { after } => {
+                let terminals = self.terminals.lock();
+                let (owner, _, terminal) = terminals.get(&session_id).ok_or_else(|| {
+                    anyhow!("terminal session is no longer available; start a new terminal")
+                })?;
+                anyhow::ensure!(*owner == runtime_id, "terminal runtime does not match");
+                Ok(ResponsePayload::TerminalOutput {
+                    snapshot: terminal.snapshot(after),
+                })
             }
             Command::WriteTerminal { data } => {
                 let terminals = self.terminals.lock();
-                let (active_runtime_id, terminal) = terminals
+                let (active_runtime_id, _, terminal) = terminals
                     .get(&session_id)
                     .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
                 if *active_runtime_id != runtime_id {
@@ -746,8 +785,12 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::ResizeTerminal { cols, rows } => {
+                anyhow::ensure!(
+                    (2..=1000).contains(&cols) && (1..=500).contains(&rows),
+                    "terminal dimensions out of range"
+                );
                 let terminals = self.terminals.lock();
-                let (active_runtime_id, terminal) = terminals
+                let (active_runtime_id, _, terminal) = terminals
                     .get(&session_id)
                     .ok_or_else(|| anyhow!("daemon terminal {session_id} is not running"))?;
                 if *active_runtime_id != runtime_id {
@@ -761,7 +804,7 @@ impl Backend for WakuBackend {
             Command::CloseTerminal => {
                 let removed = {
                     let mut terminals = self.terminals.lock();
-                    if let Some((active_runtime_id, _)) = terminals.get(&session_id) {
+                    if let Some((active_runtime_id, _, _)) = terminals.get(&session_id) {
                         if *active_runtime_id != runtime_id {
                             bail!(
                                 "daemon terminal {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
@@ -870,7 +913,12 @@ impl Backend for WakuBackend {
     }
 
     fn has_live_work(&self) -> bool {
-        !self.sessions.lock().is_empty() || !self.terminals.lock().is_empty()
+        !self.sessions.lock().is_empty()
+            || self
+                .terminals
+                .lock()
+                .values()
+                .any(|(_, _, terminal)| !terminal.exited())
     }
 
     fn shutdown(&self) {
@@ -1815,6 +1863,8 @@ fn handle_driver_command(
         | Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }
         | Command::CloseTerminal
+        | Command::AttachTerminal { .. }
+        | Command::ListTerminals
         | Command::CloseSession => {
             bail!("daemon received a command in the wrong dispatch path")
         }

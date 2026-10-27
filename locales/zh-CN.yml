@@ -1287,3 +1287,7 @@ git_graph.changed_files_count: '变更文件（%{count}）'
 
 notifications.approval: 待确认
 notifications.input: 待回答
+
+terminal.end_session: 结束终端会话
+terminal.restore_sessions: 恢复工作区终端
+terminal.reconnecting: 连接中断，正在重连

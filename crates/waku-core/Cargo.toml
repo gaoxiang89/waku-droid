@@ -17,6 +17,7 @@ dirs = "6.0"
 nucleo-matcher = "0.3"
 parking_lot = "0.12"
 polling = "3"
+vt100 = "0.16"
 rust-i18n = "4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -43,6 +44,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+portable-pty = "0.9"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

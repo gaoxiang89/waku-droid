@@ -2628,3 +2628,10 @@ notifications.approval:
   en: Approval needed
 notifications.input:
   en: Answer needed
+
+terminal.end_session:
+  en: End terminal session
+terminal.restore_sessions:
+  en: Restore workspace terminals
+terminal.reconnecting:
+  en: Connection lost — reconnecting

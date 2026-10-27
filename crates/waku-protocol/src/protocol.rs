@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -262,6 +262,12 @@ pub enum Command {
         rows: u16,
     },
     CloseTerminal,
+    /// Reattach without creating or replacing a process. Output offsets are
+    /// terminal-owned and independent of a transport's event sequence.
+    AttachTerminal {
+        after: Option<u64>,
+    },
+    ListTerminals,
     CloseSession,
 }
 
@@ -375,6 +381,12 @@ pub enum ResponseOutcome {
 )]
 pub enum ResponsePayload {
     Ack,
+    Terminals {
+        terminals: Vec<TerminalInfo>,
+    },
+    TerminalOutput {
+        snapshot: TerminalOutput,
+    },
     SessionRuntime {
         runtime_id: Option<Uuid>,
         supports_steer: bool,
@@ -460,6 +472,28 @@ pub enum ResponsePayload {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInfo {
+    pub session_id: Uuid,
+    pub runtime_id: Uuid,
+    pub cwd: PathBuf,
+    pub exited: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOutput {
+    pub offset: u64,
+    pub reset: bool,
+    pub cols: u16,
+    pub rows: u16,
+    pub exited: bool,
+    #[serde(with = "base64_bytes")]
+    #[ts(type = "string")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct RpcError {
     pub message: String,
 }
@@ -530,7 +564,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -539,7 +573,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]

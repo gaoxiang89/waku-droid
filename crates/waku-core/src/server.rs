@@ -107,9 +107,8 @@ impl EventSink {
     }
 
     /// Broadcast a live-only event without retaining it in the replay journal.
-    /// High-volume PTY output is meaningful only to a terminal emulator that
-    /// is currently attached; replaying raw chunks into a fresh emulator would
-    /// also retain an unbounded terminal transcript in daemon memory.
+    /// PTY output uses its own byte-bounded recovery buffer and snapshot
+    /// protocol; duplicating it in the general event journal wastes memory.
     pub fn send_ephemeral(&self, event: WireDriverEvent) -> anyhow::Result<()> {
         self.hub
             .emit(self.session_id, self.runtime_id, event, false);
@@ -241,6 +240,9 @@ impl Hub {
 
     fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
         let mut state = self.state.lock();
+        if state.active_runtimes.get(&session_id) == Some(&runtime_id) {
+            return;
+        }
         state.active_runtimes.insert(session_id, runtime_id);
         state
             .next_sequences
@@ -873,6 +875,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
             | Command::OpenTerminal { .. }
+            | Command::AttachTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
             | Command::CloseTerminal
@@ -1888,6 +1891,136 @@ mod tests {
 
         second_shutdown.store(true, Ordering::Release);
         second_server.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_survives_detach_and_reattaches_without_restarting_shell() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+        let root =
+            std::env::temp_dir().join(format!("waku-persistent-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let backend = backend.with_terminal_shell(alacritty_terminal::tty::Shell::new(
+            "/bin/sh".into(),
+            vec![],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "test-token".into(),
+                Arc::new(backend),
+                stop,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+        let result = std::panic::catch_unwind(|| {
+            let first = DaemonClient::connect(&address, "test-token".into()).unwrap();
+            let id = Uuid::new_v4();
+            let create = || Command::OpenTerminal {
+                cwd: root.clone(),
+                cols: 80,
+                rows: 24,
+            };
+            first.request(id, id, create()).unwrap();
+            let shell = crate::command_env::default_terminal_shell();
+            let powershell = shell.file_stem().and_then(|s| s.to_str()).is_some_and(|s| {
+                s.eq_ignore_ascii_case("powershell") || s.eq_ignore_ascii_case("pwsh")
+            });
+            let (set, read) = if cfg!(windows) && !powershell {
+                (
+                    "set WAKU_PERSIST_TEST=kept\r",
+                    "echo restored:%WAKU_PERSIST_TEST%\r",
+                )
+            } else {
+                (
+                    if cfg!(windows) {
+                        "$WAKU_PERSIST_TEST='kept'\r"
+                    } else {
+                        "WAKU_PERSIST_TEST=kept\r"
+                    },
+                    "echo restored:$WAKU_PERSIST_TEST\r",
+                )
+            };
+            first
+                .request(
+                    id,
+                    id,
+                    Command::WriteTerminal {
+                        data: set.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+            // Closing the socket is not CloseTerminal and not server shutdown.
+            first.disconnect();
+            let second = DaemonClient::connect(&address, "test-token".into()).unwrap();
+            let list = second
+                .request(Uuid::nil(), Uuid::nil(), Command::ListTerminals)
+                .unwrap();
+            assert!(
+                matches!(list, ResponsePayload::Terminals { terminals } if terminals.iter().any(|t| t.session_id == id))
+            );
+            // Even a duplicate create is idempotent, not a fresh shell.
+            second.request(id, id, create()).unwrap();
+            second
+                .request(
+                    id,
+                    id,
+                    Command::WriteTerminal {
+                        data: read.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let snapshot = loop {
+                let ResponsePayload::TerminalOutput { snapshot } = second
+                    .request(id, id, Command::AttachTerminal { after: None })
+                    .unwrap()
+                else {
+                    panic!("missing terminal snapshot")
+                };
+                if String::from_utf8_lossy(&snapshot.data).contains("restored:kept") {
+                    break snapshot;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shell state was not preserved: {}",
+                    String::from_utf8_lossy(&snapshot.data)
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            assert!(snapshot.reset);
+            assert!(!snapshot.exited);
+            assert!(
+                second
+                    .request(id, Uuid::new_v4(), Command::AttachTerminal { after: None })
+                    .is_err()
+            );
+            second.request(id, id, Command::CloseTerminal).unwrap();
+            assert!(
+                second
+                    .request(id, id, Command::AttachTerminal { after: None })
+                    .is_err()
+            );
+            second.disconnect();
+        });
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 
     #[cfg(unix)]
