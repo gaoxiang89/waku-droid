@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 pub const BRIDGE_SUBCOMMAND: &str = "bridge";
 /// Prints the binary's content fingerprint and exits.
 pub const FINGERPRINT_FLAG: &str = "--fingerprint";
+/// Bridge flag: end a running daemon that speaks another protocol, and its
+/// sessions, instead of refusing to start. Only an explicit user
+/// confirmation may pass it; reconnects never do.
+pub const REPLACE_INCOMPATIBLE_FLAG: &str = "--replace-incompatible";
 
 /// First stdout line of `waku-daemon bridge`. Everything after it is the
 /// relayed WebSocket stream.
@@ -24,6 +28,41 @@ pub struct BridgeReady {
     pub protocol_version: u32,
     pub fingerprint: String,
     pub pid: u32,
+}
+
+/// Sole stdout line of a bridge that refused to replace a running daemon
+/// speaking another protocol. The desktop cannot talk to that daemon, so the
+/// bridge describes it from the operating system's process table instead.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeBlocked {
+    pub incompatible_daemon: IncompatibleDaemon,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompatibleDaemon {
+    pub pid: u32,
+    pub protocol_version: u32,
+    /// The daemon's descendants (terminal shells, agents, and what they
+    /// run), depth-first, capped at [`IncompatibleDaemon::MAX_PROCESSES`].
+    pub processes: Vec<DaemonProcess>,
+    /// How many descendants did not fit in `processes`.
+    #[serde(default)]
+    pub omitted: u32,
+}
+
+impl IncompatibleDaemon {
+    pub const MAX_PROCESSES: usize = 24;
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonProcess {
+    pub pid: u32,
+    /// 0 for the daemon's direct children.
+    pub depth: u32,
+    pub command: String,
 }
 
 /// Daemon-owned record of a bridge-managed listener. The daemon writes it
@@ -78,6 +117,25 @@ mod tests {
         let mut text = Fingerprint::default();
         text.update(b"a");
         assert_eq!(text.finish(), "af63dc4c8601ec8c");
+    }
+
+    #[test]
+    fn blocked_line_never_parses_as_ready() {
+        let blocked = BridgeBlocked {
+            incompatible_daemon: IncompatibleDaemon {
+                pid: 7,
+                protocol_version: 7,
+                processes: vec![DaemonProcess {
+                    pid: 8,
+                    depth: 0,
+                    command: "bash".into(),
+                }],
+                omitted: 0,
+            },
+        };
+        let line = serde_json::to_string(&blocked).unwrap();
+        assert!(serde_json::from_str::<BridgeReady>(&line).is_err());
+        assert_eq!(serde_json::from_str::<BridgeBlocked>(&line).unwrap(), blocked);
     }
 
     #[test]

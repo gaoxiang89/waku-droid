@@ -473,11 +473,17 @@ fn deploy_ssh(
 }
 
 /// Remote script that starts or reuses the host's daemon and relays it.
-pub fn bridge_script() -> String {
-    format!(
+/// `replace_incompatible` lets it end a daemon speaking another protocol.
+pub fn bridge_script(replace_incompatible: bool) -> String {
+    let mut script = format!(
         "exec \"$HOME/{REMOTE_DIRECTORY}/{DAEMON_NAME}\" {}",
         waku_protocol::bridge::BRIDGE_SUBCOMMAND
-    )
+    );
+    if replace_incompatible {
+        script.push(' ');
+        script.push_str(waku_protocol::bridge::REPLACE_INCOMPATIBLE_FLAG);
+    }
+    script
 }
 
 #[cfg(test)]

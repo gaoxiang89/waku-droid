@@ -13,7 +13,9 @@ mod process_util;
 pub mod ssh;
 pub mod wsl;
 
-pub use bridge::{BridgeError, BridgeSession, BridgeStage, test_connection};
+pub use bridge::{
+    BridgeError, BridgeSession, BridgeStage, IncompatibleDaemonError, test_connection,
+};
 pub use connection::{
     Connection, ConnectionKind, ConnectionsFile, LOCAL_CONNECTION_ID, SshAuthMethod, SshTarget,
 };

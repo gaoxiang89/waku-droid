@@ -33,3 +33,10 @@ jobs = 4
 
 [profile.dev]
 debug = "line-tables-only"
+# Incremental compilation is off on purpose. A single `waku` session is
+# 200 MB-1 GB, nothing pruned the stale ones, and a week of dev rebuilds left
+# 625 session directories totalling 68 GB under target/debug/incremental.
+# Rebuilding this crate non-incrementally is dominated by the final link, so
+# the trade costs little and keeps the target directory from growing without
+# bound.
+incremental = false

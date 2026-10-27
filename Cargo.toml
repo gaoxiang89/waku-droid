@@ -205,8 +205,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# Keep debug assertions and incremental builds for app code, but do not run
-# GPUI's text shaping and Taffy layout hot paths completely unoptimized.
+# Keep debug assertions for app code, but do not run GPUI's text shaping and
+# Taffy layout hot paths completely unoptimized. Incremental compilation is
+# deliberately off; see the note in .cargo/config.toml.
 [profile.dev]
 opt-level = 1
 

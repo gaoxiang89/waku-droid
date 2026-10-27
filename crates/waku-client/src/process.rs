@@ -558,7 +558,17 @@ impl DaemonSupervisor {
     /// updating it first when needed. Blocking: the first connection to a host
     /// may upload the daemon. The remote daemon outlives this desktop.
     pub fn connect_remote(connection: Connection) -> Result<Self, BridgeError> {
-        let session = Arc::new(BridgeSession::open(&connection)?);
+        Self::connect_remote_with(connection, false)
+    }
+
+    /// [`Self::connect_remote`], optionally ending a running daemon that
+    /// speaks another protocol and its sessions. Only a user confirmation of
+    /// [`crate::remote::IncompatibleDaemonError`] may pass `true`.
+    pub fn connect_remote_with(
+        connection: Connection,
+        replace_incompatible: bool,
+    ) -> Result<Self, BridgeError> {
+        let session = Arc::new(BridgeSession::open_with(&connection, replace_incompatible)?);
         let bridge_error = |error: anyhow::Error| BridgeError {
             stage: BridgeStage::Bridge,
             error: match session.stderr() {

@@ -8,11 +8,43 @@
 
 use std::collections::HashSet;
 
-use waku_client::remote::{Connection, ConnectionKind, ConnectionsFile, SshAuthMethod, SshTarget};
+use waku_client::bridge::IncompatibleDaemon;
+use waku_client::remote::{
+    Connection, ConnectionKind, ConnectionsFile, IncompatibleDaemonError, SshAuthMethod, SshTarget,
+};
 
-use gpui::ElementId;
+use gpui::{ElementId, KeyBinding, actions};
 
 use super::*;
+
+actions!(waku_connections, [ConfirmDaemonReplace, DismissDaemonReplace]);
+
+const DAEMON_REPLACE_DIALOG_CONTEXT: &str = "DaemonReplaceDialog";
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(
+            "secondary-enter",
+            ConfirmDaemonReplace,
+            Some(DAEMON_REPLACE_DIALOG_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            DismissDaemonReplace,
+            Some(DAEMON_REPLACE_DIALOG_CONTEXT),
+        ),
+    ]);
+}
+
+/// A host whose running daemon speaks another protocol. Connecting requires
+/// ending it and its sessions, which only an explicit confirmation may do.
+#[derive(Clone)]
+pub(super) struct DaemonReplaceConfirm {
+    connection: Connection,
+    daemon: IncompatibleDaemon,
+    /// Focus moves into the dialog on the first frame that shows it.
+    focus_pending: bool,
+}
 
 pub(super) struct ConnectionsUi {
     pub(super) file: ConnectionsFile,
@@ -23,6 +55,9 @@ pub(super) struct ConnectionsUi {
     pub(super) pending: HashSet<String>,
     host_input: Entity<TextInput>,
     identity_input: Entity<TextInput>,
+    replace_confirm: Option<DaemonReplaceConfirm>,
+    replace_cancel_focus: FocusHandle,
+    replace_confirm_focus: FocusHandle,
 }
 
 impl ConnectionsUi {
@@ -41,6 +76,9 @@ impl ConnectionsUi {
             identity_input: cx.new(|cx| {
                 TextInput::new(window, cx).placeholder(tr!("connections.ssh_key_placeholder"))
             }),
+            replace_confirm: None,
+            replace_cancel_focus: cx.focus_handle(),
+            replace_confirm_focus: cx.focus_handle(),
         }
     }
 
@@ -141,6 +179,17 @@ impl Waku {
     /// Connect a host in this window. The first connection to a host may
     /// install the daemon, so the button reports progress until it resolves.
     pub(super) fn open_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {
+        self.open_connection_with(connection, false, cx);
+    }
+
+    /// `replace_incompatible` ends a host daemon that speaks another protocol
+    /// and its sessions; only [`Self::confirm_daemon_replace`] passes `true`.
+    fn open_connection_with(
+        &mut self,
+        connection: Connection,
+        replace_incompatible: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .hosts
             .get(&waku_client::hosts::HostKey::Connection(
@@ -157,8 +206,12 @@ impl Waku {
         let name = connection.name.clone();
         let host_id = id.clone();
         let host_name = name.clone();
+        let retry = connection.clone();
         let task = cx.background_executor().spawn(async move {
-            let daemon = waku_client::DaemonSupervisor::connect_remote(connection)?;
+            let daemon = waku_client::DaemonSupervisor::connect_remote_with(
+                connection,
+                replace_incompatible,
+            )?;
             let host = waku_client::hosts::Host::new(
                 waku_client::hosts::HostKey::Connection(host_id),
                 host_name,
@@ -187,11 +240,23 @@ impl Waku {
                         this.refresh_host_catalog(key.clone(), None, true);
                         this.start_host_task_state_sync(key);
                     }
-                    Err(error) => this.show_toast(tr!(
-                        "connections.connect_failed",
-                        name = name.as_str(),
-                        error = format!("{error:#}")
-                    )),
+                    Err(error) => {
+                        if let Some(incompatible) = IncompatibleDaemonError::find(&error)
+                            && !replace_incompatible
+                        {
+                            this.connections.replace_confirm = Some(DaemonReplaceConfirm {
+                                connection: retry,
+                                daemon: incompatible.0.clone(),
+                                focus_pending: true,
+                            });
+                        } else {
+                            this.show_toast(tr!(
+                                "connections.connect_failed",
+                                name = name.as_str(),
+                                error = format!("{error:#}")
+                            ));
+                        }
+                    }
                 }
                 if this.connections.pending.is_empty() && this.pending_host_session.is_some() {
                     this.pending_host_session = None;
@@ -212,6 +277,217 @@ impl Waku {
         })
         .detach();
         cx.notify();
+    }
+
+    fn dismiss_daemon_replace(&mut self, cx: &mut Context<Self>) {
+        if self.connections.replace_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn confirm_daemon_replace(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.connections.replace_confirm.take() else {
+            return;
+        };
+        self.open_connection_with(dialog.connection, true, cx);
+    }
+
+    pub(super) fn render_daemon_replace_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let dialog = self.connections.replace_confirm.as_mut()?;
+        if std::mem::take(&mut dialog.focus_pending) {
+            let focus = self.connections.replace_cancel_focus.clone();
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        }
+        let dialog = dialog.clone();
+        let theme = Theme::current(cx);
+        let cancel = div()
+            .id("daemon-replace-cancel")
+            .track_focus(&self.connections.replace_cancel_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_secondary)
+            .bg(theme.overlay)
+            .hover(|element| element.bg(theme.overlay_strong))
+            .child(tr_cow!("common.cancel"))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.dismiss_daemon_replace(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.dismiss_daemon_replace(cx)));
+        let confirm = div()
+            .id("daemon-replace-confirm")
+            .track_focus(&self.connections.replace_confirm_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.danger))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.danger)
+            .bg(theme.danger_soft)
+            .hover(|element| element.bg(theme.danger.opacity(0.16)))
+            .child(tr_cow!("connections.replace_daemon_confirm"))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.confirm_daemon_replace(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.confirm_daemon_replace(cx)));
+
+        let processes = if dialog.daemon.processes.is_empty() {
+            div()
+                .text_color(theme.text_secondary)
+                .child(tr!("connections.replace_daemon_no_processes"))
+                .into_any_element()
+        } else {
+            div()
+                .id("daemon-replace-processes")
+                .max_h(px(200.0))
+                .overflow_y_scroll()
+                .rounded(px(8.0))
+                .bg(theme.overlay)
+                .p(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .font_family(crate::md::render::MONO_FAMILY)
+                .text_size(sp(11.5))
+                .children(dialog.daemon.processes.iter().map(|process| {
+                    div()
+                        .pl(px(12.0 * process.depth.min(6) as f32))
+                        .flex()
+                        .gap(px(8.0))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.text_secondary)
+                                .child(process.pid.to_string()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text)
+                                .child(process.command.clone()),
+                        )
+                }))
+                .when(dialog.daemon.omitted > 0, |list| {
+                    list.child(div().text_color(theme.text_secondary).child(tr!(
+                        "connections.replace_daemon_more",
+                        count = dialog.daemon.omitted.to_string()
+                    )))
+                })
+                .into_any_element()
+        };
+
+        let card = div()
+            .id("daemon-replace-dialog-card")
+            .key_context(DAEMON_REPLACE_DIALOG_CONTEXT)
+            .on_action(cx.listener(|this, _: &ConfirmDaemonReplace, _, cx| {
+                this.confirm_daemon_replace(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DismissDaemonReplace, _, cx| {
+                this.dismiss_daemon_replace(cx);
+            }))
+            .tab_group()
+            .tab_stop(false)
+            .w_full()
+            .max_w(px(480.0))
+            .overflow_hidden()
+            .rounded(px(18.0))
+            .bg(theme.composer)
+            .shadow_xl()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(48.0))
+                    .px(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .text_size(sp(14.0))
+                    .text_color(theme.text)
+                    .child(icon("icons/alert.svg", 15.0, theme.danger))
+                    .child(tr!(
+                        "connections.replace_daemon_title",
+                        name = dialog.connection.name.as_str()
+                    )),
+            )
+            .child(
+                div()
+                    .px(px(16.0))
+                    .pb(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .text_size(sp(12.5))
+                    .line_height(sp(17.0))
+                    .text_color(theme.text_secondary)
+                    .whitespace_normal()
+                    .child(tr!(
+                        "connections.replace_daemon_message",
+                        old = dialog.daemon.protocol_version.to_string(),
+                        new = waku_client::PROTOCOL_VERSION.to_string(),
+                        pid = dialog.daemon.pid.to_string()
+                    ))
+                    .child(processes),
+            )
+            .child(div().mx(px(16.0)).h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(cancel)
+                    .child(confirm),
+            );
+        let scrim = if theme.is_dark {
+            gpui::hsla(0.0, 0.0, 0.0, 0.34)
+        } else {
+            gpui::hsla(0.0, 0.0, 0.0, 0.16)
+        };
+        let layer = div()
+            .id("daemon-replace-dialog-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(scrim)
+            .p(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_daemon_replace(cx)),
+            )
+            .child(card);
+        Some(gpui::deferred(layer).with_priority(4).into_any_element())
     }
 
     fn test_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {

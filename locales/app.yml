@@ -2608,6 +2608,16 @@ connections.connect_failed:
   en: "Could not connect to %{name}: %{error}"
 connections.test_succeeded:
   en: "Connected to %{name}"
+connections.replace_daemon_title:
+  en: "Upgrade the daemon on %{name}?"
+connections.replace_daemon_message:
+  en: "The running daemon (pid %{pid}) speaks protocol %{old}, and this Waku speaks %{new}, so it cannot reattach to the daemon's sessions. Upgrading ends the daemon and these processes:"
+connections.replace_daemon_no_processes:
+  en: No terminal or agent processes are running under it.
+connections.replace_daemon_more:
+  en: "…and %{count} more"
+connections.replace_daemon_confirm:
+  en: End sessions and upgrade
 remote_folder.title:
   en: "Choose a folder on %{host}"
 remote_folder.loading:

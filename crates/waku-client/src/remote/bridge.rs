@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, anyhow, bail};
 use parking_lot::Mutex;
 use waku_protocol::PROTOCOL_VERSION;
-use waku_protocol::bridge::BridgeReady;
+use waku_protocol::bridge::{BridgeBlocked, BridgeReady, IncompatibleDaemon};
 
 use super::connection::{Connection, ConnectionKind};
 use super::deploy::{self, DeployOutcome};
@@ -70,11 +70,21 @@ impl BridgeSession {
     /// Prepare the host and start a bridge. Blocking and potentially slow on
     /// first use (probe and upload); run it off the UI thread.
     pub fn open(connection: &Connection) -> Result<Self, BridgeError> {
+        Self::open_with(connection, false)
+    }
+
+    /// [`Self::open`], optionally ending a running daemon that speaks another
+    /// protocol together with its sessions. Pass `true` only after the user
+    /// confirmed the [`IncompatibleDaemonError`] this would otherwise return.
+    pub fn open_with(
+        connection: &Connection,
+        replace_incompatible: bool,
+    ) -> Result<Self, BridgeError> {
         let stage = |stage| move |error| BridgeError { stage, error };
         let target = deploy::probe(connection).map_err(stage(BridgeStage::Probe))?;
         let outcome =
             deploy::deploy(connection, target, false).map_err(stage(BridgeStage::Deploy))?;
-        match Self::spawn(connection) {
+        match Self::spawn_with(connection, replace_incompatible) {
             Ok(session) => Ok(session),
             // A reused install that speaks another protocol is the one case a
             // reinstall can fix, e.g. two Waku builds sharing a host.
@@ -83,7 +93,8 @@ impl BridgeSession {
                     && error.downcast_ref::<ProtocolMismatch>().is_some() =>
             {
                 deploy::deploy(connection, target, true).map_err(stage(BridgeStage::Deploy))?;
-                Self::spawn(connection).map_err(stage(BridgeStage::Bridge))
+                Self::spawn_with(connection, replace_incompatible)
+                    .map_err(stage(BridgeStage::Bridge))
             }
             Err(error) => Err(stage(BridgeStage::Bridge)(error)),
         }
@@ -92,7 +103,11 @@ impl BridgeSession {
     /// Start a bridge against an already installed daemon. Reconnects use this
     /// directly; the install cannot have changed under a running desktop.
     pub fn spawn(connection: &Connection) -> anyhow::Result<Self> {
-        let script = deploy::bridge_script();
+        Self::spawn_with(connection, false)
+    }
+
+    fn spawn_with(connection: &Connection, replace_incompatible: bool) -> anyhow::Result<Self> {
+        let script = deploy::bridge_script(replace_incompatible);
         let mut command = match &connection.kind {
             ConnectionKind::Local => bail!("the local connection does not use a bridge"),
             ConnectionKind::Wsl { distro } => wsl::command(distro, &script, &[]),
@@ -140,9 +155,7 @@ impl BridgeSession {
                 let mut line = String::new();
                 let result = match reader.read_line(&mut line) {
                     Ok(0) => Err(anyhow!("the bridge exited before it was ready")),
-                    Ok(_) => serde_json::from_str::<BridgeReady>(line.trim()).map_err(|_| {
-                        anyhow!("the bridge sent an invalid ready line {:?}", line.trim())
-                    }),
+                    Ok(_) => parse_ready_line(line.trim()),
                     Err(error) => Err(anyhow!("could not read the bridge: {error}")),
                 };
                 let _ = ready_tx.send(result.map(|ready| (ready, reader)));
@@ -236,6 +249,47 @@ impl std::fmt::Display for ProtocolMismatch {
 
 impl std::error::Error for ProtocolMismatch {}
 
+/// The host still runs a daemon that speaks another protocol, with sessions
+/// this desktop cannot reach. Nothing was stopped; retrying with
+/// [`BridgeSession::open_with`]`(.., true)` ends that daemon and its sessions.
+#[derive(Clone, Debug)]
+pub struct IncompatibleDaemonError(pub IncompatibleDaemon);
+
+impl std::fmt::Display for IncompatibleDaemonError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "running daemon uses protocol {}; stop its sessions before upgrading to protocol {PROTOCOL_VERSION}",
+            self.0.protocol_version
+        )
+    }
+}
+
+impl std::error::Error for IncompatibleDaemonError {}
+
+impl IncompatibleDaemonError {
+    /// Find this error anywhere in a connection failure's chain.
+    pub fn find(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| {
+            cause.downcast_ref::<Self>().or_else(|| {
+                cause
+                    .downcast_ref::<BridgeError>()
+                    .and_then(|bridge| bridge.error.downcast_ref::<Self>())
+            })
+        })
+    }
+}
+
+fn parse_ready_line(line: &str) -> anyhow::Result<BridgeReady> {
+    if let Ok(ready) = serde_json::from_str::<BridgeReady>(line) {
+        return Ok(ready);
+    }
+    if let Ok(blocked) = serde_json::from_str::<BridgeBlocked>(line) {
+        return Err(IncompatibleDaemonError(blocked.incompatible_daemon).into());
+    }
+    Err(anyhow!("the bridge sent an invalid ready line {line:?}"))
+}
+
 /// Accept the daemon client's single connection and splice it to the bridge's
 /// stdio. Whichever side closes first tears the other down, so a dead bridge
 /// surfaces as an ordinary client disconnect and triggers a reconnect.
@@ -321,4 +375,31 @@ pub fn test_connection(connection: &Connection) -> Result<u32, BridgeError> {
         })?;
     drop(client);
     Ok(session.remote_pid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_line_surfaces_as_incompatible_daemon() {
+        let line = r#"{"incompatibleDaemon":{"pid":9,"protocolVersion":7,"processes":[{"pid":10,"depth":0,"command":"bash"}]}}"#;
+        let error = parse_ready_line(line).unwrap_err();
+        let wrapped: anyhow::Error = BridgeError {
+            stage: BridgeStage::Bridge,
+            error: error.context("stderr detail"),
+        }
+        .into();
+        let found = IncompatibleDaemonError::find(&wrapped).expect("incompatible daemon");
+        assert_eq!(found.0.pid, 9);
+        assert_eq!(found.0.processes[0].command, "bash");
+        assert_eq!(found.0.omitted, 0);
+    }
+
+    #[test]
+    fn ready_line_still_parses() {
+        let line = r#"{"token":"t","protocolVersion":8,"fingerprint":"f","pid":3}"#;
+        assert_eq!(parse_ready_line(line).unwrap().pid, 3);
+        assert!(parse_ready_line("nonsense").is_err());
+    }
 }

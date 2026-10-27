@@ -1329,6 +1329,11 @@ connections.ssh_duplicate: この SSH ホストは既に保存されています
 connections.save_failed: "接続を保存できませんでした：%{error}"
 connections.connect_failed: "%{name} に接続できませんでした：%{error}"
 connections.test_succeeded: "%{name} に接続しました"
+connections.replace_daemon_title: "%{name} のデーモンをアップグレードしますか？"
+connections.replace_daemon_message: "実行中のデーモン（pid %{pid}）はプロトコル %{old}、この Waku はプロトコル %{new} を使用しているため、そのセッションに再接続できません。アップグレードするとデーモンと次のプロセスが終了します："
+connections.replace_daemon_no_processes: 配下で実行中のターミナルやエージェントのプロセスはありません。
+connections.replace_daemon_more: "…ほか %{count} 件"
+connections.replace_daemon_confirm: セッションを終了してアップグレード
 remote_folder.title: "%{host} のフォルダを選択"
 remote_folder.loading: 読み込み中…
 remote_folder.invalid_response: デーモンが無効なディレクトリ一覧を返しました

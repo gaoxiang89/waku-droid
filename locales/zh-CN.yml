@@ -1276,6 +1276,11 @@ connections.ssh_duplicate: 该 SSH 主机已保存
 connections.save_failed: "无法保存连接：%{error}"
 connections.connect_failed: "无法连接到 %{name}：%{error}"
 connections.test_succeeded: "已连接到 %{name}"
+connections.replace_daemon_title: "升级 %{name} 上的守护进程？"
+connections.replace_daemon_message: "正在运行的守护进程（pid %{pid}）使用协议 %{old}，而当前 Waku 使用协议 %{new}，无法重新连接它的会话。升级会结束该守护进程及以下进程："
+connections.replace_daemon_no_processes: 它下面没有正在运行的终端或代理进程。
+connections.replace_daemon_more: "……以及另外 %{count} 个"
+connections.replace_daemon_confirm: 结束会话并升级
 remote_folder.title: "选择 %{host} 上的文件夹"
 remote_folder.loading: 正在加载…
 remote_folder.invalid_response: 守护进程返回了无效的目录列表

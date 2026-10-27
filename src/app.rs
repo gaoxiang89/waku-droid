@@ -2030,6 +2030,7 @@ use project_picker::ProjectPickerSite;
 pub use right_panel::init as init_right_panel_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
+pub use connections_page::init as init_connection_keys;
 use sidebar::{SidebarGroup, SidebarRow};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
