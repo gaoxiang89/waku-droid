@@ -805,22 +805,38 @@ impl Waku {
             )
     }
 
-    fn render_sidebar_new_session(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        self.render_sidebar_action_row(
-            "sidebar-new-session",
-            "icons/compose.svg",
-            tr!("menu.new_task"),
-            cx,
-        )
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.new_session_action(&NewSession, window, cx);
-        }))
-        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+    fn render_conversation_new_session(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus("conversation-new-session", cx);
+        div()
+            .id("conversation-new-session")
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .active(|element| element.bg(theme.overlay_strong))
+            .child(icon("icons/plus.svg", 14.0, theme.text_secondary))
+            .child(tr!("menu.new_task"))
+            .on_click(cx.listener(|this, _, window, cx| {
                 this.new_session_action(&NewSession, window, cx);
-                cx.stop_propagation();
-            }
-        }))
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.new_session_action(&NewSession, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 
     fn render_sidebar_search(&self, cx: &mut Context<Self>) -> Div {
@@ -1238,17 +1254,6 @@ impl Waku {
             } else {
                 theme.sidebar
             })
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(10.0))
-                    .h(px(PANEL_TOOLBAR_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(self.render_sidebar_new_session(cx)),
-            )
             .child(
                 div()
                     .flex_none()
@@ -2691,6 +2696,8 @@ impl Waku {
     pub(super) fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         div()
+            .tab_group()
+            .tab_stop(false)
             .h(px(PANEL_TOOLBAR_HEIGHT))
             .flex_none()
             .flex()
@@ -2714,6 +2721,7 @@ impl Waku {
                 cx,
             ))
             .child(div().flex_1())
+            .child(self.render_conversation_new_session(cx))
             .child(self.render_workspace_controls(cx))
     }
 
