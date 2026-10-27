@@ -8699,7 +8699,7 @@ checksum = "317211a0dc0ceedd78fb2ca9a44aed3d7b9b26f81870d485c07122b4350673b7"
 
 [[package]]
 name = "waku"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8759,7 +8759,7 @@ dependencies = [
 
 [[package]]
 name = "waku-client"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -8780,7 +8780,7 @@ dependencies = [
 
 [[package]]
 name = "waku-computer-use"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "libloading",
@@ -8789,7 +8789,7 @@ dependencies = [
 
 [[package]]
 name = "waku-core"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
@@ -8824,7 +8824,7 @@ dependencies = [
 
 [[package]]
 name = "waku-daemon"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "dirs",
@@ -8839,7 +8839,7 @@ dependencies = [
 
 [[package]]
 name = "waku-protocol"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "base64",

@@ -16,6 +16,10 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.38]
+
+- Prompt to end incompatible daemon sessions and upgrade when connecting to a remote host speaking an older protocol version
+
 ## [0.1.37]
 
 - Restore terminal sessions across reconnects and desktop restarts, keeping their running processes, output, and pane layout
