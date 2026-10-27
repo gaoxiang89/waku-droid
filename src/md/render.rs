@@ -358,8 +358,12 @@ pub fn flatten(
         } else {
             SANS_FAMILY
         });
-        run_font.weight = if run.style.bold && base_weight < FontWeight::SEMIBOLD {
-            FontWeight::SEMIBOLD
+        run_font.weight = if run.style.bold {
+            if base_weight < FontWeight::SEMIBOLD {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::BOLD
+            }
         } else {
             base_weight
         };
@@ -535,16 +539,18 @@ impl MarkdownView {
             *self.veil.borrow_mut() = RowVeil::seeded();
         }
         let changed = self.parser.text() != text;
-        let append = !changed || text.starts_with(self.parser.text());
-        if changed {
-            self.parser.set_text(text);
-        }
+        let changed_from = if changed {
+            self.parser.set_text(text)
+        } else {
+            self.parser.display_tail_start()
+        };
         // The mended display tail depends only on the source and the
         // streaming flag. Deriving it re-mends — and, with a hanging marker,
         // re-parses — the final block, and `set_text` runs for every visible
         // row on every frame, so a frame that changed neither input must not
         // pay for it.
         if changed || mend != was_streaming {
+            let tail_start = self.parser.display_tail_start();
             let tail = if mend {
                 self.parser.display_tail().unwrap_or_default()
             } else {
@@ -552,10 +558,17 @@ impl MarkdownView {
             };
             if changed || tail != self.tail {
                 self.tail = tail;
-                // Markdown block structure only ever extends the final block,
-                // so every element before it is still valid. A streamed delta
-                // thus re-flattens one block instead of the whole response.
-                let boundary = if append { self.volatile_from.get() } else { 0 };
+                // Evict from whichever comes first: the first canonical block
+                // the append/reset mutated (e.g. a GFM table absorbing a row)
+                // or the mended display tail.
+                let invalidated_block = changed_from.min(tail_start);
+                let boundary = if changed && invalidated_block == 0 {
+                    0
+                } else {
+                    self.volatile_from
+                        .get()
+                        .min(block_ordinal_base(invalidated_block))
+                };
                 self.flats
                     .borrow_mut()
                     .retain(|ordinal, _| *ordinal < boundary);
@@ -563,6 +576,7 @@ impl MarkdownView {
                     .borrow_mut()
                     .retain(|ordinal| *ordinal < boundary);
             }
+            self.volatile_from.set(block_ordinal_base(tail_start));
         }
     }
 
@@ -888,13 +902,18 @@ fn text_element_with_selection(
 }
 
 fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
-    if ctx.math_enabled && flat.math.is_some() {
-        return math_text::element(flat.clone(), key, ctx);
-    }
-    let runs = match ctx
+    let streaming_veil = ctx
         .cache
-        .filter(|view| ctx.animate_streaming && view.streaming.get())
-    {
+        .filter(|view| ctx.animate_streaming && view.streaming.get());
+    if ctx.math_enabled && flat.math.is_some() {
+        let request_frame = streaming_veil.is_some_and(|view| {
+            let mut veil = view.veil.borrow_mut();
+            let _ = veil.advance(key.index, flat.text.as_ref(), ctx.now);
+            veil.is_fading()
+        });
+        return math_text::element(flat.clone(), key, ctx, request_frame);
+    }
+    let runs = match streaming_veil {
         Some(view) => {
             let spans = view
                 .veil
@@ -1442,7 +1461,7 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
                 .child(text_element(&flat, key, ctx))
                 .into_any_element()
         }
-        Block::Image { url, alt } => render_image(url, alt, ctx),
+        Block::Image { url, alt, link } => render_image(url, alt, link.as_deref(), ctx),
         Block::DisplayMath { latex } => {
             let key = ctx.next_key();
             let flat = ctx.flat(key.index, || {
@@ -1450,7 +1469,7 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
                     latex.clone(),
                     MONO_FAMILY,
                     FontWeight::NORMAL,
-                    ctx.palette.text,
+                    ctx.prose_color(),
                 );
                 flat.math = Some(Rc::new(math_text::MathData::new(vec![
                     math_text::MathSpan {
@@ -1671,7 +1690,7 @@ fn checkbox(checked: bool, ctx: &Ctx) -> AnyElement {
 /// view's [`ImageLoader`] from the host that owns the document. Network URLs
 /// are never fetched. The alt text renders beneath as a caption when there is
 /// one, and an image that cannot be drawn shows its URL in its place.
-fn render_image(url: &str, alt: &str, ctx: &Ctx) -> AnyElement {
+fn render_image(url: &str, alt: &str, link: Option<&str>, ctx: &Ctx) -> AnyElement {
     const MAX_HEIGHT: f32 = 320.0;
 
     let key = ctx.next_key();
@@ -1725,7 +1744,7 @@ fn render_image(url: &str, alt: &str, ctx: &Ctx) -> AnyElement {
             .into_any_element(),
         None => unavailable(),
     };
-    div()
+    let container = div()
         .w_full()
         .min_w_0()
         .flex()
@@ -1740,6 +1759,45 @@ fn render_image(url: &str, alt: &str, ctx: &Ctx) -> AnyElement {
                     .text_color(ctx.palette.ghost)
                     .child(SharedString::from(alt.to_owned())),
             )
+        });
+    let Some(link_url) = link
+        .filter(|target| *target != PENDING_LINK_URL)
+        .map(str::to_owned)
+    else {
+        return container.into_any_element();
+    };
+    let click_url = link_url.clone();
+    let click_handler = ctx.link_handler.clone();
+    let key_handler = ctx.link_handler.clone();
+    let accent = ctx.palette.accent;
+    container
+        .id(SharedString::from(format!(
+            "image-link-{}-{}",
+            key.row, key.index
+        )))
+        .tab_index(0)
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .focus_visible(move |style| style.border_1().border_color(accent))
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            if let Some(handler) = &click_handler {
+                handler(&click_url, window, cx);
+            } else {
+                cx.open_url(&click_url);
+            }
+        })
+        .on_key_down(move |event, window, cx| {
+            if !matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                return;
+            }
+            cx.stop_propagation();
+            window.prevent_default();
+            if let Some(handler) = &key_handler {
+                handler(&link_url, window, cx);
+            } else {
+                cx.open_url(&link_url);
+            }
         })
         .into_any_element()
 }
@@ -1871,14 +1929,23 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
 
     // A Mermaid fence draws as a diagram once it has settled. While it streams
     // the source is still growing, and every delta would compile and cache a
-    // new half-finished picture, so it stays code until then.
+    // new half-finished picture, so it stays code until then. An active search
+    // match inside the Mermaid source also reveals the code view so the match
+    // is visible and has a live `TextGeometry` to scroll to.
     let volatile = ctx.is_volatile(key.index);
     let diagram_sources = mermaid::is_mermaid(language)
         .then(|| ctx.cache.map(|view| view.diagram_sources.clone()))
         .flatten();
-    let showing_source = diagram_sources
-        .as_ref()
-        .is_some_and(|sources| sources.borrow().contains(&key.index));
+    let has_search_match = ctx.search.as_ref().is_some_and(|search| {
+        search
+            .matches
+            .binary_search_by_key(&key.index, |found| found.ordinal)
+            .is_ok()
+    });
+    let showing_source = has_search_match
+        || diagram_sources
+            .as_ref()
+            .is_some_and(|sources| sources.borrow().contains(&key.index));
     let toggle = diagram_sources
         .filter(|_| !volatile)
         .map(|sources| diagram_toggle(sources, &key, showing_source, ctx));
@@ -2152,24 +2219,44 @@ fn render_table(
         return div().into_any_element();
     }
     let widths = column_widths(header, rows, columns);
+    const MIN_COLUMN_WIDTH: f32 = 84.0;
+    let min_table_width = columns as f32 * MIN_COLUMN_WIDTH;
+    let table_id = SharedString::from(format!(
+        "table-{}-{}",
+        ctx.row,
+        ctx.next_ordinal.get()
+    ));
 
     let mut table = div()
+        .id(table_id)
         .w_full()
         .min_w_0()
         .rounded(px(8.0))
         .border_1()
         .border_color(ctx.palette.border)
-        .overflow_hidden()
+        .overflow_x_scroll()
+        .restrict_scroll_to_axis()
         .flex()
         .flex_col();
 
     if !header.is_empty() {
         table = table.child(
-            table_row(header, &widths, align, ctx, FontWeight::SEMIBOLD, true)
-                .bg(ctx.palette.overlay),
+            table_row(
+                header,
+                &widths,
+                align,
+                ctx,
+                FontWeight::SEMIBOLD,
+                !rows.is_empty(),
+                min_table_width,
+            )
+            .rounded_t(px(7.0))
+            .when(rows.is_empty(), |row| row.rounded_b(px(7.0)))
+            .bg(ctx.palette.overlay),
         );
     }
     for (index, row) in rows.iter().enumerate() {
+        let is_last = index + 1 == rows.len();
         table = table.child(
             table_row(
                 row,
@@ -2177,8 +2264,11 @@ fn render_table(
                 align,
                 ctx,
                 FontWeight::NORMAL,
-                index + 1 < rows.len(),
+                !is_last,
+                min_table_width,
             )
+            .when(header.is_empty() && index == 0, |row| row.rounded_t(px(7.0)))
+            .when(is_last, |row| row.rounded_b(px(7.0)))
             // Faint banding keeps a wide row traceable across columns.
             .when(index % 2 == 1, |row| {
                 row.bg(ctx.palette.overlay.opacity(0.45))
@@ -2195,10 +2285,11 @@ fn table_row(
     ctx: &Ctx,
     weight: FontWeight,
     divider: bool,
+    min_table_width: f32,
 ) -> gpui::Div {
     let mut row = div()
         .w_full()
-        .min_w_0()
+        .min_w(px(min_table_width))
         .flex()
         .items_start()
         .when(divider, |element| {
@@ -2207,13 +2298,15 @@ fn table_row(
     for (index, cell) in cells.iter().enumerate() {
         let key = ctx.next_key();
         let flat = ctx.flat(key.index, || {
-            flatten(cell, ctx.palette, weight, ctx.palette.text)
+            flatten(cell, ctx.palette, weight, ctx.prose_color())
         });
         let alignment = align.get(index).copied().unwrap_or_default();
+        let width_fraction = widths.get(index).copied().unwrap_or(0.0);
+        let min_cell_width = (width_fraction * min_table_width).max(52.0);
         row = row.child(
             div()
-                .w(relative(widths.get(index).copied().unwrap_or(0.0)))
-                .min_w_0()
+                .w(relative(width_fraction))
+                .min_w(px(min_cell_width))
                 .px(px(9.0))
                 .py(px(6.0))
                 .text_size(px((ctx.metrics.text_size - 0.5).max(12.5)))
@@ -2767,5 +2860,43 @@ mod tests {
         assert!((longest - 3.0).abs() < 1e-4);
         let (_, path) = cell_measure(&runs_of("`a/b.rs`"));
         assert!((path - 6.0 * 1.15).abs() < 1e-4, "code stays whole");
+    }
+
+    #[test]
+    fn markdown_view_evicts_table_when_append_absorbs_trailing_row() {
+        fn stub(label: &str) -> FlatText {
+            flatten_plain(
+                label.to_owned(),
+                SANS_FAMILY,
+                FontWeight::NORMAL,
+                palette().text,
+            )
+        }
+
+        let mut view = MarkdownView::new();
+        view.set_text("Intro.\n\n| a |\n|---|\n| 1 |\n| 2", true);
+        let intro = view.flat(block_ordinal_base(0), || stub("intro"));
+        let table = view.flat(block_ordinal_base(1), || stub("old-table"));
+
+        // Completing the trailing row mutates block 1 (the table), while block 0
+        // ("Intro.") stays untouched.
+        view.set_text("Intro.\n\n| a |\n|---|\n| 1 |\n| 2 |\n", true);
+
+        let intro_after = view.flat(block_ordinal_base(0), || {
+            panic!("settled intro block must not be evicted")
+        });
+        assert!(Rc::ptr_eq(&intro, &intro_after));
+
+        let table_after = view.flat(block_ordinal_base(1), || stub("new-table"));
+        assert!(!Rc::ptr_eq(&table, &table_after));
+        assert_eq!(table_after.text.as_ref(), "new-table");
+    }
+
+    #[test]
+    fn bold_inside_semibold_headings_steps_up_to_bold_weight() {
+        let runs = runs_of("Heading **strong**");
+        let flat = flatten(&runs, &palette(), FontWeight::SEMIBOLD, palette().text);
+        assert_eq!(flat.runs[0].font.weight, FontWeight::SEMIBOLD);
+        assert_eq!(flat.runs[1].font.weight, FontWeight::BOLD);
     }
 }

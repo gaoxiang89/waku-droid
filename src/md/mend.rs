@@ -51,6 +51,21 @@ pub fn close_hanging(text: &str) -> Option<String> {
 
     let mut index = 0;
     while index < chars.len() {
+        let is_line_start = index == 0 || chars[index - 1].1 == '\n';
+        if code.is_none() && is_line_start {
+            match skip_fenced_code_block(&chars, index) {
+                FenceScan::NotFence => {}
+                FenceScan::Unclosed => return None,
+                FenceScan::Closed { next_index } => {
+                    delimiters.clear();
+                    brackets.clear();
+                    last_content = None;
+                    index = next_index;
+                    continue;
+                }
+            }
+        }
+
         let ch = chars[index].1;
 
         if code.is_none() && ch == '\\' {
@@ -249,6 +264,109 @@ fn run_length(chars: &[(usize, char)], start: usize) -> usize {
         .count()
 }
 
+enum FenceScan {
+    NotFence,
+    Unclosed,
+    Closed { next_index: usize },
+}
+
+/// Detect a fenced code block (` ``` ` or `~~~`) at the start of a line,
+/// including one nested inside a blockquote or list item. Unclosed fences
+/// suppress inline mending entirely; closed fences are skipped whole so their
+/// literal code cannot pollute surrounding emphasis or bracket state.
+fn skip_fenced_code_block(chars: &[(usize, char)], line_start: usize) -> FenceScan {
+    let line_end = chars[line_start..]
+        .iter()
+        .position(|&(_, ch)| ch == '\n')
+        .map_or(chars.len(), |offset| line_start + offset);
+    let pos = skip_line_prefixes(chars, line_start, line_end, true);
+    let Some(&(_, marker @ ('`' | '~'))) = chars.get(pos) else {
+        return FenceScan::NotFence;
+    };
+    let run = run_length(&chars[..line_end], pos);
+    if run < 3 {
+        return FenceScan::NotFence;
+    }
+    // CommonMark forbids backticks in the info string of a backtick fence; a
+    // line like ```` ```code``` ```` is an inline code span, not a fence.
+    if marker == '`'
+        && chars[pos + run..line_end]
+            .iter()
+            .any(|&(_, ch)| ch == '`')
+    {
+        return FenceScan::NotFence;
+    }
+
+    let mut scan = line_end + 1;
+    while scan <= chars.len() {
+        if scan == chars.len() {
+            return FenceScan::Unclosed;
+        }
+        let close_end = chars[scan..]
+            .iter()
+            .position(|&(_, ch)| ch == '\n')
+            .map_or(chars.len(), |offset| scan + offset);
+        let close_pos = skip_line_prefixes(chars, scan, close_end, false);
+        if chars.get(close_pos).is_some_and(|&(_, ch)| ch == marker) {
+            let close_run = run_length(&chars[..close_end], close_pos);
+            if close_run >= run
+                && chars[close_pos + close_run..close_end]
+                    .iter()
+                    .all(|&(_, ch)| matches!(ch, ' ' | '\t' | '\r'))
+            {
+                return FenceScan::Closed {
+                    next_index: (close_end + 1).min(chars.len()),
+                };
+            }
+        }
+        if close_end == chars.len() {
+            return FenceScan::Unclosed;
+        }
+        scan = close_end + 1;
+    }
+    FenceScan::Unclosed
+}
+
+fn skip_line_prefixes(
+    chars: &[(usize, char)],
+    mut pos: usize,
+    line_end: usize,
+    allow_list_markers: bool,
+) -> usize {
+    while pos < line_end {
+        while pos < line_end && matches!(chars[pos].1, ' ' | '\t') {
+            pos += 1;
+        }
+        if pos < line_end && chars[pos].1 == '>' {
+            pos += 1;
+            continue;
+        }
+        if allow_list_markers {
+            if pos + 1 < line_end
+                && matches!(chars[pos].1, '-' | '*' | '+')
+                && matches!(chars[pos + 1].1, ' ' | '\t')
+            {
+                pos += 2;
+                continue;
+            }
+            let digits = chars[pos..line_end]
+                .iter()
+                .take_while(|&&(_, ch)| ch.is_ascii_digit())
+                .count();
+            if (1..=9).contains(&digits)
+                && pos + digits + 1 < line_end
+                && matches!(chars[pos + digits].1, '.' | ')')
+                && matches!(chars[pos + digits + 1].1, ' ' | '\t')
+            {
+                pos += digits + 2;
+                continue;
+            }
+        }
+        break;
+    }
+    pos
+}
+
 /// Classify one emphasis-family run as an opener or a closer and update the
 /// open-delimiter stack.
 fn scan_delimiter(
@@ -418,6 +536,21 @@ mod tests {
     #[test]
     fn escapes_keep_markers_literal() {
         assert_eq!(close_hanging(r"literal \*star"), None);
+    }
+
+    #[test]
+    fn nested_fenced_code_blocks_are_not_mended_as_inline_code() {
+        // Unclosed fence inside a list or blockquote must not be closed inline.
+        assert_eq!(close_hanging("- item\n  ```rust\n  let x = *a;\n"), None);
+        assert_eq!(close_hanging("> ```python\n> x = [1, 2\n"), None);
+        assert_eq!(close_hanging("1. ~~~js\n   const a = **b;\n"), None);
+
+        // Once the nested fence closes, trailing inline markers after it mend
+        // normally without picking up literal markers from inside the code.
+        assert_eq!(
+            close_hanging("- item\n  ```rust\n  let x = *a;\n  ```\n  now **bold").as_deref(),
+            Some("- item\n  ```rust\n  let x = *a;\n  ```\n  now **bold**")
+        );
     }
 
     #[test]

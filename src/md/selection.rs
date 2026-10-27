@@ -285,29 +285,71 @@ impl<G> SelectionState<G> {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WordClass {
+    Word,
+    Han,
+    Hiragana,
+    Katakana,
+    Hangul,
+}
+
+fn word_class(ch: char) -> Option<WordClass> {
+    let code = u32::from(ch);
+    if matches!(
+        code,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2EBEF
+            | 0x30000..=0x323AF
+    ) {
+        Some(WordClass::Han)
+    } else if matches!(code, 0x3040..=0x309F) {
+        Some(WordClass::Hiragana)
+    } else if matches!(
+        code,
+        0x30A0..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9F
+    ) {
+        Some(WordClass::Katakana)
+    } else if matches!(
+        code,
+        0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F
+    ) {
+        Some(WordClass::Hangul)
+    } else if ch.is_alphanumeric() || ch == '_' {
+        Some(WordClass::Word)
+    } else {
+        None
+    }
+}
+
 /// Byte range around `offset` for a double click: a word-ish run, or the
 /// single non-space character under the cursor.
 pub fn word_range(text: &str, offset: usize) -> Range<usize> {
     let offset = clamp_boundary(text, offset);
-    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
     let before = text[..offset].chars().next_back();
     let at = text[offset..].chars().next();
 
-    if !at.is_some_and(is_word) && !before.is_some_and(is_word) {
+    let Some(class) = at
+        .and_then(word_class)
+        .or_else(|| before.and_then(word_class))
+    else {
         return match at {
             Some(ch) if !ch.is_whitespace() => offset..offset + ch.len_utf8(),
             _ => offset..offset,
         };
-    }
+    };
     let start = text[..offset]
         .char_indices()
         .rev()
-        .take_while(|(_, ch)| is_word(*ch))
+        .take_while(|(_, ch)| word_class(*ch) == Some(class))
         .last()
         .map_or(offset, |(index, _)| index);
     let end = text[offset..]
         .char_indices()
-        .take_while(|(_, ch)| is_word(*ch))
+        .take_while(|(_, ch)| word_class(*ch) == Some(class))
         .last()
         .map_or(offset, |(index, ch)| offset + index + ch.len_utf8());
     start..end
@@ -476,6 +518,18 @@ mod tests {
         // Mid-character offsets snap down rather than panicking.
         let unicode = "héllo wörld";
         assert_eq!(&unicode[word_range(unicode, 2)], "héllo");
+
+        // CJK script classes split cleanly at script boundaries instead of
+        // swallowing adjacent Latin words or Kana particles.
+        let mixed = "使用Markdown渲染";
+        assert_eq!(&mixed[word_range(mixed, 0)], "使用");
+        assert_eq!(&mixed[word_range(mixed, "使用".len())], "Markdown");
+        assert_eq!(&mixed[word_range(mixed, "使用Markdown".len())], "渲染");
+
+        let kana = "日本語のテスト";
+        assert_eq!(&kana[word_range(kana, 0)], "日本語");
+        assert_eq!(&kana[word_range(kana, "日本語".len())], "の");
+        assert_eq!(&kana[word_range(kana, "日本語の".len())], "テスト");
     }
 
     #[test]

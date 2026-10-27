@@ -76,8 +76,15 @@ pub struct ListItem {
 #[derive(Clone, Debug, PartialEq)]
 enum InlinePiece {
     Run(InlineRun),
-    Image { url: String, alt: String },
-    DisplayMath(String),
+    Image {
+        url: String,
+        alt: String,
+        style: InlineStyle,
+    },
+    DisplayMath {
+        latex: String,
+        style: InlineStyle,
+    },
 }
 
 /// A markdown block. Containers nest.
@@ -91,6 +98,7 @@ pub enum Block {
     Image {
         url: String,
         alt: String,
+        link: Option<String>,
     },
     Heading {
         level: u8,
@@ -450,15 +458,19 @@ fn pieces_into_blocks(pieces: Vec<InlinePiece>) -> Vec<Block> {
     for piece in pieces {
         match piece {
             InlinePiece::Run(run) => runs.push(run),
-            InlinePiece::Image { url, alt } => {
+            InlinePiece::Image { url, alt, style } => {
                 if !runs.is_empty() {
                     blocks.push(Block::Paragraph {
                         runs: std::mem::take(&mut runs),
                     });
                 }
-                blocks.push(Block::Image { url, alt });
+                blocks.push(Block::Image {
+                    url,
+                    alt,
+                    link: style.link,
+                });
             }
-            InlinePiece::DisplayMath(latex) => {
+            InlinePiece::DisplayMath { latex, .. } => {
                 if !runs.is_empty() {
                     blocks.push(Block::Paragraph {
                         runs: std::mem::take(&mut runs),
@@ -481,12 +493,12 @@ fn pieces_into_runs(pieces: Vec<InlinePiece>) -> Vec<InlineRun> {
             .into_iter()
             .map(|piece| match piece {
                 InlinePiece::Run(run) => run,
-                InlinePiece::Image { alt, .. } => InlineRun::plain(alt),
-                InlinePiece::DisplayMath(text) => InlineRun {
-                    text,
+                InlinePiece::Image { alt, style, .. } => InlineRun { text: alt, style },
+                InlinePiece::DisplayMath { latex, style } => InlineRun {
+                    text: latex,
                     style: InlineStyle {
                         math: true,
-                        ..Default::default()
+                        ..style
                     },
                 },
             })
@@ -522,7 +534,10 @@ fn parse_inline_event(cursor: &mut Cursor, pieces: &mut Vec<InlinePiece>, style:
                 style,
             });
         }
-        Event::DisplayMath(text) => pieces.push(InlinePiece::DisplayMath(text.into_string())),
+        Event::DisplayMath(text) => pieces.push(InlinePiece::DisplayMath {
+            latex: text.into_string(),
+            style: style.clone(),
+        }),
         // A hard or soft break inside a paragraph is a line break in the
         // rendered run: shaped text splits on '\n' on its own.
         Event::SoftBreak | Event::HardBreak => push_run(InlineRun {
@@ -553,6 +568,7 @@ fn parse_inline_event(cursor: &mut Cursor, pieces: &mut Vec<InlinePiece>, style:
             pieces.push(InlinePiece::Image {
                 url: dest_url.to_string(),
                 alt,
+                style: style.clone(),
             });
         }
         Event::Start(tag) => {
@@ -948,17 +964,21 @@ impl IncrementalParser {
     }
 
     /// Point the parser at `text`. Appends reparse incrementally; any other
-    /// change falls back to a full reparse.
-    pub fn set_text(&mut self, text: &str) {
+    /// change falls back to a full reparse. Returns the index of the first
+    /// canonical block that changed.
+    pub fn set_text(&mut self, text: &str) -> usize {
         if text == self.text {
-            return;
+            return self.tree.blocks.len();
         }
         match text.strip_prefix(self.text.as_str()) {
             Some(delta) if !self.text.is_empty() && !self.full_reparse_only => {
                 let delta = delta.to_owned();
-                self.append(&delta);
+                self.append(&delta)
             }
-            _ => self.reset(text),
+            _ => {
+                self.reset(text);
+                0
+            }
         }
     }
 
@@ -971,15 +991,16 @@ impl IncrementalParser {
     }
 
     /// Append `delta`, reparsing only from the last stable block boundary.
-    pub fn append(&mut self, delta: &str) {
+    /// Returns the index of the first canonical block that changed.
+    pub fn append(&mut self, delta: &str) -> usize {
         if delta.is_empty() {
-            return;
+            return self.tree.blocks.len();
         }
         if self.full_reparse_only {
             let mut text = std::mem::take(&mut self.text);
             text.push_str(delta);
             self.reset(&text);
-            return;
+            return 0;
         }
 
         let boundary = self
@@ -988,13 +1009,21 @@ impl IncrementalParser {
             .get(self.stable_prefix)
             .map_or(self.text.len(), |block| block.range.start);
         self.text.push_str(delta);
-        if has_link_definition(delta) {
+        if has_link_definition(&self.text[boundary..]) {
             let text = std::mem::take(&mut self.text);
             self.reset(&text);
-            return;
+            return 0;
         }
 
         let tail = parse(&self.text[boundary..]);
+        let unchanged = self.tree.blocks[self.stable_prefix..]
+            .iter()
+            .zip(&tail.blocks)
+            .take_while(|(old, new)| {
+                old.range.start == new.range.start + boundary && old.block == new.block
+            })
+            .count();
+        let changed_from = self.stable_prefix + unchanged;
         self.tree.blocks.truncate(self.stable_prefix);
         self.tree
             .blocks
@@ -1004,6 +1033,7 @@ impl IncrementalParser {
                 block
             }));
         self.stable_prefix = self.settled_prefix();
+        changed_from
     }
 
     /// Replacement blocks for the final block while streaming, with its hanging
@@ -1094,13 +1124,90 @@ impl IncrementalParser {
 /// Cheap scan for a link reference definition (`[label]: destination`), which
 /// resolves references anywhere in the document and so breaks locality.
 fn has_link_definition(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
+    let mut fence: Option<(char, usize)> = None;
+    let mut open_label = false;
+    for raw_line in text.lines() {
+        if let Some((marker, min_len)) = fence {
+            let stripped = strip_container_prefixes(raw_line, false);
+            let run = stripped.chars().take_while(|&ch| ch == marker).count();
+            if run >= min_len && stripped[run..].trim().is_empty() {
+                fence = None;
+            }
+            open_label = false;
+            continue;
+        }
+
+        let line = strip_container_prefixes(raw_line, true);
+        if let Some(opened) = fence_opener(line) {
+            fence = Some(opened);
+            open_label = false;
+            continue;
+        }
+
+        if open_label {
+            if line.is_empty() {
+                open_label = false;
+            } else if let Some(close) = line.find(']') {
+                if !line[..close].contains('[') && line[close + 1..].starts_with(':') {
+                    return true;
+                }
+                open_label = false;
+            } else if line.contains('[') {
+                open_label = false;
+            }
+        }
+
         let Some(rest) = line.strip_prefix('[') else {
-            return false;
+            continue;
         };
-        rest.find("]:").is_some_and(|end| end > 0)
-    })
+        if let Some(close) = rest.find(']') {
+            if close > 0 && !rest[..close].contains('[') && rest[close + 1..].starts_with(':') {
+                return true;
+            }
+        } else if !rest.is_empty() && !rest.contains('[') {
+            open_label = true;
+        }
+    }
+    false
+}
+
+fn strip_container_prefixes(mut line: &str, allow_list_markers: bool) -> &str {
+    loop {
+        line = line.trim_start_matches([' ', '\t']);
+        if let Some(rest) = line.strip_prefix('>') {
+            line = rest;
+            continue;
+        }
+        if allow_list_markers {
+            if let Some(rest) = line.strip_prefix(['-', '*', '+'])
+                && rest.starts_with([' ', '\t'])
+            {
+                line = &rest[1..];
+                continue;
+            }
+            let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+            if (1..=9).contains(&digits)
+                && line[digits..].starts_with(['.', ')'])
+                && line[digits + 1..].starts_with([' ', '\t'])
+            {
+                line = &line[digits + 2..];
+                continue;
+            }
+        }
+        return line;
+    }
+}
+
+fn fence_opener(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next().filter(|&ch| matches!(ch, '`' | '~'))?;
+    let run = line.chars().take_while(|&ch| ch == marker).count();
+    if run < 3 {
+        return None;
+    }
+    if marker == '`' && line[run..].contains('`') {
+        return None;
+    }
+    Some((marker, run))
 }
 
 #[cfg(test)]
@@ -1387,6 +1494,7 @@ mod tests {
             Block::Image {
                 url: "https://example.com/x.png".into(),
                 alt: "a shot".into(),
+                link: None,
             }
         );
         assert_eq!(paragraph_text(&tree.blocks[2].block), " after");
@@ -1558,6 +1666,60 @@ mod tests {
         let mut parser = IncrementalParser::new();
         parser.set_text("```rust\nlet a = **b;\n");
         assert_eq!(parser.display_tree(), *parser.tree());
+
+        // A fenced code block nested inside a list or blockquote is also left literal.
+        parser.set_text("- item\n  ```rust\n  let a = **b;\n");
+        assert_eq!(parser.display_tree(), *parser.tree());
+    }
+
+    #[test]
+    fn link_definitions_handle_split_chunks_containers_and_code_fences() {
+        // Split across streaming chunks: `[docs]` then `: https://example.com\n`.
+        let mut parser = IncrementalParser::new();
+        parser.set_text("See [docs].\n\n[docs]");
+        assert!(!parser.full_reparse_only);
+        parser.set_text("See [docs].\n\n[docs]: https://example.com\n");
+        assert!(parser.full_reparse_only);
+        assert_eq!(
+            parser.tree(),
+            &parse("See [docs].\n\n[docs]: https://example.com\n")
+        );
+
+        // Link definition inside a blockquote resolves earlier references.
+        let mut quoted = IncrementalParser::new();
+        quoted.set_text("See [docs].\n\n");
+        quoted.set_text("See [docs].\n\n> [docs]: https://example.com\n");
+        assert!(quoted.full_reparse_only);
+        assert_eq!(
+            quoted.tree(),
+            &parse("See [docs].\n\n> [docs]: https://example.com\n")
+        );
+
+        // `[section]:` inside a fenced code block must not force full reparses.
+        let mut fenced = IncrementalParser::new();
+        fenced.set_text("Intro.\n\n```yaml\n[docs]: https://example.com\n```\n");
+        assert!(!fenced.full_reparse_only);
+    }
+
+    #[test]
+    fn linked_and_styled_images_preserve_outer_attributes() {
+        let tree = parse("[![Build Status](https://example.com/badge.svg)](https://example.com/ci)");
+        assert_eq!(
+            tree.blocks[0].block,
+            Block::Image {
+                url: "https://example.com/badge.svg".into(),
+                alt: "Build Status".into(),
+                link: Some("https://example.com/ci".into()),
+            }
+        );
+
+        let table = parse("| col |\n|---|\n| **[!\\[alt\\](x.png)](https://example.com)** |\n");
+        let Block::Table { rows, .. } = &table.blocks[0].block else {
+            panic!("expected a table");
+        };
+        let cell_run = &rows[0][0][0];
+        assert!(cell_run.style.bold);
+        assert_eq!(cell_run.style.link.as_deref(), Some("https://example.com"));
     }
 
     #[test]

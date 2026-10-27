@@ -1187,7 +1187,8 @@ impl Waku {
         // The skill's document, rendered with the transcript's own markdown
         // engine. The parse is cached per selected skill; re-rendering an
         // unchanged document costs `Rc` clones, not a re-parse.
-        let palette = MarkdownPalette::from_theme(theme);
+        let mut palette = MarkdownPalette::from_theme(theme);
+        palette.text = theme.text_secondary;
         let document: Option<AnyElement> = (!skill.body.is_empty()).then(|| {
             let mut cache = self.skills_detail_markdown.borrow_mut();
             let primary_dir = skill.primary().dir.clone();

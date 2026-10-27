@@ -38,7 +38,7 @@ impl MathData {
 
 #[derive(Default, Debug)]
 struct LayoutCache {
-    style: Option<(f32, f32, f32)>,
+    style: Option<(f32, f32, f32, Hsla)>,
     keys: Vec<math::Key>,
     metrics: Vec<Option<math::Metrics>>,
     tokens: Vec<Token>,
@@ -190,6 +190,15 @@ impl Geometry {
     }
 
     pub fn range_rects(&self, range: &Range<usize>) -> Vec<Bounds<Pixels>> {
+        self.range_rects_padded(range, 0.0, 0.0)
+    }
+
+    pub fn range_rects_padded(
+        &self,
+        range: &Range<usize>,
+        pad_x: f32,
+        inset_y: f32,
+    ) -> Vec<Bounds<Pixels>> {
         let frame = self.0.borrow();
         let Some((bounds, flow)) = frame.as_ref() else {
             return Vec::new();
@@ -221,11 +230,24 @@ impl Geometry {
                 rects.push(rect);
             }
         }
+        if pad_x != 0.0 || inset_y != 0.0 {
+            for rect in &mut rects {
+                rect.origin.x -= px(pad_x);
+                rect.size.width += px(pad_x * 2.0);
+                rect.origin.y += px(inset_y);
+                rect.size.height = (rect.size.height - px(inset_y * 2.0)).max(px(1.0));
+            }
+        }
         rects
     }
 }
 
-pub(super) fn element(flat: Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
+pub(super) fn element(
+    flat: Rc<FlatText>,
+    key: TextKey,
+    ctx: &Ctx,
+    request_frame: bool,
+) -> AnyElement {
     let geometry = Geometry::default();
     let mut wrapper = div()
         .relative()
@@ -342,7 +364,9 @@ pub(super) fn element(flat: Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement
         selection: ctx.selection.clone(),
         search: ctx.search.clone(),
         palette: *ctx.palette,
+        prose_color: ctx.prose_color(),
         block_break: ctx.take_block_break(),
+        request_frame,
     };
     wrapper
         .id(SharedString::from(format!(
@@ -381,7 +405,9 @@ struct MathText {
     selection: TranscriptSelection,
     search: Option<SearchHighlights>,
     palette: Palette,
+    prose_color: Hsla,
     block_break: bool,
+    request_frame: bool,
 }
 
 impl IntoElement for MathText {
@@ -419,8 +445,8 @@ impl Element for MathText {
         let scale = window.scale_factor();
         let data = self.flat.math.as_ref().unwrap();
         let mut cache = data.cache.borrow_mut();
-        if cache.style != Some((font_size, line_height, scale)) {
-            cache.style = Some((font_size, line_height, scale));
+        if cache.style != Some((font_size, line_height, scale, self.prose_color)) {
+            cache.style = Some((font_size, line_height, scale, self.prose_color));
             cache.keys = data
                 .spans
                 .iter()
@@ -430,7 +456,7 @@ impl Element for MathText {
                         span.display,
                         font_size,
                         scale,
-                        self.palette.text,
+                        self.prose_color,
                     )
                 })
                 .collect();
@@ -488,11 +514,14 @@ impl Element for MathText {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
         if let Some((stored, _)) = self.geometry.0.borrow_mut().as_mut() {
             *stored = bounds;
+        }
+        if self.request_frame && !cx.reduce_motion() {
+            window.request_animation_frame();
         }
     }
 
@@ -517,7 +546,10 @@ impl Element for MathText {
             ));
         };
         for range in &self.flat.code_ranges {
-            for rect in self.geometry.range_rects(range) {
+            for rect in self
+                .geometry
+                .range_rects_padded(range, CODE_WASH_PAD_X, CODE_WASH_INSET_Y)
+            {
                 wash(rect, self.palette.code_wash, CODE_WASH_RADIUS, window);
             }
         }
@@ -532,7 +564,7 @@ impl Element for MathText {
                 } else {
                     self.palette.search_match
                 };
-                for rect in self.geometry.range_rects(&found.range) {
+                for rect in self.geometry.range_rects_padded(&found.range, 1.0, 1.0) {
                     wash(rect, color, 2.0, window);
                 }
             }
