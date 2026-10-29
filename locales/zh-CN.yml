@@ -988,6 +988,8 @@ files.preview_markdown: 预览 Markdown
 files.edit_markdown_source: 编辑源码
 files.resize_tree: 调整文件树宽度
 files.refresh: 刷新文件
+files.auto_refresh_limited: 此工作区的自动刷新受限，请使用刷新按钮检查最新变化。
+files.refresh_failed: "无法刷新文件：%{error}"
 files.loading: 正在加载文件…
 files.workspace_files: 工作区文件
 files.loading_file: 正在加载文件

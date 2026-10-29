@@ -1734,9 +1734,8 @@ pub struct Waku {
     file_search: Option<file_search::FileSearch>,
     right_panel_diff_source: ReviewDiffSource,
     right_panel_diff_snapshot: Option<Arc<ReviewDiffSnapshot>>,
-    right_panel_diff_loading: bool,
+    right_panel_diff_refresh: crate::query::RefreshQueue<(Uuid, PanelScope, ReviewDiffSource)>,
     right_panel_diff_error: Option<String>,
-    right_panel_diff_generation: u64,
     right_panel_diff_selected_file: Option<usize>,
     right_panel_diff_expanded_paths: HashSet<String>,
     right_panel_diff_view_mode: right_panel::ReviewDiffViewMode,
@@ -1745,12 +1744,14 @@ pub struct Waku {
     /// The working tree as currently drawn. Held so a refresh can redraw the
     /// previous listing instead of blanking the panel.
     right_panel_working_tree: Vec<right_panel::WorkingTreeEntry>,
+    right_panel_tree_refresh: crate::query::RefreshQueue<PanelScope>,
     /// Working tree per project scope. Walking it is filesystem I/O and must
     /// never happen in a frame.
     working_trees: QueryCache<PanelScope, Vec<right_panel::WorkingTreeEntry>>,
     /// Set when a turn finishes; the drain loop drops the workspace queries,
     /// since the event handler has no `Context` to refresh them itself.
     workspace_queries_stale: bool,
+    workspace_watch: workspace_watch::WorkspaceWatch,
     right_panel_terminal_groups: HashMap<Uuid, SplitGroup>,
     terminal_layouts: terminal_persistence::TerminalLayouts,
     right_panel_browsers: HashMap<Uuid, Entity<BrowserView>>,
@@ -2019,6 +2020,7 @@ mod transcript_view;
 mod usage_meter;
 mod usage_page;
 mod window_chrome;
+mod workspace_watch;
 
 pub use autocomplete::init as init_composer_autocomplete;
 use background_work::{
@@ -2027,13 +2029,13 @@ use background_work::{
 pub use command_palette::init as init_command_palette;
 pub use commit_dialog::init as init_commit_dialog_keys;
 use components::*;
+pub use connections_page::init as init_connection_keys;
 pub use goal_dialog::init as init_goal_dialog_keys;
 pub use image_preview::init as init_image_preview_keys;
 use project_picker::ProjectPickerSite;
 pub use right_panel::init as init_right_panel_keys;
 pub use settings::init as init_settings_keys;
 pub use sidebar::init as init_sidebar_keys;
-pub use connections_page::init as init_connection_keys;
 use sidebar::{SidebarGroup, SidebarRow};
 pub use skills_page::init as init_skills_keys;
 use streaming::*;
@@ -2845,6 +2847,7 @@ impl Waku {
             .detach();
 
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+                this.workspace_watch.active = window.is_window_active();
                 if window.is_window_active() {
                     this.reload_clean_right_panel_file_editors(cx);
                     // The working tree and branch may have moved while another
@@ -3546,17 +3549,18 @@ impl Waku {
                 file_search: None,
                 right_panel_diff_source: ReviewDiffSource::default(),
                 right_panel_diff_snapshot: None,
-                right_panel_diff_loading: false,
+                right_panel_diff_refresh: Default::default(),
                 right_panel_diff_error: None,
-                right_panel_diff_generation: 0,
                 right_panel_diff_selected_file: None,
                 right_panel_diff_expanded_paths: HashSet::new(),
                 right_panel_diff_view_mode: right_panel::ReviewDiffViewMode::default(),
                 right_panel_diff_tree_rows: RefCell::new(Vec::new()),
                 right_panel_diff_tree_cursor: None,
                 right_panel_working_tree: Vec::new(),
+                right_panel_tree_refresh: Default::default(),
                 working_trees: QueryCache::new(MAX_CACHED_WORKSPACES),
                 workspace_queries_stale: false,
+                workspace_watch: workspace_watch::WorkspaceWatch::new(window.is_window_active()),
                 right_panel_terminal_groups: HashMap::new(),
                 terminal_layouts: terminal_persistence::TerminalLayouts::default(),
                 right_panel_browsers: HashMap::new(),
@@ -3686,6 +3690,7 @@ impl Waku {
             // `@` into the very first prompt already has data to draw.
             this.refresh_composer_sources(cx);
             this.refresh_workspace_surfaces(cx);
+            this.start_workspace_watch(cx);
             // Re-detect providers after resolving the user's login-shell
             // environment off-thread. Detection then starts model and version
             // discovery for every CLI it finds, including nvm/fnm-managed

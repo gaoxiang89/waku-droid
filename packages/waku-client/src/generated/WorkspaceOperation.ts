@@ -5,7 +5,15 @@ import type { GitGraphAction } from "./GitGraphAction";
 import type { ProviderKind } from "./ProviderKind";
 import type { ReviewDiffSource } from "./ReviewDiffSource";
 
-export type WorkspaceOperation = { "type": "listTree", root: string, expanded_paths: string[], } | { "type": "browseDirectory", path: string | null, } | { "type": "readTextFile", root: string, relative_path: string, } | { "type": "writeTextFile", root: string, relative_path: string, content: string, } | { "type": "readFileChunk", root: string, relative_path: string, offset: number,
+export type WorkspaceOperation = { "type": "watchChanges", client_id: string, root: string,
+/**
+ * Non-recursive directories visible in Files, relative to root.
+ */
+directories: string[],
+/**
+ * Live Review needs the non-ignored source tree; Files alone does not.
+ */
+recursive: boolean, watch_git: boolean, } | { "type": "listTree", root: string, expanded_paths: string[], } | { "type": "browseDirectory", path: string | null, } | { "type": "readTextFile", root: string, relative_path: string, } | { "type": "writeTextFile", root: string, relative_path: string, content: string, } | { "type": "readFileChunk", root: string, relative_path: string, offset: number,
 /**
  * Bytes requested; the daemon clamps this to its own per-chunk cap.
  */

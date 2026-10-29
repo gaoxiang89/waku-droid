@@ -2017,6 +2017,10 @@ files.resize_tree:
   en: Resize file tree
 files.refresh:
   en: Refresh files
+files.auto_refresh_limited:
+  en: Automatic refresh is limited for this workspace. Use Refresh to check for the latest changes.
+files.refresh_failed:
+  en: "Could not refresh files: %{error}"
 files.loading:
   en: Loading files…
 files.workspace_files:

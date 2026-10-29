@@ -2667,6 +2667,8 @@ impl Waku {
         // The pinned tree must never show paths from the workspace we left
         // while the new workspace's background read is in flight.
         self.right_panel_working_tree.clear();
+        self.right_panel_tree_refresh.reset();
+        self.workspace_watch.reset();
         self.right_panel_visible = state.visible;
         self.right_panel_surfaces = state.surfaces;
         self.right_panel_active_surface = state.active_surface;
@@ -2680,11 +2682,10 @@ impl Waku {
         // switching sessions abandons it rather than retargeting the wrong row.
         self.right_panel_file_rename = None;
         self.right_panel_delete_confirm = None;
-        self.right_panel_diff_generation = self.right_panel_diff_generation.wrapping_add(1);
+        self.right_panel_diff_refresh.reset();
         self.right_panel_diff_selection.clear();
         self.right_panel_diff_source = state.diff_source;
         self.right_panel_diff_snapshot = state.diff_snapshot;
-        self.right_panel_diff_loading = false;
         self.right_panel_diff_error = None;
         self.right_panel_diff_selected_file = state.diff_selected_file;
         self.right_panel_diff_expanded_paths = state.diff_expanded_paths;
@@ -2704,7 +2705,7 @@ impl Waku {
         self.right_panel_tabs_scroll_handle.scroll_to_item(index);
     }
 
-    fn active_right_panel_surface(&self) -> Option<&RightPanelSurface> {
+    pub(super) fn active_right_panel_surface(&self) -> Option<&RightPanelSurface> {
         self.right_panel_active_surface
             .and_then(|index| self.right_panel_surfaces.get(index))
     }
@@ -4157,6 +4158,42 @@ impl Waku {
                     .text_color(theme.text_secondary)
                     .child(title),
             )
+            .child({
+                let focus = self.transcript_control_focus("files-refresh", cx);
+                let refresh_icon = if self.right_panel_tree_refresh.is_loading() {
+                    motion::spin(icon("icons/loader-circle.svg", 13.0, theme.text_tertiary))
+                } else {
+                    icon("icons/rotate-cw.svg", 13.0, theme.text_tertiary).into_any_element()
+                };
+                div()
+                    .id("files-refresh")
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .size(px(24.0))
+                    .flex_none()
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_default()
+                    .hover(|style| style.bg(theme.overlay))
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .child(refresh_icon)
+                    .tooltip(Tooltip::text(tr!("files.refresh")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.refresh_right_panel_working_tree(cx);
+                        this.reload_clean_right_panel_file_editors(cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.refresh_right_panel_working_tree(cx);
+                            this.reload_clean_right_panel_file_editors(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            })
             .child(
                 icon_button("files-new-file", "icons/file.svg", *theme)
                     .tab_index(0)
@@ -5398,7 +5435,11 @@ impl Waku {
     ///
     /// Reaches the filesystem, so it queues a background read rather than
     /// blocking; the editor keeps showing its current text until that lands.
-    fn reload_right_panel_file_if_clean(&mut self, relative_path: &str, cx: &mut Context<Self>) {
+    pub(super) fn reload_right_panel_file_if_clean(
+        &mut self,
+        relative_path: &str,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .right_panel_file_editors
             .get(relative_path)
@@ -6172,7 +6213,7 @@ impl Waku {
                     )
                     .into_any_element()
             }
-            None if self.right_panel_diff_loading => self
+            None if self.right_panel_diff_refresh.is_loading() => self
                 .render_right_panel_empty_message(
                     tr!("diff.loading"),
                     tr!("diff.loading_description"),
@@ -6284,7 +6325,7 @@ impl Waku {
                 (snapshot.additions, snapshot.deletions, snapshot.truncated)
             });
         let refresh_focus = self.transcript_control_focus("right-panel-diff-refresh", cx);
-        let refresh_icon: AnyElement = if self.right_panel_diff_loading {
+        let refresh_icon: AnyElement = if self.right_panel_diff_refresh.is_loading() {
             motion::spin(icon("icons/loader-circle.svg", 12.0, theme.text_tertiary))
         } else {
             icon("icons/rotate-cw.svg", 12.0, theme.text_tertiary).into_any_element()
@@ -7215,11 +7256,16 @@ impl Waku {
     /// directories — filesystem I/O, so it runs on the background executor and
     /// the panel keeps drawing the previous listing until the result lands.
     /// Called when the tree's inputs change, never from a frame.
-    fn refresh_right_panel_working_tree(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_right_panel_working_tree(&mut self, cx: &mut Context<Self>) {
         let Some(scope) = self.selected_panel_scope() else {
             self.right_panel_working_tree.clear();
+            self.right_panel_tree_refresh.reset();
             return;
         };
+        let Some(generation) = self.right_panel_tree_refresh.begin(scope.clone()) else {
+            return;
+        };
+        cx.notify();
         // The tree on disk moves under us, and the expanded set may just have
         // changed, so a cached listing is only good until something asks again.
         self.working_trees.invalidate(&scope);
@@ -7231,17 +7277,19 @@ impl Waku {
                 let workspace =
                     waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
                 cx.spawn(async move |waku, cx| {
-                    let entries = cx
+                    let result = cx
                         .background_executor()
                         .spawn({
                             let path = scope.workspace.clone();
                             async move {
-                                match workspace.request(waku_client::WorkspaceOperation::ListTree {
-                                    root: path,
-                                    expanded_paths: expanded.into_iter().collect(),
-                                }) {
-                                    Ok(waku_client::WorkspaceResult::WorkingTree { entries }) => {
-                                        entries
+                                match workspace.request(
+                                    waku_client::WorkspaceOperation::ListTree {
+                                        root: path,
+                                        expanded_paths: expanded.into_iter().collect(),
+                                    },
+                                )? {
+                                    waku_client::WorkspaceResult::WorkingTree { entries } => {
+                                        Ok(entries
                                             .into_iter()
                                             .map(|entry| WorkingTreeEntry {
                                                 file_icon: (!entry.is_dir)
@@ -7253,20 +7301,46 @@ impl Waku {
                                                 expanded: entry.expanded,
                                                 depth: entry.depth,
                                             })
-                                            .collect()
+                                            .collect::<Vec<_>>())
                                     }
-                                    Ok(_) | Err(_) => Vec::new(),
+                                    _ => anyhow::bail!(
+                                        "the daemon returned an invalid file tree response"
+                                    ),
                                 }
                             }
                         })
                         .await;
                     waku.update(cx, |waku, cx| {
-                        if waku.working_trees.fulfill(token, entries.clone())
-                            && waku.selected_panel_scope().as_ref() == Some(&scope)
-                        {
-                            waku.right_panel_working_tree = entries;
-                            cx.notify();
+                        let Some(refresh_again) = waku.right_panel_tree_refresh.finish(generation)
+                        else {
+                            waku.working_trees.abandon(token);
+                            return;
+                        };
+                        if waku.selected_panel_scope().as_ref() != Some(&scope) {
+                            waku.working_trees.abandon(token);
+                            return;
                         }
+                        match result {
+                            Ok(entries) => {
+                                if waku.working_trees.fulfill(token, entries.clone())
+                                    && !refresh_again
+                                {
+                                    waku.right_panel_working_tree = entries;
+                                }
+                            }
+                            Err(error) => {
+                                waku.working_trees.abandon(token);
+                                waku.show_toast(tr!(
+                                    "files.refresh_failed",
+                                    error = error.to_string()
+                                ));
+                            }
+                        }
+                        if refresh_again {
+                            // Use the latest expanded paths, including clicks made during the read.
+                            waku.refresh_right_panel_working_tree(cx);
+                        }
+                        cx.notify();
                     })
                     .ok();
                 })
@@ -7336,28 +7410,30 @@ impl Waku {
     /// Captures one stable Git range and turns it into render-ready rows. Git,
     /// patch parsing, and syntax tokenization all stay off the UI thread; the
     /// generation check prevents an old source or session from landing late.
-    fn refresh_right_panel_diff(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_right_panel_diff(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.state.selected_session else {
             self.right_panel_diff_selection.clear();
             self.right_panel_diff_snapshot = None;
-            self.right_panel_diff_loading = false;
+            self.right_panel_diff_refresh.reset();
             self.right_panel_diff_error = Some(tr!("diff.unavailable"));
             return;
         };
-        let Some(project_path) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(scope) = self.selected_panel_scope() else {
             self.right_panel_diff_selection.clear();
             self.right_panel_diff_snapshot = None;
-            self.right_panel_diff_loading = false;
+            self.right_panel_diff_refresh.reset();
             self.right_panel_diff_error = Some(tr!("diff.unavailable"));
             return;
         };
 
-        self.right_panel_diff_generation = self.right_panel_diff_generation.wrapping_add(1);
-        let generation = self.right_panel_diff_generation;
         let source = self.right_panel_diff_source;
+        let project_path = scope.workspace.clone();
+        let Some(generation) = self
+            .right_panel_diff_refresh
+            .begin((session_id, scope, source))
+        else {
+            return;
+        };
         let had_snapshot = self.right_panel_diff_snapshot.is_some();
         let previous_directories = self
             .right_panel_diff_snapshot
@@ -7371,7 +7447,6 @@ impl Waku {
                 .and_then(|snapshot| snapshot.files.get(index))
                 .map(|file| file.path.clone())
         });
-        self.right_panel_diff_loading = true;
         self.right_panel_diff_error = None;
         cx.notify();
 
@@ -7402,8 +7477,10 @@ impl Waku {
                 })
                 .await;
             waku.update(cx, |waku, cx| {
+                let Some(refresh_again) = waku.right_panel_diff_refresh.finish(generation) else {
+                    return;
+                };
                 let still_current = waku.state.selected_session == Some(session_id)
-                    && waku.right_panel_diff_generation == generation
                     && waku.right_panel_diff_source == source
                     && waku
                         .selected_workspace_path()
@@ -7412,7 +7489,6 @@ impl Waku {
                     return;
                 }
 
-                waku.right_panel_diff_loading = false;
                 match result {
                     Ok(snapshot) => {
                         waku.right_panel_diff_selection.clear();
@@ -7445,6 +7521,9 @@ impl Waku {
                             waku.right_panel_diff_error = Some(message);
                         }
                     }
+                }
+                if refresh_again {
+                    waku.refresh_right_panel_diff(cx);
                 }
                 cx.notify();
             })

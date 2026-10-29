@@ -62,6 +62,7 @@ pub mod theme;
 pub mod usage;
 pub mod usage_history;
 pub mod workspace;
+mod workspace_watch;
 pub mod worktree;
 
 mod fs_ext;

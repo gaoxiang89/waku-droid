@@ -1031,6 +1031,8 @@ files.preview_markdown: Markdown をプレビュー
 files.edit_markdown_source: ソースを編集
 files.resize_tree: ファイルツリーの幅を変更
 files.refresh: ファイルを更新
+files.auto_refresh_limited: このワークスペースの自動更新は制限されています。更新ボタンで最新の変更を確認してください。
+files.refresh_failed: "ファイルを更新できませんでした：%{error}"
 files.loading: ファイルを読み込み中…
 files.workspace_files: ワークスペースのファイル
 files.loading_file: ファイルを読み込み中

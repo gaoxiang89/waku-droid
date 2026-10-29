@@ -35,6 +35,56 @@ use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::sync::Arc;
 
+/// Coalesce refresh bursts into one active read and one follow-up. A different
+/// key starts immediately; generations keep superseded completions harmless.
+pub struct RefreshQueue<K> {
+    active: Option<K>,
+    generation: u64,
+    queued: bool,
+}
+
+impl<K> Default for RefreshQueue<K> {
+    fn default() -> Self {
+        Self {
+            active: None,
+            generation: 0,
+            queued: false,
+        }
+    }
+}
+
+impl<K: PartialEq> RefreshQueue<K> {
+    pub fn begin(&mut self, key: K) -> Option<u64> {
+        if self.active.as_ref() == Some(&key) {
+            self.queued = true;
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.active = Some(key);
+        self.queued = false;
+        Some(self.generation)
+    }
+
+    /// None means obsolete; otherwise the bool asks for one fresh follow-up.
+    pub fn finish(&mut self, generation: u64) -> Option<bool> {
+        if self.active.is_none() || generation != self.generation {
+            return None;
+        }
+        self.active = None;
+        Some(std::mem::take(&mut self.queued))
+    }
+
+    pub fn reset(&mut self) {
+        self.active = None;
+        self.queued = false;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.active.is_some()
+    }
+}
+
 /// Proof that a caller is the one who should fetch a key, carrying the
 /// generation the request was made at.
 ///
@@ -213,6 +263,44 @@ impl<K: Clone + Eq + Hash, V> QueryCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_bursts_get_one_follow_up() {
+        let mut queue = RefreshQueue::default();
+        let first = queue.begin("workspace").unwrap();
+        for _ in 0..10 {
+            assert_eq!(queue.begin("workspace"), None);
+        }
+        assert_eq!(queue.finish(first), Some(true));
+        let next = queue.begin("workspace").unwrap();
+        assert_eq!(queue.finish(next), Some(false));
+        assert!(!queue.is_loading());
+    }
+
+    #[test]
+    fn obsolete_refresh_cannot_clear_new_request_or_its_follow_up() {
+        let mut queue = RefreshQueue::default();
+        let first = queue.begin("a").unwrap();
+        let second = queue.begin("b").unwrap();
+        let third = queue.begin("a").unwrap();
+        assert_eq!(queue.begin("a"), None);
+        assert_eq!(queue.finish(first), None);
+        assert_eq!(queue.finish(second), None);
+        assert!(queue.is_loading());
+        assert_eq!(queue.finish(third), Some(true));
+    }
+
+    #[test]
+    fn reset_abandons_refresh_and_pending_follow_up() {
+        let mut queue = RefreshQueue::default();
+        let first = queue.begin("a").unwrap();
+        queue.begin("a");
+        queue.reset();
+        assert!(!queue.is_loading());
+        let next = queue.begin("a").unwrap();
+        assert_eq!(queue.finish(first), None);
+        assert_eq!(queue.finish(next), Some(false));
+    }
 
     fn cache() -> QueryCache<&'static str, String> {
         QueryCache::new(4)

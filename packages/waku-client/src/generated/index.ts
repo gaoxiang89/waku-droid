@@ -112,3 +112,4 @@ export type { WireSessionOptions } from "./WireSessionOptions";
 export type { WorkingTreeEntry } from "./WorkingTreeEntry";
 export type { WorkspaceOperation } from "./WorkspaceOperation";
 export type { WorkspaceResult } from "./WorkspaceResult";
+export type { WorkspaceWatchState } from "./WorkspaceWatchState";

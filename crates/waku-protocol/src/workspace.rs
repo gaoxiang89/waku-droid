@@ -50,6 +50,18 @@ pub struct WorkingTreeEntry {
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WorkspaceOperation {
+    /// Renew a short native-watch lease and read its in-memory change counters.
+    WatchChanges {
+        client_id: Uuid,
+        #[ts(type = "string")]
+        root: PathBuf,
+        /// Non-recursive directories visible in Files, relative to root.
+        #[ts(type = "string[]")]
+        directories: Vec<PathBuf>,
+        /// Live Review needs the non-ignored source tree; Files alone does not.
+        recursive: bool,
+        watch_git: bool,
+    },
     ListTree {
         #[ts(type = "string")]
         root: PathBuf,
@@ -273,6 +285,9 @@ pub enum WorkspaceOperation {
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WorkspaceResult {
+    Changes {
+        state: WorkspaceWatchState,
+    },
     Ack,
     WorkingTree {
         entries: Vec<WorkingTreeEntry>,
@@ -347,4 +362,18 @@ pub enum WorkspaceResult {
     GitFileDiff {
         diff: GitFileDiff,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceWatchState {
+    pub epoch: Uuid,
+    pub tree: u64,
+    pub content: u64,
+    pub worktree: u64,
+    pub git: u64,
+    pub ready: bool,
+    /// Native watching failed or reached its resource budget. Manual refresh
+    /// and activation refresh remain available; no full-tree polling fallback.
+    pub limited: bool,
 }

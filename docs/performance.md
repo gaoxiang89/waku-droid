@@ -149,6 +149,41 @@ element per word or start an animation clock. Selection and search use the
 original LaTeX byte ranges. The manual measurement is
 `cargo test --locked -p waku --lib md::math::tests::benchmark_native_math_cache -- --ignored --nocapture`.
 
+## Workspace auto-refresh
+
+Files and Review use daemon-host native filesystem notifications, including
+SSH/WSL workspaces. The desktop checks in-memory revision counters once per
+second while the window and relevant panel are active; unchanged counters
+cause no redraw, filesystem walk, or Git command. Requests are sequential, so
+a slow host cannot accumulate polls. Errors back off for 15 seconds.
+
+Files alone watches the root and expanded directories non-recursively. Live
+Review adds source directories respecting ignore rules, with tracked-file
+exceptions. Git monitoring covers HEAD, index and branch refs, excluding
+objects, locks and Waku checkpoint refs to avoid self-triggered refresh loops.
+The OS callback only enqueues into a bounded 256-event channel. Workers merge
+events for 250 ms (at most one second under sustained activity); directory
+reconciliation is limited to once per two seconds. Review refreshes at most
+once per two seconds and waits for the previous diff to complete.
+
+Watch leases are shared by workspace, union client interests, expire after
+30 seconds without renewal, and are capped at four roots / 2048 directories
+per root. Discovery is bounded by 100,000 entries and a two-second walk budget.
+Unsupported native watchers and exhausted budgets report limited automatic
+refresh; they never silently enable full-tree polling. Manual and activation
+refresh remain the recovery paths, including filesystems that lose events.
+
+Native watcher regression tests cover idle counters, edits, replacement saves,
+deletion, ignore rules, Git feedback suppression, batching and lease retirement.
+Keep these invariants when extending the watcher or changing its cadence.
+
+References: [VS Code file watcher internals](https://github.com/microsoft/vscode/wiki/File-Watcher-Internals)
+for shared watchers, exclusions and remote-host ownership; the pinned
+[Zed worktree scanner](https://github.com/egoist/zed/blob/f9bad8941ea813982d6dfb10c0377ebf7716b3e7/crates/worktree/src/worktree.rs)
+for event coalescing and Git feedback suppression. These are design precedents,
+not evidence of Waku's end-to-end CPU usage; measure large real repositories
+before raising the limits or reducing the refresh intervals.
+
 ## Measuring
 
 Sampling alone misled this investigation for hours; counters cracked it in one

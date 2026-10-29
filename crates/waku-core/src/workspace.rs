@@ -25,6 +25,21 @@ pub use waku_protocol::workspace::{
 
 pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult> {
     Ok(match operation {
+        WorkspaceOperation::WatchChanges {
+            client_id,
+            root,
+            directories,
+            recursive,
+            watch_git,
+        } => WorkspaceResult::Changes {
+            state: crate::workspace_watch::poll(
+                client_id,
+                root,
+                directories,
+                recursive,
+                watch_git,
+            )?,
+        },
         WorkspaceOperation::ListTree {
             root,
             expanded_paths,
@@ -438,8 +453,21 @@ struct DiffRange {
 fn collect_review_diff(cwd: &Path, source: ReviewDiffSource) -> anyhow::Result<ReviewDiffData> {
     ensure_repository(cwd)?;
     let range = resolve_diff_range(cwd, source)?;
-    let numstat = diff_output(cwd, &range, &["--numstat"])?;
-    let hydrated = diff_output(cwd, &range, &["--unified=2147483647"])?;
+    // Ask Git for both views in one pass. Separate invocations recompute the
+    // same diff, which is especially costly for large files and on Windows.
+    let mut numstat = diff_output(
+        cwd,
+        &range,
+        &["--numstat", "--patch", "--unified=2147483647"],
+    )?;
+    let hydrated = if let Some(boundary) = numstat.find("\ndiff --git ") {
+        let patch = numstat.split_off(boundary + 1);
+        // Drop the separator, retaining numstat's own final newline.
+        numstat.truncate(boundary);
+        patch
+    } else {
+        String::new()
+    };
     let (patch, complete_context) = if hydrated.len() <= MAX_HYDRATED_PATCH_BYTES {
         (hydrated, true)
     } else {
@@ -946,6 +974,27 @@ mod tests {
         assert!(root.join("other.txt").is_file());
         assert!(!root.parent().unwrap().join("escape.txt").exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn combined_review_output_matches_separate_git_views() {
+        let root = repository();
+        let clean = collect(&root, ReviewDiffSource::Uncommitted);
+        assert!(clean.numstat.is_empty());
+        assert!(clean.patch.is_empty());
+
+        fs::write(root.join("src/lib.rs"), "fn changed() {}\n").unwrap();
+        fs::write(root.join("binary.dat"), b"\0\x01\x02").unwrap();
+        fs::write(root.join("space name.txt"), "diff --git is file content\n").unwrap();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        let range = resolve_diff_range(&root, ReviewDiffSource::Uncommitted).unwrap();
+        let expected_numstat = diff_output(&root, &range, &["--numstat"]).unwrap();
+        let expected_patch = diff_output(&root, &range, &["--unified=2147483647"]).unwrap();
+        let combined = collect(&root, ReviewDiffSource::Uncommitted);
+        assert_eq!(combined.numstat, expected_numstat);
+        assert_eq!(combined.patch, expected_patch);
+        assert!(combined.complete_context);
         fs::remove_dir_all(root).unwrap();
     }
 
