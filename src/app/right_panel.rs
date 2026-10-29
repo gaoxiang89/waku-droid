@@ -2568,6 +2568,13 @@ impl Waku {
         }
     }
 
+    pub(super) fn clear_right_panel_state(&mut self, cx: &mut Context<Self>) {
+        self.replace_active_right_panel_state(RightPanelWorkspaceState::empty(false));
+        self.sync_right_panel_diff_tree_rows(cx);
+        self.reset_file_search_for_session(cx);
+        self.state.right_panel_visible = false;
+    }
+
     /// Remove a deleted session's share of the panel state. A review pinned
     /// to one of its turns and the background work it reported close with
     /// it; everything else belongs to the workspace and survives while any

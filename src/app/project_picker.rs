@@ -109,7 +109,8 @@ impl Waku {
                     .projects
                     .iter()
                     .filter(|project| {
-                        self.hosts.ownership.project(project.id) == self.selected_host_key()
+                        self.state.project_is_open(project.id)
+                            && self.hosts.ownership.project(project.id) == self.selected_host_key()
                     })
                     .cloned()
                     .collect::<Vec<_>>(),

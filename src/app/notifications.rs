@@ -308,10 +308,11 @@ impl Waku {
         }
     }
 
-    /// Snapshot the queue for the popover, built only while it is open.
-    /// Targets that no longer exist — a closed terminal tab, a removed
-    /// session — are left out here rather than pruned from state, so the
-    /// render path stays a read-only pass.
+    /// Snapshot the popover's rows, built only while it is open. Newest first,
+    /// and the card's viewport is sized to about three rows, so the list shows
+    /// the latest few and scrolls to the rest. Targets that no longer exist — a
+    /// closed terminal tab, a removed session — are left out here rather than
+    /// pruned from state, so the render path stays a read-only pass.
     pub(super) fn app_notification_rows(&self, cx: &mut App) -> Vec<AppNotificationRow> {
         self.app_notifications
             .iter()
@@ -428,6 +429,40 @@ mod tests {
             );
         }
         assert_eq!(queue.iter().count(), MAX_APP_NOTIFICATIONS);
+    }
+
+    fn listed_titles(queue: &AppNotificationQueue) -> Vec<&str> {
+        queue
+            .iter()
+            .map(|notification| notification.title.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn rows_list_newest_first_and_the_next_moves_up() {
+        let mut queue = AppNotificationQueue::default();
+        for index in 0..5 {
+            queue.push(
+                AppNotificationTarget::Session(Uuid::new_v4()),
+                AppNotificationKind::Completed,
+                format!("title {index}"),
+                "body".to_owned(),
+            );
+        }
+        assert_eq!(
+            listed_titles(&queue),
+            vec!["title 4", "title 3", "title 2", "title 1", "title 0"]
+        );
+
+        // Opening the first row dismisses it, so the next notification moves
+        // up into the window the card shows and the history stays scrollable.
+        let opened = queue.iter().next().unwrap().id;
+        assert!(queue.dismiss(opened));
+        assert_eq!(
+            listed_titles(&queue).into_iter().take(3).collect::<Vec<_>>(),
+            vec!["title 3", "title 2", "title 1"]
+        );
+        assert_eq!(queue.iter().count(), 4);
     }
 
     #[test]

@@ -644,6 +644,7 @@ struct PreparedDriver {
 }
 
 struct RemoteTaskStateSnapshot {
+    deleted_project_ids: Vec<Uuid>,
     projects: Vec<Project>,
     sessions: Vec<AgentSession>,
 }
@@ -1646,6 +1647,7 @@ pub struct Waku {
     /// button handles live on the window so rebuilding the sidebar cannot drop
     /// keyboard focus while the dialog is open.
     session_delete_confirm: Option<sidebar::SessionDeleteConfirm>,
+    project_deletions: HashSet<Uuid>,
     session_delete_cancel_focus: FocusHandle,
     session_delete_confirm_focus: FocusHandle,
     /// Groups the user has folded in either sidebar view, mirrored into the
@@ -3477,6 +3479,7 @@ impl Waku {
                 session_rename: None,
                 session_rename_input,
                 session_delete_confirm: None,
+                project_deletions: HashSet::new(),
                 session_delete_cancel_focus,
                 session_delete_confirm_focus,
                 right_panel_file_rename: None,

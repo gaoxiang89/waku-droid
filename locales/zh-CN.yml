@@ -250,6 +250,18 @@ sidebar.search: 搜索
 sidebar.pin: 置顶任务
 sidebar.unpin: 取消置顶
 sidebar.pinned: 已置顶
+project.options: 工作区选项
+project.archive: 归档工作区
+project.restore: 恢复工作区
+project.archived: 工作区已归档，文件和会话历史已保留。
+project.archived_workspaces: 已归档工作区
+project.no_archived: 暂无已归档工作区
+project.delete: 删除工作区
+project.delete_confirm_title: 删除工作区？
+project.delete_confirm_message: 删除“%{title}”及其全部 Waku 会话历史和草稿（包括已归档任务）？此操作无法撤销。磁盘上的项目文件和服务商原生历史不会被删除。远程工作区的删除会影响连接到该主机的所有客户端。
+project.deleted: 工作区和 Waku 会话历史已删除，项目文件已保留。
+project.delete_failed: "无法删除工作区：%{error}"
+project.remove_busy: 请先停止此工作区中正在运行的任务，再归档或删除工作区。
 sidebar.archive: 归档任务
 sidebar.unarchive: 恢复任务
 sidebar.archived: 已归档
@@ -905,6 +917,7 @@ notifications.title: 通知
 notifications.count: "%{count} 条通知"
 notifications.clear: 清除历史通知
 notifications.empty: 暂无通知
+notifications.more: "还有 %{count} 条"
 environment.title: 环境
 environment.changes: 更改
 environment.commit_or_push: 提交或推送

@@ -51,6 +51,7 @@ pub struct WakuBackend {
     task_store: StateStore,
     task_state: Mutex<PersistedState>,
     removed_session_ids: Mutex<HashSet<Uuid>>,
+    removed_project_ids: Mutex<HashSet<Uuid>>,
     composer_drafts: ComposerDraftStore,
     attachments: AttachmentStore,
     usage_scan_cache: Mutex<crate::usage_history::ScanCache>,
@@ -60,11 +61,86 @@ pub struct WakuBackend {
 }
 
 impl WakuBackend {
+    fn remove_project(&self, project_id: Uuid) -> anyhow::Result<()> {
+        let session_ids = {
+            let mut state = self.task_state.lock();
+            anyhow::ensure!(
+                !state
+                    .sessions
+                    .iter()
+                    .any(|session| session.project_id == project_id && session.is_busy()),
+                "Stop running tasks before deleting this workspace"
+            );
+            let session_ids = state
+                .sessions
+                .iter()
+                .filter(|session| session.project_id == project_id)
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            let mut projects = self.removed_project_ids.lock();
+            let mut sessions = self.removed_session_ids.lock();
+            let mut changes = session_ids
+                .iter()
+                .map(|id| waku_protocol::persistence::ComposerDraftChange {
+                    target: waku_protocol::persistence::ComposerDraftTarget::Session {
+                        session_id: *id,
+                    },
+                    draft: None,
+                })
+                .collect::<Vec<_>>();
+            changes.push(waku_protocol::persistence::ComposerDraftChange {
+                target: waku_protocol::persistence::ComposerDraftTarget::NewSession { project_id },
+                draft: None,
+            });
+            let previous_drafts = self.composer_drafts.load()?;
+            let restore_drafts = changes
+                .iter()
+                .map(|change| waku_protocol::persistence::ComposerDraftChange {
+                    target: change.target,
+                    draft: previous_drafts.get(change.target.into()).cloned(),
+                })
+                .collect();
+            self.composer_drafts.apply_changes(changes)?;
+            // Move the removed entries out so a failed write can restore memory.
+            let (deleted_projects, retained_projects) = std::mem::take(&mut state.projects)
+                .into_iter()
+                .partition(|project: &Project| project.id == project_id);
+            state.projects = retained_projects;
+            let (deleted_sessions, retained_sessions) = std::mem::take(&mut state.sessions)
+                .into_iter()
+                .partition(|session: &AgentSession| session.project_id == project_id);
+            state.sessions = retained_sessions;
+            if let Err(error) = self
+                .task_store
+                .save_with_deleted_workspace(&mut state, Some((project_id, &session_ids)))
+            {
+                state.projects.extend(deleted_projects);
+                state.sessions.extend(deleted_sessions);
+                self.composer_drafts
+                    .apply_changes(restore_drafts)
+                    .context("workspace deletion failed and its drafts could not be restored")?;
+                return Err(error.into());
+            }
+            projects.insert(project_id);
+            sessions.extend(session_ids.iter().copied());
+            session_ids
+        };
+        let mut runtimes = self.sessions.lock();
+        let removed = session_ids
+            .iter()
+            .filter_map(|id| runtimes.remove(id))
+            .collect::<Vec<_>>();
+        drop(runtimes);
+        drop(removed);
+        Ok(())
+    }
+
     pub fn new(settings: DaemonSettingsStore, task_store: StateStore) -> anyhow::Result<Self> {
         let mut task_state = task_store
             .load()
             .context("could not load Waku task database")?;
         migrate_projectless_state(&task_store, &mut task_state)?;
+        let (removed_project_ids, removed_session_ids) = task_store.deleted_workspace_items()?;
         let composer_drafts = ComposerDraftStore::for_state_path(task_store.path());
         let attachments = AttachmentStore::new(
             task_store
@@ -86,7 +162,8 @@ impl WakuBackend {
             settings,
             task_store,
             task_state: Mutex::new(task_state),
-            removed_session_ids: Mutex::new(HashSet::new()),
+            removed_session_ids: Mutex::new(removed_session_ids),
+            removed_project_ids: Mutex::new(removed_project_ids),
             composer_drafts,
             attachments,
             usage_scan_cache: Mutex::new(HashMap::new()),
@@ -340,6 +417,7 @@ impl Backend for WakuBackend {
             Command::LoadTaskState => {
                 let state = self.task_state.lock();
                 Ok(ResponsePayload::TaskState {
+                    deleted_project_ids: self.removed_project_ids.lock().iter().copied().collect(),
                     projects: state.projects.clone(),
                     sessions: state
                         .sessions
@@ -362,8 +440,12 @@ impl Backend for WakuBackend {
                     .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
+                let removed_project_ids = self.removed_project_ids.lock();
                 let removed_session_ids = self.removed_session_ids.lock();
-                for project in projects {
+                for project in projects
+                    .into_iter()
+                    .filter(|project| !removed_project_ids.contains(&project.id))
+                {
                     if let Some(existing) = state
                         .projects
                         .iter_mut()
@@ -376,7 +458,10 @@ impl Backend for WakuBackend {
                 }
                 let sessions = sessions
                     .into_iter()
-                    .filter(|session| !removed_session_ids.contains(&session.id))
+                    .filter(|session| {
+                        !removed_session_ids.contains(&session.id)
+                            && !removed_project_ids.contains(&session.project_id)
+                    })
                     .collect::<Vec<_>>();
                 drop(removed_session_ids);
                 let saved_ids = sessions
@@ -459,6 +544,10 @@ impl Backend for WakuBackend {
                 }
                 let removed = self.sessions.lock().remove(&session_id);
                 drop(removed);
+                Ok(ResponsePayload::Ack)
+            }
+            Command::RemoveProject { project_id } => {
+                self.remove_project(project_id)?;
                 Ok(ResponsePayload::Ack)
             }
             Command::HydrateSession { session_id } => {
@@ -644,11 +733,28 @@ impl Backend for WakuBackend {
             Command::LoadComposerDrafts => Ok(ResponsePayload::ComposerDrafts {
                 drafts: self.composer_drafts.load()?,
             }),
-            Command::SaveComposerDrafts { drafts, generation } => {
+            Command::SaveComposerDrafts {
+                mut drafts,
+                generation,
+            } => {
+                let projects = self.removed_project_ids.lock();
+                let sessions = self.removed_session_ids.lock();
+                drafts.new_sessions.retain(|id, _| !projects.contains(id));
+                drafts.sessions.retain(|id, _| !sessions.contains(id));
                 self.composer_drafts.save(drafts, generation)?;
                 Ok(ResponsePayload::Ack)
             }
-            Command::ApplyComposerDraftChanges { changes } => {
+            Command::ApplyComposerDraftChanges { mut changes } => {
+                let projects = self.removed_project_ids.lock();
+                let sessions = self.removed_session_ids.lock();
+                changes.retain(|change| match change.target {
+                    waku_protocol::persistence::ComposerDraftTarget::NewSession { project_id } => {
+                        !projects.contains(&project_id)
+                    }
+                    waku_protocol::persistence::ComposerDraftTarget::Session { session_id } => {
+                        !sessions.contains(&session_id)
+                    }
+                });
                 self.composer_drafts.apply_changes(changes)?;
                 Ok(ResponsePayload::Ack)
             }
@@ -817,6 +923,10 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
+                anyhow::ensure!(
+                    !self.removed_session_ids.lock().contains(&session_id),
+                    "the task has been deleted"
+                );
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
                 let provider = decode_enum(&options.provider)?;
@@ -858,9 +968,12 @@ impl Backend for WakuBackend {
                         }
                     })
                     .context("could not start daemon event forwarding thread")?;
-                self.sessions
-                    .lock()
-                    .insert(session_id, (runtime_id, handle));
+                let mut sessions = self.sessions.lock();
+                anyhow::ensure!(
+                    !self.removed_session_ids.lock().contains(&session_id),
+                    "the task has been deleted"
+                );
+                sessions.insert(session_id, (runtime_id, handle));
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
@@ -1089,6 +1202,12 @@ impl WakuBackend {
 
         let pinned = self.sessions.lock().keys().copied().collect();
         let mut state = self.task_state.lock();
+        if self.removed_project_ids.lock().contains(&source.project_id)
+            || self.removed_session_ids.lock().contains(&source.id)
+        {
+            let _ = crate::checkpoint::delete_all_session_refs(&cwd, fork_id);
+            bail!("the source workspace or task was deleted while copying the response");
+        }
         state.push_session(forked.clone());
         if let Err(error) = self.task_store.save(&mut state) {
             state.sessions.retain(|session| session.id != fork_id);
@@ -1842,6 +1961,7 @@ fn handle_driver_command(
         | Command::LoadTaskState
         | Command::SaveTaskState { .. }
         | Command::RemoveSession
+        | Command::RemoveProject { .. }
         | Command::HydrateSession { .. }
         | Command::SearchSessionMessages { .. }
         | Command::ListProviderSessions { .. }

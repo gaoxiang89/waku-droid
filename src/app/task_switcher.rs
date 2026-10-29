@@ -313,6 +313,7 @@ impl Waku {
             .sessions
             .iter()
             .filter(|session| task_switcher_session_visible(session))
+            .filter(|session| self.state.project_is_open(session.project_id))
             .map(|session| session.id)
             .collect::<Vec<_>>();
         let ordered = ordered_task_ids(

@@ -1354,6 +1354,39 @@ impl StateStore {
     /// Persists whatever the app marked as changed, so a streaming turn writes
     /// one session row and a selection change writes no rows at all.
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
+        self.save_with_deleted_workspace(state, None)
+    }
+
+    pub fn deleted_workspace_items(&self) -> io::Result<(HashSet<Uuid>, HashSet<Uuid>)> {
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare("SELECT id, kind FROM deleted_workspace_items")
+            .map_err(to_io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_error)?;
+        let mut projects = HashSet::new();
+        let mut sessions = HashSet::new();
+        for row in rows {
+            let (id, kind) = row.map_err(to_io_error)?;
+            let id = Uuid::parse_str(&id).map_err(to_io_error)?;
+            if kind == "project" {
+                projects.insert(id);
+            } else {
+                sessions.insert(id);
+            }
+        }
+        Ok((projects, sessions))
+    }
+
+    /// Store deletion tombstones in the same transaction that removes history.
+    pub fn save_with_deleted_workspace(
+        &self,
+        state: &mut PersistedState,
+        deleted: Option<(Uuid, &[Uuid])>,
+    ) -> io::Result<()> {
         // Only changed sessions can hold a new inline payload, so the blob walk
         // follows the same set rather than every transcript on every save.
         let dirty = state.dirty_sessions.clone();
@@ -1402,6 +1435,17 @@ impl StateStore {
             .map_err(to_io_error)?;
 
         let projects = serde_json::to_string(&state.projects).map_err(to_io_error)?;
+        if let Some((project_id, sessions)) = deleted {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO deleted_workspace_items(id, kind) VALUES(?1, 'project')",
+                    params![project_id.to_string()],
+                )
+                .map_err(to_io_error)?;
+            for id in sessions {
+                transaction.execute("INSERT OR IGNORE INTO deleted_workspace_items(id, kind) VALUES(?1, 'session')", params![id.to_string()]).map_err(to_io_error)?;
+            }
+        }
         let projects_fingerprint = fingerprint(&projects);
         if projects_fingerprint != storage.saved_projects {
             transaction
@@ -1421,7 +1465,6 @@ impl StateStore {
                     )
                     .map_err(to_io_error)?;
             }
-            storage.saved_projects = projects_fingerprint;
         }
 
         // Only sessions the app reported as changed are written. A draft that
@@ -1485,7 +1528,7 @@ impl StateStore {
             .copied()
             .filter(|id| !live.contains(id))
             .collect::<Vec<_>>();
-        for id in removed {
+        for id in &removed {
             let key = id.to_string();
             transaction
                 .execute("DELETE FROM sessions WHERE id = ?1", params![key])
@@ -1499,12 +1542,15 @@ impl StateStore {
             transaction
                 .execute("DELETE FROM messages WHERE session_id = ?1", params![key])
                 .map_err(to_io_error)?;
-            storage.persisted_sessions.remove(&id);
-            storage.written_messages.remove(&id);
         }
 
         transaction.commit().map_err(to_io_error)?;
         // Now that the rows are durable, and not before.
+        storage.saved_projects = projects_fingerprint;
+        for id in removed {
+            storage.persisted_sessions.remove(&id);
+            storage.written_messages.remove(&id);
+        }
         for (session_id, fingerprints) in written_messages {
             storage.written_messages.insert(session_id, fingerprints);
         }

@@ -1332,6 +1332,13 @@ fn background_work_selection_input(selection: TranscriptSelection) -> impl IntoE
     .h(px(0.0))
 }
 
+/// A two-line notification row is `py(4) + title 16 + gap 1 + body 15` tall.
+/// The card shows three of them before the list scrolls, and the scroll
+/// container adds its own `p(8)` plus `gap(2)` between rows.
+const NOTIFICATION_ROWS_IN_VIEW: usize = 3;
+const NOTIFICATION_LIST_HEIGHT: f32 =
+    NOTIFICATION_ROWS_IN_VIEW as f32 * 40.0 + 2.0 * 2.0 + 2.0 * 8.0;
+
 fn render_notification_queue_card(
     handle: &ContextMenuHandle,
     rows: Rc<Vec<AppNotificationRow>>,
@@ -1342,7 +1349,7 @@ fn render_notification_queue_card(
     let theme = Theme::current(cx);
     let mut list = div()
         .id("notification-queue-scroll")
-        .max_h(px(420.0))
+        .max_h(px(NOTIFICATION_LIST_HEIGHT))
         .overflow_y_scroll()
         .p(px(8.0))
         .flex()
@@ -1418,6 +1425,10 @@ fn render_notification_queue_card(
         )
         .child(div().flex_1())
         .when(!rows.is_empty(), |header| header.child(clear));
+    // More queued than the viewport shows: say so, because the list scrolls
+    // without a visible scrollbar and an exact three-row window has no
+    // half-row to hint at the rest.
+    let hidden = rows.len().saturating_sub(NOTIFICATION_ROWS_IN_VIEW);
     div()
         .id("notification-queue-card")
         .track_focus(handle.focus_handle())
@@ -1430,6 +1441,16 @@ fn render_notification_queue_card(
         .shadow_lg()
         .child(header)
         .child(list)
+        .when(hidden > 0, |card| {
+            card.child(
+                div()
+                    .px(px(8.0))
+                    .pb(px(7.0))
+                    .text_size(sp(11.0))
+                    .text_color(theme.text_tertiary)
+                    .child(tr!("notifications.more", count = hidden)),
+            )
+        })
         .into_any_element()
 }
 
@@ -1444,12 +1465,17 @@ fn render_notification_row(
     let id = row.id;
     let click_weak = weak.clone();
     let key_weak = weak;
+    // The row carries a title and, usually, a body line, so its height has to
+    // follow that content. A fixed height let the two lines overflow the row
+    // box and paint over the neighbouring rows once several notifications
+    // stacked up, which read as a jumbled list.
     div()
         .id(row.id as usize)
         .track_focus(&row.focus)
         .tab_index(0)
         .w_full()
-        .h(px(30.0))
+        .min_h(px(30.0))
+        .py(px(4.0))
         .px(px(6.0))
         .rounded(px(6.0))
         .flex()
@@ -1476,21 +1502,26 @@ fn render_notification_row(
                     div()
                         .truncate()
                         .text_size(sp(12.5))
+                        .line_height(sp(16.0))
                         .font_weight(FontWeight::MEDIUM)
                         .child(single_line_label(&row.title)),
                 )
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(sp(11.5))
-                        .text_color(theme.text_secondary)
-                        .child(single_line_label(&row.body)),
-                ),
+                .when(!row.body.is_empty(), |column| {
+                    column.child(
+                        div()
+                            .truncate()
+                            .text_size(sp(11.5))
+                            .line_height(sp(15.0))
+                            .text_color(theme.text_secondary)
+                            .child(single_line_label(&row.body)),
+                    )
+                }),
         )
         .child(
             div()
                 .flex_none()
                 .text_size(sp(11.0))
+                .line_height(sp(15.0))
                 .text_color(theme.text_tertiary)
                 .child(row.age.clone()),
         )
@@ -1540,6 +1571,12 @@ mod tests {
         assert!(row.contains(".truncate()"));
         assert!(row.contains(".child(single_line_label(&row.title))"));
         assert!(!row.contains(".line_clamp(1)"));
+        // A row draws a title and a body line, so a fixed height would let the
+        // text spill into the next row. It has to size to its content instead.
+        assert!(!row.contains(".h(px(30.0))"));
+        assert!(row.contains(".min_h(px(30.0))"));
+        assert!(row.contains(".line_height(sp(16.0))"));
+        assert!(row.contains(".line_height(sp(15.0))"));
         assert_eq!(
             single_line_label("Fix auth flow\n  then rebuild"),
             "Fix auth flow then rebuild"

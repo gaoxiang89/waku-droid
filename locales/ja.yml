@@ -262,6 +262,18 @@ sidebar.search: 検索
 sidebar.pin: タスクをピン留め
 sidebar.unpin: ピン留めを解除
 sidebar.pinned: ピン留め済み
+project.options: ワークスペースのオプション
+project.archive: ワークスペースをアーカイブ
+project.restore: ワークスペースを復元
+project.archived: ワークスペースをアーカイブしました。ファイルと会話履歴は保持されます。
+project.archived_workspaces: アーカイブ済みワークスペース
+project.no_archived: アーカイブ済みワークスペースはありません
+project.delete: ワークスペースを削除
+project.delete_confirm_title: ワークスペースを削除しますか？
+project.delete_confirm_message: 「%{title}」とすべての Waku 会話履歴および下書き（アーカイブ済みタスクを含む）を削除しますか？この操作は元に戻せません。ディスク上のプロジェクトファイルとプロバイダーの履歴は保持されます。リモートワークスペースの削除はそのホストに接続しているすべてのクライアントに適用されます。
+project.deleted: ワークスペースと Waku 会話履歴を削除しました。プロジェクトファイルは保持されます。
+project.delete_failed: "ワークスペースを削除できませんでした：%{error}"
+project.remove_busy: アーカイブまたは削除する前に、実行中のタスクを停止してください。
 sidebar.archive: タスクをアーカイブ
 sidebar.unarchive: タスクを復元
 sidebar.archived: アーカイブ済み
@@ -944,6 +956,7 @@ notifications.title: 通知
 notifications.count: "%{count} 件の通知"
 notifications.clear: 履歴をクリア
 notifications.empty: 通知はありません
+notifications.more: "他 %{count} 件"
 
 environment.title: 環境
 environment.changes: 変更

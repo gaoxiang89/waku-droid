@@ -42,9 +42,15 @@ pub fn init(cx: &mut App) {
 /// return focus to the original virtualized row.
 #[derive(Clone)]
 pub(super) struct SessionDeleteConfirm {
-    session_id: Uuid,
+    target: DeleteTarget,
     title: String,
     row_focus: FocusHandle,
+}
+
+#[derive(Clone, Copy)]
+enum DeleteTarget {
+    Session(Uuid),
+    Project(Uuid),
 }
 
 /// Stable identity for a collapsible sidebar section under a host row.
@@ -481,6 +487,85 @@ fn reveal_sidebar_list_row(
 }
 
 impl Waku {
+    fn project_menu_items(&self, project_id: Uuid, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        let archived = !self.state.project_is_open(project_id);
+        let pending = self.project_deletions.contains(&project_id);
+        let archive = cx.entity().downgrade();
+        let delete = archive.clone();
+        vec![
+            MenuItem::new(
+                tr!(if archived {
+                    "project.restore"
+                } else {
+                    "project.archive"
+                }),
+                move |window, cx| {
+                    let _ = archive.update(cx, |this, cx| {
+                        if archived {
+                            this.select_project(project_id, cx);
+                        } else {
+                            this.archive_project(project_id, window, cx);
+                        }
+                    });
+                },
+            )
+            .icon(if archived {
+                "icons/rotate-cw.svg"
+            } else {
+                "icons/archive.svg"
+            })
+            .disabled(pending),
+            MenuItem::new(tr!("project.delete"), move |window, cx| {
+                let _ = delete.update(cx, |this, cx| {
+                    let Some(project) = this
+                        .state
+                        .projects
+                        .iter()
+                        .find(|project| project.id == project_id)
+                    else {
+                        return;
+                    };
+                    this.session_delete_confirm = Some(SessionDeleteConfirm {
+                        target: DeleteTarget::Project(project_id),
+                        title: project.display_name(),
+                        row_focus: this.composer_focus(cx),
+                    });
+                    let focus = this.session_delete_cancel_focus.clone();
+                    window.on_next_frame(move |window, _| {
+                        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+                    });
+                    cx.notify();
+                });
+            })
+            .icon("icons/trash.svg")
+            .disabled(pending),
+        ]
+    }
+
+    fn archived_project_menu_items(&self, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        let weak = cx.entity().downgrade();
+        let items = self
+            .state
+            .projects
+            .iter()
+            .filter(|project| !self.state.project_is_open(project.id))
+            .map(|project| {
+                let weak = weak.clone();
+                let id = project.id;
+                let host = self.hosts.for_project(id).name.clone();
+                MenuItem::submenu_with_value(project.display_name(), host, move |cx| {
+                    weak.update(cx, |this, cx| this.project_menu_items(id, cx))
+                        .unwrap_or_default()
+                })
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            vec![MenuItem::new(tr!("project.no_archived"), |_, _| {}).disabled(true)]
+        } else {
+            items
+        }
+    }
+
     pub(super) fn window_drag_region(
         &self,
         region: Stateful<Div>,
@@ -687,6 +772,7 @@ impl Waku {
             move |_| {
                 let ordering_weak = weak.clone();
                 let archive_view_weak = weak.clone();
+                let workspaces_weak = weak.clone();
                 vec![
                     MenuItem::submenu_with_value(
                         tr!("sidebar.ordering"),
@@ -725,6 +811,15 @@ impl Waku {
                     )
                     .icon("icons/archive.svg")
                     .selected(show_archived),
+                    MenuItem::submenu_with_value(
+                        tr!("project.archived_workspaces"),
+                        "",
+                        move |cx| {
+                            workspaces_weak
+                                .update(cx, |this, cx| this.archived_project_menu_items(cx))
+                                .unwrap_or_default()
+                        },
+                    ),
                 ]
             },
         );
@@ -1105,6 +1200,10 @@ impl Waku {
         }
         for project in &self.state.projects {
             fingerprint = mix_uuid(fingerprint, project.id);
+            fingerprint = mix(
+                fingerprint,
+                u64::from(self.state.project_is_open(project.id)),
+            );
         }
         if self.sidebar_branch_scan_fingerprint.get() == Some(fingerprint) {
             return;
@@ -1128,6 +1227,7 @@ impl Waku {
             .projects
             .iter()
             .filter(|project| local_project_ids.contains(&project.id))
+            .filter(|project| self.state.project_is_open(project.id))
             .filter(|project| !sidebar_project_is_projectless(project, &projectless_roots))
             .map(|project| {
                 (
@@ -1454,6 +1554,12 @@ impl Waku {
             fingerprint = mix_uuid(fingerprint, project.id);
         }
         // A map has no stable iteration order; combine order-independently.
+        let closed = self
+            .state
+            .closed_project_ids
+            .iter()
+            .fold(0u64, |hash, id| hash.wrapping_add(mix_uuid(0, *id)));
+        fingerprint = mix(fingerprint, closed);
         let revealed = self
             .sidebar_project_reveal_counts
             .iter()
@@ -1492,6 +1598,7 @@ impl Waku {
             .sessions
             .iter()
             .filter(|session| sidebar_session_in_view(session, self.state.sidebar_show_archived))
+            .filter(|session| self.state.project_is_open(session.project_id))
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
@@ -1535,6 +1642,7 @@ impl Waku {
             let mut groups = project_sidebar_groups(&sessions, &projectless_project_ids);
             for project in &self.state.projects {
                 if !self.state.sidebar_show_archived
+                    && self.state.project_is_open(project.id)
                     && self.hosts.ownership.project(project.id) == host.key
                     && !projectless_project_ids.contains(&project.id)
                     && !groups
@@ -1655,6 +1763,38 @@ impl Waku {
         let theme = Theme::current(cx);
         let collapsed = self.sidebar_collapsed_groups.contains(&group);
         let group_key = group.element_key();
+        let workspace_menu = self.menu_handle(format!("workspace-{group_key}"), cx);
+        let keyboard_menu = workspace_menu.clone();
+        let workspace_options = if let SidebarGroup::Project(project_id) = group {
+            let menu = self.menu_handle(format!("workspace-options-{group_key}"), cx);
+            let weak = cx.entity().downgrade();
+            Some(dropdown_menu(
+                div()
+                    .id(SharedString::from(format!("workspace-options-{group_key}")))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .cursor_default()
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .hover(|style| style.bg(theme.overlay))
+                    .tooltip(Tooltip::text(tr!("project.options")))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(icon("icons/ellipsis.svg", 14.0, theme.text_secondary)),
+                SharedString::from(format!("workspace-options-menu-{group_key}")),
+                &menu,
+                MenuAlign::BelowRight,
+                move |cx| {
+                    weak.update(cx, |this, cx| this.project_menu_items(project_id, cx))
+                        .unwrap_or_default()
+                },
+            ))
+        } else {
+            None
+        };
         let group_name = SharedString::from(format!("sidebar-group-header-{group_key}"));
         let header_focus = self
             .sidebar_group_header_focuses
@@ -1810,6 +1950,7 @@ impl Waku {
                     }),
             )
             .child(compose)
+            .when_some(workspace_options, |element, options| element.child(options))
             .when(has_expanded_children, |element| {
                 element.child(
                     div()
@@ -1824,7 +1965,15 @@ impl Waku {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_sidebar_group(group, cx);
             }))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "f10"
+                    && event.keystroke.modifiers.shift
+                    && matches!(group, SidebarGroup::Project(_))
+                {
+                    keyboard_menu.open_context_menu(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "enter" | "space" => {
                         this.toggle_sidebar_group(group, cx);
@@ -1842,6 +1991,20 @@ impl Waku {
                 }
             }));
 
+        let header = if let SidebarGroup::Project(project_id) = group {
+            let weak = cx.entity().downgrade();
+            context_menu(
+                div().w_full().child(header),
+                SharedString::from(format!("workspace-menu-{group_key}")),
+                &workspace_menu,
+                move |cx| {
+                    weak.update(cx, |this, cx| this.project_menu_items(project_id, cx))
+                        .unwrap_or_default()
+                },
+            )
+        } else {
+            header.into_any_element()
+        };
         div()
             .w_full()
             .pb(px(SIDEBAR_GROUP_HEADER_BOTTOM_GAP))
@@ -2138,7 +2301,7 @@ impl Waku {
             return;
         };
         self.session_delete_confirm = Some(SessionDeleteConfirm {
-            session_id,
+            target: DeleteTarget::Session(session_id),
             title: localized_session_title(session),
             row_focus,
         });
@@ -2159,11 +2322,14 @@ impl Waku {
         cx.notify();
     }
 
-    fn confirm_session_delete(&mut self, cx: &mut Context<Self>) {
+    fn confirm_session_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = self.session_delete_confirm.take() else {
             return;
         };
-        self.remove_session(dialog.session_id, cx);
+        match dialog.target {
+            DeleteTarget::Session(id) => self.remove_session(id, cx),
+            DeleteTarget::Project(id) => self.delete_project(id, window, cx),
+        }
     }
 
     pub(super) fn render_session_delete_dialog(
@@ -2171,6 +2337,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let dialog = self.session_delete_confirm.clone()?;
+        let project = matches!(dialog.target, DeleteTarget::Project(_));
         let theme = Theme::current(cx);
         let cancel = div()
             .id("session-delete-cancel")
@@ -2216,21 +2383,25 @@ impl Waku {
             .bg(theme.danger_soft)
             .hover(|element| element.bg(theme.danger.opacity(0.16)))
             .child(icon("icons/trash.svg", 13.0, theme.danger))
-            .child(tr_cow!("sidebar.delete_task"))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .child(tr!(if project {
+                "project.delete"
+            } else {
+                "sidebar.delete_task"
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.confirm_session_delete(cx);
+                    this.confirm_session_delete(window, cx);
                     cx.stop_propagation();
                 }
             }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.confirm_session_delete(cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.confirm_session_delete(window, cx);
             }));
         let card = div()
             .id("session-delete-dialog-card")
             .key_context(SESSION_DELETE_DIALOG_CONTEXT)
-            .on_action(cx.listener(|this, _: &ConfirmSessionDelete, _, cx| {
-                this.confirm_session_delete(cx);
+            .on_action(cx.listener(|this, _: &ConfirmSessionDelete, window, cx| {
+                this.confirm_session_delete(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DismissSessionDelete, window, cx| {
                 this.dismiss_session_delete(window, cx);
@@ -2257,7 +2428,11 @@ impl Waku {
                     .text_size(sp(14.0))
                     .text_color(theme.text)
                     .child(icon("icons/alert.svg", 15.0, theme.danger))
-                    .child(tr_cow!("sidebar.delete_confirm_title")),
+                    .child(tr!(if project {
+                        "project.delete_confirm_title"
+                    } else {
+                        "sidebar.delete_confirm_title"
+                    })),
             )
             .child(
                 div()
@@ -2267,7 +2442,14 @@ impl Waku {
                     .line_height(sp(17.0))
                     .text_color(theme.text_secondary)
                     .whitespace_normal()
-                    .child(tr!("sidebar.delete_confirm_message", title = dialog.title)),
+                    .child(tr!(
+                        if project {
+                            "project.delete_confirm_message"
+                        } else {
+                            "sidebar.delete_confirm_message"
+                        },
+                        title = dialog.title
+                    )),
             )
             .child(div().mx(px(16.0)).h(px(1.0)).bg(theme.border))
             .child(

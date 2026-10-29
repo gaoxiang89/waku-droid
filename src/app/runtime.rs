@@ -82,6 +82,7 @@ pub(super) fn load_remote_task_state(
         projects,
         mut sessions,
         projectless_root,
+        deleted_project_ids,
         ..
     } = response
     else {
@@ -93,7 +94,11 @@ pub(super) fn load_remote_task_state(
     for session in &mut sessions {
         session.detail_loaded = false;
     }
-    Ok(RemoteTaskStateSnapshot { projects, sessions })
+    Ok(RemoteTaskStateSnapshot {
+        projects,
+        sessions,
+        deleted_project_ids,
+    })
 }
 
 /// The running turn and the user message that opened it — the identity other
@@ -168,22 +173,44 @@ fn merge_host_task_state(
     state: &mut PersistedState,
     ownership: &mut waku_client::hosts::HostOwnership,
     key: &waku_client::hosts::HostKey,
-    snapshot: RemoteTaskStateSnapshot,
+    mut snapshot: RemoteTaskStateSnapshot,
     has_runtime: impl Fn(Uuid) -> bool,
 ) -> Vec<Uuid> {
     ownership.register_new_sessions(state);
+    state
+        .deleted_project_ids
+        .extend(snapshot.deleted_project_ids);
+    snapshot
+        .projects
+        .retain(|project| !state.deleted_project_ids.contains(&project.id));
+    snapshot
+        .sessions
+        .retain(|session| !state.deleted_project_ids.contains(&session.project_id));
     let (mut sessions, other_sessions) = std::mem::take(&mut state.sessions)
         .into_iter()
         .partition(|session| ownership.session(session.id) == *key);
     state.sessions = other_sessions;
+    let mut deleted = Vec::new();
+    sessions.retain(|session| {
+        if state.deleted_project_ids.contains(&session.project_id) {
+            deleted.push(session.id);
+            false
+        } else {
+            true
+        }
+    });
     ownership.register(key, &snapshot.projects, &snapshot.sessions);
-    let removed = merge_remote_session_catalog(&mut sessions, snapshot.sessions, has_runtime);
+    deleted.extend(merge_remote_session_catalog(
+        &mut sessions,
+        snapshot.sessions,
+        has_runtime,
+    ));
     state.sessions.extend(sessions);
     state
         .projects
         .retain(|project| ownership.project(project.id) != *key);
     state.projects.extend(snapshot.projects);
-    removed
+    deleted
 }
 
 /// Perform every blocking operation between accepting a submission and
@@ -1061,7 +1088,13 @@ impl Waku {
             self.remove_bottom_panel_session_state(*session_id);
             self.background_work.remove(session_id);
             self.task_switcher.remove(*session_id);
+            self.session_navigation.remove(*session_id);
+            self.composer_drafts
+                .remove(crate::persistence::ComposerDraftKey::Session(*session_id));
         }
+        self.composer_drafts
+            .new_sessions
+            .retain(|id, _| !self.state.deleted_project_ids.contains(id));
 
         let attach = self
             .state
@@ -1093,12 +1126,22 @@ impl Waku {
         }) {
             let previous_project = self.state.selected_project;
             self.state.selected_session = None;
+            self.state.selected_project = previous_project.filter(|id| {
+                self.state.project_is_open(*id)
+                    && self.state.projects.iter().any(|project| project.id == *id)
+            });
+            self.clear_right_panel_state(cx);
+            self.clear_bottom_panel_state();
+            self.restore_selected_composer_draft(cx);
+            self.reset_visible_state();
+            self.reset_transcript_rows(self.transcript_row_count());
             let next = self
                 .state
                 .sessions
                 .iter()
                 .filter(|session| {
-                    previous_project.is_none_or(|project| session.project_id == project)
+                    self.state.project_is_open(session.project_id)
+                        && previous_project.is_none_or(|project| session.project_id == project)
                 })
                 .max_by_key(|session| session.updated_at)
                 .map(|session| session.id)
@@ -1106,6 +1149,7 @@ impl Waku {
                     self.state
                         .sessions
                         .iter()
+                        .filter(|session| self.state.project_is_open(session.project_id))
                         .max_by_key(|session| session.updated_at)
                         .map(|session| session.id)
                 });
@@ -1115,12 +1159,20 @@ impl Waku {
                 .state
                 .selected_project
                 .filter(|project_id| {
+                    self.state.project_is_open(*project_id)
+                        && self
+                            .state
+                            .projects
+                            .iter()
+                            .any(|project| project.id == *project_id)
+                })
+                .or_else(|| {
                     self.state
                         .projects
                         .iter()
-                        .any(|project| project.id == *project_id)
+                        .find(|project| self.state.project_is_open(project.id))
+                        .map(|project| project.id)
                 })
-                .or_else(|| self.state.projects.first().map(|project| project.id))
             {
                 self.state.selected_project = Some(project_id);
                 self.create_session_for(project_id, self.state.last_provider, cx);
@@ -3886,6 +3938,70 @@ mod response_fork_title_tests {
     };
 
     #[test]
+    fn removed_workspace_stays_closed_after_remote_catalog_refresh() {
+        use waku_client::hosts::{HostKey, HostOwnership};
+        let local = Project::from_path("/same/path".into());
+        let remote = Project::from_path("/same/path".into());
+        let task = AgentSession::new(remote.id, ProviderKind::Codex);
+        let key = HostKey::Connection("ssh:build".into());
+        let mut owners = HostOwnership::default();
+        let mut state = PersistedState::empty();
+        state.projects = vec![local.clone()];
+        state.closed_project_ids.insert(remote.id);
+        merge_host_task_state(
+            &mut state,
+            &mut owners,
+            &key,
+            RemoteTaskStateSnapshot {
+                deleted_project_ids: vec![],
+                projects: vec![remote.clone()],
+                sessions: vec![task.clone()],
+            },
+            |_| false,
+        );
+        assert!(!state.project_is_open(remote.id));
+        assert!(state.project_is_open(local.id));
+        assert_eq!(owners.project(remote.id), key);
+        assert_eq!(state.sessions[0].id, task.id);
+        // Reopening restores the same catalog identity, not a duplicate.
+        state.closed_project_ids.remove(&remote.id);
+        assert!(state.project_is_open(remote.id));
+        assert_eq!(state.projects.len(), 2);
+        assert_eq!(state.sessions.len(), 1);
+        // A delayed snapshot fetched before deletion must not resurrect it.
+        let removed = merge_host_task_state(
+            &mut state,
+            &mut owners,
+            &key,
+            RemoteTaskStateSnapshot {
+                deleted_project_ids: vec![remote.id],
+                projects: vec![],
+                sessions: vec![],
+            },
+            |_| false,
+        );
+        assert_eq!(removed, vec![task.id]);
+        assert!(
+            state.sessions.is_empty(),
+            "even unsent drafts leave a deleted workspace"
+        );
+        merge_host_task_state(
+            &mut state,
+            &mut owners,
+            &key,
+            RemoteTaskStateSnapshot {
+                deleted_project_ids: vec![],
+                projects: vec![remote],
+                sessions: vec![task],
+            },
+            |_| false,
+        );
+        assert_eq!(state.projects.len(), 1);
+        assert_eq!(state.projects[0].id, local.id);
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
     fn host_catalog_replacement_keeps_other_hosts_and_removes_only_its_own_sessions() {
         use waku_client::hosts::{HostKey, HostOwnership};
         let local = Project::from_path("/same/path".into());
@@ -3906,6 +4022,7 @@ mod response_fork_title_tests {
             &mut owners,
             &remote_key,
             RemoteTaskStateSnapshot {
+                deleted_project_ids: vec![],
                 projects: vec![],
                 sessions: vec![],
             },

@@ -179,6 +179,10 @@ pub enum Command {
     /// merge-only so a stale client snapshot cannot delete tasks another
     /// client just created.
     RemoveSession,
+    /// Delete the workspace catalog entry and all Waku tasks, retaining disk files.
+    RemoveProject {
+        project_id: Uuid,
+    },
     HydrateSession {
         session_id: Uuid,
     },
@@ -420,6 +424,8 @@ pub enum ResponsePayload {
         catalog: SkillsCatalog,
     },
     TaskState {
+        #[serde(default)]
+        deleted_project_ids: Vec<Uuid>,
         projects: Vec<Project>,
         sessions: Vec<AgentSession>,
         default_cwd: PathBuf,

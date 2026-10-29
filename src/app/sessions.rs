@@ -19,6 +19,12 @@ impl Waku {
     }
 
     pub(super) fn select_project(&mut self, project_id: Uuid, cx: &mut Context<Self>) {
+        if self.project_deletions.contains(&project_id)
+            || self.state.deleted_project_ids.contains(&project_id)
+        {
+            return;
+        }
+        self.state.closed_project_ids.remove(&project_id);
         self.state.selected_project = Some(project_id);
         self.create_session_for(project_id, self.state.last_provider, cx);
     }
@@ -27,18 +33,216 @@ impl Waku {
         self.request_session_activation(session_id, SessionActivationTransition::Visit, cx);
     }
 
+    /// Remove only this desktop's workspace entry. Keep the daemon catalog,
+    /// transcripts and drafts so adding the same folder restores its history.
+    pub(super) fn archive_project(
+        &mut self,
+        project_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hide_project(project_id, window, cx) {
+            self.show_success_toast(tr!("project.archived"));
+        }
+    }
+
+    fn hide_project(
+        &mut self,
+        project_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .state
+            .projects
+            .iter()
+            .any(|project| project.id == project_id && !project.is_projectless())
+        {
+            return false;
+        }
+        let session_ids = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.project_id == project_id && session.is_busy())
+            || session_ids.iter().any(|id| {
+                self.submission_preparations.contains(id)
+                    || self.response_fork_preparations.contains_key(id)
+                    || self.goal_runtime_starts.contains(id)
+            })
+        {
+            self.show_toast(tr!("project.remove_busy"));
+            cx.notify();
+            return false;
+        }
+        let selected = self.state.selected_project == Some(project_id);
+        if selected {
+            self.capture_and_save_current_composer_draft(cx);
+            self.store_selected_right_panel_state();
+            self.store_selected_bottom_panel_state();
+            self.state.selected_session = None;
+            self.state.selected_project = None;
+            self.clear_right_panel_state(cx);
+            self.clear_bottom_panel_state();
+            self.restore_selected_composer_draft(cx);
+            self.reset_visible_state();
+            self.reset_transcript_rows(self.transcript_row_count());
+            self.refresh_composer_sources(cx);
+        }
+        self.state.closed_project_ids.insert(project_id);
+        if self
+            .pending_session_activation
+            .is_some_and(|pending| session_ids.contains(&pending.session_id))
+        {
+            self.pending_session_activation = None;
+        }
+        for id in session_ids {
+            self.session_navigation.remove(id);
+            self.task_switcher.remove(id);
+        }
+        if selected {
+            let next = self
+                .state
+                .sessions
+                .iter()
+                .filter(|session| {
+                    self.state.project_is_open(session.project_id) && !session.archived
+                })
+                .max_by_key(|session| session.updated_at)
+                .map(|session| session.id);
+            if let Some(id) = next {
+                self.select_session(id, cx);
+            }
+        }
+        self.save();
+        let focus = if self.state.selected_project.is_some() {
+            self.composer_focus(cx)
+        } else {
+            self.onboarding_add_project_focus.clone()
+        };
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        cx.notify();
+        true
+    }
+
+    pub(super) fn delete_project(
+        &mut self,
+        project_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.project_deletions.contains(&project_id) {
+            return;
+        }
+        let was_archived = !self.state.project_is_open(project_id);
+        let previous_selection = self.state.selected_session;
+        let session_ids = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| session.project_id == project_id)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if !self.hide_project(project_id, window, cx) {
+            return;
+        }
+        self.project_deletions.insert(project_id);
+        let owner = self.hosts.for_project(project_id);
+        let host = owner.key.clone();
+        let generation = owner.generation;
+        let daemon = owner.daemon.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match daemon.client().request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        waku_client::Command::RemoveProject { project_id },
+                    )? {
+                        waku_client::ResponsePayload::Ack => {
+                            let _ = daemon.client().notify(
+                                Uuid::nil(),
+                                Uuid::nil(),
+                                waku_client::Command::SweepBlobs,
+                            );
+                            Ok(())
+                        }
+                        _ => anyhow::bail!(
+                            "the daemon returned an invalid workspace deletion response"
+                        ),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.project_deletions.remove(&project_id);
+                if !this
+                    .hosts
+                    .get(&host)
+                    .is_some_and(|owner| owner.generation == generation)
+                {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.state.deleted_project_ids.insert(project_id);
+                        for id in session_ids {
+                            this.submission_preparations.remove(&id);
+                            this.goal_runtime_starts.remove(&id);
+                            this.pending_goal_operations.remove(&id);
+                            this.goal_observed_at.remove(&id);
+                            this.reset_session_runtime(id);
+                            this.remove_right_panel_session_state(id);
+                            this.remove_bottom_panel_session_state(id);
+                            this.background_work.remove(&id);
+                            this.composer_drafts
+                                .remove(crate::persistence::ComposerDraftKey::Session(id));
+                            this.state.sessions.retain(|session| session.id != id);
+                            this.session_navigation.remove(id);
+                            this.task_switcher.remove(id);
+                        }
+                        this.composer_drafts
+                            .remove(crate::persistence::ComposerDraftKey::NewSession(project_id));
+                        this.state
+                            .projects
+                            .retain(|project| project.id != project_id);
+                        this.schedule_composer_draft_save(cx);
+                        this.save();
+                        this.show_success_toast(tr!("project.deleted"));
+                    }
+                    Err(error) => {
+                        if !was_archived {
+                            this.state.closed_project_ids.remove(&project_id);
+                            if let Some(id) = previous_selection {
+                                this.select_session(id, cx);
+                            }
+                        }
+                        this.save();
+                        this.show_toast(tr!("project.delete_failed", error = error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn request_session_activation(
         &mut self,
         session_id: Uuid,
         transition: SessionActivationTransition,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .state
-            .sessions
-            .iter()
-            .any(|session| session.id == session_id)
-        {
+        if !self.state.sessions.iter().any(|session| {
+            session.id == session_id && self.state.project_is_open(session.project_id)
+        }) {
             return;
         }
         self.expand_sidebar_path_to_session(session_id);

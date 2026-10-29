@@ -24,6 +24,12 @@ export const projects = sqliteTable("projects", {
   createdAt: integer("created_at").notNull(),
 });
 
+/** Durable tombstones prevent stale clients from resurrecting deleted workspaces. */
+export const deletedWorkspaceItems = sqliteTable("deleted_workspace_items", {
+  id: text("id").primaryKey(),
+  kind: text("kind").notNull(),
+});
+
 export const sessions = sqliteTable(
   "sessions",
   {

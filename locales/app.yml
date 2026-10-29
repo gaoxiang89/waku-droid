@@ -512,6 +512,30 @@ sidebar.unpin:
   en: Unpin task
 sidebar.pinned:
   en: Pinned
+project.options:
+  en: Workspace options
+project.archive:
+  en: Archive workspace
+project.restore:
+  en: Restore workspace
+project.archived:
+  en: Workspace archived. Files and history are kept.
+project.archived_workspaces:
+  en: Archived workspaces
+project.no_archived:
+  en: No archived workspaces
+project.delete:
+  en: Delete workspace
+project.delete_confirm_title:
+  en: Delete workspace?
+project.delete_confirm_message:
+  en: Delete “%{title}” and all its Waku session history and drafts, including archived tasks? This cannot be undone. Project files on disk and provider-native history will not be deleted. For a remote workspace, this affects all clients connected to that host.
+project.deleted:
+  en: Workspace and Waku session history deleted. Project files are kept.
+project.delete_failed:
+  en: "Could not delete workspace: %{error}"
+project.remove_busy:
+  en: Stop running tasks in this workspace before archiving or deleting it.
 sidebar.archive:
   en: Archive task
 sidebar.unarchive:
@@ -1847,6 +1871,8 @@ notifications.clear:
   en: Clear history
 notifications.empty:
   en: No notifications
+notifications.more:
+  en: "%{count} more"
 
 environment.title:
   en: Environment

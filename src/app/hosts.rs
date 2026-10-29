@@ -506,7 +506,13 @@ impl Waku {
         if self.connections.pending.is_empty() && self.pending_host_session.take().is_some() {
             self.state.selected_session = None;
             self.state.selected_project = None;
-            if let Some(id) = self.state.sessions.first().map(|session| session.id) {
+            if let Some(id) = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| self.state.project_is_open(session.project_id))
+                .map(|session| session.id)
+            {
                 self.select_session(id, cx);
             }
         }
@@ -702,7 +708,13 @@ impl Waku {
             self.state.selected_project = None;
             self.restore_selected_composer_draft(cx);
             self.pending_session_activation = None;
-            if let Some(id) = self.state.sessions.first().map(|session| session.id) {
+            if let Some(id) = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| self.state.project_is_open(session.project_id))
+                .map(|session| session.id)
+            {
                 self.select_session(id, cx);
             } else {
                 self.reset_visible_state();

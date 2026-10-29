@@ -347,6 +347,9 @@ struct AppState {
     sidebar_collapsed_hosts: Vec<String>,
     #[serde(default)]
     sidebar_collapsed_groups: Vec<String>,
+    /// Desktop-local workspace visibility; daemon history remains intact.
+    #[serde(default)]
+    closed_project_ids: HashSet<Uuid>,
     #[serde(default = "default_right_panel_width")]
     right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
@@ -419,6 +422,11 @@ pub struct PersistedState {
     pub sidebar_collapsed_hosts: Vec<String>,
     #[serde(default)]
     pub sidebar_collapsed_groups: Vec<String>,
+    #[serde(default)]
+    pub closed_project_ids: HashSet<Uuid>,
+    /// Reject already queued catalog snapshots after a confirmed deletion.
+    #[serde(skip)]
+    pub deleted_project_ids: HashSet<Uuid>,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
@@ -493,6 +501,8 @@ impl PersistedState {
             sidebar_show_archived: false,
             sidebar_collapsed_hosts: Vec::new(),
             sidebar_collapsed_groups: Vec::new(),
+            closed_project_ids: HashSet::new(),
+            deleted_project_ids: HashSet::new(),
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
             markdown_preview: false,
@@ -530,6 +540,11 @@ impl PersistedState {
             session.context_window.clone_from(&self.last_context_window);
         }
         session
+    }
+
+    pub fn project_is_open(&self, project_id: Uuid) -> bool {
+        !self.closed_project_ids.contains(&project_id)
+            && !self.deleted_project_ids.contains(&project_id)
     }
 
     pub fn remember_model_traits(
@@ -643,6 +658,7 @@ impl PersistedState {
             sidebar_show_archived: self.sidebar_show_archived,
             sidebar_collapsed_hosts: self.sidebar_collapsed_hosts.clone(),
             sidebar_collapsed_groups: self.sidebar_collapsed_groups.clone(),
+            closed_project_ids: self.closed_project_ids.clone(),
             right_panel_width: self.right_panel_width,
             bottom_panel_height: self.bottom_panel_height,
             markdown_preview: self.markdown_preview,
@@ -683,6 +699,7 @@ impl PersistedState {
         self.sidebar_show_archived = app_state.sidebar_show_archived;
         self.sidebar_collapsed_hosts = app_state.sidebar_collapsed_hosts;
         self.sidebar_collapsed_groups = app_state.sidebar_collapsed_groups;
+        self.closed_project_ids = app_state.closed_project_ids;
         self.right_panel_width = app_state.right_panel_width;
         self.bottom_panel_height = app_state.bottom_panel_height;
         self.markdown_preview = app_state.markdown_preview;
@@ -698,6 +715,13 @@ impl PersistedState {
     }
 
     fn ensure_runtime_session(&mut self) {
+        if self
+            .selected_project
+            .is_some_and(|id| !self.project_is_open(id))
+        {
+            self.selected_project = None;
+            self.selected_session = None;
+        }
         // A saved selection may belong to a host that has not reconnected yet.
         // Preserve its identity until that host's catalog joins the window.
         if self.selected_session.is_some()
@@ -1023,6 +1047,7 @@ impl StateStore {
             Err(_) => PersistedState::fresh(cwd),
         };
         if state.projects.is_empty()
+            && state.deleted_project_ids.is_empty()
             && let Some(cwd) = self.remote_default_cwd.lock().clone()
             && cwd.parent().is_some()
         {
@@ -1046,7 +1071,7 @@ impl StateStore {
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
-        let (projects, mut sessions, default_cwd) = match self
+        let (projects, mut sessions, default_cwd, deleted_project_ids) = match self
             .daemon
             .client()
             .request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)
@@ -1057,6 +1082,7 @@ impl StateStore {
                 sessions,
                 default_cwd,
                 projectless_root,
+                deleted_project_ids,
             } => {
                 // A window on a WSL or SSH daemon adds that host's root
                 // instead of replacing the local one other windows rely on.
@@ -1066,7 +1092,7 @@ impl StateStore {
                     }
                     root => waku_protocol::projectless::set_workspace_root(root),
                 }
-                (projects, sessions, default_cwd)
+                (projects, sessions, default_cwd, deleted_project_ids)
             }
             _ => {
                 return Err(io::Error::other(
@@ -1077,6 +1103,7 @@ impl StateStore {
         restore_task_state_skeletons(&mut sessions);
         *self.remote_default_cwd.lock() = Some(default_cwd);
         let mut state = PersistedState::empty();
+        state.deleted_project_ids.extend(deleted_project_ids);
         state.projects = projects;
         state.sessions = sessions;
         let app_settings_missing = !self.app_settings_path.is_file();
@@ -1457,6 +1484,7 @@ mod tests {
         assert!(!state.sidebar_show_archived);
         assert!(state.sidebar_collapsed_hosts.is_empty());
         assert!(state.sidebar_collapsed_groups.is_empty());
+        assert!(state.closed_project_ids.is_empty());
         assert!(!state.files_panel_visible);
         assert_eq!(state.files_panel_width, default_files_panel_width());
     }
@@ -1473,6 +1501,35 @@ mod tests {
         assert!(restored.files_panel_visible);
         assert_eq!(restored.files_panel_width, 310.0);
         assert!(!restored.right_panel_visible);
+    }
+
+    #[test]
+    fn removed_workspace_survives_restart_without_deleting_history() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let session_id = state.sessions[0].id;
+        state.sessions[0].archived = true;
+        state.closed_project_ids.insert(project_id);
+        let encoded = serde_json::to_vec(&state.app_state()).unwrap();
+
+        let mut restored = PersistedState::empty();
+        // The daemon still returns the complete catalog after reconnecting.
+        restored.projects = state.projects.clone();
+        restored.sessions = state.sessions.clone();
+        restored.apply_app_state(serde_json::from_slice(&encoded).unwrap());
+        restored.ensure_runtime_session();
+        assert!(!restored.project_is_open(project_id));
+        assert_eq!(restored.selected_project, None);
+        assert_eq!(restored.selected_session, None);
+        assert_eq!(restored.projects.len(), 1);
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].id, session_id);
+        assert!(restored.sessions[0].archived);
+
+        restored.closed_project_ids.remove(&project_id);
+        assert!(restored.project_is_open(project_id));
+        assert_eq!(restored.sessions[0].id, session_id);
+        assert!(restored.sessions[0].archived);
     }
 
     #[test]
@@ -1521,6 +1578,7 @@ mod tests {
         );
 
         let encoded = serde_json::to_vec(&ResponsePayload::TaskState {
+            deleted_project_ids: vec![],
             projects: Vec::new(),
             sessions: vec![session],
             default_cwd: PathBuf::from("/daemon/project"),

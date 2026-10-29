@@ -910,6 +910,11 @@ impl Waku {
         // shuts the PTYs down.
     }
 
+    pub(super) fn clear_bottom_panel_state(&mut self) {
+        self.replace_active_bottom_panel_state(BottomPanelWorkspaceState::empty(false));
+        self.state.bottom_panel_visible = false;
+    }
+
     fn take_active_bottom_panel_state(&mut self) -> BottomPanelWorkspaceState {
         BottomPanelWorkspaceState {
             visible: self.bottom_panel_visible,

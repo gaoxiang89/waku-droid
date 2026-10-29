@@ -1061,6 +1061,7 @@ impl Waku {
             .sessions
             .iter()
             .filter(|session| command_palette_task_searchable(session))
+            .filter(|session| self.state.project_is_open(session.project_id))
             .enumerate()
             .map(|(order, session)| {
                 let (project, project_path) = projects

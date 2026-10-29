@@ -1083,6 +1083,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
             projects: projects.clone(),
         },
         Command::RemoveSession
+        | Command::RemoveProject { .. }
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
@@ -1188,6 +1189,209 @@ mod tests {
         runtimes: Mutex<HashMap<Uuid, Uuid>>,
     }
 
+    #[test]
+    fn workspace_deletion_keeps_files_and_rejects_stale_saves_after_restart() {
+        use crate::daemon::WakuBackend;
+        use crate::model::{Project, SessionStatus};
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+        use waku_protocol::persistence::{
+            ComposerDraft, ComposerDraftChange, ComposerDraftTarget, ComposerDrafts,
+        };
+        let root = std::env::temp_dir().join(format!("waku-workspace-deletion-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("keep.txt");
+        std::fs::write(&file, "project data").unwrap();
+        let make_backend = || {
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap()
+        };
+        let hub = Arc::new(Hub::default());
+        let call = |backend: &WakuBackend, command: Command| {
+            backend.handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command,
+                },
+                hub.event_sink(Uuid::nil(), Uuid::nil()),
+            )
+        };
+        let backend = make_backend();
+        let project = Project::from_path(root.clone());
+        let other = Project::from_path(root.join("other"));
+        let mut active = AgentSession::new(project.id, ProviderKind::Codex);
+        active.begin_turn("delete this history");
+        active.status = SessionStatus::Working;
+        let mut archived = AgentSession::new(project.id, ProviderKind::Codex);
+        archived.begin_turn("archived history");
+        archived.status = SessionStatus::Idle;
+        archived.archived = true;
+        let mut kept = AgentSession::new(other.id, ProviderKind::Codex);
+        kept.begin_turn("keep this history");
+        kept.status = SessionStatus::Idle;
+        let save = |active: &AgentSession| Command::SaveTaskState {
+            projects: vec![project.clone(), other.clone()],
+            live_session_ids: vec![active.id, archived.id, kept.id],
+            sessions: vec![active.clone(), archived.clone(), kept.clone()],
+        };
+        call(&backend, save(&active)).unwrap();
+        assert!(
+            call(
+                &backend,
+                Command::RemoveProject {
+                    project_id: project.id
+                }
+            )
+            .is_err()
+        );
+        active.status = SessionStatus::Idle;
+        call(&backend, save(&active)).unwrap();
+        let draft = ComposerDraft {
+            text: "draft".into(),
+            attachments: vec![],
+        };
+        let drafts = ComposerDrafts {
+            new_sessions: HashMap::from([(project.id, draft.clone()), (other.id, draft.clone())]),
+            sessions: HashMap::from([
+                (active.id, draft.clone()),
+                (archived.id, draft.clone()),
+                (kept.id, draft.clone()),
+            ]),
+        };
+        call(
+            &backend,
+            Command::SaveComposerDrafts {
+                drafts: drafts.clone(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+        let connection = rusqlite::Connection::open(root.join("app.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_workspace_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").unwrap();
+        assert!(
+            call(
+                &backend,
+                Command::RemoveProject {
+                    project_id: project.id
+                }
+            )
+            .is_err()
+        );
+        let ResponsePayload::ComposerDrafts { drafts: restored } =
+            call(&backend, Command::LoadComposerDrafts).unwrap()
+        else {
+            panic!("drafts");
+        };
+        assert_eq!(restored, drafts);
+        connection
+            .execute_batch("DROP TRIGGER fail_workspace_delete")
+            .unwrap();
+        drop(connection);
+        call(
+            &backend,
+            Command::RemoveProject {
+                project_id: project.id,
+            },
+        )
+        .unwrap();
+        drop(backend);
+
+        let backend = make_backend();
+        call(&backend, save(&active)).unwrap();
+        call(
+            &backend,
+            Command::SaveComposerDrafts {
+                drafts,
+                generation: 2,
+            },
+        )
+        .unwrap();
+        call(
+            &backend,
+            Command::ApplyComposerDraftChanges {
+                changes: vec![
+                    ComposerDraftChange {
+                        target: ComposerDraftTarget::Session {
+                            session_id: archived.id,
+                        },
+                        draft: Some(draft.clone()),
+                    },
+                    ComposerDraftChange {
+                        target: ComposerDraftTarget::NewSession {
+                            project_id: project.id,
+                        },
+                        draft: Some(draft),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let ResponsePayload::TaskState {
+            projects, sessions, ..
+        } = call(&backend, Command::LoadTaskState).unwrap()
+        else {
+            panic!("catalog");
+        };
+        assert_eq!(
+            projects.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![other.id]
+        );
+        assert_eq!(
+            sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![kept.id]
+        );
+        let ResponsePayload::ComposerDrafts { drafts } =
+            call(&backend, Command::LoadComposerDrafts).unwrap()
+        else {
+            panic!("drafts");
+        };
+        assert_eq!(drafts.new_sessions.len(), 1);
+        assert_eq!(drafts.sessions.len(), 1);
+        assert!(drafts.sessions.contains_key(&kept.id));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "project data");
+        let connection = rusqlite::Connection::open(root.join("app.db")).unwrap();
+        for table in ["messages", "session_details"] {
+            let count: u64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id IN (?1, ?2)"),
+                    rusqlite::params![active.id.to_string(), archived.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        drop(connection);
+        let reopened = Project::from_path(root.clone());
+        call(
+            &backend,
+            Command::SaveTaskState {
+                projects: vec![reopened.clone()],
+                live_session_ids: vec![],
+                sessions: vec![],
+            },
+        )
+        .unwrap();
+        let ResponsePayload::TaskState {
+            projects, sessions, ..
+        } = call(&backend, Command::LoadTaskState).unwrap()
+        else {
+            panic!("catalog");
+        };
+        assert!(projects.iter().any(|project| project.id == reopened.id));
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.project_id != reopened.id)
+        );
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     impl Backend for TestBackend {
         fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
             let session_id = request.session_id;
@@ -1244,6 +1448,7 @@ mod tests {
                     })
                 }
                 Command::LoadTaskState => Ok(ResponsePayload::TaskState {
+                    deleted_project_ids: vec![],
                     projects: Vec::new(),
                     sessions: self.sessions.lock().clone(),
                     default_cwd: PathBuf::from("/tmp"),
