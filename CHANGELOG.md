@@ -16,6 +16,11 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.39]
+
+- Add a VS Code-style changed-file tree to the Review panel and the Git commit page: folders sort before files, single-child folder chains merge into one row, and rows show vertical indent guides
+- Add tree/list view toggles and collapse-all/expand-all buttons to both changed-file lists, with keyboard operation and localized tooltips (English, Simplified Chinese, Japanese)
+
 ## [0.1.38]
 
 - Prompt to end incompatible daemon sessions and upgrade when connecting to a remote host speaking an older protocol version
