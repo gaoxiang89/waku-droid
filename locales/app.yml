@@ -2105,6 +2105,14 @@ diff.no_changes_description:
   en: This source has no file changes to review
 diff.filter_files:
   en: Filter files…
+diff.view_as_tree:
+  en: View as Tree
+diff.view_as_list:
+  en: View as List
+diff.collapse_all:
+  en: Collapse All Folders
+diff.expand_all:
+  en: Expand All Folders
 diff.source_last_turn:
   en: Last Turn
 diff.source_turn:

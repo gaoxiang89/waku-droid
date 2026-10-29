@@ -826,6 +826,7 @@ struct RightPanelWorkspaceState {
     diff_snapshot: Option<Arc<ReviewDiffSnapshot>>,
     diff_selected_file: Option<usize>,
     diff_expanded_paths: HashSet<String>,
+    diff_view_mode: right_panel::ReviewDiffViewMode,
 }
 
 impl RightPanelWorkspaceState {
@@ -844,6 +845,7 @@ impl RightPanelWorkspaceState {
             diff_snapshot: None,
             diff_selected_file: None,
             diff_expanded_paths: HashSet::new(),
+            diff_view_mode: right_panel::ReviewDiffViewMode::default(),
         }
     }
 
@@ -1737,6 +1739,7 @@ pub struct Waku {
     right_panel_diff_generation: u64,
     right_panel_diff_selected_file: Option<usize>,
     right_panel_diff_expanded_paths: HashSet<String>,
+    right_panel_diff_view_mode: right_panel::ReviewDiffViewMode,
     right_panel_diff_tree_rows: RefCell<Vec<right_panel::ReviewDiffTreeRow>>,
     right_panel_diff_tree_cursor: Option<usize>,
     /// The working tree as currently drawn. Held so a refresh can redraw the
@@ -3548,6 +3551,7 @@ impl Waku {
                 right_panel_diff_generation: 0,
                 right_panel_diff_selected_file: None,
                 right_panel_diff_expanded_paths: HashSet::new(),
+                right_panel_diff_view_mode: right_panel::ReviewDiffViewMode::default(),
                 right_panel_diff_tree_rows: RefCell::new(Vec::new()),
                 right_panel_diff_tree_cursor: None,
                 right_panel_working_tree: Vec::new(),

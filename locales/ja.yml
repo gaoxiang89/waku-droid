@@ -1075,6 +1075,10 @@ file_picker.typed_file: "%{type} ファイル"
 diff.no_changes: 変更はありません
 diff.no_changes_description: このソースにはレビューするファイル変更がありません
 diff.filter_files: ファイルを絞り込む…
+diff.view_as_tree: ツリーとして表示
+diff.view_as_list: リストとして表示
+diff.collapse_all: すべてのフォルダを折りたたむ
+diff.expand_all: すべてのフォルダを展開
 diff.source_last_turn: 前回のターン
 diff.source_turn: ターン %{turn}
 diff.source_uncommitted: 未コミット

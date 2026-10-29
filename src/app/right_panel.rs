@@ -356,6 +356,13 @@ fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLi
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ReviewDiffViewMode {
+    #[default]
+    Tree,
+    List,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ReviewDiffTreeRow {
     Directory {
@@ -416,10 +423,12 @@ fn review_diff_gap_directions(
     }
 }
 
-fn review_diff_directory_paths(files: &[crate::review_diff::File]) -> HashSet<String> {
+pub(super) fn diff_tree_directory_paths<'a>(
+    file_paths: impl IntoIterator<Item = &'a str>,
+) -> HashSet<String> {
     let mut paths = HashSet::new();
-    for file in files {
-        let parts = file.path.split('/').collect::<Vec<_>>();
+    for file_path in file_paths {
+        let parts = file_path.split('/').collect::<Vec<_>>();
         let mut path = String::new();
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
             if !path.is_empty() {
@@ -432,58 +441,182 @@ fn review_diff_directory_paths(files: &[crate::review_diff::File]) -> HashSet<St
     paths
 }
 
-fn review_diff_tree_rows(
-    files: &[crate::review_diff::File],
+fn review_diff_directory_paths(files: &[crate::review_diff::File]) -> HashSet<String> {
+    diff_tree_directory_paths(files.iter().map(|file| file.path.as_str()))
+}
+
+struct DiffTreeBuilderNode<'a> {
+    name: &'a str,
+    path: String,
+    directories: Vec<DiffTreeBuilderNode<'a>>,
+    files: Vec<(usize, &'a str, &'a str)>,
+}
+
+impl<'a> DiffTreeBuilderNode<'a> {
+    fn new(name: &'a str, path: String) -> Self {
+        Self {
+            name,
+            path,
+            directories: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, file_index: usize, full_path: &'a str, parts: &[&'a str]) {
+        match parts {
+            [] => {}
+            [file_name] => {
+                self.files.push((file_index, *file_name, full_path));
+            }
+            [dir_name, rest @ ..] => {
+                let child = if let Some(pos) = self
+                    .directories
+                    .iter()
+                    .position(|dir| dir.name == *dir_name)
+                {
+                    &mut self.directories[pos]
+                } else {
+                    let child_path = if self.path.is_empty() {
+                        (*dir_name).to_owned()
+                    } else {
+                        format!("{}/{dir_name}", self.path)
+                    };
+                    self.directories
+                        .push(DiffTreeBuilderNode::new(dir_name, child_path));
+                    self.directories.last_mut().expect("inserted child")
+                };
+                child.insert(file_index, full_path, rest);
+            }
+        }
+    }
+
+    fn emit_children(
+        &mut self,
+        depth: usize,
+        expanded_paths: &HashSet<String>,
+        filtering: bool,
+        rows: &mut Vec<ReviewDiffTreeRow>,
+    ) {
+        self.directories.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.name.cmp(right.name))
+        });
+        self.files
+            .sort_by(|(_, left_name, left_path), (_, right_name, right_path)| {
+                left_name
+                    .to_ascii_lowercase()
+                    .cmp(&right_name.to_ascii_lowercase())
+                    .then_with(|| left_name.cmp(right_name))
+                    .then_with(|| left_path.cmp(right_path))
+            });
+
+        for dir in &mut self.directories {
+            dir.emit_directory(depth, expanded_paths, filtering, rows);
+        }
+        for &(file_index, _, _) in &self.files {
+            rows.push(ReviewDiffTreeRow::File { file_index, depth });
+        }
+    }
+
+    fn emit_directory(
+        &mut self,
+        depth: usize,
+        expanded_paths: &HashSet<String>,
+        filtering: bool,
+        rows: &mut Vec<ReviewDiffTreeRow>,
+    ) {
+        let mut compacted_name = self.name.to_owned();
+        let mut current = self;
+        while current.files.is_empty() && current.directories.len() == 1 {
+            current = &mut current.directories[0];
+            compacted_name.push('/');
+            compacted_name.push_str(current.name);
+        }
+        let path = current.path.clone();
+        let expanded = filtering || expanded_paths.contains(&path);
+        rows.push(ReviewDiffTreeRow::Directory {
+            path,
+            name: compacted_name,
+            depth,
+            expanded,
+        });
+        if expanded {
+            current.emit_children(depth + 1, expanded_paths, filtering, rows);
+        }
+    }
+}
+
+pub(super) fn diff_tree_rows_for_paths(
+    file_paths: &[&str],
     expanded_paths: &HashSet<String>,
     filter: &str,
+    view_mode: ReviewDiffViewMode,
 ) -> Vec<ReviewDiffTreeRow> {
     let filter = filter.trim().to_ascii_lowercase();
     let filtering = !filter.is_empty();
-    let mut indexes = files
+    let mut indexes = file_paths
         .iter()
         .enumerate()
-        .filter(|(_, file)| {
+        .filter(|(_, path)| {
             filtering
-                .then(|| file.path.to_ascii_lowercase().contains(&filter))
+                .then(|| path.to_ascii_lowercase().contains(&filter))
                 .unwrap_or(true)
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    indexes.sort_by_key(|index| files[*index].path.to_ascii_lowercase());
 
-    let mut rows = Vec::new();
-    let mut emitted_directories = HashSet::new();
-    for file_index in indexes {
-        let parts = files[file_index].path.split('/').collect::<Vec<_>>();
-        let mut directory = String::new();
-        let mut visible = true;
-        for (depth, part) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
-            if !directory.is_empty() {
-                directory.push('/');
-            }
-            directory.push_str(part);
-            let expanded = filtering || expanded_paths.contains(&directory);
-            if emitted_directories.insert(directory.clone()) && visible {
-                rows.push(ReviewDiffTreeRow::Directory {
-                    path: directory.clone(),
-                    name: (*part).to_owned(),
-                    depth,
-                    expanded,
-                });
-            }
-            if !expanded {
-                visible = false;
-                break;
-            }
-        }
-        if visible {
-            rows.push(ReviewDiffTreeRow::File {
-                file_index,
-                depth: parts.len().saturating_sub(1),
+    match view_mode {
+        ReviewDiffViewMode::List => {
+            indexes.sort_by(|&left, &right| {
+                let left_path = file_paths[left];
+                let right_path = file_paths[right];
+                let left_name = left_path.rsplit('/').next().unwrap_or(left_path);
+                let right_name = right_path.rsplit('/').next().unwrap_or(right_path);
+                left_name
+                    .to_ascii_lowercase()
+                    .cmp(&right_name.to_ascii_lowercase())
+                    .then_with(|| {
+                        left_path
+                            .to_ascii_lowercase()
+                            .cmp(&right_path.to_ascii_lowercase())
+                    })
+                    .then_with(|| left_path.cmp(right_path))
             });
+            indexes
+                .into_iter()
+                .map(|file_index| ReviewDiffTreeRow::File {
+                    file_index,
+                    depth: 0,
+                })
+                .collect()
+        }
+        ReviewDiffViewMode::Tree => {
+            let mut root = DiffTreeBuilderNode::new("", String::new());
+            for file_index in indexes {
+                let path = file_paths[file_index];
+                let parts = path.split('/').collect::<Vec<_>>();
+                root.insert(file_index, path, &parts);
+            }
+            let mut rows = Vec::new();
+            root.emit_children(0, expanded_paths, filtering, &mut rows);
+            rows
         }
     }
-    rows
+}
+
+fn review_diff_tree_rows(
+    files: &[crate::review_diff::File],
+    expanded_paths: &HashSet<String>,
+    filter: &str,
+    view_mode: ReviewDiffViewMode,
+) -> Vec<ReviewDiffTreeRow> {
+    let paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    diff_tree_rows_for_paths(&paths, expanded_paths, filter, view_mode)
 }
 
 /// How wide and tall a diff row is drawn. The Review panel is a reading
@@ -1603,12 +1736,8 @@ mod tests {
         let files = review_files();
         let expanded = review_diff_directory_paths(&files);
         assert_eq!(
-            review_diff_tree_rows(&files, &expanded, ""),
+            review_diff_tree_rows(&files, &expanded, "", ReviewDiffViewMode::Tree),
             vec![
-                ReviewDiffTreeRow::File {
-                    file_index: 0,
-                    depth: 0,
-                },
                 ReviewDiffTreeRow::Directory {
                     path: "src".into(),
                     name: "src".into(),
@@ -1643,6 +1772,10 @@ mod tests {
                     file_index: 4,
                     depth: 1,
                 },
+                ReviewDiffTreeRow::File {
+                    file_index: 0,
+                    depth: 0,
+                },
             ]
         );
     }
@@ -1651,7 +1784,7 @@ mod tests {
     fn review_tree_collapse_hides_only_descendants() {
         let files = review_files();
         let expanded = HashSet::from(["src".to_owned()]);
-        let rows = review_diff_tree_rows(&files, &expanded, "");
+        let rows = review_diff_tree_rows(&files, &expanded, "", ReviewDiffViewMode::Tree);
 
         assert!(rows.contains(&ReviewDiffTreeRow::Directory {
             path: "src/app".into(),
@@ -1673,25 +1806,92 @@ mod tests {
 
     #[test]
     fn review_tree_filter_reveals_matching_path_and_ancestors() {
-        let rows = review_diff_tree_rows(&review_files(), &HashSet::new(), "RUNTIME");
+        let rows = review_diff_tree_rows(
+            &review_files(),
+            &HashSet::new(),
+            "RUNTIME",
+            ReviewDiffViewMode::Tree,
+        );
         assert_eq!(
             rows,
             vec![
                 ReviewDiffTreeRow::Directory {
-                    path: "src".into(),
-                    name: "src".into(),
+                    path: "src/app".into(),
+                    name: "src/app".into(),
+                    depth: 0,
+                    expanded: true,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 1,
+                    depth: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn review_tree_compacts_single_child_directory_chains() {
+        let files = [
+            "crates/waku-core/src/lib.rs",
+            "crates/waku-core/src/ui/tree.rs",
+        ]
+        .into_iter()
+        .map(review_file)
+        .collect::<Vec<_>>();
+        let expanded = review_diff_directory_paths(&files);
+        assert_eq!(
+            review_diff_tree_rows(&files, &expanded, "", ReviewDiffViewMode::Tree),
+            vec![
+                ReviewDiffTreeRow::Directory {
+                    path: "crates/waku-core/src".into(),
+                    name: "crates/waku-core/src".into(),
                     depth: 0,
                     expanded: true,
                 },
                 ReviewDiffTreeRow::Directory {
-                    path: "src/app".into(),
-                    name: "app".into(),
+                    path: "crates/waku-core/src/ui".into(),
+                    name: "ui".into(),
                     depth: 1,
                     expanded: true,
                 },
                 ReviewDiffTreeRow::File {
                     file_index: 1,
                     depth: 2,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 0,
+                    depth: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn review_tree_list_mode_flattens_and_sorts_by_file_name() {
+        let files = review_files();
+        let expanded = review_diff_directory_paths(&files);
+        assert_eq!(
+            review_diff_tree_rows(&files, &expanded, "", ReviewDiffViewMode::List),
+            vec![
+                ReviewDiffTreeRow::File {
+                    file_index: 3, // src/lib.rs ("lib.rs")
+                    depth: 0,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 0, // README.md ("README.md")
+                    depth: 0,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 4, // tests/review.rs ("review.rs")
+                    depth: 0,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 1, // src/app/runtime.rs ("runtime.rs")
+                    depth: 0,
+                },
+                ReviewDiffTreeRow::File {
+                    file_index: 2, // src/app/view.rs ("view.rs")
+                    depth: 0,
                 },
             ]
         );
@@ -2459,6 +2659,7 @@ impl Waku {
             diff_snapshot: self.right_panel_diff_snapshot.take(),
             diff_selected_file: self.right_panel_diff_selected_file.take(),
             diff_expanded_paths: std::mem::take(&mut self.right_panel_diff_expanded_paths),
+            diff_view_mode: self.right_panel_diff_view_mode,
         }
     }
 
@@ -2487,6 +2688,7 @@ impl Waku {
         self.right_panel_diff_error = None;
         self.right_panel_diff_selected_file = state.diff_selected_file;
         self.right_panel_diff_expanded_paths = state.diff_expanded_paths;
+        self.right_panel_diff_view_mode = state.diff_view_mode;
         self.right_panel_diff_tree_cursor = None;
         self.right_panel_diff_tree_rows.borrow_mut().clear();
         self.right_panel_diff_tree_list_state.reset(0);
@@ -6573,6 +6775,84 @@ impl Waku {
         let theme = Theme::current(cx);
         let focus = self.transcript_control_focus("right-panel-diff-tree", cx);
         let tree_focused = focus.is_focused(window);
+        let view_mode = self.right_panel_diff_view_mode;
+        let (has_directories, any_expanded) = {
+            let rows = self.right_panel_diff_tree_rows.borrow();
+            let has_directories = rows
+                .iter()
+                .any(|row| matches!(row, ReviewDiffTreeRow::Directory { .. }));
+            let any_expanded = rows
+                .iter()
+                .any(|row| matches!(row, ReviewDiffTreeRow::Directory { expanded: true, .. }));
+            (has_directories, any_expanded)
+        };
+        let view_mode_focus = self.transcript_control_focus("right-panel-diff-view-mode", cx);
+        let (view_mode_icon, view_mode_tooltip) = match view_mode {
+            ReviewDiffViewMode::Tree => ("icons/list.svg", tr!("diff.view_as_list")),
+            ReviewDiffViewMode::List => ("icons/list-tree.svg", tr!("diff.view_as_tree")),
+        };
+        let view_mode_button = div()
+            .id("right-panel-diff-view-mode")
+            .track_focus(&view_mode_focus)
+            .tab_index(0)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(5.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(|style| style.bg(theme.overlay))
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .tooltip(Tooltip::text(view_mode_tooltip))
+            .child(icon(view_mode_icon, 13.0, theme.text_secondary))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_right_panel_diff_view_mode(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.toggle_right_panel_diff_view_mode(cx);
+                    cx.stop_propagation();
+                }
+            }));
+        let collapse_all_button =
+            (view_mode == ReviewDiffViewMode::Tree && has_directories).then(|| {
+                let collapse_focus =
+                    self.transcript_control_focus("right-panel-diff-collapse-all", cx);
+                let (collapse_icon, collapse_tooltip) = if any_expanded {
+                    ("icons/chevrons-down-up.svg", tr!("diff.collapse_all"))
+                } else {
+                    ("icons/chevrons-up-down.svg", tr!("diff.expand_all"))
+                };
+                div()
+                    .id("right-panel-diff-collapse-all")
+                    .track_focus(&collapse_focus)
+                    .tab_index(0)
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|style| style.bg(theme.overlay))
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .tooltip(Tooltip::text(collapse_tooltip))
+                    .child(icon(collapse_icon, 13.0, theme.text_secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_right_panel_diff_expand_all(cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.toggle_right_panel_diff_expand_all(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            });
         let entity = cx.entity().downgrade();
         div()
             .size_full()
@@ -6586,16 +6866,21 @@ impl Waku {
                     .px(px(8.0))
                     .flex()
                     .items_center()
+                    .gap(px(4.0))
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        TextField::new(
-                            "right-panel-diff-filter",
-                            self.right_panel_diff_filter.clone(),
-                        )
-                        .icon("icons/search.svg", 13.0)
-                        .w_full(),
-                    ),
+                        div().flex_1().min_w_0().child(
+                            TextField::new(
+                                "right-panel-diff-filter",
+                                self.right_panel_diff_filter.clone(),
+                            )
+                            .icon("icons/search.svg", 13.0)
+                            .w_full(),
+                        ),
+                    )
+                    .when_some(collapse_all_button, |bar, button| bar.child(button))
+                    .child(view_mode_button),
             )
             .child(
                 div()
@@ -6638,6 +6923,25 @@ impl Waku {
             )
     }
 
+    pub(super) fn render_diff_tree_indent_guides(
+        mut container: Div,
+        depth: usize,
+        theme: &Theme,
+    ) -> Div {
+        for guide_depth in 0..depth {
+            container = container.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(18.0 + guide_depth as f32 * 14.0))
+                    .w(px(1.0))
+                    .bg(theme.border),
+            );
+        }
+        container
+    }
+
     fn render_right_panel_diff_tree_row(
         &self,
         index: usize,
@@ -6649,61 +6953,83 @@ impl Waku {
         };
         let theme = Theme::current(cx);
         let cursor = tree_focused && self.right_panel_diff_tree_cursor == Some(index);
+        let view_mode = self.right_panel_diff_view_mode;
         match row {
             ReviewDiffTreeRow::Directory {
                 path,
                 name,
                 depth,
                 expanded,
-            } => div()
-                .w_full()
-                .h(px(30.0))
-                .px(px(6.0))
-                .flex()
-                .items_center()
-                .child(
+            } => {
+                let outer = Self::render_diff_tree_indent_guides(
                     div()
-                        .id(SharedString::from(format!("review-diff-directory-{path}")))
-                        .h(px(26.0))
-                        .flex_1()
-                        .min_w_0()
-                        .pl(px(7.0 + depth as f32 * 14.0))
-                        .pr(px(7.0))
-                        .rounded(px(5.0))
+                        .w_full()
+                        .h(px(30.0))
+                        .px(px(6.0))
+                        .relative()
                         .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .cursor_default()
-                        .when(cursor, |row| row.bg(theme.overlay_strong))
-                        .when(!cursor, |row| row.hover(|row| row.bg(theme.overlay)))
-                        .child(icon(
-                            if expanded {
-                                "icons/chevron-down.svg"
-                            } else {
-                                "icons/chevron-right.svg"
-                            },
-                            10.0,
-                            theme.text_ghost,
-                        ))
-                        .child(icon("icons/folder.svg", 13.0, theme.text_tertiary))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .text_size(sp(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text_secondary)
-                                .child(name),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let focus = this.transcript_control_focus("right-panel-diff-tree", cx);
-                            focus.focus(window, cx);
-                            this.right_panel_diff_tree_cursor = Some(index);
-                            this.toggle_right_panel_diff_directory(path.clone(), cx);
-                        })),
-                )
-                .into_any_element(),
+                        .items_center(),
+                    depth,
+                    &theme,
+                );
+                outer
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("review-diff-directory-{path}")))
+                            .h(px(26.0))
+                            .flex_1()
+                            .min_w_0()
+                            .pl(px(7.0 + depth as f32 * 14.0))
+                            .pr(px(7.0))
+                            .rounded(px(5.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_default()
+                            .when(cursor, |row| row.bg(theme.overlay_strong))
+                            .when(!cursor, |row| row.hover(|row| row.bg(theme.overlay)))
+                            .child(icon(
+                                if expanded {
+                                    "icons/chevron-down.svg"
+                                } else {
+                                    "icons/chevron-right.svg"
+                                },
+                                10.0,
+                                theme.text_ghost,
+                            ))
+                            .child(icon(
+                                if expanded {
+                                    "icons/folder-open.svg"
+                                } else {
+                                    "icons/folder.svg"
+                                },
+                                13.0,
+                                theme.text_tertiary,
+                            ))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "review-diff-directory-label-{path}"
+                                    )))
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(sp(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_secondary)
+                                    .tooltip(Tooltip::text(path.clone()))
+                                    .child(name),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let focus =
+                                    this.transcript_control_focus("right-panel-diff-tree", cx);
+                                focus.focus(window, cx);
+                                this.right_panel_diff_tree_cursor = Some(index);
+                                this.toggle_right_panel_diff_directory(path.clone(), cx);
+                            })),
+                    )
+                    .into_any_element()
+            }
             ReviewDiffTreeRow::File { file_index, depth } => {
                 let Some(snapshot) = self.right_panel_diff_snapshot.as_ref() else {
                     return div().h(px(30.0)).into_any_element();
@@ -6712,7 +7038,10 @@ impl Waku {
                     return div().h(px(30.0)).into_any_element();
                 };
                 let path = file.path.clone();
-                let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                let (parent_dir, name) = match path.rsplit_once('/') {
+                    Some((dir, file_name)) => (Some(dir.to_owned()), file_name.to_owned()),
+                    None => (None, path.clone()),
+                };
                 let selected = self.right_panel_diff_selected_file == Some(file_index);
                 let (status, status_color) = match file.status {
                     crate::review_diff::FileStatus::Added => ("A", theme.success),
@@ -6720,19 +7049,29 @@ impl Waku {
                     crate::review_diff::FileStatus::Binary => ("B", theme.warning),
                     crate::review_diff::FileStatus::Modified => ("M", theme.warning),
                 };
-                div()
-                    .w_full()
-                    .h(px(30.0))
-                    .px(px(6.0))
-                    .flex()
-                    .items_center()
+                let left_padding = match view_mode {
+                    ReviewDiffViewMode::Tree => 23.0 + depth as f32 * 14.0,
+                    ReviewDiffViewMode::List => 8.0,
+                };
+                let outer = Self::render_diff_tree_indent_guides(
+                    div()
+                        .w_full()
+                        .h(px(30.0))
+                        .px(px(6.0))
+                        .relative()
+                        .flex()
+                        .items_center(),
+                    depth,
+                    &theme,
+                );
+                outer
                     .child(
                         div()
                             .id(SharedString::from(format!("review-diff-tree-file-{path}")))
                             .h(px(26.0))
                             .flex_1()
                             .min_w_0()
-                            .pl(px(23.0 + depth as f32 * 14.0))
+                            .pl(px(left_padding))
                             .pr(px(7.0))
                             .rounded(px(5.0))
                             .flex()
@@ -6752,15 +7091,38 @@ impl Waku {
                                     )))
                                     .min_w_0()
                                     .flex_1()
-                                    .truncate()
-                                    .text_size(sp(12.5))
-                                    .text_color(if selected {
-                                        theme.text
-                                    } else {
-                                        theme.text_secondary
-                                    })
+                                    .flex()
+                                    .items_baseline()
+                                    .gap(px(6.0))
+                                    .overflow_hidden()
                                     .tooltip(Tooltip::text(path.clone()))
-                                    .child(name),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(sp(12.5))
+                                            .text_color(if selected {
+                                                theme.text
+                                            } else {
+                                                theme.text_secondary
+                                            })
+                                            .child(name),
+                                    )
+                                    .when_some(
+                                        (view_mode == ReviewDiffViewMode::List)
+                                            .then_some(parent_dir)
+                                            .flatten(),
+                                        |label, dir| {
+                                            label.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .text_size(sp(11.5))
+                                                    .text_color(theme.text_tertiary)
+                                                    .child(dir),
+                                            )
+                                        },
+                                    ),
                             )
                             .child(
                                 div()
@@ -7104,6 +7466,7 @@ impl Waku {
                     &snapshot.files,
                     &self.right_panel_diff_expanded_paths,
                     &filter,
+                    self.right_panel_diff_view_mode,
                 )
             });
         let cursor = previous_cursor_row
@@ -7142,6 +7505,30 @@ impl Waku {
         self.right_panel_diff_tree_cursor = cursor;
         self.right_panel_diff_tree_list_state
             .reset_with_uniform_height(row_count, px(30.0));
+    }
+
+    fn toggle_right_panel_diff_view_mode(&mut self, cx: &mut Context<Self>) {
+        self.right_panel_diff_view_mode = match self.right_panel_diff_view_mode {
+            ReviewDiffViewMode::Tree => ReviewDiffViewMode::List,
+            ReviewDiffViewMode::List => ReviewDiffViewMode::Tree,
+        };
+        self.sync_right_panel_diff_tree_rows(cx);
+        cx.notify();
+    }
+
+    fn toggle_right_panel_diff_expand_all(&mut self, cx: &mut Context<Self>) {
+        let any_expanded = self
+            .right_panel_diff_tree_rows
+            .borrow()
+            .iter()
+            .any(|row| matches!(row, ReviewDiffTreeRow::Directory { expanded: true, .. }));
+        if any_expanded {
+            self.right_panel_diff_expanded_paths.clear();
+        } else if let Some(snapshot) = &self.right_panel_diff_snapshot {
+            self.right_panel_diff_expanded_paths = review_diff_directory_paths(&snapshot.files);
+        }
+        self.sync_right_panel_diff_tree_rows(cx);
+        cx.notify();
     }
 
     fn toggle_right_panel_diff_directory(&mut self, path: String, cx: &mut Context<Self>) {
