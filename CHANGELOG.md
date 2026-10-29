@@ -16,6 +16,13 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+## [0.1.40]
+
+- Refresh the Files panel and the Review diff on their own while you work, using the workspace host's native filesystem events for local, SSH, and WSL workspaces; a workspace that cannot be watched says so and keeps Refresh as the recovery path
+- Archive a workspace from its menu to hide it without losing anything, and restore it from the archived-workspaces list in the sidebar options
+- Delete a workspace with its Waku session history and drafts after a confirmation that spells out what stays: project files on disk and provider-native history are never touched, and a workspace with running tasks must stop them first
+- Show the newest notifications first with the rest a scroll away, keep each row on its own lines as the queue grows, and dismiss an opened notification so the next one moves up into its place
+
 ## [0.1.39]
 
 - Add a VS Code-style changed-file tree to the Review panel and the Git commit page: folders sort before files, single-child folder chains merge into one row, and rows show vertical indent guides
