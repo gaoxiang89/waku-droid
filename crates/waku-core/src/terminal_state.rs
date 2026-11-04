@@ -2,6 +2,7 @@
 use crate::{EventSink, WireDriverEvent};
 use base64::Engine as _;
 use parking_lot::Mutex;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use waku_protocol::TerminalOutput;
@@ -74,7 +75,7 @@ impl TerminalState {
                 data.extend(b"\r\n");
             }
             if history > 0 {
-                for _ in 0..rows {
+                for _ in 0..rows.saturating_sub(1) {
                     data.extend(b"\r\n");
                 }
             }
@@ -105,6 +106,15 @@ impl TerminalState {
     }
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// A dead stream never produces replay bytes again; any attach now gets
+    /// the reconstructed final screen instead. Freeing the ring keeps an
+    /// exited session from pinning its 2 MiB replay window until the record
+    /// itself is dropped.
+    fn mark_exited(&mut self) {
+        self.exited = true;
+        self.bytes = VecDeque::new();
     }
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.parser.callbacks_mut().0)
@@ -141,6 +151,10 @@ impl vt100::Callbacks for DeviceReplies {
             (None, 'c', _) => "\x1b[?6c".to_owned(),
             (Some(b'>'), 'c', _) => "\x1b[>0;1;0c".to_owned(),
             (Some(b'?'), 'u', _) => format!("\x1b[?{}u", self.1),
+            (None, 't', 14) => {
+                let (rows, cols) = screen.size();
+                format!("\x1b[4;{};{}t", rows.saturating_mul(16), cols.saturating_mul(8))
+            }
             (None, 't', 18) => {
                 let (rows, cols) = screen.size();
                 format!("\x1b[8;{rows};{cols}t")
@@ -148,22 +162,6 @@ impl vt100::Callbacks for DeviceReplies {
             _ => String::new(),
         };
         self.0.extend(response.as_bytes());
-    }
-    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        if params.len() >= 2 && params[1] == b"?" && matches!(params[0], b"10" | b"11" | b"12") {
-            let color = if params[0] == b"11" {
-                "1010/1010/1010"
-            } else {
-                "dddd/dddd/dddd"
-            };
-            self.0.extend(
-                format!(
-                    "\x1b]{};rgb:{color}\x1b\\",
-                    String::from_utf8_lossy(params[0])
-                )
-                .as_bytes(),
-            );
-        }
     }
 }
 
@@ -241,20 +239,26 @@ impl TerminalEvents {
         }
     }
 
-    pub fn send_ephemeral(&self, mut event: WireDriverEvent) -> anyhow::Result<()> {
+    /// Appends raw PTY bytes and publishes them as one `terminalOutput`
+    /// event. Encoding once here avoids the daemon-side base64 decode that
+    /// `send_ephemeral` used to perform on its own output.
+    pub fn send_output(&self, bytes: &[u8]) -> anyhow::Result<()> {
         // Publish under the same lock as the snapshot, so its offset is an
         // exact boundary between replay and queued live output.
         let mut state = self.state.lock();
-        match event.kind.as_str() {
-            "terminalOutput" => {
-                if let Some(data) = event.payload.get("data").and_then(|v| v.as_str()) {
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
-                    state.append(&bytes);
-                    event.payload["offset"] = state.offset.into();
-                }
-            }
-            "terminalExited" | "terminalError" => state.exited = true,
-            _ => {}
+        state.append(bytes);
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let event = WireDriverEvent::new(
+            "terminalOutput",
+            json!({ "data": data, "offset": state.offset }),
+        );
+        self.sink.send_ephemeral(event)
+    }
+
+    pub fn send_ephemeral(&self, event: WireDriverEvent) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        if matches!(event.kind.as_str(), "terminalExited" | "terminalError") {
+            state.mark_exited();
         }
         self.sink.send_ephemeral(event)
     }
@@ -295,5 +299,22 @@ mod tests {
         let snapshot = state.snapshot(Some(u64::MAX));
         assert!(snapshot.data.windows(8).any(|b| b == b"\x1b[?1049h"));
         assert!(snapshot.data.ends_with(b"\x1b[>3u"));
+    }
+
+    #[test]
+    fn exit_frees_the_replay_ring_but_attaches_get_the_final_screen() {
+        let mut state = TerminalState::new(80, 24);
+        state.append(b"final line\r\n");
+        let before = state.snapshot(None);
+        state.mark_exited();
+        assert!(state.bytes.is_empty());
+        let tail = state.snapshot(Some(before.offset));
+        assert!(!tail.reset);
+        assert!(tail.data.is_empty());
+        assert!(tail.exited);
+        let fresh = state.snapshot(None);
+        assert!(fresh.reset);
+        assert!(fresh.exited);
+        assert!(String::from_utf8_lossy(&fresh.data).contains("final line"));
     }
 }

@@ -28,8 +28,9 @@ use gpui::{
     Hsla, ImageFormat, InteractiveElement, IntoElement, KeyBinding, KeyContext, KeyDownEvent,
     KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, StyledText,
-    Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    canvas, div, font,
     is_no_action, prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
@@ -60,8 +61,9 @@ fn terminal_clipboard_modifier_pressed(modifiers: &Modifiers) -> bool {
 const TERMINAL_PADDING_X: f32 = 10.0;
 const TERMINAL_PADDING_Y: f32 = 8.0;
 const TERMINAL_TOOLBAR_HEIGHT: f32 = 34.0;
+const TERMINAL_RECONNECTING_HEIGHT: f32 = 20.0;
 const TERMINAL_MIN_COLUMNS: usize = 20;
-const TERMINAL_MIN_ROWS: usize = 8;
+const TERMINAL_MIN_ROWS: usize = 2;
 /// Coding agents print long transcripts into the main screen, so keep more
 /// than Alacritty's 10k default. Rows are allocated only as history fills.
 const TERMINAL_SCROLLBACK_LINES: usize = 30_000;
@@ -71,9 +73,10 @@ const TERMINAL_CURSOR_BLINK_PAUSE: Duration = Duration::from_millis(300);
 /// Alacritty's default URL hint plus local file paths containing a slash.
 /// Requiring a slash keeps ordinary dotted words from becoming links.
 #[rustfmt::skip]
-const TERMINAL_LINK_REGEX: &str = "((ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)|\
-                                    (/|~/|\\./|\\.\\./|[A-Za-z0-9._@%+~-]+/))\
-                                   [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
+const TERMINAL_LINK_REGEX: &str = "((ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
+                                   [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+|\
+                                   ([A-Za-z]:[\\\\/]|/|~/|\\./|\\.\\./|\\.\\\\|\\.\\.\\\\|[A-Za-z0-9._@%+~-]+[/\\\\])\
+                                   [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`]+)";
 const MAX_TERMINAL_LINK_SEARCH_LINES: i32 = 100;
 
 /// Icon glyphs (nerd-font private-use codepoints) resolve through CoreText's
@@ -94,7 +97,6 @@ enum TerminalUiEvent {
     Title(String),
     ResetTitle,
     ClipboardStore(String),
-    ClipboardLoad(Arc<dyn Fn(&str) -> String + Send + Sync>),
     /// BEL, or an OSC 9 / OSC 777 desktop notification (`None` for BEL).
     Alert(Option<TerminalAlert>),
     Exited,
@@ -151,6 +153,10 @@ impl OscAlertScanner {
                     OscScanState::Ground
                 }
                 (OscScanState::Osc | OscScanState::OscEscape, 0x1b) => OscScanState::OscEscape,
+                (OscScanState::OscEscape, b']') => {
+                    self.payload.clear();
+                    OscScanState::Osc
+                }
                 // Any other byte after ESC inside an OSC aborts it, as in VT parsers.
                 (OscScanState::OscEscape, _) => OscScanState::Ground,
                 (OscScanState::Osc, _) if self.payload.len() >= Self::MAX_PAYLOAD => {
@@ -330,6 +336,7 @@ struct RemoteTerminal {
     daemon: waku_client::DaemonSupervisor,
     session_id: uuid::Uuid,
     runtime_id: uuid::Uuid,
+    working_directory: PathBuf,
     closed: AtomicBool,
 }
 
@@ -381,6 +388,7 @@ impl RemoteTerminal {
             daemon,
             session_id: id,
             runtime_id: id,
+            working_directory: working_directory.to_path_buf(),
             closed: AtomicBool::new(false),
         });
         let client = remote.daemon.client();
@@ -441,6 +449,9 @@ impl RemoteTerminal {
         let mut alerts = OscAlertScanner::default();
         let mut offset = 0;
         let mut needs_snapshot = !create;
+        // A restored pane restarts a dead shell at most once; a replacement
+        // that dies immediately stays exited instead of respawn-looping.
+        let mut respawned = false;
         let exited = |ui_events: &Sender<TerminalUiEvent>| {
             let _ = ui_events.send(TerminalUiEvent::Exited);
             dirty.store(true, Ordering::Release);
@@ -450,6 +461,7 @@ impl RemoteTerminal {
                 return;
             }
             if needs_snapshot {
+                let initial_attach = !create && offset == 0;
                 match client.request(
                     self.session_id,
                     self.runtime_id,
@@ -485,9 +497,66 @@ impl RemoteTerminal {
                         needs_snapshot = false;
                         dirty.store(true, Ordering::Release);
                         if snapshot.exited {
+                            if initial_attach && !respawned {
+                                respawned = true;
+                                if client
+                                    .request(
+                                        self.session_id,
+                                        self.runtime_id,
+                                        waku_client::Command::OpenTerminal {
+                                            cwd: self.working_directory.clone(),
+                                            cols: desired.0 as u16,
+                                            rows: desired.1 as u16,
+                                        },
+                                    )
+                                    .is_ok()
+                                {
+                                    // The dead terminal's terminalExited was
+                                    // queued before its snapshot reported
+                                    // `exited`; drain it so it cannot kill the
+                                    // replacement, then attach the new shell
+                                    // from a clean snapshot.
+                                    while events.try_recv().is_ok() {}
+                                    offset = 0;
+                                    needs_snapshot = true;
+                                    continue;
+                                }
+                            }
                             exited(&ui_events);
                             return;
                         }
+                    }
+                    Err(error)
+                        if !create
+                            && offset == 0
+                            && !respawned
+                            && error.to_string().contains("no longer available") =>
+                    {
+                        let (cols, rows) = {
+                            let term = term.lock();
+                            (term.columns() as u16, term.screen_lines() as u16)
+                        };
+                        respawned = true;
+                        if client
+                            .request(
+                                self.session_id,
+                                self.runtime_id,
+                                waku_client::Command::OpenTerminal {
+                                    cwd: self.working_directory.clone(),
+                                    cols,
+                                    rows,
+                                },
+                            )
+                            .is_ok()
+                        {
+                            // Same as above: the record vanished, so any
+                            // queued events belonged to the old terminal.
+                            while events.try_recv().is_ok() {}
+                            needs_snapshot = true;
+                            continue;
+                        }
+                        exited(&ui_events);
+                        return;
                     }
                     Err(error)
                         if !error.to_string().contains("no longer available")
@@ -667,11 +736,17 @@ impl TerminalReplyColors {
 impl TerminalEventProxy {
     fn write_pty(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         if let Some(sender) = self.sender.get() {
-            // A resident daemon answers terminal device queries even while
+            // A resident daemon answers CSI device queries even while
             // detached. Never send a second response from a renderer.
             if matches!(sender, PtyInput::Remote(_)) {
                 return;
             }
+            sender.input(bytes.into());
+        }
+    }
+
+    fn write_color_reply(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        if let Some(sender) = self.sender.get() {
             sender.input(bytes.into());
         }
     }
@@ -699,18 +774,14 @@ impl EventListener for TerminalEventProxy {
             Event::ClipboardStore(_, text) => {
                 let _ = self.ui_events.send(TerminalUiEvent::ClipboardStore(text));
             }
-            Event::ClipboardLoad(_, formatter) => {
-                let _ = self
-                    .ui_events
-                    .send(TerminalUiEvent::ClipboardLoad(formatter));
-            }
+            Event::ClipboardLoad(_, _) => {}
             Event::PtyWrite(text) => self.write_pty(text.into_bytes()),
             Event::ColorRequest(index, formatter) => {
                 let color = self
                     .reply_colors
                     .color(index)
                     .unwrap_or_else(|| terminal_rgb(index, self.reply_colors.is_dark()));
-                self.write_pty(formatter(color).into_bytes());
+                self.write_color_reply(formatter(color).into_bytes());
             }
             Event::TextAreaSizeRequest(formatter) => {
                 self.write_pty(formatter(*self.window_size.lock()).into_bytes());
@@ -996,17 +1067,16 @@ impl TerminalSession {
                 continue;
             }
             let cell = indexed.cell;
-            let mut text = if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            let ch = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                '\0'
+            } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
                 || cell.flags.contains(Flags::HIDDEN)
             {
-                " ".to_owned()
+                ' '
             } else {
-                cell.c.to_string()
+                cell.c
             };
-            if let Some(zerowidth) = cell.zerowidth() {
-                text.extend(zerowidth);
-            }
+            let zerowidth = cell.zerowidth();
 
             let mut foreground = resolve_color(cell.fg, content.colors, theme, true);
             let mut background = resolve_color(cell.bg, content.colors, theme, false);
@@ -1036,7 +1106,8 @@ impl TerminalSession {
             }
 
             cells[row as usize * columns + column] = TerminalCell {
-                text,
+                ch,
+                zerowidth,
                 foreground,
                 background,
                 bold: cell.flags.contains(Flags::BOLD),
@@ -1049,11 +1120,17 @@ impl TerminalSession {
 
         let mut rendered_rows = Vec::with_capacity(rows);
         for row in cells.chunks(columns) {
-            let mut text = String::new();
+            let mut text = String::with_capacity(columns);
             let mut runs: Vec<TerminalRun> = Vec::new();
             for cell in row {
-                let len = cell.text.len();
-                text.push_str(&cell.text);
+                if cell.ch == '\0' {
+                    continue;
+                }
+                let len = 1 + cell.zerowidth.map_or(0, <[char]>::len);
+                text.push(cell.ch);
+                if let Some(zerowidth) = cell.zerowidth {
+                    text.extend(zerowidth);
+                }
                 let style = TerminalRunStyle {
                     foreground: cell.foreground,
                     background: cell.background,
@@ -1131,9 +1208,14 @@ impl scrollbar::Scrollable for TerminalScrollbarTarget {
     }
 }
 
-#[derive(Clone)]
-struct TerminalCell {
-    text: String,
+/// One grid cell ready for row assembly. `ch == '\0'` marks a wide-character
+/// spacer, which contributes nothing to the row text. Keeping a `char` plus a
+/// borrowed combining-mark slice — instead of a heap `String` per cell — keeps
+/// snapshot rebuilds allocation-light while output streams.
+#[derive(Clone, Copy)]
+struct TerminalCell<'a> {
+    ch: char,
+    zerowidth: Option<&'a [char]>,
     foreground: Hsla,
     background: Hsla,
     bold: bool,
@@ -1142,10 +1224,11 @@ struct TerminalCell {
     strikeout: bool,
 }
 
-impl TerminalCell {
+impl TerminalCell<'_> {
     fn blank(theme: Theme) -> Self {
         Self {
-            text: " ".into(),
+            ch: ' ',
+            zerowidth: None,
             foreground: theme.text,
             background: theme.terminal,
             bold: false,
@@ -1350,17 +1433,24 @@ fn clipboard_has_paste_content(clipboard: &ClipboardItem) -> bool {
 
 fn shell_quote_path(path: &Path) -> String {
     let path_str = path.to_string_lossy();
+    let windows_path = path_str.contains('\\') || has_windows_drive_prefix(&path_str);
     let is_safe = !path_str.is_empty()
-        && path_str
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '\\' | ':' | '.' | '_' | '-'));
+        && path_str.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | ':' | '.' | '_' | '-')
+                || (windows_path && c == '\\')
+        });
     if is_safe {
         return path_str.into_owned();
     }
 
-    if cfg!(windows) || path_str.contains('\\') {
-        let escaped = path_str.replace('"', "\\\"");
-        format!("\"{escaped}\"")
+    if windows_path || (cfg!(windows) && !path_str.starts_with('/')) {
+        if (path_str.contains('$') || path_str.contains('`')) && !path_str.contains('\'') {
+            format!("'{path_str}'")
+        } else {
+            let escaped = path_str.replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        }
     } else {
         let escaped = path_str.replace('\'', "'\\''");
         format!("'{escaped}'")
@@ -1607,6 +1697,25 @@ impl TerminalView {
                 });
             })
             .detach();
+        } else {
+            if let Some(session) = &self.session {
+                session.sender.shutdown();
+            }
+            self.exited = true;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close_daemon_session(&self) {
+        if let Some(session) = &self.session {
+            session.sender.shutdown();
+        }
+        if let TerminalLauncher::Daemon(daemon) = &self.launcher {
+            let _ = daemon.client().notify(
+                self.persistent_id,
+                self.persistent_id,
+                waku_client::Command::CloseTerminal,
+            );
         }
     }
     pub fn new(
@@ -1637,13 +1746,16 @@ impl TerminalView {
         let session_launcher = launcher.clone();
         let reply_colors = TerminalReplyColors::new(Theme::current(cx));
         cx.spawn(async move |this, cx| {
+            let (initial_columns, initial_rows) = this
+                .read_with(cx, |this, _| this.estimated_grid_size())
+                .unwrap_or((80, 24));
             let started = cx
                 .background_executor()
                 .spawn(async move {
                     TerminalSession::new(
                         &terminal_cwd,
-                        52,
-                        36,
+                        initial_columns,
+                        initial_rows,
                         session_launcher,
                         reply_colors,
                         (persistent_id, create),
@@ -1657,8 +1769,10 @@ impl TerminalView {
                         Err(error) => this.error = Some(error.to_string()),
                     }
                     cx.notify();
+                    this.session.is_some()
                 })
-                .is_err()
+                .ok()
+                != Some(true)
             {
                 return;
             }
@@ -1666,14 +1780,15 @@ impl TerminalView {
                 cx.background_executor()
                     .timer(Duration::from_millis(24))
                     .await;
-                if this
+                let keep_polling = this
                     .update(cx, |this, cx| {
                         if this.poll(cx) {
                             cx.notify();
                         }
+                        this.session.is_some() && !this.exited
                     })
-                    .is_err()
-                {
+                    .unwrap_or(false);
+                if !keep_polling {
                     break;
                 }
             }
@@ -1820,13 +1935,6 @@ impl TerminalView {
                 TerminalUiEvent::ClipboardStore(text) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 }
-                TerminalUiEvent::ClipboardLoad(formatter) => {
-                    let text = cx
-                        .read_from_clipboard()
-                        .and_then(|item| item.text())
-                        .unwrap_or_default();
-                    session.write(formatter(&text).into_bytes());
-                }
                 TerminalUiEvent::Alert(alert) => {
                     // Programs ring and notify for whoever is not watching;
                     // repeated bells while already flagged stay quiet.
@@ -1884,6 +1992,10 @@ impl TerminalView {
                 PaneChord::ResizeRight => cx.dispatch_action(&crate::ResizeTerminalPaneRight),
                 PaneChord::ResizeUp => cx.dispatch_action(&crate::ResizeTerminalPaneUp),
                 PaneChord::ResizeDown => cx.dispatch_action(&crate::ResizeTerminalPaneDown),
+                PaneChord::FocusLeft => cx.dispatch_action(&crate::FocusTerminalPaneLeft),
+                PaneChord::FocusRight => cx.dispatch_action(&crate::FocusTerminalPaneRight),
+                PaneChord::FocusUp => cx.dispatch_action(&crate::FocusTerminalPaneUp),
+                PaneChord::FocusDown => cx.dispatch_action(&crate::FocusTerminalPaneDown),
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -1970,6 +2082,23 @@ impl TerminalView {
         self.measured_cell_width.unwrap_or(TERMINAL_CELL_WIDTH)
     }
 
+    fn estimated_grid_size(&self) -> (usize, usize) {
+        let cell_width = self.cell_width();
+        let toolbar_height = if self.bottom_panel_tabs {
+            0.0
+        } else {
+            TERMINAL_TOOLBAR_HEIGHT
+        };
+        let body_height = (self.panel_height.unwrap_or(240.0) - toolbar_height).max(0.0);
+        let columns = ((self.panel_width - TERMINAL_PADDING_X * 2.0) / cell_width)
+            .floor()
+            .max(TERMINAL_MIN_COLUMNS as f32) as usize;
+        let rows = ((body_height - TERMINAL_PADDING_Y * 2.0) / TERMINAL_CELL_HEIGHT)
+            .floor()
+            .max(TERMINAL_MIN_ROWS as f32) as usize;
+        (columns, rows)
+    }
+
     fn grid_point_for_position(
         &self,
         position: Point<Pixels>,
@@ -2027,7 +2156,8 @@ impl TerminalView {
             return;
         };
 
-        if primary_modifier_pressed(&event.modifiers)
+        if event.button == MouseButton::Left
+            && primary_modifier_pressed(&event.modifiers)
             && let Some(link) = self
                 .session
                 .as_mut()
@@ -2054,10 +2184,11 @@ impl TerminalView {
             return;
         }
 
-        if let Some(cell) = self.viewport_cell_for_position(event.position, false)
+        if let Some(button) = mouse_button_code(event.button)
+            && let Some(cell) = self.viewport_cell_for_position(event.position, false)
             && let Some(session) = &self.session
             && let Some(bytes) =
-                terminal_mouse_button_input(0, true, cell, &event.modifiers, session.mode())
+                terminal_mouse_button_input(button, true, cell, &event.modifiers, session.mode())
         {
             self.selecting = false;
             self.mouse_reported_cell = Some(cell);
@@ -2067,6 +2198,9 @@ impl TerminalView {
             return;
         }
 
+        if event.button != MouseButton::Left {
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
@@ -2117,15 +2251,18 @@ impl TerminalView {
         }
 
         if self.mouse_reported_cell.is_some() {
-            if event.pressed_button == Some(MouseButton::Left)
+            if let Some(button) = event.pressed_button.and_then(mouse_button_code)
                 && let Some(cell) = self.viewport_cell_for_position(event.position, true)
                 && let Some(session) = &self.session
             {
                 if self.mouse_reported_cell != Some(cell) {
                     self.mouse_reported_cell = Some(cell);
-                    if let Some(bytes) =
-                        terminal_mouse_move_input(Some(0), cell, &event.modifiers, session.mode())
-                    {
+                    if let Some(bytes) = terminal_mouse_move_input(
+                        Some(button),
+                        cell,
+                        &event.modifiers,
+                        session.mode(),
+                    ) {
                         session.write(bytes);
                     }
                 }
@@ -2166,13 +2303,14 @@ impl TerminalView {
         self.selecting = false;
         self.mouse_motion_cell = None;
         if let Some(last_cell) = self.mouse_reported_cell.take()
+            && let Some(button) = mouse_button_code(event.button)
             && let Some(session) = &self.session
         {
             let cell = self
                 .viewport_cell_for_position(event.position, true)
                 .unwrap_or(last_cell);
             if let Some(bytes) =
-                terminal_mouse_button_input(0, false, cell, &event.modifiers, session.mode())
+                terminal_mouse_button_input(button, false, cell, &event.modifiers, session.mode())
             {
                 session.write(bytes);
             }
@@ -2533,10 +2671,13 @@ impl EntityInputHandler for TerminalView {
     ) -> Option<Bounds<Pixels>> {
         let grid = self.grid_bounds.get()?;
         let (row, column) = self.cursor_position?;
+        let composition_columns = self.composition.as_ref().map_or(range.start, |ime| {
+            utf16_prefix_columns(&ime.text, range.start)
+        });
         Some(Bounds::new(
             grid.origin
                 + gpui::point(
-                    px((column + range.start) as f32 * self.cell_width()),
+                    px((column + composition_columns) as f32 * self.cell_width()),
                     px(row as f32 * TERMINAL_CELL_HEIGHT),
                 ),
             gpui::size(px(self.cell_width()), px(TERMINAL_CELL_HEIGHT)),
@@ -2569,9 +2710,16 @@ impl Render for TerminalView {
         } else {
             TERMINAL_TOOLBAR_HEIGHT
         };
+        let reconnecting_height = if self.reconnecting {
+            TERMINAL_RECONNECTING_HEIGHT
+        } else {
+            0.0
+        };
         let body_height = match self.panel_height {
-            Some(height) => (height - toolbar_height).max(120.0),
-            None => (f32::from(viewport.height) - 48.0 - toolbar_height).max(120.0),
+            Some(height) => (height - toolbar_height - reconnecting_height).max(0.0),
+            None => {
+                (f32::from(viewport.height) - 48.0 - toolbar_height - reconnecting_height).max(0.0)
+            }
         };
         // The rows are laid out by `StyledText` at the font's own advance, so
         // the grid must be sized from that same measured advance or the text
@@ -2598,11 +2746,6 @@ impl Render for TerminalView {
         }
         if self.selecting {
             self.set_hovered_link(None);
-        } else {
-            self.refresh_hovered_link(
-                primary_modifier_pressed(&window.modifiers()),
-                window.mouse_position(),
-            );
         }
         let hovered_link = self.hovered_link.as_ref().map(|link| &link.bounds);
         let snapshot = self
@@ -2634,8 +2777,14 @@ impl Render for TerminalView {
             .relative()
             .cursor_text()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_exit(cx.listener(Self::on_mouse_exit))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed));
@@ -2896,8 +3045,10 @@ impl Render for TerminalView {
                         .bg(theme.surface)
                         .child(
                             div()
+                                .id("terminal-toolbar-status")
                                 .w(px(6.0))
                                 .h(px(6.0))
+                                .flex_none()
                                 .rounded_full()
                                 .bg(if self.exited {
                                     theme.danger
@@ -2905,6 +3056,29 @@ impl Render for TerminalView {
                                     theme.warning
                                 } else {
                                     theme.accent
+                                })
+                                .when(self.needs_attention && !self.exited, |element| {
+                                    element
+                                        .border_2()
+                                        .border_color(theme.warning.opacity(0.35))
+                                        .w(px(10.0))
+                                        .h(px(10.0))
+                                })
+                                .when(self.exited, |element| {
+                                    element.tooltip(|window, cx| {
+                                        crate::ui::tooltip::Tooltip::new(tr!(
+                                            "terminal.process_exited"
+                                        ))
+                                        .build(window, cx)
+                                    })
+                                })
+                                .when(self.needs_attention && !self.exited, |element| {
+                                    element.tooltip(|window, cx| {
+                                        crate::ui::tooltip::Tooltip::new(tr!(
+                                            "terminal.needs_attention"
+                                        ))
+                                        .build(window, cx)
+                                    })
                                 }),
                         )
                         .child(
@@ -2928,6 +3102,10 @@ impl Render for TerminalView {
             .when(self.reconnecting, |view| {
                 view.child(
                     div()
+                        .h(px(TERMINAL_RECONNECTING_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
                         .px(px(8.0))
                         .text_size(sp(12.0))
                         .text_color(theme.text_secondary)
@@ -3129,13 +3307,64 @@ fn terminal_link_target(
     Some(TerminalLinkTarget::Url(url.to_string()))
 }
 
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
+fn utf16_prefix_columns(text: &str, utf16_offset: usize) -> usize {
+    let mut units = 0;
+    let mut columns = 0;
+    for ch in text.chars() {
+        if units >= utf16_offset {
+            break;
+        }
+        units += ch.len_utf16();
+        columns += if is_wide_terminal_char(ch) { 2 } else { 1 };
+    }
+    columns
+}
+
+fn is_wide_terminal_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x115F
+            | 0x2329..=0x232A
+            | 0x2E80..=0x303E
+            | 0x3040..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    )
+}
+
 fn terminal_file_path(
     value: &str,
     working_directory: &Path,
     local_terminal: bool,
 ) -> Option<PathBuf> {
-    let mut path = match url::Url::parse(value) {
-        Ok(url) if url.scheme() == "file" => {
+    let url_parsed = (!has_windows_drive_prefix(value))
+        .then(|| url::Url::parse(value).ok())
+        .flatten();
+    let mut path = match url_parsed {
+        Some(url) if url.scheme() == "file" => {
             if !matches!(url.host_str(), None | Some("" | "localhost")) {
                 return None;
             }
@@ -3145,8 +3374,8 @@ fn terminal_file_path(
                 PathBuf::from(url.path())
             }
         }
-        Ok(_) => return None,
-        Err(_) => {
+        Some(_) => return None,
+        None => {
             if let Some(relative) = value.strip_prefix("~/") {
                 if local_terminal {
                     dirs::home_dir()?.join(relative)
@@ -3157,7 +3386,7 @@ fn terminal_file_path(
             } else {
                 let path = Path::new(value);
                 if local_terminal {
-                    if path.is_absolute() {
+                    if path.is_absolute() || has_windows_drive_prefix(value) {
                         path.to_path_buf()
                     } else {
                         working_directory.join(path)
@@ -3165,8 +3394,9 @@ fn terminal_file_path(
                 } else if value.starts_with('/') {
                     PathBuf::from(value)
                 } else {
-                    let pathlike =
-                        value.starts_with("./") || value.starts_with("../") || value.contains('/');
+                    let pathlike = value.starts_with("./")
+                        || value.starts_with("../")
+                        || value.contains('/');
                     if !pathlike {
                         return None;
                     }
@@ -3390,6 +3620,10 @@ enum PaneChord {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
 }
 
 /// The pane chord a keydown carries, whatever spelling the platform reports.
@@ -3422,6 +3656,16 @@ fn terminal_pane_chord(keystroke: &Keystroke) -> Option<PaneChord> {
 
     if !modifiers.alt {
         return None;
+    }
+
+    if modifiers.secondary() && !modifiers.shift {
+        return match key {
+            "left" => Some(PaneChord::FocusLeft),
+            "right" => Some(PaneChord::FocusRight),
+            "up" => Some(PaneChord::FocusUp),
+            "down" => Some(PaneChord::FocusDown),
+            _ => None,
+        };
     }
 
     let shifted = modifiers.shift;
@@ -3465,6 +3709,10 @@ const PANE_CHORD_SOURCES: &[(&str, PaneChord)] = &[
     ("alt-shift-right", PaneChord::ResizeRight),
     ("alt-shift-up", PaneChord::ResizeUp),
     ("alt-shift-down", PaneChord::ResizeDown),
+    ("secondary-alt-left", PaneChord::FocusLeft),
+    ("secondary-alt-right", PaneChord::FocusRight),
+    ("secondary-alt-up", PaneChord::FocusUp),
+    ("secondary-alt-down", PaneChord::FocusDown),
 ];
 
 pub(crate) const TERMINAL_PANE_CONTEXT: &str = "TerminalPane";
@@ -3497,6 +3745,10 @@ fn pane_chord_binding(source: &str, chord: PaneChord) -> KeyBinding {
         PaneChord::ResizeRight => KeyBinding::new(source, crate::ResizeTerminalPaneRight, context),
         PaneChord::ResizeUp => KeyBinding::new(source, crate::ResizeTerminalPaneUp, context),
         PaneChord::ResizeDown => KeyBinding::new(source, crate::ResizeTerminalPaneDown, context),
+        PaneChord::FocusLeft => KeyBinding::new(source, crate::FocusTerminalPaneLeft, context),
+        PaneChord::FocusRight => KeyBinding::new(source, crate::FocusTerminalPaneRight, context),
+        PaneChord::FocusUp => KeyBinding::new(source, crate::FocusTerminalPaneUp, context),
+        PaneChord::FocusDown => KeyBinding::new(source, crate::FocusTerminalPaneDown, context),
     }
 }
 
@@ -5059,20 +5311,16 @@ mod tests {
         );
 
         let space_posix = PathBuf::from("/Users/alice/my images/photo.png");
-        if !cfg!(windows) {
-            assert_eq!(
-                shell_quote_path(&space_posix),
-                "'/Users/alice/my images/photo.png'"
-            );
-        }
+        assert_eq!(
+            shell_quote_path(&space_posix),
+            "'/Users/alice/my images/photo.png'"
+        );
 
         let quoted_posix = PathBuf::from("/tmp/bob's photo.png");
-        if !cfg!(windows) {
-            assert_eq!(
-                shell_quote_path(&quoted_posix),
-                "'/tmp/bob'\\''s photo.png'"
-            );
-        }
+        assert_eq!(
+            shell_quote_path(&quoted_posix),
+            "'/tmp/bob'\\''s photo.png'"
+        );
     }
 
     #[test]
@@ -5275,5 +5523,89 @@ mod tests {
         assert_eq!(scrollback_line_number(0, 3), 4);
         assert_eq!(scrollback_line_number(5, 0), 6);
         assert_eq!(scrollback_line_number(-10, 0), 1);
+    }
+
+    #[test]
+    fn wide_characters_do_not_emit_trailing_spacer_spaces_in_snapshot() {
+        let (sender, _written) = unbounded();
+        let dirty = Arc::new(AtomicBool::new(true));
+        let (ui_tx, ui_events) = unbounded();
+        let window_size = Arc::new(Mutex::new(WindowSize {
+            num_cols: 10,
+            num_lines: 2,
+            cell_width: 8,
+            cell_height: 18,
+        }));
+        let reply_colors = TerminalReplyColors::new(Theme::dark());
+        let proxy = TerminalEventProxy {
+            replaying: Arc::new(AtomicBool::new(false)),
+            dirty: dirty.clone(),
+            sender: Arc::new(OnceLock::new()),
+            ui_events: ui_tx,
+            window_size: window_size.clone(),
+            reply_colors: reply_colors.clone(),
+        };
+        let session = TerminalSession {
+            term: Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TerminalDimensions {
+                    columns: 10,
+                    rows: 2,
+                },
+                proxy,
+            ))),
+            sender: PtyInput::Test(sender),
+            dirty,
+            snapshot_dirty: AtomicBool::new(true),
+            cached_snapshot: Mutex::new(None),
+            ui_events,
+            window_size,
+            grid_size: (10, 2),
+            reply_colors,
+            url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+        };
+        {
+            let mut term = session.term.lock();
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut *term, "中文ok".as_bytes());
+        }
+        let theme = Theme::dark();
+        let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        // "中文" occupies 4 columns, "ok" 2 columns, and 4 trailing blank columns remain.
+        assert_eq!(snapshot.rows[0].text.as_ref(), "中文ok    ");
+    }
+
+    #[test]
+    fn osc_scanner_recovers_when_unclosed_osc_is_followed_by_another_osc() {
+        let mut scanner = OscAlertScanner::default();
+        let mut found = Vec::new();
+        scanner.feed(b"\x1b]0;unclosed\x1b]9;Recovered alert\x07", |alert| {
+            found.push(alert);
+        });
+        assert_eq!(
+            found,
+            vec![TerminalAlert {
+                title: None,
+                body: "Recovered alert".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_windows_backslash_paths_and_computes_cjk_ime_columns() {
+        let content = "error in src\\terminal.rs:42:8 here";
+        let term = parse_terminal(content.as_bytes());
+        assert_eq!(
+            plain_link_value(&term, terminal_point_for(content, "terminal")),
+            Some("src\\terminal.rs:42:8".to_owned())
+        );
+        assert!(has_windows_drive_prefix("C:\\Users\\waku\\main.rs"));
+        assert!(has_windows_drive_prefix("d:/work/main.rs"));
+        assert!(!has_windows_drive_prefix("https://example.com"));
+
+        assert_eq!(utf16_prefix_columns("你好a", 0), 0);
+        assert_eq!(utf16_prefix_columns("你好a", 1), 2);
+        assert_eq!(utf16_prefix_columns("你好a", 2), 4);
+        assert_eq!(utf16_prefix_columns("你好a", 3), 5);
     }
 }

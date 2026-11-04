@@ -10,8 +10,9 @@ detached live sessions belonging to the selected host and workspace.
 The desktop saves terminal IDs, host/workspace ownership, split weights,
 active panes and panel visibility in `terminal-layouts.json` beside the
 desktop state database. Normal exit flushes pending layout changes. Restoring
-a saved ID only attaches: a missing process is shown as exited, never silently
-replaced with a new shell. A crash may lose the latest second of layout changes;
+a saved ID attaches the daemon's live session; an exited or missing terminal
+is restarted once as a fresh shell in that pane, and a shell that dies again
+stays exited. A crash may lose the latest second of layout changes;
 the restore command can still discover the daemon's live terminals.
 
 The local daemon writes a resident listener record beside that database and

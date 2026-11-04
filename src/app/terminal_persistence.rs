@@ -195,6 +195,12 @@ impl Waku {
             .restored
             .retain(|scope| &scope.host != host);
     }
+    pub(super) fn remove_workspace_terminal_layouts(&mut self, scope: &PanelScope) {
+        self.terminal_layouts.restored.remove(scope);
+        self.terminal_layouts
+            .saved
+            .retain(|saved| &saved.scope != scope);
+    }
     pub(super) fn restore_detached_terminals(&mut self, cx: &mut Context<Self>) {
         let Some(scope) = self.selected_panel_scope() else {
             return;

@@ -15,11 +15,9 @@ mod platform {
     use alacritty_terminal::event::{OnResize as _, WindowSize};
     use alacritty_terminal::tty::{self, EventedPty as _, EventedReadWrite as _, Shell};
     use anyhow::{Context as _, bail};
-    use base64::Engine as _;
     use crossbeam_channel::{Sender, unbounded};
     use parking_lot::Mutex;
     use polling::{Event as PollEvent, Events, PollMode, Poller};
-    use serde_json::json;
 
     use crate::{EventSink, WireDriverEvent};
 
@@ -213,12 +211,7 @@ mod platform {
                                     break;
                                 }
                                 Ok(read) => {
-                                    let data = base64::engine::general_purpose::STANDARD
-                                        .encode(&buffer[..read]);
-                                    let _ = reader_events.send_ephemeral(WireDriverEvent::new(
-                                        "terminalOutput",
-                                        json!({ "data": data }),
-                                    ));
+                                    let _ = reader_events.send_output(&buffer[..read]);
                                     let replies = reader_events.state.lock().take_replies();
                                     if !replies.is_empty() {
                                         let _ = reply_tx.send(DaemonTerminalInput::Write(replies));

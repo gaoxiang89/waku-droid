@@ -836,12 +836,18 @@ impl Backend for WakuBackend {
                 );
                 // A retried create must never replace a live shell.
                 let mut terminals = self.terminals.lock();
-                if let Some((owner, directory, _)) = terminals.get(&session_id) {
+                if let Some((owner, directory, existing)) = terminals.get(&session_id) {
                     anyhow::ensure!(
                         *owner == runtime_id && *directory == cwd,
                         "terminal identity already exists"
                     );
-                    return Ok(ResponsePayload::Ack);
+                    if !existing.exited() {
+                        return Ok(ResponsePayload::Ack);
+                    }
+                    terminals.remove(&session_id);
+                }
+                if terminals.len() >= 256 {
+                    terminals.retain(|id, (_, _, terminal)| *id == session_id || !terminal.exited());
                 }
                 anyhow::ensure!(
                     terminals.len() < 256,

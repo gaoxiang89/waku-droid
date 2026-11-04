@@ -69,9 +69,10 @@ use crate::ui::{
 };
 use crate::{
     CancelTaskSwitch, CancelTurn, CloseFind, CloseTerminalPane, CloseWindow, ConfirmTaskSwitch,
-    CopySelection, FindNext, FindPrevious, FocusComposer, NavigateBack, NavigateForward,
-    NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker,
-    OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
+    CopySelection, FindNext, FindPrevious, FocusComposer, FocusTerminalPaneDown,
+    FocusTerminalPaneLeft, FocusTerminalPaneRight, FocusTerminalPaneUp, NavigateBack,
+    NavigateForward, NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace,
+    OpenResumePicker, OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
     ResizeTerminalPaneLeft, ResizeTerminalPaneRight, ResizeTerminalPaneUp, SaveFile,
     SelectFirstTask, SelectLastTask, SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward,
     SwitchTaskForward, ToggleBottomPanel, ToggleCommandPalette, ToggleFilesSurface,

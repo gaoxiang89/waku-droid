@@ -2,7 +2,6 @@
 use crate::terminal_state::TerminalEvents;
 use crate::{EventSink, WireDriverEvent};
 use anyhow::Context as _;
-use base64::Engine as _;
 use crossbeam_channel::{Sender, unbounded};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
@@ -48,6 +47,7 @@ impl DaemonTerminal {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "waku");
+        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         let mut child = pair.slave.spawn_command(command)?;
         let job = match child
             .process_id()
@@ -98,12 +98,7 @@ impl DaemonTerminal {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(n) => {
-                            let data =
-                                base64::engine::general_purpose::STANDARD.encode(&buffer[..n]);
-                            let _ = output.send_ephemeral(WireDriverEvent::new(
-                                "terminalOutput",
-                                serde_json::json!({"data": data}),
-                            ));
+                            let _ = output.send_output(&buffer[..n]);
                             let bytes = output.state.lock().take_replies();
                             if !bytes.is_empty() {
                                 let _ = replies.send(DaemonTerminalInput::Write(bytes));

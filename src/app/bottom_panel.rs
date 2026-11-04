@@ -207,6 +207,10 @@ impl Waku {
                 let resize_right_pane = terminal.clone();
                 let resize_up_pane = terminal.clone();
                 let resize_down_pane = terminal.clone();
+                let focus_left_pane = terminal.clone();
+                let focus_right_pane = terminal.clone();
+                let focus_up_pane = terminal.clone();
+                let focus_down_pane = terminal.clone();
                 div()
                     .id(SharedString::from(format!(
                         "terminal-pane-{:?}",
@@ -262,6 +266,50 @@ impl Waku {
                             cx,
                         );
                     }))
+                    .on_action(
+                        cx.listener(move |this, _: &FocusTerminalPaneLeft, window, cx| {
+                            this.focus_terminal_pane(
+                                target,
+                                &focus_left_pane,
+                                ResizeDirection::Left,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(move |this, _: &FocusTerminalPaneRight, window, cx| {
+                            this.focus_terminal_pane(
+                                target,
+                                &focus_right_pane,
+                                ResizeDirection::Right,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(move |this, _: &FocusTerminalPaneUp, window, cx| {
+                            this.focus_terminal_pane(
+                                target,
+                                &focus_up_pane,
+                                ResizeDirection::Up,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(move |this, _: &FocusTerminalPaneDown, window, cx| {
+                            this.focus_terminal_pane(
+                                target,
+                                &focus_down_pane,
+                                ResizeDirection::Down,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     .into_any_element()
             }
             SplitMember::Axis(axis) => {
@@ -905,6 +953,8 @@ impl Waku {
             if let Some(removed) = removed {
                 self.bottom_panel_workspace_states.insert(scope, removed);
             }
+        } else {
+            self.remove_workspace_terminal_layouts(&scope);
         }
         // A workspace with no sessions left drops its groups, which is what
         // shuts the PTYs down.
@@ -999,6 +1049,46 @@ impl Waku {
         }
     }
 
+    fn focus_terminal_pane(
+        &mut self,
+        target: SplitTarget,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SplitTarget::Bottom(_) => {
+                self.focus_bottom_panel_pane(pane, direction, window, cx);
+            }
+            SplitTarget::Right(terminal_id) => {
+                self.focus_right_panel_terminal_pane(terminal_id, pane, direction, window, cx);
+            }
+        }
+    }
+
+    pub(super) fn focus_bottom_panel_pane(
+        &mut self,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self
+            .bottom_panel_terminal_groups
+            .iter_mut()
+            .find(|group| group.contains(pane.entity_id()))
+        else {
+            return;
+        };
+        if let Some(next) = group.adjacent_pane(pane.entity_id(), direction) {
+            group.set_active(next.entity_id());
+            let focus = next.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            cx.notify();
+        }
+    }
+
     /// Split one pane in two. The new pane takes the focus so consecutive
     /// splits stack where the user is looking.
     pub(super) fn split_bottom_panel_pane(
@@ -1047,6 +1137,9 @@ impl Waku {
             return;
         };
         if self.bottom_panel_terminal_groups[group_index].remove_pane(pane.entity_id()) {
+            if pane.read(cx).exited() {
+                pane.read(cx).close_daemon_session();
+            }
             self.bottom_panel_pending_terminal_focus = true;
             cx.notify();
             return;
@@ -1080,7 +1173,12 @@ impl Waku {
         if index >= self.bottom_panel_terminal_groups.len() {
             return;
         }
-        self.bottom_panel_terminal_groups.remove(index);
+        let removed = self.bottom_panel_terminal_groups.remove(index);
+        for pane in removed.panes() {
+            if pane.read(cx).exited() {
+                pane.read(cx).close_daemon_session();
+            }
+        }
         self.bottom_panel_active_group = active_index_after_close(
             index,
             self.bottom_panel_active_group,
@@ -1262,6 +1360,50 @@ impl Waku {
     ) {
         if let Some(pane) = self.active_bottom_panel_terminal() {
             self.resize_bottom_panel_pane(&pane, ResizeDirection::Down, cx);
+        }
+    }
+
+    pub(super) fn focus_terminal_pane_left_action(
+        &mut self,
+        _: &FocusTerminalPaneLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.focus_bottom_panel_pane(&pane, ResizeDirection::Left, window, cx);
+        }
+    }
+
+    pub(super) fn focus_terminal_pane_right_action(
+        &mut self,
+        _: &FocusTerminalPaneRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.focus_bottom_panel_pane(&pane, ResizeDirection::Right, window, cx);
+        }
+    }
+
+    pub(super) fn focus_terminal_pane_up_action(
+        &mut self,
+        _: &FocusTerminalPaneUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.focus_bottom_panel_pane(&pane, ResizeDirection::Up, window, cx);
+        }
+    }
+
+    pub(super) fn focus_terminal_pane_down_action(
+        &mut self,
+        _: &FocusTerminalPaneDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.active_bottom_panel_terminal() {
+            self.focus_bottom_panel_pane(&pane, ResizeDirection::Down, window, cx);
         }
     }
 }

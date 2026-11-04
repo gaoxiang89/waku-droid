@@ -185,6 +185,42 @@ impl SplitMember {
         }
     }
 
+    fn last_pane(&self) -> Option<Entity<TerminalView>> {
+        match self {
+            SplitMember::Pane(terminal) => Some(terminal.clone()),
+            SplitMember::Axis(axis) => axis.members.iter().rev().find_map(SplitMember::last_pane),
+        }
+    }
+
+    fn adjacent_pane(
+        &self,
+        target: EntityId,
+        direction: ResizeDirection,
+    ) -> Option<Entity<TerminalView>> {
+        let SplitMember::Axis(axis) = self else {
+            return None;
+        };
+        let target_axis = match direction {
+            ResizeDirection::Left | ResizeDirection::Right => Axis::Horizontal,
+            ResizeDirection::Up | ResizeDirection::Down => Axis::Vertical,
+        };
+        let index = axis.members.iter().position(|m| m.contains(target))?;
+        if let Some(found) = axis.members[index].adjacent_pane(target, direction) {
+            return Some(found);
+        }
+        if axis.axis != target_axis {
+            return None;
+        }
+        match direction {
+            ResizeDirection::Left | ResizeDirection::Up => {
+                index.checked_sub(1).and_then(|i| axis.members[i].last_pane())
+            }
+            ResizeDirection::Right | ResizeDirection::Down => {
+                axis.members.get(index + 1).and_then(SplitMember::first_pane)
+            }
+        }
+    }
+
     /// Split the pane `target` in two, placing `new_pane` after it along
     /// `axis`. A leaf becomes an axis; a matching-axis parent absorbs the new
     /// pane directly; a perpendicular parent nests, so a split right inside a
@@ -382,6 +418,27 @@ impl SplitAxis {
 impl SplitGroup {
     pub(crate) fn resize_pane(&mut self, target: EntityId, direction: ResizeDirection) -> bool {
         self.root.resize_pane(target, direction)
+    }
+
+    pub(crate) fn adjacent_pane(
+        &self,
+        target: EntityId,
+        direction: ResizeDirection,
+    ) -> Option<Entity<TerminalView>> {
+        if let Some(found) = self.root.adjacent_pane(target, direction) {
+            return Some(found);
+        }
+        let panes = self.panes();
+        if panes.len() < 2 {
+            return None;
+        }
+        let index = panes.iter().position(|pane| pane.entity_id() == target)?;
+        let step = match direction {
+            ResizeDirection::Left | ResizeDirection::Up => -1,
+            ResizeDirection::Right | ResizeDirection::Down => 1,
+        };
+        let next = (index as isize + step).rem_euclid(panes.len() as isize) as usize;
+        panes.get(next).cloned()
     }
 
     pub(crate) fn single(terminal: Entity<TerminalView>) -> Self {
@@ -734,5 +791,31 @@ mod tests {
         // Vertical resize does nothing on a purely horizontal axis.
         assert!(!group.resize_pane(terminals[0].entity_id(), ResizeDirection::Up));
         assert!(!group.resize_pane(terminals[0].entity_id(), ResizeDirection::Down));
+    }
+
+    #[gpui::test]
+    fn adjacent_pane_navigates_across_splits_and_wraps(cx: &mut gpui::TestAppContext) {
+        let (terminals, mut group) = group_with(cx, 1);
+        let second = cx.update(|cx| TerminalView::inert_test_view_entity(cx));
+        group.split_pane(terminals[0].entity_id(), second.clone(), Axis::Horizontal);
+
+        assert_eq!(
+            group
+                .adjacent_pane(terminals[0].entity_id(), ResizeDirection::Right)
+                .map(|p| p.entity_id()),
+            Some(second.entity_id())
+        );
+        assert_eq!(
+            group
+                .adjacent_pane(second.entity_id(), ResizeDirection::Left)
+                .map(|p| p.entity_id()),
+            Some(terminals[0].entity_id())
+        );
+        assert_eq!(
+            group
+                .adjacent_pane(second.entity_id(), ResizeDirection::Right)
+                .map(|p| p.entity_id()),
+            Some(terminals[0].entity_id())
+        );
     }
 }

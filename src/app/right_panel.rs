@@ -2930,8 +2930,14 @@ impl Waku {
         if index >= self.right_panel_surfaces.len() {
             return;
         }
-        if let Some(terminal_id) = self.right_panel_surfaces[index].terminal_id() {
-            self.right_panel_terminal_groups.remove(&terminal_id);
+        if let Some(terminal_id) = self.right_panel_surfaces[index].terminal_id()
+            && let Some(group) = self.right_panel_terminal_groups.remove(&terminal_id)
+        {
+            for pane in group.panes() {
+                if pane.read(cx).exited() {
+                    pane.read(cx).close_daemon_session();
+                }
+            }
         }
         if let Some(browser_id) = self.right_panel_surfaces[index].browser_id() {
             self.right_panel_browsers.remove(&browser_id);
@@ -3598,6 +3604,9 @@ impl Waku {
             .map(|group| group.remove_pane(pane.entity_id()));
         match removed {
             Some(true) => {
+                if pane.read(cx).exited() {
+                    pane.read(cx).close_daemon_session();
+                }
                 self.right_panel_pending_terminal_focus = Some(terminal_id);
                 cx.notify();
             }
@@ -3626,6 +3635,25 @@ impl Waku {
             .get_mut(&terminal_id)
             .is_some_and(|group| group.resize_pane(pane.entity_id(), direction))
         {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn focus_right_panel_terminal_pane(
+        &mut self,
+        terminal_id: Uuid,
+        pane: &Entity<TerminalView>,
+        direction: ResizeDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.right_panel_terminal_groups.get_mut(&terminal_id) else {
+            return;
+        };
+        if let Some(next) = group.adjacent_pane(pane.entity_id(), direction) {
+            group.set_active(next.entity_id());
+            let focus = next.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
             cx.notify();
         }
     }
