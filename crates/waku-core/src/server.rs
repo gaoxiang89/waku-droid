@@ -2484,6 +2484,182 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exited_terminal_events_predate_the_exited_snapshot_and_respawn_resets_offsets() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+        let root =
+            std::env::temp_dir().join(format!("waku-exited-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let backend = backend.with_terminal_shell(alacritty_terminal::tty::Shell::new(
+            "/bin/sh".into(),
+            vec![],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "test-token".into(),
+                Arc::new(backend),
+                stop,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+        let result = std::panic::catch_unwind(|| {
+            let client = DaemonClient::connect(&address, "test-token".into()).unwrap();
+            let id = Uuid::new_v4();
+            // The desktop restores with a fresh subscription and then
+            // attaches; a shell dying before that attach must surface only
+            // through this already-open subscription and the snapshot.
+            let events = client.subscribe(id, id);
+            client
+                .request(
+                    id,
+                    id,
+                    Command::OpenTerminal {
+                        cwd: root.clone(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .unwrap();
+            let marker = format!("waku-exit-{}", &id.to_string()[..8]);
+            let echo = if cfg!(windows) {
+                format!("echo {marker}\r")
+            } else {
+                format!("printf '%s\\n' '{marker}'\r")
+            };
+            client
+                .request(
+                    id,
+                    id,
+                    Command::WriteTerminal {
+                        data: echo.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+            wait_for_terminal_marker(&events, marker.as_bytes(), Duration::from_secs(20));
+            // Pad the dead terminal's stream so its final offset is
+            // unmistakably larger than a fresh shell's.
+            let pad = format!("echo {}\r", "waku-pad-".repeat(24));
+            for _ in 0..24 {
+                client
+                    .request(
+                        id,
+                        id,
+                        Command::WriteTerminal {
+                            data: pad.as_bytes().to_vec(),
+                        },
+                    )
+                    .unwrap();
+            }
+            wait_for_terminal_marker(&events, b"waku-pad-", Duration::from_secs(20));
+            client
+                .request(
+                    id,
+                    id,
+                    Command::WriteTerminal {
+                        data: b"exit\r".to_vec(),
+                    },
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let Ok(event) = events.recv_timeout(remaining) else {
+                    let ResponsePayload::Terminals { terminals } = client
+                        .request(Uuid::nil(), Uuid::nil(), Command::ListTerminals)
+                        .unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    panic!(
+                        "terminalExited never reached the pre-death subscriber; \
+                         daemon reports exited={:?}",
+                        terminals
+                            .iter()
+                            .find(|t| t.session_id == id)
+                            .map(|t| t.exited)
+                    );
+                };
+                if event.event.kind == "terminalExited" {
+                    break;
+                }
+            }
+            // A subscriber arriving after the death hears silence: ephemeral
+            // events are not replayed, so a respawn cannot be killed by a
+            // stale exit on the restoring connection.
+            let late_client = DaemonClient::connect(&address, "test-token".into()).unwrap();
+            let late = late_client.subscribe(id, id);
+            assert!(late.recv_timeout(Duration::from_millis(300)).is_err());
+            let ResponsePayload::TerminalOutput { snapshot: dead } = client
+                .request(id, id, Command::AttachTerminal { after: None })
+                .unwrap()
+            else {
+                panic!("missing terminal snapshot")
+            };
+            assert!(dead.exited);
+            assert!(dead.offset > 4096);
+            // Reopening the exited id respawns, and the replacement's byte
+            // offsets restart from zero.
+            client
+                .request(
+                    id,
+                    id,
+                    Command::OpenTerminal {
+                        cwd: root.clone(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .unwrap();
+            let respawned = format!("waku-respawn-{}", &id.to_string()[..8]);
+            let echo_again = if cfg!(windows) {
+                format!("echo {respawned}\r")
+            } else {
+                format!("printf '%s\\n' '{respawned}'\r")
+            };
+            client
+                .request(
+                    id,
+                    id,
+                    Command::WriteTerminal {
+                        data: echo_again.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+            wait_for_terminal_marker(&late, respawned.as_bytes(), Duration::from_secs(20));
+            let ResponsePayload::TerminalOutput { snapshot: fresh } = late_client
+                .request(id, id, Command::AttachTerminal { after: None })
+                .unwrap()
+            else {
+                panic!("missing terminal snapshot")
+            };
+            assert!(!fresh.exited);
+            assert!(fresh.offset < 4096);
+            client.request(id, id, Command::CloseTerminal).unwrap();
+            client.disconnect();
+            late_client.disconnect();
+        });
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
     fn wait_for_terminal_marker(
         events: &Receiver<SequencedEvent>,
         marker: &[u8],

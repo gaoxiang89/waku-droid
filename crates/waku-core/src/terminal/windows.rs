@@ -7,6 +7,8 @@ use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::io::Read as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 enum DaemonTerminalInput {
     Write(Vec<u8>),
@@ -20,6 +22,8 @@ pub struct DaemonTerminal {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     input: Option<Sender<DaemonTerminalInput>>,
     output: TerminalEvents,
+    stopped: Arc<AtomicBool>,
+    exit_reported: Arc<AtomicBool>,
 }
 
 impl DaemonTerminal {
@@ -65,12 +69,16 @@ impl DaemonTerminal {
         let output = TerminalEvents::new(events, cols, rows);
         let master = Arc::new(Mutex::new(pair.master));
         let (input, rx) = unbounded::<DaemonTerminalInput>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let exit_reported = Arc::new(AtomicBool::new(false));
         let terminal = Self {
             job,
             _master: master.clone(),
             child,
             input: Some(input),
             output: output.clone(),
+            stopped: stopped.clone(),
+            exit_reported: exit_reported.clone(),
         };
         let replies = terminal.input.as_ref().unwrap().clone();
         let writer_events = output.clone();
@@ -90,6 +98,10 @@ impl DaemonTerminal {
                 );
             })
             .context("start terminal input")?;
+        let watcher_child = terminal.child.clone();
+        let watcher_output = output.clone();
+        let watcher_stopped = stopped.clone();
+        let watcher_reported = exit_reported.clone();
         std::thread::Builder::new()
             .name("waku-terminal-output".into())
             .spawn(move || {
@@ -108,12 +120,32 @@ impl DaemonTerminal {
                         Err(_) => break,
                     }
                 }
-                let _ = output.send_ephemeral(WireDriverEvent::new(
-                    "terminalExited",
-                    serde_json::Value::Null,
-                ));
+                report_exit(&output, &exit_reported);
             })
             .context("start terminal output")?;
+
+        // ConPTY keeps its output pipe open while the master handle lives,
+        // so a shell that exits on its own never produces the pipe EOF the
+        // reader waits for. Watch the child handle instead (Zed waits the
+        // same way) and report the exit from here.
+        std::thread::Builder::new()
+            .name("waku-terminal-child".into())
+            .spawn(move || {
+                while !watcher_stopped.load(Ordering::Acquire) {
+                    let exited = watcher_child
+                        .lock()
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if exited {
+                        report_exit(&watcher_output, &watcher_reported);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .context("start terminal child watcher")?;
         Ok(terminal)
     }
 
@@ -142,9 +174,19 @@ impl DaemonTerminal {
 }
 impl Drop for DaemonTerminal {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         self.job.take();
         self.input.take();
         let _ = self.child.lock().kill();
+    }
+}
+
+fn report_exit(output: &TerminalEvents, reported: &AtomicBool) {
+    if !reported.swap(true, Ordering::AcqRel) {
+        let _ = output.send_ephemeral(WireDriverEvent::new(
+            "terminalExited",
+            serde_json::Value::Null,
+        ));
     }
 }
 fn size(cols: u16, rows: u16) -> PtySize {
