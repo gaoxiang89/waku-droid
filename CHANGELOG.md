@@ -16,6 +16,8 @@ the original feature bullet instead of adding separate entries for them.
 
 ## [unreleased]
 
+- Restore a terminal after reconnect or a desktop restart and keep typing: live output is re-armed on attach, a colliding create no longer silences the existing shell, and Windows ConPTY input survives resize instead of going dead while the snapshot still looks alive
+
 ## [0.1.40]
 
 - Refresh the Files panel and the Review diff on their own while you work, using the workspace host's native filesystem events for local, SSH, and WSL workspaces; a workspace that cannot be watched says so and keeps Refresh as the recovery path

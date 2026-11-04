@@ -22,10 +22,11 @@ sessions first. Idle daemons may exit after 30 minutes without connections or
 live work.
 
 Each terminal maintains an independent byte offset and a 2 MiB replay window.
-Attach subscribes before requesting recovery, and the renderer discards bytes
-already included in the snapshot. A short disconnect replays exact missing
-bytes. Fresh attachments and evicted cursors receive a reconstructed screen and up to 2,000 lines
-of readable scrollback; scrollback formatting is not retained in this fallback.
+Attach subscribes before requesting recovery, re-arms the live output stream so
+typed input echoes again, and the renderer discards bytes already included in
+the snapshot. A short disconnect replays exact missing bytes. Fresh attachments
+and evicted cursors receive a reconstructed screen and up to 2,000 lines of
+readable scrollback; scrollback formatting is not retained in this fallback.
 The fallback supports common VT screen modes and kitty keyboard state, but is
 not a full serialization of every Alacritty extension. Input is never retried
 after a network failure. Device queries are answered by the daemon, so an
