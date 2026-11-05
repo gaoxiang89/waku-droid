@@ -14,9 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
-## [unreleased]
+## [0.1.41]
 
 - Restore a terminal after reconnect or a desktop restart and keep typing: live output is re-armed on attach, a colliding create no longer silences the existing shell, and Windows ConPTY input survives resize instead of going dead while the snapshot still looks alive
+- Restart a terminal whose shell had exited when the session comes back, and detect a shell that exits on its own on Windows ConPTY so the pane stops claiming to be live
+- Move focus between split terminal panes with Alt+arrows, and reach mouse-aware terminal apps with the middle and right buttons
+- Place CJK input-method candidates at the text caret on Windows, and link and quote Windows paths with backslashes
+- Cut terminal overhead: a finished terminal frees its replay buffer, output takes one less copy, and snapshot rebuilds stop allocating per cell
 
 ## [0.1.40]
 
