@@ -231,12 +231,13 @@ const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-
 pub const SYMBOLS_FONT_FAMILY: &str = "Symbols Nerd Font Mono";
 
 pub fn register_fonts(cx: &App) -> Result<()> {
-    cx.text_system().add_fonts(
-        TEXT_FONTS
-            .iter()
-            .map(|font| Cow::Borrowed(*font))
-            .collect::<Vec<_>>(),
-    )?;
+    let mut fonts = TEXT_FONTS
+        .iter()
+        .map(|font| Cow::Borrowed(*font))
+        .collect::<Vec<_>>();
+    #[cfg(not(target_os = "macos"))]
+    fonts.push(Cow::Borrowed(SYMBOLS_FONT));
+    cx.text_system().add_fonts(fonts)?;
     crate::platform::register_fonts_with_coretext(&[SYMBOLS_FONT])
 }
 

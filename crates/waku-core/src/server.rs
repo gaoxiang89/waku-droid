@@ -414,14 +414,34 @@ impl Hub {
     /// subscriber's connection observes the kick, closes, and reconnects with
     /// replay cursors, so no event stream is lost permanently.
     fn broadcast(state: &mut HubState, message: &ServerMessage, skip: Option<u64>) {
+        let is_ephemeral_terminal_output = matches!(
+            message,
+            ServerMessage::Event(SequencedEvent {
+                event: WireDriverEvent { kind, .. },
+                ..
+            }) if kind == "terminalOutput"
+        );
         let mut overwhelmed = Vec::new();
         for (&subscriber_id, subscriber) in &state.subscribers {
             if Some(subscriber_id) == skip {
                 continue;
             }
+            if is_ephemeral_terminal_output
+                && subscriber.messages.len() >= MAX_QUEUED_MESSAGES_PER_SUBSCRIBER / 2
+            {
+                // Drop ephemeral terminal chunks when a subscriber's queue is
+                // past its high watermark rather than filling the queue and
+                // tearing down the entire WebSocket connection. The client's
+                // RemoteTerminal::pump detects the resulting offset gap and
+                // resynchronizes via AttachTerminal.
+                continue;
+            }
             if subscriber.messages.len() >= MAX_QUEUED_MESSAGES_PER_SUBSCRIBER
                 || subscriber.messages.try_send(message.clone()).is_err()
             {
+                if is_ephemeral_terminal_output {
+                    continue;
+                }
                 overwhelmed.push((subscriber_id, subscriber.kicked.clone()));
             }
         }
@@ -499,7 +519,7 @@ impl Hub {
         if matches!(
             &outcome,
             ResponseOutcome::Ok {
-                payload: ResponsePayload::BlobData { .. }
+                payload: ResponsePayload::BlobData { .. } | ResponsePayload::TerminalOutput { .. }
             }
         ) {
             return;

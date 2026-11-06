@@ -247,6 +247,17 @@ impl Waku {
             .into_any_element()
     }
 
+    pub(super) fn bottom_panel_pane_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let height = self.effective_bottom_panel_height(window);
+        let width = self.chat_viewport_width(window);
+        self.render_bottom_panel(height, width, window, cx)
+            .into_any_element()
+    }
+
     /// Measure live frame rate by counting renders over a sliding one-second
     /// window and keep requesting animation frames so the counter stays current.
     fn tick_fps(&mut self, window: &Window) {
@@ -473,18 +484,14 @@ impl Render for Waku {
                                                     element.overflow_hidden()
                                                 })
                                                 .child(
-                                                    div()
-                                                        .absolute()
-                                                        .bottom_0()
-                                                        .left_0()
-                                                        .w_full()
-                                                        .h(px(panels.bottom_panel_content))
-                                                        .child(self.render_bottom_panel(
-                                                            panels.bottom_panel_content,
-                                                            self.chat_viewport_width(window),
-                                                            window,
-                                                            cx,
-                                                        )),
+                                                    self.bottom_panel_pane.clone().cached(
+                                                        StyleRefinement::default()
+                                                            .absolute()
+                                                            .bottom_0()
+                                                            .left_0()
+                                                            .w_full()
+                                                            .h(px(panels.bottom_panel_content)),
+                                                    ),
                                                 ),
                                         )
                                     })

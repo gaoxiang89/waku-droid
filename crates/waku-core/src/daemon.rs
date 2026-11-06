@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     Backend, Command, EventSink, Request, ResponsePayload, WireDriverEvent, WorkspaceOperation,
@@ -835,26 +836,31 @@ impl Backend for WakuBackend {
                     "terminal dimensions out of range"
                 );
                 // A retried create must never replace a live shell.
-                let mut terminals = self.terminals.lock();
-                if let Some((owner, directory, existing)) = terminals.get(&session_id) {
-                    anyhow::ensure!(
-                        *owner == runtime_id && *directory == cwd,
-                        "terminal identity already exists"
-                    );
-                    if !existing.exited() {
-                        return Ok(ResponsePayload::Ack);
+                {
+                    let mut terminals = self.terminals.lock();
+                    if let Some((owner, directory, existing)) = terminals.get(&session_id) {
+                        anyhow::ensure!(
+                            *owner == runtime_id && *directory == cwd,
+                            "terminal identity already exists"
+                        );
+                        if !existing.exited() {
+                            return Ok(ResponsePayload::Ack);
+                        }
+                        terminals.remove(&session_id);
                     }
-                    terminals.remove(&session_id);
+                    if terminals.len() >= 256 {
+                        terminals
+                            .retain(|id, (_, _, terminal)| *id == session_id || !terminal.exited());
+                    }
+                    anyhow::ensure!(
+                        terminals.len() < 256,
+                        "too many terminal sessions; end unused sessions first"
+                    );
                 }
-                if terminals.len() >= 256 {
-                    terminals.retain(|id, (_, _, terminal)| *id == session_id || !terminal.exited());
-                }
-                anyhow::ensure!(
-                    terminals.len() < 256,
-                    "too many terminal sessions; end unused sessions first"
-                );
                 let terminal = self.open_terminal(&cwd, cols, rows, events)?;
-                terminals.insert(session_id, (runtime_id, cwd, terminal));
+                self.terminals
+                    .lock()
+                    .insert(session_id, (runtime_id, cwd, terminal));
                 Ok(ResponsePayload::Ack)
             }
             Command::ListTerminals => {
@@ -1999,10 +2005,15 @@ fn handle_driver_command(
 }
 
 fn ensure_shell_environment() {
-    static REFRESHED: OnceLock<()> = OnceLock::new();
-    REFRESHED.get_or_init(|| {
-        crate::command_env::refresh_from_default_shell();
-    });
+    static REFRESHED: AtomicBool = AtomicBool::new(false);
+    static REFRESH_LOCK: Mutex<()> = Mutex::new(());
+    if REFRESHED.load(Ordering::Acquire) {
+        return;
+    }
+    let _guard = REFRESH_LOCK.lock();
+    if !REFRESHED.load(Ordering::Acquire) && crate::command_env::refresh_from_default_shell() {
+        REFRESHED.store(true, Ordering::Release);
+    }
 }
 
 fn decode_enum<T: DeserializeOwned>(value: &str) -> anyhow::Result<T> {

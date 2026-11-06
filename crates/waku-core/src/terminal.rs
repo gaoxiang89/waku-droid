@@ -388,12 +388,14 @@ mod platform {
             return;
         }
         unsafe {
+            libc::kill(-child_pid, libc::SIGHUP);
             libc::kill(child_pid, libc::SIGHUP);
         }
         let deadline = Instant::now() + SHELL_SHUTDOWN_GRACE;
         while !child_has_exited(child_pid) {
             if Instant::now() >= deadline {
                 unsafe {
+                    libc::kill(-child_pid, libc::SIGKILL);
                     libc::kill(child_pid, libc::SIGKILL);
                 }
                 break;

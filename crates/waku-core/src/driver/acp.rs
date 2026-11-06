@@ -2293,15 +2293,33 @@ impl AcpTerminalProcess {
             self.output_truncated = true;
             return;
         }
+        if chunk.len() >= self.output_byte_limit {
+            let start = chunk.floor_char_boundary(chunk.len() - self.output_byte_limit);
+            self.output.clear();
+            self.output.push_str(&chunk[start..]);
+            self.output_truncated = true;
+            return;
+        }
         self.output.push_str(chunk);
         if self.output.len() > self.output_byte_limit {
-            let excess = self.output.len() - self.output_byte_limit;
-            let mut boundary = excess;
-            while boundary < self.output.len() && !self.output.is_char_boundary(boundary) {
-                boundary += 1;
-            }
-            self.output.drain(..boundary);
             self.output_truncated = true;
+            let slack = (self.output_byte_limit / 4).max(65_536);
+            if self.output.len() > self.output_byte_limit.saturating_add(slack) {
+                let excess = self.output.len() - self.output_byte_limit;
+                let boundary = self.output.ceil_char_boundary(excess);
+                self.output.drain(..boundary);
+            }
+        }
+    }
+
+    fn visible_output(&self) -> &str {
+        if self.output.len() <= self.output_byte_limit {
+            &self.output
+        } else {
+            let start = self
+                .output
+                .ceil_char_boundary(self.output.len() - self.output_byte_limit);
+            &self.output[start..]
         }
     }
 
@@ -2333,7 +2351,10 @@ impl AcpTerminalProcess {
             detail: None,
             command: Some(self.command_display.clone()),
             cwd: Some(self.cwd_display.clone()),
-            output: (!self.output.is_empty()).then(|| self.output.clone()),
+            output: {
+                let visible = self.visible_output();
+                (!visible.is_empty()).then(|| visible.to_owned())
+            },
             output_truncated: self.output_truncated,
             started_at_ms: self.started_at_ms,
             updated_at_ms: self.updated_at_ms,
@@ -2491,18 +2512,25 @@ impl AcpTerminalRegistry {
             entry.lock().to_background_work_item(),
         )));
 
-        if let Some(stdout) = child.stdout.take() {
-            Self::spawn_output_reader(id.clone(), stdout, entry.clone(), events.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            Self::spawn_output_reader(id.clone(), stderr, entry.clone(), events.clone());
-        }
+        let stdout_handle = child.stdout.take().and_then(|stdout| {
+            Self::spawn_output_reader(id.clone(), stdout, entry.clone(), events.clone())
+        });
+        let stderr_handle = child.stderr.take().and_then(|stderr| {
+            Self::spawn_output_reader(id.clone(), stderr, entry.clone(), events.clone())
+        });
         let wait_entry = entry;
         let wait_events = events.clone();
         let _ = thread::Builder::new()
             .name("waku-acp-term-wait".into())
             .spawn(move || {
-                let status = match child.wait() {
+                let wait_result = child.wait();
+                if let Some(handle) = stdout_handle {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
+                let status = match wait_result {
                     Ok(exit) => {
                         let code = exit.code().and_then(|code| u32::try_from(code).ok());
                         #[cfg(unix)]
@@ -2539,30 +2567,62 @@ impl AcpTerminalRegistry {
         mut reader: R,
         entry: Arc<Mutex<AcpTerminalProcess>>,
         events: DriverEventSender,
-    ) {
-        let _ = thread::Builder::new()
+    ) -> Option<thread::JoinHandle<()>> {
+        thread::Builder::new()
             .name("waku-acp-term-out".into())
             .spawn(move || {
                 let mut buffer = [0u8; 4096];
+                let mut pending_len = 0usize;
                 loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
+                    match reader.read(&mut buffer[pending_len..]) {
+                        Ok(0) | Err(_) => {
+                            if pending_len > 0 {
+                                let delta =
+                                    String::from_utf8_lossy(&buffer[..pending_len]).into_owned();
+                                entry.lock().append_output(&delta);
+                                let _ = events.send(DriverEvent::BackgroundWork(
+                                    BackgroundWorkEvent::OutputDelta {
+                                        key: BackgroundWorkKey::new(
+                                            BackgroundWorkKind::Process,
+                                            terminal_id.clone(),
+                                        ),
+                                        delta,
+                                    },
+                                ));
+                            }
+                            break;
+                        }
                         Ok(read) => {
-                            let delta = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                            entry.lock().append_output(&delta);
-                            let _ = events.send(DriverEvent::BackgroundWork(
-                                BackgroundWorkEvent::OutputDelta {
-                                    key: BackgroundWorkKey::new(
-                                        BackgroundWorkKind::Process,
-                                        terminal_id.clone(),
-                                    ),
-                                    delta,
-                                },
-                            ));
+                            let total = pending_len + read;
+                            let valid_len = match std::str::from_utf8(&buffer[..total]) {
+                                Ok(_) => total,
+                                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                                Err(_) => total,
+                            };
+                            if valid_len > 0 {
+                                let delta =
+                                    String::from_utf8_lossy(&buffer[..valid_len]).into_owned();
+                                entry.lock().append_output(&delta);
+                                let _ = events.send(DriverEvent::BackgroundWork(
+                                    BackgroundWorkEvent::OutputDelta {
+                                        key: BackgroundWorkKey::new(
+                                            BackgroundWorkKind::Process,
+                                            terminal_id.clone(),
+                                        ),
+                                        delta,
+                                    },
+                                ));
+                            }
+                            let leftover = total - valid_len;
+                            if leftover > 0 {
+                                buffer.copy_within(valid_len..total, 0);
+                            }
+                            pending_len = leftover;
                         }
                     }
                 }
-            });
+            })
+            .ok()
     }
 
     pub(crate) fn terminal_output(
@@ -2582,7 +2642,7 @@ impl AcpTerminalRegistry {
             })?;
         let proc = entry.lock();
         Ok(
-            TerminalOutputResponse::new(proc.output.clone(), proc.output_truncated)
+            TerminalOutputResponse::new(proc.visible_output().to_owned(), proc.output_truncated)
                 .exit_status(proc.exit_status.clone()),
         )
     }
@@ -2590,7 +2650,7 @@ impl AcpTerminalRegistry {
     pub(crate) fn output_text(&self, terminal_id: &str) -> Option<String> {
         let entry = self.terminals.lock().get(terminal_id).cloned()?;
         let proc = entry.lock();
-        let trimmed = proc.output.trim();
+        let trimmed = proc.visible_output().trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 

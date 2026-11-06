@@ -11,6 +11,7 @@ const REPLAY_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) struct TerminalState {
     parser: vt100::Parser<DeviceReplies>,
+    saved_primary: Option<Vec<u8>>,
     bytes: VecDeque<u8>,
     offset: u64,
     exited: bool,
@@ -27,6 +28,7 @@ impl TerminalState {
                 2000,
                 DeviceReplies::default(),
             ),
+            saved_primary: None,
             bytes: VecDeque::new(),
             offset: 0,
             exited: false,
@@ -36,9 +38,22 @@ impl TerminalState {
     }
 
     fn append(&mut self, bytes: &[u8]) {
+        let was_alternate = self.modes.alternate;
         self.mode_parser.advance(&mut self.modes, bytes);
         self.parser.callbacks_mut().1 = self.modes.keyboard.last().copied().unwrap_or(0);
-        self.parser.process(bytes);
+        if !was_alternate && self.modes.alternate {
+            let split = find_alt_screen_enter(bytes).unwrap_or(0);
+            if split > 0 {
+                self.parser.process(&bytes[..split]);
+            }
+            self.saved_primary = Some(format_screen_with_scrollback(self.parser.screen()));
+            self.parser.process(&bytes[split..]);
+        } else {
+            self.parser.process(bytes);
+            if !self.modes.alternate {
+                self.saved_primary = None;
+            }
+        }
         self.offset += bytes.len() as u64;
         self.bytes.extend(bytes);
         let excess = self.bytes.len().saturating_sub(REPLAY_BYTES);
@@ -60,38 +75,17 @@ impl TerminalState {
                 .copied()
                 .collect()
         } else {
-            let mut screen = self.parser.screen().clone();
-            let (_, cols) = screen.size();
-            screen.set_scrollback(usize::MAX);
-            let history = screen.scrollback();
+            let screen = self.parser.screen();
             let mut data = Vec::new();
-            // Scrollback is restored as readable text; the visible screen
-            // retains its formatting. Bound both independently of uptime.
-            for offset in (1..=history).rev() {
-                screen.set_scrollback(offset);
-                if let Some(row) = screen.rows(0, cols).next() {
-                    data.extend(row.trim_end_matches(' ').as_bytes());
-                }
-                data.extend(b"\r\n");
-            }
-            screen.set_scrollback(0);
-            if history > 0 {
-                let used_rows = screen
-                    .rows(0, cols)
-                    .enumerate()
-                    .filter(|(_, row)| !row.trim_end_matches(' ').is_empty())
-                    .last()
-                    .map(|(idx, _)| idx + 1)
-                    .unwrap_or(0)
-                    .max(usize::from(screen.cursor_position().0) + 1);
-                for _ in 0..used_rows.saturating_sub(1) {
-                    data.extend(b"\r\n");
-                }
-            }
             if screen.alternate_screen() {
-                data.extend(b"\x1b[?1049h");
+                if let Some(primary) = &self.saved_primary {
+                    data.extend_from_slice(primary);
+                }
+                data.extend_from_slice(b"\x1b[?1049h");
+                data.extend(screen.state_formatted());
+            } else {
+                data.extend(format_screen_with_scrollback(screen));
             }
-            data.extend(screen.state_formatted());
             for flags in &self.modes.keyboard {
                 data.extend(format!("\x1b[>{flags}u").as_bytes());
             }
@@ -99,6 +93,9 @@ impl TerminalState {
                 data.extend(b"\x1b]2;");
                 data.extend(title.as_bytes());
                 data.extend(b"\x1b\\");
+            }
+            if let Some(cwd_osc) = &self.parser.callbacks().3 {
+                data.extend_from_slice(cwd_osc);
             }
             data
         };
@@ -129,8 +126,50 @@ impl TerminalState {
     }
 }
 
+fn format_screen_with_scrollback(screen: &vt100::Screen) -> Vec<u8> {
+    let mut screen = screen.clone();
+    let (_, cols) = screen.size();
+    screen.set_scrollback(usize::MAX);
+    let history = screen.scrollback();
+    let mut data = Vec::new();
+    // Scrollback is restored as readable text; the visible screen retains its
+    // formatting. Bound both independently of uptime.
+    for offset in (1..=history).rev() {
+        screen.set_scrollback(offset);
+        if let Some(row) = screen.rows(0, cols).next() {
+            data.extend(row.trim_end_matches(' ').as_bytes());
+        }
+        data.extend(b"\r\n");
+    }
+    screen.set_scrollback(0);
+    if history > 0 {
+        let used_rows = screen
+            .rows(0, cols)
+            .enumerate()
+            .filter(|(_, row)| !row.trim_end_matches(' ').is_empty())
+            .last()
+            .map(|(idx, _)| idx + 1)
+            .unwrap_or(0)
+            .max(usize::from(screen.cursor_position().0) + 1);
+        for _ in 0..used_rows.saturating_sub(1) {
+            data.extend(b"\r\n");
+        }
+    }
+    data.extend(screen.state_formatted());
+    data
+}
+
+fn find_alt_screen_enter(bytes: &[u8]) -> Option<usize> {
+    for pattern in [&b"\x1b[?1049h"[..], &b"\x1b[?1047h"[..], &b"\x1b[?47h"[..]] {
+        if let Some(pos) = bytes.windows(pattern.len()).position(|w| w == pattern) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
 #[derive(Default)]
-struct DeviceReplies(Vec<u8>, u16, Option<String>);
+struct DeviceReplies(Vec<u8>, u16, Option<String>, Option<Vec<u8>>);
 impl vt100::Callbacks for DeviceReplies {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.2 = Some(
@@ -140,6 +179,25 @@ impl vt100::Callbacks for DeviceReplies {
                 .take(512)
                 .collect(),
         );
+    }
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        match params {
+            [b"7", uri, ..] if !uri.is_empty() && uri.len() <= 2048 => {
+                let mut osc = Vec::with_capacity(uri.len() + 6);
+                osc.extend_from_slice(b"\x1b]7;");
+                osc.extend_from_slice(uri);
+                osc.extend_from_slice(b"\x1b\\");
+                self.3 = Some(osc);
+            }
+            [b"9", b"9", path, ..] if !path.is_empty() && path.len() <= 2048 => {
+                let mut osc = Vec::with_capacity(path.len() + 8);
+                osc.extend_from_slice(b"\x1b]9;9;");
+                osc.extend_from_slice(path);
+                osc.extend_from_slice(b"\x1b\\");
+                self.3 = Some(osc);
+            }
+            _ => {}
+        }
     }
     fn unhandled_csi(
         &mut self,
@@ -252,13 +310,14 @@ impl TerminalEvents {
     /// `send_ephemeral` used to perform on its own output.
     pub fn send_output(&self, bytes: &[u8]) -> anyhow::Result<()> {
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        // Publish under the same lock as the snapshot, so its offset is an
-        // exact boundary between replay and queued live output.
-        let mut state = self.state.lock();
-        state.append(bytes);
+        let offset = {
+            let mut state = self.state.lock();
+            state.append(bytes);
+            state.offset
+        };
         let event = WireDriverEvent::new(
             "terminalOutput",
-            json!({ "data": data, "offset": state.offset }),
+            json!({ "data": data, "offset": offset }),
         );
         self.sink.send_ephemeral(event)
     }
@@ -324,5 +383,18 @@ mod tests {
         assert!(fresh.reset);
         assert!(fresh.exited);
         assert!(String::from_utf8_lossy(&fresh.data).contains("final line"));
+    }
+
+    #[test]
+    fn alt_screen_snapshot_preserves_primary_screen_and_cwd() {
+        let mut state = TerminalState::new(80, 24);
+        state.append(b"\x1b]7;file://localhost/tmp/work\x1b\\primary-before-alt\r\n");
+        state.append(b"\x1b[?1049halt-screen-view");
+        let snapshot = state.snapshot(None);
+        assert!(snapshot.reset);
+        let text = String::from_utf8_lossy(&snapshot.data);
+        assert!(text.contains("primary-before-alt"));
+        assert!(text.contains("alt-screen-view"));
+        assert!(text.contains("\x1b]7;file://localhost/tmp/work\x1b\\"));
     }
 }

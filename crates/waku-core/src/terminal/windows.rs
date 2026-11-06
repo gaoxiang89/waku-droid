@@ -118,7 +118,9 @@ impl DaemonTerminal {
                         Err(_) => break,
                     }
                 }
-                report_exit(&output, &exit_reported);
+                if !stopped.load(Ordering::Acquire) {
+                    report_exit(&output, &exit_reported);
+                }
             })
             .context("start terminal output")?;
 
@@ -137,7 +139,9 @@ impl DaemonTerminal {
                         .flatten()
                         .is_some();
                     if exited {
-                        report_exit(&watcher_output, &watcher_reported);
+                        if !watcher_stopped.load(Ordering::Acquire) {
+                            report_exit(&watcher_output, &watcher_reported);
+                        }
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(100));

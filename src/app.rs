@@ -1973,6 +1973,7 @@ pub struct Waku {
     transcript_pane: Entity<WakuPane>,
     right_panel_pane: Entity<WakuPane>,
     files_panel_pane: Entity<WakuPane>,
+    bottom_panel_pane: Entity<WakuPane>,
     /// The unix second the pending time-label wake-up targets, or `None` when
     /// none is armed. See `schedule_time_label_wake`.
     time_label_wake: Cell<Option<u64>>,
@@ -2507,6 +2508,7 @@ impl Waku {
         let transcript_pane = WakuPane::new(Waku::transcript_pane_content, cx);
         let right_panel_pane = WakuPane::new(Waku::right_panel_pane_content, cx);
         let files_panel_pane = WakuPane::new(Waku::files_panel_pane_content, cx);
+        let bottom_panel_pane = WakuPane::new(Waku::bottom_panel_pane_content, cx);
         let workspace_client = waku_client::WorkspaceClient::new(daemon.client());
         let (projectless_migrated, projectless_migration_error) =
             migrate_legacy_projectless_projects(&mut state, &workspace_client);
@@ -3661,6 +3663,7 @@ impl Waku {
                 transcript_pane: transcript_pane.clone(),
                 right_panel_pane: right_panel_pane.clone(),
                 files_panel_pane: files_panel_pane.clone(),
+                bottom_panel_pane: bottom_panel_pane.clone(),
                 time_label_wake: Cell::new(None),
                 time_label_wake_generation: Cell::new(0),
                 fps_last_frame: Instant::now(),
@@ -3674,6 +3677,7 @@ impl Waku {
             &transcript_pane,
             &right_panel_pane,
             &files_panel_pane,
+            &bottom_panel_pane,
         ] {
             pane.update(cx, |pane, cx| pane.bind(&entity, cx));
         }

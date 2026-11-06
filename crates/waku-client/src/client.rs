@@ -385,7 +385,7 @@ fn run_client(
                                     let sessions = inner.sessions.lock();
                                     if let Some(events) = sessions.get(&key) {
                                         let _ = events.send(event);
-                                    } else {
+                                    } else if event.event.kind != "terminalOutput" {
                                         let mut pending = inner.pending_events.lock();
                                         let buffered = pending.entry(key).or_default();
                                         buffered.push_back(event);

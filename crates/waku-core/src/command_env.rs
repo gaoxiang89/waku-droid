@@ -333,9 +333,14 @@ const WINDOWS_NO_PROFILE_ENV_TIMEOUT: Duration = Duration::from_secs(2);
 const WINDOWS_ENV_CAPTURE_COMMAND: &str = "\
 $ErrorActionPreference = 'Continue'
 $entries = [System.Collections.Generic.List[string]]::new()
-foreach ($name in @('PATH', 'FNM_DIR', 'FNM_MULTISHELL_PATH')) {
-  $value = [Environment]::GetEnvironmentVariable($name)
-  if ($value) { $entries.Add($name + '=' + $value) }
+$path = [Environment]::GetEnvironmentVariable('PATH')
+if ($path) { $entries.Add('PATH=' + $path) }
+foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+  $name = [string]$entry.Key
+  $value = [string]$entry.Value
+  if ($name -and $value -and $name -inotlike 'PATH' -and $name -inotlike 'WAKU_*') {
+    $entries.Add($name + '=' + $value)
+  }
 }
 foreach ($target in @('User', 'Machine')) {
   $value = [Environment]::GetEnvironmentVariable('PATH', $target)

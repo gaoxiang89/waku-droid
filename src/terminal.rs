@@ -89,10 +89,36 @@ static TERMINAL_FONT_FALLBACKS: LazyLock<FontFallbacks> = LazyLock::new(|| {
 
 fn terminal_font() -> gpui::Font {
     let mut terminal_font = font("JetBrains Mono");
-    terminal_font.fallbacks = Some(TERMINAL_FONT_FALLBACKS.clone());
+    if cfg!(target_os = "macos") {
+        terminal_font.fallbacks = Some(TERMINAL_FONT_FALLBACKS.clone());
+    }
     terminal_font
 }
 
+fn terminal_font_for_char(ch: char) -> gpui::Font {
+    if cfg!(windows) && is_nerd_font_fallback_char(ch) {
+        font(crate::assets::SYMBOLS_FONT_FAMILY)
+    } else {
+        terminal_font()
+    }
+}
+
+fn is_nerd_font_fallback_char(ch: char) -> bool {
+    let cp = ch as u32;
+    if matches!(cp, 0xE0A0..=0xE0A3 | 0xE0B0..=0xE0D4) {
+        return false;
+    }
+    matches!(
+        cp,
+        0x23FB..=0x23FE
+            | 0x2665
+            | 0x26A1
+            | 0x2B58
+            | 0xE000..=0xF8FF
+            | 0xF0000..=0xFFFFD
+            | 0x100000..=0x10FFFD
+    )
+}
 enum TerminalUiEvent {
     Title(String),
     ResetTitle,
@@ -257,6 +283,7 @@ struct AlertScanningPty {
     pty: tty::Pty,
     scanner: OscAlertScanner,
     ui_events: Sender<TerminalUiEvent>,
+    wake: smol::channel::Sender<()>,
 }
 
 impl std::io::Read for AlertScanningPty {
@@ -264,13 +291,16 @@ impl std::io::Read for AlertScanningPty {
         use alacritty_terminal::tty::EventedReadWrite as _;
         let read = self.pty.reader().read(buf)?;
         let ui_events = &self.ui_events;
+        let wake = &self.wake;
         self.scanner.feed(
             &buf[..read],
             |alert| {
                 let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
+                let _ = wake.try_send(());
             },
             |cwd| {
                 let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
+                let _ = wake.try_send(());
             },
         );
         Ok(read)
@@ -442,6 +472,7 @@ impl RemoteTerminal {
         term: Arc<FairMutex<Term<TerminalEventProxy>>>,
         dirty: Arc<AtomicBool>,
         ui_events: Sender<TerminalUiEvent>,
+        wake: smol::channel::Sender<()>,
         sender_slot: Arc<OnceLock<PtyInput>>,
         replaying: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
@@ -489,7 +520,11 @@ impl RemoteTerminal {
         let reader = remote.clone();
         std::thread::Builder::new()
             .name("waku-remote-terminal".into())
-            .spawn(move || reader.pump(client, events, term, dirty, ui_events, replaying, create))
+            .spawn(move || {
+                reader.pump(
+                    client, events, term, dirty, ui_events, wake, replaying, create,
+                )
+            })
             .context("start remote terminal reader")?;
         Ok(remote)
     }
@@ -501,6 +536,7 @@ impl RemoteTerminal {
         term: Arc<FairMutex<Term<TerminalEventProxy>>>,
         dirty: Arc<AtomicBool>,
         ui_events: Sender<TerminalUiEvent>,
+        wake: smol::channel::Sender<()>,
         replaying: Arc<AtomicBool>,
         create: bool,
     ) {
@@ -516,6 +552,7 @@ impl RemoteTerminal {
         let exited = |ui_events: &Sender<TerminalUiEvent>| {
             let _ = ui_events.send(TerminalUiEvent::Exited);
             dirty.store(true, Ordering::Release);
+            let _ = wake.try_send(());
         };
         loop {
             if self.closed.load(Ordering::Acquire) {
@@ -542,21 +579,31 @@ impl RemoteTerminal {
                                 rows: snapshot.rows as usize,
                             });
                         }
+                        alerts.feed(
+                            &snapshot.data,
+                            |_| {},
+                            |cwd| {
+                                let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
+                            },
+                        );
                         parser.advance(&mut *grid, &snapshot.data);
                         replaying.store(false, Ordering::Release);
-                        if snapshot.reset {
+                        let size_changed = snapshot.cols as usize != desired.0
+                            || snapshot.rows as usize != desired.1;
+                        if snapshot.reset && size_changed {
                             grid.resize(TerminalDimensions {
                                 columns: desired.0,
                                 rows: desired.1,
                             });
                         }
                         drop(grid);
-                        if snapshot.reset {
+                        if snapshot.reset && size_changed {
                             self.resize(desired.0 as u16, desired.1 as u16);
                         }
                         offset = snapshot.offset;
                         needs_snapshot = false;
                         dirty.store(true, Ordering::Release);
+                        let _ = wake.try_send(());
                         if snapshot.exited {
                             if initial_attach && !respawned {
                                 respawned = true;
@@ -669,9 +716,9 @@ impl RemoteTerminal {
                         );
                         parser.advance(&mut *term.lock(), bytes);
                         dirty.store(true, Ordering::Release);
+                        let _ = wake.try_send(());
                     }
                     "terminalExited" | "terminalError" => {
-                        self.closed.store(true, Ordering::Release);
                         exited(&ui_events);
                         return;
                     }
@@ -737,6 +784,7 @@ struct TerminalEventProxy {
     dirty: Arc<AtomicBool>,
     sender: Arc<OnceLock<PtyInput>>,
     ui_events: Sender<TerminalUiEvent>,
+    wake: Option<smol::channel::Sender<()>>,
     window_size: Arc<Mutex<WindowSize>>,
     /// Palette OSC replies run on the PTY thread; `snapshot` refreshes them
     /// so they track the active theme.
@@ -831,15 +879,27 @@ impl EventListener for TerminalEventProxy {
         match event {
             Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
                 self.dirty.store(true, Ordering::Release);
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
             Event::Title(title) => {
                 let _ = self.ui_events.send(TerminalUiEvent::Title(title));
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
             Event::ResetTitle => {
                 let _ = self.ui_events.send(TerminalUiEvent::ResetTitle);
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
             Event::ClipboardStore(_, text) => {
                 let _ = self.ui_events.send(TerminalUiEvent::ClipboardStore(text));
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
             Event::ClipboardLoad(_, _) => {}
             Event::PtyWrite(text) => self.write_pty(text.into_bytes()),
@@ -855,10 +915,16 @@ impl EventListener for TerminalEventProxy {
             }
             Event::Bell => {
                 let _ = self.ui_events.send(TerminalUiEvent::Alert(None));
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
             Event::Exit | Event::ChildExit(_) => {
                 let _ = self.ui_events.send(TerminalUiEvent::Exited);
                 self.dirty.store(true, Ordering::Release);
+                if let Some(wake) = &self.wake {
+                    let _ = wake.try_send(());
+                }
             }
         }
     }
@@ -906,6 +972,7 @@ impl TerminalSession {
         launcher: TerminalLauncher,
         reply_colors: TerminalReplyColors,
         identity: (uuid::Uuid, bool),
+        wake: smol::channel::Sender<()>,
     ) -> Result<Self> {
         let columns = columns.max(TERMINAL_MIN_COLUMNS);
         let rows = rows.max(TERMINAL_MIN_ROWS);
@@ -926,6 +993,7 @@ impl TerminalSession {
             dirty: dirty.clone(),
             sender: sender_slot.clone(),
             ui_events: ui_event_tx.clone(),
+            wake: Some(wake.clone()),
             window_size: shared_window_size.clone(),
             reply_colors: reply_colors.clone(),
         };
@@ -954,6 +1022,7 @@ impl TerminalSession {
                 term.clone(),
                 dirty.clone(),
                 ui_event_tx,
+                wake,
                 sender_slot,
                 proxy.replaying.clone(),
             )?;
@@ -998,6 +1067,7 @@ impl TerminalSession {
                 .with_context(|| format!("spawn terminal in {}", working_directory.display()))?,
             scanner: OscAlertScanner::default(),
             ui_events: ui_event_tx,
+            wake,
         };
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
             .context("create Alacritty PTY event loop")?;
@@ -1037,7 +1107,7 @@ impl TerminalSession {
 
         self.grid_size = (columns, rows);
         let dimensions = TerminalDimensions { columns, rows };
-        self.term.lock().resize(dimensions);
+        self.term.lock_unfair().resize(dimensions);
         let size = WindowSize {
             num_lines: rows.min(u16::MAX as usize) as u16,
             num_cols: columns.min(u16::MAX as usize) as u16,
@@ -1050,21 +1120,30 @@ impl TerminalSession {
     }
 
     fn mode(&self) -> TermMode {
-        *self.term.lock().mode()
+        *self.term.lock_unfair().mode()
     }
 
     fn scroll(&self, lines: i32) {
         if lines == 0 {
             return;
         }
-        self.term.lock().scroll_display(Scroll::Delta(lines));
+        self.term.lock_unfair().scroll_display(Scroll::Delta(lines));
         self.dirty.store(true, Ordering::Release);
     }
 
-    fn scroll_to_bottom(&self) {
-        let mut term = self.term.lock();
-        if term.grid().display_offset() != 0 {
+    fn scroll_display(&self, scroll: Scroll) {
+        self.term.lock_unfair().scroll_display(scroll);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn prepare_for_user_input(&self) {
+        let mut term = self.term.lock_unfair();
+        let mut changed = term.selection.take().is_some();
+        if !term.mode().contains(TermMode::ALT_SCREEN) && term.grid().display_offset() != 0 {
             term.scroll_display(Scroll::Bottom);
+            changed = true;
+        }
+        if changed {
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -1081,7 +1160,7 @@ impl TerminalSession {
         let TerminalSession {
             term, url_regex, ..
         } = self;
-        let term = term.lock();
+        let term = term.lock_unfair();
         let (value, bounds) =
             hyperlink_at(&term, point).or_else(|| plain_link_at(&term, url_regex, point))?;
         Some(TerminalLink { value, bounds })
@@ -1116,7 +1195,7 @@ impl TerminalSession {
             return cached_snapshot.clone();
         }
 
-        let term = self.term.lock();
+        let term = self.term.lock_unfair();
         let content = term.renderable_content();
         let selection = content.selection;
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
@@ -1130,7 +1209,13 @@ impl TerminalSession {
         } else {
             cursor_style
         };
-        let outline_cursor = (cursor_style == TerminalCursorStyle::Outline
+        let is_outline_cursor = cursor_style == TerminalCursorStyle::Outline
+            || (cursor_style == TerminalCursorStyle::Solid
+                && matches!(
+                    cursor_shape,
+                    alacritty_terminal::vte::ansi::CursorShape::HollowBlock
+                ));
+        let outline_cursor = (is_outline_cursor
             && (0..rows as i32).contains(&cursor_row)
             && cursor_column < columns)
             .then_some((cursor_row as usize, cursor_column));
@@ -1169,19 +1254,24 @@ impl TerminalSession {
                     foreground.l = 1.0 - (1.0 - foreground.l) * 0.7;
                 }
             }
+            let is_exact_fg = matches!(cell.fg, Color::Spec(_) | Color::Indexed(16..=255));
+            if !is_exact_fg && !is_decorative_terminal_char(ch) && ch != ' ' && ch != '\0' {
+                foreground = ensure_minimum_terminal_contrast(foreground, background);
+            }
             if selection.is_some_and(|selection| selection.contains(indexed.point)) {
                 background = selection_color;
                 foreground = theme.text;
             }
-            if cursor_style == TerminalCursorStyle::Solid
+            let under_solid_block_cursor = cursor_style == TerminalCursorStyle::Solid
                 && matches!(
                     cursor_shape,
                     alacritty_terminal::vte::ansi::CursorShape::Block
-                        | alacritty_terminal::vte::ansi::CursorShape::HollowBlock
                 )
                 && row == cursor_row
-                && column == cursor_column
-            {
+                && (column == cursor_column
+                    || (column == cursor_column + 1
+                        && cell.flags.contains(Flags::WIDE_CHAR_SPACER)));
+            if under_solid_block_cursor {
                 background = theme.text;
                 foreground = theme.terminal;
             }
@@ -1199,11 +1289,29 @@ impl TerminalSession {
             };
         }
 
-        let mut rendered_rows = Vec::with_capacity(rows);
-        for row in cells.chunks(columns) {
-            let mut text = String::with_capacity(columns);
-            let mut runs: Vec<TerminalRun> = Vec::new();
-            for cell in row {
+        let mut bg_rects: Vec<TerminalBgRect> = Vec::new();
+        let mut block_rects: Vec<TerminalSubcellRect> = Vec::new();
+        let mut batched_runs: Vec<TerminalBatchedRun> = Vec::new();
+
+        for (row_idx, row) in cells.chunks(columns).enumerate() {
+            let mut active_batch: Option<(usize, usize, bool, String, TextRun)> = None;
+
+            for (col_idx, cell) in row.iter().enumerate() {
+                if cell.background != theme.terminal {
+                    if let Some(last) = bg_rects.last_mut().filter(|r| {
+                        r.row == row_idx && r.end_col == col_idx && r.color == cell.background
+                    }) {
+                        last.end_col = col_idx + 1;
+                    } else {
+                        bg_rects.push(TerminalBgRect {
+                            row: row_idx,
+                            start_col: col_idx,
+                            end_col: col_idx + 1,
+                            color: cell.background,
+                        });
+                    }
+                }
+
                 if cell.ch == '\0' {
                     continue;
                 }
@@ -1211,60 +1319,114 @@ impl TerminalSession {
                     + cell
                         .zerowidth
                         .map_or(0, |zw| zw.iter().map(|c| c.len_utf8()).sum::<usize>());
-                text.push(cell.ch);
-                if let Some(zerowidth) = cell.zerowidth {
-                    text.extend(zerowidth);
+                let custom_drawn = collect_custom_terminal_glyph_rects(
+                    row_idx,
+                    col_idx,
+                    cell.ch,
+                    cell.foreground,
+                    &mut block_rects,
+                );
+                let draw_char = if custom_drawn { ' ' } else { cell.ch };
+                let is_blank_undecorated = draw_char == ' '
+                    && (custom_drawn || cell.zerowidth.is_none())
+                    && !cell.underline
+                    && !cell.strikeout;
+                if is_blank_undecorated {
+                    if let Some((start_col, _, _, batch_text, batch_style)) = active_batch.take() {
+                        batched_runs.push(TerminalBatchedRun {
+                            row: row_idx,
+                            start_col,
+                            text: SharedString::from(batch_text),
+                            style: batch_style,
+                        });
+                    }
+                    continue;
                 }
-                let style = TerminalRunStyle {
-                    foreground: cell.foreground,
-                    background: cell.background,
-                    bold: cell.bold,
-                    italic: cell.italic,
-                    underline: cell.underline,
-                    strikeout: cell.strikeout,
+
+                let mut run_font = terminal_font_for_char(draw_char);
+                if cell.bold {
+                    run_font.weight = FontWeight::BOLD;
+                }
+                if cell.italic {
+                    run_font.style = FontStyle::Italic;
+                }
+                let cell_text_run = TextRun {
+                    len: if custom_drawn { 1 } else { len },
+                    font: run_font,
+                    color: cell.foreground,
+                    background_color: None,
+                    underline: cell.underline.then_some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(cell.foreground),
+                        wavy: false,
+                    }),
+                    strikethrough: cell.strikeout.then_some(StrikethroughStyle {
+                        thickness: px(1.0),
+                        color: Some(cell.foreground),
+                    }),
                 };
-                if let Some(run) = runs.last_mut().filter(|run| run.style == style) {
-                    run.len += len;
-                } else {
-                    runs.push(TerminalRun { len, style });
+                let breaks_after = !draw_char.is_ascii()
+                    || is_wide_terminal_char(draw_char)
+                    || (!custom_drawn && cell.zerowidth.is_some_and(|zw| !zw.is_empty()));
+
+                if let Some((_, end_col, prev_breaks, batch_text, batch_style)) =
+                    active_batch.as_mut()
+                {
+                    if !*prev_breaks
+                        && !breaks_after
+                        && *end_col == col_idx
+                        && batch_style.font == cell_text_run.font
+                        && batch_style.color == cell_text_run.color
+                        && batch_style.underline == cell_text_run.underline
+                        && batch_style.strikethrough == cell_text_run.strikethrough
+                    {
+                        batch_text.push(draw_char);
+                        if !custom_drawn && let Some(zw) = cell.zerowidth {
+                            batch_text.extend(zw);
+                        }
+                        batch_style.len += cell_text_run.len;
+                        *end_col = col_idx + 1;
+                        *prev_breaks = breaks_after;
+                        continue;
+                    }
+                    let (start_col, _, _, batch_text, batch_style) = active_batch.take().unwrap();
+                    batched_runs.push(TerminalBatchedRun {
+                        row: row_idx,
+                        start_col,
+                        text: SharedString::from(batch_text),
+                        style: batch_style,
+                    });
                 }
+
+                let mut batch_text = String::with_capacity(16);
+                batch_text.push(draw_char);
+                if !custom_drawn && let Some(zw) = cell.zerowidth {
+                    batch_text.extend(zw);
+                }
+                active_batch = Some((
+                    col_idx,
+                    col_idx + 1,
+                    breaks_after,
+                    batch_text,
+                    cell_text_run,
+                ));
             }
-            let gpui_runs = runs
-                .iter()
-                .map(|run| {
-                    let mut run_font = terminal_font();
-                    if run.style.bold {
-                        run_font.weight = FontWeight::BOLD;
-                    }
-                    if run.style.italic {
-                        run_font.style = FontStyle::Italic;
-                    }
-                    TextRun {
-                        len: run.len,
-                        font: run_font,
-                        color: run.style.foreground,
-                        background_color: Some(run.style.background),
-                        underline: run.style.underline.then_some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(run.style.foreground),
-                            wavy: false,
-                        }),
-                        strikethrough: run.style.strikeout.then_some(StrikethroughStyle {
-                            thickness: px(1.0),
-                            color: Some(run.style.foreground),
-                        }),
-                    }
-                })
-                .collect();
-            rendered_rows.push(TerminalRow {
-                text: SharedString::from(text),
-                runs,
-                gpui_runs,
-            });
+
+            if let Some((start_col, _, _, batch_text, batch_style)) = active_batch.take() {
+                batched_runs.push(TerminalBatchedRun {
+                    row: row_idx,
+                    start_col,
+                    text: SharedString::from(batch_text),
+                    style: batch_style,
+                });
+            }
+
         }
 
         let snapshot = Arc::new(TerminalSnapshot {
-            rows: rendered_rows,
+            bg_rects,
+            block_rects,
+            batched_runs,
             outline_cursor,
             cursor_shape,
             cursor_position: ((0..rows as i32).contains(&cursor_row) && cursor_column < columns)
@@ -1297,18 +1459,18 @@ impl scrollbar::Scrollable for TerminalScrollbarTarget {
     }
 
     fn max_offset(&self) -> Pixels {
-        px(self.term.lock().grid().history_size() as f32 * TERMINAL_CELL_HEIGHT)
+        px(self.term.lock_unfair().grid().history_size() as f32 * TERMINAL_CELL_HEIGHT)
     }
 
     fn scrolled(&self) -> Pixels {
-        let term = self.term.lock();
+        let term = self.term.lock_unfair();
         let grid = term.grid();
         let lines_above = grid.history_size().saturating_sub(grid.display_offset());
         px(lines_above as f32 * TERMINAL_CELL_HEIGHT)
     }
 
     fn scroll_to(&self, offset: Pixels) {
-        let mut term = self.term.lock();
+        let mut term = self.term.lock_unfair();
         let target_offset = (term.grid().history_size() as f32
             - f32::from(offset) / TERMINAL_CELL_HEIGHT)
             .round()
@@ -1352,29 +1514,38 @@ impl TerminalCell<'_> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct TerminalRunStyle {
-    foreground: Hsla,
-    background: Hsla,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    strikeout: bool,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalBgRect {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    color: Hsla,
 }
 
-struct TerminalRun {
-    len: usize,
-    style: TerminalRunStyle,
+const TERMINAL_SUBCELL_COLS: usize = 8;
+const TERMINAL_SUBCELL_ROWS: usize = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalSubcellRect {
+    sub_col: usize,
+    sub_row: usize,
+    col_span: usize,
+    row_span: usize,
+    color: Hsla,
 }
 
-struct TerminalRow {
+#[derive(Clone)]
+struct TerminalBatchedRun {
+    row: usize,
+    start_col: usize,
     text: SharedString,
-    runs: Vec<TerminalRun>,
-    gpui_runs: Vec<TextRun>,
+    style: TextRun,
 }
 
 struct TerminalSnapshot {
-    rows: Vec<TerminalRow>,
+    bg_rects: Vec<TerminalBgRect>,
+    block_rects: Vec<TerminalSubcellRect>,
+    batched_runs: Vec<TerminalBatchedRun>,
     outline_cursor: Option<(usize, usize)>,
     cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
     cursor_position: Option<(usize, usize)>,
@@ -1868,6 +2039,8 @@ impl TerminalView {
             let (initial_columns, initial_rows) = this
                 .read_with(cx, |this, _| this.estimated_grid_size())
                 .unwrap_or((80, 24));
+            let (wake_tx, wake_rx) = smol::channel::bounded::<()>(1);
+            let _ = wake_tx.try_send(());
             let started = cx
                 .background_executor()
                 .spawn(async move {
@@ -1878,6 +2051,7 @@ impl TerminalView {
                         session_launcher,
                         reply_colors,
                         (persistent_id, create),
+                        wake_tx,
                     )
                 })
                 .await;
@@ -1895,10 +2069,7 @@ impl TerminalView {
             {
                 return;
             }
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(24))
-                    .await;
+            while wake_rx.recv().await.is_ok() {
                 let keep_polling = this
                     .update(cx, |this, cx| {
                         if this.poll(cx) {
@@ -1910,6 +2081,9 @@ impl TerminalView {
                 if !keep_polling {
                     break;
                 }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
             }
         })
         .detach();
@@ -2146,7 +2320,7 @@ impl TerminalView {
             self.copy_selection(cx);
             if !cfg!(target_os = "macos") && !keystroke.modifiers.shift {
                 if let Some(session) = &self.session {
-                    session.term.lock().selection = None;
+                    session.term.lock_unfair().selection = None;
                     session.dirty.store(true, Ordering::Release);
                     cx.notify();
                 }
@@ -2177,21 +2351,46 @@ impl TerminalView {
         }
 
         let mode = session.mode();
+        if !mode.contains(TermMode::ALT_SCREEN)
+            && !keystroke.modifiers.alt
+            && ((keystroke.modifiers.shift
+                && !keystroke.modifiers.control
+                && !keystroke.modifiers.platform)
+                || (cfg!(target_os = "macos")
+                    && keystroke.modifiers.platform
+                    && !keystroke.modifiers.control
+                    && !keystroke.modifiers.shift)
+                || (!cfg!(target_os = "macos")
+                    && keystroke.modifiers.control
+                    && keystroke.modifiers.shift
+                    && !keystroke.modifiers.platform))
+        {
+            let scroll = match keystroke.key.as_str() {
+                "pageup" => Some(Scroll::PageUp),
+                "pagedown" => Some(Scroll::PageDown),
+                "home" if !mode.contains(TermMode::APP_CURSOR) => Some(Scroll::Top),
+                "end" if !mode.contains(TermMode::APP_CURSOR) => Some(Scroll::Bottom),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                session.scroll_display(scroll);
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if let Some(bytes) = kitty_key_bytes(keystroke, event.is_held, mode) {
             self.kitty_reported_keys.insert(keystroke.key.clone());
-            session.term.lock().selection = None;
-            session.scroll_to_bottom();
+            session.prepare_for_user_input();
             session.write(bytes);
-            session.dirty.store(true, Ordering::Release);
             window.prevent_default();
             cx.stop_propagation();
             return;
         }
         if let Some(bytes) = terminal_key_bytes(keystroke, mode) {
-            session.term.lock().selection = None;
-            session.scroll_to_bottom();
+            session.prepare_for_user_input();
             session.write(bytes);
-            session.dirty.store(true, Ordering::Release);
             window.prevent_default();
             cx.stop_propagation();
         }
@@ -2241,7 +2440,7 @@ impl TerminalView {
     ) -> Option<(TerminalPoint, Side)> {
         let bounds = self.grid_bounds.get()?;
         let session = self.session.as_ref()?;
-        let display_offset = session.term.lock().grid().display_offset();
+        let display_offset = session.term.lock_unfair().grid().display_offset();
         terminal_grid_point(
             bounds,
             position,
@@ -2341,7 +2540,7 @@ impl TerminalView {
             return;
         };
 
-        let mut term = session.term.lock();
+        let mut term = session.term.lock_unfair();
         if event.modifiers.shift
             && let Some(selection) = term.selection.as_mut()
         {
@@ -2438,7 +2637,7 @@ impl TerminalView {
             return;
         };
 
-        if let Some(selection) = session.term.lock().selection.as_mut() {
+        if let Some(selection) = session.term.lock_unfair().selection.as_mut() {
             selection.update(point, side);
             session.dirty.store(true, Ordering::Release);
             cx.stop_propagation();
@@ -2509,7 +2708,7 @@ impl TerminalView {
         self.session
             .as_ref()?
             .term
-            .lock()
+            .lock_unfair()
             .selection_to_string()
             .filter(|text| !text.is_empty())
     }
@@ -2518,7 +2717,7 @@ impl TerminalView {
     /// composer's context block. `None` when nothing useful is selected.
     fn selection_context(&self) -> Option<TerminalSelectionContext> {
         let session = self.session.as_ref()?;
-        let term = session.term.lock();
+        let term = session.term.lock_unfair();
         let selection = term.selection.clone()?;
         let range = selection.to_range(&term)?;
         let text = term
@@ -2548,10 +2747,8 @@ impl TerminalView {
         let Some(session) = &self.session else {
             return;
         };
-        session.term.lock().selection = None;
-        session.scroll_to_bottom();
+        session.prepare_for_user_input();
         session.write(bracketed_paste(text, session.mode()));
-        session.dirty.store(true, Ordering::Release);
         cx.notify();
     }
 
@@ -2628,7 +2825,7 @@ impl TerminalView {
         let Some(session) = &self.session else {
             return;
         };
-        let mut term = session.term.lock();
+        let mut term = session.term.lock_unfair();
         let start = TerminalPoint::new(term.topmost_line(), Column(0));
         let end = TerminalPoint::new(term.bottommost_line(), term.last_column());
         let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
@@ -2781,10 +2978,8 @@ impl EntityInputHandler for TerminalView {
         if !text.is_empty()
             && let Some(session) = &self.session
         {
-            session.term.lock().selection = None;
-            session.scroll_to_bottom();
+            session.prepare_for_user_input();
             session.write(text.as_bytes().to_vec());
-            session.dirty.store(true, Ordering::Release);
         }
         window.invalidate_character_coordinates();
         cx.notify();
@@ -2946,23 +3141,23 @@ impl Render for TerminalView {
 
         if let Some(snapshot) = snapshot {
             let TerminalSnapshot {
-                rows: snapshot_rows,
                 outline_cursor,
                 cursor_shape,
                 cursor_position,
+                ..
             } = &*snapshot;
-            for row in snapshot_rows {
-                screen = screen.child(
-                    div()
-                        .h(px(TERMINAL_CELL_HEIGHT))
-                        .flex_none()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(TERMINAL_FONT_SIZE))
-                        .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text.clone()).with_runs(row.gpui_runs.clone())),
-                );
-            }
+            let paint_snapshot = snapshot.clone();
+            screen = screen.child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        paint_terminal_snapshot(&paint_snapshot, bounds, cell_width, window, cx);
+                    },
+                )
+                .w_full()
+                .h(px(rows as f32 * TERMINAL_CELL_HEIGHT))
+                .flex_none(),
+            );
             if cursor_style == TerminalCursorStyle::Solid
                 && let Some((row, column)) = *cursor_position
             {
@@ -3709,7 +3904,10 @@ fn mouse_report_with_state(
 
 fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
-        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        // Strip ESC and bracketed-paste closing markers so clipboard content
+        // cannot break out of the paste envelope and execute shell commands.
+        let sanitized = text.replace("\x1b[201~", "").replace('\x1b', "");
+        format!("\x1b[200~{sanitized}\x1b[201~").into_bytes()
     } else {
         text.into_bytes()
     }
@@ -4333,6 +4531,322 @@ fn terminal_rgb(index: usize, is_dark: bool) -> Rgb {
     }
 }
 
+fn paint_terminal_snapshot(
+    snapshot: &TerminalSnapshot,
+    bounds: Bounds<Pixels>,
+    cell_width: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    for rect in &snapshot.bg_rects {
+        let origin = gpui::point(
+            bounds.origin.x + px((rect.start_col as f32 * cell_width).floor()),
+            bounds.origin.y + px(rect.row as f32 * TERMINAL_CELL_HEIGHT),
+        );
+        let size = gpui::size(
+            px(((rect.end_col - rect.start_col) as f32 * cell_width).ceil()),
+            px(TERMINAL_CELL_HEIGHT),
+        );
+        window.paint_quad(gpui::fill(Bounds::new(origin, size), rect.color));
+    }
+    let sub_w = cell_width / TERMINAL_SUBCELL_COLS as f32;
+    let sub_h = TERMINAL_CELL_HEIGHT / TERMINAL_SUBCELL_ROWS as f32;
+    for rect in &snapshot.block_rects {
+        let origin = gpui::point(
+            bounds.origin.x + px((rect.sub_col as f32 * sub_w).floor()),
+            bounds.origin.y + px((rect.sub_row as f32 * sub_h).floor()),
+        );
+        let end_x = ((rect.sub_col + rect.col_span) as f32 * sub_w).ceil();
+        let end_y = ((rect.sub_row + rect.row_span) as f32 * sub_h).ceil();
+        let size = gpui::size(
+            px((end_x - (rect.sub_col as f32 * sub_w).floor()).max(1.0)),
+            px((end_y - (rect.sub_row as f32 * sub_h).floor()).max(1.0)),
+        );
+        window.paint_quad(gpui::fill(Bounds::new(origin, size), rect.color));
+    }
+    for run in &snapshot.batched_runs {
+        let pos = gpui::point(
+            bounds.origin.x + px(run.start_col as f32 * cell_width),
+            bounds.origin.y + px(run.row as f32 * TERMINAL_CELL_HEIGHT),
+        );
+        let _ = window
+            .text_system()
+            .shape_line(
+                run.text.clone(),
+                px(TERMINAL_FONT_SIZE),
+                std::slice::from_ref(&run.style),
+                Some(px(cell_width)),
+            )
+            .paint(
+                pos,
+                px(TERMINAL_CELL_HEIGHT),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+    }
+}
+
+/// Decorative connectors, blocks, and Powerline separators must keep their
+/// exact color so they blend seamlessly with adjacent cell backgrounds.
+fn is_decorative_terminal_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2500..=0x257F
+            | 0x2580..=0x259F
+            | 0x25A0..=0x25FF
+            | 0x1FB00..=0x1FB3B
+            | 0xE0B0..=0xE0D7
+    )
+}
+
+fn ensure_minimum_terminal_contrast(mut foreground: Hsla, background: Hsla) -> Hsla {
+    const MIN_LIGHTNESS_DELTA: f32 = 0.24;
+    let delta = (foreground.l - background.l).abs();
+    if delta >= MIN_LIGHTNESS_DELTA {
+        return foreground;
+    }
+    if background.l < 0.5 {
+        foreground.l = (background.l + MIN_LIGHTNESS_DELTA).min(1.0);
+    } else {
+        foreground.l = (background.l - MIN_LIGHTNESS_DELTA).max(0.0);
+    }
+    foreground
+}
+
+fn push_subcell_rect(
+    row: usize,
+    col: usize,
+    sub_x: usize,
+    sub_y: usize,
+    w: usize,
+    h: usize,
+    color: Hsla,
+    rects: &mut Vec<TerminalSubcellRect>,
+) {
+    let sub_col = col * TERMINAL_SUBCELL_COLS + sub_x;
+    let sub_row = row * TERMINAL_SUBCELL_ROWS + sub_y;
+    if let Some(last) = rects.last_mut().filter(|r| {
+        r.sub_row == sub_row
+            && r.row_span == h
+            && r.sub_col + r.col_span == sub_col
+            && r.color == color
+    }) {
+        last.col_span += w;
+        return;
+    }
+    rects.push(TerminalSubcellRect {
+        sub_col,
+        sub_row,
+        col_span: w,
+        row_span: h,
+        color,
+    });
+}
+
+fn collect_custom_terminal_glyph_rects(
+    row: usize,
+    col: usize,
+    ch: char,
+    color: Hsla,
+    rects: &mut Vec<TerminalSubcellRect>,
+) -> bool {
+    let cp = ch as u32;
+    match cp {
+        // Upper half block ▀
+        0x2580 => {
+            push_subcell_rect(row, col, 0, 0, 8, 12, color, rects);
+            true
+        }
+        // Lower 1..=8 eighths ▁▂▃▄▅▆▇█
+        0x2581..=0x2588 => {
+            let h = ((cp - 0x2580) * 3) as usize;
+            push_subcell_rect(row, col, 0, 24 - h, 8, h, color, rects);
+            true
+        }
+        // Left 7..=1 eighths ▉▊▋▌▍▎▏
+        0x2589..=0x258F => {
+            let w = (0x2590 - cp) as usize;
+            push_subcell_rect(row, col, 0, 0, w, 24, color, rects);
+            true
+        }
+        // Right half block ▐
+        0x2590 => {
+            push_subcell_rect(row, col, 4, 0, 4, 24, color, rects);
+            true
+        }
+        // Shades ░▒▓
+        0x2591..=0x2593 => {
+            let opacity = match cp {
+                0x2591 => 0.25,
+                0x2592 => 0.50,
+                _ => 0.75,
+            };
+            push_subcell_rect(row, col, 0, 0, 8, 24, color.opacity(opacity), rects);
+            true
+        }
+        // Upper one eighth ▔
+        0x2594 => {
+            push_subcell_rect(row, col, 0, 0, 8, 3, color, rects);
+            true
+        }
+        // Right one eighth ▕
+        0x2595 => {
+            push_subcell_rect(row, col, 7, 0, 1, 24, color, rects);
+            true
+        }
+        // Quadrants ▖▗▘▙▚▛▜▝▞▟
+        0x2596..=0x259F => {
+            let mask: u8 = match ch {
+                '▖' => 0b0100,
+                '▗' => 0b1000,
+                '▘' => 0b0001,
+                '▙' => 0b1101,
+                '▚' => 0b1001,
+                '▛' => 0b0111,
+                '▜' => 0b1011,
+                '▝' => 0b0010,
+                '▞' => 0b0110,
+                '▟' => 0b1110,
+                _ => return false,
+            };
+            for q_row in 0..2 {
+                for q_col in 0..2 {
+                    if mask & (1 << (q_row * 2 + q_col)) != 0 {
+                        push_subcell_rect(row, col, q_col * 4, q_row * 12, 4, 12, color, rects);
+                    }
+                }
+            }
+            true
+        }
+        // Legacy Computing Sextants U+1FB00..=U+1FB3B
+        0x1FB00..=0x1FB3B => {
+            let offset = cp - 0x1FB00;
+            let mask = (offset + 1 + u32::from(offset >= 20) + u32::from(offset >= 40)) as u8;
+            for s_row in 0..3 {
+                for s_col in 0..2 {
+                    if mask & (1 << (s_row * 2 + s_col)) != 0 {
+                        push_subcell_rect(row, col, s_col * 4, s_row * 8, 4, 8, color, rects);
+                    }
+                }
+            }
+            true
+        }
+        // Common Box Drawing lines & corners so vertical/horizontal borders have zero gaps
+        0x2500..=0x257F => collect_box_drawing_rects(row, col, ch, color, rects),
+        _ => false,
+    }
+}
+
+fn collect_box_drawing_rects(
+    row: usize,
+    col: usize,
+    ch: char,
+    color: Hsla,
+    rects: &mut Vec<TerminalSubcellRect>,
+) -> bool {
+    // (left, right, up, down) stroke weights: 0 = none, 1 = light, 2 = heavy, 3 = double
+    let (l, r, u, d) = match ch {
+        '─' => (1, 1, 0, 0),
+        '━' => (2, 2, 0, 0),
+        '│' => (0, 0, 1, 1),
+        '┃' => (0, 0, 2, 2),
+        '┌' | '╭' => (0, 1, 0, 1),
+        '┏' => (0, 2, 0, 2),
+        '┐' | '╮' => (1, 0, 0, 1),
+        '┓' => (2, 0, 0, 2),
+        '└' | '╰' => (0, 1, 1, 0),
+        '┗' => (0, 2, 2, 0),
+        '┘' | '╯' => (1, 0, 1, 0),
+        '┛' => (2, 0, 2, 0),
+        '├' => (0, 1, 1, 1),
+        '┣' => (0, 2, 2, 2),
+        '┤' => (1, 0, 1, 1),
+        '┫' => (2, 0, 2, 2),
+        '┬' => (1, 1, 0, 1),
+        '┳' => (2, 2, 0, 2),
+        '┴' => (1, 1, 1, 0),
+        '┻' => (2, 2, 2, 0),
+        '┼' => (1, 1, 1, 1),
+        '╋' => (2, 2, 2, 2),
+        '═' => (3, 3, 0, 0),
+        '║' => (0, 0, 3, 3),
+        '╔' => (0, 3, 0, 3),
+        '╗' => (3, 0, 0, 3),
+        '╚' => (0, 3, 3, 0),
+        '╝' => (3, 0, 3, 0),
+        '╠' => (0, 3, 3, 3),
+        '╣' => (3, 0, 3, 3),
+        '╦' => (3, 3, 0, 3),
+        '╩' => (3, 3, 3, 0),
+        '╬' => (3, 3, 3, 3),
+        '╴' => (1, 0, 0, 0),
+        '╵' => (0, 0, 1, 0),
+        '╶' => (0, 1, 0, 0),
+        '╷' => (0, 0, 0, 1),
+        '╸' => (2, 0, 0, 0),
+        '╹' => (0, 0, 2, 0),
+        '╺' => (0, 2, 0, 0),
+        '╻' => (0, 0, 0, 2),
+        _ => return false,
+    };
+
+    match (l, r) {
+        (1, 1) => push_subcell_rect(row, col, 0, 11, 8, 2, color, rects),
+        (2, 2) => push_subcell_rect(row, col, 0, 10, 8, 4, color, rects),
+        (3, 3) => {
+            push_subcell_rect(row, col, 0, 8, 8, 2, color, rects);
+            push_subcell_rect(row, col, 0, 14, 8, 2, color, rects);
+        }
+        _ => {
+            if l == 1 {
+                push_subcell_rect(row, col, 0, 11, 5, 2, color, rects);
+            } else if l == 2 {
+                push_subcell_rect(row, col, 0, 10, 5, 4, color, rects);
+            } else if l == 3 {
+                push_subcell_rect(row, col, 0, 8, 5, 2, color, rects);
+                push_subcell_rect(row, col, 0, 14, 5, 2, color, rects);
+            }
+            if r == 1 {
+                push_subcell_rect(row, col, 3, 11, 5, 2, color, rects);
+            } else if r == 2 {
+                push_subcell_rect(row, col, 3, 10, 5, 4, color, rects);
+            } else if r == 3 {
+                push_subcell_rect(row, col, 3, 8, 5, 2, color, rects);
+                push_subcell_rect(row, col, 3, 14, 5, 2, color, rects);
+            }
+        }
+    }
+    match (u, d) {
+        (1, 1) => push_subcell_rect(row, col, 3, 0, 2, 24, color, rects),
+        (2, 2) => push_subcell_rect(row, col, 2, 0, 4, 24, color, rects),
+        (3, 3) => {
+            push_subcell_rect(row, col, 1, 0, 2, 24, color, rects);
+            push_subcell_rect(row, col, 5, 0, 2, 24, color, rects);
+        }
+        _ => {
+            if u == 1 {
+                push_subcell_rect(row, col, 3, 0, 2, 13, color, rects);
+            } else if u == 2 {
+                push_subcell_rect(row, col, 2, 0, 4, 14, color, rects);
+            } else if u == 3 {
+                push_subcell_rect(row, col, 1, 0, 2, 16, color, rects);
+                push_subcell_rect(row, col, 5, 0, 2, 16, color, rects);
+            }
+            if d == 1 {
+                push_subcell_rect(row, col, 3, 11, 2, 13, color, rects);
+            } else if d == 2 {
+                push_subcell_rect(row, col, 2, 10, 4, 14, color, rects);
+            } else if d == 3 {
+                push_subcell_rect(row, col, 1, 8, 2, 16, color, rects);
+                push_subcell_rect(row, col, 5, 8, 2, 16, color, rects);
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::terminal_pane_chord as bottom_panel_pane_chord;
@@ -4355,6 +4869,7 @@ mod tests {
             dirty: Arc::new(AtomicBool::new(false)),
             sender: sender_slot,
             ui_events: ui_tx,
+            wake: None,
             window_size: Arc::new(Mutex::new(WindowSize {
                 num_cols: 40,
                 num_lines: 8,
@@ -4474,6 +4989,7 @@ mod tests {
                 dirty: dirty.clone(),
                 sender: Arc::new(OnceLock::new()),
                 ui_events: ui_tx,
+                wake: None,
                 window_size: window_size.clone(),
                 reply_colors: reply_colors.clone(),
             };
@@ -4636,6 +5152,7 @@ mod tests {
                 dirty: dirty.clone(),
                 sender: Arc::new(OnceLock::new()),
                 ui_events: ui_tx,
+                wake: None,
                 window_size: window_size.clone(),
                 reply_colors: reply_colors.clone(),
             };
@@ -5295,6 +5812,7 @@ mod tests {
             dirty: dirty.clone(),
             sender: Arc::new(OnceLock::new()),
             ui_events: ui_tx,
+            wake: None,
             window_size: window_size.clone(),
             reply_colors: reply_colors.clone(),
         };
@@ -5711,6 +6229,7 @@ mod tests {
             dirty: dirty.clone(),
             sender: Arc::new(OnceLock::new()),
             ui_events: ui_tx,
+            wake: None,
             window_size: window_size.clone(),
             reply_colors: reply_colors.clone(),
         };
@@ -5740,10 +6259,15 @@ mod tests {
         }
         let theme = Theme::dark();
         let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
-        // "中文" occupies 4 columns (6 UTF-8 bytes), "ok" 2 columns (2 bytes), and 4 trailing blank columns (4 bytes) remain.
-        assert_eq!(snapshot.rows[0].text.as_ref(), "中文ok    ");
-        let total_run_bytes: usize = snapshot.rows[0].runs.iter().map(|run| run.len).sum();
-        assert_eq!(total_run_bytes, snapshot.rows[0].text.len());
+        // "中文" occupies columns 0..4, "ok" columns 4..6. Each wide character
+        // is its own run so the renderer can advance it by two cells, "ok"
+        // shares one run, and the four trailing blank columns emit no text.
+        let runs: Vec<(usize, &str)> = snapshot
+            .batched_runs
+            .iter()
+            .map(|run| (run.start_col, run.text.as_ref()))
+            .collect();
+        assert_eq!(runs, vec![(0, "中"), (2, "文"), (4, "ok")]);
     }
 
     #[test]
@@ -5787,5 +6311,73 @@ mod tests {
         assert_eq!(utf16_prefix_columns("你好a", 1), 2);
         assert_eq!(utf16_prefix_columns("你好a", 2), 4);
         assert_eq!(utf16_prefix_columns("你好a", 3), 5);
+    }
+
+    #[test]
+    fn bracketed_paste_strips_injected_escape_sequences() {
+        assert_eq!(
+            bracketed_paste(
+                "safe\x1b[201~; rm -rf /\x1b[200~".into(),
+                TermMode::BRACKETED_PASTE
+            ),
+            b"\x1b[200~safe; rm -rf /[200~\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn custom_box_and_block_glyphs_produce_subcell_rects_and_cjk_splits_batches() {
+        let (sender, _written) = unbounded();
+        let dirty = Arc::new(AtomicBool::new(true));
+        let (ui_tx, ui_events) = unbounded();
+        let window_size = Arc::new(Mutex::new(WindowSize {
+            num_cols: 10,
+            num_lines: 2,
+            cell_width: 8,
+            cell_height: 18,
+        }));
+        let reply_colors = TerminalReplyColors::new(Theme::dark());
+        let proxy = TerminalEventProxy {
+            replaying: Arc::new(AtomicBool::new(false)),
+            dirty: dirty.clone(),
+            sender: Arc::new(OnceLock::new()),
+            ui_events: ui_tx,
+            wake: None,
+            window_size: window_size.clone(),
+            reply_colors: reply_colors.clone(),
+        };
+        let session = TerminalSession {
+            term: Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TerminalDimensions {
+                    columns: 10,
+                    rows: 2,
+                },
+                proxy,
+            ))),
+            sender: PtyInput::Test(sender),
+            dirty,
+            snapshot_dirty: AtomicBool::new(true),
+            cached_snapshot: Mutex::new(None),
+            ui_events,
+            window_size,
+            grid_size: (10, 2),
+            reply_colors,
+            url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+        };
+        {
+            let mut term = session.term.lock();
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut *term, "中a█─".as_bytes());
+        }
+        let theme = Theme::dark();
+        let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
+        // '中' is at col 0, 'a' is anchored at col 2 (not shifted by '中' advance),
+        // while '█' and '─' are rendered as subcell rects rather than text runs.
+        assert_eq!(snapshot.batched_runs.len(), 2);
+        assert_eq!(snapshot.batched_runs[0].start_col, 0);
+        assert_eq!(snapshot.batched_runs[0].text.as_ref(), "中");
+        assert_eq!(snapshot.batched_runs[1].start_col, 2);
+        assert_eq!(snapshot.batched_runs[1].text.as_ref(), "a");
+        assert!(!snapshot.block_rects.is_empty());
     }
 }

@@ -3,7 +3,7 @@ use super::terminal_split::{SplitAxis, SplitMember};
 use super::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 enum SavedPane {
     Pane {
         id: Uuid,
@@ -15,12 +15,12 @@ enum SavedPane {
         flexes: Vec<f32>,
     },
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct SavedGroup {
     root: SavedPane,
     active: Option<Uuid>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct SavedWorkspace {
     scope: PanelScope,
     bottom: Vec<SavedGroup>,
@@ -387,6 +387,7 @@ impl Waku {
             .cloned()
             .chain(active.clone())
             .collect();
+        let mut changed = false;
         for scope in scopes {
             // A host may still be reconnecting, or navigation may have
             // happened before the asynchronous load completed. Empty live
@@ -455,10 +456,17 @@ impl Waku {
                 .iter_mut()
                 .find(|s| s.scope == scope)
             {
-                *old = state;
+                if *old != state {
+                    *old = state;
+                    changed = true;
+                }
             } else {
                 self.terminal_layouts.saved.push(state);
+                changed = true;
             }
+        }
+        if !changed && done.is_none() {
+            return;
         }
         let bytes = serde_json::to_vec(&self.terminal_layouts.saved).unwrap_or_default();
         if bytes != self.terminal_layouts.last_bytes || done.is_some() {
