@@ -14,13 +14,14 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
-## [0.1.41]
+## [0.1.42]
 
-- Restore a terminal after reconnect or a desktop restart and keep typing: live output is re-armed on attach, a colliding create no longer silences the existing shell, and Windows ConPTY input survives resize instead of going dead while the snapshot still looks alive
+- Restore a terminal after reconnect or a desktop restart and keep typing: live output is re-armed on attach, a colliding create no longer silences the existing shell, and Windows ConPTY input survives resize instead of going dead while the snapshot still looks alive. Closing a Windows terminal releases the console, and a terminal still opens when Windows will not let the shell join a job
 - Restart a terminal whose shell had exited when the session comes back, and detect a shell that exits on its own on Windows ConPTY so the pane stops claiming to be live
-- Move focus between split terminal panes with Alt+arrows, and reach mouse-aware terminal apps with the middle and right buttons
-- Place CJK input-method candidates at the text caret on Windows, and link and quote Windows paths with backslashes
-- Cut terminal overhead: a finished terminal frees its replay buffer, output takes one less copy, and snapshot rebuilds stop allocating per cell
+- Move focus between split terminal panes with Alt+arrows, and reach mouse-aware terminal apps with the middle and right buttons. A new split opens in the directory the shell is actually in, and splitting the same way again shares that pane evenly
+- Place CJK input-method candidates at the text caret on Windows, link and quote Windows paths with backslashes, and keep colors aligned on CJK text, box drawing, and emoji. File links open at the reported line and column, and beam and underline cursors follow the program
+- Typing or pasting while scrolled up returns to the live prompt, and dragging a selection past the edge scrolls the history. On Windows and Linux, Ctrl+C copies when text is selected and still interrupts the shell when it is not
+- Cut terminal overhead: a finished terminal frees its replay buffer, output takes one less copy, and snapshot rebuilds stop allocating per cell. Reconnect snapshots no longer pad history with trailing spaces, and very wide terminals can resize past the old column limit
 
 ## [0.1.40]
 
