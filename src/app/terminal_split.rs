@@ -253,10 +253,12 @@ impl SplitMember {
                 if parent.axis == axis
                     && matches!(&parent.members[index], SplitMember::Pane(terminal) if terminal.entity_id() == target)
                 {
+                    let half = (parent.flexes[index] * 0.5).max(0.1);
+                    parent.flexes[index] = half;
                     parent
                         .members
                         .insert(index + 1, SplitMember::Pane(new_pane));
-                    parent.flexes.insert(index + 1, 1.0);
+                    parent.flexes.insert(index + 1, half);
                 } else {
                     parent.members[index].split_pane(target, new_pane, axis);
                 }

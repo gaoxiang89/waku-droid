@@ -888,7 +888,12 @@ impl Waku {
         cx.subscribe(
             terminal,
             |this, _, open_file: &crate::terminal::TerminalOpenFile, cx| {
-                this.open_terminal_file(&open_file.path, open_file.local_terminal, cx);
+                this.open_terminal_file(
+                    &open_file.path,
+                    open_file.location,
+                    open_file.local_terminal,
+                    cx,
+                );
             },
         )
         .detach();
@@ -1107,10 +1112,7 @@ impl Waku {
         if self.bottom_panel_terminal_groups[group_index].pane_count() >= MAX_SPLIT_PANES {
             return;
         }
-        let Some(working_directory) = self.selected_workspace_path() else {
-            return;
-        };
-        let working_directory = working_directory.to_path_buf();
+        let working_directory = pane.read(cx).working_directory().to_path_buf();
         let new_pane = self.new_bottom_panel_terminal(&working_directory, cx);
         let group = &mut self.bottom_panel_terminal_groups[group_index];
         if !group.split_pane(pane.entity_id(), new_pane, axis) {

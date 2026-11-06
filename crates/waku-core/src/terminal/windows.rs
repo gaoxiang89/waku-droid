@@ -10,20 +10,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+const CELL_WIDTH: u16 = 8;
+const CELL_HEIGHT: u16 = 16;
+
 enum DaemonTerminalInput {
     Write(Vec<u8>),
     Resize(PtySize),
+    Shutdown,
 }
 
 pub struct DaemonTerminal {
     job: Option<crate::process_tree::KillOnCloseJob>,
-    /// Kept so ConPTY outlives a writer thread that has already exited.
-    _master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// Kept so ConPTY outlives a writer thread that has already exited, and dropped
+    /// during `Drop` to close the pseudo-console and unblock `reader.read()`.
+    master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     input: Option<Sender<DaemonTerminalInput>>,
     output: TerminalEvents,
     stopped: Arc<AtomicBool>,
-    exit_reported: Arc<AtomicBool>,
 }
 
 impl DaemonTerminal {
@@ -52,18 +56,13 @@ impl DaemonTerminal {
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "waku");
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        let mut child = pair.slave.spawn_command(command)?;
-        let job = match child
+        let child = pair.slave.spawn_command(command)?;
+        // Nested job containers (Windows Sandbox, AppX, some enterprise hosts)
+        // may deny job assignment; keep the terminal working and rely on
+        // direct `child.kill()` in `Drop`.
+        let job = child
             .process_id()
-            .map(crate::process_tree::KillOnCloseJob::adopt)
-            .transpose()
-        {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                return Err(error.into());
-            }
-        };
+            .and_then(|pid| crate::process_tree::KillOnCloseJob::adopt(pid).ok());
         let child = Arc::new(Mutex::new(child));
         drop(pair.slave);
         let output = TerminalEvents::new(events, cols, rows);
@@ -73,14 +72,13 @@ impl DaemonTerminal {
         let exit_reported = Arc::new(AtomicBool::new(false));
         let terminal = Self {
             job,
-            _master: master.clone(),
+            master: Some(master.clone()),
             child,
-            input: Some(input),
+            input: Some(input.clone()),
             output: output.clone(),
             stopped: stopped.clone(),
-            exit_reported: exit_reported.clone(),
         };
-        let replies = terminal.input.as_ref().unwrap().clone();
+        let replies = input;
         let writer_events = output.clone();
         std::thread::Builder::new()
             .name("waku-terminal-input".into())
@@ -106,13 +104,13 @@ impl DaemonTerminal {
             .name("waku-terminal-output".into())
             .spawn(move || {
                 let mut buffer = [0u8; 32768];
-                loop {
+                while !stopped.load(Ordering::Acquire) {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(n) => {
                             let _ = output.send_output(&buffer[..n]);
                             let bytes = output.state.lock().take_replies();
-                            if !bytes.is_empty() {
+                            if !bytes.is_empty() && !stopped.load(Ordering::Acquire) {
                                 let _ = replies.send(DaemonTerminalInput::Write(bytes));
                             }
                         }
@@ -175,9 +173,13 @@ impl DaemonTerminal {
 impl Drop for DaemonTerminal {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(input) = self.input.take() {
+            let _ = input.send(DaemonTerminalInput::Shutdown);
+        }
         self.job.take();
-        self.input.take();
         let _ = self.child.lock().kill();
+        let _ = self.child.lock().try_wait();
+        self.master.take();
     }
 }
 
@@ -190,11 +192,13 @@ fn report_exit(output: &TerminalEvents, reported: &AtomicBool) {
     }
 }
 fn size(cols: u16, rows: u16) -> PtySize {
+    let cols = cols.max(2);
+    let rows = rows.max(1);
     PtySize {
-        cols: cols.max(2),
-        rows: rows.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
+        cols,
+        rows,
+        pixel_width: cols.saturating_mul(CELL_WIDTH),
+        pixel_height: rows.saturating_mul(CELL_HEIGHT),
     }
 }
 
@@ -220,9 +224,38 @@ fn run_terminal_input(
                     break;
                 }
             }
-            DaemonTerminalInput::Resize(size) => {
-                let _ = resize(size);
+            DaemonTerminalInput::Resize(mut latest_size) => {
+                // Coalesce back-to-back resizes queued during drag before
+                // invoking synchronous ConPTY `ResizePseudoConsole`, while
+                // preserving strict ordering relative to Write/Shutdown.
+                let mut stop = false;
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        DaemonTerminalInput::Resize(newer_size) => latest_size = newer_size,
+                        DaemonTerminalInput::Write(bytes) => {
+                            let _ = resize(latest_size);
+                            if !bytes.is_empty() {
+                                if let Err(error) =
+                                    writer.write_all(&bytes).and_then(|_| writer.flush())
+                                {
+                                    on_write_error(error);
+                                    return;
+                                }
+                            }
+                            // Resume outer loop after flushing the interleaved write.
+                            stop = true;
+                            break;
+                        }
+                        DaemonTerminalInput::Shutdown => {
+                            return;
+                        }
+                    }
+                }
+                if !stop {
+                    let _ = resize(latest_size);
+                }
             }
+            DaemonTerminalInput::Shutdown => break,
         }
     }
 }

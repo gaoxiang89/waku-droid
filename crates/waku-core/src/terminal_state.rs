@@ -61,7 +61,7 @@ impl TerminalState {
                 .collect()
         } else {
             let mut screen = self.parser.screen().clone();
-            let (rows, cols) = screen.size();
+            let (_, cols) = screen.size();
             screen.set_scrollback(usize::MAX);
             let history = screen.scrollback();
             let mut data = Vec::new();
@@ -70,16 +70,24 @@ impl TerminalState {
             for offset in (1..=history).rev() {
                 screen.set_scrollback(offset);
                 if let Some(row) = screen.rows(0, cols).next() {
-                    data.extend(row.as_bytes());
+                    data.extend(row.trim_end_matches(' ').as_bytes());
                 }
                 data.extend(b"\r\n");
             }
+            screen.set_scrollback(0);
             if history > 0 {
-                for _ in 0..rows.saturating_sub(1) {
+                let used_rows = screen
+                    .rows(0, cols)
+                    .enumerate()
+                    .filter(|(_, row)| !row.trim_end_matches(' ').is_empty())
+                    .last()
+                    .map(|(idx, _)| idx + 1)
+                    .unwrap_or(0)
+                    .max(usize::from(screen.cursor_position().0) + 1);
+                for _ in 0..used_rows.saturating_sub(1) {
                     data.extend(b"\r\n");
                 }
             }
-            screen.set_scrollback(0);
             if screen.alternate_screen() {
                 data.extend(b"\x1b[?1049h");
             }
@@ -243,11 +251,11 @@ impl TerminalEvents {
     /// event. Encoding once here avoids the daemon-side base64 decode that
     /// `send_ephemeral` used to perform on its own output.
     pub fn send_output(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         // Publish under the same lock as the snapshot, so its offset is an
         // exact boundary between replay and queued live output.
         let mut state = self.state.lock();
         state.append(bytes);
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         let event = WireDriverEvent::new(
             "terminalOutput",
             json!({ "data": data, "offset": state.offset }),

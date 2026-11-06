@@ -2497,13 +2497,19 @@ impl Waku {
     pub(super) fn open_terminal_file(
         &mut self,
         path: &Path,
+        location: Option<(usize, Option<usize>)>,
         local_terminal: bool,
         cx: &mut Context<Self>,
     ) {
+        let suffix = match location {
+            Some((line, Some(column))) => format!(":{line}:{column}"),
+            Some((line, None)) => format!(":{line}"),
+            None => String::new(),
+        };
         if !local_terminal {
-            self.open_transcript_link(&path.to_string_lossy(), cx);
+            self.open_transcript_link(&format!("{}{suffix}", path.to_string_lossy()), cx);
         } else if !path.is_dir() && self.selected_workspace_path().is_some() {
-            self.open_activity_file(&path.to_string_lossy(), cx);
+            self.open_activity_file(&format!("{}{suffix}", path.to_string_lossy()), cx);
         } else {
             crate::platform::reveal_in_file_manager(path, cx);
         }
@@ -3564,12 +3570,7 @@ impl Waku {
         axis: Axis,
         cx: &mut Context<Self>,
     ) {
-        let Some(working_directory) = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf)
-        else {
-            return;
-        };
+        let working_directory = pane.read(cx).working_directory().to_path_buf();
         let can_split = self
             .right_panel_terminal_groups
             .get(&terminal_id)

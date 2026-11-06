@@ -831,7 +831,7 @@ impl Backend for WakuBackend {
             }),
             Command::OpenTerminal { cwd, cols, rows } => {
                 anyhow::ensure!(
-                    (2..=1000).contains(&cols) && (1..=500).contains(&rows),
+                    (2..=4000).contains(&cols) && (1..=2000).contains(&rows),
                     "terminal dimensions out of range"
                 );
                 // A retried create must never replace a live shell.
@@ -898,7 +898,7 @@ impl Backend for WakuBackend {
             }
             Command::ResizeTerminal { cols, rows } => {
                 anyhow::ensure!(
-                    (2..=1000).contains(&cols) && (1..=500).contains(&rows),
+                    (2..=4000).contains(&cols) && (1..=2000).contains(&rows),
                     "terminal dimensions out of range"
                 );
                 let terminals = self.terminals.lock();

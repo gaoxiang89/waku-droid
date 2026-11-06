@@ -96,6 +96,7 @@ fn terminal_font() -> gpui::Font {
 enum TerminalUiEvent {
     Title(String),
     ResetTitle,
+    WorkingDirectory(PathBuf),
     ClipboardStore(String),
     /// BEL, or an OSC 9 / OSC 777 desktop notification (`None` for BEL).
     Alert(Option<TerminalAlert>),
@@ -134,7 +135,12 @@ enum OscScanState {
 impl OscAlertScanner {
     const MAX_PAYLOAD: usize = 4096;
 
-    fn feed(&mut self, bytes: &[u8], mut alert: impl FnMut(TerminalAlert)) {
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        mut alert: impl FnMut(TerminalAlert),
+        mut cwd: impl FnMut(PathBuf),
+    ) {
         for &byte in bytes {
             self.state = match (self.state, byte) {
                 (OscScanState::Ground, 0x1b) => OscScanState::Escape,
@@ -149,6 +155,8 @@ impl OscAlertScanner {
                 | (OscScanState::OscEscape, b'\\') => {
                     if let Some(found) = osc_alert(&self.payload) {
                         alert(found);
+                    } else if let Some(path) = osc_working_directory(&self.payload) {
+                        cwd(path);
                     }
                     OscScanState::Ground
                 }
@@ -196,6 +204,53 @@ fn osc_alert(payload: &[u8]) -> Option<TerminalAlert> {
     })
 }
 
+fn osc_working_directory(payload: &[u8]) -> Option<PathBuf> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    if let Some(uri) = payload.strip_prefix("7;") {
+        let url = url::Url::parse(uri.trim()).ok()?;
+        if url.scheme() != "file" {
+            return None;
+        }
+        if let Ok(path) = url.to_file_path() {
+            return Some(path);
+        }
+        let path = decode_percent_path(url.path())?;
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+        return None;
+    }
+    if let Some(path) = payload.strip_prefix("9;9;") {
+        let path = path.trim().trim_matches('"');
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn decode_percent_path(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The local PTY with its output passed through an [`OscAlertScanner`] on the
 /// way to Alacritty's event loop.
 struct AlertScanningPty {
@@ -209,9 +264,15 @@ impl std::io::Read for AlertScanningPty {
         use alacritty_terminal::tty::EventedReadWrite as _;
         let read = self.pty.reader().read(buf)?;
         let ui_events = &self.ui_events;
-        self.scanner.feed(&buf[..read], |alert| {
-            let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
-        });
+        self.scanner.feed(
+            &buf[..read],
+            |alert| {
+                let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
+            },
+            |cwd| {
+                let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
+            },
+        );
         Ok(read)
     }
 }
@@ -597,9 +658,15 @@ impl RemoteTerminal {
                         }
                         let bytes = &bytes[(offset - start) as usize..];
                         offset = end;
-                        alerts.feed(bytes, |alert| {
-                            let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
-                        });
+                        alerts.feed(
+                            bytes,
+                            |alert| {
+                                let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
+                            },
+                            |cwd| {
+                                let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
+                            },
+                        );
                         parser.advance(&mut *term.lock(), bytes);
                         dirty.store(true, Ordering::Release);
                     }
@@ -994,6 +1061,14 @@ impl TerminalSession {
         self.dirty.store(true, Ordering::Release);
     }
 
+    fn scroll_to_bottom(&self) {
+        let mut term = self.term.lock();
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
     fn take_dirty(&self) -> bool {
         let dirty = self.dirty.swap(false, Ordering::AcqRel);
         if dirty {
@@ -1046,8 +1121,9 @@ impl TerminalSession {
         let selection = content.selection;
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
         let cursor_column = content.cursor.point.column.0;
+        let cursor_shape = content.cursor.shape;
         let cursor_style = if matches!(
-            content.cursor.shape,
+            cursor_shape,
             alacritty_terminal::vte::ansi::CursorShape::Hidden
         ) {
             TerminalCursorStyle::Hidden
@@ -1098,6 +1174,11 @@ impl TerminalSession {
                 foreground = theme.text;
             }
             if cursor_style == TerminalCursorStyle::Solid
+                && matches!(
+                    cursor_shape,
+                    alacritty_terminal::vte::ansi::CursorShape::Block
+                        | alacritty_terminal::vte::ansi::CursorShape::HollowBlock
+                )
                 && row == cursor_row
                 && column == cursor_column
             {
@@ -1126,7 +1207,10 @@ impl TerminalSession {
                 if cell.ch == '\0' {
                     continue;
                 }
-                let len = 1 + cell.zerowidth.map_or(0, <[char]>::len);
+                let len = cell.ch.len_utf8()
+                    + cell
+                        .zerowidth
+                        .map_or(0, |zw| zw.iter().map(|c| c.len_utf8()).sum::<usize>());
                 text.push(cell.ch);
                 if let Some(zerowidth) = cell.zerowidth {
                     text.extend(zerowidth);
@@ -1145,15 +1229,44 @@ impl TerminalSession {
                     runs.push(TerminalRun { len, style });
                 }
             }
+            let gpui_runs = runs
+                .iter()
+                .map(|run| {
+                    let mut run_font = terminal_font();
+                    if run.style.bold {
+                        run_font.weight = FontWeight::BOLD;
+                    }
+                    if run.style.italic {
+                        run_font.style = FontStyle::Italic;
+                    }
+                    TextRun {
+                        len: run.len,
+                        font: run_font,
+                        color: run.style.foreground,
+                        background_color: Some(run.style.background),
+                        underline: run.style.underline.then_some(UnderlineStyle {
+                            thickness: px(1.0),
+                            color: Some(run.style.foreground),
+                            wavy: false,
+                        }),
+                        strikethrough: run.style.strikeout.then_some(StrikethroughStyle {
+                            thickness: px(1.0),
+                            color: Some(run.style.foreground),
+                        }),
+                    }
+                })
+                .collect();
             rendered_rows.push(TerminalRow {
                 text: SharedString::from(text),
                 runs,
+                gpui_runs,
             });
         }
 
         let snapshot = Arc::new(TerminalSnapshot {
             rows: rendered_rows,
             outline_cursor,
+            cursor_shape,
             cursor_position: ((0..rows as i32).contains(&cursor_row) && cursor_column < columns)
                 .then_some((cursor_row as usize, cursor_column)),
         });
@@ -1257,11 +1370,13 @@ struct TerminalRun {
 struct TerminalRow {
     text: SharedString,
     runs: Vec<TerminalRun>,
+    gpui_runs: Vec<TextRun>,
 }
 
 struct TerminalSnapshot {
     rows: Vec<TerminalRow>,
     outline_cursor: Option<(usize, usize)>,
+    cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
     cursor_position: Option<(usize, usize)>,
 }
 
@@ -1291,7 +1406,10 @@ struct TerminalLink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalLinkTarget {
     Url(String),
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        location: Option<(usize, Option<usize>)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1593,6 +1711,7 @@ impl EventEmitter<TerminalAttention> for TerminalView {}
 /// `local_terminal` pins which filesystem semantics produced the path.
 pub struct TerminalOpenFile {
     pub path: PathBuf,
+    pub location: Option<(usize, Option<usize>)>,
     pub local_terminal: bool,
 }
 
@@ -1932,6 +2051,7 @@ impl TerminalView {
             match event {
                 TerminalUiEvent::Title(title) => self.title = title,
                 TerminalUiEvent::ResetTitle => self.title = tr!("right_panel.terminal"),
+                TerminalUiEvent::WorkingDirectory(cwd) => self.working_directory = cwd,
                 TerminalUiEvent::ClipboardStore(text) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
                 }
@@ -2014,10 +2134,23 @@ impl TerminalView {
         {
             return;
         }
-        if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
+        if (terminal_clipboard_modifier_pressed(&keystroke.modifiers)
+            || (!cfg!(target_os = "macos")
+                && keystroke.modifiers.control
+                && !keystroke.modifiers.shift
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.platform
+                && self.selected_text().is_some()))
             && keystroke.key.eq_ignore_ascii_case("c")
         {
             self.copy_selection(cx);
+            if !cfg!(target_os = "macos") && !keystroke.modifiers.shift {
+                if let Some(session) = &self.session {
+                    session.term.lock().selection = None;
+                    session.dirty.store(true, Ordering::Release);
+                    cx.notify();
+                }
+            }
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -2047,6 +2180,7 @@ impl TerminalView {
         if let Some(bytes) = kitty_key_bytes(keystroke, event.is_held, mode) {
             self.kitty_reported_keys.insert(keystroke.key.clone());
             session.term.lock().selection = None;
+            session.scroll_to_bottom();
             session.write(bytes);
             session.dirty.store(true, Ordering::Release);
             window.prevent_default();
@@ -2055,6 +2189,7 @@ impl TerminalView {
         }
         if let Some(bytes) = terminal_key_bytes(keystroke, mode) {
             session.term.lock().selection = None;
+            session.scroll_to_bottom();
             session.write(bytes);
             session.dirty.store(true, Ordering::Release);
             window.prevent_default();
@@ -2173,8 +2308,9 @@ impl TerminalView {
             self.hovered_link = Some(link);
             match target {
                 TerminalLinkTarget::Url(url) => cx.open_url(&url),
-                TerminalLinkTarget::File(path) => cx.emit(TerminalOpenFile {
+                TerminalLinkTarget::File { path, location } => cx.emit(TerminalOpenFile {
                     path,
+                    location,
                     local_terminal: self.launcher.is_local(),
                 }),
             }
@@ -2281,6 +2417,19 @@ impl TerminalView {
                 cx.notify();
             }
             return;
+        }
+        if let Some(bounds) = self.grid_bounds.get()
+            && let Some(session) = &self.session
+        {
+            let y = f32::from(event.position.y - bounds.origin.y);
+            let max_y = session.grid_size.1 as f32 * TERMINAL_CELL_HEIGHT;
+            if y < 0.0 {
+                let lines = (( -y / TERMINAL_CELL_HEIGHT).ceil() as i32).clamp(1, 5);
+                session.scroll(lines);
+            } else if y > max_y {
+                let lines = -(((y - max_y) / TERMINAL_CELL_HEIGHT).ceil() as i32).clamp(1, 5);
+                session.scroll(lines);
+            }
         }
         let Some((point, side)) = self.grid_point_for_position(event.position, true) else {
             return;
@@ -2400,6 +2549,7 @@ impl TerminalView {
             return;
         };
         session.term.lock().selection = None;
+        session.scroll_to_bottom();
         session.write(bracketed_paste(text, session.mode()));
         session.dirty.store(true, Ordering::Release);
         cx.notify();
@@ -2632,6 +2782,7 @@ impl EntityInputHandler for TerminalView {
             && let Some(session) = &self.session
         {
             session.term.lock().selection = None;
+            session.scroll_to_bottom();
             session.write(text.as_bytes().to_vec());
             session.dirty.store(true, Ordering::Release);
         }
@@ -2797,37 +2948,10 @@ impl Render for TerminalView {
             let TerminalSnapshot {
                 rows: snapshot_rows,
                 outline_cursor,
+                cursor_shape,
                 cursor_position,
             } = &*snapshot;
             for row in snapshot_rows {
-                let runs = row
-                    .runs
-                    .iter()
-                    .map(|run| {
-                        let mut run_font = terminal_font();
-                        if run.style.bold {
-                            run_font.weight = FontWeight::BOLD;
-                        }
-                        if run.style.italic {
-                            run_font.style = FontStyle::Italic;
-                        }
-                        TextRun {
-                            len: run.len,
-                            font: run_font,
-                            color: run.style.foreground,
-                            background_color: Some(run.style.background),
-                            underline: run.style.underline.then_some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: Some(run.style.foreground),
-                                wavy: false,
-                            }),
-                            strikethrough: run.style.strikeout.then_some(StrikethroughStyle {
-                                thickness: px(1.0),
-                                color: Some(run.style.foreground),
-                            }),
-                        }
-                    })
-                    .collect::<Vec<_>>();
                 screen = screen.child(
                     div()
                         .h(px(TERMINAL_CELL_HEIGHT))
@@ -2836,8 +2960,37 @@ impl Render for TerminalView {
                         .whitespace_nowrap()
                         .text_size(px(TERMINAL_FONT_SIZE))
                         .line_height(px(TERMINAL_CELL_HEIGHT))
-                        .child(StyledText::new(row.text.clone()).with_runs(runs)),
+                        .child(StyledText::new(row.text.clone()).with_runs(row.gpui_runs.clone())),
                 );
+            }
+            if cursor_style == TerminalCursorStyle::Solid
+                && let Some((row, column)) = *cursor_position
+            {
+                match cursor_shape {
+                    alacritty_terminal::vte::ansi::CursorShape::Beam => {
+                        screen = screen.child(
+                            div()
+                                .absolute()
+                                .left(px(column as f32 * cell_width))
+                                .top(px(row as f32 * TERMINAL_CELL_HEIGHT))
+                                .w(px(2.0))
+                                .h(px(TERMINAL_CELL_HEIGHT))
+                                .bg(theme.text),
+                        );
+                    }
+                    alacritty_terminal::vte::ansi::CursorShape::Underline => {
+                        screen = screen.child(
+                            div()
+                                .absolute()
+                                .left(px(column as f32 * cell_width))
+                                .top(px((row + 1) as f32 * TERMINAL_CELL_HEIGHT - 2.0))
+                                .w(px(cell_width))
+                                .h(px(2.0))
+                                .bg(theme.text),
+                        );
+                    }
+                    _ => {}
+                }
             }
             if let Some((row, column)) = *outline_cursor {
                 screen = screen.child(
@@ -3296,8 +3449,10 @@ fn terminal_link_target(
     working_directory: &Path,
     local_terminal: bool,
 ) -> Option<TerminalLinkTarget> {
-    if let Some(path) = terminal_file_path(value, working_directory, local_terminal) {
-        return Some(TerminalLinkTarget::File(path));
+    if let Some((path, location)) =
+        terminal_file_path_with_location(value, working_directory, local_terminal)
+    {
+        return Some(TerminalLinkTarget::File { path, location });
     }
 
     let url = url::Url::parse(value).ok()?;
@@ -3355,11 +3510,12 @@ fn is_wide_terminal_char(ch: char) -> bool {
     )
 }
 
-fn terminal_file_path(
+fn terminal_file_path_with_location(
     value: &str,
     working_directory: &Path,
     local_terminal: bool,
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, Option<(usize, Option<usize>)>)> {
+    let location = crate::md::parser::parse_file_location(value).1;
     let url_parsed = (!has_windows_drive_prefix(value))
         .then(|| url::Url::parse(value).ok())
         .flatten();
@@ -3417,7 +3573,7 @@ fn terminal_file_path(
     if local_terminal {
         loop {
             if path.exists() {
-                return Some(path);
+                return Some((path, location));
             }
             let value = path.to_string_lossy();
             let (prefix, suffix) = value.rsplit_once(':')?;
@@ -3431,10 +3587,10 @@ fn terminal_file_path(
     loop {
         let value = path.to_string_lossy();
         let Some((prefix, suffix)) = value.rsplit_once(':') else {
-            return Some(path);
+            return Some((path, location));
         };
         if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Some(path);
+            return Some((path, location));
         }
         path = PathBuf::from(prefix);
     }
@@ -4705,9 +4861,10 @@ mod tests {
         );
         assert_eq!(
             terminal_link_target("src/terminal.rs:42:8", working_directory, true),
-            Some(TerminalLinkTarget::File(
-                working_directory.join("src/terminal.rs")
-            ))
+            Some(TerminalLinkTarget::File {
+                path: working_directory.join("src/terminal.rs"),
+                location: Some((42, Some(8))),
+            })
         );
         assert_eq!(
             terminal_link_target("src/does-not-exist.rs", working_directory, true),
@@ -4724,15 +4881,21 @@ mod tests {
                 working_directory,
                 false
             ),
-            Some(TerminalLinkTarget::File(PathBuf::from(
-                "/home/waku/project/src/main.rs"
-            )))
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("/home/waku/project/src/main.rs"),
+                location: Some((42, Some(8))),
+            })
         );
         let remote_relative = terminal_link_target("src/main.rs:42", working_directory, false)
             .expect("remote relative path resolves");
-        let TerminalLinkTarget::File(remote_relative) = remote_relative else {
+        let TerminalLinkTarget::File {
+            path: remote_relative,
+            location,
+        } = remote_relative
+        else {
             panic!("expected a file link");
         };
+        assert_eq!(location, Some((42, None)));
         // PathBuf equality treats both separators alike on Windows, so pin
         // the string the remote route actually receives.
         assert_eq!(
@@ -4745,13 +4908,17 @@ mod tests {
                 working_directory,
                 false
             ),
-            Some(TerminalLinkTarget::File(PathBuf::from(
-                "/home/waku/project/src/main.rs"
-            )))
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("/home/waku/project/src/main.rs"),
+                location: None,
+            })
         );
         assert_eq!(
             terminal_link_target("~/src/main.rs", working_directory, false),
-            Some(TerminalLinkTarget::File(PathBuf::from("~/src/main.rs")))
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("~/src/main.rs"),
+                location: None,
+            })
         );
         assert_eq!(
             terminal_link_target(
@@ -4925,13 +5092,15 @@ mod tests {
     fn scans_osc_notifications_across_reads_and_skips_conemu() {
         let mut scanner = OscAlertScanner::default();
         let mut found = Vec::new();
+        let mut cwds = Vec::new();
         for chunk in [
             &b"out\x1b]9;Agent turn com"[..],
             b"plete\x07\x1b]9;4;3;0\x07\x1b]9;9;C:\\\x1b\\",
             b"\x1b]777;notify;Codex;Approval needed\x1b\\\x1b]0;title\x07",
         ] {
-            scanner.feed(chunk, |alert| found.push(alert));
+            scanner.feed(chunk, |alert| found.push(alert), |cwd| cwds.push(cwd));
         }
+        assert_eq!(cwds, vec![PathBuf::from("C:\\")]);
         assert_eq!(
             found,
             vec![
@@ -5571,17 +5740,26 @@ mod tests {
         }
         let theme = Theme::dark();
         let snapshot = session.snapshot(theme, theme.selection, TerminalCursorStyle::Outline, None);
-        // "中文" occupies 4 columns, "ok" 2 columns, and 4 trailing blank columns remain.
+        // "中文" occupies 4 columns (6 UTF-8 bytes), "ok" 2 columns (2 bytes), and 4 trailing blank columns (4 bytes) remain.
         assert_eq!(snapshot.rows[0].text.as_ref(), "中文ok    ");
+        let total_run_bytes: usize = snapshot.rows[0].runs.iter().map(|run| run.len).sum();
+        assert_eq!(total_run_bytes, snapshot.rows[0].text.len());
     }
 
     #[test]
     fn osc_scanner_recovers_when_unclosed_osc_is_followed_by_another_osc() {
         let mut scanner = OscAlertScanner::default();
         let mut found = Vec::new();
-        scanner.feed(b"\x1b]0;unclosed\x1b]9;Recovered alert\x07", |alert| {
-            found.push(alert);
-        });
+        let mut cwds = Vec::new();
+        scanner.feed(
+            b"\x1b]0;unclosed\x1b]9;Recovered alert\x07\x1b]7;file://localhost/tmp/work\x1b\\",
+            |alert| {
+                found.push(alert);
+            },
+            |cwd| {
+                cwds.push(cwd);
+            },
+        );
         assert_eq!(
             found,
             vec![TerminalAlert {
@@ -5589,6 +5767,8 @@ mod tests {
                 body: "Recovered alert".to_owned(),
             }]
         );
+        assert_eq!(cwds.len(), 1);
+        assert!(cwds[0].to_string_lossy().ends_with("work"));
     }
 
     #[test]
