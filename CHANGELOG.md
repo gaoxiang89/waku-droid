@@ -14,6 +14,17 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.43]
+
+- Keep terminal text on its grid: CJK, emoji, and Nerd Font icons no longer push the rest of the line sideways, so the cursor, the selection, and the IME candidate window stay where the text actually is. Box-drawing and block characters are drawn as exact geometry, so TUI borders and panels meet without seams, and the bundled icon font renders on Windows and Linux without installing it
+- Stop a flooding command from taking the app down with it: terminal output that outruns the connection is dropped and resynchronized instead of closing the socket, so agent turns and other terminals keep running
+- Restore a terminal running a full-screen app — `vim`, `htop`, a full-screen agent TUI — with the screen underneath it and the shell's current directory intact
+- Cut idle terminal cost: a pane no longer wakes the UI forty times a second while nothing is happening, and the bottom panel no longer rebuilds whenever another part of the window repaints
+- Scroll terminal history from the keyboard with Shift+PageUp, Shift+PageDown, Shift+Home, and Shift+End
+- Paste safely: pasted text can no longer break out of the paste envelope and run commands
+- Read agent terminal output correctly: commands that print non-ASCII text no longer garble it, and the last lines of a command are no longer lost when it exits
+- Inherit the whole Windows shell environment from the PowerShell profile, including proxies and toolchain variables beyond `PATH`
+
 ## [0.1.42]
 
 - Restore a terminal after reconnect or a desktop restart and keep typing: live output is re-armed on attach, a colliding create no longer silences the existing shell, and Windows ConPTY input survives resize instead of going dead while the snapshot still looks alive. Closing a Windows terminal releases the console, and a terminal still opens when Windows will not let the shell join a job
