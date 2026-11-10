@@ -745,7 +745,7 @@ impl Waku {
 
         let can_choose_model = self
             .selected_session()
-            .is_some_and(|session| session.can_choose_model(session.provider));
+            .is_some_and(|session| session.can_choose_model());
         if can_choose_model {
             commands.push(CommandPaletteItem::command(
                 display_section(PaletteSection::Suggested),

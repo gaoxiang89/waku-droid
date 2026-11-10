@@ -265,7 +265,10 @@ impl Waku {
                     {
                         session.mark_active_turn_provider_resume_at(message_id.clone());
                     }
-                    session.provider_cursor = provider_cursor;
+                    // The live cursor belongs to the agent that just connected;
+                    // any parked cursor for that same agent is stale, so it is
+                    // replaced rather than kept as a second resume point.
+                    session.set_live_provider_cursor(provider_cursor);
                     if session.status == SessionStatus::Connecting {
                         session.status = SessionStatus::Working;
                     }

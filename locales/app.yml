@@ -676,6 +676,22 @@ session.reverting_message:
   en: Reverting message…
 session.reverting_message_title:
   en: Reverting Message…
+session.agent_switch_carried_one:
+  en: Switched to %{provider}. 1 earlier turn will be carried over as context.
+session.agent_switch_carried_many:
+  en: Switched to %{provider}. %{count} earlier turns will be carried over as context.
+session.agent_switch_resumed:
+  en: Switched back to %{provider}, which resumes its own conversation.
+session.handoff_notice_one:
+  en: "Continuing with %{provider}: 1 earlier turn from %{agents} is carried over as context. Tool state and reasoning are not."
+session.handoff_notice_many:
+  en: "Continuing with %{provider}: %{count} earlier turns from %{agents} are carried over as context. Tool state and reasoning are not."
+session.handoff_notice_resumed_one:
+  en: "Back with %{provider}, resuming its own conversation: 1 turn it had not seen is carried over as context."
+session.handoff_notice_resumed_many:
+  en: "Back with %{provider}, resuming its own conversation: %{count} turns it had not seen are carried over as context."
+session.handoff_notice_omitted:
+  en: "%{count} older turns did not fit this model's context window and stayed in the app."
 
 time.yesterday_at:
   en: Yesterday %{time}

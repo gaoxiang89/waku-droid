@@ -132,6 +132,9 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         started_at: timestamp,
         completed_at: None,
         checkpoint: None,
+        provider: None,
+        handoff: None,
+        handoff_preamble: None,
     });
     id
 }

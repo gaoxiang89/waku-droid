@@ -2046,7 +2046,7 @@ fn computer_use_navigation_is_debug_only() {
 }
 
 #[test]
-fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
+fn switched_off_providers_leave_the_picker() {
     use super::ModelPickerTab;
     use super::composer::visible_picker_models;
     use crate::model::{FavoriteModel, ProviderModel, ProviderProbe};
@@ -2070,11 +2070,12 @@ fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
     let disabled = [ProviderKind::Claude];
 
     // Provider tab and favorites both stop offering the switched-off provider.
+    // A task may change agents between turns, so no session is exempt: a
+    // switched-off agent offers nothing to any task, including one it started.
     let models = visible_picker_models(
         &probes,
         &favorites,
         &disabled,
-        None,
         ModelPickerTab::Provider(ProviderKind::Claude),
         "",
     );
@@ -2083,7 +2084,6 @@ fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
         &probes,
         &favorites,
         &disabled,
-        None,
         ModelPickerTab::Favorites,
         "",
     );
@@ -2092,7 +2092,6 @@ fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
         &probes,
         &favorites,
         &disabled,
-        None,
         ModelPickerTab::Provider(ProviderKind::Codex),
         "",
     );
@@ -2103,22 +2102,10 @@ fn switched_off_providers_leave_the_picker_except_for_their_locked_session() {
         &probes,
         &favorites,
         &disabled,
-        None,
         ModelPickerTab::Provider(ProviderKind::Codex),
         "claude",
     );
     assert!(models.is_empty());
-
-    // A session already locked to the provider keeps its models.
-    let models = visible_picker_models(
-        &probes,
-        &favorites,
-        &disabled,
-        Some(ProviderKind::Claude),
-        ModelPickerTab::Provider(ProviderKind::Claude),
-        "",
-    );
-    assert_eq!(models.len(), 1);
 }
 
 #[test]
@@ -2157,7 +2144,7 @@ fn tab_cycle_walks_favorites_then_usable_providers_in_rail_order() {
 
     // Uninstalled providers never join the cycle; favorites leads.
     assert_eq!(
-        visible_picker_tabs(&probes, &[], None),
+        visible_picker_tabs(&probes, &[]),
         vec![
             ModelPickerTab::Favorites,
             ModelPickerTab::Provider(ProviderKind::Claude),
@@ -2167,20 +2154,10 @@ fn tab_cycle_walks_favorites_then_usable_providers_in_rail_order() {
 
     // Switched-off providers leave the cycle like they leave the rail.
     assert_eq!(
-        visible_picker_tabs(&probes, &[ProviderKind::Claude], None),
+        visible_picker_tabs(&probes, &[ProviderKind::Claude]),
         vec![
             ModelPickerTab::Favorites,
             ModelPickerTab::Provider(ProviderKind::Codex),
-        ]
-    );
-
-    // A locked session cycles between favorites and its own provider only,
-    // even when that provider was switched off after the session started.
-    assert_eq!(
-        visible_picker_tabs(&probes, &[ProviderKind::Claude], Some(ProviderKind::Claude)),
-        vec![
-            ModelPickerTab::Favorites,
-            ModelPickerTab::Provider(ProviderKind::Claude),
         ]
     );
 }
@@ -2211,24 +2188,17 @@ fn the_picker_is_empty_only_once_detection_has_answered() {
 
     // An unsettled first pass reads as "not known yet", so the composer keeps
     // showing the remembered model instead of flashing an empty state.
-    assert!(!picker_has_no_providers(&undetected, &[], None, false));
+    assert!(!picker_has_no_providers(&undetected, &[], false));
     // Once it settles, the same probes really do mean nothing is installed.
-    assert!(picker_has_no_providers(&undetected, &[], None, true));
+    assert!(picker_has_no_providers(&undetected, &[], true));
     // One detected CLI is enough to keep the picker populated...
-    assert!(!picker_has_no_providers(&detected, &[], None, true));
+    assert!(!picker_has_no_providers(&detected, &[], true));
     // ...until it is switched off, which empties the picker just as surely as
-    // never having been installed.
+    // never having been installed — for every task, since any task may change
+    // agents between turns.
     assert!(picker_has_no_providers(
         &detected,
         &[ProviderKind::Claude],
-        None,
-        true
-    ));
-    // A session already locked to that provider keeps it, switched off or not.
-    assert!(!picker_has_no_providers(
-        &detected,
-        &[ProviderKind::Claude],
-        Some(ProviderKind::Claude),
         true
     ));
 }
@@ -2257,31 +2227,18 @@ fn the_rail_draws_only_installed_providers_the_settings_left_on() {
     assert!(!picker_rail_shows_provider(
         &probes,
         &[],
-        None,
         ProviderKind::Cursor
     ));
     assert!(!picker_rail_shows_provider(
         &probes,
         &[ProviderKind::Claude],
-        None,
         ProviderKind::Claude
     ));
 
-    // A provider only the *current* session locks out stays drawn: that is a
-    // fact about this session, not about what the user configured.
+    // Installed and left on, the same provider is drawn.
     assert!(picker_rail_shows_provider(
         &probes,
         &[],
-        Some(ProviderKind::Codex),
-        ProviderKind::Claude
-    ));
-
-    // ...and the locked session keeps its own tab even once it is switched
-    // off, since the picker is its only route to another model.
-    assert!(picker_rail_shows_provider(
-        &probes,
-        &[ProviderKind::Claude],
-        Some(ProviderKind::Claude),
         ProviderKind::Claude
     ));
 }

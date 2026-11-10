@@ -1362,11 +1362,27 @@ impl Waku {
                             view.set_text(message.visible_content(), message.streaming);
                             &*view
                         });
+                    // Only a task that has changed agents labels its answers:
+                    // one owner per row is already implied when the whole
+                    // transcript came from a single agent.
+                    let turn_provider = self.selected_session().and_then(|session| {
+                        if message.role != MessageRole::Assistant || !session.has_mixed_providers()
+                        {
+                            return None;
+                        }
+                        let turn_id = message.turn_id?;
+                        session
+                            .turns
+                            .iter()
+                            .find(|turn| turn.id == turn_id)
+                            .map(|turn| session.turn_provider(turn))
+                    });
                     let rendered = render_message(
                         MessageRender {
                             theme: &theme,
                             message: &message,
                             message_index,
+                            turn_provider,
                             assistant_footer_copy_content,
                             assistant_footer_time,
                             copied,

@@ -1660,6 +1660,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         updated_at: updated_at as u64,
         last_reply_at: last_reply_at.map(|at| at as u64),
         provider_cursor: None,
+        provider_cursors: Vec::new(),
         available_commands: Vec::new(),
         thread_goal: None,
         context_usage: None,

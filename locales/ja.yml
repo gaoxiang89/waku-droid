@@ -346,6 +346,14 @@ session.revert_to_here: ここまで戻す
 session.revert_to_here_title: ここまで戻す
 session.reverting_message: メッセージを戻しています…
 session.reverting_message_title: メッセージを戻しています…
+session.agent_switch_carried_one: "%{provider} に切り替えました。以前の 1 ターンはコンテキストとして引き継がれます。"
+session.agent_switch_carried_many: "%{provider} に切り替えました。以前の %{count} ターンはコンテキストとして引き継がれます。"
+session.agent_switch_resumed: "%{provider} に戻しました。そのエージェント自身の会話を再開します。"
+session.handoff_notice_one: "%{provider} が引き継ぎます。%{agents} による以前の 1 ターンをコンテキストとして渡しました。ツールの状態と推論は含まれません。"
+session.handoff_notice_many: "%{provider} が引き継ぎます。%{agents} による以前の %{count} ターンをコンテキストとして渡しました。ツールの状態と推論は含まれません。"
+session.handoff_notice_resumed_one: "%{provider} に戻り、自身の会話を再開します。未確認の 1 ターンをコンテキストとして渡しました。"
+session.handoff_notice_resumed_many: "%{provider} に戻り、自身の会話を再開します。未確認の %{count} ターンをコンテキストとして渡しました。"
+session.handoff_notice_omitted: 古い %{count} ターンはこのモデルのコンテキストウィンドウに収まらないため、アプリ内に残しました。
 
 time.yesterday_at: 昨日 %{time}
 time.weekday_at: "%{weekday} %{time}"

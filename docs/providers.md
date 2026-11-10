@@ -95,7 +95,11 @@ the transport absorbed the change or wants to be restarted:
 | --- | --- | --- | --- | --- | --- | --- |
 | Model, reasoning effort, service tier | in session — they ride on every `turn/start` | in session — `set_model`, `set_thinking_level` | in session — `session/set_model`, Cursor's parameterized `configOptions`, or Fx's advertised `model` option | in session — `POST /api/session/{id}/model`, with effort as the model's variant | in session — a `set_model` control request | restart — all three are launch arguments |
 | Access mode | restart | restart | restart | in session — the mode only decides who answers a permission request, which is the driver's own state | restart | restart |
-| Provider | restart | restart | restart | restart | restart | restart |
+
+The provider itself is the one input `apply_options` never receives: a task that
+changes agents drops the outgoing runtime and starts a new one, which is why
+switching agents needs the transcript handoff described below rather than a
+`DriverControl` call.
 
 The permission policy is deliberately excluded even for Codex, which does carry
 `approvalPolicy` and `sandboxPolicy` on every `turn/start`: loosening or
@@ -109,6 +113,49 @@ keeps the session only for a model change the adapter declares it can switch.
 The idle sweep runs at most every 5 minutes off the existing frame tick and skips
 any session with an active turn, so a slow tool call or an unanswered approval is
 never reaped out from under the user.
+
+### Switching agents inside one task
+
+A task is not bound to the agent that started it. The model picker lists every
+installed, switched-on provider for every task, and choosing a different one
+re-owns the task rather than starting a new one — the transcript, the workspace,
+the queued follow-ups and the checkpoint history all stay.
+
+Three pieces make that work:
+
+- **Per-turn attribution.** `AgentTurn::provider` records the agent that ran each
+  turn (`None` on turns written before a task could change agents, which means
+  the session's own provider). `AgentSession::turn_provider` reads it, and
+  `has_mixed_providers` tells the transcript whether to label each answer.
+- **Per-agent resume cursors.** `AgentSession::provider_cursor` is the live
+  agent's cursor; `provider_cursors` holds the parked one for every other agent
+  that has run this task. `switch_provider` parks the outgoing cursor, adopts the
+  returning agent's, and clears the provider-owned state `thread_goal`,
+  `context_usage` and `available_commands` that the departing agent reported. A
+  cursor arriving from the driver goes through `set_live_provider_cursor`, which
+  drops the stale parked copy, so a returning agent resumes exactly one
+  conversation.
+- **A deterministic transcript handoff.** `src/app/handoff.rs` builds what the
+  incoming agent gets on its first turn. The selection is real messages, not a
+  model-written summary: the newest turn first, then the task's original request,
+  then older turns newest-first until the budget runs out. The budget is the
+  target model's context window minus what this turn already uses minus
+  `max(16_000, window / 4)` reserved for the reply, capped by
+  `WAKU_CONTEXT_HANDOFF_TOKEN_CAP`. Each turn is rendered as
+  `### Turn N — <Provider>` with its user and assistant text, command lines and
+  changed-file paths; reasoning, tool results, approvals and attachments are not
+  replayed, and the preamble says so. When the incoming agent resumes its own
+  conversation, only the turns it has not seen are sent.
+
+The preamble is prepended to the prompt once, at the seam where provider syntax
+resolves, and is taken off the turn as it is read (`AgentTurn::handoff_preamble`
+is `#[serde(skip)]` runtime state), so a retry cannot send it twice. A prompt that
+is still a provider-native slash command travels without it. The transcript
+records the transfer as a centred notice naming both agents, and a resumed
+provider gets a delta rather than the whole task.
+
+Rewinding past a switch drops the parked cursors (`truncate_after_turn`), so no
+rewound task can resume a conversation that no longer matches its transcript.
 
 Note what is *not* on the teardown list: finishing a turn. `TurnFinished` leaves
 the long-lived processes resident and idle, which is the point of them — until
@@ -956,13 +1003,23 @@ silently ignored.
 
 ## Compared with T3 Code
 
-[T3 Code](https://github.com/pingdotgg/t3code) solves the same problem with five
-drivers — `codex`, `claudeAgent`, `cursor`, `grok`, `opencode` (no Amp, no Pi) —
-registered in `apps/server/src/provider/builtInDrivers.ts` and documented in its
-own `docs/internals/providers.md`.
+[T3 Code](https://github.com/pingdotgg/t3code) solves the same problem with a
+wider driver table than it had a year ago — `codex`, `claudeAgent`,
+`antigravity`, `cursor`, `grok`, `opencode`, `pi`, `kiro`, `muse`, `fx`, plus a
+generic ACP-registry entry for anything else that speaks ACP — registered in
+`packages/client-runtime/src/providerClients.ts` and documented in its own
+`docs/internals/providers.md`. Waku ships twelve (`ProviderKind::ALL`), keeps no
+ACP-registry escape hatch, and registers nothing it has not spoken to directly.
 
-**Its one structural difference: no provider is a per-turn process.** All five
-hold a long-lived session; the transport differs, the lifetime does not.
+**Its Antigravity entry needs no CLI.** T3 provisions the official
+`antigravity-acp` bridge into `tools/<agent-id>/<version>/` and runs that, one
+isolated profile per instance, with ambient Google credentials cleared first.
+That is a third transport shape next to "JSON-RPC app-server" and "ACP binary
+already on `PATH`": a bridge the app installs.
+
+**Its one structural difference is unchanged: no provider is a per-turn
+process.** Every driver holds a long-lived session; the transport differs, the
+lifetime does not.
 
 | Provider | T3 Code transport | Waku transport |
 | --- | --- | --- |
@@ -970,15 +1027,17 @@ hold a long-lived session; the transport differs, the lifetime does not.
 | Claude | `@anthropic-ai/claude-agent-sdk` `query()` with an `AsyncIterable` prompt queue | same protocol, spoken directly — the SDK is a wrapper around these flags |
 | Cursor | **`cursor-agent acp`** — ACP over stdio (`packages/effect-acp`) | same |
 | Grok | **`grok agent stdio`** — ACP over stdio | same |
+| Antigravity | **provisioned `antigravity-acp`**, per-instance profile | not offered |
 | OpenCode | long-lived `opencode serve` + HTTP SDK | the user's shared OpenCode 2 background service, adopted rather than started per workspace |
 
-**All five now hold a long-lived session**, and Claude reaches the same place
+**All of them now hold a long-lived session**, and Claude reaches the same place
 without the SDK: there is no Rust Agent SDK, but the SDK is a wrapper around the
 `claude` CLI's own streaming-input protocol, which Waku speaks directly. No Node
 sidecar and no npm dependency.
 
-Waku goes one further than the comparison: Amp and Pi, which T3 Code does not
-support, are long-lived here too. Every provider holds a session.
+Waku goes one further than the comparison: Amp, Pi, DeepSeek, Kimi, Fx, Droid and
+Oh My Pi, which T3 Code does not support as first-class drivers, are long-lived
+here too. Every provider holds a session.
 
 What the long-lived session buys, and what Waku pays for not having it:
 
@@ -987,6 +1046,7 @@ What the long-lived session buys, and what Waku pays for not having it:
 | Interactive approvals | Every provider: Claude via the SDK's `canUseTool` (including `AskUserQuestion` and `ExitPlanMode`), Cursor/Grok via ACP `session/request_permission`, Codex via `*requestApproval*` | Every provider except Amp and Pi, neither of which exposes a request to answer |
 | Interrupt | `session/cancel`, `query.interrupt()` (plus `stopTask()` for runaway subagents) | Protocol interrupt everywhere except Amp, which has none and is stopped outright |
 | Change model mid-session | `capabilities.sessionModelSwitch: "in-session"` → `session/set_model`, `query.setModel()` | Every transport keeps the session except Amp, whose mode is a launch argument |
+| Change agent mid-task | `threadSupportsProviderHandoff` → `create_with_handoff`; the budgeted history comes from the thread's real messages (`packages/provider-core/src/server/handoffBudget.ts`) | Same rule and the same shape of budget, in `src/app/handoff.rs`; both keep the task and give the incoming agent a slice of the transcript, not a summary |
 | Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider (`⌘↩`); plain `Enter` queues a visible, editable follow-up instead |
 | Native rollback | `rollbackThread` on the adapter contract | Codex/Pi natively; the rest emulated out-of-band by the `*_session.rs` helpers |
 | Idle cleanup | `ProviderSessionReaper` stops sessions idle 30 min, swept every 5 min, skipping threads with an active turn | same, on the same thresholds |

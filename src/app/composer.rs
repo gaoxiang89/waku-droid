@@ -938,10 +938,7 @@ impl Waku {
         let provider = session.map(|session| session.provider).unwrap_or_default();
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let selected_model_name = self.model_display_name(provider, selected_model);
-        let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
-            .map(|session| session.provider);
-        let picker_enabled = session.is_some_and(|session| session.can_choose_model(provider));
+        let picker_enabled = session.is_some_and(|session| session.can_choose_model());
 
         if !picker_enabled {
             return div()
@@ -1067,7 +1064,6 @@ impl Waku {
                 &probes,
                 &favorites,
                 &disabled_providers,
-                locked_provider,
                 selected_tab,
                 &normalized_query,
             )
@@ -1160,21 +1156,14 @@ impl Waku {
 
                 // One predicate with the `tab` cycle, so clicking and cycling
                 // agree on which tabs are usable.
-                let rail_tabs = visible_picker_tabs(&probes, &disabled_providers, locked_provider);
+                let rail_tabs = visible_picker_tabs(&probes, &disabled_providers);
                 for kind in ProviderKind::ALL {
                     // A provider with no CLI on the machine, or one switched
                     // off in the Providers settings, leaves the rail entirely
                     // rather than sitting there dimmed: a tab that can never
                     // open only advertises a choice settings already ruled
-                    // out. Being locked out by the current session is a
-                    // different claim — that tab stays, dimmed, because it is
-                    // true only until the next session.
-                    if !picker_rail_shows_provider(
-                        &probes,
-                        &disabled_providers,
-                        locked_provider,
-                        kind,
-                    ) {
+                    // out.
+                    if !picker_rail_shows_provider(&probes, &disabled_providers, kind) {
                         continue;
                     }
                     let usable = rail_tabs.contains(&ModelPickerTab::Provider(kind));
@@ -1503,14 +1492,10 @@ impl Waku {
         if !self.model_search.read(cx).content().trim().is_empty() {
             return;
         }
-        let locked_provider = self
-            .selected_session()
-            .filter(|session| !session.messages.is_empty())
-            .map(|session| session.provider);
         let disabled = self
             .disabled_providers_for(&self.selected_host_key())
             .to_vec();
-        let tabs = visible_picker_tabs(self.provider_probes(), &disabled, locked_provider);
+        let tabs = visible_picker_tabs(self.provider_probes(), &disabled);
         let current = tabs.iter().position(|tab| *tab == self.model_picker_tab);
         let Some(next) = next_picker_highlight(current, tabs.len(), key) else {
             return;
@@ -1530,9 +1515,6 @@ impl Waku {
         let session = self.selected_session();
         let provider = session.map(|session| session.provider).unwrap_or_default();
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
-        let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
-            .map(|session| session.provider);
         let disabled = self
             .disabled_providers_for(&self.selected_host_key())
             .to_vec();
@@ -1540,7 +1522,6 @@ impl Waku {
             self.provider_probes(),
             &self.state.favorite_models,
             &disabled,
-            locked_provider,
             self.model_picker_tab,
             "",
         )
@@ -3882,19 +3863,16 @@ pub(super) fn next_picker_highlight(
 /// then every installed provider a new session may use.
 ///
 /// Shared by the rail's click gating and by `tab`'s cycle handler so the two
-/// agree on which tabs are usable. A locked session keeps its own provider
-/// usable even if it was switched off afterwards — disabling is for new work —
-/// while every other provider drops out for the lock's duration.
+/// agree on which tabs are usable. A task may change agents between turns, so
+/// there is no locked provider: every installed, switched-on agent is offered.
 pub(super) fn visible_picker_tabs(
     probes: &[ProviderProbe],
     disabled_providers: &[ProviderKind],
-    locked_provider: Option<ProviderKind>,
 ) -> Vec<ModelPickerTab> {
     let mut tabs = vec![ModelPickerTab::Favorites];
     tabs.extend(ProviderKind::ALL.into_iter().filter_map(|kind| {
-        let drawn = picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind);
-        let allowed = locked_provider.is_none() || locked_provider == Some(kind);
-        (drawn && allowed).then_some(ModelPickerTab::Provider(kind))
+        picker_rail_shows_provider(probes, disabled_providers, kind)
+            .then_some(ModelPickerTab::Provider(kind))
     }));
     tabs
 }
@@ -4011,20 +3989,16 @@ fn open_provider_settings_from_picker(
 /// Installed on this machine and not switched off in the Providers settings.
 /// Both of those are settings-level facts the user has already decided, so the
 /// tab is absent rather than dimmed — the rail offers what could be picked,
-/// not a catalog of everything Waku can speak to. A session locked to a
-/// provider switched off afterwards keeps its own tab, since the picker is
-/// that session's only route to another model.
+/// not a catalog of everything Waku can speak to.
 pub(super) fn picker_rail_shows_provider(
     probes: &[ProviderProbe],
     disabled_providers: &[ProviderKind],
-    locked_provider: Option<ProviderKind>,
     kind: ProviderKind,
 ) -> bool {
     let installed = probes
         .iter()
         .any(|probe| probe.provider == kind && probe.installed);
-    let switched_off = disabled_providers.contains(&kind) && locked_provider != Some(kind);
-    installed && !switched_off
+    installed && !disabled_providers.contains(&kind)
 }
 
 pub(super) fn model_picker_subtitle(provider: ProviderKind, sub_provider: Option<&str>) -> String {
@@ -4046,13 +4020,12 @@ pub(super) fn model_picker_subtitle(provider: ProviderKind, sub_provider: Option
 pub(super) fn picker_has_no_providers(
     probes: &[ProviderProbe],
     disabled_providers: &[ProviderKind],
-    locked_provider: Option<ProviderKind>,
     detection_settled: bool,
 ) -> bool {
     detection_settled
-        && !ProviderKind::ALL.into_iter().any(|kind| {
-            picker_rail_shows_provider(probes, disabled_providers, locked_provider, kind)
-        })
+        && !ProviderKind::ALL
+            .into_iter()
+            .any(|kind| picker_rail_shows_provider(probes, disabled_providers, kind))
 }
 
 /// The models the picker lists, in display order.
@@ -4063,7 +4036,6 @@ pub(super) fn visible_picker_models(
     probes: &[ProviderProbe],
     favorites: &[FavoriteModel],
     disabled_providers: &[ProviderKind],
-    locked_provider: Option<ProviderKind>,
     selected_tab: ModelPickerTab,
     normalized_query: &str,
 ) -> Vec<(ProviderKind, ProviderModel)> {
@@ -4078,10 +4050,8 @@ pub(super) fn visible_picker_models(
                 .cloned()
                 .map(move |model| (probe.provider, model))
         })
-        .filter(|(kind, _)| locked_provider.is_none() || locked_provider == Some(*kind))
-        // Switched-off providers keep serving the session already locked to
-        // them, but offer nothing to new work — including favorites.
-        .filter(|(kind, _)| !disabled_providers.contains(kind) || locked_provider == Some(*kind))
+        // A switched-off provider offers nothing, including favorites.
+        .filter(|(kind, _)| !disabled_providers.contains(kind))
         .filter(|(kind, model)| {
             if searching {
                 let searchable = format!(

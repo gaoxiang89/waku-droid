@@ -1172,12 +1172,7 @@ impl WakuBackend {
         };
 
         validate_response_fork(&source, turn_count)?;
-        let provider_turn_count = source
-            .turns
-            .iter()
-            .take(turn_count)
-            .filter(|turn| turn.provider_turn_started)
-            .count();
+        let provider_turn_count = source.provider_turns_through(turn_count);
         let turns_to_remove = source.provider_turns_after(turn_count);
         let (provider_cursor, message_ids) = self.fork_provider_response(
             &source,
@@ -1266,12 +1261,7 @@ impl WakuBackend {
         let retained_turn_count = turn_count.saturating_sub(1);
         let previous_turn_count = source.turns.len();
         let rollback_turns = source.provider_turns_after(retained_turn_count);
-        let provider_turn_count = source
-            .turns
-            .iter()
-            .take(retained_turn_count)
-            .filter(|turn| turn.provider_turn_started)
-            .count();
+        let provider_turn_count = source.provider_turns_through(retained_turn_count);
         let provider_resume_at = retained_turn_count
             .checked_sub(1)
             .and_then(|index| source.turns.get(index))

@@ -330,6 +330,14 @@ session.revert_to_here: 回退到这里
 session.revert_to_here_title: 回退到这里
 session.reverting_message: 正在回退消息…
 session.reverting_message_title: 正在回退消息…
+session.agent_switch_carried_one: 已切换到 %{provider}，此前的 1 轮对话会作为上下文带过去。
+session.agent_switch_carried_many: 已切换到 %{provider}，此前的 %{count} 轮对话会作为上下文带过去。
+session.agent_switch_resumed: 已切回 %{provider}，继续它自己的会话。
+session.handoff_notice_one: 由 %{provider} 接手：来自 %{agents} 的 1 轮对话作为上下文带过来了；工具状态和推理过程没有带过来。
+session.handoff_notice_many: 由 %{provider} 接手：来自 %{agents} 的 %{count} 轮对话作为上下文带过来了；工具状态和推理过程没有带过来。
+session.handoff_notice_resumed_one: 回到 %{provider}，继续它自己的会话：它没见过的 1 轮对话作为上下文带过来了。
+session.handoff_notice_resumed_many: 回到 %{provider}，继续它自己的会话：它没见过的 %{count} 轮对话作为上下文带过来了。
+session.handoff_notice_omitted: 另有 %{count} 轮较早的对话超出该模型的上下文窗口，仍保留在应用里。
 time.yesterday_at: 昨天 %{time}
 time.weekday_at: "%{weekday} %{time}"
 time.date_at: "%{month}月%{day}日 %{time}"

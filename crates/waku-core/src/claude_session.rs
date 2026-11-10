@@ -541,6 +541,9 @@ fn provider_session_history_in(
                 started_at: timestamp,
                 completed_at: Some(timestamp),
                 checkpoint: None,
+                provider: None,
+                handoff: None,
+                handoff_preamble: None,
             });
             if let Some(content) = message_text(entry) {
                 let mut message = Message::new_for_turn(MessageRole::User, content, turn_id);

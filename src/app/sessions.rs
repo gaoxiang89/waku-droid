@@ -1280,7 +1280,7 @@ impl Waku {
         let Some((session_id, provider_changed)) = self
             .selected_session()
             .filter(|session| {
-                session.can_choose_model(provider)
+                session.can_choose_model()
                     && (session.provider != provider
                         || session.model.as_deref() != Some(model.as_str()))
             })
@@ -1292,12 +1292,18 @@ impl Waku {
         self.remember_selected_model_traits();
         let (reasoning_effort, service_tier, context_window) =
             self.state.model_traits_for(provider, &model);
+        let mut carried_turns = 0;
+        let mut resumed_agent = false;
         if let Some(session) = self.selected_session_mut() {
-            session.provider = provider;
-            session.model = Some(model.clone());
             if provider_changed {
+                // Switching parks the outgoing agent's cursor and adopts the
+                // incoming one's, so returning to an agent resumes its own
+                // conversation instead of starting over.
+                resumed_agent = session.switch_provider(provider);
+                carried_turns = session.turns.len();
                 session.agent_preset = None;
             }
+            session.model = Some(model.clone());
             session.reasoning_effort.clone_from(&reasoning_effort);
             session.service_tier.clone_from(&service_tier);
             session.context_window.clone_from(&context_window);
@@ -1319,6 +1325,27 @@ impl Waku {
             self.save();
             cx.notify();
         }
+        if provider_changed && carried_turns > 0 {
+            let message = if resumed_agent {
+                tr!(
+                    "session.agent_switch_resumed",
+                    provider = provider.display_name()
+                )
+            } else if carried_turns == 1 {
+                tr!(
+                    "session.agent_switch_carried_one",
+                    count = carried_turns,
+                    provider = provider.display_name()
+                )
+            } else {
+                tr!(
+                    "session.agent_switch_carried_many",
+                    count = carried_turns,
+                    provider = provider.display_name()
+                )
+            };
+            self.show_success_toast(message);
+        }
     }
 
     /// Primary modifier + /: toggle the composer's model picker as if its chip were clicked.
@@ -1333,7 +1360,7 @@ impl Waku {
         }
         if !self
             .selected_session()
-            .is_some_and(|session| session.can_choose_model(session.provider))
+            .is_some_and(|session| session.can_choose_model())
         {
             return;
         }

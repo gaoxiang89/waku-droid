@@ -2001,6 +2001,7 @@ mod git_commit_view;
 mod git_graph;
 mod git_graph_actions;
 mod goal_dialog;
+mod handoff;
 mod hosts;
 mod image_preview;
 mod markdown_images;

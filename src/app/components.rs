@@ -370,6 +370,11 @@ pub(super) struct MessageRender<'a> {
     pub(super) theme: &'a Theme,
     pub(super) message: &'a Message,
     pub(super) message_index: usize,
+    /// The agent that produced this message, present only when the task has
+    /// been run by more than one. A single-agent task reads the same as it
+    /// always did; a mixed one labels each response so a reader can tell whose
+    /// answer they are looking at.
+    pub(super) turn_provider: Option<ProviderKind>,
     pub(super) assistant_footer_copy_content: Option<SharedString>,
     pub(super) assistant_footer_time: Option<u64>,
     pub(super) copied: bool,
@@ -569,6 +574,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         theme,
         message,
         message_index,
+        turn_provider,
         assistant_footer_copy_content,
         assistant_footer_time,
         copied,
@@ -949,8 +955,34 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .flex_col()
                 .py(px(4.0))
                 .gap(px(3.0))
-                .group(group_name.clone())
-                .child(body);
+                .group(group_name.clone());
+            // Which agent wrote this answer. Only a task that changed agents
+            // carries the label, so the common single-agent transcript keeps
+            // its unlabelled rows.
+            if let Some(provider) = turn_provider {
+                column = column.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .w(px(5.0))
+                                .h(px(5.0))
+                                .rounded_full()
+                                .bg(provider_color(theme, provider)),
+                        )
+                        .child(
+                            div()
+                                .text_size(sp(11.0))
+                                .line_height(sp(14.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_tertiary)
+                                .child(provider.short_name()),
+                        ),
+                );
+            }
+            column = column.child(body);
             // Turn-backed responses render one footer after every ordered row
             // in the turn. Only legacy/unkeyed assistant messages retain an
             // inline footer because they have no turn boundary to target.

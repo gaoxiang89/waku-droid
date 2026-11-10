@@ -842,6 +842,43 @@ pub struct AgentTurn {
     pub completed_at: Option<u64>,
     #[serde(default)]
     pub checkpoint: Option<Checkpoint>,
+    /// The agent that ran this turn. `None` means the session's provider, which
+    /// is every turn recorded before a task could change agents mid-thread —
+    /// the provider was locked to the thread, so the session's own value is
+    /// exactly the agent that produced them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
+    /// What this turn carried over from the agents that ran the turns before
+    /// it. Present only on the first turn after a switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<TurnHandoff>,
+    /// The provider-facing preamble built from `handoff`. Runtime state, not
+    /// stored: it is rebuilt from the transcript when a turn begins, and a
+    /// process that dies before the prompt is sent simply starts the turn
+    /// without it rather than resuming a stale summary.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub handoff_preamble: Option<String>,
+}
+
+/// A portable context handoff: the budgeted slice of this task's transcript
+/// that a newly selected agent receives on its first turn.
+///
+/// Waku keeps the transcript and hands the new agent a deterministic selection
+/// of it. The outgoing agent's reasoning, tool state, approvals and attachments
+/// are not replayed, so this record says what was covered and what was left out.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct TurnHandoff {
+    /// Agents whose turns this handoff covers, oldest first.
+    pub from_providers: Vec<ProviderKind>,
+    /// The app turns the handoff describes.
+    pub covered_turns: usize,
+    /// Turns left out of the preamble to fit the target's context window.
+    /// Zero when everything eligible fit.
+    pub omitted_turns: usize,
+    /// Whether the target agent resumed its own native conversation, in which
+    /// case the handoff covers only the turns it had not seen.
+    pub resumed: bool,
 }
 
 /// How full the provider's context window is, from the latest main-thread
@@ -1010,6 +1047,11 @@ pub struct AgentSession {
     pub last_reply_at: Option<u64>,
     #[serde(default)]
     pub provider_cursor: Option<ProviderResumeCursor>,
+    /// Resume cursors for agents this task used before the user switched away.
+    /// A cursor already names its provider, so returning to one of these agents
+    /// resumes its native conversation instead of starting from nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_cursors: Vec<ProviderResumeCursor>,
     /// Slash commands the provider reported for this session's live process,
     /// kept so a resumed session still completes them before its next
     /// handshake.
@@ -1081,6 +1123,7 @@ impl AgentSession {
             last_reply_at: None,
             detail_loaded: true,
             provider_cursor: None,
+            provider_cursors: Vec::new(),
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1119,6 +1162,7 @@ impl AgentSession {
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,
             provider_cursor: None,
+            provider_cursors: Vec::new(),
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1263,8 +1307,83 @@ impl AgentSession {
         true
     }
 
-    pub fn can_choose_model(&self, provider: ProviderKind) -> bool {
-        !self.status.is_busy() && (self.messages.is_empty() || self.provider == provider)
+    /// Whether the model picker may change anything at all. A task holds one
+    /// agent while a turn runs; between turns any installed agent is a legal
+    /// choice, and picking a different one is a switch that carries a handoff.
+    pub fn can_choose_model(&self) -> bool {
+        !self.status.is_busy()
+    }
+
+    /// The agent that ran `turn`, resolving the implicit case recorded before
+    /// a task could hold turns from more than one agent.
+    pub fn turn_provider(&self, turn: &AgentTurn) -> ProviderKind {
+        turn.provider.unwrap_or(self.provider)
+    }
+
+    /// Whether this task's history was written by more than one agent, which is
+    /// what makes a per-response agent label necessary rather than noise.
+    pub fn has_mixed_providers(&self) -> bool {
+        let mut seen = None;
+        self.turns
+            .iter()
+            .map(|turn| self.turn_provider(turn))
+            .any(|provider| match seen {
+                None => {
+                    seen = Some(provider);
+                    false
+                }
+                Some(first) => first != provider,
+            })
+    }
+
+    /// Parks the active agent's resume cursor so returning to that agent can
+    /// resume its native conversation instead of starting a new one.
+    pub fn park_provider_cursor(&mut self) {
+        let Some(cursor) = self.provider_cursor.take() else {
+            return;
+        };
+        let provider = cursor.provider();
+        self.provider_cursors
+            .retain(|parked| parked.provider() != provider);
+        self.provider_cursors.push(cursor);
+    }
+
+    /// Makes `provider` active: parks the outgoing agent's cursor and adopts
+    /// the incoming agent's parked one, if it has any. Returns whether a native
+    /// conversation was resumed, which decides whether the next turn needs a
+    /// full handoff or only the delta the incoming agent has not seen.
+    pub fn switch_provider(&mut self, provider: ProviderKind) -> bool {
+        let outgoing = self.provider;
+        self.park_provider_cursor();
+        self.provider = provider;
+        let parked = self
+            .provider_cursors
+            .iter()
+            .position(|cursor| cursor.provider() == provider)
+            .map(|index| self.provider_cursors.remove(index));
+        let resumed = parked.is_some();
+        self.provider_cursor = parked;
+        if outgoing != provider {
+            // Provider-owned state describes the agent that just left. The
+            // incoming agent reports its own when it connects.
+            self.thread_goal = None;
+            self.context_usage = None;
+            self.available_commands.clear();
+            self.provider_session_id = None;
+            self.updated_at = unix_time();
+        }
+        resumed
+    }
+
+    /// Records a cursor the live agent reported, keeping the parked copy for
+    /// this agent in step so a later switch back resumes the same conversation.
+    pub fn set_live_provider_cursor(&mut self, cursor: Option<ProviderResumeCursor>) {
+        if let Some(cursor) = cursor.as_ref() {
+            let provider = cursor.provider();
+            self.provider_cursors
+                .retain(|parked| parked.provider() != provider);
+        }
+        self.provider_cursor = cursor;
     }
 
     pub fn migrate_legacy_state(&mut self) {
@@ -1377,6 +1496,9 @@ impl AgentSession {
                 started_at,
                 completed_at: Some(completed_at),
                 checkpoint: None,
+                provider: None,
+                handoff: None,
+                handoff_preamble: None,
             });
         }
     }
@@ -1392,8 +1514,30 @@ impl AgentSession {
         display_content: Option<String>,
         attachments: Vec<MessageAttachment>,
     ) -> Uuid {
+        self.begin_turn_with_handoff(prompt, display_content, attachments, None, None)
+    }
+
+    /// Begin a turn that carries context over from the agents that ran the
+    /// previous turns. `notice` is the transcript row that tells the reader what
+    /// moved and what did not; `preamble` is what the incoming agent receives
+    /// ahead of the prompt and is never persisted.
+    pub fn begin_turn_with_handoff(
+        &mut self,
+        prompt: impl Into<String>,
+        display_content: Option<String>,
+        attachments: Vec<MessageAttachment>,
+        notice: Option<(String, TurnHandoff)>,
+        preamble: Option<String>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let now = unix_time();
+        let mut handoff = None;
+        if let Some((notice, record)) = notice {
+            let mut message = Message::new_for_turn(MessageRole::System, notice, id);
+            message.created_at = now;
+            self.messages.push(message);
+            handoff = Some(record);
+        }
         self.turns.push(AgentTurn {
             id,
             turn_count: self.turns.len() + 1,
@@ -1403,6 +1547,9 @@ impl AgentSession {
             started_at: now,
             completed_at: None,
             checkpoint: None,
+            provider: Some(self.provider),
+            handoff,
+            handoff_preamble: preamble,
         });
         self.messages.push(
             Message::new_for_turn(MessageRole::User, prompt, id)
@@ -1430,6 +1577,9 @@ impl AgentSession {
             started_at: now,
             completed_at: None,
             checkpoint: None,
+            provider: Some(self.provider),
+            handoff: None,
+            handoff_preamble: None,
         });
         self.last_reply_at = Some(now);
         self.updated_at = now;
@@ -1477,6 +1627,9 @@ impl AgentSession {
             started_at: now,
             completed_at: None,
             checkpoint: None,
+            provider: Some(self.provider),
+            handoff: None,
+            handoff_preamble: None,
         });
         let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
         prompt.id = message_id;
@@ -1553,11 +1706,25 @@ impl AgentSession {
         }
     }
 
+    /// Turns the session's current agent itself ran, counted from the start of
+    /// the transcript. A task may change agents, so "how many turns does this
+    /// provider know about" is not "how many turns the transcript has": the
+    /// provider's own thread never saw the ones another agent ran.
+    pub fn provider_turns_through(&self, turn_count: usize) -> usize {
+        self.turns
+            .iter()
+            .take(turn_count)
+            .filter(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
+            .count()
+    }
+
+    /// Turns after `turn_count` that the current agent itself ran, which is how
+    /// many of its own turns a rollback has to undo.
     pub fn provider_turns_after(&self, turn_count: usize) -> usize {
         self.turns
             .iter()
             .skip(turn_count)
-            .filter(|turn| turn.provider_turn_started)
+            .filter(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
             .count()
     }
 
@@ -1622,6 +1789,10 @@ impl AgentSession {
         for block in &mut self.transcript_blocks {
             block.after_message = block.after_message.min(message_count);
         }
+        // A parked cursor's native conversation still contains the turns that
+        // just left this task, so resuming it would contradict the rollback.
+        // The active agent's own cursor is the caller's to rewound or replace.
+        self.provider_cursors.clear();
         self.updated_at = unix_time();
     }
 
@@ -1668,6 +1839,10 @@ impl AgentSession {
         fork.created_at = now;
         fork.updated_at = now;
         fork.provider_cursor = Some(provider_cursor);
+        // The fork starts with one agent's native conversation; the cursors of
+        // agents that ran turns in the source task would point at transcripts
+        // that still include turns this fork dropped.
+        fork.provider_cursors.clear();
         fork.provider_session_id = None;
         // A fork snapshots the conversation, not the pending follow-ups its
         // source session is still holding for the live agent.
@@ -4231,15 +4406,66 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_keeps_started_sessions_on_their_provider() {
+    fn a_started_session_can_change_agents_between_turns() {
         let project = Project::from_path(PathBuf::from("/tmp/waku"));
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
 
-        assert!(session.can_choose_model(ProviderKind::Claude));
+        assert!(session.can_choose_model());
 
         session.push_message(MessageRole::User, "first turn");
-        assert!(session.can_choose_model(ProviderKind::Codex));
-        assert!(!session.can_choose_model(ProviderKind::Claude));
+        assert!(session.can_choose_model());
+
+        session.status = SessionStatus::Working;
+        assert!(!session.can_choose_model());
+    }
+
+    #[test]
+    fn switching_parks_the_outgoing_agents_cursor_and_resumes_the_returning_one() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-thread".into(),
+        });
+
+        assert!(!session.switch_provider(ProviderKind::Claude));
+        assert_eq!(session.provider, ProviderKind::Claude);
+        assert!(session.provider_cursor.is_none());
+        assert_eq!(session.provider_cursors.len(), 1);
+        assert_eq!(
+            session.provider_cursors[0].provider(),
+            ProviderKind::Codex
+        );
+
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-session".into(),
+            resume_at: None,
+        });
+        assert!(session.switch_provider(ProviderKind::Codex));
+        assert_eq!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Codex {
+                thread_id: "codex-thread".into(),
+            })
+        );
+        assert_eq!(session.provider_cursors.len(), 1);
+        assert_eq!(
+            session.provider_cursors[0].provider(),
+            ProviderKind::Claude
+        );
+    }
+
+    #[test]
+    fn turns_record_the_agent_that_ran_them_and_a_mix_is_visible() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.begin_turn("first");
+        assert!(!session.has_mixed_providers());
+
+        session.switch_provider(ProviderKind::Claude);
+        session.begin_turn("second");
+        assert_eq!(session.turn_provider(&session.turns[0]), ProviderKind::Codex);
+        assert_eq!(session.turn_provider(&session.turns[1]), ProviderKind::Claude);
+        assert!(session.has_mixed_providers());
     }
 
     #[test]
@@ -4254,11 +4480,11 @@ mod tests {
             SessionStatus::Waiting,
         ] {
             session.status = status;
-            assert!(!session.can_choose_model(ProviderKind::Codex));
+            assert!(!session.can_choose_model());
         }
 
         session.status = SessionStatus::Idle;
-        assert!(session.can_choose_model(ProviderKind::Codex));
+        assert!(session.can_choose_model());
     }
 
     #[test]
@@ -4654,6 +4880,37 @@ mod tests {
         assert_eq!(value["provider"], "cursor");
         assert_eq!(value["sessionId"], "");
         assert_eq!(value["forkContext"], "[]");
+    }
+
+    #[test]
+    fn native_rollback_counts_only_the_current_agents_own_turns() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        let run = |session: &mut AgentSession, prompt: &str| {
+            session.begin_turn(prompt);
+            session.mark_active_turn_provider_started();
+            let _ = session.finish_active_turn(TurnStatus::Completed);
+        };
+
+        run(&mut session, "codex one");
+        session.switch_provider(ProviderKind::Claude);
+        run(&mut session, "claude one");
+        run(&mut session, "claude two");
+        session.switch_provider(ProviderKind::Codex);
+        run(&mut session, "codex two");
+
+        // Codex's own thread holds two turns, not four, and only the turns after
+        // the retained index count for a rollback of it.
+        assert_eq!(session.provider_turns_through(4), 2);
+        assert_eq!(session.provider_turns_through(2), 1);
+        assert_eq!(session.provider_turns_after(0), 2);
+        assert_eq!(session.provider_turns_after(1), 1);
+        assert_eq!(session.provider_turns_after(3), 1);
+        // Claude sees none of the Codex turns when it becomes current again.
+        session.switch_provider(ProviderKind::Claude);
+        assert_eq!(session.provider_turns_through(4), 2);
+        assert_eq!(session.provider_turns_after(1), 2);
+        assert_eq!(session.provider_turns_after(2), 1);
     }
 
     #[test]

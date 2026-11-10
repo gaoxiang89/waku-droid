@@ -1756,17 +1756,12 @@ impl Waku {
     /// composer's trigger, the picker panel, and the send button all swap to
     /// their unavailable state.
     pub(super) fn model_picker_has_no_providers(&self) -> bool {
-        let locked_provider = self
-            .selected_session()
-            .filter(|session| !session.messages.is_empty())
-            .map(|session| session.provider);
         let disabled = self
             .disabled_providers_for(&self.selected_host_key())
             .to_vec();
         super::composer::picker_has_no_providers(
             self.provider_probes(),
             &disabled,
-            locked_provider,
             self.provider_detection_checked_at.is_some(),
         )
     }
@@ -2068,12 +2063,7 @@ impl Waku {
                 .filter(|session| session.project_id == project_id)
                 .map(AgentSession::display_title),
         );
-        let provider_turn_count = source
-            .turns
-            .iter()
-            .take(turn_count)
-            .filter(|turn| turn.provider_turn_started)
-            .count();
+        let provider_turn_count = source.provider_turns_through(turn_count);
         let turns_to_remove = source.provider_turns_after(turn_count);
         let driver = self
             .runtimes
@@ -2445,12 +2435,7 @@ impl Waku {
             cx.notify();
             return;
         };
-        let provider_turn_count = source
-            .turns
-            .iter()
-            .take(retained_turn_count)
-            .filter(|turn| turn.provider_turn_started)
-            .count();
+        let provider_turn_count = source.provider_turns_through(retained_turn_count);
         let provider_resume_at = retained_turn_count
             .checked_sub(1)
             .and_then(|index| source.turns.get(index))
@@ -3487,11 +3472,25 @@ impl Waku {
         };
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
-            let turn_id = session.begin_turn_with_presentation(
-                &prompt,
-                submission.display_content.clone(),
-                submission.attachments.clone(),
-            );
+            // A task may change agents between turns. The incoming agent has
+            // no memory of the outgoing one's conversation, so the earlier
+            // turns travel with the prompt as a preamble the driver prepends
+            // once, plus a transcript notice that says so on the record.
+            let handoff = super::handoff::plan(session, &prompt);
+            let turn_id = match handoff {
+                Some(handoff) => session.begin_turn_with_handoff(
+                    &prompt,
+                    submission.display_content.clone(),
+                    submission.attachments.clone(),
+                    Some((handoff.notice, handoff.record)),
+                    Some(handoff.preamble),
+                ),
+                None => session.begin_turn_with_presentation(
+                    &prompt,
+                    submission.display_content.clone(),
+                    submission.attachments.clone(),
+                ),
+            };
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();
             selected.then_some(TranscriptAnchor {
@@ -3698,7 +3697,24 @@ impl Waku {
         // while templates expand and skills adopt provider-native syntax.
         // Claude's commands pass through untouched; its CLI owns expansion.
         let prompt = submission.prompt;
-        let driver_prompt = self.resolve_provider_submission(provider, &prompt);
+        // A handoff preamble belongs to exactly one prompt: it describes the
+        // conversation as it stood when this turn began. Take it so a retry or
+        // the next turn cannot send it twice. Busy sessions reject new turns,
+        // so the turn created at accept time is still the last one here.
+        let handoff_preamble = self
+            .state
+            .session_mut(session_id)
+            .and_then(|session| session.turns.last_mut())
+            .and_then(|turn| turn.handoff_preamble.take());
+        let mut driver_prompt = self.resolve_provider_submission(provider, &prompt);
+        if let Some(preamble) = handoff_preamble {
+            // A provider-native command owns the head of its message, so it
+            // travels alone; the incoming agent still resumes its own
+            // conversation, it simply misses this one turn's recap.
+            if !driver_prompt.trim_start().starts_with('/') {
+                driver_prompt = format!("{preamble}\n\n---\n\n{driver_prompt}");
+            }
+        }
         // The turn and its user message landed at accept time. Their ids go
         // with the prompt so every other client attached to the runtime
         // mirrors the same rows instead of minting its own.

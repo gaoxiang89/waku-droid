@@ -142,6 +142,9 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 started_at: at,
                 completed_at: Some(at),
                 checkpoint: None,
+                provider: None,
+                handoff: None,
+                handoff_preamble: None,
             });
             if let Some(text) = message_text(&native) {
                 let mut message = Message::new_for_turn(MessageRole::User, text, turn_id);
