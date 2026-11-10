@@ -366,7 +366,7 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
                     started_at: 0,
                     completed_at: Some(0),
                     checkpoint: None,
-                    provider: None,
+                    provider: Some(provider),
                     handoff: None,
                     handoff_preamble: None,
                 });
@@ -480,9 +480,11 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
                 {
                     message.content.push_str(text);
                 } else {
-                    history
-                        .messages
-                        .push(Message::new_for_turn(MessageRole::Assistant, text, turn_id));
+                    history.messages.push(Message::new_for_turn(
+                        MessageRole::Assistant,
+                        text,
+                        turn_id,
+                    ));
                 }
                 phase = Some(ReplayPhase::Text);
             }
@@ -624,7 +626,10 @@ mod tests {
         let block1 = &history.transcript_blocks[0];
         assert_eq!(block1.after_message, 1); // after "prompt 1"
         assert_eq!(block1.activities.len(), 2); // 1 reasoning, 1 tool call
-        assert_eq!(block1.activities[0].reasoning.as_ref().unwrap().content, "thinking 1 more");
+        assert_eq!(
+            block1.activities[0].reasoning.as_ref().unwrap().content,
+            "thinking 1 more"
+        );
         assert_eq!(block1.activities[1].kind, ActivityKind::FileRead);
         assert_eq!(block1.activities[1].title, "read_file");
 
@@ -632,7 +637,10 @@ mod tests {
         let block2 = &history.transcript_blocks[1];
         assert_eq!(block2.after_message, 3); // after "prompt 2"
         assert_eq!(block2.activities.len(), 2);
-        assert_eq!(block2.activities[0].reasoning.as_ref().unwrap().content, "thinking 2");
+        assert_eq!(
+            block2.activities[0].reasoning.as_ref().unwrap().content,
+            "thinking 2"
+        );
         assert_eq!(block2.activities[1].kind, ActivityKind::FileChange);
         assert_eq!(block2.activities[1].title, "write_file");
 

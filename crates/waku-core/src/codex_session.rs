@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    AgentTurn, Message, MessageRole, ProviderResumeCursor, ProviderSessionHistory,
+    AgentTurn, Message, MessageRole, ProviderKind, ProviderResumeCursor, ProviderSessionHistory,
     ProviderSessionSummary, TurnStatus,
 };
 
@@ -313,7 +313,7 @@ fn parse_session_history(response: &Value) -> ProviderSessionHistory {
             started_at,
             completed_at,
             checkpoint: None,
-            provider: None,
+            provider: Some(ProviderKind::Codex),
             handoff: None,
             handoff_preamble: None,
         });

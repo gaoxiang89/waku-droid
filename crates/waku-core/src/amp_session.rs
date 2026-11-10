@@ -9,7 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    AgentTurn, Message, MessageRole, ProviderResumeCursor, ProviderSessionHistory,
+    AgentTurn, Message, MessageRole, ProviderKind, ProviderResumeCursor, ProviderSessionHistory,
     ProviderSessionSummary, TurnStatus,
 };
 
@@ -142,7 +142,7 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 started_at: at,
                 completed_at: Some(at),
                 checkpoint: None,
-                provider: None,
+                provider: Some(ProviderKind::Amp),
                 handoff: None,
                 handoff_preamble: None,
             });

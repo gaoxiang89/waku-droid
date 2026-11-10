@@ -1348,12 +1348,21 @@ impl AgentSession {
         self.provider_cursors.push(cursor);
     }
 
+    pub fn all_provider_cursors(&self) -> impl Iterator<Item = &ProviderResumeCursor> {
+        self.provider_cursor.iter().chain(&self.provider_cursors)
+    }
+
     /// Makes `provider` active: parks the outgoing agent's cursor and adopts
     /// the incoming agent's parked one, if it has any. Returns whether a native
     /// conversation was resumed, which decides whether the next turn needs a
     /// full handoff or only the delta the incoming agent has not seen.
     pub fn switch_provider(&mut self, provider: ProviderKind) -> bool {
         let outgoing = self.provider;
+        if outgoing != provider {
+            for turn in &mut self.turns {
+                turn.provider.get_or_insert(outgoing);
+            }
+        }
         self.park_provider_cursor();
         self.provider = provider;
         let parked = self
@@ -1728,6 +1737,15 @@ impl AgentSession {
             .count()
     }
 
+    pub fn provider_resume_at_through(&self, turn_count: usize) -> Option<String> {
+        self.turns
+            .iter()
+            .take(turn_count)
+            .rev()
+            .find(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
+            .and_then(|turn| turn.provider_resume_at.clone())
+    }
+
     pub fn finish_active_turn(&mut self, status: TurnStatus) -> Option<(Uuid, usize)> {
         let turn = self
             .turns
@@ -1799,7 +1817,7 @@ impl AgentSession {
     pub fn fork_through_turn(
         &self,
         turn_count: usize,
-        provider_cursor: ProviderResumeCursor,
+        provider_cursor: Option<ProviderResumeCursor>,
         fork_title: &str,
     ) -> Option<Self> {
         if turn_count == 0 || turn_count > self.turns.len() {
@@ -1838,7 +1856,7 @@ impl AgentSession {
         fork.status = SessionStatus::Idle;
         fork.created_at = now;
         fork.updated_at = now;
-        fork.provider_cursor = Some(provider_cursor);
+        fork.provider_cursor = provider_cursor;
         // The fork starts with one agent's native conversation; the cursors of
         // agents that ran turns in the source task would point at transcripts
         // that still include turns this fork dropped.
@@ -4431,10 +4449,7 @@ mod tests {
         assert_eq!(session.provider, ProviderKind::Claude);
         assert!(session.provider_cursor.is_none());
         assert_eq!(session.provider_cursors.len(), 1);
-        assert_eq!(
-            session.provider_cursors[0].provider(),
-            ProviderKind::Codex
-        );
+        assert_eq!(session.provider_cursors[0].provider(), ProviderKind::Codex);
 
         session.provider_cursor = Some(ProviderResumeCursor::Claude {
             session_id: "claude-session".into(),
@@ -4448,10 +4463,7 @@ mod tests {
             })
         );
         assert_eq!(session.provider_cursors.len(), 1);
-        assert_eq!(
-            session.provider_cursors[0].provider(),
-            ProviderKind::Claude
-        );
+        assert_eq!(session.provider_cursors[0].provider(), ProviderKind::Claude);
     }
 
     #[test]
@@ -4463,8 +4475,14 @@ mod tests {
 
         session.switch_provider(ProviderKind::Claude);
         session.begin_turn("second");
-        assert_eq!(session.turn_provider(&session.turns[0]), ProviderKind::Codex);
-        assert_eq!(session.turn_provider(&session.turns[1]), ProviderKind::Claude);
+        assert_eq!(
+            session.turn_provider(&session.turns[0]),
+            ProviderKind::Codex
+        );
+        assert_eq!(
+            session.turn_provider(&session.turns[1]),
+            ProviderKind::Claude
+        );
         assert!(session.has_mixed_providers());
     }
 
@@ -4725,9 +4743,9 @@ mod tests {
         let fork = session
             .fork_through_turn(
                 1,
-                ProviderResumeCursor::Codex {
+                Some(ProviderResumeCursor::Codex {
                     thread_id: "forked-thread".into(),
-                },
+                }),
                 "New task (2)",
             )
             .unwrap();
@@ -4766,9 +4784,9 @@ mod tests {
         let fork = session
             .fork_through_turn(
                 1,
-                ProviderResumeCursor::Codex {
+                Some(ProviderResumeCursor::Codex {
                     thread_id: "forked-thread".into(),
-                },
+                }),
                 "New task (2)",
             )
             .unwrap();
@@ -5274,5 +5292,113 @@ mod tests {
         assert!(projection.transcript_blocks.is_empty());
         assert!(projection.turns.is_empty());
         assert!(projection.queued_messages.is_empty());
+    }
+
+    #[test]
+    fn legacy_unattributed_turns_keep_outgoing_provider_across_agent_switch() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-1".into(),
+        });
+        session.turns.push(AgentTurn {
+            id: Uuid::new_v4(),
+            turn_count: 1,
+            status: TurnStatus::Completed,
+            provider_turn_started: true,
+            provider_resume_at: None,
+            started_at: 10,
+            completed_at: Some(20),
+            checkpoint: None,
+            provider: None,
+            handoff: None,
+            handoff_preamble: None,
+        });
+
+        assert!(!session.switch_provider(ProviderKind::Claude));
+        assert_eq!(session.turns[0].provider, Some(ProviderKind::Codex));
+        assert_eq!(
+            session.turn_provider(&session.turns[0]),
+            ProviderKind::Codex
+        );
+        assert_eq!(session.provider_turns_through(1), 0);
+        assert_eq!(session.provider_turns_after(0), 0);
+
+        session.begin_turn("claude follow-up");
+        session.mark_active_turn_provider_started();
+        session.finish_active_turn(TurnStatus::Completed);
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-1".into(),
+            resume_at: Some("msg-1".into()),
+        });
+
+        assert!(session.has_mixed_providers());
+        assert_eq!(session.provider_turns_through(2), 1);
+        assert_eq!(session.provider_turns_after(0), 1);
+        assert_eq!(session.provider_turns_after(1), 1);
+        assert_eq!(
+            session
+                .all_provider_cursors()
+                .map(ProviderResumeCursor::provider)
+                .collect::<Vec<_>>(),
+            vec![ProviderKind::Claude, ProviderKind::Codex]
+        );
+    }
+
+    #[test]
+    fn provider_resume_at_through_skips_other_agents_and_unstarted_turns() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Claude);
+
+        session.begin_turn("claude 1");
+        session.mark_active_turn_provider_started();
+        session.mark_active_turn_provider_resume_at("claude-msg-1".into());
+        session.finish_active_turn(TurnStatus::Completed);
+
+        session.switch_provider(ProviderKind::Codex);
+        session.begin_turn("codex 1");
+        session.mark_active_turn_provider_started();
+        session.mark_active_turn_provider_resume_at("codex-item-1".into());
+        session.finish_active_turn(TurnStatus::Completed);
+
+        session.switch_provider(ProviderKind::Claude);
+        assert_eq!(
+            session.provider_resume_at_through(2).as_deref(),
+            Some("claude-msg-1")
+        );
+
+        session.begin_turn("claude unstarted");
+        session.mark_active_turn_provider_resume_at("unstarted-msg".into());
+        session.finish_active_turn(TurnStatus::Failed);
+        assert_eq!(
+            session.provider_resume_at_through(3).as_deref(),
+            Some("claude-msg-1")
+        );
+
+        session.switch_provider(ProviderKind::OpenCode);
+        assert_eq!(session.provider_resume_at_through(3), None);
+    }
+
+    #[test]
+    fn fork_through_turn_with_zero_current_agent_turns_clears_provider_cursors() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-thread".into(),
+        });
+        session.begin_turn("codex prompt");
+        session.mark_active_turn_provider_started();
+        session.push_message(MessageRole::Assistant, "codex reply");
+        session.finish_active_turn(TurnStatus::Completed);
+
+        session.switch_provider(ProviderKind::Claude);
+        assert_eq!(session.provider_turns_through(1), 0);
+
+        let fork = session.fork_through_turn(1, None, "Forked task").unwrap();
+        assert_eq!(fork.provider, ProviderKind::Claude);
+        assert!(fork.provider_cursor.is_none());
+        assert!(fork.provider_cursors.is_empty());
+        assert_eq!(fork.turns.len(), 1);
+        assert_eq!(fork.turn_provider(&fork.turns[0]), ProviderKind::Codex);
     }
 }

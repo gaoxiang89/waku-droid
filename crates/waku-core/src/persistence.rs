@@ -1315,6 +1315,7 @@ impl StateStore {
         session.queued_messages = stored.queued_messages;
         session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
+        session.provider_cursors = stored.provider_cursors;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
         session.service_tier = stored.service_tier;
@@ -3816,6 +3817,57 @@ mod tests {
         let state = store_in(&directory).load_or_fresh(PathBuf::from("/"));
         assert!(state.projects.is_empty());
         assert!(state.selected_session.is_none());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn hydrate_restores_parked_provider_cursors_alongside_active_cursor() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.begin_turn("Codex turn");
+            session.mark_active_turn_provider_started();
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(crate::model::ProviderResumeCursor::Codex {
+                thread_id: "codex-thread-1".into(),
+            });
+            assert!(!session.switch_provider(ProviderKind::Claude));
+            session.begin_turn("Claude turn");
+            session.mark_active_turn_provider_started();
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(crate::model::ProviderResumeCursor::Claude {
+                session_id: "claude-session-1".into(),
+                resume_at: Some("msg-1".into()),
+            });
+        }
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        assert_eq!(restored.sessions.len(), 1);
+        assert!(!restored.sessions[0].detail_loaded);
+        assert!(restored.sessions[0].provider_cursor.is_none());
+        assert!(restored.sessions[0].provider_cursors.is_empty());
+
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert!(restored.sessions[0].detail_loaded);
+        assert_eq!(restored.sessions[0].provider, ProviderKind::Claude);
+        assert_eq!(
+            restored.sessions[0].provider_cursor,
+            Some(crate::model::ProviderResumeCursor::Claude {
+                session_id: "claude-session-1".into(),
+                resume_at: Some("msg-1".into()),
+            })
+        );
+        assert_eq!(
+            restored.sessions[0].provider_cursors,
+            vec![crate::model::ProviderResumeCursor::Codex {
+                thread_id: "codex-thread-1".into(),
+            }]
+        );
         fs::remove_dir_all(directory).ok();
     }
 }

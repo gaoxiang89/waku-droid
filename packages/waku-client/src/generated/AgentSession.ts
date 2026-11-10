@@ -49,6 +49,12 @@ updated_at: number,
  */
 last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
 /**
+ * Resume cursors for agents this task used before the user switched away.
+ * A cursor already names its provider, so returning to one of these agents
+ * resumes its native conversation instead of starting from nothing.
+ */
+provider_cursors?: Array<ProviderResumeCursor>,
+/**
  * Slash commands the provider reported for this session's live process,
  * kept so a resumed session still completes them before its next
  * handshake.

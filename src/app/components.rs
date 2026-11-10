@@ -370,10 +370,9 @@ pub(super) struct MessageRender<'a> {
     pub(super) theme: &'a Theme,
     pub(super) message: &'a Message,
     pub(super) message_index: usize,
-    /// The agent that produced this message, present only when the task has
-    /// been run by more than one. A single-agent task reads the same as it
-    /// always did; a mixed one labels each response so a reader can tell whose
-    /// answer they are looking at.
+    /// The agent that produced this message, present only on the opening
+    /// visible segment of each response when the task has been run by more than
+    /// one agent. A single-agent task reads the same as it always did.
     pub(super) turn_provider: Option<ProviderKind>,
     pub(super) assistant_footer_copy_content: Option<SharedString>,
     pub(super) assistant_footer_time: Option<u64>,

@@ -69,6 +69,61 @@ impl Waku {
         value
     }
 
+    /// The provider label for `message_index` in a mixed-agent session, cached
+    /// under the row-kinds fingerprint.
+    ///
+    /// Only the first visible non-blank assistant segment of each turn carries
+    /// the badge, so multi-part responses interleaved with tool calls do not
+    /// repeat `● Provider` on every paragraph.
+    pub(super) fn assistant_turn_provider_cached(
+        &self,
+        message_index: usize,
+    ) -> Option<ProviderKind> {
+        if self
+            .selected_session()
+            .and_then(|session| session.messages.get(message_index))
+            .is_none_or(|message| message.role != MessageRole::Assistant)
+        {
+            return None;
+        }
+        self.ensure_assistant_turn_providers();
+        self.assistant_turn_provider_cache
+            .borrow()
+            .get(&message_index)
+            .copied()
+    }
+
+    fn ensure_assistant_turn_providers(&self) {
+        self.refresh_transcript_row_kinds();
+        let fingerprint = self.transcript_row_kinds_fingerprint.get();
+        if self.assistant_turn_provider_fingerprint.get() != fingerprint {
+            let mut cache = self.assistant_turn_provider_cache.borrow_mut();
+            if let Some(session) = self.selected_session() {
+                let row_kinds = self.transcript_row_kinds.borrow();
+                rebuild_assistant_turn_providers(session, &row_kinds, &mut cache);
+            } else {
+                cache.clear();
+            }
+            self.assistant_turn_provider_fingerprint.set(fingerprint);
+        }
+    }
+
+    fn consume_mixed_providers_change(&self) -> bool {
+        let current = self
+            .selected_session()
+            .map(|session| (session.id, session.has_mixed_providers()));
+        let previous = self.transcript_mixed_providers_state.replace(current);
+        mixed_providers_transitioned(previous, current)
+    }
+
+    fn remeasure_all_transcript_lists(&self, next_count: usize) {
+        let previous = self.transcript_rows.item_count();
+        self.transcript_rows.splice(0..previous, next_count);
+        let anchored_previous = self.anchored_transcript_rows.item_count();
+        self.anchored_transcript_rows
+            .splice(0..anchored_previous, next_count);
+    }
+
     /// The navigation rail's turn list, rebuilt only when the row-kinds
     /// fingerprint moves.
     ///
@@ -164,6 +219,10 @@ impl Waku {
     /// Bulk-reset the transcript. Used for session/document replacement.
     pub(super) fn reset_transcript_rows(&self, count: usize) {
         self.transcript_is_scrolled.set(false);
+        self.transcript_mixed_providers_state.set(
+            self.selected_session()
+                .map(|session| (session.id, session.has_mixed_providers())),
+        );
         self.transcript_rows.reset(count);
         self.anchored_transcript_rows.reset(count);
     }
@@ -174,11 +233,29 @@ impl Waku {
         &self,
         previous_kinds: &[TranscriptRowKind],
     ) {
-        self.refresh_transcript_row_kinds();
+        let previous_providers = self.assistant_turn_provider_cache.borrow().clone();
+        let had_provider_cache = self.assistant_turn_provider_fingerprint.get().is_some();
+        self.ensure_assistant_turn_providers();
+        if self.consume_mixed_providers_change() {
+            let next_count = self.transcript_row_kinds.borrow().len();
+            self.remeasure_all_transcript_lists(next_count);
+            return;
+        }
+        let next_providers = self.assistant_turn_provider_cache.borrow();
         let splice = {
             let next_kinds = self.transcript_row_kinds.borrow();
-            transcript_row_splice(previous_kinds, &next_kinds)
+            if had_provider_cache {
+                transcript_row_splice_with_providers(
+                    previous_kinds,
+                    &next_kinds,
+                    &previous_providers,
+                    &next_providers,
+                )
+            } else {
+                transcript_row_splice(previous_kinds, &next_kinds)
+            }
         };
+        drop(next_providers);
         self.splice_transcript_rows(splice);
     }
 
@@ -209,11 +286,29 @@ impl Waku {
         &self,
         previous_kinds: &[TranscriptRowKind],
     ) {
-        self.refresh_transcript_row_kinds();
+        let previous_providers = self.assistant_turn_provider_cache.borrow().clone();
+        let had_provider_cache = self.assistant_turn_provider_fingerprint.get().is_some();
+        self.ensure_assistant_turn_providers();
+        if self.consume_mixed_providers_change() {
+            let next_count = self.transcript_row_kinds.borrow().len();
+            self.remeasure_all_transcript_lists(next_count);
+            return;
+        }
+        let next_providers = self.assistant_turn_provider_cache.borrow();
         let splice = {
             let next_kinds = self.transcript_row_kinds.borrow();
-            transcript_row_splice(previous_kinds, &next_kinds)
+            if had_provider_cache {
+                transcript_row_splice_with_providers(
+                    previous_kinds,
+                    &next_kinds,
+                    &previous_providers,
+                    &next_providers,
+                )
+            } else {
+                transcript_row_splice(previous_kinds, &next_kinds)
+            }
         };
+        drop(next_providers);
         if let Some((range, new_count)) = splice {
             self.active_transcript_rows().splice(range, new_count);
         }
@@ -361,7 +456,12 @@ impl Waku {
         // The fold is cached; the list-state reconciliation below is not. It
         // has to run every time because `active_transcript_rows` can switch
         // lists under an unchanged transcript.
-        let count = self.refresh_transcript_row_kinds();
+        self.ensure_assistant_turn_providers();
+        let count = self.transcript_row_kinds.borrow().len();
+        if self.consume_mixed_providers_change() {
+            self.remeasure_all_transcript_lists(count);
+            return;
+        }
 
         let transcript_rows = self.active_transcript_rows();
         let current = transcript_rows.item_count();
@@ -678,21 +778,123 @@ pub(super) fn transcript_row_splice(
     previous: &[TranscriptRowKind],
     next: &[TranscriptRowKind],
 ) -> Option<(Range<usize>, usize)> {
+    transcript_row_splice_by(previous, next, |left, right| left == right)
+}
+
+fn transcript_row_splice_by(
+    previous: &[TranscriptRowKind],
+    next: &[TranscriptRowKind],
+    mut same_row: impl FnMut(TranscriptRowKind, TranscriptRowKind) -> bool,
+) -> Option<(Range<usize>, usize)> {
     let prefix = previous
         .iter()
-        .zip(next)
-        .take_while(|(left, right)| left == right)
+        .copied()
+        .zip(next.iter().copied())
+        .take_while(|&(left, right)| same_row(left, right))
         .count();
     let suffix = previous[prefix..]
         .iter()
+        .copied()
         .rev()
-        .zip(next[prefix..].iter().rev())
-        .take_while(|(left, right)| left == right)
+        .zip(next[prefix..].iter().copied().rev())
+        .take_while(|&(left, right)| same_row(left, right))
         .count();
     let old_end = previous.len() - suffix;
     let new_count = next.len() - prefix - suffix;
 
     (prefix != old_end || new_count != 0).then_some((prefix..old_end, new_count))
+}
+
+pub(super) fn transcript_row_splice_with_providers(
+    previous: &[TranscriptRowKind],
+    next: &[TranscriptRowKind],
+    previous_providers: &HashMap<usize, ProviderKind>,
+    next_providers: &HashMap<usize, ProviderKind>,
+) -> Option<(Range<usize>, usize)> {
+    transcript_row_splice_by(previous, next, |left, right| {
+        left == right
+            && match left {
+                TranscriptRowKind::Message(index) => {
+                    previous_providers.get(&index) == next_providers.get(&index)
+                }
+                _ => true,
+            }
+    })
+}
+
+pub(super) fn mixed_providers_transitioned(
+    previous: Option<(Uuid, bool)>,
+    current: Option<(Uuid, bool)>,
+) -> bool {
+    matches!(
+        (previous, current),
+        (Some((previous_id, previous_mixed)), Some((current_id, current_mixed)))
+            if previous_id == current_id && previous_mixed != current_mixed
+    )
+}
+
+pub(super) fn rebuild_assistant_turn_providers(
+    session: &AgentSession,
+    row_kinds: &[TranscriptRowKind],
+    cache: &mut HashMap<usize, ProviderKind>,
+) {
+    cache.clear();
+    if !session.has_mixed_providers() {
+        return;
+    }
+    let providers_by_turn: HashMap<Uuid, ProviderKind> = session
+        .turns
+        .iter()
+        .map(|turn| (turn.id, session.turn_provider(turn)))
+        .collect();
+    let mut seen_turns: HashSet<Uuid> = HashSet::with_capacity(session.turns.len());
+    for row in row_kinds {
+        let TranscriptRowKind::Message(message_index) = *row else {
+            continue;
+        };
+        let Some(message) = session.messages.get(message_index) else {
+            continue;
+        };
+        if message.role != MessageRole::Assistant || message.visible_content().trim().is_empty() {
+            continue;
+        }
+        let Some(turn_id) = message.turn_id else {
+            continue;
+        };
+        if let Some(&provider) = providers_by_turn.get(&turn_id)
+            && seen_turns.insert(turn_id)
+        {
+            cache.insert(message_index, provider);
+        }
+    }
+}
+
+pub(super) fn assistant_fork_turn_count(
+    session: &AgentSession,
+    message_index: usize,
+) -> Option<usize> {
+    let message = session.messages.get(message_index)?;
+    if message.role != MessageRole::Assistant
+        || !matches!(session.status, SessionStatus::Idle | SessionStatus::Failed)
+        || !session.provider.supports_conversation_fork()
+        || assistant_response_footer_index(session, message_index) != Some(message_index)
+    {
+        return None;
+    }
+    let turn_id = message.turn_id?;
+    let turn = session
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id && turn.provider_turn_started)?;
+    if session.provider_turns_through(turn.turn_count) > 0
+        && session
+            .provider_cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.provider() != session.provider)
+    {
+        return None;
+    }
+    Some(turn.turn_count)
 }
 
 /// Leading space above a short, bottom-aligned transcript, or `None` when the
@@ -836,6 +1038,7 @@ pub(super) fn transcript_rows_fingerprint(
     // driver error can drop the busy status without touching any turn — the
     // turn statuses below would hold still while the rows moved.
     hash = mix(hash, session.status.is_busy() as u64);
+    hash = mix(hash, session.provider as u64);
 
     hash = mix(hash, session.messages.len() as u64);
     for message in &session.messages {
@@ -845,6 +1048,7 @@ pub(super) fn transcript_rows_fingerprint(
         // line moves rows. `trim` stops at the first non-space character, so
         // this stays a per-message constant on the frame path.
         hash = mix(hash, message.content.trim().is_empty() as u64);
+        hash = mix(hash, message.visible_content().trim().is_empty() as u64);
     }
 
     hash = mix(hash, session.transcript_blocks.len() as u64);
@@ -859,6 +1063,7 @@ pub(super) fn transcript_rows_fingerprint(
     for turn in &session.turns {
         hash = mix_uuid(hash, turn.id);
         hash = mix(hash, turn.status as u64);
+        hash = mix(hash, session.turn_provider(turn) as u64);
         hash = mix(
             hash,
             turn.checkpoint.as_ref().is_some_and(|checkpoint| {
@@ -1319,4 +1524,164 @@ pub(super) fn message_starts_followup_turn(messages: &[Message], message_index: 
         && messages[..message_index]
             .iter()
             .any(|message| message.role == MessageRole::User)
+}
+
+#[cfg(test)]
+mod mixed_provider_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_provider_labels_only_first_visible_assistant_segment_per_turn() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("first prompt");
+        session.push_message(MessageRole::Assistant, "codex answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+
+        let expanded = HashSet::new();
+        let mut cache = HashMap::new();
+        let single_rows = folded_transcript_row_kinds(&session, &expanded);
+        rebuild_assistant_turn_providers(&session, &single_rows, &mut cache);
+        assert!(
+            cache.is_empty(),
+            "single-agent sessions do not label assistant rows"
+        );
+
+        session.switch_provider(ProviderKind::Claude);
+        session.begin_turn("second prompt");
+        let turn2_id = session.turns.last().expect("second turn").id;
+        // Blank placeholder followed by interim text, a tool block, and final answer.
+        session.push_message(MessageRole::Assistant, "   ");
+        session.push_message(MessageRole::Assistant, "Let me read the file.");
+        session.transcript_blocks.push(TranscriptBlock {
+            turn_id: Some(turn2_id),
+            after_message: session.messages.len(),
+            activities: vec![ActivityItem::new(
+                None,
+                ActivityKind::FileRead,
+                "src/main.rs",
+                None,
+                true,
+            )],
+        });
+        session.push_message(MessageRole::Assistant, "Here is the final answer.");
+
+        // While running, the first non-blank segment (index 4) carries the
+        // badge and the post-tool segment (index 5) does not repeat it.
+        let live_rows = folded_transcript_row_kinds(&session, &expanded);
+        rebuild_assistant_turn_providers(&session, &live_rows, &mut cache);
+        assert_eq!(cache.get(&1), Some(&ProviderKind::Codex));
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(cache.get(&4), Some(&ProviderKind::Claude));
+        assert_eq!(cache.get(&5), None);
+
+        // Once settled and collapsed, index 4 hides inside `TurnFold`, so the
+        // visible answer (index 5) carries the badge; expanding moves it back
+        // to index 4 and splices index 5 for remeasurement.
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+        let collapsed_rows = folded_transcript_row_kinds(&session, &expanded);
+        let mut collapsed_cache = HashMap::new();
+        rebuild_assistant_turn_providers(&session, &collapsed_rows, &mut collapsed_cache);
+        assert_eq!(collapsed_cache.get(&4), None);
+        assert_eq!(collapsed_cache.get(&5), Some(&ProviderKind::Claude));
+
+        let mut reopened = HashSet::new();
+        reopened.insert(turn2_id);
+        let expanded_rows = folded_transcript_row_kinds(&session, &reopened);
+        let mut expanded_cache = HashMap::new();
+        rebuild_assistant_turn_providers(&session, &expanded_rows, &mut expanded_cache);
+        assert_eq!(expanded_cache.get(&4), Some(&ProviderKind::Claude));
+        assert_eq!(expanded_cache.get(&5), None);
+
+        let (splice_range, _) = transcript_row_splice_with_providers(
+            &collapsed_rows,
+            &expanded_rows,
+            &collapsed_cache,
+            &expanded_cache,
+        )
+        .expect("reopening fold splices rows");
+        let answer_pos = collapsed_rows
+            .iter()
+            .position(|row| *row == TranscriptRowKind::Message(5))
+            .expect("collapsed answer row");
+        assert!(
+            splice_range.contains(&answer_pos),
+            "answer row losing its provider header must be remeasured"
+        );
+    }
+
+    #[test]
+    fn fingerprint_and_mixed_transition_track_provider_switches() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("prompt");
+        session.push_message(MessageRole::Assistant, "answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+
+        let expanded = HashSet::new();
+        let fp_before = transcript_rows_fingerprint(&session, &expanded);
+        let state_before = Some((session.id, session.has_mixed_providers()));
+
+        session.switch_provider(ProviderKind::Claude);
+        let fp_after_switch = transcript_rows_fingerprint(&session, &expanded);
+        assert_ne!(fp_before, fp_after_switch);
+
+        session.begin_turn("second");
+        let state_after = Some((session.id, session.has_mixed_providers()));
+        assert!(mixed_providers_transitioned(state_before, state_after));
+        assert!(!mixed_providers_transitioned(state_after, state_after));
+        assert!(!mixed_providers_transitioned(
+            Some((Uuid::new_v4(), false)),
+            state_after
+        ));
+    }
+
+    #[test]
+    fn fork_affordance_allows_cross_agent_turns_with_zero_target_native_turns() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("codex turn");
+        session.push_message(MessageRole::Assistant, "codex answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-1".into(),
+        });
+
+        // Switch to Claude before running any Claude turn: Claude has 0 native
+        // turns through Turn 1, so forking from Turn 1 needs no Claude cursor.
+        session.switch_provider(ProviderKind::Claude);
+        assert_eq!(session.provider_cursor, None);
+        assert_eq!(assistant_fork_turn_count(&session, 1), Some(1));
+
+        // Once Claude runs Turn 2, Turn 2 requires a matching Claude cursor,
+        // while Turn 1 still has 0 Claude turns through it.
+        session.begin_turn("claude turn");
+        session.push_message(MessageRole::Assistant, "claude answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+        assert_eq!(assistant_fork_turn_count(&session, 1), Some(1));
+        assert_eq!(assistant_fork_turn_count(&session, 3), None);
+
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-1".into(),
+            resume_at: None,
+        });
+        assert_eq!(assistant_fork_turn_count(&session, 3), Some(2));
+    }
 }

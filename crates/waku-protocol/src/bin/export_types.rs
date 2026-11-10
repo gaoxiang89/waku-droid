@@ -14,11 +14,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TypeScript protocol bindings are current");
         return Ok(());
     }
-    export_to(&output)?;
+    sync_generated(&output)?;
     println!(
         "generated TypeScript protocol bindings in {}",
         output.display()
     );
+    Ok(())
+}
+
+fn sync_generated(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = std::env::temp_dir().join(format!(
+        "waku-protocol-bindings-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    export_to(&temporary)?;
+    let actual_files = read_tree(&temporary)?;
+    let existing_files = if output.exists() {
+        read_tree(output)?
+    } else {
+        BTreeMap::new()
+    };
+    fs::remove_dir_all(&temporary)?;
+
+    for relative in existing_files.keys() {
+        if !actual_files.contains_key(relative) {
+            fs::remove_file(output.join(relative))?;
+        }
+    }
+    for (relative, bytes) in &actual_files {
+        if existing_files.get(relative) != Some(bytes) {
+            let target = output.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(target, bytes)?;
+        }
+    }
     Ok(())
 }
 
@@ -100,7 +131,10 @@ fn read_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, Vec<u8>>> {
             } else {
                 files.insert(
                     path.strip_prefix(root).unwrap_or(&path).to_owned(),
-                    fs::read(path)?,
+                    fs::read(&path)?
+                        .into_iter()
+                        .filter(|byte| *byte != b'\r')
+                        .collect(),
                 );
             }
         }

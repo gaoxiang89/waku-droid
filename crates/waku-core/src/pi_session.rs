@@ -408,7 +408,7 @@ fn history_from_session(provider: ProviderKind, session: &ParsedSession) -> Prov
                 started_at: entry.timestamp,
                 completed_at: None,
                 checkpoint: None,
-                provider: None,
+                provider: Some(provider),
                 handoff: None,
                 handoff_preamble: None,
             });

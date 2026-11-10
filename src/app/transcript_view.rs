@@ -1126,29 +1126,13 @@ impl Waku {
         message_index: usize,
     ) -> Option<AssistantMessageAction> {
         let session = self.selected_session()?;
-        let message = session.messages.get(message_index)?;
-        if message.role != MessageRole::Assistant
-            || assistant_response_footer_index(session, message_index) != Some(message_index)
-            || !matches!(session.status, SessionStatus::Idle | SessionStatus::Failed)
-            || !session.provider.supports_conversation_fork()
-            || session
-                .provider_cursor
-                .as_ref()
-                .is_none_or(|cursor| cursor.provider() != session.provider)
-        {
-            return None;
-        }
-        let turn_id = message.turn_id?;
-        let turn = session
-            .turns
-            .iter()
-            .find(|turn| turn.id == turn_id && turn.provider_turn_started)?;
+        let turn_count = assistant_fork_turn_count(session, message_index)?;
         let pending_turn = self.response_fork_preparations.get(&session.id).copied();
         Some(AssistantMessageAction {
             session_id: session.id,
-            turn_count: turn.turn_count,
+            turn_count,
             enabled: pending_turn.is_none(),
-            preparing: pending_turn == Some(turn.turn_count),
+            preparing: pending_turn == Some(turn_count),
         })
     }
 
@@ -1365,18 +1349,7 @@ impl Waku {
                     // Only a task that has changed agents labels its answers:
                     // one owner per row is already implied when the whole
                     // transcript came from a single agent.
-                    let turn_provider = self.selected_session().and_then(|session| {
-                        if message.role != MessageRole::Assistant || !session.has_mixed_providers()
-                        {
-                            return None;
-                        }
-                        let turn_id = message.turn_id?;
-                        session
-                            .turns
-                            .iter()
-                            .find(|turn| turn.id == turn_id)
-                            .map(|turn| session.turn_provider(turn))
-                    });
+                    let turn_provider = self.assistant_turn_provider_cached(message_index);
                     let rendered = render_message(
                         MessageRender {
                             theme: &theme,

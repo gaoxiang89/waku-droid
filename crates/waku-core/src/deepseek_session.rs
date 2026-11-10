@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    AgentTurn, Message, MessageRole, ProviderResumeCursor, ProviderSessionHistory,
+    AgentTurn, Message, MessageRole, ProviderKind, ProviderResumeCursor, ProviderSessionHistory,
     ProviderSessionSummary, TurnStatus,
 };
 
@@ -132,7 +132,7 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         started_at: timestamp,
         completed_at: None,
         checkpoint: None,
-        provider: None,
+        provider: Some(ProviderKind::DeepSeek),
         handoff: None,
         handoff_preamble: None,
     });

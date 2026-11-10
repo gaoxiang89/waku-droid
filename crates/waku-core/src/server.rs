@@ -316,7 +316,9 @@ impl Hub {
 
     fn restore_displaced_runtime(&self, session_id: Uuid, displaced: DisplacedRuntime) {
         let mut state = self.state.lock();
-        state.active_runtimes.insert(session_id, displaced.runtime_id);
+        state
+            .active_runtimes
+            .insert(session_id, displaced.runtime_id);
         clear_session_replay(&mut state, session_id);
         for (key, sequence) in displaced.sequences {
             state.next_sequences.insert(key, sequence);
@@ -2081,6 +2083,7 @@ mod tests {
                 runtime_id,
                 Command::Prompt {
                     prompt: "streamed from the first client".into(),
+                    transcript_message: None,
                     turn_id: None,
                     message_id: None,
                 },
@@ -2509,8 +2512,7 @@ mod tests {
         use crate::daemon::WakuBackend;
         use crate::persistence::StateStore;
         use crate::settings::DaemonSettingsStore;
-        let root =
-            std::env::temp_dir().join(format!("waku-exited-terminal-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("waku-exited-terminal-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let backend = WakuBackend::new(
             DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
@@ -3352,7 +3354,6 @@ mod tests {
         assert_eq!(event.event.kind, "resumed");
     }
 
-
     #[test]
     fn response_cache_evicts_oversized_and_byte_budget_exceeding_outcomes() {
         let hub = Hub::default();
@@ -3526,6 +3527,7 @@ mod tests {
                 runtime_id: blocked_runtime_id,
                 command: Command::Prompt {
                     prompt: "after start".into(),
+                    transcript_message: None,
                     turn_id: None,
                     message_id: None,
                 },

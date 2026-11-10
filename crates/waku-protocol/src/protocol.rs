@@ -88,6 +88,8 @@ pub enum Command {
     },
     Prompt {
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_message: Option<String>,
         /// The ids the submitting client already gave this turn and its user
         /// message. The daemon republishes them with the submission so every
         /// other client attached to the runtime mirrors the same rows instead
@@ -658,5 +660,38 @@ mod tests {
             project_id.to_string()
         );
         assert_eq!(json["changes"][0]["draft"]["text"], "unfinished");
+    }
+
+    #[test]
+    fn prompt_command_serializes_optional_transcript_message_in_camel_case() {
+        let plain = serde_json::to_value(Command::Prompt {
+            prompt: "hello".into(),
+            transcript_message: None,
+            turn_id: None,
+            message_id: None,
+        })
+        .unwrap();
+        assert_eq!(plain["type"], "prompt");
+        assert_eq!(plain["prompt"], "hello");
+        assert!(plain.get("transcriptMessage").is_none());
+
+        let with_handoff = serde_json::to_value(Command::Prompt {
+            prompt: "<handoff>\nhello".into(),
+            transcript_message: Some("hello".into()),
+            turn_id: None,
+            message_id: None,
+        })
+        .unwrap();
+        assert_eq!(with_handoff["transcriptMessage"], "hello");
+        let Command::Prompt {
+            prompt,
+            transcript_message,
+            ..
+        } = serde_json::from_value(with_handoff).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(prompt, "<handoff>\nhello");
+        assert_eq!(transcript_message.as_deref(), Some("hello"));
     }
 }

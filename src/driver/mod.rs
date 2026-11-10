@@ -233,9 +233,16 @@ impl RemoteDriverControl {
 }
 
 impl DriverControl for RemoteDriverControl {
-    fn prompt(&self, prompt: String, turn_id: Option<uuid::Uuid>, message_id: Option<uuid::Uuid>) {
+    fn prompt(
+        &self,
+        prompt: String,
+        transcript_message: Option<String>,
+        turn_id: Option<uuid::Uuid>,
+        message_id: Option<uuid::Uuid>,
+    ) {
         self.notify(waku_client::Command::Prompt {
             prompt,
+            transcript_message,
             turn_id,
             message_id,
         });

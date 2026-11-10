@@ -631,12 +631,7 @@ impl Backend for WakuBackend {
                 });
                 let imported = {
                     let state = self.task_state.lock();
-                    state
-                        .sessions
-                        .iter()
-                        .filter_map(|session| session.provider_cursor.as_ref())
-                        .map(|cursor| (cursor.provider(), cursor.native_id().to_owned()))
-                        .collect::<HashSet<_>>()
+                    imported_provider_session_keys(&state.sessions)
                 };
                 sessions.retain(|session| {
                     !imported.contains(&(session.provider(), session.cursor.native_id().to_owned()))
@@ -1013,12 +1008,7 @@ impl Backend for WakuBackend {
                     }
                     driver.clone()
                 };
-                if let Command::Prompt {
-                    prompt,
-                    turn_id,
-                    message_id,
-                } = &command
-                {
+                if let Some(event) = prompt_submission_wire_event(&command)? {
                     // Publish the submission into the runtime's event stream
                     // before the provider can start the turn. Every attached
                     // client mirrors the user message and its turn from this
@@ -1026,11 +1016,7 @@ impl Backend for WakuBackend {
                     // the only record of the prompt — a follower that only
                     // knew the provider's `turnStarted` used to persist a
                     // projection without it, erasing the message for everyone.
-                    events.send(event_to_wire(DriverEvent::PromptSubmitted {
-                        message: prompt.clone(),
-                        turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
-                        message_id: message_id.unwrap_or_else(Uuid::new_v4),
-                    })?)?;
+                    events.send(event)?;
                 }
                 handle_driver_command(&driver, command)
             }
@@ -1052,6 +1038,32 @@ impl Backend for WakuBackend {
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
     }
+}
+
+fn imported_provider_session_keys(sessions: &[AgentSession]) -> HashSet<(ProviderKind, String)> {
+    sessions
+        .iter()
+        .flat_map(AgentSession::all_provider_cursors)
+        .map(|cursor| (cursor.provider(), cursor.native_id().to_owned()))
+        .collect()
+}
+
+fn prompt_submission_wire_event(command: &Command) -> anyhow::Result<Option<WireDriverEvent>> {
+    let Command::Prompt {
+        prompt,
+        transcript_message,
+        turn_id,
+        message_id,
+    } = command
+    else {
+        return Ok(None);
+    };
+    event_to_wire(DriverEvent::PromptSubmitted {
+        message: transcript_message.clone().unwrap_or_else(|| prompt.clone()),
+        turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
+        message_id: message_id.unwrap_or_else(Uuid::new_v4),
+    })
+    .map(Some)
 }
 
 fn session_projection_precedes(
@@ -1088,7 +1100,9 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.archived = incoming.archived;
         existing.project_id = incoming.project_id;
         existing.workspace = incoming.workspace;
-        existing.provider = incoming.provider;
+        if existing.provider != incoming.provider && !existing.status.is_busy() {
+            existing.switch_provider(incoming.provider);
+        }
         existing.model = incoming.model;
         existing.runtime_mode = incoming.runtime_mode;
         existing.reasoning_effort = incoming.reasoning_effort;
@@ -1174,14 +1188,19 @@ impl WakuBackend {
         validate_response_fork(&source, turn_count)?;
         let provider_turn_count = source.provider_turns_through(turn_count);
         let turns_to_remove = source.provider_turns_after(turn_count);
-        let (provider_cursor, message_ids) = self.fork_provider_response(
-            &source,
-            &cwd,
-            &fork_title,
-            turn_count,
-            provider_turn_count,
-            turns_to_remove,
-        )?;
+        let (provider_cursor, message_ids) = if provider_turn_count == 0 {
+            (None, HashMap::new())
+        } else {
+            let (cursor, message_ids) = self.fork_provider_response(
+                &source,
+                &cwd,
+                &fork_title,
+                turn_count,
+                provider_turn_count,
+                turns_to_remove,
+            )?;
+            (Some(cursor), message_ids)
+        };
         let mut forked = source
             .fork_through_turn(turn_count, provider_cursor, &fork_title)
             .ok_or_else(|| anyhow!("the selected response cannot be copied"))?;
@@ -1253,19 +1272,19 @@ impl WakuBackend {
         };
         validate_message_rewind(&source, turn_count)?;
 
-        // Resolve the executable before touching the worktree. Even native
-        // transcript operations are immediately followed by a replacement
-        // prompt, so accepting a rewind that cannot resume would strand the
-        // user at a provider state the UI cannot continue.
-        let binary = self.provider_binary(source.provider)?;
         let retained_turn_count = turn_count.saturating_sub(1);
         let previous_turn_count = source.turns.len();
         let rollback_turns = source.provider_turns_after(retained_turn_count);
         let provider_turn_count = source.provider_turns_through(retained_turn_count);
-        let provider_resume_at = retained_turn_count
-            .checked_sub(1)
-            .and_then(|index| source.turns.get(index))
-            .and_then(|turn| turn.provider_resume_at.clone());
+        let provider_resume_at = source.provider_resume_at_through(retained_turn_count);
+        // Resolve the executable before touching the worktree whenever the
+        // native session itself must roll back or fork. Even native transcript
+        // operations are immediately followed by a replacement prompt, so
+        // accepting a rewind that cannot resume would strand the user at a
+        // provider state the UI cannot continue.
+        let binary = (rollback_turns > 0 && provider_turn_count > 0)
+            .then(|| self.provider_binary(source.provider))
+            .transpose()?;
 
         let turn_start_ref = crate::checkpoint::turn_start_ref(session_id, turn_count);
         let retained_ref = crate::checkpoint::checkpoint_ref(session_id, retained_turn_count);
@@ -1293,7 +1312,7 @@ impl WakuBackend {
         let provider_rewind = self.rewind_provider_response(
             &source,
             &cwd,
-            &binary,
+            binary.as_deref(),
             retained_turn_count,
             rollback_turns,
             provider_turn_count,
@@ -1380,10 +1399,7 @@ impl WakuBackend {
                 else {
                     bail!("Claude's native session is unavailable");
                 };
-                let resume_at = source
-                    .turns
-                    .get(turn_count.saturating_sub(1))
-                    .and_then(|turn| turn.provider_resume_at.clone());
+                let resume_at = source.provider_resume_at_through(turn_count);
                 let fork = fork_provider_session(ProviderSessionForkRequest::Claude {
                     session_id: session_id.clone(),
                     resume_at,
@@ -1546,7 +1562,7 @@ impl WakuBackend {
         &self,
         source: &AgentSession,
         cwd: &Path,
-        binary: &Path,
+        binary: Option<&Path>,
         retained_turn_count: usize,
         rollback_turns: usize,
         provider_turn_count: usize,
@@ -1555,14 +1571,16 @@ impl WakuBackend {
         if rollback_turns == 0 {
             return Ok((None, HashMap::new(), false));
         }
-        let reset_native_session = retained_turn_count == 0
-            && matches!(
-                source.provider,
-                ProviderKind::Claude | ProviderKind::Cursor | ProviderKind::Grok
-            );
+        let reset_native_session = provider_turn_count == 0;
         if reset_native_session {
             return Ok((None, HashMap::new(), true));
         }
+        let binary = binary.ok_or_else(|| {
+            anyhow!(
+                "{} is not installed on the daemon",
+                source.provider.display_name()
+            )
+        })?;
 
         match source.provider {
             ProviderKind::Claude => {
@@ -1758,12 +1776,11 @@ fn validate_response_fork(source: &AgentSession, turn_count: usize) -> anyhow::R
     if !matches!(source.status, SessionStatus::Idle | SessionStatus::Failed) {
         bail!("stop the task before forking a response");
     }
-    let cursor = source
-        .provider_cursor
-        .as_ref()
-        .ok_or_else(|| anyhow!("the provider conversation is unavailable"))?;
-    if cursor.provider() != source.provider {
-        bail!("the provider conversation does not match this task");
+    if !source.provider.supports_conversation_fork() {
+        bail!(
+            "{} cannot branch a conversation at a turn",
+            source.provider.display_name()
+        );
     }
     if source
         .turns
@@ -1771,6 +1788,15 @@ fn validate_response_fork(source: &AgentSession, turn_count: usize) -> anyhow::R
         .is_none_or(|turn| turn.turn_count != turn_count || !turn.provider_turn_started)
     {
         bail!("the selected response cannot be forked");
+    }
+    if source.provider_turns_through(turn_count) > 0 {
+        let cursor = source
+            .provider_cursor
+            .as_ref()
+            .ok_or_else(|| anyhow!("the provider conversation is unavailable"))?;
+        if cursor.provider() != source.provider {
+            bail!("the provider conversation does not match this task");
+        }
     }
     Ok(())
 }
@@ -2441,5 +2467,172 @@ mod tests {
             DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
+    }
+
+    #[test]
+    fn prompt_submission_broadcasts_clean_transcript_message_instead_of_handoff_prompt() {
+        let turn_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let command = Command::Prompt {
+            prompt: "<handoff_context>\nprior codex turn\n</handoff_context>\n\n---\n\nship it"
+                .into(),
+            transcript_message: Some("ship it".into()),
+            turn_id: Some(turn_id),
+            message_id: Some(message_id),
+        };
+        let wire = prompt_submission_wire_event(&command)
+            .unwrap()
+            .expect("prompt command emits submission event");
+        assert_eq!(wire.kind, "promptSubmitted");
+        assert_eq!(wire.payload["message"], "ship it");
+        assert!(matches!(
+            event_from_wire(wire).unwrap(),
+            DriverEvent::PromptSubmitted {
+                message,
+                turn_id: decoded_turn,
+                message_id: decoded_message,
+            } if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
+        ));
+
+        let fallback = Command::Prompt {
+            prompt: "legacy client prompt".into(),
+            transcript_message: None,
+            turn_id: Some(turn_id),
+            message_id: Some(message_id),
+        };
+        let fallback_wire = prompt_submission_wire_event(&fallback)
+            .unwrap()
+            .expect("prompt command emits submission event");
+        assert_eq!(fallback_wire.payload["message"], "legacy client prompt");
+    }
+
+    #[test]
+    fn imported_provider_keys_include_parked_cursors() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-parked".into(),
+        });
+        session.switch_provider(ProviderKind::Claude);
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-active".into(),
+            resume_at: None,
+        });
+
+        let keys = imported_provider_session_keys(&[session]);
+        assert!(keys.contains(&(ProviderKind::Codex, "codex-parked".into())));
+        assert!(keys.contains(&(ProviderKind::Claude, "claude-active".into())));
+    }
+
+    #[test]
+    fn stale_metadata_merge_switches_provider_cleanly_when_idle_and_preserves_busy_provider() {
+        let mut idle = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        idle.updated_at = 10;
+        idle.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-1".into(),
+        });
+
+        let mut incoming = idle.clone();
+        incoming.switch_provider(ProviderKind::Claude);
+        incoming.model = Some("claude-sonnet-4-6".into());
+        incoming.updated_at = 20;
+
+        merge_stale_session_metadata(&mut idle, incoming.clone());
+        assert_eq!(idle.provider, ProviderKind::Claude);
+        assert!(idle.provider_cursor.is_none());
+        assert_eq!(
+            idle.provider_cursors,
+            vec![ProviderResumeCursor::Codex {
+                thread_id: "codex-1".into(),
+            }]
+        );
+        assert_eq!(idle.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(idle.updated_at, 20);
+
+        let mut busy = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        busy.status = SessionStatus::Working;
+        busy.updated_at = 10;
+        busy.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-live".into(),
+        });
+        merge_stale_session_metadata(&mut busy, incoming);
+        assert_eq!(busy.provider, ProviderKind::Codex);
+        assert_eq!(
+            busy.provider_cursor,
+            Some(ProviderResumeCursor::Codex {
+                thread_id: "codex-live".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_agent_fork_and_rewind_with_zero_current_agent_turns_reset_cursor_cleanly() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-test-{}", Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store = StateStore::daemon(dir.join("state.db"));
+        let mut state = PersistedState::fresh(workspace.clone());
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.provider = ProviderKind::Codex;
+            session.begin_turn("codex turn 1");
+            session.mark_active_turn_provider_started();
+            session.push_message(crate::model::MessageRole::Assistant, "codex answer 1");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(ProviderResumeCursor::Codex {
+                thread_id: "codex-thread-1".into(),
+            });
+
+            // Switch to OpenCode: 0 OpenCode turns exist at turn 1, and cursor is None.
+            session.switch_provider(ProviderKind::OpenCode);
+        }
+        store.save(&mut state).unwrap();
+
+        let settings = DaemonSettingsStore::open(dir.join("daemon-settings.json")).unwrap();
+        let backend = WakuBackend::new(settings, store).unwrap();
+
+        // Forking at turn 1 while OpenCode has 0 turns must validate and succeed
+        // without requiring an OpenCode cursor or binary.
+        let (forked, _) = backend.fork_session_from_response(session_id, 1).unwrap();
+        assert_eq!(forked.provider, ProviderKind::OpenCode);
+        assert!(forked.provider_cursor.is_none());
+        assert!(forked.provider_cursors.is_empty());
+        assert_eq!(forked.turns.len(), 1);
+        assert_eq!(forked.turn_provider(&forked.turns[0]), ProviderKind::Codex);
+
+        // Now simulate OpenCode having run turn 2, then rewinding turn 2 back to
+        // retained_turn_count = 1 where OpenCode has provider_turn_count = 0.
+        let mut with_second_turn = forked.clone();
+        with_second_turn.provider_cursor = Some(ProviderResumeCursor::OpenCode {
+            session_id: "ses_2".into(),
+            directory: None,
+        });
+        with_second_turn.begin_turn("opencode turn 2");
+        with_second_turn.mark_active_turn_provider_started();
+        with_second_turn.finish_active_turn(crate::model::TurnStatus::Completed);
+
+        assert!(validate_message_rewind(&with_second_turn, 2).is_ok());
+        let rollback_turns = with_second_turn.provider_turns_after(1);
+        let provider_turn_count = with_second_turn.provider_turns_through(1);
+        assert_eq!(rollback_turns, 1);
+        assert_eq!(provider_turn_count, 0);
+
+        let (cursor, message_ids, reset_native_session) = backend
+            .rewind_provider_response(
+                &with_second_turn,
+                &workspace,
+                None,
+                1,
+                rollback_turns,
+                provider_turn_count,
+                with_second_turn.provider_resume_at_through(1),
+            )
+            .unwrap();
+        assert!(cursor.is_none());
+        assert!(message_ids.is_empty());
+        assert!(reset_native_session);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

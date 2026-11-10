@@ -1878,6 +1878,16 @@ pub struct Waku {
     assistant_footer_cache: RefCell<HashMap<usize, (Option<SharedString>, Option<u64>)>>,
     /// The row-kinds fingerprint `assistant_footer_cache` was built under.
     assistant_footer_fingerprint: Cell<Option<u64>>,
+    /// Provider badge per visible assistant message index in a mixed-agent
+    /// session, rebuilt in one linear pass when the row-kinds fingerprint
+    /// moves so `transcript_row` stays O(1) per visible row.
+    assistant_turn_provider_cache: RefCell<HashMap<usize, ProviderKind>>,
+    /// The row-kinds fingerprint `assistant_turn_provider_cache` was built under.
+    assistant_turn_provider_fingerprint: Cell<Option<u64>>,
+    /// Selected `(session_id, has_mixed_providers)` last reconciled with the
+    /// transcript `ListState`s, so flipping `false <-> true` forces a full
+    /// re-measure of rows that gained or lost their provider header.
+    transcript_mixed_providers_state: Cell<Option<(Uuid, bool)>>,
     /// The response row currently under the pointer. Response footers are
     /// separate virtual-list rows, so GPUI's ancestor-scoped `group_hover`
     /// cannot reveal them when a sibling response row is hovered.
@@ -3629,6 +3639,9 @@ impl Waku {
                 transcript_navigation_turns_fingerprint: Cell::new(None),
                 assistant_footer_cache: RefCell::new(HashMap::new()),
                 assistant_footer_fingerprint: Cell::new(None),
+                assistant_turn_provider_cache: RefCell::new(HashMap::new()),
+                assistant_turn_provider_fingerprint: Cell::new(None),
+                transcript_mixed_providers_state: Cell::new(None),
                 hovered_response_row: None,
                 checkpoint_ref_cache: RefCell::new(HashMap::new()),
                 checkpoint_ref_generation: Cell::new(0),

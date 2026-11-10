@@ -1123,7 +1123,7 @@ impl Waku {
             .iter()
             .filter(|native| {
                 !self.state.sessions.iter().any(|session| {
-                    session.provider_cursor.as_ref().is_some_and(|cursor| {
+                    session.all_provider_cursors().any(|cursor| {
                         cursor.provider() == native.provider()
                             && cursor.native_id() == native.cursor.native_id()
                     })
@@ -1314,12 +1314,7 @@ impl Waku {
             .scroll_to_item(self.command_palette_scroll_index(self.command_palette.selected));
     }
 
-    fn refresh_command_palette_results(
-        &mut self,
-        query: &str,
-        preserve_selection: bool,
-        cx: &App,
-    ) {
+    fn refresh_command_palette_results(&mut self, query: &str, preserve_selection: bool, cx: &App) {
         match self.command_palette.view {
             CommandPaletteView::Resume => {
                 self.refresh_command_palette_resume_results(query, preserve_selection);
@@ -1573,9 +1568,8 @@ impl Waku {
             .find(|session| {
                 self.hosts.ownership.session(session.id) == host
                     && session
-                        .provider_cursor
-                        .as_ref()
-                        .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
+                        .all_provider_cursors()
+                        .any(|cursor| same_provider_session(cursor, &summary.cursor))
             })
             .map(|session| session.id)
         {
@@ -1658,9 +1652,8 @@ impl Waku {
             .find(|session| {
                 self.hosts.ownership.session(session.id) == host
                     && session
-                        .provider_cursor
-                        .as_ref()
-                        .is_some_and(|cursor| same_provider_session(cursor, &summary.cursor))
+                        .all_provider_cursors()
+                        .any(|cursor| same_provider_session(cursor, &summary.cursor))
             })
             .map(|session| session.id)
         {
