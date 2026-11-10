@@ -203,8 +203,8 @@ const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_SESSION_DETAIL_ROW_HEIGHT: f32 =
     SIDEBAR_SESSION_DETAIL_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
-const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_SEARCH_BOTTOM_GAP: f32 = 10.0;
+const SIDEBAR_NEW_TASK_BUTTON_HEIGHT: f32 = 34.0;
+const SIDEBAR_SECTION_HEADER_HEIGHT: f32 = 28.0;
 /// Host rows are section titles; every host after the first is preceded by a
 /// hairline divider inside this gap.
 pub(super) const SIDEBAR_HOST_ROW_HEIGHT: f32 = 36.0;
@@ -858,49 +858,97 @@ impl Waku {
             .child(add_project)
     }
 
-    fn render_sidebar_action_row(
-        &self,
-        id: &'static str,
-        icon_path: &'static str,
-        label: String,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    fn render_header_search_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus("sidebar-search", cx);
         div()
-            .id(id)
+            .id("sidebar-search")
+            .track_focus(&focus)
             .tab_index(0)
-            .w_full()
-            .h(px(SIDEBAR_ACTION_ROW_HEIGHT))
+            .w(px(26.0))
+            .h(px(26.0))
             .flex_none()
-            .px(px(4.0))
-            .rounded(px(7.0))
+            .rounded(px(6.0))
             .flex()
             .items_center()
-            .gap(px(10.0))
+            .justify_center()
             .cursor_default()
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .hover(|element| element.bg(theme.sidebar_item_background))
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .hover(|element| element.bg(theme.overlay))
             .active(|element| element.bg(theme.overlay_strong))
-            .child(
-                div()
-                    .size(px(20.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(icon_path, 14.0, theme.text_secondary)),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(sp(13.0))
-                    .text_color(theme.text_secondary)
-                    .child(label),
-            )
+            .child(icon("icons/search.svg", 14.0, theme.text_tertiary))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("sidebar.search"),
+                crate::platform::primary_shortcut("⌘K", "Ctrl+K"),
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_command_palette_action(&ToggleCommandPalette, window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.toggle_command_palette_action(&ToggleCommandPalette, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 
-    fn render_conversation_new_session(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_header_new_session_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let focus = self.transcript_control_focus("header-new-session", cx);
+        div()
+            .id("header-new-session")
+            .track_focus(&focus)
+            .tab_index(0)
+            .w(px(26.0))
+            .h(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .focus_visible(|style| {
+                style
+                    .bg(theme.overlay)
+                    .border_1()
+                    .border_color(theme.accent)
+            })
+            .hover(|element| element.bg(theme.overlay))
+            .active(|element| element.bg(theme.overlay_strong))
+            .child(icon("icons/plus.svg", 14.0, theme.text_tertiary))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("menu.new_task"),
+                crate::platform::primary_shortcut("⌘N", "Ctrl+N"),
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.new_session_action(&NewSession, window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.new_session_action(&NewSession, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    fn render_sidebar_new_task(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
         let focus = self.transcript_control_focus("conversation-new-session", cx);
         div()
@@ -908,21 +956,30 @@ impl Waku {
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
-            .h(px(28.0))
-            .px(px(8.0))
+            .w_full()
+            .h(px(SIDEBAR_NEW_TASK_BUTTON_HEIGHT))
+            .px(px(12.0))
             .flex_none()
-            .rounded(px(6.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.sidebar_item_background)
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .cursor_default()
-            .text_size(sp(12.5))
-            .text_color(theme.text_secondary)
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text)
             .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .hover(|element| element.bg(theme.overlay))
-            .active(|element| element.bg(theme.overlay_strong))
+            .hover(|element| element.bg(theme.overlay_strong))
+            .active(|element| element.bg(theme.overlay))
+            .tooltip(Tooltip::with_shortcut(
+                tr!("menu.new_task"),
+                crate::platform::primary_shortcut("⌘N", "Ctrl+N"),
+            ))
             .child(icon("icons/plus.svg", 14.0, theme.text_secondary))
-            .child(tr!("menu.new_task"))
+            .child(div().min_w_0().truncate().child(tr!("menu.new_task")))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.new_session_action(&NewSession, window, cx);
             }))
@@ -934,31 +991,37 @@ impl Waku {
             }))
     }
 
-    fn render_sidebar_search(&self, cx: &mut Context<Self>) -> Div {
-        let search = self
-            .render_sidebar_action_row(
-                "sidebar-search",
-                "icons/search.svg",
-                tr!("sidebar.search"),
-                cx,
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_command_palette_action(&ToggleCommandPalette, window, cx);
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.toggle_command_palette_action(&ToggleCommandPalette, window, cx);
-                    cx.stop_propagation();
-                }
-            }));
+    fn render_sidebar_top(&self, cx: &mut Context<Self>) -> Div {
+        let theme = Theme::current(cx);
         div()
             .w_full()
-            .h(px(SIDEBAR_ACTION_ROW_HEIGHT + SIDEBAR_SEARCH_BOTTOM_GAP))
+            .pt(px(10.0))
+            .pb(px(4.0))
             .flex_none()
             .flex()
-            .items_center()
-            .child(div().flex_1().min_w_0().child(search))
-            .child(self.render_sidebar_header_actions(cx))
+            .flex_col()
+            .gap(px(8.0))
+            .child(self.render_sidebar_new_task(cx))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(SIDEBAR_SECTION_HEADER_HEIGHT))
+                    .pl(px(4.0))
+                    .pr(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(sp(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_tertiary)
+                            .child(tr!("usage.projects")),
+                    )
+                    .child(self.render_sidebar_header_actions(cx)),
+            )
     }
 
     pub(super) fn start_available_update(&mut self, cx: &mut Context<Self>) {
@@ -1358,7 +1421,7 @@ impl Waku {
                 div()
                     .flex_none()
                     .px(px(10.0))
-                    .child(self.render_sidebar_search(cx)),
+                    .child(self.render_sidebar_top(cx)),
             )
             .child(
                 div()
@@ -2820,7 +2883,35 @@ impl Waku {
                     cx,
                 ),
             )
-            .child(self.render_sidebar_toggle(cx))
+            .child(
+                div()
+                    .id("header-navigation-controls")
+                    .tab_group()
+                    .tab_stop(false)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(self.render_sidebar_toggle(cx))
+                    .child(self.render_history_button(
+                        "navigate-back",
+                        "icons/arrow-left.svg",
+                        !self.session_navigation.back.is_empty(),
+                        true,
+                        cx,
+                    ))
+                    .child(self.render_history_button(
+                        "navigate-forward",
+                        "icons/arrow-right.svg",
+                        !self.session_navigation.forward.is_empty(),
+                        false,
+                        cx,
+                    ))
+                    .child(self.render_header_search_button(cx))
+                    .when(!self.sidebar_visible, |controls| {
+                        controls.child(self.render_header_new_session_button(cx))
+                    }),
+            )
             .child(
                 self.window_drag_region(
                     div()
@@ -2854,6 +2945,7 @@ impl Waku {
             .when(self.fps_counter_visible, |element| {
                 element.child(self.render_fps_counter(cx))
             })
+            .child(self.render_workspace_controls(cx))
             .child(
                 div()
                     .id("header-panel-controls")
@@ -2873,38 +2965,6 @@ impl Waku {
                 window,
                 cx,
             ))
-    }
-
-    pub(super) fn render_conversation_toolbar(&self, cx: &mut Context<Self>) -> Div {
-        let theme = Theme::current(cx);
-        div()
-            .tab_group()
-            .tab_stop(false)
-            .h(px(PANEL_TOOLBAR_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .px(px(10.0))
-            .gap(px(2.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(self.render_history_button(
-                "navigate-back",
-                "icons/arrow-left.svg",
-                !self.session_navigation.back.is_empty(),
-                true,
-                cx,
-            ))
-            .child(self.render_history_button(
-                "navigate-forward",
-                "icons/arrow-right.svg",
-                !self.session_navigation.forward.is_empty(),
-                false,
-                cx,
-            ))
-            .child(div().flex_1())
-            .child(self.render_conversation_new_session(cx))
-            .child(self.render_workspace_controls(cx))
     }
 
     // ── Empty states ───────────────────────────────────────────────────────
