@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.46]
+
+- See how fast the model is writing: the live turn shows an estimated tokens-per-second rate beside its working indicator, and each finished turn keeps its average in the "Worked for" summary. The estimate comes from streamed text and reasoning, so tool-call pauses do not drag it down
+
 ## [0.1.45]
 
 - Add Google Antigravity as a coding agent through the installed `agy` CLI and its ACP server, using the Google sign-in `agy` already has
