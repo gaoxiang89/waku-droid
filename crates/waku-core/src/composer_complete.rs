@@ -1654,14 +1654,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
         std::os::unix::fs::symlink(&skill, root.join(".agents/skills/to-spec")).unwrap();
 
-        let commands = assemble_slash_commands(ProviderKind::Codex, &root, Vec::new());
+        let commands = assemble_slash_commands(ProviderKind::Codex, &root, None, Vec::new());
         assert!(
             commands
                 .iter()
                 .any(|command| command.name == "mattpocock-skills:to-spec"),
             "Codex plugin skill is missing its catalog key: {commands:?}"
         );
-        let claude_commands = assemble_slash_commands(ProviderKind::Claude, &root, Vec::new());
+        let claude_commands = assemble_slash_commands(ProviderKind::Claude, &root, None, Vec::new());
         assert!(
             claude_commands
                 .iter()

@@ -2324,7 +2324,7 @@ printf '%s\n' '{"type":"control_response","response":{"request_id":"waku-initial
 "#,
         );
 
-        let models = discover_claude_models(&binary);
+        let models = discover_claude_models(&binary, None);
 
         let _ = std::fs::remove_file(binary);
         assert_eq!(models.len(), 1);

@@ -2525,6 +2525,7 @@ mod tests {
                 DriverStartOptions {
                     binary: binary.clone(),
                     cwd: directory.clone(),
+                    config_dir: None,
                     mode: RuntimeMode::Ask,
                     model: None,
                     reasoning_effort: None,
