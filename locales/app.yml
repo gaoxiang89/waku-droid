@@ -183,7 +183,7 @@ settings.general_keywords:
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
-  en: providers agents models cli version install detect claude codex cursor opencode amp grok pi kimi droid factory
+  en: providers agents models cli version install detect antigravity agy gemini claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills:
   en: Skills
 settings.skills_keywords:
@@ -1523,6 +1523,10 @@ errors.open_provider_session:
   en: "Could not open a %{provider} session: %{error}"
 errors.select_model:
   en: "Could not select the model: %{error}"
+errors.antigravity_quota:
+  en: "You have reached your Antigravity quota for this period."
+errors.antigravity_turn_failed:
+  en: "Antigravity stopped this turn because of an error."
 errors.set_session_option:
   en: "Could not change the session setting: %{error}"
 errors.read_provider_event_stream:

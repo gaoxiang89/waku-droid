@@ -56,9 +56,11 @@ impl HeadlessComputerUseRuntime {
         let runtime = computer_use_runtime::ComputerUseRuntime::start(events)?;
         let config = match provider {
             ProviderKind::Grok => build_grok_computer_use_config(runtime.config.clone())?,
-            ProviderKind::Cursor | ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
-                build_acp_mcp_computer_use_config(runtime.config.clone())?
-            }
+            ProviderKind::Antigravity
+            | ProviderKind::Cursor
+            | ProviderKind::Droid
+            | ProviderKind::Fx
+            | ProviderKind::Kimi => build_acp_mcp_computer_use_config(runtime.config.clone())?,
             _ => return Err(anyhow!("Computer Use is not supported by this driver")),
         };
         Ok(Self { runtime, config })

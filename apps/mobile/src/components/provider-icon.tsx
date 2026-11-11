@@ -13,6 +13,7 @@ const PROVIDER_BRAND_COLORS: Partial<Record<ProviderKind, string>> = {
   claude: '#d97757',
   deepSeek: '#4d6bfe',
   amp: '#f34e3f',
+  antigravity: '#4285f4',
 };
 
 /** Brand color for a provider mark, when the brand has one. */

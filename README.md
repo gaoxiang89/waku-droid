@@ -64,6 +64,7 @@ Settings → Connections; see [docs/remote.md](docs/remote.md).
 Waku works with:
 
 - [Amp](https://ampcode.com/)
+- Antigravity
 - Claude Code
 - Codex CLI
 - Cursor CLI

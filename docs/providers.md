@@ -10,13 +10,13 @@ polled off disk, and the one Waku generates itself — is in
 
 Every provider is reached through the same driver abstraction in
 [driver/mod.rs](../crates/waku-core/src/driver/mod.rs). There are seven
-transport implementations behind twelve providers, and **every one of them holds a
-session that spans the whole conversation**:
+transport implementations behind thirteen providers, and **every one of them
+holds a session that spans the whole conversation**:
 
 | Transport | File | Providers |
 | --- | --- | --- |
 | Codex app-server (JSON-RPC over stdio) | [driver/codex.rs](../crates/waku-core/src/driver/codex.rs) | Codex CLI |
-| Agent Client Protocol (JSON-RPC over stdio) | [driver/acp.rs](../crates/waku-core/src/driver/acp.rs) | Cursor CLI, Fx, Grok Build, Kimi Code, Factory Droid |
+| Agent Client Protocol (JSON-RPC over stdio) | [driver/acp.rs](../crates/waku-core/src/driver/acp.rs) | Antigravity, Cursor CLI, Fx, Grok Build, Kimi Code, Factory Droid |
 | OpenCode background service (HTTP + server-sent events) | [driver/opencode.rs](../crates/waku-core/src/driver/opencode.rs) | OpenCode |
 | Pi RPC mode (NDJSON request/response over stdio) | [driver/pi.rs](../crates/waku-core/src/driver/pi.rs) | Pi, Oh My Pi |
 | Claude streaming-input session (NDJSON over stdio) | [driver/claude.rs](../crates/waku-core/src/driver/claude.rs) | Claude Code |
@@ -216,25 +216,27 @@ stops a turn, and the short-lived server that backs a Grok fork.
 
 ## At a glance
 
-| | Codex CLI | Pi | Oh My Pi | Claude Code | Amp | Cursor CLI | Fx | OpenCode | Grok Build | Kimi Code | Factory Droid |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Binary | `codex` | `pi` | `omp` | `claude` | `amp` | `cursor-agent` | `fx` | `opencode` | `grok` | `kimi` | `droid` |
-| Wire protocol | JSON-RPC over stdio | NDJSON RPC over stdio | NDJSON RPC over stdio | stream-json over stdio | stream-json over stdio | ACP over stdio | ACP over stdio | HTTP + SSE | ACP over stdio | ACP over stdio | ACP over stdio |
-| Process spans the whole session | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| Process spawned per turn | no | no | no | no | no | no | no | no | no | no | no |
-| Bidirectional | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| Reasoning stream | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| Interactive approvals | yes | no | no (has them; Waku runs `--yolo`) | yes | no | yes | yes | yes | yes | yes | yes |
-| Mid-turn steering | yes | yes | yes | yes | yes | yes | **no** | yes | yes | yes (transport) | **no** |
-| Model discovery | yes | yes | yes | no (fixed) | no (modes) | yes | yes | yes | yes | yes | yes |
-| Computer Use | yes | yes | no (ships its own) | no | no | no | no | yes | yes | no | no |
-| Restricted to Full access | no | yes | yes | no | yes | no | no | no | no | no | no |
-| Rewind and branch at a turn | yes | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
+| | Codex CLI | Antigravity | Pi | Oh My Pi | Claude Code | Amp | Cursor CLI | Fx | OpenCode | Grok Build | Kimi Code | Factory Droid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Binary | `codex` | `agy` | `pi` | `omp` | `claude` | `amp` | `cursor-agent` | `fx` | `opencode` | `grok` | `kimi` | `droid` |
+| Wire protocol | JSON-RPC over stdio | ACP over stdio | NDJSON RPC over stdio | NDJSON RPC over stdio | stream-json over stdio | stream-json over stdio | ACP over stdio | ACP over stdio | HTTP + SSE | ACP over stdio | ACP over stdio | ACP over stdio |
+| Process spans the whole session | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Process spawned per turn | no | no | no | no | no | no | no | no | no | no | no | no |
+| Bidirectional | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Reasoning stream | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| Interactive approvals | yes | yes | no | no (has them; Waku runs `--yolo`) | yes | no | yes | yes | yes | yes | yes | yes |
+| Mid-turn steering | yes | **no** | yes | yes | yes | yes | yes | **no** | yes | yes | yes (transport) | **no** |
+| Model discovery | yes | yes | yes | yes | no (fixed) | no (modes) | yes | yes | yes | yes | yes | yes |
+| Computer Use | yes | yes (MCP) | yes | no (ships its own) | no | no | no | no | yes | yes | no | no |
+| Restricted to Full access | no | no | yes | yes | no | yes | no | no | no | no | no | no |
+| Rewind and branch at a turn | yes | **no** | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
 
 Kimi Code's steering is the transport's, not a probed policy: the ACP driver
-sends the second `session/prompt` for every agent it drives except Fx and
-Factory Droid, but Kimi's superseded-prompt behaviour has not been observed
-against a live turn the way Cursor's and Grok's were.
+sends the second `session/prompt` for every agent it drives except Antigravity,
+Fx, and Factory Droid, but Kimi's superseded-prompt behaviour has not been
+observed against a live turn the way Cursor's and Grok's were. Antigravity is
+kept on the queue path until a second `session/prompt` has been probed against
+its live server; the upstream ACP adapter is one prompt at a time.
 
 Every provider now holds a session across turns. That was not true when this
 document was first written: five of the seven spawned a process per prompt, and
@@ -695,7 +697,7 @@ instruction entry; see [computer-use.md](computer-use.md).
 
 ## Agent Client Protocol
 
-**Launch** — `cursor-agent acp`, `fx acp`, `grok agent [--reasoning-effort E] stdio`, `kimi acp`, `droid exec --output-format acp-daemon`
+**Launch** — `agy acp`, `cursor-agent acp`, `fx acp`, `grok agent [--reasoning-effort E] stdio`, `kimi acp`, `droid exec --output-format acp-daemon`
 ([driver/acp.rs](../crates/waku-core/src/driver/acp.rs)).
 
 **Protocol** — newline-delimited JSON-RPC over stdio, bidirectional. One agent
@@ -707,16 +709,22 @@ Supervised mode means what it says.
 **Lifetime** — long-lived, like Codex and Pi. Cursor and Grok previously spawned
 a process per turn; Fx and Kimi Code arrived on this transport directly.
 
-**Handshake** — `initialize` (advertising **no** `fs` or `terminal` client
-capability, since Waku does not proxy the agent's file or terminal access — an
-advertised capability the client cannot honor strands the agent mid-tool-call;
-Cursor alone receives its `_meta.parameterizedModelPicker` opt-in) →
+**Handshake** — `initialize` (advertising Waku's `fs` read/write and `terminal`
+services, scoped to the session workspace, and `clientCapabilities.elicitation`;
+Antigravity is the exception and gets reads only — advertising writes swaps its
+native diff edits for whole-file `client_edit_file` calls, and it runs its own
+commands. Cursor alone receives its `_meta.parameterizedModelPicker` opt-in) →
 `session/resume` when resuming and the agent advertises it (so history is not
 replayed), otherwise a replay-suppressed `session/load` when it reports
-`loadSession`, else `session/new` → optional `session/set_mode` for Fx's access
-policy. A restore the agent no longer recognizes falls back to a fresh session
+`loadSession`, else `session/new` → optional `session/set_mode` for Fx's and
+Antigravity's access policy, and for returning a legacy Cursor session from
+`plan`. A restore the agent no longer recognizes falls back to a fresh session
 rather than stranding the task. Kimi Code advertises both, so it takes the first
 rung — `session/resume`, verified against a session left by an earlier process.
+Antigravity advertises both but takes `session/load`: its `session/resume`
+answers with the session's settings and no history, and the next turn then
+starts with an empty model context. Loading replays the history (suppressed on
+the client side) and keeps the conversation continuous.
 
 Cursor's picker opt-in makes `session/new`, `session/load`, and
 `session/resume` return provider-owned `configOptions`. Model discovery uses
@@ -742,6 +750,39 @@ extension would not change Fx's model.
 It is tracked apart from the blocking request table precisely so the writer stays
 free to send a cancel while it is outstanding; its reply is what emits
 `TurnFinished`, keyed off `stopReason`.
+
+**Antigravity specifics.** `agy acp` advertises `loadSession`, `session/list`,
+`resume`, and `close`. Waku uses `session/load` for both resume and history
+import: on 1.5.5, `session/resume` returns the session's model, mode, and config
+options but no messages, and a fresh process then answers as if the
+conversation had just started. `session/load` replays the history and restores
+the agent's context; the client suppresses those updates because it already has
+the transcript. Its `session/new` response carries the account's model catalog as
+a `model` select whose values are families (`gemini-4-carbon`,
+`claude-opus-5-5`, `gpt-oss-120b-medium`), plus a `thought_level` select for the
+selected family. The full variant ids in `models.availableModels`
+(`gemini-4-carbon-medium`) are accepted by `session/set_config_option` but are
+not picker entries: Waku stores the variant id on the turn, reduces it to the
+advertised family, and applies the variant's effort suffix or the session's own
+effort to `thought_level`. A family without `thought_level`, such as
+`gpt-oss-120b-medium`, gets no thinking picker. Discovery probes each family in a
+throwaway session because the levels are per model.
+
+Antigravity has no `yolo` or `auto_edit` session mode: the CLI rejects both and
+offers `default`, `accept-edits`, `auto`, and `plan`. Waku keeps `default` for
+every mode except Auto-accept edits, which it maps to `accept-edits`, and
+answers permission requests itself outside Supervised. It does not use the
+native `auto` mode because that would take approvals away from the access mode,
+and it does not use `plan` for Supervised because `plan` changes what the agent
+does, not whether it may act. A live `session/set_mode` probe is accepted for
+`accept-edits`, `default`, `auto`, and `plan` on `agy acp` 1.5.5.
+
+Its multiple-choice questions arrive as `session/request_permission` with a
+`toolCallId` beginning `interaction_`; the permission options are the choices,
+not allow/deny decisions. Waku routes those to the question UI before the
+approval path, even under Full access, and answers with the selected option id,
+falling back to a unique label. Allow-always answers carry
+`_meta["agy.security.warning"]`, which Waku appends to the approval detail.
 
 **When `stopReason` lies.** Kimi Code answers a turn its model provider
 rejected — an inactive plan, a spent quota — with a clean `end_turn` carrying no
@@ -769,6 +810,20 @@ unsuccessfully. Three details make it safe:
 All of it runs on the driver thread, never a frame. The invariant it protects is
 covered by `kimi_never_reports_an_empty_turn_as_a_success`, which passes whether
 or not the account can currently serve a request.
+
+Antigravity has the same failure shape for a different reason: it renders an
+upstream API failure as an ordinary chat message and ends the turn with
+`end_turn`. The harness records the real error as step type 17
+(`CORTEX_STEP_TYPE_ERROR_MESSAGE`) in its own SQLite trajectory at
+`~/.gemini/antigravity-cli/conversations/<session>.db` (or the older
+`antigravity-acp` sibling). [antigravity_session.rs](../crates/waku-core/src/antigravity_session.rs)
+captures the highest step index before the prompt, reads only the newest step
+added after it, and parses the harness's
+`Error <code>, Message: <text>, Status: <status>` line. A quota failure — the
+step's `QUOTA_EXHAUSTED` marker, HTTP 429, `RESOURCE_EXHAUSTED`, or a typed
+`refusal` — becomes the localized quota message; any other API error keeps the
+provider's own message. The lookup is read-only, bounded at one second, and runs
+on the driver thread.
 
 **Inbound stream** — `session/update` notifications:
 
@@ -825,33 +880,34 @@ render is cancelled, so the turn is not left waiting on a request that will
 never be answered. Auto modes still wait for these answers; a question is not
 a permission.
 
-**Why the client advertises no `fs` or `terminal` capability.** Those declare
-services *Waku offers the agent*, not permissions the agent needs. `fs` exists so
-an editor can serve unsaved buffer contents in place of what is on disk, and
-`terminal` lets the agent run commands through the client's own terminal. Waku
-provides neither, so the agent uses its own read and shell tools and reaches the
-filesystem exactly as before — verified against `cursor-agent acp` with both
-declined: it read a file, ran a shell command, and ended the turn normally.
-Advertising a capability Waku cannot service is the harmful choice, because the
-agent would call `fs/read_text_file` and wait forever for a reply.
+**Client `fs` and `terminal` capabilities.** Those declare services *Waku offers
+the agent*, not permissions the agent needs. Waku implements both for the ACP
+transport: `fs/read_text_file` and `fs/write_text_file` are confined to the
+session workspace, and `terminal/create` and its output, wait, kill, and release
+requests back the terminal UI. Advertising a capability the client cannot
+service is the harmful choice, because the agent calls it and waits forever for
+a reply; every advertised handler here has a real implementation.
 
-T3 Code lands in the same place: its `AcpSessionRuntime` defaults to
-`fs.readTextFile: false`, `fs.writeTextFile: false`, `terminal: false`, Grok
-passes no override, and Cursor's is only `_meta.parameterizedModelPicker`. The
-handler registration points in its `packages/effect-acp` belong to a
-general-purpose ACP library, not to the app that drives these two providers.
+Antigravity is the one exception: Waku advertises `fs.readTextFile` but not
+`fs.writeTextFile` or `terminal`. `agy` runs its own shell tools, and a client
+that advertises writes makes it emit whole-file `client_edit_file` calls instead
+of native diff edits, which loses the hunk the transcript and review rely on.
+T3 Code takes the same position more broadly: its `AcpSessionRuntime` defaults to
+`fs.readTextFile: false`, `fs.writeTextFile: false`, `terminal: false`, and even
+Antigravity's `clientFileReads` opt-in keeps writes and terminals off.
 
-The one case that would justify serving `fs/read_text_file` is Waku's own file
-editor, which tracks unsaved buffers
-([src/app/right_panel.rs:1004](../src/app/right_panel.rs#L1004)): an agent
-reading a file the user has unsaved edits in currently gets the disk copy. That
-is a deliberate future call, not an oversight.
+Waku's read handler returns the disk copy. A file the user has unsaved edits in
+([src/app/right_panel.rs:1004](../src/app/right_panel.rs#L1004)) is therefore not
+served from the editor buffer; that remains a deliberate future call, not an
+oversight.
 
 **Access modes** — Fx exposes native `ask` and `code` modes, so Waku maps
-Supervised to `ask` and the auto modes to `code`. Every other ACP agent stays in
-its ordinary execution mode, and `auto_approves_permissions` decides whether
-Waku answers `session/request_permission` on the user's behalf (for Droid,
-only under Full access; see Approvals). That is why Kimi is left in
+Supervised to `ask` and the auto modes to `code`. Antigravity exposes
+`accept-edits`, selected only for Auto-accept edits; its other modes stay in
+`default` so Waku's own permission policy remains the control. Every other ACP
+agent stays in its ordinary execution mode, and `auto_approves_permissions`
+decides whether Waku answers `session/request_permission` on the user's behalf
+(for Droid, only under Full access; see Approvals). That is why Kimi is left in
 `default` rather than switched to `auto` or `yolo`: the permission traffic is
 the feature, not an obstacle. A legacy session still reporting the removed
 read-only setting is returned to the agent's advertised `agent` or `default`
@@ -978,12 +1034,12 @@ which its `--print` transport did not emit at all.
 Waku's `RuntimeMode` (Supervised / Auto-accept edits / Auto / Full access)
 maps into each CLI's own vocabulary.
 
-| Waku | Codex (`approvalPolicy` / `sandbox` / reviewer) | Claude `--permission-mode` | Cursor | Fx | OpenCode | Grok | Kimi Code | Factory Droid |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Supervised | `untrusted` / `read-only` / `user` | `default` + `can_use_tool` reaches the user | `session/request_permission` reaches the user | `session/set_mode` → `ask` | permission requests reach the user | `session/request_permission` reaches the user | `session/request_permission` reaches the user | `autonomy_level` `normal`; requests reach the user |
-| Auto-accept edits | `on-request` / `workspace-write` / `user` | `acceptEdits` | auto-answered | `session/set_mode` → `code` | edits auto-answered (`once`), the rest reach the user | auto-answered | auto-answered | `autonomy_level` `auto-low`; remaining requests auto-answered (`proceed_once`) |
-| Auto | `on-request` / `workspace-write` / `auto_review` | `auto` | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-medium`; remaining requests auto-answered (`proceed_once`) |
-| Full access | `never` / `danger-full-access` / `user` | `bypassPermissions` + `--dangerously-skip-permissions` | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-high`; remaining requests auto-answered (`proceed_once`) |
+| Waku | Codex (`approvalPolicy` / `sandbox` / reviewer) | Claude `--permission-mode` | Antigravity `mode` | Cursor | Fx | OpenCode | Grok | Kimi Code | Factory Droid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Supervised | `untrusted` / `read-only` / `user` | `default` + `can_use_tool` reaches the user | `default`; requests reach the user | `session/request_permission` reaches the user | `session/set_mode` → `ask` | permission requests reach the user | `session/request_permission` reaches the user | `session/request_permission` reaches the user | `autonomy_level` `normal`; requests reach the user |
+| Auto-accept edits | `on-request` / `workspace-write` / `user` | `acceptEdits` | `accept-edits`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | edits auto-answered (`once`), the rest reach the user | auto-answered | auto-answered | `autonomy_level` `auto-low`; remaining requests auto-answered (`proceed_once`) |
+| Auto | `on-request` / `workspace-write` / `auto_review` | `auto` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-medium`; remaining requests auto-answered (`proceed_once`) |
+| Full access | `never` / `danger-full-access` / `user` | `bypassPermissions` + `--dangerously-skip-permissions` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-high`; remaining requests auto-answered (`proceed_once`) |
 
 Amp, Pi, and Oh My Pi accept Full access only and always run wide open
 (`--dangerously-allow-all`, `--approve`, `--yolo`).
@@ -1004,6 +1060,7 @@ persisted with the session and is what makes a Waku task outlive its process:
 | Provider | Cursor fields | Why |
 | --- | --- | --- |
 | Codex | `thread_id` | `thread/resume` |
+| Antigravity | `session_id` | `session/load`, because `session/resume` returns no context; no turn-aware fork |
 | Pi | `session_id`, `session_file` | `switch_session` needs the path |
 | Oh My Pi | `session_id`, `session_file` | same, plus `--fork <file>` for a whole-session copy |
 | Claude | `session_id`, `resume_at` | `resume_at` is the transcript message uuid used for forking |
@@ -1025,14 +1082,16 @@ wider driver table than it had a year ago — `codex`, `claudeAgent`,
 `antigravity`, `cursor`, `grok`, `opencode`, `pi`, `kiro`, `muse`, `fx`, plus a
 generic ACP-registry entry for anything else that speaks ACP — registered in
 `packages/client-runtime/src/providerClients.ts` and documented in its own
-`docs/internals/providers.md`. Waku ships twelve (`ProviderKind::ALL`), keeps no
-ACP-registry escape hatch, and registers nothing it has not spoken to directly.
+`docs/internals/providers.md`. Waku ships thirteen (`ProviderKind::ALL`), keeps
+no ACP-registry escape hatch, and registers nothing it has not spoken to
+directly.
 
-**Its Antigravity entry needs no CLI.** T3 provisions the official
-`antigravity-acp` bridge into `tools/<agent-id>/<version>/` and runs that, one
-isolated profile per instance, with ambient Google credentials cleared first.
-That is a third transport shape next to "JSON-RPC app-server" and "ACP binary
-already on `PATH`": a bridge the app installs.
+**Their Antigravity entry does not use the installed CLI.** T3 provisions the
+official `antigravity-acp` bridge into `tools/<agent-id>/<version>/` and runs
+that, with its own sign-in and one isolated profile per instance. Waku drives
+the `agy acp` server of the CLI the user already installed and signed in, the
+same way it drives every other provider binary: no managed runtime, no separate
+credentials, and the existing `agy` login is the account.
 
 **Its one structural difference is unchanged: no provider is a per-turn
 process.** Every driver holds a long-lived session; the transport differs, the
@@ -1044,7 +1103,7 @@ lifetime does not.
 | Claude | `@anthropic-ai/claude-agent-sdk` `query()` with an `AsyncIterable` prompt queue | same protocol, spoken directly — the SDK is a wrapper around these flags |
 | Cursor | **`cursor-agent acp`** — ACP over stdio (`packages/effect-acp`) | same |
 | Grok | **`grok agent stdio`** — ACP over stdio | same |
-| Antigravity | **provisioned `antigravity-acp`**, per-instance profile | not offered |
+| Antigravity | **provisioned `antigravity-acp`**, per-instance profile | installed `agy acp`, user's existing login |
 | OpenCode | long-lived `opencode serve` + HTTP SDK | the user's shared OpenCode 2 background service, adopted rather than started per workspace |
 
 **All of them now hold a long-lived session**, and Claude reaches the same place
@@ -1052,9 +1111,9 @@ without the SDK: there is no Rust Agent SDK, but the SDK is a wrapper around the
 `claude` CLI's own streaming-input protocol, which Waku speaks directly. No Node
 sidecar and no npm dependency.
 
-Waku goes one further than the comparison: Amp, Pi, DeepSeek, Kimi, Fx, Droid and
-Oh My Pi, which T3 Code does not support as first-class drivers, are long-lived
-here too. Every provider holds a session.
+Waku goes one further than the comparison: Amp, Pi, DeepSeek, Kimi, Fx, Droid,
+Antigravity on the installed CLI, and Oh My Pi, which T3 Code does not support
+the same way, are long-lived here too. Every provider holds a session.
 
 What the long-lived session buys, and what Waku pays for not having it:
 
@@ -1064,8 +1123,8 @@ What the long-lived session buys, and what Waku pays for not having it:
 | Interrupt | `session/cancel`, `query.interrupt()` (plus `stopTask()` for runaway subagents) | Protocol interrupt everywhere except Amp, which has none and is stopped outright |
 | Change model mid-session | `capabilities.sessionModelSwitch: "in-session"` → `session/set_model`, `query.setModel()` | Every transport keeps the session except Amp, whose mode is a launch argument |
 | Change agent mid-task | `threadSupportsProviderHandoff` → `create_with_handoff`; the budgeted history comes from the thread's real messages (`packages/provider-core/src/server/handoffBudget.ts`) | Same rule and the same shape of budget, in `src/app/handoff.rs`; both keep the task and give the incoming agent a slice of the transcript, not a summary |
-| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn on every provider (`⌘↩`); plain `Enter` queues a visible, editable follow-up instead |
-| Native rollback | `rollbackThread` on the adapter contract | Codex/Pi natively; the rest emulated out-of-band by the `*_session.rs` helpers |
+| Mid-turn prompt | Queued into the live agent loop as a **steer**, same turn | Steered into the live turn where the transport accepts a second prompt (`⌘↩`); Antigravity, Fx, and Droid queue it because their ACP server takes one prompt at a time. Plain `Enter` always queues a visible, editable follow-up |
+| Native rollback | `rollbackThread` on the adapter contract | Codex/Pi natively; most others emulated out-of-band by the `*_session.rs` helpers; Fx, Kimi, Droid, and Antigravity cannot rewind |
 | Idle cleanup | `ProviderSessionReaper` stops sessions idle 30 min, swept every 5 min, skipping threads with an active turn | same, on the same thresholds |
 
 The adapter contract itself is wider than `DriverControl`:

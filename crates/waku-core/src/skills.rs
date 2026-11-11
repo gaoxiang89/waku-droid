@@ -99,6 +99,15 @@ pub fn user_skill_locations() -> Vec<SkillLocation> {
         SkillSource::Provider(ProviderKind::Droid),
         home_join(".factory/skills"),
     );
+    // `agy` merges the shared Gemini profile with its CLI-private skills.
+    push(
+        SkillSource::Provider(ProviderKind::Antigravity),
+        home_join(".gemini/config/skills"),
+    );
+    push(
+        SkillSource::Provider(ProviderKind::Antigravity),
+        home_join(".gemini/antigravity-cli/skills"),
+    );
     locations
 }
 
@@ -125,6 +134,14 @@ pub fn project_skill_locations(project_root: &Path, project_name: &str) -> Vec<S
         (
             SkillSource::Provider(ProviderKind::Droid),
             ".factory/skills",
+        ),
+        (
+            SkillSource::Provider(ProviderKind::Antigravity),
+            ".gemini/skills",
+        ),
+        (
+            SkillSource::Provider(ProviderKind::Antigravity),
+            ".agent/skills",
         ),
     ]
     .into_iter()

@@ -107,6 +107,14 @@ struct AcpLaunch {
 
 fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow::Result<AcpLaunch> {
     match provider {
+        // Antigravity's CLI already carries the user's Google sign-in and its
+        // account catalog. `agy acp` is the CLI's own long-lived ACP server;
+        // Waku takes the installed route instead of T3 Code's downloaded
+        // `antigravity-acp` bridge.
+        ProviderKind::Antigravity => Ok(AcpLaunch {
+            args: vec!["acp".into()],
+            env: Vec::new(),
+        }),
         ProviderKind::Cursor => Ok(AcpLaunch {
             args: vec!["acp".into()],
             env: Vec::new(),
@@ -252,8 +260,12 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
-            // Both reject a second `session/prompt` while one is running.
-            supports_steer: !matches!(provider, ProviderKind::Fx | ProviderKind::Droid),
+            // These reject a second `session/prompt` while one is running, so
+            // Waku keeps follow-ups queued until the current turn settles.
+            supports_steer: !matches!(
+                provider,
+                ProviderKind::Antigravity | ProviderKind::Fx | ProviderKind::Droid
+            ),
             mode: Mutex::new(mode),
             switches_mode_live: provider == ProviderKind::Droid,
             computer_use,
@@ -456,6 +468,13 @@ enum PendingAcpUserInput {
         request: CreateElicitationRequest,
         responder: Responder<CreateElicitationResponse>,
     },
+    /// Antigravity asks its multiple-choice questions through
+    /// `session/request_permission` with an `interaction_` tool-call id. The
+    /// options are the choices, and the answer selects one by label.
+    Permission {
+        request: RequestPermissionRequest,
+        responder: PermissionResponder,
+    },
 }
 
 type PendingAcpUserInputs = Arc<Mutex<HashMap<String, PendingAcpUserInput>>>;
@@ -627,14 +646,17 @@ async fn run_sdk_connection(
             {
                 let events = events.clone();
                 let pending_permissions = pending_permissions.clone();
+                let pending_user_inputs = pending_user_inputs.clone();
                 let access_mode = access_mode.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
                     handle_permission_request(
+                        provider,
                         request,
                         responder,
                         auto_approves_permissions(provider, *access_mode.lock()),
                         provider == ProviderKind::Droid,
                         &pending_permissions,
+                        &pending_user_inputs,
                         &events,
                     )
                 }
@@ -815,11 +837,16 @@ async fn run_sdk_connection(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+            // Antigravity swaps its native diff edits for whole-file
+            // `client_edit_file` calls whenever a client advertises writes, and
+            // runs its own commands, so it gets reads only. Every other ACP
+            // agent uses Waku's write and terminal handlers.
+            let native_tools = provider != ProviderKind::Antigravity;
             let mut client_capabilities = ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true)
+                    .write_text_file(native_tools))
+                .terminal(native_tools)
                 .elicitation(
                     ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
                 );
@@ -847,6 +874,7 @@ async fn run_sdk_connection(
                 .is_some();
             let (session_id, modes, initial_config_options) = establish_session(
                 &connection,
+                provider,
                 &initialize,
                 resume_session_id.as_deref(),
                 &cwd,
@@ -1034,6 +1062,10 @@ async fn run_sdk_connection(
                                     let _ = responder
                                         .respond(elicitation_accept_response(&request, &answers));
                                 }
+                                PendingAcpUserInput::Permission { request, responder } => {
+                                    let _ = responder
+                                        .respond(antigravity_question_response(&request, &answers));
+                                }
                             }
                         }
                     }
@@ -1141,6 +1173,7 @@ async fn run_sdk_connection(
 
 async fn establish_session(
     connection: &ConnectionTo<Agent>,
+    provider: ProviderKind,
     initialize: &InitializeResponse,
     resume_session_id: Option<&str>,
     cwd: &Path,
@@ -1152,11 +1185,17 @@ async fn establish_session(
     Option<Vec<SessionConfigOption>>,
 )> {
     if let Some(existing) = resume_session_id {
-        if initialize
-            .agent_capabilities
-            .session_capabilities
-            .resume
-            .is_some()
+        // `agy acp` answers `session/resume` with the session's settings and no
+        // conversation history; its next turn starts with an empty model
+        // context. `session/load` replays the history and does restore it, so
+        // Antigravity takes that rung even though resume is advertised.
+        let resume_restores_context = provider != ProviderKind::Antigravity;
+        if resume_restores_context
+            && initialize
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some()
         {
             let mut request = ResumeSessionRequest::new(existing.to_owned(), cwd);
             if !mcp_servers.is_empty() {
@@ -1203,7 +1242,21 @@ fn desired_access_mode(
     mode: RuntimeMode,
 ) -> Option<SessionModeId> {
     let modes = modes?;
-    let desired = if provider == ProviderKind::Fx {
+    let desired = if provider == ProviderKind::Antigravity {
+        // `agy` supports `default`, `accept-edits`, and `plan`. It has no
+        // auto/yolo mode; Waku answers permission requests itself outside Ask,
+        // so only Auto-accept edits maps to a different native mode.
+        let desired = match mode {
+            RuntimeMode::AutoAcceptEdits => "accept-edits",
+            RuntimeMode::Ask | RuntimeMode::Auto | RuntimeMode::FullAccess => "default",
+        };
+        modes
+            .available_modes
+            .iter()
+            .find(|mode| mode.id.to_string().eq_ignore_ascii_case(desired))?
+            .id
+            .clone()
+    } else if provider == ProviderKind::Fx {
         let desired = if mode == RuntimeMode::Ask {
             "ask"
         } else {
@@ -1246,6 +1299,7 @@ fn desired_access_mode(
 /// effort rides on `session/set_model` as `_meta.reasoningEffort`.
 fn reasoning_effort_config_id(provider: ProviderKind) -> &'static str {
     match provider {
+        ProviderKind::Antigravity => "thought_level",
         ProviderKind::Kimi => "thinking",
         _ => "mode",
     }
@@ -1809,6 +1863,114 @@ async fn apply_droid_model(
     Some(options)
 }
 
+/// Resolves a stored Antigravity model against the advertised families. A
+/// family value is used as-is; a variant such as `gemini-4-carbon-medium`
+/// reduces to its longest advertised prefix and carries the suffix's thinking
+/// level as a fallback when the session has no explicit effort.
+fn antigravity_model_selection(
+    advertised: &[&str],
+    model: &str,
+) -> Option<(String, Option<String>)> {
+    if advertised.contains(&model) {
+        return Some((model.to_owned(), None));
+    }
+    let family = advertised
+        .iter()
+        .filter(|family| {
+            model
+                .strip_prefix(**family)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+        .max_by_key(|family| family.len())?;
+    let suffix = model
+        .strip_prefix(*family)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .unwrap_or_default();
+    let effort = suffix.rsplit('-').next().and_then(|level| {
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+            .contains(&level)
+            .then(|| level.to_owned())
+    });
+    Some(((*family).to_owned(), effort))
+}
+
+/// Antigravity advertises model families as its `model` config option and the
+/// selected family's thinking levels as `thought_level`; the full variant ids
+/// from `models.availableModels` are accepted but not listed there. A stored
+/// variant id is therefore reduced to its advertised family, with any effort
+/// suffix used when the session has no explicit effort of its own.
+async fn apply_antigravity_model(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    config_options: Option<&[SessionConfigOption]>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    events: &DriverEventSender,
+) -> Option<Vec<SessionConfigOption>> {
+    let model = model?;
+    let mut options = config_options.unwrap_or_default().to_vec();
+    let Some(model_option) = config_option_by_id(&options, "model").cloned() else {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.select_model",
+            error = "Antigravity did not advertise its model configuration"
+        )));
+        return None;
+    };
+    let advertised = session_config_select_values(&model_option);
+    let Some((selected, inferred_effort)) = antigravity_model_selection(&advertised, model) else {
+        let _ = events.send(DriverEvent::Error(tr!(
+            "errors.select_model",
+            error = format!("Antigravity did not advertise model {model}")
+        )));
+        return None;
+    };
+    if session_config_current_value(&model_option) != Some(selected.as_str()) {
+        match connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                model_option.id.clone(),
+                selected.as_str(),
+            ))
+            .block_task()
+            .await
+        {
+            Ok(response) => options = response.config_options,
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return None;
+            }
+        }
+    }
+    let effort = reasoning_effort
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned)
+        .or(inferred_effort);
+    if let Some(effort) = effort
+        && let Some(option) = config_option_by_id(&options, "thought_level")
+        && session_config_select_values(option).contains(&effort.as_str())
+        && session_config_current_value(option) != Some(effort.as_str())
+    {
+        // Thinking is optional and per model; a rejected level must not drop
+        // the model the session already accepted.
+        if let Ok(response) = connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.id.clone(),
+                effort.as_str(),
+            ))
+            .block_task()
+            .await
+        {
+            options = response.config_options;
+        }
+    }
+    Some(options)
+}
+
 /// [`sync_session_model`] against the shared cache. Only an answer from the
 /// agent is written back, so a notification that lands while the requests are
 /// in flight is not overwritten by the snapshot they started from.
@@ -1855,6 +2017,21 @@ async fn sync_session_model(
     context_window: Option<&str>,
     events: &DriverEventSender,
 ) {
+    if provider == ProviderKind::Antigravity {
+        if let Some(updated) = apply_antigravity_model(
+            connection,
+            session_id,
+            config_options.as_deref(),
+            model,
+            reasoning_effort,
+            events,
+        )
+        .await
+        {
+            *config_options = Some(updated);
+        }
+        return;
+    }
     if provider == ProviderKind::Droid {
         if let Some(updated) = apply_droid_model(
             connection,
@@ -2069,8 +2246,10 @@ fn send_prompt(
     stream_state.lock().produced_content = false;
     // Read before the turn runs, so the failure lookup cannot mistake an
     // earlier turn's record for this one's.
-    let wire_offset = (provider == ProviderKind::Kimi)
+    let kimi_offset = (provider == ProviderKind::Kimi)
         .then(|| crate::kimi_session::wire_offset(native_session_id));
+    let antigravity_offset = (provider == ProviderKind::Antigravity)
+        .then(|| crate::antigravity_session::step_offset(native_session_id));
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
     let content_blocks = build_prompt_content_blocks(&text, cwd, prompt_capabilities);
@@ -2094,11 +2273,22 @@ fn send_prompt(
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
-            // Only an empty turn pays for this lookup, so a healthy turn never
-            // waits on Kimi's records.
-            let native_failure = wire_offset
-                .filter(|_| !stream_state.lock().produced_content)
-                .and_then(|offset| crate::kimi_session::turn_failure(&native_session_id, offset));
+            // Only an empty turn pays for Kimi's lookup. Antigravity always
+            // checks its own step log once, because it reports upstream API
+            // failures as a chat message and a clean `end_turn`.
+            let native_failure = if let Some(offset) = kimi_offset {
+                (!stream_state.lock().produced_content)
+                    .then(|| crate::kimi_session::turn_failure(&native_session_id, offset))
+                    .flatten()
+            } else if let Some(offset) = antigravity_offset {
+                let refusal = matches!(
+                    &result,
+                    Ok(response) if matches!(response.stop_reason, StopReason::Refusal)
+                );
+                crate::antigravity_session::turn_failure(&native_session_id, offset, refusal)
+            } else {
+                None
+            };
             let success = finish_prompt(result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
@@ -2924,6 +3114,11 @@ fn cancel_pending_user_inputs(pending: &PendingAcpUserInputs) {
             PendingAcpUserInput::Elicitation { responder, .. } => {
                 let _ = responder.respond(cancelled_elicitation_response());
             }
+            PendingAcpUserInput::Permission { responder, .. } => {
+                let _ = responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            }
         }
     }
 }
@@ -3513,19 +3708,161 @@ fn offered_permission_options(
         .collect()
 }
 
+fn antigravity_question_label(
+    option: &agent_client_protocol::schema::v1::PermissionOption,
+) -> String {
+    let label = option.name.trim();
+    let label = if label.is_empty() {
+        option.option_id.to_string()
+    } else {
+        label.to_owned()
+    };
+    truncate(&label, 512)
+}
+
+/// `agy` puts the Allow Always warning under the option's
+/// `_meta["agy.security.warning"]` rather than in the visible label.
+fn antigravity_security_warning(request: &RequestPermissionRequest) -> Option<String> {
+    let option = request
+        .options
+        .iter()
+        .find(|option| option.kind == PermissionOptionKind::AllowAlways)?;
+    let warning = option.meta.as_ref()?.get("agy.security.warning")?;
+    warning
+        .get("message")
+        .or_else(|| warning.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|warning| !warning.is_empty())
+        .map(|warning| warning.chars().take(512).collect())
+}
+
+/// Antigravity's `ask_question` arrives as a permission request whose tool-call
+/// id starts with `interaction_`. Its options are the choices, not allow/deny
+/// decisions, so the permission prompt must not auto-approve it or show a tool
+/// approval.
+fn antigravity_user_input_questions(
+    request: &RequestPermissionRequest,
+) -> Option<Vec<UserInputQuestion>> {
+    if !request
+        .tool_call
+        .tool_call_id
+        .to_string()
+        .starts_with("interaction_")
+        || request.options.is_empty()
+    {
+        return None;
+    }
+    let mut ids = std::collections::HashSet::new();
+    for option in &request.options {
+        let id = option.option_id.to_string();
+        if id.trim().is_empty() || !ids.insert(id) {
+            return None;
+        }
+    }
+    let question = request
+        .tool_call
+        .fields
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .unwrap_or("Choose an option.");
+    Some(vec![UserInputQuestion {
+        id: request.tool_call.tool_call_id.to_string(),
+        header: "Question".into(),
+        question: truncate(question, 8_000),
+        options: request
+            .options
+            .iter()
+            .map(|option| {
+                let label = antigravity_question_label(option);
+                UserInputOption {
+                    description: Some(label.clone()),
+                    label,
+                }
+            })
+            .collect(),
+        multi_select: false,
+        required: true,
+        accepts_custom: false,
+    }])
+}
+
+fn antigravity_question_response(
+    request: &RequestPermissionRequest,
+    answers: &[UserInputAnswer],
+) -> RequestPermissionResponse {
+    let question_id = request.tool_call.tool_call_id.to_string();
+    let value = answers
+        .iter()
+        .find(|answer| answer.question_id == question_id)
+        .and_then(|answer| answer.answers.first());
+    let option = value.and_then(|value| {
+        request
+            .options
+            .iter()
+            .find(|option| option.option_id.to_string() == *value)
+            .or_else(|| {
+                let matching = request
+                    .options
+                    .iter()
+                    .filter(|option| antigravity_question_label(option) == *value)
+                    .collect::<Vec<_>>();
+                (matching.len() == 1).then(|| matching[0])
+            })
+    });
+    match option {
+        Some(option) => RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new(option.option_id.clone()),
+        )),
+        None => RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
+    }
+}
+
 /// `allow_once_only` is Droid's: its "always" answer raises the session's
 /// autonomy level, so it is neither chosen automatically nor offered, and the
 /// access mode stays the one control over what runs unasked.
+#[allow(clippy::too_many_arguments)]
 fn handle_permission_request(
+    provider: ProviderKind,
     request: RequestPermissionRequest,
     responder: PermissionResponder,
     auto_approve: bool,
     allow_once_only: bool,
     pending: &PendingPermissions,
+    pending_user_inputs: &PendingAcpUserInputs,
     events: &impl DriverEventSink,
 ) -> agent_client_protocol::Result<()> {
     let request_id = responder.id().to_string();
     let params = serde_json::to_value(&request)?;
+
+    // Questions are not approvals: answer them even in Full access, and route
+    // them to the question UI before the permission path can take the options
+    // for allow/deny choices.
+    if provider == ProviderKind::Antigravity
+        && let Some(questions) = antigravity_user_input_questions(&request)
+    {
+        pending_user_inputs.lock().insert(
+            request_id.clone(),
+            PendingAcpUserInput::Permission { request, responder },
+        );
+        if events
+            .send(DriverEvent::UserInputRequested {
+                request_id: request_id.clone(),
+                questions,
+            })
+            .is_err()
+            && let Some(PendingAcpUserInput::Permission { responder, .. }) =
+                pending_user_inputs.lock().remove(&request_id)
+        {
+            let _ = responder.respond(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            ));
+        }
+        return Ok(());
+    }
+
     let options = offered_permission_options(&request.options, allow_once_only);
 
     if auto_approve {
@@ -3553,6 +3890,13 @@ fn handle_permission_request(
             .map(|kind| tr!("permission.agent_wants_to", action = kind))
             .unwrap_or_else(|| tr!("permission.agent_asks_for_permission"))
     });
+    let detail = if provider == ProviderKind::Antigravity {
+        antigravity_security_warning(&request)
+            .map(|warning| format!("{detail}\n\n{warning}"))
+            .unwrap_or(detail)
+    } else {
+        detail
+    };
     pending.lock().insert(request_id.clone(), responder);
     if events
         .send(DriverEvent::Permission {
@@ -4356,6 +4700,159 @@ mod tests {
         let launch = launch_for(ProviderKind::Fx, None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn antigravity_launches_its_acp_server() {
+        let launch = launch_for(ProviderKind::Antigravity, Some("high")).unwrap();
+        assert_eq!(launch.args, ["acp"]);
+        assert!(launch.env.is_empty());
+        assert_eq!(
+            reasoning_effort_config_id(ProviderKind::Antigravity),
+            "thought_level"
+        );
+    }
+
+    #[test]
+    fn antigravity_access_mode_uses_default_and_accept_edits() {
+        let modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("accept-edits", "Accept edits"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        let mode = |runtime| {
+            desired_access_mode(ProviderKind::Antigravity, Some(&modes), runtime)
+                .map(|mode| mode.to_string())
+        };
+        assert_eq!(mode(RuntimeMode::Ask), None);
+        assert_eq!(mode(RuntimeMode::Auto), None);
+        assert_eq!(
+            mode(RuntimeMode::AutoAcceptEdits),
+            Some("accept-edits".to_owned())
+        );
+        assert_eq!(mode(RuntimeMode::FullAccess), None);
+    }
+
+    #[test]
+    fn antigravity_reduces_variant_ids_to_advertised_families() {
+        let advertised = ["gemini-4-carbon", "claude-opus-5-5", "gpt-oss-120b-medium"];
+        assert_eq!(
+            antigravity_model_selection(&advertised, "gemini-4-carbon"),
+            Some(("gemini-4-carbon".to_owned(), None))
+        );
+        assert_eq!(
+            antigravity_model_selection(&advertised, "gemini-4-carbon-medium"),
+            Some(("gemini-4-carbon".to_owned(), Some("medium".to_owned())))
+        );
+        assert_eq!(
+            antigravity_model_selection(&advertised, "gpt-oss-120b-medium"),
+            Some(("gpt-oss-120b-medium".to_owned(), None)),
+            "an advertised family is used as-is; its suffix is part of the id"
+        );
+        assert_eq!(
+            antigravity_model_selection(&advertised, "claude-opus-5-5-high"),
+            Some(("claude-opus-5-5".to_owned(), Some("high".to_owned())))
+        );
+        assert!(
+            antigravity_model_selection(&advertised, "gemini-4-carbon-fast").is_some(),
+            "an unknown suffix keeps the family without inventing an effort"
+        );
+        assert_eq!(
+            antigravity_model_selection(&advertised, "gemini-unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn antigravity_questions_use_permission_options_as_choices() {
+        use agent_client_protocol::schema::v1::PermissionOption as AcpPermissionOption;
+        let request = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new(
+                "interaction_abc",
+                ToolCallUpdateFields::new().title("Which environment?"),
+            ),
+            vec![
+                AcpPermissionOption::new("staging", "Staging", PermissionOptionKind::AllowOnce),
+                AcpPermissionOption::new(
+                    "production",
+                    "Production",
+                    PermissionOptionKind::AllowOnce,
+                ),
+            ],
+        );
+
+        let questions = antigravity_user_input_questions(&request).expect("question");
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "interaction_abc");
+        assert_eq!(questions[0].question, "Which environment?");
+        assert!(!questions[0].multi_select);
+        assert!(!questions[0].accepts_custom);
+        assert_eq!(
+            questions[0]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Staging", "Production"]
+        );
+
+        let response = antigravity_question_response(
+            &request,
+            &[UserInputAnswer {
+                question_id: "interaction_abc".into(),
+                answers: vec!["Production".into()],
+            }],
+        );
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(choice)
+                if choice.option_id.to_string() == "production"
+        ));
+    }
+
+    #[test]
+    fn antigravity_exposes_the_allow_always_security_warning() {
+        use agent_client_protocol::schema::v1::PermissionOption as AcpPermissionOption;
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "agy.security.warning".into(),
+            json!({"title": "Runs outside the sandbox", "message": "This command can modify the host."}),
+        );
+        let request = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new("call-1", ToolCallUpdateFields::new().title("Run a command")),
+            vec![
+                AcpPermissionOption::new(
+                    "allow",
+                    "Allow for this thread",
+                    PermissionOptionKind::AllowAlways,
+                )
+                .meta(meta),
+            ],
+        );
+        assert_eq!(
+            antigravity_security_warning(&request).as_deref(),
+            Some("This command can modify the host.")
+        );
+    }
+
+    #[test]
+    fn antigravity_questions_are_not_approval_requests() {
+        use agent_client_protocol::schema::v1::PermissionOption as AcpPermissionOption;
+        let request = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new("call-1", ToolCallUpdateFields::new().title("Run the tests")),
+            vec![AcpPermissionOption::new(
+                "allow",
+                "Allow",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        assert!(antigravity_user_input_questions(&request).is_none());
     }
 
     #[test]
@@ -5378,5 +5875,156 @@ mod tests {
         }
         assert!(produced_text, "the Droid turn produced no text");
         assert_eq!(finished, Some(true));
+    }
+
+    /// Antigravity's `agy acp` server must accept a session and settle a turn.
+    #[test]
+    #[ignore = "requires an installed, authenticated agy"]
+    fn antigravity_acp_server_finishes_a_real_turn() {
+        let binary = crate::command_env::find_executable("agy").expect("agy is not installed");
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Antigravity,
+            DriverStartOptions {
+                binary,
+                cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                mode: RuntimeMode::AutoAcceptEdits,
+                model: Some("gemini-4-carbon".into()),
+                reasoning_effort: Some("low".into()),
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: None,
+            },
+            events,
+        )
+        .expect("the ACP session should open");
+
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Antigravity { .. }),
+                } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        driver.prompt("Reply exactly OK.".into());
+
+        let mut produced_text = false;
+        let mut finished = None;
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
+            match event {
+                DriverEvent::TextDelta(text) => produced_text |= !text.is_empty(),
+                DriverEvent::TurnFinished { success, .. } => {
+                    finished = Some(success);
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        assert!(produced_text, "the Antigravity turn produced no text");
+        assert_eq!(finished, Some(true));
+    }
+
+    /// Antigravity advertises `session/resume`, but only `session/load`
+    /// restores the conversation; a resumed process otherwise starts empty.
+    #[test]
+    #[ignore = "requires an installed, authenticated agy"]
+    fn antigravity_resume_keeps_the_conversation() {
+        let binary = crate::command_env::find_executable("agy").expect("agy is not installed");
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let options = || DriverStartOptions {
+            binary: binary.clone(),
+            cwd: cwd.clone(),
+            mode: RuntimeMode::AutoAcceptEdits,
+            model: Some("gemini-4-carbon".into()),
+            reasoning_effort: Some("low".into()),
+            service_tier: None,
+            context_window: None,
+            agent_preset: None,
+            computer_use_enabled: false,
+            provider_cursor: None,
+        };
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver =
+            AcpDriver::start(ProviderKind::Antigravity, options(), events).expect("session opens");
+        let cursor = loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(cursor),
+                } => break cursor,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        };
+        driver.prompt("Remember the word PINEAPPLE. Reply exactly STORED.".into());
+        loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(120))
+                .expect("the first turn should finish")
+            {
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success, "the first turn failed");
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        drop(driver);
+        std::thread::sleep(Duration::from_secs(1));
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Antigravity,
+            DriverStartOptions {
+                provider_cursor: Some(cursor),
+                ..options()
+            },
+            events,
+        )
+        .expect("the session should resume");
+        loop {
+            let event = event_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the agent should report its session");
+            match event {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Antigravity { .. }),
+                } => break,
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        driver.prompt("What word were you asked to remember? Reply with exactly that word.".into());
+
+        let mut reply = String::new();
+        let mut finished = None;
+        while let Ok(event) = event_rx.recv_timeout(Duration::from_secs(120)) {
+            match event {
+                DriverEvent::TextDelta(text) => reply.push_str(&text),
+                DriverEvent::TurnFinished { success, .. } => {
+                    finished = Some(success);
+                    break;
+                }
+                DriverEvent::Error(error) => panic!("the agent reported: {error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(finished, Some(true));
+        assert!(
+            reply.to_ascii_uppercase().contains("PINEAPPLE"),
+            "the resumed turn lost the conversation: {reply:?}"
+        );
     }
 }

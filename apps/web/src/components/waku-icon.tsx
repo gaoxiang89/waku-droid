@@ -327,6 +327,7 @@ function fileTypeIconName(path: string): FileTypeIconName {
 
 const PROVIDER_ICONS: Record<ProviderKind, string> = {
   amp: 'i-waku-provider-amp',
+  antigravity: 'i-waku-provider-antigravity',
   claude: 'i-waku-provider-claude',
   codex: 'i-waku-provider-openai',
   cursor: 'i-waku-provider-cursor',
@@ -347,6 +348,7 @@ export const PROVIDERS: Array<{
   command: string
 }> = [
   { id: 'amp', name: 'Amp', shortName: 'Amp', command: 'amp' },
+  { id: 'antigravity', name: 'Antigravity', shortName: 'Antigravity', command: 'agy' },
   { id: 'claude', name: 'Claude Code', shortName: 'Claude', command: 'claude' },
   { id: 'codex', name: 'Codex CLI', shortName: 'Codex', command: 'codex' },
   { id: 'cursor', name: 'Cursor CLI', shortName: 'Cursor', command: 'cursor-agent' },
@@ -361,7 +363,10 @@ export const PROVIDERS: Array<{
 ]
 
 export function providerMeta(provider: ProviderKind) {
-  return PROVIDERS.find((candidate) => candidate.id === provider) ?? PROVIDERS[2]!
+  return (
+    PROVIDERS.find((candidate) => candidate.id === provider) ??
+    PROVIDERS.find((candidate) => candidate.id === 'codex')!
+  )
 }
 
 export function ProviderIcon({
@@ -391,6 +396,7 @@ export function ProviderIcon({
 
 function providerColor(provider: ProviderKind) {
   if (provider === 'amp') return 'text-[#f34e3f]'
+  if (provider === 'antigravity') return 'text-[#4285f4]'
   if (provider === 'claude') return 'text-[#d97757]'
   if (provider === 'deepSeek') return 'text-[#4d6bfe]'
   return 'text-[#34363b] dark:text-[#f3f3f3]'

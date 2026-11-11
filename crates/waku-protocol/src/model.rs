@@ -11,6 +11,9 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     Amp,
+    /// Google's Antigravity CLI. It serves a long-lived ACP session from
+    /// `agy acp`.
+    Antigravity,
     Claude,
     #[default]
     Codex,
@@ -31,8 +34,9 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Amp,
+        Self::Antigravity,
         Self::Claude,
         Self::Codex,
         Self::Cursor,
@@ -49,6 +53,7 @@ impl ProviderKind {
     pub fn id(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Antigravity => "antigravity",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
@@ -66,6 +71,7 @@ impl ProviderKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Antigravity => "Antigravity",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor CLI",
@@ -83,6 +89,7 @@ impl ProviderKind {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Antigravity => "Antigravity",
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
@@ -100,6 +107,7 @@ impl ProviderKind {
     pub fn command(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Antigravity => "agy",
             Self::Claude => "claude",
             Self::Codex => "codex",
             // Cursor documents `agent` as its primary command, but that name is
@@ -116,11 +124,12 @@ impl ProviderKind {
         }
     }
 
-    /// Kimi Code, Fx, and Factory Droid are deliberately absent from this list
-    /// and from [`Self::supports_conversation_fork`]. Kimi's ACP `session/fork`
-    /// copies a whole session and takes no turn count, Fx exposes no turn-aware
-    /// fork or truncation method, and Droid's ACP session has not been shown to
-    /// accept a turn boundary either. None of them can reproduce Waku's "drop
+    /// Kimi Code, Fx, Factory Droid, and Antigravity are deliberately absent
+    /// from this list and from [`Self::supports_conversation_fork`]. Kimi's ACP
+    /// `session/fork` copies a whole session and takes no turn count, Fx
+    /// exposes no turn-aware fork or truncation method, Droid's ACP session has
+    /// not been shown to accept a turn boundary either, and Antigravity cannot
+    /// rewind its conversation at all. None of them can reproduce Waku's "drop
     /// the last N turns" semantics without corrupting history.
     pub fn supports_conversation_rollback(self) -> bool {
         matches!(
@@ -155,7 +164,8 @@ impl ProviderKind {
     pub fn supports_model_discovery(self) -> bool {
         matches!(
             self,
-            Self::Claude
+            Self::Antigravity
+                | Self::Claude
                 | Self::Codex
                 | Self::Cursor
                 | Self::DeepSeek
@@ -181,6 +191,9 @@ pub enum ProviderResumeCursor {
         thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_context: Option<String>,
+    },
+    Antigravity {
+        session_id: String,
     },
     Claude {
         session_id: String,
@@ -238,6 +251,7 @@ impl ProviderResumeCursor {
                 thread_id: id,
                 fork_context: None,
             },
+            ProviderKind::Antigravity => Self::Antigravity { session_id: id },
             ProviderKind::Claude => Self::Claude {
                 session_id: id,
                 resume_at: None,
@@ -270,6 +284,7 @@ impl ProviderResumeCursor {
     pub fn provider(&self) -> ProviderKind {
         match self {
             Self::Amp { .. } => ProviderKind::Amp,
+            Self::Antigravity { .. } => ProviderKind::Antigravity,
             Self::Claude { .. } => ProviderKind::Claude,
             Self::Codex { .. } => ProviderKind::Codex,
             Self::Cursor { .. } => ProviderKind::Cursor,
@@ -287,6 +302,7 @@ impl ProviderResumeCursor {
     pub fn native_id(&self) -> &str {
         match self {
             Self::Amp { thread_id, .. } => thread_id,
+            Self::Antigravity { session_id } => session_id,
             Self::Claude { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::DeepSeek { session_id }
@@ -4575,6 +4591,8 @@ mod tests {
     #[test]
     fn provider_ids_are_stable() {
         assert_eq!(ProviderKind::Amp.id(), "amp");
+        assert_eq!(ProviderKind::Antigravity.id(), "antigravity");
+        assert_eq!(ProviderKind::Antigravity.command(), "agy");
         assert_eq!(ProviderKind::Claude.id(), "claude");
         assert_eq!(ProviderKind::Codex.command(), "codex");
         assert_eq!(ProviderKind::Cursor.command(), "cursor-agent");
@@ -4602,7 +4620,12 @@ mod tests {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
         }
-        for provider in [ProviderKind::Fx, ProviderKind::Kimi, ProviderKind::Droid] {
+        for provider in [
+            ProviderKind::Antigravity,
+            ProviderKind::Fx,
+            ProviderKind::Kimi,
+            ProviderKind::Droid,
+        ] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
         }
@@ -4611,6 +4634,7 @@ mod tests {
     #[test]
     fn only_dynamic_provider_catalogs_are_discovered() {
         assert!(!ProviderKind::Amp.supports_model_discovery());
+        assert!(ProviderKind::Antigravity.supports_model_discovery());
         assert!(ProviderKind::Claude.supports_model_discovery());
         assert!(ProviderKind::Codex.supports_model_discovery());
         assert!(ProviderKind::Cursor.supports_model_discovery());
@@ -4687,7 +4711,7 @@ mod tests {
 
     #[test]
     fn all_contains_every_provider_kind() {
-        assert_eq!(ProviderKind::ALL.len(), 12);
+        assert_eq!(ProviderKind::ALL.len(), 13);
         let ids: std::collections::HashSet<_> =
             ProviderKind::ALL.iter().map(|kind| kind.id()).collect();
         assert_eq!(

@@ -28,6 +28,8 @@ const DROID_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 /// Selecting a model answers in roughly 100-200 ms, so this covers a catalog
 /// of about a hundred models while leaving the overall timeout room to spare.
 const DROID_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
+const ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
+const ANTIGRAVITY_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
 
 pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
     match provider {
@@ -88,6 +90,9 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         ProviderKind::Cursor => {
             vec![ProviderModel::new("auto", tr!("model_option.auto")).default()]
         }
+        // Antigravity reports its account's model families on `session/new`,
+        // and availability changes with the signed-in plan.
+        ProviderKind::Antigravity => Vec::new(),
         // Harness reports its account/configuration-specific catalog from its
         // Host. An invented fallback would make unavailable routes selectable.
         ProviderKind::DeepSeek => Vec::new(),
@@ -140,9 +145,9 @@ pub fn discover_catalog(
 }
 
 /// [`discover_catalog`], plus why live discovery failed when the provider
-/// can say. Only Droid reports a reason today: its discovery fails outright on
-/// a rejected login or `FACTORY_API_KEY`, which otherwise looks exactly like
-/// a provider with no models.
+/// can say. Droid reports a reason when its login or `FACTORY_API_KEY` is
+/// rejected, and Antigravity when `agy` refuses its session, either of which
+/// otherwise looks exactly like a provider with no models.
 pub fn discover_catalog_reporting(
     provider: ProviderKind,
     binary: &Path,
@@ -152,6 +157,13 @@ pub fn discover_catalog_reporting(
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
         ProviderKind::Amp => (Vec::new(), None),
+        ProviderKind::Antigravity => match discover_antigravity_models(binary) {
+            Ok(models) => (models, None),
+            Err(error) => {
+                discovery_error = Some(error);
+                (Vec::new(), None)
+            }
+        },
         ProviderKind::Codex => (discover_codex_models(binary), None),
         ProviderKind::Claude => (discover_claude_models(binary), None),
         ProviderKind::Cursor => (discover_cursor_models(binary), None),
@@ -967,13 +979,16 @@ fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
                 .block_task()
                 .await?;
             let options = response.config_options.unwrap_or_default();
-            let mut efforts = DroidModelEfforts::new();
-            if let Some(model_option) = droid_config_option(&options, "model") {
-                if let Some(current) = droid_select_current(model_option) {
-                    efforts.insert(current.to_owned(), droid_effort_choices(&options));
+            let mut efforts = AcpModelEfforts::new();
+            if let Some(model_option) = acp_config_option(&options, "model") {
+                if let Some(current) = acp_select_current(model_option) {
+                    efforts.insert(
+                        current.to_owned(),
+                        acp_effort_choices(&options, "reasoning_effort"),
+                    );
                 }
                 let probe_until = Instant::now() + DROID_EFFORT_PROBE_BUDGET;
-                for (id, _) in droid_select_choices(model_option) {
+                for (id, _) in acp_select_choices(model_option) {
                     if Instant::now() >= probe_until {
                         break;
                     }
@@ -989,14 +1004,17 @@ fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
                         .block_task()
                         .await
                     {
-                        efforts.insert(id, droid_effort_choices(&updated.config_options));
+                        efforts.insert(
+                            id,
+                            acp_effort_choices(&updated.config_options, "reasoning_effort"),
+                        );
                     }
                 }
             }
             Ok((options, efforts))
         });
     let (options, efforts) = smol::block_on(smol::future::race(
-        async move { request.await.map_err(|error| droid_discovery_error(&error)) },
+        async move { request.await.map_err(|error| acp_discovery_error(&error)) },
         async move {
             smol::Timer::after(DROID_ACP_DISCOVERY_TIMEOUT).await;
             Err(format!(
@@ -1005,12 +1023,87 @@ fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
             ))
         },
     ))?;
-    Ok(droid_models_from_config(&options, &efforts))
+    Ok(acp_models_from_config(&options, &efforts))
 }
 
-/// The ACP error's own message, with its detail when Droid sent one. The
+/// Antigravity advertises its model families on `session/new` as the `model`
+/// config option. The per-family thinking levels live in `thought_level` and
+/// differ by model (for example, `gpt-oss-120b-medium` has none), so discovery
+/// selects each family in the throwaway session and records the levels
+/// Antigravity answers with. The full variant ids from `models.availableModels`
+/// are accepted by `session/set_config_option` but are not picker entries;
+/// Waku's effort picker maps them onto the family plus `thought_level`.
+fn discover_antigravity_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
+    let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
+    let agent = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd)
+        .map_err(|error| error.to_string())?;
+    let request = Client
+        .builder()
+        .name("waku-antigravity-model-discovery")
+        .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+            connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new().terminal(false))
+                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
+            let response = connection
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let options = response.config_options.unwrap_or_default();
+            let mut efforts = AcpModelEfforts::new();
+            if let Some(model_option) = acp_config_option(&options, "model") {
+                if let Some(current) = acp_select_current(model_option) {
+                    efforts.insert(
+                        current.to_owned(),
+                        acp_effort_choices(&options, "thought_level"),
+                    );
+                }
+                let probe_until = Instant::now() + ANTIGRAVITY_EFFORT_PROBE_BUDGET;
+                for (id, _) in acp_select_choices(model_option) {
+                    if Instant::now() >= probe_until {
+                        break;
+                    }
+                    if id.is_empty() || efforts.contains_key(&id) {
+                        continue;
+                    }
+                    if let Ok(updated) = connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            response.session_id.clone(),
+                            model_option.id.clone(),
+                            id.as_str(),
+                        ))
+                        .block_task()
+                        .await
+                    {
+                        efforts.insert(
+                            id,
+                            acp_effort_choices(&updated.config_options, "thought_level"),
+                        );
+                    }
+                }
+            }
+            Ok((options, efforts))
+        });
+    let (options, efforts) = smol::block_on(smol::future::race(
+        async move { request.await.map_err(|error| acp_discovery_error(&error)) },
+        async move {
+            smol::Timer::after(ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT).await;
+            Err(format!(
+                "Antigravity did not answer within {} seconds",
+                ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT.as_secs()
+            ))
+        },
+    ))?;
+    Ok(acp_models_from_config(&options, &efforts))
+}
+
+/// The ACP error's own message, with its detail when the agent sent one. The
 /// SDK's `Display` adds JSON-RPC framing that means nothing in a picker.
-fn droid_discovery_error(error: &agent_client_protocol::Error) -> String {
+fn acp_discovery_error(error: &agent_client_protocol::Error) -> String {
     let message = error.message.trim();
     match error.data.as_ref() {
         Some(serde_json::Value::String(detail)) if !detail.trim().is_empty() => {
@@ -1022,30 +1115,33 @@ fn droid_discovery_error(error: &agent_client_protocol::Error) -> String {
 
 /// Reasoning choices and the current choice, keyed by model id. A model that
 /// is absent was not probed in time and offers no effort picker.
-type DroidModelEfforts = HashMap<String, Option<DroidEffortChoices>>;
+type AcpModelEfforts = HashMap<String, Option<AcpEffortChoices>>;
 
 /// `(id, label)` pairs for every level, then the selected level.
-type DroidEffortChoices = (Vec<(String, String)>, Option<String>);
+type AcpEffortChoices = (Vec<(String, String)>, Option<String>);
 
-fn droid_effort_choices(options: &[SessionConfigOption]) -> Option<DroidEffortChoices> {
-    droid_config_option(options, "reasoning_effort").map(|option| {
+fn acp_effort_choices(
+    options: &[SessionConfigOption],
+    effort_id: &str,
+) -> Option<AcpEffortChoices> {
+    acp_config_option(options, effort_id).map(|option| {
         (
-            droid_select_choices(option),
-            droid_select_current(option).map(str::to_owned),
+            acp_select_choices(option),
+            acp_select_current(option).map(str::to_owned),
         )
     })
 }
 
-fn droid_models_from_config(
+fn acp_models_from_config(
     options: &[SessionConfigOption],
-    efforts: &DroidModelEfforts,
+    efforts: &AcpModelEfforts,
 ) -> Vec<ProviderModel> {
-    let Some(model_option) = droid_config_option(options, "model") else {
+    let Some(model_option) = acp_config_option(options, "model") else {
         return Vec::new();
     };
-    let current_model = droid_select_current(model_option);
+    let current_model = acp_select_current(model_option);
     let mut models = Vec::new();
-    for (id, name) in droid_select_choices(model_option) {
+    for (id, name) in acp_select_choices(model_option) {
         if id.is_empty() || models.iter().any(|model: &ProviderModel| model.id == id) {
             continue;
         }
@@ -1089,7 +1185,7 @@ fn droid_models_from_config(
     models
 }
 
-fn droid_config_option<'a>(
+fn acp_config_option<'a>(
     options: &'a [SessionConfigOption],
     id: &str,
 ) -> Option<&'a SessionConfigOption> {
@@ -1098,14 +1194,14 @@ fn droid_config_option<'a>(
         .find(|option| option.id.to_string().eq_ignore_ascii_case(id))
 }
 
-fn droid_select_current(option: &SessionConfigOption) -> Option<&str> {
+fn acp_select_current(option: &SessionConfigOption) -> Option<&str> {
     let SessionConfigKind::Select(select) = &option.kind else {
         return None;
     };
     Some(select.current_value.0.as_ref())
 }
 
-fn droid_select_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
+fn acp_select_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
     let SessionConfigKind::Select(select) = &option.kind else {
         return Vec::new();
     };
@@ -1845,7 +1941,7 @@ mod tests {
             ),
             droid_effort_option("high", &["low", "high", "max"]),
         ];
-        let efforts: DroidModelEfforts = [
+        let efforts: AcpModelEfforts = [
             (
                 "glm-5.3-flash",
                 droid_effort_option("high", &["low", "high", "max"]),
@@ -1857,10 +1953,15 @@ mod tests {
             ("auto", droid_effort_option("none", &["none"])),
         ]
         .into_iter()
-        .map(|(model, option)| (model.to_owned(), droid_effort_choices(&[option])))
+        .map(|(model, option)| {
+            (
+                model.to_owned(),
+                acp_effort_choices(&[option], "reasoning_effort"),
+            )
+        })
         .collect();
 
-        let models = droid_models_from_config(&options, &efforts);
+        let models = acp_models_from_config(&options, &efforts);
         let levels = |index: usize| {
             models[index]
                 .reasoning_efforts
@@ -1887,6 +1988,107 @@ mod tests {
         assert!(models[3].reasoning_efforts.is_empty());
     }
 
+    fn antigravity_effort_option(current: &str, levels: &[&str]) -> SessionConfigOption {
+        SessionConfigOption::select(
+            "thought_level",
+            "Thinking",
+            current.to_owned(),
+            levels
+                .iter()
+                .map(|level| SessionConfigSelectOption::new(level.to_string(), level.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn antigravity_catalog_uses_families_and_thought_levels() {
+        let options = [
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "gemini-4-carbon",
+                vec![
+                    SessionConfigSelectOption::new("gemini-4-carbon", "Gemini 4 Carbon"),
+                    SessionConfigSelectOption::new("claude-opus-5-5", "Claude Opus 5.5"),
+                    SessionConfigSelectOption::new("gpt-oss-120b-medium", "GPT-OSS 120B"),
+                ],
+            ),
+            antigravity_effort_option("medium", &["low", "medium", "high"]),
+        ];
+        let efforts: AcpModelEfforts = [
+            (
+                "gemini-4-carbon",
+                antigravity_effort_option("medium", &["low", "medium", "high"]),
+            ),
+            (
+                "claude-opus-5-5",
+                antigravity_effort_option("high", &["low", "medium", "high"]),
+            ),
+            (
+                "gpt-oss-120b-medium",
+                SessionConfigOption::select(
+                    "mode",
+                    "Mode",
+                    "default",
+                    vec![SessionConfigSelectOption::new("default", "Default")],
+                ),
+            ),
+        ]
+        .into_iter()
+        .map(|(model, option)| {
+            (
+                model.to_owned(),
+                acp_effort_choices(&[option], "thought_level"),
+            )
+        })
+        .collect();
+
+        let models = acp_models_from_config(&options, &efforts);
+        assert_eq!(models.len(), 3);
+        assert!(models[0].is_default);
+        assert_eq!(models[0].id, "gemini-4-carbon");
+        assert_eq!(models[0].name, "Gemini 4 Carbon");
+        assert_eq!(
+            models[0]
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(
+            models[0].default_reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
+        assert!(
+            models[2].reasoning_efforts.is_empty(),
+            "a model without thought_level gets no thinking picker"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an installed, authenticated agy"]
+    fn antigravity_discovery_reads_each_models_thinking_levels() {
+        let binary = std::env::var("WAKU_ANTIGRAVITY_BINARY")
+            .ok()
+            .and_then(|spec| crate::command_env::resolve_binary_override(&spec))
+            .or_else(|| crate::command_env::find_executable("agy"))
+            .expect("agy is not installed");
+        let models = discover_antigravity_models(&binary).expect("antigravity discovery failed");
+        assert!(models.iter().any(|model| model.is_default));
+        assert!(
+            models.iter().any(|model| model.reasoning_efforts.len() > 1),
+            "no Antigravity model reported thinking levels"
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| !model.reasoning_efforts.is_empty()
+                    || model.id.starts_with("gpt-oss")),
+            "a reasoning model lost its thinking picker"
+        );
+    }
     #[test]
     #[ignore = "requires an installed, authenticated droid"]
     fn droid_discovery_reads_each_models_reasoning_levels() {

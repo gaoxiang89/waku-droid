@@ -44,6 +44,7 @@ const WINDOWS_DOCS_URL =
 
 const PROVIDERS = [
   { slug: 'amp', label: 'Amp' },
+  { slug: 'antigravity', label: 'Antigravity' },
   { slug: 'claude', label: 'Claude Code' },
   { slug: 'openai', label: 'Codex' },
   { slug: 'cursor', label: 'Cursor' },
@@ -94,7 +95,7 @@ const FAQ = [
   },
   {
     q: 'Do I need new API keys?',
-    a: 'No. Waku detects amp, claude, codex, cursor-agent, opencode, grok, pi, kimi, and droid on your machine and drives them directly — your existing logins, plans, and rate limits apply unchanged.',
+    a: 'No. Waku detects amp, agy, claude, codex, cursor-agent, opencode, grok, pi, kimi, and droid on your machine and drives them directly — your existing logins, plans, and rate limits apply unchanged.',
   },
   {
     q: 'Where does my data live?',

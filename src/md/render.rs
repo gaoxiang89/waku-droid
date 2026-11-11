@@ -2833,7 +2833,7 @@ mod tests {
             (
                 "ACP(JSON-RPC over stdio)",
                 "`driver/acp.rs`",
-                "Cursor、Fx、Grok、Kimi、Factory Droid",
+                "Antigravity、Cursor、Fx、Grok、Kimi、Factory Droid",
             ),
         ]
         .map(|(a, b, c)| vec![runs_of(a), runs_of(b), runs_of(c)]);

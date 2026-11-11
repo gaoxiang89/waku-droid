@@ -280,6 +280,25 @@ fn agent_arguments(
                 push(&mut args, model);
             }
         }
+        // `agy --print` is its one-shot. Slash-command expansion is disabled so
+        // the diff prompt is never interpreted as a command; the prompt still
+        // forbids tool use and carries the complete context.
+        ProviderKind::Antigravity => {
+            push(&mut args, "--print");
+            push(&mut args, prompt);
+            push(&mut args, "--output-format");
+            push(&mut args, "text");
+            push(&mut args, "--disable-slash-commands");
+            if let Some(model) = model {
+                push(&mut args, "--model");
+                push(&mut args, model);
+            }
+            if let Some(effort) = reasoning_effort {
+                push(&mut args, "--effort");
+                push(&mut args, effort);
+            }
+            return args;
+        }
         ProviderKind::DeepSeek => {
             // The headless profile is Harness's one-shot, stdout-only client.
             // The commit prompt embeds all context and explicitly forbids tools.
@@ -786,6 +805,13 @@ mod tests {
                     assert!(has(&args, "--print"));
                     assert!(has_pair(&args, "--mode", "ask"));
                     assert!(has_pair(&args, "--sandbox", "enabled"));
+                }
+                ProviderKind::Antigravity => {
+                    assert!(has_pair(&args, "--print", prompt));
+                    assert!(has_pair(&args, "--output-format", "text"));
+                    assert!(has(&args, "--disable-slash-commands"));
+                    assert!(has_pair(&args, "--model", "model"));
+                    assert!(has_pair(&args, "--effort", "low"));
                 }
                 ProviderKind::DeepSeek => {
                     assert!(has_pair(&args, "--profile", "headless"));

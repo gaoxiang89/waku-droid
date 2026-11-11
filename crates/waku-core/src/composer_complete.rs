@@ -318,6 +318,24 @@ fn assemble_slash_commands(
                 scan_skill_files(provider, &home.join(".config/agents/skills"), &mut commands);
             }
         }
+        // Antigravity reads `.gemini/skills` first, then the shared skill
+        // trees. Its user-level skills live under the CLI profile.
+        ProviderKind::Antigravity => {
+            scan_skill_files(
+                provider,
+                &project_root.join(".gemini/skills"),
+                &mut commands,
+            );
+            scan_skill_files(provider, &project_root.join(".agent/skills"), &mut commands);
+            if let Some(home) = home.as_deref() {
+                scan_skill_files(provider, &home.join(".gemini/config/skills"), &mut commands);
+                scan_skill_files(
+                    provider,
+                    &home.join(".gemini/antigravity-cli/skills"),
+                    &mut commands,
+                );
+            }
+        }
         // Factory Droid reads `.factory/skills` in addition to the shared
         // `.agents/skills` tree scanned for every provider.
         ProviderKind::Droid => {
@@ -1432,6 +1450,7 @@ mod tests {
 
         // Each ecosystem's own project-level skill tree is read too.
         for (provider, dir) in [
+            (ProviderKind::Antigravity, ".gemini/skills"),
             (ProviderKind::Codex, ".codex/skills"),
             (ProviderKind::Cursor, ".cursor/skills"),
             (ProviderKind::Fx, "skills"),
