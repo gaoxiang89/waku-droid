@@ -2221,11 +2221,7 @@ fn render_table(
     let widths = column_widths(header, rows, columns);
     const MIN_COLUMN_WIDTH: f32 = 84.0;
     let min_table_width = columns as f32 * MIN_COLUMN_WIDTH;
-    let table_id = SharedString::from(format!(
-        "table-{}-{}",
-        ctx.row,
-        ctx.next_ordinal.get()
-    ));
+    let table_id = SharedString::from(format!("table-{}-{}", ctx.row, ctx.next_ordinal.get()));
 
     let mut table = div()
         .id(table_id)
@@ -2267,7 +2263,9 @@ fn render_table(
                 !is_last,
                 min_table_width,
             )
-            .when(header.is_empty() && index == 0, |row| row.rounded_t(px(7.0)))
+            .when(header.is_empty() && index == 0, |row| {
+                row.rounded_t(px(7.0))
+            })
             .when(is_last, |row| row.rounded_b(px(7.0)))
             // Faint banding keeps a wide row traceable across columns.
             .when(index % 2 == 1, |row| {

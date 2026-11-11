@@ -219,7 +219,11 @@ impl vt100::Callbacks for DeviceReplies {
             (Some(b'?'), 'u', _) => format!("\x1b[?{}u", self.1),
             (None, 't', 14) => {
                 let (rows, cols) = screen.size();
-                format!("\x1b[4;{};{}t", rows.saturating_mul(16), cols.saturating_mul(8))
+                format!(
+                    "\x1b[4;{};{}t",
+                    rows.saturating_mul(16),
+                    cols.saturating_mul(8)
+                )
             }
             (None, 't', 18) => {
                 let (rows, cols) = screen.size();
@@ -315,10 +319,8 @@ impl TerminalEvents {
             state.append(bytes);
             state.offset
         };
-        let event = WireDriverEvent::new(
-            "terminalOutput",
-            json!({ "data": data, "offset": offset }),
-        );
+        let event =
+            WireDriverEvent::new("terminalOutput", json!({ "data": data, "offset": offset }));
         self.sink.send_ephemeral(event)
     }
 

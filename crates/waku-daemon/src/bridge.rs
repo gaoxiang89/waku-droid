@@ -220,7 +220,11 @@ struct ProcessEntry {
 /// The daemon's descendants, depth-first, from the OS rather than the wire:
 /// the bridge cannot speak the old daemon's protocol.
 fn describe_daemon(state: &BridgeState) -> IncompatibleDaemon {
-    describe_tree(state.pid, state.protocol_version, &platform::process_table())
+    describe_tree(
+        state.pid,
+        state.protocol_version,
+        &platform::process_table(),
+    )
 }
 
 fn describe_tree(pid: u32, protocol_version: u32, table: &[ProcessEntry]) -> IncompatibleDaemon {
@@ -261,10 +265,7 @@ fn describe_tree(pid: u32, protocol_version: u32, table: &[ProcessEntry]) -> Inc
     }
 }
 
-fn children_of(
-    pid: u32,
-    table: &[ProcessEntry],
-) -> impl DoubleEndedIterator<Item = &ProcessEntry> {
+fn children_of(pid: u32, table: &[ProcessEntry]) -> impl DoubleEndedIterator<Item = &ProcessEntry> {
     table.iter().filter(move |entry| entry.parent == pid)
 }
 
@@ -518,7 +519,10 @@ mod tests {
     #[test]
     fn shortens_long_commands() {
         let long = "x".repeat(MAX_COMMAND_CHARS + 10);
-        assert_eq!(shorten_command(&long).chars().count(), MAX_COMMAND_CHARS + 1);
+        assert_eq!(
+            shorten_command(&long).chars().count(),
+            MAX_COMMAND_CHARS + 1
+        );
     }
 }
 

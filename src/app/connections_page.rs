@@ -17,7 +17,10 @@ use gpui::{ElementId, KeyBinding, actions};
 
 use super::*;
 
-actions!(waku_connections, [ConfirmDaemonReplace, DismissDaemonReplace]);
+actions!(
+    waku_connections,
+    [ConfirmDaemonReplace, DismissDaemonReplace]
+);
 
 const DAEMON_REPLACE_DIALOG_CONTEXT: &str = "DaemonReplaceDialog";
 

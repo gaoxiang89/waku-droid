@@ -459,7 +459,10 @@ mod tests {
         let opened = queue.iter().next().unwrap().id;
         assert!(queue.dismiss(opened));
         assert_eq!(
-            listed_titles(&queue).into_iter().take(3).collect::<Vec<_>>(),
+            listed_titles(&queue)
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>(),
             vec!["title 3", "title 2", "title 1"]
         );
         assert_eq!(queue.iter().count(), 4);

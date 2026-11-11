@@ -30,8 +30,7 @@ use gpui::{
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NoAction, ParentElement, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, StrikethroughStyle,
     Styled, StyledText, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
-    canvas, div, font,
-    is_no_action, prelude::FluentBuilder, px, rgb,
+    canvas, div, font, is_no_action, prelude::FluentBuilder, px, rgb,
 };
 use parking_lot::Mutex;
 
@@ -1420,7 +1419,6 @@ impl TerminalSession {
                     style: batch_style,
                 });
             }
-
         }
 
         let snapshot = Arc::new(TerminalSnapshot {
@@ -2623,7 +2621,7 @@ impl TerminalView {
             let y = f32::from(event.position.y - bounds.origin.y);
             let max_y = session.grid_size.1 as f32 * TERMINAL_CELL_HEIGHT;
             if y < 0.0 {
-                let lines = (( -y / TERMINAL_CELL_HEIGHT).ceil() as i32).clamp(1, 5);
+                let lines = ((-y / TERMINAL_CELL_HEIGHT).ceil() as i32).clamp(1, 5);
                 session.scroll(lines);
             } else if y > max_y {
                 let lines = -(((y - max_y) / TERMINAL_CELL_HEIGHT).ceil() as i32).clamp(1, 5);
@@ -3745,9 +3743,8 @@ fn terminal_file_path_with_location(
                 } else if value.starts_with('/') {
                     PathBuf::from(value)
                 } else {
-                    let pathlike = value.starts_with("./")
-                        || value.starts_with("../")
-                        || value.contains('/');
+                    let pathlike =
+                        value.starts_with("./") || value.starts_with("../") || value.contains('/');
                     if !pathlike {
                         return None;
                     }

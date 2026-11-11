@@ -132,12 +132,7 @@ impl DaemonTerminal {
             .name("waku-terminal-child".into())
             .spawn(move || {
                 while !watcher_stopped.load(Ordering::Acquire) {
-                    let exited = watcher_child
-                        .lock()
-                        .try_wait()
-                        .ok()
-                        .flatten()
-                        .is_some();
+                    let exited = watcher_child.lock().try_wait().ok().flatten().is_some();
                     if exited {
                         if !watcher_stopped.load(Ordering::Acquire) {
                             report_exit(&watcher_output, &watcher_reported);
@@ -290,13 +285,16 @@ mod tests {
     fn write_failure_stops_the_writer() {
         let (tx, rx) = unbounded();
         tx.send(DaemonTerminalInput::Write(b"hi".to_vec())).unwrap();
-        tx.send(DaemonTerminalInput::Write(b"more".to_vec())).unwrap();
+        tx.send(DaemonTerminalInput::Write(b"more".to_vec()))
+            .unwrap();
         drop(tx);
         let mut writes = 0;
         let mut fatal = None;
         run_terminal_input(
             rx,
-            FailWrite { writes: &mut writes },
+            FailWrite {
+                writes: &mut writes,
+            },
             |_| Ok(()),
             |error| fatal = Some(error.kind()),
         );

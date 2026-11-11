@@ -1703,7 +1703,8 @@ mod tests {
 
     #[test]
     fn linked_and_styled_images_preserve_outer_attributes() {
-        let tree = parse("[![Build Status](https://example.com/badge.svg)](https://example.com/ci)");
+        let tree =
+            parse("[![Build Status](https://example.com/badge.svg)](https://example.com/ci)");
         assert_eq!(
             tree.blocks[0].block,
             Block::Image {

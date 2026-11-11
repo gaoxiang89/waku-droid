@@ -289,11 +289,7 @@ fn skip_fenced_code_block(chars: &[(usize, char)], line_start: usize) -> FenceSc
     }
     // CommonMark forbids backticks in the info string of a backtick fence; a
     // line like ```` ```code``` ```` is an inline code span, not a fence.
-    if marker == '`'
-        && chars[pos + run..line_end]
-            .iter()
-            .any(|&(_, ch)| ch == '`')
-    {
+    if marker == '`' && chars[pos + run..line_end].iter().any(|&(_, ch)| ch == '`') {
         return FenceScan::NotFence;
     }
 

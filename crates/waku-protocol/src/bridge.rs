@@ -135,7 +135,10 @@ mod tests {
         };
         let line = serde_json::to_string(&blocked).unwrap();
         assert!(serde_json::from_str::<BridgeReady>(&line).is_err());
-        assert_eq!(serde_json::from_str::<BridgeBlocked>(&line).unwrap(), blocked);
+        assert_eq!(
+            serde_json::from_str::<BridgeBlocked>(&line).unwrap(),
+            blocked
+        );
     }
 
     #[test]

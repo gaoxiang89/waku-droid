@@ -212,12 +212,13 @@ impl SplitMember {
             return None;
         }
         match direction {
-            ResizeDirection::Left | ResizeDirection::Up => {
-                index.checked_sub(1).and_then(|i| axis.members[i].last_pane())
-            }
-            ResizeDirection::Right | ResizeDirection::Down => {
-                axis.members.get(index + 1).and_then(SplitMember::first_pane)
-            }
+            ResizeDirection::Left | ResizeDirection::Up => index
+                .checked_sub(1)
+                .and_then(|i| axis.members[i].last_pane()),
+            ResizeDirection::Right | ResizeDirection::Down => axis
+                .members
+                .get(index + 1)
+                .and_then(SplitMember::first_pane),
         }
     }
 

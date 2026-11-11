@@ -2245,7 +2245,10 @@ pub(crate) fn handle_write_text_file(
     } else {
         default_cwd.join(request.path)
     };
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).map_err(|error| {
             agent_client_protocol::util::internal_error(format!(
                 "Failed to create parent directory {}: {error}",
@@ -3955,7 +3958,9 @@ impl DriverControl for AcpDriver {
     }
 
     fn refresh_background_work(&self) {
-        let _ = self.commands.try_send(CommandMessage::RefreshBackgroundWork);
+        let _ = self
+            .commands
+            .try_send(CommandMessage::RefreshBackgroundWork);
     }
 
     fn stop_background_work(&self, key: BackgroundWorkKey, control_id: String) {
@@ -5062,7 +5067,8 @@ mod tests {
 
     #[test]
     fn acp_fs_read_and_write_text_file_handlers() {
-        let temp_dir = std::env::temp_dir().join(format!("waku-acp-fs-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("waku-acp-fs-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         let write_req = WriteTextFileRequest::new("session-1", "nested/test.txt", "1\n2\n3\n4\n5");
@@ -5080,7 +5086,8 @@ mod tests {
 
     #[test]
     fn acp_prompt_content_blocks_attaches_images_and_resources() {
-        let temp_dir = std::env::temp_dir().join(format!("waku-acp-prompt-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("waku-acp-prompt-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let image_file = temp_dir.join("test.png");
@@ -5089,9 +5096,7 @@ mod tests {
         std::fs::write(&doc_file, "Project documentation").unwrap();
 
         let prompt = "Please check @test.png and @notes.txt";
-        let capabilities = PromptCapabilities::new()
-            .image(true)
-            .embedded_context(true);
+        let capabilities = PromptCapabilities::new().image(true).embedded_context(true);
         let blocks = build_prompt_content_blocks(prompt, &temp_dir, &capabilities);
 
         assert_eq!(blocks.len(), 3);
