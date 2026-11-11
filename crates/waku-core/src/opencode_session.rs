@@ -228,6 +228,7 @@ fn history_from_messages(messages: &[MessageInfo]) -> ProviderSessionHistory {
                         account_id: None,
                         handoff: None,
                         native_conversation_start: false,
+                        stream_stats: None,
                         handoff_preamble: None,
                     });
                     turn_id = Some(id);

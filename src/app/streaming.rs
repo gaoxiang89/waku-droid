@@ -28,6 +28,47 @@ impl Waku {
         runtime.stream_phase = Some(StreamPhase::Text);
     }
 
+    /// Feed one streamed delta to the session's throughput meter and store
+    /// the running average on the turn in flight. A meter left over from an
+    /// earlier turn is replaced, picking up whatever the turn already holds.
+    fn record_stream_tokens(&mut self, session_id: Uuid, delta: &str) {
+        let Some(turn) = self
+            .state
+            .session_mut(session_id)
+            .and_then(|session| session.turns.last_mut())
+            .filter(|turn| turn.status == TurnStatus::Running)
+        else {
+            self.token_rate_meters.remove(&session_id);
+            return;
+        };
+        let meter = self
+            .token_rate_meters
+            .entry(session_id)
+            .or_insert_with(|| token_rate::TokenRateMeter::new(turn.id, turn.stream_stats));
+        if meter.turn_id() != turn.id {
+            *meter = token_rate::TokenRateMeter::new(turn.id, turn.stream_stats);
+        }
+        let stats = meter.record(delta, Instant::now());
+        turn.stream_stats = (stats.tokens > 0 || stats.generation_ms > 0).then_some(stats);
+    }
+
+    /// The working row's throughput: the live window while output is
+    /// arriving, the turn's average otherwise (during tool calls), so the
+    /// figure does not blink on and off between bursts.
+    pub(super) fn running_turn_token_rate(&self, session: &AgentSession) -> Option<f64> {
+        let turn = session
+            .turns
+            .last()
+            .filter(|turn| turn.status == TurnStatus::Running)?;
+        let meter = self
+            .token_rate_meters
+            .get(&session.id)
+            .filter(|meter| meter.turn_id() == turn.id);
+        meter
+            .and_then(|meter| meter.live_rate(Instant::now()))
+            .or_else(|| turn.stream_stats?.tokens_per_second())
+    }
+
     fn complete_reasoning_activity(&mut self, session_id: Uuid) {
         let Some(session) = self.state.session_mut(session_id) else {
             return;
@@ -417,11 +458,13 @@ impl Waku {
             }
             DriverEvent::TextDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
+                    self.record_stream_tokens(session_id, &delta);
                     self.append_text_delta(session_id, runtime, delta);
                 }
             }
             DriverEvent::ReasoningDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
+                    self.record_stream_tokens(session_id, &delta);
                     self.append_reasoning_delta(session_id, runtime, delta);
                 }
             }
@@ -759,6 +802,9 @@ impl Waku {
                         crate::analytics::TurnOutcome::Failed
                     },
                 );
+                // The settled turn keeps its average in `stream_stats`; the
+                // live window has no further use.
+                self.token_rate_meters.remove(&session_id);
                 runtime.pending_permission = None;
                 runtime.pending_user_input = None;
                 self.clear_user_input_fields(session_id);
@@ -880,6 +926,7 @@ impl Waku {
                         )
                         .is_some();
                 if finished_turn {
+                    self.token_rate_meters.remove(&session_id);
                     self.capture_latest_turn_checkpoint_for(session_id);
                 }
                 if let Some(previous_kinds) = previous_kinds.as_deref() {

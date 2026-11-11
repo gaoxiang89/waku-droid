@@ -412,6 +412,7 @@ fn history_from_session(provider: ProviderKind, session: &ParsedSession) -> Prov
                 account_id: None,
                 handoff: None,
                 native_conversation_start: false,
+                stream_stats: None,
                 handoff_preamble: None,
             });
             if let Some(text) = entry.text.as_deref() {

@@ -3,6 +3,7 @@ import type { Checkpoint } from "./Checkpoint";
 import type { ProviderKind } from "./ProviderKind";
 import type { TurnHandoff } from "./TurnHandoff";
 import type { TurnStatus } from "./TurnStatus";
+import type { TurnStreamStats } from "./TurnStreamStats";
 
 export type AgentTurn = { id: string, turn_count: number, status: TurnStatus, provider_turn_started: boolean, provider_resume_at?: string | null, started_at: number, completed_at: number | null, checkpoint: Checkpoint | null,
 /**
@@ -29,4 +30,10 @@ handoff?: TurnHandoff | null,
  * latest such turn of the current agent; see
  * [`AgentSession::provider_turns_through`].
  */
-native_conversation_start?: boolean, };
+native_conversation_start?: boolean,
+/**
+ * Client-measured output throughput of this turn, estimated from the
+ * streamed text and reasoning deltas. `None` for turns that streamed too
+ * little to measure, and for imported or pre-existing history.
+ */
+stream_stats?: TurnStreamStats | null, };

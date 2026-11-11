@@ -1552,6 +1552,9 @@ pub struct Waku {
     /// the wall clock since then while an active goal's turn runs, so elapsed
     /// pursuit time ticks live the way the Codex CLI shows it.
     goal_observed_at: HashMap<Uuid, Instant>,
+    /// Live output-throughput meters for sessions with a streaming turn,
+    /// keyed by session. Runtime-only; the turn keeps the persisted average.
+    token_rate_meters: HashMap<Uuid, token_rate::TokenRateMeter>,
     /// Commit-message generation and Git mutation outlive the modal that
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
@@ -2040,6 +2043,7 @@ mod streaming;
 mod task_switcher;
 mod terminal_persistence;
 mod terminal_split;
+mod token_rate;
 mod transcript;
 mod transcript_search;
 mod transcript_view;
@@ -3495,6 +3499,7 @@ impl Waku {
                 pending_goal_operations: HashMap::new(),
                 goal_runtime_starts: HashSet::new(),
                 goal_observed_at: HashMap::new(),
+                token_rate_meters: HashMap::new(),
                 commit_operation: None,
                 // Providers × workspaces; both scans are small, the cache
                 // only exists to keep them off the frame path.

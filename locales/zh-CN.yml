@@ -1143,6 +1143,7 @@ transcript.worked: 已完成
 transcript.worked_for: 用时 %{duration}
 transcript.you_stopped_after: 你在工作 %{duration} 后停止了
 transcript.working_for: 工作中 · %{duration}
+transcript.token_rate: "~%{rate} tok/s"
 transcript.thinking: 正在思考
 transcript.thought_for: 思考用时 %{duration}
 transcript.changed_file: 更改了 %{count} 个文件

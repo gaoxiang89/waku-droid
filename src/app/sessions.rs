@@ -1260,6 +1260,9 @@ impl Waku {
     pub(super) fn reset_session_runtime(&mut self, session_id: Uuid) {
         self.goal_runtime_starts.remove(&session_id);
         self.pending_goal_operations.remove(&session_id);
+        // The live throughput window belongs to the runtime that produced it;
+        // a replacement provider starts a fresh measurement.
+        self.token_rate_meters.remove(&session_id);
         if let Some(runtime) = self.runtimes.remove(&session_id) {
             runtime.driver.cancel();
             runtime.driver.close();
@@ -1680,6 +1683,7 @@ impl Waku {
                 TurnStatus::Interrupted,
                 crate::analytics::TurnOutcome::Cancelled,
             );
+            self.token_rate_meters.remove(&session_id);
         }
         if has_active_turn {
             self.capture_latest_turn_checkpoint_for(session_id);

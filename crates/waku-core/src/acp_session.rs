@@ -370,6 +370,7 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
                     account_id: None,
                     handoff: None,
                     native_conversation_start: false,
+                    stream_stats: None,
                     handoff_preamble: None,
                 });
                 history

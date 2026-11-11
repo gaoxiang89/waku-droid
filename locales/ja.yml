@@ -1193,6 +1193,7 @@ transcript.worked: 完了
 transcript.worked_for: 作業時間 %{duration}
 transcript.you_stopped_after: "%{duration} 後にタスクを停止しました"
 transcript.working_for: 作業中 · %{duration}
+transcript.token_rate: "~%{rate} tok/s"
 transcript.thinking: 思考中
 transcript.thought_for: 思考時間 %{duration}
 transcript.changed_file: "%{count} 個のファイルを変更"

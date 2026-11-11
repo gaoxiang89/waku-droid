@@ -146,6 +146,7 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 account_id: None,
                 handoff: None,
                 native_conversation_start: false,
+                stream_stats: None,
                 handoff_preamble: None,
             });
             if let Some(text) = message_text(&native) {

@@ -1868,14 +1868,18 @@ impl Waku {
             .map(|turn| unix_time().saturating_sub(turn.started_at))
             .unwrap_or(0);
         // A parked turn is waiting on detached work, not working.
-        let label = if session.is_some_and(|session| session.status == SessionStatus::Background) {
-            tr!("transcript.waiting_background")
-        } else {
-            tr!(
-                "transcript.working_for",
-                duration = format_working_elapsed(elapsed)
-            )
-        };
+        let (label, rate) =
+            if session.is_some_and(|session| session.status == SessionStatus::Background) {
+                (tr!("transcript.waiting_background"), None)
+            } else {
+                (
+                    tr!(
+                        "transcript.working_for",
+                        duration = format_working_elapsed(elapsed)
+                    ),
+                    session.and_then(|session| self.running_turn_token_rate(session)),
+                )
+            };
         div()
             .h(px(22.0))
             .flex()
@@ -1884,11 +1888,21 @@ impl Waku {
             .child(working_wave_dots(theme.text_tertiary))
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
                     .text_size(sp(13.5))
                     .line_height(sp(18.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_tertiary)
-                    .child(SharedString::from(label)),
+                    .child(SharedString::from(label))
+                    .when_some(rate, |element, rate| {
+                        element
+                            .child(div().text_color(theme.text_ghost).child("·"))
+                            .child(div().text_color(theme.accent).child(SharedString::from(
+                                super::token_rate::format_token_rate(rate),
+                            )))
+                    }),
             )
             .into_any_element()
     }

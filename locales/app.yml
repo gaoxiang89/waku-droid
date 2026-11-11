@@ -2338,6 +2338,8 @@ transcript.you_stopped_after:
   en: You stopped after %{duration}
 transcript.working_for:
   en: Working for %{duration}
+transcript.token_rate:
+  en: "~%{rate} tok/s"
 transcript.thinking:
   en: Thinking
 transcript.thought_for:

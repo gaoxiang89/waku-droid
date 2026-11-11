@@ -1493,9 +1493,22 @@ pub(super) fn turn_fold_label(session: &AgentSession, turn_id: Uuid) -> String {
     } else {
         tr!("transcript.worked_for", duration = duration)
     };
-    match turn_fold_work_summary(session, turn_id) {
+    let base = match turn_fold_work_summary(session, turn_id) {
         Some(summary) => format!("{base} · {summary}"),
         None => base,
+    };
+    with_token_rate(
+        base,
+        turn.stream_stats
+            .and_then(|stats| stats.tokens_per_second()),
+    )
+}
+
+/// Append the turn's throughput to a status label when one was measured.
+pub(super) fn with_token_rate(label: String, rate: Option<f64>) -> String {
+    match rate {
+        Some(rate) => format!("{label} · {}", super::token_rate::format_token_rate(rate)),
+        None => label,
     }
 }
 

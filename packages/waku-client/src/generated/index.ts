@@ -105,6 +105,7 @@ export type { TokenTotals } from "./TokenTotals";
 export type { TranscriptBlock } from "./TranscriptBlock";
 export type { TurnHandoff } from "./TurnHandoff";
 export type { TurnStatus } from "./TurnStatus";
+export type { TurnStreamStats } from "./TurnStreamStats";
 export type { UsageHistory } from "./UsageHistory";
 export type { UsageProvider } from "./UsageProvider";
 export type { UsageWindow } from "./UsageWindow";

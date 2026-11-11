@@ -136,6 +136,7 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         account_id: None,
         handoff: None,
         native_conversation_start: false,
+        stream_stats: None,
         handoff_preamble: None,
     });
     id

@@ -892,6 +892,11 @@ pub struct AgentTurn {
     /// [`AgentSession::provider_turns_through`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub native_conversation_start: bool,
+    /// Client-measured output throughput of this turn, estimated from the
+    /// streamed text and reasoning deltas. `None` for turns that streamed too
+    /// little to measure, and for imported or pre-existing history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_stats: Option<TurnStreamStats>,
     /// The provider-facing preamble built from `handoff`. Runtime state, not
     /// stored: it is rebuilt from the transcript when a turn begins, and a
     /// process that dies before the prompt is sent simply starts the turn
@@ -899,6 +904,30 @@ pub struct AgentTurn {
     #[serde(skip)]
     #[ts(skip)]
     pub handoff_preamble: Option<String>,
+}
+
+/// Estimated output tokens over the time a turn spent generating them.
+///
+/// `generation_ms` counts only the gaps between consecutive stream deltas
+/// that are short enough to be generation, so tool execution and other
+/// pauses do not dilute the rate. `tokens` likewise counts only the deltas
+/// that closed such a gap: the first chunk of each burst has no measured
+/// time behind it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+pub struct TurnStreamStats {
+    pub tokens: u64,
+    pub generation_ms: u64,
+}
+
+impl TurnStreamStats {
+    /// Below this much measured generation time a rate is noise.
+    pub const MIN_GENERATION_MS: u64 = 1_000;
+
+    /// Tokens per second, or `None` while too little time has been measured.
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        (self.generation_ms >= Self::MIN_GENERATION_MS && self.tokens > 0)
+            .then(|| self.tokens as f64 * 1_000.0 / self.generation_ms as f64)
+    }
 }
 
 /// A portable context handoff: the budgeted slice of this task's transcript
@@ -1632,6 +1661,7 @@ impl AgentSession {
                 account_id: None,
                 handoff: None,
                 native_conversation_start: false,
+                stream_stats: None,
                 handoff_preamble: None,
             });
         }
@@ -1686,6 +1716,7 @@ impl AgentSession {
             account_id: self.account_id.clone(),
             handoff,
             native_conversation_start,
+            stream_stats: None,
             handoff_preamble: preamble,
         });
         self.messages.push(
@@ -1718,6 +1749,7 @@ impl AgentSession {
             account_id: self.account_id.clone(),
             handoff: None,
             native_conversation_start: false,
+            stream_stats: None,
             handoff_preamble: None,
         });
         self.last_reply_at = Some(now);
@@ -1780,6 +1812,7 @@ impl AgentSession {
             account_id: self.account_id.clone(),
             handoff: handoff.map(|handoff| handoff.record.clone()),
             native_conversation_start,
+            stream_stats: None,
             handoff_preamble: None,
         });
         let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
@@ -5586,6 +5619,7 @@ mod tests {
             account_id: None,
             handoff: None,
             native_conversation_start: false,
+            stream_stats: None,
             handoff_preamble: None,
         });
 

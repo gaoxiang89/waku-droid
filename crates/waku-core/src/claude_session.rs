@@ -570,6 +570,7 @@ fn provider_session_history_in(
                 account_id: None,
                 handoff: None,
                 native_conversation_start: false,
+                stream_stats: None,
                 handoff_preamble: None,
             });
             if let Some(content) = message_text(entry) {

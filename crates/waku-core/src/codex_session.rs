@@ -331,6 +331,7 @@ fn parse_session_history(response: &Value) -> ProviderSessionHistory {
             account_id: None,
             handoff: None,
             native_conversation_start: false,
+            stream_stats: None,
             handoff_preamble: None,
         });
 
