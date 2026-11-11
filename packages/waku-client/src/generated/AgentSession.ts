@@ -2,6 +2,7 @@
 import type { AgentTurn } from "./AgentTurn";
 import type { ContextUsage } from "./ContextUsage";
 import type { Message } from "./Message";
+import type { ParkedAccountCursor } from "./ParkedAccountCursor";
 import type { ProviderKind } from "./ProviderKind";
 import type { ProviderResumeCursor } from "./ProviderResumeCursor";
 import type { QueuedMessage } from "./QueuedMessage";
@@ -27,7 +28,7 @@ auto_title?: string | null, pinned: boolean, archived: boolean, project_id: stri
 /**
  * Local project checkout or an isolated Git worktree for this task.
  */
-workspace?: SessionWorkspace, provider: ProviderKind, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
+workspace?: SessionWorkspace, provider: ProviderKind, account_id?: string | null, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
 /**
  * Selected context window, when the provider exposes more than one.
  */
@@ -54,6 +55,11 @@ last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
  * resumes its native conversation instead of starting from nothing.
  */
 provider_cursors?: Array<ProviderResumeCursor>,
+/**
+ * Resume cursors for named provider profiles (`account_id != None`) this
+ * task used before switching away.
+ */
+account_cursors?: Array<ParkedAccountCursor>,
 /**
  * Slash commands the provider reported for this session's live process,
  * kept so a resumed session still completes them before its next

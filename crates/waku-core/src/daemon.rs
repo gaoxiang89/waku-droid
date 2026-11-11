@@ -328,6 +328,7 @@ impl Backend for WakuBackend {
             Command::ProbeProvider {
                 provider,
                 binary_override,
+                config_dir,
                 discover_models,
                 probe_version,
             } => {
@@ -347,22 +348,35 @@ impl Backend for WakuBackend {
                     })
                     .flatten();
                 if discover_models {
-                    probe = crate::model::discover_provider_models(probe);
+                    let resolved_config_dir = config_dir
+                        .as_deref()
+                        .and_then(crate::command_env::resolve_config_dir);
+                    probe = crate::model::discover_provider_models_in(
+                        probe,
+                        resolved_config_dir.as_deref(),
+                    );
                 }
                 Ok(ResponsePayload::ProviderProbe { probe, version })
             }
             Command::FetchPlanUsage {
                 provider,
                 binary_override,
+                config_dir,
                 cli_version,
             } => {
+                let resolved_config_dir = config_dir
+                    .as_deref()
+                    .and_then(crate::command_env::resolve_config_dir);
                 let usage = match provider {
-                    crate::model::ProviderKind::Claude => Some(
-                        crate::usage::fetch_claude_plan_usage(cli_version.as_deref())?,
-                    ),
-                    crate::model::ProviderKind::Codex => {
-                        Some(crate::usage::fetch_codex_plan_usage()?)
+                    crate::model::ProviderKind::Claude => {
+                        Some(crate::usage::fetch_claude_plan_usage(
+                            cli_version.as_deref(),
+                            resolved_config_dir.as_deref(),
+                        )?)
                     }
+                    crate::model::ProviderKind::Codex => Some(
+                        crate::usage::fetch_codex_plan_usage(resolved_config_dir.as_deref())?,
+                    ),
                     crate::model::ProviderKind::OpenCode => {
                         crate::usage::fetch_opencode_go_plan_usage()?
                     }
@@ -390,11 +404,27 @@ impl Backend for WakuBackend {
                 project_roots,
             } => {
                 let rates = crate::usage_history::load_rate_table(&self.usage_rates_dir);
-                let history = crate::usage_history::scan(
+                let account_dirs = self
+                    .settings
+                    .get()
+                    .provider_accounts
+                    .into_iter()
+                    .filter_map(|account| {
+                        let provider = match account.provider {
+                            ProviderKind::Claude => crate::usage_history::UsageProvider::Claude,
+                            ProviderKind::Codex => crate::usage_history::UsageProvider::Codex,
+                            _ => return None,
+                        };
+                        let dir = crate::command_env::resolve_config_dir(&account.config_dir)?;
+                        Some((provider, dir))
+                    })
+                    .collect::<Vec<_>>();
+                let history = crate::usage_history::scan_with_account_dirs(
                     &mut self.usage_scan_cache.lock(),
                     &rates,
                     window,
                     &project_roots,
+                    &account_dirs,
                 );
                 Ok(ResponsePayload::UsageHistory { history })
             }
@@ -573,7 +603,11 @@ impl Backend for WakuBackend {
                 let matches = self.task_store.session_message_search(query, limit)()?;
                 Ok(ResponsePayload::SessionMessageMatches { matches })
             }
-            Command::ListProviderSessions { provider, limit } => {
+            Command::ListProviderSessions {
+                provider,
+                account_id,
+                limit,
+            } => {
                 const MAX_PROVIDER_SESSIONS: usize = 500;
                 let limit = limit.min(MAX_PROVIDER_SESSIONS);
                 if limit == 0 {
@@ -588,10 +622,11 @@ impl Backend for WakuBackend {
                         sessions: Vec::new(),
                     });
                 }
-                let binary_override = settings
-                    .provider_binary_overrides
-                    .get(&provider)
-                    .map(String::as_str);
+                let binary_override =
+                    settings.effective_binary_override(provider, account_id.as_deref());
+                let config_dir = settings
+                    .effective_config_dir(provider, account_id.as_deref())
+                    .and_then(crate::command_env::resolve_config_dir);
                 let Some(binary) = crate::model::provider_probe(provider, binary_override).path
                 else {
                     return Ok(ResponsePayload::ProviderSessions {
@@ -605,10 +640,14 @@ impl Backend for WakuBackend {
                     ProviderKind::Amp => {
                         crate::amp_session::list_provider_sessions(&binary, limit)?
                     }
-                    ProviderKind::Claude => crate::claude_session::list_provider_sessions(limit)?,
-                    ProviderKind::Codex => {
-                        crate::codex_session::list_provider_sessions(&binary, limit)?
+                    ProviderKind::Claude => {
+                        crate::claude_session::list_provider_sessions(limit, config_dir.as_deref())?
                     }
+                    ProviderKind::Codex => crate::codex_session::list_provider_sessions(
+                        &binary,
+                        config_dir.as_deref(),
+                        limit,
+                    )?,
                     ProviderKind::Antigravity
                     | ProviderKind::Cursor
                     | ProviderKind::Droid
@@ -642,13 +681,18 @@ impl Backend for WakuBackend {
                 sessions.truncate(limit);
                 Ok(ResponsePayload::ProviderSessions { sessions })
             }
-            Command::LoadProviderSession { cursor, cwd } => {
+            Command::LoadProviderSession {
+                cursor,
+                cwd,
+                account_id,
+            } => {
                 // Preserve every native turn shell for exact provider turn
                 // numbering, but bound imported display text to recent turns.
                 const VISIBLE_TURN_LIMIT: usize = 100;
-                let history = match &cursor {
+                let account_ref = account_id.as_deref();
+                let mut history = match &cursor {
                     ProviderResumeCursor::Amp { thread_id, .. } => {
-                        let binary = self.provider_binary(ProviderKind::Amp)?;
+                        let binary = self.provider_binary(ProviderKind::Amp, None)?;
                         crate::amp_session::provider_session_history(
                             &binary,
                             &cwd,
@@ -657,16 +701,21 @@ impl Backend for WakuBackend {
                         )?
                     }
                     ProviderResumeCursor::Claude { session_id, .. } => {
-                        self.provider_binary(ProviderKind::Claude)?;
+                        self.provider_binary(ProviderKind::Claude, account_ref)?;
+                        let config_dir =
+                            self.provider_config_dir(ProviderKind::Claude, account_ref);
                         crate::claude_session::provider_session_history(
                             session_id,
                             VISIBLE_TURN_LIMIT,
+                            config_dir.as_deref(),
                         )?
                     }
                     ProviderResumeCursor::Codex { thread_id } => {
-                        let binary = self.provider_binary(ProviderKind::Codex)?;
+                        let binary = self.provider_binary(ProviderKind::Codex, account_ref)?;
+                        let config_dir = self.provider_config_dir(ProviderKind::Codex, account_ref);
                         crate::codex_session::provider_session_history(
                             &binary,
+                            config_dir.as_deref(),
                             thread_id,
                             VISIBLE_TURN_LIMIT,
                         )?
@@ -674,7 +723,7 @@ impl Backend for WakuBackend {
                     // OpenCode is not an ACP provider: its history comes from
                     // the adopted background service's own export route.
                     ProviderResumeCursor::OpenCode { session_id, .. } => {
-                        let binary = self.provider_binary(ProviderKind::OpenCode)?;
+                        let binary = self.provider_binary(ProviderKind::OpenCode, None)?;
                         crate::opencode_session::provider_session_history(
                             &binary,
                             session_id,
@@ -688,7 +737,7 @@ impl Backend for WakuBackend {
                     | ProviderResumeCursor::Grok { session_id }
                     | ProviderResumeCursor::Kimi { session_id } => {
                         let provider = cursor.provider();
-                        let binary = self.provider_binary(provider)?;
+                        let binary = self.provider_binary(provider, None)?;
                         crate::acp_session::provider_session_history(
                             provider,
                             &binary,
@@ -698,7 +747,7 @@ impl Backend for WakuBackend {
                         )?
                     }
                     ProviderResumeCursor::DeepSeek { session_id } => {
-                        let binary = self.provider_binary(ProviderKind::DeepSeek)?;
+                        let binary = self.provider_binary(ProviderKind::DeepSeek, None)?;
                         crate::deepseek_session::provider_session_history(
                             &binary,
                             session_id,
@@ -713,7 +762,7 @@ impl Backend for WakuBackend {
                         session_id,
                         session_file,
                     } => {
-                        self.provider_binary(cursor.provider())?;
+                        self.provider_binary(cursor.provider(), None)?;
                         let session_file = session_file.as_deref().ok_or_else(|| {
                             anyhow!(
                                 "{} did not report its native session file",
@@ -728,6 +777,13 @@ impl Backend for WakuBackend {
                         )?
                     }
                 };
+                if cursor.provider().supports_multiple_accounts()
+                    && let Some(account_id) = account_id.filter(|id| !id.trim().is_empty())
+                {
+                    for turn in &mut history.turns {
+                        turn.account_id = Some(account_id.clone());
+                    }
+                }
                 Ok(ResponsePayload::ProviderSessionHistory { history })
             }
             Command::LoadComposerDrafts => Ok(ResponsePayload::ComposerDrafts {
@@ -943,6 +999,10 @@ impl Backend for WakuBackend {
                 let provider = decode_enum(&options.provider)?;
                 let options = DriverStartOptions {
                     binary: options.binary,
+                    config_dir: options
+                        .config_dir
+                        .as_deref()
+                        .and_then(crate::command_env::resolve_config_dir),
                     cwd: options.cwd,
                     mode: decode_enum(&options.mode)?,
                     model: options.model,
@@ -1106,12 +1166,17 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.archived = incoming.archived;
         existing.project_id = incoming.project_id;
         existing.workspace = incoming.workspace;
-        if existing.provider != incoming.provider && !existing.status.is_busy() {
-            existing.switch_provider(incoming.provider);
+        if (existing.provider, existing.account_id.as_deref())
+            != (incoming.provider, incoming.account_id.as_deref())
+            && !existing.status.is_busy()
+        {
+            existing.switch_agent(incoming.provider, incoming.account_id.clone());
         }
         // A busy task keeps its agent, so the incoming model and options
         // belong to an agent it is not running and must not be applied to it.
-        if existing.provider == incoming.provider {
+        if (existing.provider, existing.account_id.as_deref())
+            == (incoming.provider, incoming.account_id.as_deref())
+        {
             existing.model = incoming.model;
             existing.reasoning_effort = incoming.reasoning_effort;
             existing.service_tier = incoming.service_tier;
@@ -1293,7 +1358,7 @@ impl WakuBackend {
         // accepting a rewind that cannot resume would strand the user at a
         // provider state the UI cannot continue.
         let binary = (rollback_turns > 0 && provider_turn_count > 0)
-            .then(|| self.provider_binary(source.provider))
+            .then(|| self.provider_binary(source.provider, source.account_id.as_deref()))
             .transpose()?;
 
         let turn_start_ref = crate::checkpoint::turn_start_ref(session_id, turn_count);
@@ -1415,6 +1480,8 @@ impl WakuBackend {
                     resume_at,
                     turn_count: provider_turn_count,
                     title: fork_title.to_owned(),
+                    config_dir: self
+                        .provider_config_dir(ProviderKind::Claude, source.account_id.as_deref()),
                 })?;
                 Ok((fork.cursor, fork.message_ids))
             }
@@ -1441,7 +1508,7 @@ impl WakuBackend {
                     bail!("Amp's native thread is unavailable");
                 };
                 let fork = fork_provider_session(ProviderSessionForkRequest::Amp {
-                    binary: self.provider_binary(ProviderKind::Amp)?,
+                    binary: self.provider_binary(ProviderKind::Amp, None)?,
                     cwd: cwd.to_owned(),
                     thread_id: thread_id.clone(),
                     fork_context: fork_context.clone(),
@@ -1458,7 +1525,7 @@ impl WakuBackend {
                 // No cwd: a session carries its own `location`, so there is no
                 // server working directory to fork against.
                 let fork = fork_provider_session(ProviderSessionForkRequest::OpenCode {
-                    binary: self.provider_binary(ProviderKind::OpenCode)?,
+                    binary: self.provider_binary(ProviderKind::OpenCode, None)?,
                     session_id: session_id.clone(),
                     turn_count: provider_turn_count,
                 })?;
@@ -1471,7 +1538,7 @@ impl WakuBackend {
                     bail!("Grok Build's native session is unavailable");
                 };
                 let fork = fork_provider_session(ProviderSessionForkRequest::Grok {
-                    binary: self.provider_binary(ProviderKind::Grok)?,
+                    binary: self.provider_binary(ProviderKind::Grok, None)?,
                     cwd: cwd.to_owned(),
                     session_id: session_id.clone(),
                     turn_count: provider_turn_count,
@@ -1554,7 +1621,8 @@ impl WakuBackend {
         let driver = driver::start_local(
             source.provider,
             DriverStartOptions {
-                binary: self.provider_binary(source.provider)?,
+                binary: self.provider_binary(source.provider, source.account_id.as_deref())?,
+                config_dir: self.provider_config_dir(source.provider, source.account_id.as_deref()),
                 cwd: cwd.to_owned(),
                 mode: source.runtime_mode,
                 model: source.model.clone(),
@@ -1607,6 +1675,8 @@ impl WakuBackend {
                     resume_at: provider_resume_at,
                     turn_count: provider_turn_count,
                     title: format!("{} (rewind)", source.display_title()),
+                    config_dir: self
+                        .provider_config_dir(ProviderKind::Claude, source.account_id.as_deref()),
                 })?;
                 Ok((Some(fork.cursor), fork.message_ids, false))
             }
@@ -1720,6 +1790,7 @@ impl WakuBackend {
             source.provider,
             DriverStartOptions {
                 binary: binary.to_owned(),
+                config_dir: self.provider_config_dir(source.provider, source.account_id.as_deref()),
                 cwd: cwd.to_owned(),
                 mode: source.runtime_mode,
                 model: source.model.clone(),
@@ -1735,16 +1806,28 @@ impl WakuBackend {
         driver.rollback(rollback_turns)
     }
 
-    fn provider_binary(&self, provider: ProviderKind) -> anyhow::Result<PathBuf> {
+    fn provider_binary(
+        &self,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
         ensure_shell_environment();
         let settings = self.settings.get();
-        let binary_override = settings
-            .provider_binary_overrides
-            .get(&provider)
-            .map(String::as_str);
+        let binary_override = settings.effective_binary_override(provider, account_id);
         crate::model::provider_probe(provider, binary_override)
             .path
             .ok_or_else(|| anyhow!("{} is not installed on the daemon", provider.display_name()))
+    }
+
+    fn provider_config_dir(
+        &self,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<PathBuf> {
+        let settings = self.settings.get();
+        settings
+            .effective_config_dir(provider, account_id)
+            .and_then(crate::command_env::resolve_config_dir)
     }
 }
 
@@ -1858,12 +1941,21 @@ fn fork_provider_session(
             resume_at,
             turn_count,
             title,
+            config_dir,
         } => {
             let source_resume_at = resume_at.map(Ok).unwrap_or_else(|| {
-                crate::claude_session::message_id_for_turn(&session_id, turn_count)
+                crate::claude_session::message_id_for_turn(
+                    &session_id,
+                    turn_count,
+                    config_dir.as_deref(),
+                )
             })?;
-            let fork =
-                crate::claude_session::fork_session_at(&session_id, &source_resume_at, &title)?;
+            let fork = crate::claude_session::fork_session_at(
+                &session_id,
+                &source_resume_at,
+                &title,
+                config_dir.as_deref(),
+            )?;
             let fork_resume_at = fork
                 .message_ids
                 .get(&source_resume_at)
@@ -2387,9 +2479,43 @@ mod tests {
 
         merge_stale_session_metadata(&mut existing, older);
 
-        assert!(existing.pinned);
-        assert!(existing.archived);
+        assert_eq!(existing.pinned, true);
+        assert_eq!(existing.archived, true);
         assert_eq!(existing.updated_at, 100);
+    }
+
+    #[test]
+    fn stale_metadata_applies_same_provider_account_switch_only_when_idle() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        existing.set_live_provider_cursor(Some(ProviderResumeCursor::Claude {
+            session_id: "default-session".into(),
+            resume_at: None,
+        }));
+
+        let mut switched = existing.clone();
+        switched.switch_agent(ProviderKind::Claude, Some("claude-work".into()));
+        switched.set_live_provider_cursor(Some(ProviderResumeCursor::Claude {
+            session_id: "work-session".into(),
+            resume_at: None,
+        }));
+
+        let mut busy = existing.clone();
+        busy.status = SessionStatus::Working;
+        merge_stale_session_metadata(&mut busy, switched.clone());
+        assert_eq!(busy.account_id, None);
+        assert_eq!(
+            busy.provider_cursor.as_ref().map(|c| c.native_id()),
+            Some("default-session")
+        );
+
+        merge_stale_session_metadata(&mut existing, switched);
+        assert_eq!(existing.account_id.as_deref(), Some("claude-work"));
+        assert_eq!(existing.provider_cursor, None);
+        existing.switch_agent(ProviderKind::Claude, None);
+        assert_eq!(
+            existing.provider_cursor.as_ref().map(|c| c.native_id()),
+            Some("default-session")
+        );
     }
 
     #[test]

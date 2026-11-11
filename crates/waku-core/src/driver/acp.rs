@@ -172,6 +172,7 @@ impl AcpDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
+            config_dir: _,
         } = options;
         let fork_context = match &provider_cursor {
             Some(ProviderResumeCursor::Cursor { fork_context, .. }) => fork_context.clone(),
@@ -5661,6 +5662,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -5714,6 +5716,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -5772,6 +5775,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -5841,6 +5845,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -5896,6 +5901,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -5950,6 +5956,7 @@ mod tests {
             agent_preset: None,
             computer_use_enabled: false,
             provider_cursor: None,
+            config_dir: None,
         };
 
         let (events, event_rx) = crate::driver::test_event_channel();

@@ -66,8 +66,21 @@ fn turn_reached_provider(turn: &AgentTurn) -> bool {
 /// Returns `None` when there is nothing to hand over: the incoming agent
 /// already saw every turn (it resumed its own conversation), or this is the
 /// task's first turn.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> {
+    plan_with_accounts(session, prompt, &[])
+}
+
+pub(super) fn plan_with_accounts(
+    session: &AgentSession,
+    prompt: &str,
+    accounts: &[waku_protocol::ProviderAccount],
+) -> Option<HandoffPlan> {
     let target = session.provider;
+    let target_account_id = session.account_id.as_deref();
+    let same_target = |turn: &AgentTurn| {
+        session.turn_provider(turn) == target && session.turn_account_id(turn) == target_account_id
+    };
     // A cursor for the incoming agent means its native conversation is about to
     // be resumed, so it only needs the turns it has not seen. Without one the
     // provider starts a fresh conversation, and the whole task is the context
@@ -86,15 +99,13 @@ pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> 
             .turns
             .iter()
             .rposition(|turn| {
-                session.turn_provider(turn) == target
-                    && turn_reached_provider(turn)
-                    && turn.handoff.is_some()
+                same_target(turn) && turn_reached_provider(turn) && turn.handoff.is_some()
             })
             .map_or(0, |index| index + 1);
         (handoff_floor..session.turns.len())
             .filter(|&turn_index| {
                 let turn = &session.turns[turn_index];
-                turn_reached_provider(turn) && session.turn_provider(turn) != target
+                turn_reached_provider(turn) && !same_target(turn)
             })
             .collect()
     } else {
@@ -105,6 +116,42 @@ pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> 
     if covered.is_empty() {
         return None;
     }
+
+    let mut providers_with_multiple_accounts: Vec<ProviderKind> = Vec::new();
+    for provider in ProviderKind::ALL {
+        let mut seen_default = target == provider && target_account_id.is_none();
+        let mut seen_named = target == provider && target_account_id.is_some();
+        for turn in &session.turns {
+            if session.turn_provider(turn) == provider {
+                if session.turn_account_id(turn).is_some() {
+                    seen_named = true;
+                } else {
+                    seen_default = true;
+                }
+            }
+        }
+        if seen_default && seen_named {
+            providers_with_multiple_accounts.push(provider);
+        }
+    }
+    let format_agent = |provider: ProviderKind, account_id: Option<&str>| -> String {
+        if let Some(id) = account_id {
+            let label = accounts
+                .iter()
+                .find(|account| account.provider == provider && account.id == id)
+                .map(|account| account.label.as_str())
+                .unwrap_or(id);
+            format!("{} ({label})", provider.display_name())
+        } else if providers_with_multiple_accounts.contains(&provider) {
+            format!(
+                "{} ({})",
+                provider.display_name(),
+                tr!("providers.default_account")
+            )
+        } else {
+            provider.display_name().to_owned()
+        }
+    };
 
     let mut messages_by_turn: HashMap<Uuid, Vec<&Message>> =
         HashMap::with_capacity(session.turns.len());
@@ -128,9 +175,22 @@ pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> 
             .saturating_mul(4)
             .saturating_sub(HEADER_RESERVE_BYTES),
     };
-    let render =
-        |pos: usize| render_turn(session, covered[pos], &messages_by_turn, &blocks_by_turn);
-    let render_prompt = |pos: usize| render_turn_prompt(session, covered[pos], &messages_by_turn);
+    let render = |pos: usize| {
+        let turn = &session.turns[covered[pos]];
+        let speaker = format_agent(session.turn_provider(turn), session.turn_account_id(turn));
+        render_turn(
+            session,
+            covered[pos],
+            &speaker,
+            &messages_by_turn,
+            &blocks_by_turn,
+        )
+    };
+    let render_prompt = |pos: usize| {
+        let turn = &session.turns[covered[pos]];
+        let speaker = format_agent(session.turn_provider(turn), session.turn_account_id(turn));
+        render_turn_prompt(session, covered[pos], &speaker, &messages_by_turn)
+    };
     let mut selected: Vec<(usize, String)> = Vec::new();
     // The newest turn is what the incoming agent continues from. When its
     // response does not fit, its request alone is still worth carrying.
@@ -171,32 +231,35 @@ pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> 
     selected.sort_unstable_by_key(|(pos, _)| *pos);
 
     let mut from_providers: Vec<ProviderKind> = Vec::new();
+    let mut from_agent_names: Vec<String> = Vec::new();
     for (pos, _) in &selected {
-        let provider = session.turn_provider(&session.turns[covered[*pos]]);
+        let turn = &session.turns[covered[*pos]];
+        let provider = session.turn_provider(turn);
         if !from_providers.contains(&provider) {
             from_providers.push(provider);
         }
+        let agent_name = format_agent(provider, session.turn_account_id(turn));
+        if !from_agent_names.contains(&agent_name) {
+            from_agent_names.push(agent_name);
+        }
     }
     let omitted_turns = covered.len() - selected.len();
-    let agents = from_providers
-        .iter()
-        .map(|provider| provider.display_name())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let agents = from_agent_names.join(", ");
+    let target_name = format_agent(target, target_account_id);
     let mut notice = if resumed {
         if selected.len() == 1 {
             tr!(
                 "session.handoff_notice_resumed_one",
                 count = selected.len(),
                 agents = agents.clone(),
-                provider = target.display_name()
+                provider = target_name.clone()
             )
         } else {
             tr!(
                 "session.handoff_notice_resumed_many",
                 count = selected.len(),
                 agents = agents.clone(),
-                provider = target.display_name()
+                provider = target_name.clone()
             )
         }
     } else if selected.len() == 1 {
@@ -204,14 +267,14 @@ pub(super) fn plan(session: &AgentSession, prompt: &str) -> Option<HandoffPlan> 
             "session.handoff_notice_one",
             count = selected.len(),
             agents = agents.clone(),
-            provider = target.display_name()
+            provider = target_name.clone()
         )
     } else {
         tr!(
             "session.handoff_notice_many",
             count = selected.len(),
             agents = agents.clone(),
-            provider = target.display_name()
+            provider = target_name.clone()
         )
     };
     if omitted_turns > 0 {
@@ -307,7 +370,7 @@ impl Budget {
 fn handoff_budget_tokens(session: &AgentSession, prompt: &str, resumed: bool) -> usize {
     let window = context_window_tokens(session);
     // Live usage describes the conversation it was reported for. A fresh
-    // conversation starts empty whatever the dropped one had used. A resumed
+    // conversation starts empty whatever the one it replaces had used. A resumed
     // agent's usage is unknown until it reports again (switching clears it),
     // which the cap and the reserve below bound.
     let used = if resumed {
@@ -389,17 +452,14 @@ fn truncate_head(text: &str, max_chars: usize) -> String {
 fn render_turn(
     session: &AgentSession,
     turn_index: usize,
+    speaker: &str,
     messages_by_turn: &HashMap<Uuid, Vec<&Message>>,
     blocks_by_turn: &HashMap<Uuid, Vec<&TranscriptBlock>>,
 ) -> String {
     let Some(turn) = session.turns.get(turn_index) else {
         return String::new();
     };
-    let mut out = format!(
-        "### Turn {} — {}\n",
-        turn_index + 1,
-        session.turn_provider(turn).display_name()
-    );
+    let mut out = format!("### Turn {} — {speaker}\n", turn_index + 1);
     if let Some(messages) = messages_by_turn.get(&turn.id) {
         for message in messages {
             match message.role {
@@ -471,16 +531,13 @@ fn neutralize_transcript_delimiters(text: &str) -> String {
 fn render_turn_prompt(
     session: &AgentSession,
     turn_index: usize,
+    speaker: &str,
     messages_by_turn: &HashMap<Uuid, Vec<&Message>>,
 ) -> String {
     let Some(turn) = session.turns.get(turn_index) else {
         return String::new();
     };
-    let mut out = format!(
-        "### Turn {} — {}\n",
-        turn_index + 1,
-        session.turn_provider(turn).display_name()
-    );
+    let mut out = format!("### Turn {} — {speaker}\n", turn_index + 1);
     if let Some(message) = messages_by_turn.get(&turn.id).and_then(|messages| {
         messages
             .iter()
@@ -801,5 +858,70 @@ mod tests {
         assert_eq!(parse_window_option("1m"), Some(1_000_000));
         assert_eq!(parse_window_option("131072"), Some(131_072));
         assert_eq!(parse_window_option(""), None);
+    }
+
+    #[test]
+    fn same_provider_account_switch_hands_over_with_distinct_account_labels() {
+        let work_account = waku_protocol::ProviderAccount {
+            id: "work".into(),
+            provider: ProviderKind::Claude,
+            label: "Work".into(),
+            config_dir: "/tmp/claude-work".into(),
+            binary_override: None,
+        };
+        let accounts = vec![work_account];
+
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        session.begin_turn("personal question");
+        session.push_message(MessageRole::Assistant, "personal answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-default-thread".into(),
+            resume_at: None,
+        });
+
+        // Switch from Claude (Default) to Claude (Work): fresh native thread on Work.
+        session.switch_agent(ProviderKind::Claude, Some("work".into()));
+        let to_work = plan_with_accounts(&session, "continue on work account", &accounts)
+            .expect("switching accounts within Claude hands over prior turn");
+        assert!(!to_work.record.resumed);
+        assert_eq!(to_work.record.covered_turns, 1);
+        assert!(
+            to_work
+                .preamble
+                .contains("### Turn 1 — Claude Code (Default)")
+        );
+        assert!(to_work.preamble.contains("personal answer"));
+        assert!(to_work.notice.contains("Claude Code (Default)"));
+        assert!(to_work.notice.contains("Claude Code (Work)"));
+
+        session.begin_turn("continue on work account");
+        session.push_message(MessageRole::Assistant, "work answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+            turn.handoff = Some(to_work.record);
+        }
+        session.provider_cursor = Some(ProviderResumeCursor::Claude {
+            session_id: "claude-work-thread".into(),
+            resume_at: None,
+        });
+
+        // Switch back to Claude (Default): restores its parked cursor and hands over only Work's delta.
+        session.switch_agent(ProviderKind::Claude, None);
+        let back_to_default = plan_with_accounts(&session, "back to personal", &accounts)
+            .expect("switching back to Default resumes and hands over Work delta");
+        assert!(back_to_default.record.resumed);
+        assert_eq!(back_to_default.record.covered_turns, 1);
+        assert!(
+            back_to_default
+                .preamble
+                .contains("### Turn 2 — Claude Code (Work)")
+        );
+        assert!(back_to_default.preamble.contains("work answer"));
+        assert!(!back_to_default.preamble.contains("personal answer"));
     }
 }

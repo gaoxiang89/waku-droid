@@ -1983,6 +1983,7 @@ mod tests {
                         agent_preset: None,
                         computer_use_enabled: false,
                         provider_cursor: None,
+                        config_dir: None,
                     },
                 },
             )
@@ -2050,6 +2051,7 @@ mod tests {
                         agent_preset: None,
                         computer_use_enabled: false,
                         provider_cursor: None,
+                        config_dir: None,
                     },
                 },
             )
@@ -2169,6 +2171,7 @@ mod tests {
                         agent_preset: None,
                         computer_use_enabled: false,
                         provider_cursor: None,
+                        config_dir: None,
                     },
                 },
             )
@@ -3419,6 +3422,7 @@ mod tests {
                 command: Command::ProbeProvider {
                     provider: crate::model::ProviderKind::Codex,
                     binary_override: None,
+                    config_dir: None,
                     discover_models: false,
                     probe_version: false,
                 },
@@ -3633,6 +3637,7 @@ mod tests {
             agent_preset: None,
             computer_use_enabled: false,
             provider_cursor: None,
+            config_dir: None,
         }
     }
 }

@@ -228,6 +228,8 @@ struct AppState {
     #[serde(default = "default_provider")]
     last_provider: ProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_reasoning_effort: Option<String>,
@@ -265,6 +267,8 @@ pub struct PersistedState {
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,6 +308,9 @@ pub struct PersistedState {
     /// detect from PATH.
     #[serde(default)]
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
+    /// Named provider account profiles owned by the daemon.
+    #[serde(default)]
+    pub provider_accounts: Vec<waku_protocol::ProviderAccount>,
     /// Unknown daemon settings survive edits made by this desktop version.
     #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
@@ -392,6 +399,7 @@ impl PersistedState {
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
+            last_account_id: None,
             last_model: None,
             last_reasoning_effort: None,
             last_service_tier: None,
@@ -410,6 +418,7 @@ impl PersistedState {
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
+            provider_accounts: Vec::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
         }
@@ -430,6 +439,9 @@ impl PersistedState {
     pub fn new_session(&self, project_id: Uuid, provider: ProviderKind) -> AgentSession {
         let mut session = AgentSession::new(project_id, provider);
         if provider == self.last_provider {
+            if provider.supports_multiple_accounts() {
+                session.account_id.clone_from(&self.last_account_id);
+            }
             session.model.clone_from(&self.last_model);
             session
                 .reasoning_effort
@@ -507,6 +519,7 @@ impl PersistedState {
             computer_use_allowed_apps: self.computer_use_allowed_apps.clone(),
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
+            provider_accounts: self.provider_accounts.clone(),
             extra: self.daemon_settings_extra.clone(),
         }
     }
@@ -518,6 +531,7 @@ impl PersistedState {
             selected_project: self.selected_project,
             selected_session: self.persistable_selected_session(),
             last_provider: self.last_provider,
+            last_account_id: self.last_account_id.clone(),
             last_model: self.last_model.clone(),
             last_reasoning_effort: self.last_reasoning_effort.clone(),
             last_service_tier: self.last_service_tier.clone(),
@@ -544,6 +558,7 @@ impl PersistedState {
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
+        self.provider_accounts = settings.provider_accounts;
         self.daemon_settings_extra = settings.extra;
     }
 
@@ -552,6 +567,7 @@ impl PersistedState {
         self.selected_project = app_state.selected_project;
         self.selected_session = app_state.selected_session;
         self.last_provider = app_state.last_provider;
+        self.last_account_id = app_state.last_account_id;
         self.last_model = app_state.last_model;
         self.last_reasoning_effort = app_state.last_reasoning_effort;
         self.last_service_tier = app_state.last_service_tier;
@@ -1316,10 +1332,13 @@ impl StateStore {
         session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
         session.provider_cursors = stored.provider_cursors;
+        session.account_id = stored.account_id;
+        session.account_cursors = stored.account_cursors;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
         session.service_tier = stored.service_tier;
         session.context_window = stored.context_window;
+        session.agent_preset = stored.agent_preset;
         session.context_usage = stored.context_usage;
         session.runtime_event_cursor = stored.runtime_event_cursor;
 
@@ -1649,6 +1668,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         project_id: Uuid::parse_str(&project_id).ok()?,
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
+        account_id: None,
         model,
         // Hydration replaces these; the list never reads them.
         runtime_mode: RuntimeMode::default(),
@@ -1662,6 +1682,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         last_reply_at: last_reply_at.map(|at| at as u64),
         provider_cursor: None,
         provider_cursors: Vec::new(),
+        account_cursors: Vec::new(),
         available_commands: Vec::new(),
         thread_goal: None,
         context_usage: None,

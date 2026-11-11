@@ -29,13 +29,23 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
     writer.flush()
 }
 
-fn app_server_request(binary: &Path, request: Value) -> anyhow::Result<Value> {
+fn app_server_request(
+    binary: &Path,
+    config_dir: Option<&Path>,
+    request: Value,
+) -> anyhow::Result<Value> {
     let cwd = crate::acp_session::catalog_working_directory()?;
-    app_server_request_in(binary, &cwd, request)
+    app_server_request_in(binary, &cwd, config_dir, request)
 }
 
-fn app_server_request_in(binary: &Path, cwd: &Path, request: Value) -> anyhow::Result<Value> {
+fn app_server_request_in(
+    binary: &Path,
+    cwd: &Path,
+    config_dir: Option<&Path>,
+    request: Value,
+) -> anyhow::Result<Value> {
     let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
     let command = command
         .args(["app-server", "--stdio"])
         .current_dir(cwd)
@@ -141,12 +151,14 @@ fn app_server_request_in(binary: &Path, cwd: &Path, request: Value) -> anyhow::R
 pub(crate) fn fork_session_at_turn(
     binary: &Path,
     cwd: &Path,
+    config_dir: Option<&Path>,
     thread_id: &str,
     last_turn_id: &str,
 ) -> anyhow::Result<ProviderResumeCursor> {
     let response = app_server_request_in(
         binary,
         cwd,
+        config_dir,
         json!({
             "method": "thread/fork",
             "id": 1,
@@ -244,6 +256,7 @@ fn parse_session_summaries(response: &Value, limit: usize) -> Vec<ProviderSessio
 /// native cursor in the daemon catalog.
 pub fn list_provider_sessions(
     binary: &Path,
+    config_dir: Option<&Path>,
     limit: usize,
 ) -> anyhow::Result<Vec<ProviderSessionSummary>> {
     if limit == 0 {
@@ -251,6 +264,7 @@ pub fn list_provider_sessions(
     }
     let response = app_server_request(
         binary,
+        config_dir,
         json!({
             "method": "thread/list",
             "id": 1,
@@ -314,6 +328,7 @@ fn parse_session_history(response: &Value) -> ProviderSessionHistory {
             completed_at,
             checkpoint: None,
             provider: Some(ProviderKind::Codex),
+            account_id: None,
             handoff: None,
             native_conversation_start: false,
             handoff_preamble: None,
@@ -374,6 +389,7 @@ fn retain_recent_messages(history: &mut ProviderSessionHistory, visible_turn_lim
 /// retained; Codex remains authoritative for the full conversation context.
 pub fn provider_session_history(
     binary: &Path,
+    config_dir: Option<&Path>,
     thread_id: &str,
     visible_turn_limit: usize,
 ) -> anyhow::Result<ProviderSessionHistory> {
@@ -382,6 +398,7 @@ pub fn provider_session_history(
     }
     let response = app_server_request(
         binary,
+        config_dir,
         json!({
             "method": "thread/read",
             "id": 1,

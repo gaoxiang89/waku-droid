@@ -171,12 +171,13 @@ pub(super) fn merge_remote_session_catalog(
             local.pinned = remote.pinned;
             local.archived = remote.archived;
             local.project_id = remote.project_id;
-            if local.provider != remote.provider {
+            if local.provider != remote.provider || local.account_id != remote.account_id {
                 // Parks the outgoing agent's cursor and attributes the turns
-                // it ran before `turn_provider` starts reading them as the
-                // new agent's. The remote timestamps stay authoritative.
+                // it ran before `turn_provider` / `turn_account_id` starts
+                // reading them as the new agent's. The remote timestamps stay
+                // authoritative.
                 let updated_at = local.updated_at;
-                local.switch_provider(remote.provider);
+                local.switch_agent(remote.provider, remote.account_id);
                 local.updated_at = updated_at;
             }
             local.model = remote.model;
@@ -315,6 +316,7 @@ struct MessageRewindRequest {
     session_id: Uuid,
     provider: ProviderKind,
     provider_cursor: Option<ProviderResumeCursor>,
+    claude_config_dir: Option<PathBuf>,
     session_title: String,
     /// Cursor has no native branch API, so its background helper needs the
     /// retained visible transcript. Other providers avoid cloning a long task
@@ -508,6 +510,7 @@ fn perform_provider_rewind(
                         "session.rewind_title",
                         title = request.session_title.as_str()
                     ),
+                    config_dir: request.claude_config_dir.clone(),
                 },
             )?;
             Ok((None, Some(fork), None))
@@ -661,6 +664,7 @@ fn perform_provider_rewind(
 struct ResponseForkRequest {
     workspace_client: waku_client::WorkspaceClient,
     source: AgentSession,
+    claude_config_dir: Option<PathBuf>,
     source_workspace_path: PathBuf,
     fork_title: String,
     turn_count: usize,
@@ -768,6 +772,7 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
                             resume_at,
                             turn_count: request.provider_turn_count,
                             title: request.fork_title.clone(),
+                            config_dir: request.claude_config_dir.clone(),
                         },
                     )?;
                     Ok((fork.cursor, Some(fork.message_ids), None))
@@ -1528,6 +1533,7 @@ impl Waku {
                         binary_override,
                         discover_models: true,
                         probe_version: false,
+                        config_dir: None,
                     },
                 ) {
                     Ok(waku_client::ResponsePayload::ProviderProbe { probe, .. }) => probe,
@@ -1596,6 +1602,7 @@ impl Waku {
                             binary_override,
                             discover_models: false,
                             probe_version: true,
+                            config_dir: None,
                         },
                     ) {
                         Ok(waku_client::ResponsePayload::ProviderProbe { version, .. }) => version,
@@ -1661,6 +1668,7 @@ impl Waku {
                             binary_override: overrides.get(&provider).cloned(),
                             discover_models: false,
                             probe_version: false,
+                            config_dir: None,
                         },
                     );
                     let probe = match response {
@@ -2143,6 +2151,9 @@ impl Waku {
         } else {
             None
         };
+        let claude_config_dir = self
+            .effective_config_dir_for_session(&source)
+            .map(PathBuf::from);
         let request = ResponseForkRequest {
             workspace_client: waku_client::WorkspaceClient::for_daemon(
                 self.daemon_for_session(source.id).clone(),
@@ -2154,6 +2165,7 @@ impl Waku {
             provider_turn_count,
             turns_to_remove,
             binary,
+            claude_config_dir,
             driver,
             driver_start,
         };
@@ -2543,6 +2555,9 @@ impl Waku {
             cx.notify();
             return;
         };
+        let claude_config_dir = self
+            .effective_config_dir_for_session(&source)
+            .map(PathBuf::from);
         let request = MessageRewindRequest {
             workspace_client: waku_client::WorkspaceClient::for_daemon(
                 self.daemon_for_session(session_id).clone(),
@@ -2559,6 +2574,7 @@ impl Waku {
             provider_turn_count,
             provider_resume_at,
             binary,
+            claude_config_dir,
             driver,
             driver_start,
         };
@@ -2950,15 +2966,25 @@ impl Waku {
         session: &AgentSession,
         cwd: PathBuf,
     ) -> anyhow::Result<DriverStartRequest> {
-        let binary = self
-            .provider_probe_for_session(session)
-            .and_then(|probe| probe.path.clone())
+        let host = self.hosts.ownership.session(session.id);
+        let account_override = self
+            .account_for_host(&host, session.provider, session.account_id.as_deref())
+            .and_then(|account| account.binary_override.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let binary = account_override
+            .or_else(|| {
+                self.provider_probe_for_session(session)
+                    .and_then(|probe| probe.path.clone())
+            })
             .ok_or_else(|| {
                 anyhow::anyhow!(tr!(
                     "errors.provider_not_found",
                     provider = session.provider.display_name()
                 ))
             })?;
+        let config_dir = self.effective_config_dir_for_session(session);
         let agent_preset = self.agent_preset_for_session(session);
         let SessionOptions {
             mode,
@@ -2972,6 +2998,7 @@ impl Waku {
             provider: session.provider,
             options: DriverStartOptions {
                 binary,
+                config_dir,
                 cwd,
                 mode,
                 model,
@@ -3012,6 +3039,7 @@ impl Waku {
             return;
         };
         let expected_provider = session.provider;
+        let expected_account_id = session.account_id.clone();
         let project_id = session.project_id;
         let workspace = session.workspace.clone();
         let next_turn_count = session.turns.len() + 1;
@@ -3068,7 +3096,13 @@ impl Waku {
                 })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
-                waku.finish_goal_runtime_start(session_id, expected_provider, prepared, cx);
+                waku.finish_goal_runtime_start(
+                    session_id,
+                    expected_provider,
+                    expected_account_id,
+                    prepared,
+                    cx,
+                );
             });
         })
         .detach();
@@ -3078,6 +3112,7 @@ impl Waku {
         &mut self,
         session_id: Uuid,
         expected_provider: ProviderKind,
+        expected_account_id: Option<String>,
         prepared: anyhow::Result<PreparedSubmission>,
         cx: &mut Context<Self>,
     ) {
@@ -3087,7 +3122,9 @@ impl Waku {
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .is_some_and(|session| session.provider == expected_provider);
+            .is_some_and(|session| {
+                session.provider == expected_provider && session.account_id == expected_account_id
+            });
         if !started || !provider_matches {
             if !self
                 .state
@@ -3534,14 +3571,17 @@ impl Waku {
             Vec::new()
         };
         let resolved_prompt = self.resolve_provider_submission(session_provider, &prompt);
+        let session_host = self.hosts.ownership.session(session_id);
+        let host_accounts = self.provider_accounts_for(&session_host).to_vec();
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
-            // A task may change agents between turns. The incoming agent has
-            // no memory of the outgoing one's conversation, so the earlier
-            // turns travel with the prompt as a preamble the driver prepends
-            // once, plus a transcript notice that says so on the record.
+            // A task may change agents or accounts between turns. The incoming
+            // agent has no memory of the outgoing one's conversation, so the
+            // earlier turns travel with the prompt as a preamble the driver
+            // prepends once, plus a transcript notice that says so on the
+            // record.
             let handoff = (!resolved_prompt.trim_start().starts_with('/'))
-                .then(|| super::handoff::plan(session, &prompt))
+                .then(|| super::handoff::plan_with_accounts(session, &prompt, &host_accounts))
                 .flatten();
             let turn_id = match handoff {
                 Some(handoff) => session.begin_turn_with_handoff(
@@ -4156,6 +4196,32 @@ mod response_fork_title_tests {
         assert!(local[0].archived);
         assert_eq!(local[0].turns.len(), 1);
         assert_eq!(local[0].updated_at, local_updated_at);
+    }
+
+    #[test]
+    fn remote_catalog_switches_same_provider_account_and_parks_cursor() {
+        let project = Project::from_path("/remote/project".into());
+        let mut session = AgentSession::new(project.id, ProviderKind::Claude);
+        session.begin_turn("Default account prompt");
+        session.provider_cursor = Some(crate::model::ProviderResumeCursor::Claude {
+            session_id: "claude-default-1".into(),
+            resume_at: None,
+        });
+        let mut remote = session.list_projection();
+        remote.switch_agent(ProviderKind::Claude, Some("work".into()));
+        let mut local = vec![session];
+
+        merge_remote_session_catalog(&mut local, vec![remote], |_| false);
+
+        assert_eq!(local[0].provider, ProviderKind::Claude);
+        assert_eq!(local[0].account_id.as_deref(), Some("work"));
+        assert_eq!(local[0].provider_cursor, None);
+        assert!(
+            local[0]
+                .provider_cursors
+                .iter()
+                .any(|cursor| cursor.provider() == ProviderKind::Claude)
+        );
     }
 
     #[test]

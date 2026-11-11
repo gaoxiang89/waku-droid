@@ -828,6 +828,13 @@ impl Aggregator {
     }
 }
 
+fn account_transcript_root(provider: UsageProvider, config_dir: &Path) -> PathBuf {
+    match provider {
+        UsageProvider::Claude => config_dir.join("projects"),
+        UsageProvider::Codex => config_dir.join("sessions"),
+    }
+}
+
 /// Scan every provider's transcripts for `window` ending today and derive
 /// the page snapshot. `project_roots` are the app's known project paths, used
 /// to attribute working directories to projects. Blocking; run on the
@@ -837,6 +844,18 @@ pub fn scan(
     rates: &RateTable,
     window: UsageWindow,
     project_roots: &[PathBuf],
+) -> UsageHistory {
+    scan_with_account_dirs(cache, rates, window, project_roots, &[])
+}
+
+/// Like [`scan`], additionally scanning custom account configuration roots
+/// configured in `DaemonSettings::provider_accounts`.
+pub fn scan_with_account_dirs(
+    cache: &mut ScanCache,
+    rates: &RateTable,
+    window: UsageWindow,
+    project_roots: &[PathBuf],
+    account_dirs: &[(UsageProvider, PathBuf)],
 ) -> UsageHistory {
     let started = Instant::now();
     let (since_day, until_day) = window.bounds(Local::now().date_naive());
@@ -854,12 +873,27 @@ pub fn scan(
     let mut skipped_files = 0;
     let mut errors = Vec::new();
 
+    let mut roots_to_scan: Vec<(UsageProvider, PathBuf)> = Vec::new();
+    let mut seen_roots: HashSet<(UsageProvider, PathBuf)> = HashSet::new();
     for provider in UsageProvider::ALL {
-        let Some(root) = provider_root(provider) else {
-            continue;
-        };
+        if let Some(root) = provider_root(provider) {
+            let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            if seen_roots.insert((provider, canonical)) {
+                roots_to_scan.push((provider, root));
+            }
+        }
+    }
+    for (provider, config_dir) in account_dirs {
+        let root = account_transcript_root(*provider, config_dir);
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if seen_roots.insert((*provider, canonical)) {
+            roots_to_scan.push((*provider, root));
+        }
+    }
+
+    for (provider, root) in roots_to_scan {
         if !root.is_dir() {
-            // Provider never used on this machine; zero usage, not an error.
+            // Provider or account never used on this machine; zero usage, not an error.
             continue;
         }
         let mut files = Vec::new();

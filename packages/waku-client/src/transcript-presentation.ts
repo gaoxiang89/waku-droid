@@ -32,12 +32,25 @@ export function turnProvider(session: AgentSession, turn: SessionTurn) {
   return turn.provider ?? session.provider
 }
 
+/** The named profile within `turnProvider` that ran `turn`, or `null` for the
+ * provider's default account; mirrors `AgentSession::turn_account_id`. */
+export function turnAccountId(session: AgentSession, turn: SessionTurn): string | null {
+  if (turn.account_id) return turn.account_id
+  if (turn.provider === undefined || turn.provider === null) return session.account_id ?? null
+  return null
+}
+
+function sameAgent(session: AgentSession, turn: SessionTurn) {
+  return turnProvider(session, turn) === session.provider
+    && turnAccountId(session, turn) === (session.account_id ?? null)
+}
+
 /** Index of the turn that opened the current agent's native conversation;
  * mirrors `AgentSession::native_conversation_floor`. */
 function nativeConversationFloor(session: AgentSession) {
   for (let index = session.turns.length - 1; index >= 0; index--) {
     const turn = session.turns[index]!
-    if (turn.native_conversation_start && turnProvider(session, turn) === session.provider) {
+    if (turn.native_conversation_start && sameAgent(session, turn)) {
       return index
     }
   }
@@ -45,7 +58,7 @@ function nativeConversationFloor(session: AgentSession) {
 }
 
 function isNativeConversationTurn(session: AgentSession, turn: SessionTurn) {
-  return turn.provider_turn_started && turnProvider(session, turn) === session.provider
+  return turn.provider_turn_started && sameAgent(session, turn)
 }
 
 /** Turns among the first `turnCount` that the current agent's native

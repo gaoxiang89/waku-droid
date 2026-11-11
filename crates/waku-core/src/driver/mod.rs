@@ -185,6 +185,7 @@ pub trait DriverControl: Send + Sync {
 pub struct DriverStartOptions {
     pub binary: PathBuf,
     pub cwd: PathBuf,
+    pub config_dir: Option<PathBuf>,
     pub mode: RuntimeMode,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,

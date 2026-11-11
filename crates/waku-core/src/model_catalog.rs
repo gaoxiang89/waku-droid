@@ -152,6 +152,14 @@ pub fn discover_catalog_reporting(
     provider: ProviderKind,
     binary: &Path,
 ) -> (Vec<ProviderModel>, Vec<ProviderAgentPreset>, Option<String>) {
+    discover_catalog_reporting_in(provider, binary, None)
+}
+
+pub fn discover_catalog_reporting_in(
+    provider: ProviderKind,
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> (Vec<ProviderModel>, Vec<ProviderAgentPreset>, Option<String>) {
     let mut discovery_error = None;
     let (discovered, discovered_presets) = match provider {
         // Amp exposes stable agent modes rather than a model inventory. Keep
@@ -164,8 +172,8 @@ pub fn discover_catalog_reporting(
                 (Vec::new(), None)
             }
         },
-        ProviderKind::Codex => (discover_codex_models(binary), None),
-        ProviderKind::Claude => (discover_claude_models(binary), None),
+        ProviderKind::Codex => (discover_codex_models(binary, config_dir), None),
+        ProviderKind::Claude => (discover_claude_models(binary, config_dir), None),
         ProviderKind::Cursor => (discover_cursor_models(binary), None),
         ProviderKind::DeepSeek => discover_deepseek_catalog(binary),
         ProviderKind::Fx => (discover_fx_models(binary), None),
@@ -248,8 +256,8 @@ fn write_models_file(path: &Path, models: &[ProviderModel]) -> std::io::Result<(
 /// Claude Code's sessionless SDK initialization response carries the exact
 /// catalog behind `/model`. Unlike a fixed Anthropic list, it reflects account
 /// availability and role mappings supplied by tools such as CC Switch.
-fn discover_claude_models(binary: &Path) -> Vec<ProviderModel> {
-    crate::claude_metadata::initialize(binary, None, "user")
+fn discover_claude_models(binary: &Path, config_dir: Option<&Path>) -> Vec<ProviderModel> {
+    crate::claude_metadata::initialize(binary, None, config_dir, "user")
         .map(|value| parse_claude_models(&value))
         .unwrap_or_default()
 }
@@ -1510,8 +1518,9 @@ fn pi_reasoning_options(dialect: PiDialect, model: &Value) -> Vec<ProviderModelO
         .collect()
 }
 
-fn discover_codex_models(binary: &Path) -> Vec<ProviderModel> {
+fn discover_codex_models(binary: &Path, config_dir: Option<&Path>) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
     let command = command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())

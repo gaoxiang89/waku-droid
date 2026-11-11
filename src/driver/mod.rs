@@ -28,6 +28,7 @@ pub(crate) fn start_remote(
         options: waku_client::WireDriverStartOptions {
             provider: waku_client::encode_enum(provider)?,
             binary: options.binary,
+            config_dir: options.config_dir,
             cwd: options.cwd,
             mode: waku_client::encode_enum(options.mode)?,
             model: options.model,

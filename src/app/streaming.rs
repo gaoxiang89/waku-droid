@@ -600,15 +600,20 @@ impl Waku {
                 }
             }
             DriverEvent::PlanUsageUpdated(usage) => {
-                if let Some(provider) = self
+                if let Some((provider, raw_account_id)) = self
                     .state
                     .sessions
                     .iter()
                     .find(|session| session.id == session_id)
-                    .map(|session| session.provider)
+                    .map(|session| (session.provider, session.account_id.clone()))
                 {
-                    self.plan_usage
-                        .insert((self.hosts.ownership.session(session_id), provider), usage);
+                    let host = self.hosts.ownership.session(session_id);
+                    let account_id = self.validated_account_id_for_host(
+                        &host,
+                        provider,
+                        raw_account_id.as_deref(),
+                    );
+                    self.plan_usage.insert((host, provider, account_id), usage);
                 }
             }
             DriverEvent::GoalUpdated(goal) => {
@@ -664,16 +669,21 @@ impl Waku {
                 // A settled turn moved the account's rate-limit needles; ask
                 // that provider's plan meter to refresh once its backoff
                 // allows.
-                if let Some(provider) = self
+                if let Some((provider, raw_account_id)) = self
                     .state
                     .sessions
                     .iter()
                     .find(|session| session.id == session_id)
-                    .map(|session| session.provider)
-                    .filter(|provider| usage_meter::PLAN_USAGE_PROVIDERS.contains(provider))
+                    .map(|session| (session.provider, session.account_id.clone()))
+                    .filter(|(provider, _)| usage_meter::PLAN_USAGE_PROVIDERS.contains(provider))
                 {
-                    self.plan_usage_stale
-                        .insert((self.hosts.ownership.session(session_id), provider));
+                    let host = self.hosts.ownership.session(session_id);
+                    let account_id = self.validated_account_id_for_host(
+                        &host,
+                        provider,
+                        raw_account_id.as_deref(),
+                    );
+                    self.plan_usage_stale.insert((host, provider, account_id));
                 }
                 if self
                     .state

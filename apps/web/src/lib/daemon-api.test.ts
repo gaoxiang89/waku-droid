@@ -345,9 +345,13 @@ describe('provider session resume', () => {
 
     await expect(listProviderSessions(client, 'claude')).resolves.toEqual([summary])
     await expect(loadProviderSessionHistory(client, summary)).resolves.toEqual(history)
+    await expect(listProviderSessions(client, 'claude', 250, 'claude-work')).resolves.toEqual([summary])
+    await expect(loadProviderSessionHistory(client, summary, 'claude-work')).resolves.toEqual(history)
     expect(commands).toEqual([
       { type: 'listProviderSessions', provider: 'claude', limit: 250 },
       { type: 'loadProviderSession', cursor: summary.cursor, cwd: '/srv/waku' },
+      { type: 'listProviderSessions', provider: 'claude', accountId: 'claude-work', limit: 250 },
+      { type: 'loadProviderSession', cursor: summary.cursor, accountId: 'claude-work', cwd: '/srv/waku' },
     ])
   })
 

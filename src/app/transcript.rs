@@ -78,7 +78,7 @@ impl Waku {
     pub(super) fn assistant_turn_provider_cached(
         &self,
         message_index: usize,
-    ) -> Option<ProviderKind> {
+    ) -> Option<TurnAgentBadge> {
         if self
             .selected_session()
             .and_then(|session| session.messages.get(message_index))
@@ -90,17 +90,41 @@ impl Waku {
         self.assistant_turn_provider_cache
             .borrow()
             .get(&message_index)
-            .copied()
+            .cloned()
     }
 
     fn ensure_assistant_turn_providers(&self) {
         self.refresh_transcript_row_kinds();
-        let fingerprint = self.transcript_row_kinds_fingerprint.get();
+        let fingerprint = self.transcript_row_kinds_fingerprint.get().map(|row_fp| {
+            let Some(session) = self.selected_session() else {
+                return row_fp;
+            };
+            let host = self.hosts.ownership.session(session.id);
+            let mut hash = row_fp;
+            if let Some(accounts) = self.host_provider_accounts.get(&host) {
+                hash = mix(hash, accounts.len() as u64);
+                for account in accounts {
+                    hash = mix_str(hash, &account.id);
+                    hash = mix(hash, account.provider as u64);
+                    hash = mix_str(hash, &account.label);
+                }
+            } else if host == waku_client::hosts::HostKey::Local {
+                hash = mix(hash, self.state.provider_accounts.len() as u64);
+                for account in &self.state.provider_accounts {
+                    hash = mix_str(hash, &account.id);
+                    hash = mix(hash, account.provider as u64);
+                    hash = mix_str(hash, &account.label);
+                }
+            }
+            hash
+        });
         if self.assistant_turn_provider_fingerprint.get() != fingerprint {
             let mut cache = self.assistant_turn_provider_cache.borrow_mut();
             if let Some(session) = self.selected_session() {
+                let host = self.hosts.ownership.session(session.id);
+                let accounts = self.provider_accounts_for(&host);
                 let row_kinds = self.transcript_row_kinds.borrow();
-                rebuild_assistant_turn_providers(session, &row_kinds, &mut cache);
+                rebuild_assistant_turn_providers(session, &row_kinds, &accounts, &mut cache);
             } else {
                 cache.clear();
             }
@@ -808,8 +832,8 @@ fn transcript_row_splice_by(
 pub(super) fn transcript_row_splice_with_providers(
     previous: &[TranscriptRowKind],
     next: &[TranscriptRowKind],
-    previous_providers: &HashMap<usize, ProviderKind>,
-    next_providers: &HashMap<usize, ProviderKind>,
+    previous_providers: &HashMap<usize, TurnAgentBadge>,
+    next_providers: &HashMap<usize, TurnAgentBadge>,
 ) -> Option<(Range<usize>, usize)> {
     transcript_row_splice_by(previous, next, |left, right| {
         left == right
@@ -836,16 +860,50 @@ pub(super) fn mixed_providers_transitioned(
 pub(super) fn rebuild_assistant_turn_providers(
     session: &AgentSession,
     row_kinds: &[TranscriptRowKind],
-    cache: &mut HashMap<usize, ProviderKind>,
+    accounts: &[waku_protocol::ProviderAccount],
+    cache: &mut HashMap<usize, TurnAgentBadge>,
 ) {
     cache.clear();
     if !session.has_mixed_providers() {
         return;
     }
-    let providers_by_turn: HashMap<Uuid, ProviderKind> = session
+    let mut multi_account_providers: HashSet<ProviderKind> = HashSet::new();
+    let mut seen_provider_accounts: HashMap<ProviderKind, Option<&str>> = HashMap::new();
+    for turn in &session.turns {
+        let provider = session.turn_provider(turn);
+        let account_id = session.turn_account_id(turn);
+        if let Some(&first_account) = seen_provider_accounts.get(&provider) {
+            if first_account != account_id {
+                multi_account_providers.insert(provider);
+            }
+        } else {
+            seen_provider_accounts.insert(provider, account_id);
+        }
+    }
+    let badges_by_turn: HashMap<Uuid, TurnAgentBadge> = session
         .turns
         .iter()
-        .map(|turn| (turn.id, session.turn_provider(turn)))
+        .map(|turn| {
+            let provider = session.turn_provider(turn);
+            let account_id = session.turn_account_id(turn);
+            let label = match account_id {
+                Some(id) => {
+                    let account_label = accounts
+                        .iter()
+                        .find(|account| account.provider == provider && account.id == id)
+                        .map(|account| account.label.as_str())
+                        .unwrap_or(id);
+                    SharedString::from(format!("{} · {account_label}", provider.short_name()))
+                }
+                None if multi_account_providers.contains(&provider) => SharedString::from(format!(
+                    "{} · {}",
+                    provider.short_name(),
+                    tr!("providers.default_account")
+                )),
+                None => SharedString::from(provider.short_name()),
+            };
+            (turn.id, TurnAgentBadge { provider, label })
+        })
         .collect();
     let mut seen_turns: HashSet<Uuid> = HashSet::with_capacity(session.turns.len());
     for row in row_kinds {
@@ -861,10 +919,10 @@ pub(super) fn rebuild_assistant_turn_providers(
         let Some(turn_id) = message.turn_id else {
             continue;
         };
-        if let Some(&provider) = providers_by_turn.get(&turn_id)
+        if let Some(badge) = badges_by_turn.get(&turn_id)
             && seen_turns.insert(turn_id)
         {
-            cache.insert(message_index, provider);
+            cache.insert(message_index, badge.clone());
         }
     }
 }
@@ -1039,6 +1097,7 @@ pub(super) fn transcript_rows_fingerprint(
     // turn statuses below would hold still while the rows moved.
     hash = mix(hash, session.status.is_busy() as u64);
     hash = mix(hash, session.provider as u64);
+    hash = mix_account_id(hash, session.account_id.as_deref());
 
     hash = mix(hash, session.messages.len() as u64);
     for message in &session.messages {
@@ -1064,6 +1123,7 @@ pub(super) fn transcript_rows_fingerprint(
         hash = mix_uuid(hash, turn.id);
         hash = mix(hash, turn.status as u64);
         hash = mix(hash, session.turn_provider(turn) as u64);
+        hash = mix_account_id(hash, session.turn_account_id(turn));
         hash = mix(
             hash,
             turn.checkpoint.as_ref().is_some_and(|checkpoint| {
@@ -1099,6 +1159,21 @@ fn mix_turn_id(hash: u64, turn_id: Option<Uuid>) -> u64 {
     match turn_id {
         Some(turn_id) => mix_uuid(hash, turn_id),
         None => mix(hash, u64::MAX),
+    }
+}
+
+fn mix_str(mut hash: u64, value: &str) -> u64 {
+    hash = mix(hash, value.len() as u64);
+    for byte in value.bytes() {
+        hash = mix(hash, u64::from(byte));
+    }
+    hash
+}
+
+fn mix_account_id(hash: u64, account_id: Option<&str>) -> u64 {
+    match account_id {
+        Some(id) => mix_str(mix(hash, 1), id),
+        None => mix(hash, 0),
     }
 }
 
@@ -1544,7 +1619,7 @@ mod mixed_provider_tests {
         let expanded = HashSet::new();
         let mut cache = HashMap::new();
         let single_rows = folded_transcript_row_kinds(&session, &expanded);
-        rebuild_assistant_turn_providers(&session, &single_rows, &mut cache);
+        rebuild_assistant_turn_providers(&session, &single_rows, &[], &mut cache);
         assert!(
             cache.is_empty(),
             "single-agent sessions do not label assistant rows"
@@ -1569,13 +1644,22 @@ mod mixed_provider_tests {
         });
         session.push_message(MessageRole::Assistant, "Here is the final answer.");
 
+        let codex_badge = TurnAgentBadge {
+            provider: ProviderKind::Codex,
+            label: "Codex".into(),
+        };
+        let claude_badge = TurnAgentBadge {
+            provider: ProviderKind::Claude,
+            label: "Claude".into(),
+        };
+
         // While running, the first non-blank segment (index 4) carries the
         // badge and the post-tool segment (index 5) does not repeat it.
         let live_rows = folded_transcript_row_kinds(&session, &expanded);
-        rebuild_assistant_turn_providers(&session, &live_rows, &mut cache);
-        assert_eq!(cache.get(&1), Some(&ProviderKind::Codex));
+        rebuild_assistant_turn_providers(&session, &live_rows, &[], &mut cache);
+        assert_eq!(cache.get(&1), Some(&codex_badge));
         assert_eq!(cache.get(&3), None);
-        assert_eq!(cache.get(&4), Some(&ProviderKind::Claude));
+        assert_eq!(cache.get(&4), Some(&claude_badge));
         assert_eq!(cache.get(&5), None);
 
         // Once settled and collapsed, index 4 hides inside `TurnFold`, so the
@@ -1588,16 +1672,16 @@ mod mixed_provider_tests {
         session.status = SessionStatus::Idle;
         let collapsed_rows = folded_transcript_row_kinds(&session, &expanded);
         let mut collapsed_cache = HashMap::new();
-        rebuild_assistant_turn_providers(&session, &collapsed_rows, &mut collapsed_cache);
+        rebuild_assistant_turn_providers(&session, &collapsed_rows, &[], &mut collapsed_cache);
         assert_eq!(collapsed_cache.get(&4), None);
-        assert_eq!(collapsed_cache.get(&5), Some(&ProviderKind::Claude));
+        assert_eq!(collapsed_cache.get(&5), Some(&claude_badge));
 
         let mut reopened = HashSet::new();
         reopened.insert(turn2_id);
         let expanded_rows = folded_transcript_row_kinds(&session, &reopened);
         let mut expanded_cache = HashMap::new();
-        rebuild_assistant_turn_providers(&session, &expanded_rows, &mut expanded_cache);
-        assert_eq!(expanded_cache.get(&4), Some(&ProviderKind::Claude));
+        rebuild_assistant_turn_providers(&session, &expanded_rows, &[], &mut expanded_cache);
+        assert_eq!(expanded_cache.get(&4), Some(&claude_badge));
         assert_eq!(expanded_cache.get(&5), None);
 
         let (splice_range, _) = transcript_row_splice_with_providers(
@@ -1683,5 +1767,62 @@ mod mixed_provider_tests {
             resume_at: None,
         });
         assert_eq!(assistant_fork_turn_count(&session, 3), Some(2));
+    }
+
+    #[test]
+    fn same_provider_account_switch_labels_default_and_named_accounts() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        session.begin_turn("first prompt");
+        session.push_message(MessageRole::Assistant, "default account answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+
+        let expanded = HashSet::new();
+        let fp_before = transcript_rows_fingerprint(&session, &expanded);
+        let state_before = Some((session.id, session.has_mixed_providers()));
+
+        session.switch_agent(ProviderKind::Claude, Some("work".into()));
+        let fp_after_switch = transcript_rows_fingerprint(&session, &expanded);
+        assert_ne!(fp_before, fp_after_switch);
+
+        session.begin_turn("second prompt");
+        session.push_message(MessageRole::Assistant, "work account answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.status = SessionStatus::Idle;
+
+        let state_after = Some((session.id, session.has_mixed_providers()));
+        assert!(mixed_providers_transitioned(state_before, state_after));
+
+        let accounts = [waku_protocol::ProviderAccount {
+            id: "work".into(),
+            provider: ProviderKind::Claude,
+            label: "Work".into(),
+            config_dir: "/tmp/claude-work".into(),
+            binary_override: None,
+        }];
+        let rows = folded_transcript_row_kinds(&session, &expanded);
+        let mut cache = HashMap::new();
+        rebuild_assistant_turn_providers(&session, &rows, &accounts, &mut cache);
+
+        assert_eq!(
+            cache.get(&1),
+            Some(&TurnAgentBadge {
+                provider: ProviderKind::Claude,
+                label: "Claude · Default".into(),
+            })
+        );
+        assert_eq!(
+            cache.get(&3),
+            Some(&TurnAgentBadge {
+                provider: ProviderKind::Claude,
+                label: "Claude · Work".into(),
+            })
+        );
     }
 }

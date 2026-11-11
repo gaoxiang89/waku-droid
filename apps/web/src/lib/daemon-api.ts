@@ -135,9 +135,15 @@ export async function listProviderSessions(
   client: WakuClient,
   provider: ProviderKind,
   limit = 250,
+  accountId: string | null = null,
 ): Promise<ProviderSessionSummary[]> {
   const response = expectResponse(
-    await client.request({ type: 'listProviderSessions', provider, limit }),
+    await client.request({
+      type: 'listProviderSessions',
+      provider,
+      ...(accountId ? { accountId } : {}),
+      limit,
+    }),
     'providerSessions',
   )
   return response.sessions
@@ -146,11 +152,13 @@ export async function listProviderSessions(
 export async function loadProviderSessionHistory(
   client: WakuClient,
   summary: ProviderSessionSummary,
+  accountId: string | null = null,
 ): Promise<ProviderSessionHistory> {
   const response = expectResponse(
     await client.request({
       type: 'loadProviderSession',
       cursor: summary.cursor,
+      ...(accountId ? { accountId } : {}),
       cwd: summary.cwd,
     }),
     'providerSessionHistory',
@@ -165,7 +173,19 @@ export async function loadDaemonSettings(
   return {
     ...response.settings,
     provider_binary_overrides: response.settings.provider_binary_overrides ?? {},
+    provider_accounts: response.settings.provider_accounts ?? [],
   }
+}
+
+export function resolveProviderAccount(
+  settings: DaemonSettings,
+  provider: ProviderKind,
+  accountId: string | null | undefined,
+) {
+  if (!accountId) return null
+  return settings.provider_accounts?.find(
+    (account) => account.provider === provider && account.id === accountId,
+  ) ?? null
 }
 
 export async function updateDaemonSettings(
@@ -179,14 +199,25 @@ export async function probeProvider(
   client: WakuClient,
   provider: ProviderKind,
   settings: DaemonSettings,
-  options: { discoverModels?: boolean; probeVersion?: boolean } = {},
+  options: {
+    discoverModels?: boolean
+    probeVersion?: boolean
+    accountId?: string | null
+    configDir?: string | null
+  } = {},
 ): Promise<ProviderProbe & { version: string | null }> {
   const { discoverModels = true, probeVersion = true } = options
+  const account = resolveProviderAccount(settings, provider, options.accountId)
+  const binaryOverride = account?.binaryOverride?.trim()
+    || settings.provider_binary_overrides?.[provider]
+    || null
+  const configDir = options.configDir ?? account?.configDir ?? null
   const response = expectResponse(
     await client.request({
       type: 'probeProvider',
       provider,
-      binaryOverride: settings.provider_binary_overrides?.[provider] ?? null,
+      binaryOverride,
+      ...(configDir ? { configDir } : {}),
       discoverModels,
       probeVersion,
     }),
@@ -242,12 +273,19 @@ export async function fetchPlanUsage(
   provider: ProviderKind,
   settings: DaemonSettings,
   version: string | null,
+  accountId: string | null = null,
 ): Promise<PlanUsage | null> {
+  const account = resolveProviderAccount(settings, provider, accountId)
+  const binaryOverride = account?.binaryOverride?.trim()
+    || settings.provider_binary_overrides?.[provider]
+    || null
+  const configDir = account?.configDir ?? null
   const response = expectResponse(
     await client.request({
       type: 'fetchPlanUsage',
       provider,
-      binaryOverride: settings.provider_binary_overrides?.[provider] ?? null,
+      binaryOverride,
+      ...(configDir ? { configDir } : {}),
       cliVersion: version,
     }),
     'planUsage',
@@ -746,6 +784,7 @@ export function beginTurn(
         completed_at: null,
         checkpoint: null,
         provider: session.provider,
+        ...(session.account_id ? { account_id: session.account_id } : {}),
         // Without a cursor for this agent the provider opens a new native
         // conversation, which native rollback and fork counts start from.
         ...(session.provider_cursor?.provider !== session.provider

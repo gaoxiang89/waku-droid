@@ -143,6 +143,7 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 completed_at: Some(at),
                 checkpoint: None,
                 provider: Some(ProviderKind::Amp),
+                account_id: None,
                 handoff: None,
                 native_conversation_start: false,
                 handoff_preamble: None,

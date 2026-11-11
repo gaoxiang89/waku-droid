@@ -121,23 +121,31 @@ impl Waku {
             self.mention_file_index_loading = false;
             return;
         };
-        let provider = self
-            .selected_session()
-            .map(|session| session.provider)
-            .unwrap_or(self.state.last_provider);
-        let reported = self
-            .selected_session()
-            .map(|session| session.available_commands.clone())
-            .unwrap_or_default();
-        let binary_override = self
-            .provider_override_for_host(&scope.host, provider)
-            .cloned();
+        let (provider, raw_account_id, reported) = match self.selected_session() {
+            Some(session) => (
+                session.provider,
+                session.account_id.clone(),
+                session.available_commands.clone(),
+            ),
+            None => (
+                self.state.last_provider,
+                self.state.last_account_id.clone(),
+                Vec::new(),
+            ),
+        };
+        let account_id =
+            self.validated_account_id_for_host(&scope.host, provider, raw_account_id.as_deref());
+        let binary_override =
+            self.effective_binary_override_for_host(&scope.host, provider, account_id.as_deref());
+        let config_dir =
+            self.effective_config_dir_for_host(&scope.host, provider, account_id.as_deref());
 
         let command_key = (
             scope.host.clone(),
             provider,
             scope.workspace.clone(),
             binary_override.clone(),
+            account_id,
         );
         match self.slash_commands.read(&command_key) {
             Query::Ready(commands) => {
@@ -174,6 +182,7 @@ impl Waku {
                                     provider,
                                     project_root: path,
                                     binary_override,
+                                    config_dir,
                                 },
                             ) {
                                 Ok(waku_client::WorkspaceResult::SlashCommands { commands }) => {
@@ -250,17 +259,25 @@ impl Waku {
     /// Invalidate and re-request both indexes for the selected workspace.
     pub(super) fn invalidate_composer_sources(&mut self, cx: &mut Context<Self>) {
         if let Some(scope) = self.selected_panel_scope() {
-            let provider = self
+            let (provider, raw_account_id) = self
                 .selected_session()
-                .map(|session| session.provider)
-                .unwrap_or(self.state.last_provider);
-            let binary_override = self
-                .provider_override_for_host(&scope.host, provider)
-                .cloned();
+                .map(|session| (session.provider, session.account_id.as_deref()))
+                .unwrap_or((
+                    self.state.last_provider,
+                    self.state.last_account_id.as_deref(),
+                ));
+            let account_id =
+                self.validated_account_id_for_host(&scope.host, provider, raw_account_id);
+            let binary_override = self.effective_binary_override_for_host(
+                &scope.host,
+                provider,
+                account_id.as_deref(),
+            );
             self.slash_commands.invalidate(&(
                 scope.host.clone(),
                 provider,
                 scope.workspace.clone(),
+                account_id,
                 binary_override,
             ));
             self.mention_files.invalidate(&scope);

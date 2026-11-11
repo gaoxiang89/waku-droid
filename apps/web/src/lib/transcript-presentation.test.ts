@@ -303,6 +303,19 @@ describe('desktop transcript language', () => {
     const firstMessage = { ...session.messages[0]!, turn_id: 't1' }
     expect(providerTurnsAfter(session, 0)).toBe(0)
     expect(userMessageRewindTurnCount(session, firstMessage, new Set([0]))).toBe(1)
+
+    // Switching between two named profiles of the same provider also isolates
+    // native conversation turns by account_id.
+    session.provider = 'claude'
+    session.account_id = 'claude-work'
+    session.turns = [
+      { ...started('t1', 1, 'claude', true), account_id: null },
+      { ...started('t2', 2, 'claude', true), account_id: 'claude-work' },
+      { ...started('t3', 3, 'claude'), account_id: 'claude-work' },
+    ]
+    expect(providerTurnsThrough(session, 3)).toBe(2)
+    expect(providerTurnsThrough(session, 1)).toBe(0)
+    expect(providerTurnsAfter(session, 1)).toBe(2)
   })
 })
 

@@ -111,13 +111,22 @@ impl Waku {
         if self.commit_operation.is_some() {
             return;
         }
-        let Some((workspace, provider, model, reasoning_effort)) =
+        let Some((workspace, provider, model, reasoning_effort, config_dir, account_binary)) =
             self.selected_session().and_then(|session| {
+                let host = self.hosts.ownership.session(session.id);
+                let account_binary = self
+                    .account_for_host(&host, session.provider, session.account_id.as_deref())
+                    .and_then(|account| account.binary_override.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from);
                 Some((
                     self.workspace_path_for_session(session)?.to_path_buf(),
                     session.provider,
                     self.model_for_session(session).map(str::to_owned),
                     session.reasoning_effort.clone(),
+                    self.effective_config_dir_for_session(session),
+                    account_binary,
                 ))
             })
         else {
@@ -126,14 +135,17 @@ impl Waku {
             return;
         };
 
-        let invocation = self
-            .provider_probe(provider)
-            .and_then(|probe| probe.path.clone())
+        let invocation = account_binary
+            .or_else(|| {
+                self.provider_probe(provider)
+                    .and_then(|probe| probe.path.clone())
+            })
             .map(|binary| crate::git_commit::AgentInvocation {
                 provider,
                 binary,
                 model,
                 reasoning_effort,
+                config_dir,
             });
         let scope = PanelScope {
             host: self.selected_host_key(),

@@ -95,6 +95,7 @@ impl AmpDriver {
             agent_preset: _,
             computer_use_enabled: _,
             provider_cursor,
+            config_dir: _,
         } = options;
         if mode != RuntimeMode::FullAccess {
             return Err(anyhow!("Amp currently supports Full access only"));
@@ -572,6 +573,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -630,6 +632,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )

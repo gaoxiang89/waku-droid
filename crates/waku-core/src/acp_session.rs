@@ -367,6 +367,7 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
                     completed_at: Some(0),
                     checkpoint: None,
                     provider: Some(provider),
+                    account_id: None,
                     handoff: None,
                     native_conversation_start: false,
                     handoff_preamble: None,

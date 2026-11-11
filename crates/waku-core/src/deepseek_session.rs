@@ -133,6 +133,7 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         completed_at: None,
         checkpoint: None,
         provider: Some(ProviderKind::DeepSeek),
+        account_id: None,
         handoff: None,
         native_conversation_start: false,
         handoff_preamble: None,

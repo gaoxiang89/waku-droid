@@ -178,6 +178,12 @@ impl ProviderKind {
                 | Self::Pi
         )
     }
+
+    /// Whether Waku can run isolated account profiles for this CLI through a
+    /// dedicated configuration-directory environment variable.
+    pub fn supports_multiple_accounts(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -845,6 +851,13 @@ impl Checkpoint {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ParkedAccountCursor {
+    pub account_id: String,
+    pub cursor: ProviderResumeCursor,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentTurn {
     pub id: Uuid,
@@ -864,6 +877,10 @@ pub struct AgentTurn {
     /// exactly the agent that produced them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderKind>,
+    /// Named profile within `provider` that ran this turn, when not using the
+    /// provider's default account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     /// What this turn carried over from the agents that ran the turns before
     /// it. Present only on the first turn after a switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1056,6 +1073,8 @@ pub struct AgentSession {
     pub workspace: SessionWorkspace,
     pub provider: ProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub runtime_mode: RuntimeMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1086,6 +1105,10 @@ pub struct AgentSession {
     /// resumes its native conversation instead of starting from nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_cursors: Vec<ProviderResumeCursor>,
+    /// Resume cursors for named provider profiles (`account_id != None`) this
+    /// task used before switching away.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_cursors: Vec<ParkedAccountCursor>,
     /// Slash commands the provider reported for this session's live process,
     /// kept so a resumed session still completes them before its next
     /// handshake.
@@ -1145,6 +1168,7 @@ impl AgentSession {
             project_id,
             workspace: SessionWorkspace::Local,
             provider,
+            account_id: None,
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
             reasoning_effort: None,
@@ -1158,6 +1182,7 @@ impl AgentSession {
             detail_loaded: true,
             provider_cursor: None,
             provider_cursors: Vec::new(),
+            account_cursors: Vec::new(),
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1185,6 +1210,7 @@ impl AgentSession {
             project_id: self.project_id,
             workspace: SessionWorkspace::Local,
             provider: self.provider,
+            account_id: self.account_id.clone(),
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
             reasoning_effort: None,
@@ -1197,6 +1223,7 @@ impl AgentSession {
             last_reply_at: self.last_reply_at,
             provider_cursor: None,
             provider_cursors: Vec::new(),
+            account_cursors: Vec::new(),
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1354,19 +1381,38 @@ impl AgentSession {
         turn.provider.unwrap_or(self.provider)
     }
 
-    /// Whether this task's history was written by more than one agent, which is
-    /// what makes a per-response agent label necessary rather than noise.
+    /// Named profile within [`Self::turn_provider`] that ran `turn`, or `None`
+    /// for the provider's default account.
+    pub fn turn_account_id<'a>(&'a self, turn: &'a AgentTurn) -> Option<&'a str> {
+        if turn.provider.is_some() {
+            turn.account_id.as_deref()
+        } else {
+            self.account_id.as_deref()
+        }
+    }
+
+    pub fn turn_agent<'a>(&'a self, turn: &'a AgentTurn) -> (ProviderKind, Option<&'a str>) {
+        (self.turn_provider(turn), self.turn_account_id(turn))
+    }
+
+    pub fn active_agent(&self) -> (ProviderKind, Option<&str>) {
+        (self.provider, self.account_id.as_deref())
+    }
+
+    /// Whether this task's history was written by more than one agent or
+    /// account profile, which is what makes a per-response agent label
+    /// necessary rather than noise.
     pub fn has_mixed_providers(&self) -> bool {
         let mut seen = None;
         self.turns
             .iter()
-            .map(|turn| self.turn_provider(turn))
-            .any(|provider| match seen {
+            .map(|turn| self.turn_agent(turn))
+            .any(|agent| match seen {
                 None => {
-                    seen = Some(provider);
+                    seen = Some(agent);
                     false
                 }
-                Some(first) => first != provider,
+                Some(first) => first != agent,
             })
     }
 
@@ -1377,36 +1423,73 @@ impl AgentSession {
             return;
         };
         let provider = cursor.provider();
-        self.provider_cursors
-            .retain(|parked| parked.provider() != provider);
-        self.provider_cursors.push(cursor);
+        if let Some(account_id) = self.account_id.as_deref().filter(|id| !id.is_empty()) {
+            self.account_cursors.retain(|parked| {
+                !(parked.cursor.provider() == provider && parked.account_id == account_id)
+            });
+            self.account_cursors.push(ParkedAccountCursor {
+                account_id: account_id.to_owned(),
+                cursor,
+            });
+        } else {
+            self.provider_cursors
+                .retain(|parked| parked.provider() != provider);
+            self.provider_cursors.push(cursor);
+        }
     }
 
     pub fn all_provider_cursors(&self) -> impl Iterator<Item = &ProviderResumeCursor> {
-        self.provider_cursor.iter().chain(&self.provider_cursors)
+        self.provider_cursor
+            .iter()
+            .chain(&self.provider_cursors)
+            .chain(self.account_cursors.iter().map(|entry| &entry.cursor))
     }
 
-    /// Makes `provider` active: parks the outgoing agent's cursor and adopts
-    /// the incoming agent's parked one, if it has any. Returns whether a native
-    /// conversation was resumed, which decides whether the next turn needs a
-    /// full handoff or only the delta the incoming agent has not seen.
+    /// Makes `provider`'s default account active.
     pub fn switch_provider(&mut self, provider: ProviderKind) -> bool {
-        let outgoing = self.provider;
-        if outgoing != provider {
+        self.switch_agent(provider, None)
+    }
+
+    /// Makes `(provider, account_id)` active: parks the outgoing agent's cursor
+    /// and adopts the incoming agent's parked one, if it has any. Returns
+    /// whether a native conversation was resumed, which decides whether the
+    /// next turn needs a full handoff or only the delta the incoming agent has
+    /// not seen.
+    pub fn switch_agent(&mut self, provider: ProviderKind, account_id: Option<String>) -> bool {
+        let account_id = account_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty() && provider.supports_multiple_accounts());
+        let outgoing_provider = self.provider;
+        let outgoing_account = self.account_id.clone();
+        let agent_changed =
+            outgoing_provider != provider || outgoing_account.as_deref() != account_id.as_deref();
+        if agent_changed {
             for turn in &mut self.turns {
-                turn.provider.get_or_insert(outgoing);
+                if turn.provider.is_none() {
+                    turn.provider = Some(outgoing_provider);
+                    turn.account_id.clone_from(&outgoing_account);
+                }
             }
         }
         self.park_provider_cursor();
         self.provider = provider;
-        let parked = self
-            .provider_cursors
-            .iter()
-            .position(|cursor| cursor.provider() == provider)
-            .map(|index| self.provider_cursors.remove(index));
+        self.account_id = account_id.clone();
+        let parked = if let Some(account_id) = account_id.as_deref() {
+            self.account_cursors
+                .iter()
+                .position(|entry| {
+                    entry.cursor.provider() == provider && entry.account_id == account_id
+                })
+                .map(|index| self.account_cursors.remove(index).cursor)
+        } else {
+            self.provider_cursors
+                .iter()
+                .position(|cursor| cursor.provider() == provider)
+                .map(|index| self.provider_cursors.remove(index))
+        };
         let resumed = parked.is_some();
         self.provider_cursor = parked;
-        if outgoing != provider {
+        if agent_changed {
             // Provider-owned state describes the agent that just left. The
             // incoming agent reports its own when it connects.
             self.thread_goal = None;
@@ -1423,8 +1506,14 @@ impl AgentSession {
     pub fn set_live_provider_cursor(&mut self, cursor: Option<ProviderResumeCursor>) {
         if let Some(cursor) = cursor.as_ref() {
             let provider = cursor.provider();
-            self.provider_cursors
-                .retain(|parked| parked.provider() != provider);
+            if let Some(account_id) = self.account_id.as_deref().filter(|id| !id.is_empty()) {
+                self.account_cursors.retain(|parked| {
+                    !(parked.cursor.provider() == provider && parked.account_id == account_id)
+                });
+            } else {
+                self.provider_cursors
+                    .retain(|parked| parked.provider() != provider);
+            }
         }
         self.provider_cursor = cursor;
     }
@@ -1540,6 +1629,7 @@ impl AgentSession {
                 completed_at: Some(completed_at),
                 checkpoint: None,
                 provider: None,
+                account_id: None,
                 handoff: None,
                 native_conversation_start: false,
                 handoff_preamble: None,
@@ -1593,6 +1683,7 @@ impl AgentSession {
             completed_at: None,
             checkpoint: None,
             provider: Some(self.provider),
+            account_id: self.account_id.clone(),
             handoff,
             native_conversation_start,
             handoff_preamble: preamble,
@@ -1624,6 +1715,7 @@ impl AgentSession {
             completed_at: None,
             checkpoint: None,
             provider: Some(self.provider),
+            account_id: self.account_id.clone(),
             handoff: None,
             native_conversation_start: false,
             handoff_preamble: None,
@@ -1685,6 +1777,7 @@ impl AgentSession {
             completed_at: None,
             checkpoint: None,
             provider: Some(self.provider),
+            account_id: self.account_id.clone(),
             handoff: handoff.map(|handoff| handoff.record.clone()),
             native_conversation_start,
             handoff_preamble: None,
@@ -1777,16 +1870,15 @@ impl AgentSession {
     /// Turns before it, including the agent's own from a conversation it could
     /// no longer resume, are not in that conversation.
     fn native_conversation_floor(&self) -> usize {
+        let active = self.active_agent();
         self.turns
             .iter()
-            .rposition(|turn| {
-                turn.native_conversation_start && self.turn_provider(turn) == self.provider
-            })
+            .rposition(|turn| turn.native_conversation_start && self.turn_agent(turn) == active)
             .unwrap_or(0)
     }
 
     fn is_native_conversation_turn(&self, turn: &AgentTurn) -> bool {
-        turn.provider_turn_started && self.turn_provider(turn) == self.provider
+        turn.provider_turn_started && self.turn_agent(turn) == self.active_agent()
     }
 
     /// Turns among the first `turn_count` that the current agent's native
@@ -1893,6 +1985,7 @@ impl AgentSession {
         // just left this task, so resuming it would contradict the rollback.
         // The active agent's own cursor is the caller's to rewound or replace.
         self.provider_cursors.clear();
+        self.account_cursors.clear();
         self.updated_at = unix_time();
     }
 
@@ -1943,6 +2036,7 @@ impl AgentSession {
         // agents that ran turns in the source task would point at transcripts
         // that still include turns this fork dropped.
         fork.provider_cursors.clear();
+        fork.account_cursors.clear();
         fork.provider_session_id = None;
         // A fork snapshots the conversation, not the pending follow-ups its
         // source session is still holding for the live agent.
@@ -5489,6 +5583,7 @@ mod tests {
             completed_at: Some(20),
             checkpoint: None,
             provider: None,
+            account_id: None,
             handoff: None,
             native_conversation_start: false,
             handoff_preamble: None,
@@ -5584,7 +5679,95 @@ mod tests {
         assert_eq!(fork.provider, ProviderKind::Claude);
         assert!(fork.provider_cursor.is_none());
         assert!(fork.provider_cursors.is_empty());
+        assert!(fork.account_cursors.is_empty());
         assert_eq!(fork.turns.len(), 1);
         assert_eq!(fork.turn_provider(&fork.turns[0]), ProviderKind::Codex);
+    }
+
+    #[test]
+    fn switching_accounts_within_same_provider_parks_and_resumes_independently() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Claude);
+
+        // Turn 1 on Default Claude account (account_id = None)
+        session.begin_turn("personal prompt");
+        session.mark_active_turn_provider_started();
+        session.mark_active_turn_provider_resume_at("personal-msg-1".into());
+        session.set_live_provider_cursor(Some(ProviderResumeCursor::Claude {
+            session_id: "claude-personal".into(),
+            resume_at: Some("personal-msg-1".into()),
+        }));
+        session.finish_active_turn(TurnStatus::Completed);
+        assert!(!session.has_mixed_providers());
+
+        // Switch to Work Claude account
+        assert!(!session.switch_agent(ProviderKind::Claude, Some("work".into())));
+        assert_eq!(session.account_id.as_deref(), Some("work"));
+        assert!(session.provider_cursor.is_none());
+        assert_eq!(session.provider_cursors.len(), 1);
+        assert!(session.account_cursors.is_empty());
+        assert_eq!(session.provider_turns_through(1), 0);
+
+        // Turn 2 on Work Claude account
+        session.begin_turn("work prompt");
+        session.mark_active_turn_provider_started();
+        session.mark_active_turn_provider_resume_at("work-msg-1".into());
+        session.set_live_provider_cursor(Some(ProviderResumeCursor::Claude {
+            session_id: "claude-work".into(),
+            resume_at: Some("work-msg-1".into()),
+        }));
+        session.finish_active_turn(TurnStatus::Completed);
+
+        assert!(session.has_mixed_providers());
+        assert_eq!(
+            session.turn_agent(&session.turns[0]),
+            (ProviderKind::Claude, None)
+        );
+        assert_eq!(
+            session.turn_agent(&session.turns[1]),
+            (ProviderKind::Claude, Some("work"))
+        );
+        assert_eq!(session.provider_turns_through(2), 1);
+        assert_eq!(
+            session.provider_resume_at_through(2).as_deref(),
+            Some("work-msg-1")
+        );
+
+        // Switch back to Default Claude account: resumes personal cursor, parks work cursor
+        assert!(session.switch_agent(ProviderKind::Claude, None));
+        assert_eq!(session.account_id, None);
+        assert_eq!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Claude {
+                session_id: "claude-personal".into(),
+                resume_at: Some("personal-msg-1".into()),
+            })
+        );
+        assert!(session.provider_cursors.is_empty());
+        assert_eq!(session.account_cursors.len(), 1);
+        assert_eq!(session.account_cursors[0].account_id, "work");
+        assert_eq!(session.provider_turns_through(2), 1);
+        assert_eq!(
+            session.provider_resume_at_through(2).as_deref(),
+            Some("personal-msg-1")
+        );
+
+        // Switch back to Work Claude account: resumes work cursor
+        assert!(session.switch_agent(ProviderKind::Claude, Some("work".into())));
+        assert_eq!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Claude {
+                session_id: "claude-work".into(),
+                resume_at: Some("work-msg-1".into()),
+            })
+        );
+        assert!(session.account_cursors.is_empty());
+        assert_eq!(session.provider_cursors.len(), 1);
+        assert_eq!(session.all_provider_cursors().count(), 2);
+
+        // Truncating clears parked default and account cursors
+        session.truncate_after_turn(1);
+        assert!(session.provider_cursors.is_empty());
+        assert!(session.account_cursors.is_empty());
     }
 }

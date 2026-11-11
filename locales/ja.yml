@@ -232,6 +232,26 @@ providers.binary_path_description: Waku が %{provider} の起動に使用する
 providers.checked_just_now: たった今確認済み
 providers.checked_minutes_ago: "%{count} 分前に確認済み"
 providers.checked_hours_ago: "%{count} 時間前に確認済み"
+providers.accounts: アカウント
+providers.accounts_description: "%{provider} ごとに別の設定ディレクトリを追加し、個人用・仕事用・チーム用のログインを切り替えられます"
+providers.default_account: デフォルト
+providers.default_account_hint: "%{path} を使用"
+providers.add_account: アカウントを追加
+providers.edit_account: アカウントを編集
+providers.account_name: 名前
+providers.account_name_placeholder: 例：仕事用
+providers.account_config_dir: 設定ディレクトリ
+providers.account_config_dir_placeholder: "例：%{path}"
+providers.account_browse_dir: 参照…
+providers.account_save: 保存
+providers.account_cancel: キャンセル
+providers.account_remove: アカウントを削除
+providers.account_copy_login: ログインコマンドをコピー
+providers.account_login_copied: ログインコマンドをクリップボードにコピーしました
+providers.account_error_empty_name: アカウント名を入力してください
+providers.account_error_empty_dir: 個別の設定ディレクトリを入力してください
+providers.account_error_default_dir: デフォルトの %{path} とは別のディレクトリを指定してください
+providers.account_error_duplicate_dir: 別の %{provider} アカウントがすでにこのディレクトリを使用しています
 
 computer_use.allow_apps: Waku にアプリの操作を許可
 computer_use.availability: コンピュータ操作は Codex、OpenCode、Grok、Pi で利用できます

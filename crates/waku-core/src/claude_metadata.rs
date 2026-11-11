@@ -23,6 +23,7 @@ const REQUEST_ID: &str = "waku-initialize-catalog";
 pub(crate) fn initialize(
     binary: &Path,
     cwd: Option<&Path>,
+    config_dir: Option<&Path>,
     setting_sources: &str,
 ) -> Option<Value> {
     let request = json!({
@@ -34,6 +35,11 @@ pub(crate) fn initialize(
     input.push(b'\n');
 
     let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(
+        &mut command,
+        crate::model::ProviderKind::Claude,
+        config_dir,
+    );
     command
         .args([
             "--output-format",

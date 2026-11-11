@@ -30,20 +30,37 @@ pub struct ClaudeSessionMetadata {
     pub title: Option<String>,
 }
 
-pub fn session_metadata(session_id: &str) -> anyhow::Result<ClaudeSessionMetadata> {
-    session_metadata_in(&projects_directory()?, session_id)
+pub fn session_metadata(
+    session_id: &str,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<ClaudeSessionMetadata> {
+    session_metadata_in(&projects_directory_for(config_dir)?, session_id)
 }
 
-pub fn message_id_for_turn(session_id: &str, provider_turn_count: usize) -> anyhow::Result<String> {
-    message_id_for_turn_in(&projects_directory()?, session_id, provider_turn_count)
+pub fn message_id_for_turn(
+    session_id: &str,
+    provider_turn_count: usize,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<String> {
+    message_id_for_turn_in(
+        &projects_directory_for(config_dir)?,
+        session_id,
+        provider_turn_count,
+    )
 }
 
 pub fn fork_session_at(
     session_id: &str,
     up_to_message_id: &str,
     title: &str,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<ForkedClaudeSession> {
-    fork_session_at_in(&projects_directory()?, session_id, up_to_message_id, title)
+    fork_session_at_in(
+        &projects_directory_for(config_dir)?,
+        session_id,
+        up_to_message_id,
+        title,
+    )
 }
 
 /// List Claude Code conversations that can be resumed by session ID.
@@ -51,8 +68,11 @@ pub fn fork_session_at(
 /// Claude keeps one JSONL file per top-level conversation directly beneath a
 /// project directory. Sub-agent transcripts live deeper and are deliberately
 /// excluded, matching the interactive `/resume` picker.
-pub fn list_provider_sessions(limit: usize) -> anyhow::Result<Vec<ProviderSessionSummary>> {
-    list_provider_sessions_in(&projects_directory()?, limit)
+pub fn list_provider_sessions(
+    limit: usize,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<Vec<ProviderSessionSummary>> {
+    list_provider_sessions_in(&projects_directory_for(config_dir)?, limit)
 }
 
 /// Import the visible text of one Claude Code conversation. The native JSONL
@@ -61,14 +81,19 @@ pub fn list_provider_sessions(limit: usize) -> anyhow::Result<Vec<ProviderSessio
 pub fn provider_session_history(
     session_id: &str,
     turn_limit: usize,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<ProviderSessionHistory> {
-    provider_session_history_in(&projects_directory()?, session_id, turn_limit)
+    provider_session_history_in(&projects_directory_for(config_dir)?, session_id, turn_limit)
 }
 
-fn projects_directory() -> anyhow::Result<PathBuf> {
-    let config_directory = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+fn projects_directory_for(config_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let config_directory = config_dir
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
         .ok_or_else(|| anyhow!("Claude's configuration directory could not be located"))?;
     Ok(config_directory.join("projects"))
@@ -542,6 +567,7 @@ fn provider_session_history_in(
                 completed_at: Some(timestamp),
                 checkpoint: None,
                 provider: Some(ProviderKind::Claude),
+                account_id: None,
                 handoff: None,
                 native_conversation_start: false,
                 handoff_preamble: None,
@@ -1109,5 +1135,36 @@ mod tests {
                 .contains(&fork.session_id)
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn custom_config_dir_isolates_listing_history_and_forking() {
+        let (root, _) = fixture();
+        let empty_root =
+            std::env::temp_dir().join(format!("waku-claude-session-empty-{}", Uuid::new_v4()));
+        fs::create_dir_all(&empty_root).unwrap();
+
+        let listed = list_provider_sessions(10, Some(&root)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cursor.native_id(), SESSION);
+        assert!(
+            list_provider_sessions(10, Some(&empty_root))
+                .unwrap()
+                .is_empty()
+        );
+
+        let history = provider_session_history(SESSION, 2, Some(&root)).unwrap();
+        assert_eq!(history.turns.len(), 2);
+
+        let fork = fork_session_at(SESSION, ASSISTANT_TWO, "Work fork", Some(&root)).unwrap();
+        assert!(
+            root.join("projects")
+                .join("-tmp-project")
+                .join(format!("{}.jsonl", fork.session_id))
+                .is_file()
+        );
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(empty_root).ok();
     }
 }

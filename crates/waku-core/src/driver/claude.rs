@@ -19,7 +19,6 @@ use std::fs::File;
 #[cfg(unix)]
 use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -126,14 +125,19 @@ fn wire_model(model: Option<&str>, context_window: Option<&str>) -> Option<Strin
 fn start_claude_title_refresh(
     title_refresh: &super::title_refresh::NativeTitleRefresh,
     session_id: &str,
+    config_dir: Option<&Path>,
     events: &DriverEventSender,
 ) {
     let session_id = session_id.to_owned();
+    let config_dir = config_dir.map(Path::to_path_buf);
     title_refresh.start(
         "waku-claude-title",
         vec![Duration::from_secs(5), Duration::from_secs(10)],
         events.clone(),
-        move || crate::claude_session::session_metadata(&session_id).map(|native| native.title),
+        move || {
+            crate::claude_session::session_metadata(&session_id, config_dir.as_deref())
+                .map(|native| native.title)
+        },
     );
 }
 
@@ -171,6 +175,7 @@ impl ClaudeDriver {
         let DriverStartOptions {
             binary,
             cwd,
+            config_dir,
             mode,
             model,
             reasoning_effort,
@@ -200,6 +205,11 @@ impl ClaudeDriver {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let mut command = crate::command_env::command(&binary);
+        crate::command_env::apply_provider_config_dir(
+            &mut command,
+            crate::model::ProviderKind::Claude,
+            config_dir.as_deref(),
+        );
         command.current_dir(&cwd);
         configure_stream_command(&mut command, mode);
         let launch_model = wire_model(model.as_deref(), context_window.as_deref());
@@ -253,12 +263,14 @@ impl ClaudeDriver {
         let reader_commands = commands.clone();
         let reader_turn = turn_active.clone();
         let reader_session = session_id.clone();
+        let reader_config_dir = config_dir.clone();
         let reader_pending_task_stops = pending_task_stops.clone();
         let reader_pending_user_inputs = pending_user_inputs.clone();
         let reader_thread = thread::Builder::new()
             .name("waku-claude-reader".into())
             .spawn(move || {
                 let mut state = ClaudeStreamState {
+                    config_dir: reader_config_dir,
                     pending_task_stops: reader_pending_task_stops,
                     pending_user_inputs: reader_pending_user_inputs,
                     ..ClaudeStreamState::default()
@@ -287,6 +299,7 @@ impl ClaudeDriver {
         let writer_pending_task_stops = pending_task_stops;
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
         let title_session_id = session_id;
+        let title_config_dir = config_dir;
         thread::Builder::new()
             .name("waku-claude-writer".into())
             .spawn(move || {
@@ -300,6 +313,7 @@ impl ClaudeDriver {
                             start_claude_title_refresh(
                                 &writer_title_refresh,
                                 &title_session_id,
+                                title_config_dir.as_deref(),
                                 &writer_events,
                             );
                             let _ = writer_events.send(DriverEvent::TurnStarted);
@@ -599,6 +613,7 @@ fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
 
 #[derive(Default)]
 struct ClaudeStreamState {
+    config_dir: Option<PathBuf>,
     saw_text_delta: bool,
     saw_reasoning_delta: bool,
     /// Tool-use id → transcript presentation plus the full shell command.
@@ -1596,7 +1611,9 @@ fn handle_message(
             // Claude writes its generated title and rewind checkpoint to the
             // same native transcript as the turn settles. Read it once, ahead
             // of TurnFinished, so that event's forced save includes both.
-            if let Ok(metadata) = crate::claude_session::session_metadata(session_id) {
+            if let Ok(metadata) =
+                crate::claude_session::session_metadata(session_id, state.config_dir.as_deref())
+            {
                 if let Some(title) = metadata.title
                     && state.last_auto_title.as_deref() != Some(title.as_str())
                 {
@@ -1944,6 +1961,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -2012,6 +2030,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )

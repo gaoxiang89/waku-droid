@@ -101,9 +101,15 @@ export async function hydrateSession(
 export async function listProviderSessions(
   client: WakuClient,
   provider: ProviderKind,
+  accountId: string | null = null,
 ): Promise<ProviderSessionSummary[]> {
   return expectResponse(
-    await client.request({ type: 'listProviderSessions', provider, limit: 250 }),
+    await client.request({
+      type: 'listProviderSessions',
+      provider,
+      ...(accountId ? { accountId } : {}),
+      limit: 250,
+    }),
     'providerSessions',
   ).sessions;
 }
@@ -111,9 +117,13 @@ export async function listProviderSessions(
 export async function loadProviderSessionHistory(
   client: WakuClient,
   summary: ProviderSessionSummary,
+  accountId: string | null = null,
 ): Promise<ProviderSessionHistory> {
   return expectResponse(await client.request({
-    type: 'loadProviderSession', cursor: summary.cursor, cwd: summary.cwd,
+    type: 'loadProviderSession',
+    cursor: summary.cursor,
+    ...(accountId ? { accountId } : {}),
+    cwd: summary.cwd,
   }), 'providerSessionHistory').history;
 }
 
@@ -141,20 +151,43 @@ export async function loadDaemonSettings(client: WakuClient): Promise<DaemonSett
   return {
     ...response.settings,
     provider_binary_overrides: response.settings.provider_binary_overrides ?? {},
+    provider_accounts: response.settings.provider_accounts ?? [],
   };
+}
+
+export function resolveProviderAccount(
+  settings: DaemonSettings,
+  provider: ProviderKind,
+  accountId: string | null | undefined,
+) {
+  if (!accountId) return null;
+  return settings.provider_accounts?.find(
+    (account) => account.provider === provider && account.id === accountId,
+  ) ?? null;
 }
 
 export async function probeProvider(
   client: WakuClient,
   provider: ProviderKind,
   settings: DaemonSettings,
-  options: { discoverModels?: boolean; probeVersion?: boolean } = {},
+  options: {
+    discoverModels?: boolean;
+    probeVersion?: boolean;
+    accountId?: string | null;
+    configDir?: string | null;
+  } = {},
 ): Promise<ProviderProbe & { version: string | null }> {
+  const account = resolveProviderAccount(settings, provider, options.accountId);
+  const binaryOverride = account?.binaryOverride?.trim()
+    || settings.provider_binary_overrides?.[provider]
+    || null;
+  const configDir = options.configDir ?? account?.configDir ?? null;
   const response = expectResponse(
     await client.request({
       type: 'probeProvider',
       provider,
-      binaryOverride: settings.provider_binary_overrides?.[provider] ?? null,
+      binaryOverride,
+      ...(configDir ? { configDir } : {}),
       discoverModels: options.discoverModels ?? true,
       probeVersion: options.probeVersion ?? false,
     }),

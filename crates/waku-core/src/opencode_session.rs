@@ -225,6 +225,7 @@ fn history_from_messages(messages: &[MessageInfo]) -> ProviderSessionHistory {
                         completed_at: Some(0),
                         checkpoint: None,
                         provider: Some(ProviderKind::OpenCode),
+                        account_id: None,
                         handoff: None,
                         native_conversation_start: false,
                         handoff_preamble: None,

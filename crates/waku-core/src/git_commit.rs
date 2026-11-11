@@ -106,6 +106,15 @@ pub fn generate_message(
         amp_settings.as_deref(),
     );
     let mut command = crate::command_env::command(&invocation.binary);
+    let resolved_config_dir = invocation
+        .config_dir
+        .as_deref()
+        .and_then(crate::command_env::resolve_config_dir);
+    crate::command_env::apply_provider_config_dir(
+        &mut command,
+        invocation.provider,
+        resolved_config_dir.as_deref(),
+    );
     command
         .args(args)
         .current_dir(cwd)

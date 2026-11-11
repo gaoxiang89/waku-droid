@@ -15,6 +15,8 @@ pub enum ProviderSessionForkRequest {
         resume_at: Option<String>,
         turn_count: usize,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<PathBuf>,
     },
     Amp {
         binary: PathBuf,

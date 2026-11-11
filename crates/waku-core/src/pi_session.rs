@@ -409,6 +409,7 @@ fn history_from_session(provider: ProviderKind, session: &ParsedSession) -> Prov
                 completed_at: None,
                 checkpoint: None,
                 provider: Some(provider),
+                account_id: None,
                 handoff: None,
                 native_conversation_start: false,
                 handoff_preamble: None,

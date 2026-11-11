@@ -448,6 +448,7 @@ impl OpenCodeDriver {
             agent_preset,
             computer_use_enabled,
             provider_cursor,
+            config_dir: _,
         } = options;
 
         let resumed = match provider_cursor {
@@ -3576,6 +3577,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -3665,6 +3667,7 @@ mod tests {
             agent_preset: None,
             computer_use_enabled: false,
             provider_cursor,
+            config_dir: None,
         };
         let (events, event_rx) = crate::driver::test_event_channel();
         let driver = OpenCodeDriver::start(options(None), events).unwrap();
@@ -3833,6 +3836,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -3953,6 +3957,7 @@ mod tests {
                     agent_preset: None,
                     computer_use_enabled: true,
                     provider_cursor: None,
+                    config_dir: None,
                 },
                 events,
             )

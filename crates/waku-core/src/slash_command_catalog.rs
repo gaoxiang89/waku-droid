@@ -28,11 +28,12 @@ pub(crate) fn discover(
     provider: ProviderKind,
     binary: &Path,
     project_root: &Path,
+    config_dir: Option<&Path>,
 ) -> Option<Vec<SlashCommand>> {
     match provider {
         ProviderKind::Amp => discover_amp(binary, project_root),
-        ProviderKind::Claude => discover_claude(binary, project_root),
-        ProviderKind::Codex => discover_codex(binary, project_root),
+        ProviderKind::Claude => discover_claude(binary, project_root, config_dir),
+        ProviderKind::Codex => discover_codex(binary, project_root, config_dir),
         ProviderKind::OpenCode => discover_opencode(binary, project_root),
         ProviderKind::OhMyPi => discover_oh_my_pi(binary, project_root),
         ProviderKind::Pi => discover_pi(binary, project_root),
@@ -55,17 +56,30 @@ fn discover_amp(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>>
     Some(parse_amp_skills(&value))
 }
 
-fn discover_claude(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
+fn discover_claude(
+    binary: &Path,
+    project_root: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
     // This is the initialization request used by the Claude Agent SDK. No user
     // message follows it, so the CLI loads local commands without making a
     // model request or persisting a conversation.
-    let value =
-        crate::claude_metadata::initialize(binary, Some(project_root), "user,project,local")?;
+    let value = crate::claude_metadata::initialize(
+        binary,
+        Some(project_root),
+        config_dir,
+        "user,project,local",
+    )?;
     Some(parse_claude_commands(&value))
 }
 
-fn discover_codex(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
+fn discover_codex(
+    binary: &Path,
+    project_root: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
     let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
     command
         .args(["app-server", "--stdio"])
         .current_dir(project_root)
@@ -702,7 +716,7 @@ mod tests {
         )
         .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        let commands = discover(ProviderKind::OpenCode, &binary, &root).unwrap();
+        let commands = discover(ProviderKind::OpenCode, &binary, &root, None).unwrap();
         for name in ["init", "review", "waku-catalog-smoke"] {
             assert!(
                 commands

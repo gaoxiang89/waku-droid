@@ -194,11 +194,13 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             provider,
             project_root,
             binary_override,
+            config_dir,
         } => WorkspaceResult::SlashCommands {
-            commands: crate::composer_complete::discover_slash_commands(
+            commands: crate::composer_complete::discover_slash_commands_for_account(
                 provider,
                 &project_root,
                 binary_override.as_deref(),
+                config_dir.as_deref(),
             ),
         },
         WorkspaceOperation::CreateProjectlessWorkspace { prompt } => {
@@ -848,7 +850,7 @@ mod tests {
         );
         let WorkspaceResult::FileChunk {
             bytes: encoded,
-            total_bytes,
+            total_bytes: _,
         } = execute(WorkspaceOperation::ReadFileChunk {
             root: root.clone(),
             relative_path: PathBuf::from("blob.bin"),

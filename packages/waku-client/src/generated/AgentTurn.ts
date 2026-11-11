@@ -13,6 +13,11 @@ export type AgentTurn = { id: string, turn_count: number, status: TurnStatus, pr
  */
 provider?: ProviderKind | null,
 /**
+ * Named profile within `provider` that ran this turn, when not using the
+ * provider's default account.
+ */
+account_id?: string | null,
+/**
  * What this turn carried over from the agents that ran the turns before
  * it. Present only on the first turn after a switch.
  */

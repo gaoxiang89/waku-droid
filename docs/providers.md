@@ -37,9 +37,9 @@ Inputs ([driver/mod.rs:67](../crates/waku-core/src/driver/mod.rs#L79)):
 
 ```rust
 pub struct DriverStartOptions {
-    binary, cwd, mode,
-    model, reasoning_effort, service_tier,
-    computer_use_enabled, provider_cursor,
+    binary, config_dir, cwd, mode,
+    model, reasoning_effort, service_tier, context_window,
+    agent_preset, computer_use_enabled, provider_cursor,
 }
 ```
 
@@ -173,6 +173,44 @@ records the same rows instead of saving a projection without them.
 
 Rewinding past a switch drops the parked cursors (`truncate_after_turn`), so no
 rewound task can resume a conversation that no longer matches its transcript.
+
+### Multiple accounts per provider
+
+Claude Code (`CLAUDE_CONFIG_DIR`) and Codex CLI (`CODEX_HOME`) support isolated
+on-disk configuration roots (`ProviderKind::supports_multiple_accounts`). Users
+can add named `ProviderAccount` profiles (`{ id, provider, label, config_dir,
+binary_override }`) in **Settings → Providers**; each profile runs alongside the
+implicit **Default** account (`account_id: None`, which uses `~/.claude` or
+`~/.codex` and strips any ambient `CLAUDE_CONFIG_DIR` / `CODEX_HOME` inherited
+from the parent shell so Default stays deterministic).
+
+Every layer keys state by `(ProviderKind, Option<account_id>)`:
+
+- **Process environment (`command_env.rs`).** `DriverStartOptions::config_dir`,
+  model/preset catalog probes, slash-command discovery, Claude session forks,
+  commit-message invocations, and cold provider-session imports inject
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` when `config_dir` is `Some(...)`, and
+  remove those variables when `config_dir` is `None`.
+- **Plan usage (`usage.rs`) and usage history (`usage_history.rs`).** Plan usage
+  reads `<config_dir>/.credentials.json` (plus macOS Keychain service
+  `"Claude Code-credentials-<first 8 hex chars of sha256(config_dir)>"`) for
+  Claude Code and `<config_dir>/auth.json` for Codex, caching limits per
+  `(HostKey, ProviderKind, Option<String>)`. Token/cost history scans both the
+  default root and every configured account's `config_dir` (deduplicated by
+  canonical path).
+- **In-task switching (`switch_agent`).** `AgentSession::account_id` and
+  `AgentTurn::account_id` track the active and per-turn account; parked cursors
+  for named accounts live in `AgentSession::account_cursors` alongside legacy
+  default-account `provider_cursors`. Switching between two accounts of the same
+  provider (for example `Claude (Default)` → `Claude (Work)`) parks the outgoing
+  cursor, adopts the target account's parked cursor if any, runs the same
+  deterministic `<task-transcript>` handoff with disambiguated speaker labels,
+  and labels assistant turns (`Claude · Default`, `Claude · Work`).
+
+Antigravity (`agy acp` ignores `AGY_ACCOUNT` and reads one shared
+`~/.gemini/antigravity` state store) and OpenCode (one shared user-level
+background daemon at `service.json`) do not expose isolated per-process config
+roots and remain single-account.
 
 Note what is *not* on the teardown list: finishing a turn. `TurnFinished` leaves
 the long-lived processes resident and idle, which is the point of them — until

@@ -370,10 +370,11 @@ pub(super) struct MessageRender<'a> {
     pub(super) theme: &'a Theme,
     pub(super) message: &'a Message,
     pub(super) message_index: usize,
-    /// The agent that produced this message, present only on the opening
-    /// visible segment of each response when the task has been run by more than
-    /// one agent. A single-agent task reads the same as it always did.
-    pub(super) turn_provider: Option<ProviderKind>,
+    /// The agent (and optional account label) that produced this message,
+    /// present only on the opening visible segment of each response when the
+    /// task has been run by more than one agent or account. A single-agent task
+    /// reads the same as it always did.
+    pub(super) turn_provider: Option<TurnAgentBadge>,
     pub(super) assistant_footer_copy_content: Option<SharedString>,
     pub(super) assistant_footer_time: Option<u64>,
     pub(super) copied: bool,
@@ -955,10 +956,10 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .py(px(4.0))
                 .gap(px(3.0))
                 .group(group_name.clone());
-            // Which agent wrote this answer. Only a task that changed agents
-            // carries the label, so the common single-agent transcript keeps
-            // its unlabelled rows.
-            if let Some(provider) = turn_provider {
+            // Which agent wrote this answer. Only a task that changed agents or
+            // accounts carries the label, so the common single-agent transcript
+            // keeps its unlabelled rows.
+            if let Some(badge) = turn_provider {
                 column = column.child(
                     div()
                         .flex()
@@ -969,7 +970,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                 .w(px(5.0))
                                 .h(px(5.0))
                                 .rounded_full()
-                                .bg(provider_color(theme, provider)),
+                                .bg(provider_color(theme, badge.provider)),
                         )
                         .child(
                             div()
@@ -977,7 +978,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                                 .line_height(sp(14.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text_tertiary)
-                                .child(provider.short_name()),
+                                .child(badge.label),
                         ),
                 );
             }

@@ -153,7 +153,7 @@ enum PaletteAction {
     NewTask,
     Resume,
     ChooseResumeProvider,
-    SelectResumeProvider(ProviderKind),
+    SelectResumeProvider(ProviderKind, Option<String>),
     ResumeProviderSession(ProviderSessionSummary),
     OpenProject,
     FocusComposer,
@@ -378,6 +378,7 @@ pub(super) struct CommandPaletteUi {
     message_search_pending: bool,
     provider_sessions: Vec<ProviderSessionSummary>,
     resume_provider: ProviderKind,
+    resume_account_id: Option<String>,
     provider_sessions_pending: bool,
     provider_session_import: Option<ProviderResumeCursor>,
     provider_session_error: Option<String>,
@@ -403,6 +404,7 @@ impl CommandPaletteUi {
             message_search_pending: false,
             provider_sessions: Vec::new(),
             resume_provider: ProviderKind::default(),
+            resume_account_id: None,
             provider_sessions_pending: false,
             provider_session_import: None,
             provider_session_error: None,
@@ -1077,7 +1079,14 @@ impl Waku {
                         (path.to_string_lossy().into_owned(), Some(branch.as_str()))
                     }
                 };
+                let host = self.hosts.ownership.session(session.id);
+                let account_label = self
+                    .account_for_host(&host, session.provider, session.account_id.as_deref())
+                    .map(|account| account.label.as_str());
                 let mut details = vec![project.clone()];
+                if let Some(account_label) = account_label {
+                    details.push(account_label.to_owned());
+                }
                 if let Some(branch) = branch {
                     details.push(format!("#{branch}"));
                 }
@@ -1097,10 +1106,11 @@ impl Waku {
                 CommandPaletteItem {
                     section: PaletteSection::Tasks,
                     search_text: format!(
-                        "{label} {project} {project_path} {workspace_path} {} {} {} {} task session chat conversation",
+                        "{label} {project} {project_path} {workspace_path} {} {} {} {} {} task session chat conversation",
                         branch.unwrap_or_default(),
                         session.provider.short_name(),
                         session.provider.display_name(),
+                        account_label.unwrap_or_default(),
                         session.model.as_deref().unwrap_or_default(),
                     ),
                     label,
@@ -1118,6 +1128,14 @@ impl Waku {
 
     fn command_palette_resume_candidates(&self) -> Vec<CommandPaletteItem> {
         let now = unix_time();
+        let host = self.selected_host_key();
+        let account_label = self
+            .account_for_host(
+                &host,
+                self.command_palette.resume_provider,
+                self.command_palette.resume_account_id.as_deref(),
+            )
+            .map(|account| account.label.clone());
         self.command_palette
             .provider_sessions
             .iter()
@@ -1134,20 +1152,27 @@ impl Waku {
                 let provider = native.provider();
                 let age = super::sidebar::format_time_ago(now.saturating_sub(native.updated_at));
                 let path = native.cwd.to_string_lossy();
+                let detail = match &account_label {
+                    Some(account) => {
+                        format!("{} · {account} · {} · {age}", provider.short_name(), path)
+                    }
+                    None => format!("{} · {} · {age}", provider.short_name(), path),
+                };
                 CommandPaletteItem {
                     section: PaletteSection::Sessions,
                     label: native.title.clone(),
-                    detail: Some(format!("{} · {} · {age}", provider.short_name(), path)),
+                    detail: Some(detail),
                     icon: PaletteIcon::Provider(provider),
                     shortcut: None,
                     action: PaletteAction::ResumeProviderSession(native.clone()),
                     content_match: None,
                     search_text: format!(
-                        "{} {} {} {} {} resume continue terminal cli session conversation",
+                        "{} {} {} {} {} {} resume continue terminal cli session conversation",
                         native.title,
                         path,
                         provider.short_name(),
                         provider.display_name(),
+                        account_label.as_deref().unwrap_or_default(),
                         native.cursor.native_id(),
                     ),
                     order,
@@ -1158,17 +1183,23 @@ impl Waku {
     }
 
     fn command_palette_resume_provider_selector(&self) -> CommandPaletteItem {
+        let host = self.selected_host_key();
         let provider = self.command_palette.resume_provider;
+        let label = self.agent_display_name_for_host(
+            &host,
+            provider,
+            self.command_palette.resume_account_id.as_deref(),
+        );
         CommandPaletteItem {
             section: PaletteSection::Providers,
-            label: provider.display_name().to_owned(),
+            label: label.clone(),
             detail: Some(tr!("command_palette.change_provider")),
             icon: PaletteIcon::Provider(provider),
             shortcut: None,
             action: PaletteAction::ChooseResumeProvider,
             content_match: None,
             search_text: format!(
-                "{} {} change select provider agent cli",
+                "{} {} {label} change select provider agent account profile cli",
                 provider.short_name(),
                 provider.display_name()
             ),
@@ -1178,33 +1209,69 @@ impl Waku {
     }
 
     fn command_palette_resume_provider_candidates(&self) -> Vec<CommandPaletteItem> {
-        ProviderKind::ALL
-            .into_iter()
-            .filter(|provider| {
-                *provider == self.command_palette.resume_provider
-                    || !self
-                        .disabled_providers_for(&self.selected_host_key())
-                        .contains(provider)
-            })
-            .enumerate()
-            .map(|(order, provider)| CommandPaletteItem {
+        let host = self.selected_host_key();
+        let disabled = self.disabled_providers_for(&host).to_vec();
+        let mut items = Vec::new();
+        let mut order = 0usize;
+        for provider in ProviderKind::ALL {
+            if provider != self.command_palette.resume_provider && disabled.contains(&provider) {
+                continue;
+            }
+            let accounts = self.provider_accounts_for_kind(&host, provider);
+            let default_label = if accounts.is_empty() {
+                provider.display_name().to_owned()
+            } else {
+                format!(
+                    "{} · {}",
+                    provider.display_name(),
+                    tr!("providers.default_account")
+                )
+            };
+            let is_default_current = provider == self.command_palette.resume_provider
+                && self.command_palette.resume_account_id.is_none();
+            items.push(CommandPaletteItem {
                 section: PaletteSection::Providers,
-                label: provider.display_name().to_owned(),
-                detail: (provider == self.command_palette.resume_provider)
-                    .then(|| tr!("command_palette.current_provider")),
+                label: default_label.clone(),
+                detail: is_default_current.then(|| tr!("command_palette.current_provider")),
                 icon: PaletteIcon::Provider(provider),
                 shortcut: None,
-                action: PaletteAction::SelectResumeProvider(provider),
+                action: PaletteAction::SelectResumeProvider(provider, None),
                 content_match: None,
                 search_text: format!(
-                    "{} {} provider agent cli terminal session",
+                    "{} {} {default_label} provider agent account profile cli terminal session",
                     provider.short_name(),
                     provider.display_name()
                 ),
                 order,
                 recency: 0,
-            })
-            .collect()
+            });
+            order += 1;
+            for account in accounts {
+                let label = format!("{} · {}", provider.display_name(), account.label);
+                let is_current = provider == self.command_palette.resume_provider
+                    && self.command_palette.resume_account_id.as_deref()
+                        == Some(account.id.as_str());
+                items.push(CommandPaletteItem {
+                    section: PaletteSection::Providers,
+                    label: label.clone(),
+                    detail: is_current.then(|| tr!("command_palette.current_provider")),
+                    icon: PaletteIcon::Provider(provider),
+                    shortcut: None,
+                    action: PaletteAction::SelectResumeProvider(provider, Some(account.id.clone())),
+                    content_match: None,
+                    search_text: format!(
+                        "{} {} {} {label} provider agent account profile cli terminal session",
+                        provider.short_name(),
+                        provider.display_name(),
+                        account.label
+                    ),
+                    order,
+                    recency: 0,
+                });
+                order += 1;
+            }
+        }
+        items
     }
 
     fn refresh_command_palette_resume_results(&mut self, query: &str, preserve_selection: bool) {
@@ -1303,10 +1370,14 @@ impl Waku {
                     .position(|item| item.action == action)
             })
             .or_else(|| {
-                self.command_palette.results.iter().position(|item| {
-                    item.action
-                        == PaletteAction::SelectResumeProvider(self.command_palette.resume_provider)
-                })
+                let current_action = PaletteAction::SelectResumeProvider(
+                    self.command_palette.resume_provider,
+                    self.command_palette.resume_account_id.clone(),
+                );
+                self.command_palette
+                    .results
+                    .iter()
+                    .position(|item| item.action == current_action)
             })
             .unwrap_or(0);
         self.command_palette
@@ -1472,16 +1543,30 @@ impl Waku {
         }
     }
 
-    fn default_resume_provider(&self) -> ProviderKind {
-        self.selected_session()
-            .map(|session| session.provider)
-            .or_else(|| {
-                let host = self.selected_host_key();
-                ProviderKind::ALL
-                    .into_iter()
-                    .find(|provider| !self.disabled_providers_for(&host).contains(provider))
-            })
-            .unwrap_or_default()
+    fn default_resume_agent(&self) -> (ProviderKind, Option<String>) {
+        let host = self.selected_host_key();
+        if let Some(session) = self.selected_session() {
+            let account_id = self.validated_account_id_for_host(
+                &host,
+                session.provider,
+                session.account_id.as_deref(),
+            );
+            return (session.provider, account_id);
+        }
+        let provider = ProviderKind::ALL
+            .into_iter()
+            .find(|provider| !self.disabled_providers_for(&host).contains(provider))
+            .unwrap_or_default();
+        let account_id = if provider == self.state.last_provider {
+            self.validated_account_id_for_host(
+                &host,
+                provider,
+                self.state.last_account_id.as_deref(),
+            )
+        } else {
+            None
+        };
+        (provider, account_id)
     }
 
     fn open_command_palette_resume_provider_view(&mut self, cx: &mut Context<Self>) {
@@ -1496,13 +1581,16 @@ impl Waku {
 
     fn open_command_palette_resume_view(
         &mut self,
-        provider: Option<ProviderKind>,
+        agent: Option<(ProviderKind, Option<String>)>,
         cx: &mut Context<Self>,
     ) {
         let host = self.selected_host_key();
-        let provider = provider.unwrap_or_else(|| self.default_resume_provider());
+        let (provider, raw_account_id) = agent.unwrap_or_else(|| self.default_resume_agent());
+        let account_id =
+            self.validated_account_id_for_host(&host, provider, raw_account_id.as_deref());
         self.command_palette.view = CommandPaletteView::Resume;
         self.command_palette.resume_provider = provider;
+        self.command_palette.resume_account_id = account_id.clone();
         self.command_palette.provider_sessions.clear();
         self.command_palette.provider_sessions_pending = true;
         self.command_palette.provider_session_import = None;
@@ -1519,9 +1607,11 @@ impl Waku {
         self.refresh_command_palette_results("", false, cx);
         cx.notify();
 
-        let fetch = self
-            .selected_store()
-            .provider_sessions(provider, PROVIDER_SESSION_CATALOG_LIMIT);
+        let fetch = self.selected_store().provider_sessions(
+            provider,
+            account_id.clone(),
+            PROVIDER_SESSION_CATALOG_LIMIT,
+        );
         cx.spawn(async move |waku, cx| {
             let result = cx.background_executor().spawn(async move { fetch() }).await;
             let _ = waku.update(cx, |waku, cx| {
@@ -1529,6 +1619,7 @@ impl Waku {
                     || !waku.command_palette.open
                     || waku.command_palette.provider_session_generation != generation
                     || waku.command_palette.resume_provider != provider
+                    || waku.command_palette.resume_account_id != account_id
                 {
                     return;
                 }
@@ -1557,6 +1648,7 @@ impl Waku {
         &mut self,
         summary: ProviderSessionSummary,
         history: ProviderSessionHistory,
+        account_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1597,6 +1689,7 @@ impl Waku {
             project_id
         };
         let provider = summary.provider();
+        let account_id = self.validated_account_id_for_host(&host, provider, account_id.as_deref());
         let runtime_mode = self
             .selected_session()
             .map(|session| session.runtime_mode)
@@ -1612,6 +1705,7 @@ impl Waku {
             || !history.transcript_blocks.is_empty()
             || !history.turns.is_empty();
         let mut session = AgentSession::new(project_id, provider);
+        session.account_id = account_id.clone();
         session.runtime_mode = runtime_mode;
         session.auto_title = Some(summary.title);
         session.provider_cursor = Some(summary.cursor);
@@ -1621,6 +1715,9 @@ impl Waku {
         session.messages = history.messages;
         session.transcript_blocks = history.transcript_blocks;
         session.turns = history.turns;
+        for turn in &mut session.turns {
+            turn.account_id = account_id.clone();
+        }
         let session_id = session.id;
         self.hosts
             .ownership
@@ -1665,6 +1762,11 @@ impl Waku {
             return;
         }
 
+        let account_id = self.validated_account_id_for_host(
+            &host,
+            summary.provider(),
+            self.command_palette.resume_account_id.as_deref(),
+        );
         self.command_palette.provider_session_import = Some(summary.cursor.clone());
         self.command_palette.provider_session_error = None;
         self.command_palette.provider_session_generation = self
@@ -1673,9 +1775,11 @@ impl Waku {
             .wrapping_add(1);
         let generation = self.command_palette.provider_session_generation;
         let cursor = summary.cursor.clone();
-        let fetch = self
-            .selected_store()
-            .provider_session_history(cursor.clone(), summary.cwd.clone());
+        let fetch = self.selected_store().provider_session_history(
+            cursor.clone(),
+            summary.cwd.clone(),
+            account_id.clone(),
+        );
         let window_handle = window.window_handle();
         cx.notify();
 
@@ -1716,7 +1820,7 @@ impl Waku {
                         && waku.command_palette.view == CommandPaletteView::Resume
                         && waku.command_palette.provider_session_generation == generation
                     {
-                        waku.import_provider_session(summary, history, window, cx);
+                        waku.import_provider_session(summary, history, account_id, window, cx);
                     }
                 });
             });
@@ -1749,8 +1853,8 @@ impl Waku {
                 self.open_command_palette_resume_provider_view(cx);
                 return;
             }
-            PaletteAction::SelectResumeProvider(provider) => {
-                self.open_command_palette_resume_view(Some(provider), cx);
+            PaletteAction::SelectResumeProvider(provider, account_id) => {
+                self.open_command_palette_resume_view(Some((provider, account_id)), cx);
                 return;
             }
             PaletteAction::ResumeProviderSession(summary) => {
@@ -1854,7 +1958,7 @@ impl Waku {
             }
             PaletteAction::Resume
             | PaletteAction::ChooseResumeProvider
-            | PaletteAction::SelectResumeProvider(_)
+            | PaletteAction::SelectResumeProvider(_, _)
             | PaletteAction::ResumeProviderSession(_) => {
                 unreachable!("resume actions are handled before closing the palette")
             }
@@ -1952,6 +2056,11 @@ impl Waku {
                 )
             };
             let empty_icon = icon(icon_path, 18.0, theme.text_ghost);
+            let resume_agent_label = self.agent_display_name_for_host(
+                &self.selected_host_key(),
+                self.command_palette.resume_provider,
+                self.command_palette.resume_account_id.as_deref(),
+            );
             results = results.child(
                 div()
                     .h(px(EMPTY_RESULTS_HEIGHT))
@@ -1999,7 +2108,7 @@ impl Waku {
                                     div()
                                         .text_size(sp(12.5))
                                         .text_color(theme.text_secondary)
-                                        .child(provider.display_name().to_owned()),
+                                        .child(resume_agent_label.clone()),
                                 ),
                         )
                     })
@@ -2029,7 +2138,7 @@ impl Waku {
                                     div()
                                         .text_size(sp(12.5))
                                         .text_color(theme.text_secondary)
-                                        .child(provider.display_name().to_owned()),
+                                        .child(resume_agent_label),
                                 )
                                 .child(icon("icons/chevron-down.svg", 11.0, theme.text_tertiary))
                                 .on_click(cx.listener(|this, _, _, cx| {

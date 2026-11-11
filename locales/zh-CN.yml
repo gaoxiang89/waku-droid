@@ -224,6 +224,26 @@ providers.binary_path_description: Waku 用于启动 %{provider} 的可执行文
 providers.checked_just_now: 刚刚检查过
 providers.checked_minutes_ago: "%{count} 分钟前检查过"
 providers.checked_hours_ago: "%{count} 小时前检查过"
+providers.accounts: 账号
+providers.accounts_description: 为 %{provider} 配置独立的配置目录，以便在个人、工作或团队登录态之间自由切换
+providers.default_account: 默认
+providers.default_account_hint: 使用 %{path}
+providers.add_account: 添加账号
+providers.edit_account: 编辑账号
+providers.account_name: 名称
+providers.account_name_placeholder: 例如：工作
+providers.account_config_dir: 配置目录
+providers.account_config_dir_placeholder: "例如：%{path}"
+providers.account_browse_dir: 浏览…
+providers.account_save: 保存
+providers.account_cancel: 取消
+providers.account_remove: 移除账号
+providers.account_copy_login: 复制登录命令
+providers.account_login_copied: 已将登录命令复制到剪贴板
+providers.account_error_empty_name: 请输入账号名称
+providers.account_error_empty_dir: 请输入独立的配置目录路径
+providers.account_error_default_dir: 请选择默认目录 %{path} 以外的路径
+providers.account_error_duplicate_dir: 已有另一个 %{provider} 账号使用该目录
 computer_use.allow_apps: 允许 Waku 操作其他应用
 computer_use.availability: Codex、OpenCode、Grok 和 Pi 支持电脑操作功能
 computer_use.desktop_access: 桌面权限

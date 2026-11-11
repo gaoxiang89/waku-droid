@@ -56,6 +56,7 @@ impl Waku {
             return;
         }
         self.apply_provider_path_override(cx);
+        self.cancel_provider_account_form(cx);
         self.provider_settings_host = key.clone();
         if key != HostKey::Local {
             self.sync_host_provider_settings(&key);
@@ -100,6 +101,110 @@ impl Waku {
         }
     }
 
+    pub(super) fn provider_accounts_for(&self, key: &HostKey) -> &[waku_client::ProviderAccount] {
+        if *key == HostKey::Local {
+            &self.state.provider_accounts
+        } else {
+            self.host_provider_accounts
+                .get(key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        }
+    }
+
+    pub(super) fn provider_accounts_for_kind(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+    ) -> Vec<waku_client::ProviderAccount> {
+        if !provider.supports_multiple_accounts() {
+            return Vec::new();
+        }
+        self.provider_accounts_for(key)
+            .iter()
+            .filter(|account| account.provider == provider)
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn account_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<&waku_client::ProviderAccount> {
+        if !provider.supports_multiple_accounts() {
+            return None;
+        }
+        let account_id = account_id?;
+        self.provider_accounts_for(key)
+            .iter()
+            .find(|account| account.provider == provider && account.id == account_id)
+    }
+
+    pub(super) fn validated_account_id_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<String> {
+        self.account_for_host(key, provider, account_id)
+            .map(|account| account.id.clone())
+    }
+
+    pub(super) fn effective_binary_override_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(account_override) = self
+            .account_for_host(key, provider, account_id)
+            .and_then(|account| account.binary_override.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(account_override.to_owned());
+        }
+        self.provider_override_for_host(key, provider)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    pub(super) fn effective_config_dir_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<String> {
+        self.account_for_host(key, provider, account_id)
+            .map(|account| account.config_dir.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    pub(super) fn effective_config_dir_for_session(
+        &self,
+        session: &AgentSession,
+    ) -> Option<String> {
+        let key = self.hosts.ownership.session(session.id);
+        self.effective_config_dir_for_host(&key, session.provider, session.account_id.as_deref())
+    }
+
+    pub(super) fn agent_display_name_for_host(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> String {
+        if let Some(account) = self.account_for_host(key, provider, account_id) {
+            format!("{} · {}", provider.display_name(), account.label)
+        } else {
+            provider.display_name().to_owned()
+        }
+    }
+
     /// Refresh the render snapshot of a remote host's provider settings from
     /// its daemon. Runs in click handlers and on connect, never in render.
     pub(super) fn sync_host_provider_settings(&mut self, key: &HostKey) {
@@ -109,6 +214,8 @@ impl Waku {
                 .insert(key.clone(), settings.provider_binary_overrides);
             self.host_disabled_providers
                 .insert(key.clone(), settings.disabled_providers);
+            self.host_provider_accounts
+                .insert(key.clone(), settings.provider_accounts);
         }
     }
 
@@ -254,6 +361,7 @@ impl Waku {
                                 .provider_binary_overrides
                                 .get(&provider)
                                 .cloned(),
+                            config_dir: None,
                             discover_models: true,
                             probe_version: false,
                         },
@@ -557,11 +665,11 @@ impl Waku {
         }
         self.git_graph_ui.retain_host(|host| host != removed_host);
         self.slash_commands
-            .retain(|(host, _, _, _)| host != removed_host);
+            .retain(|(host, _, _, _, _)| host != removed_host);
         if self
             .slash_command_index_key
             .as_ref()
-            .is_some_and(|(host, _, _, _)| host == removed_host)
+            .is_some_and(|(host, _, _, _, _)| host == removed_host)
         {
             self.slash_command_index = Rc::new(Vec::new());
             self.slash_command_index_key = None;
@@ -658,14 +766,16 @@ impl Waku {
         self.host_catalogs.remove(key);
         self.host_provider_overrides.remove(key);
         self.host_disabled_providers.remove(key);
-        self.plan_usage_pending.retain(|(owner, _)| owner != key);
+        self.host_provider_accounts.remove(key);
+        self.plan_usage_pending.retain(|(owner, _, _)| owner != key);
         self.plan_usage_checked_at
-            .retain(|(owner, _), _| owner != key);
-        self.plan_usage.retain(|(owner, _), _| owner != key);
-        self.plan_usage_error.retain(|(owner, _), _| owner != key);
+            .retain(|(owner, _, _), _| owner != key);
+        self.plan_usage.retain(|(owner, _, _), _| owner != key);
+        self.plan_usage_error
+            .retain(|(owner, _, _), _| owner != key);
         self.plan_usage_unconfigured
-            .retain(|(owner, _)| owner != key);
-        self.plan_usage_stale.retain(|(owner, _)| owner != key);
+            .retain(|(owner, _, _)| owner != key);
+        self.plan_usage_stale.retain(|(owner, _, _)| owner != key);
         self.host_focuses.borrow_mut().remove(key);
         self.remote_images
             .borrow_mut()
@@ -675,6 +785,7 @@ impl Waku {
         self.collapsed_hosts.remove(key);
         self.clear_host_workspace_caches_for(key);
         if &self.provider_settings_host == key {
+            self.cancel_provider_account_form(cx);
             self.provider_settings_host = HostKey::Local;
         }
         if &self.skills_settings_host == key {

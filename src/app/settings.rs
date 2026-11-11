@@ -1,6 +1,20 @@
 use super::composer::next_picker_highlight;
 use super::*;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum AccountFormMode {
+    Add(ProviderKind),
+    Edit { provider: ProviderKind, id: String },
+}
+
+impl AccountFormMode {
+    pub(super) fn provider(&self) -> ProviderKind {
+        match self {
+            Self::Add(provider) | Self::Edit { provider, .. } => *provider,
+        }
+    }
+}
+
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 
 /// The Usage page is a dashboard, not a form; it mirrors T3 Code's wide
@@ -2105,7 +2119,7 @@ impl Waku {
 
     /// The expanded row's settings body: the binary override for this
     /// provider on the page's host, with that host's detection result as its
-    /// caption.
+    /// caption, plus multi-account configuration for supported providers.
     fn render_provider_expanded_settings(
         &self,
         kind: ProviderKind,
@@ -2200,6 +2214,815 @@ impl Waku {
                     .text_color(theme.text_ghost)
                     .child(SharedString::from(caption)),
             )
+            .when(kind.supports_multiple_accounts(), |element| {
+                element.child(self.render_provider_accounts_section(kind, &host_key, theme, cx))
+            })
+    }
+
+    fn render_provider_accounts_section(
+        &self,
+        kind: ProviderKind,
+        host_key: &waku_client::hosts::HostKey,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let local = *host_key == waku_client::hosts::HostKey::Local;
+        let home = local.then_some(self.home_directory.as_deref()).flatten();
+        let default_path = default_account_hint_path(kind, home, local);
+        let accounts = self.provider_accounts_for_kind(host_key, kind);
+
+        let mut list = div()
+            .mt(px(6.0))
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col();
+
+        // Default account row.
+        list = list.child(
+            div()
+                .px(px(12.0))
+                .py(px(9.0))
+                .when(!accounts.is_empty(), |row| {
+                    row.border_b_1().border_color(theme.border)
+                })
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(sp(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(tr!("providers.default_account")),
+                        )
+                        .child(
+                            div()
+                                .mt(px(2.0))
+                                .font_family(crate::md::render::MONO_FAMILY)
+                                .text_size(sp(11.5))
+                                .text_color(theme.text_tertiary)
+                                .truncate()
+                                .child(SharedString::from(tr!(
+                                    "providers.default_account_hint",
+                                    path = default_path
+                                ))),
+                        ),
+                ),
+        );
+
+        let account_count = accounts.len();
+        for (index, account) in accounts.into_iter().enumerate() {
+            let is_last = index + 1 == account_count;
+            let account_id = account.id.clone();
+            let dir_display = abbreviate_home_path(Path::new(&account.config_dir), home);
+            let login_cmd = format_account_login_command(account.provider, &account.config_dir);
+            let copy_login_cmd = login_cmd.clone();
+            let key_login_cmd = login_cmd;
+            let feedback_id = format!("provider-account-login-{account_id}");
+            let copied = self.control_was_copied(&feedback_id);
+            let click_feedback_id = feedback_id.clone();
+            let key_feedback_id = feedback_id;
+
+            let copy_button = div()
+                .id(SharedString::from(format!(
+                    "provider-account-copy-login-{account_id}"
+                )))
+                .tab_index(0)
+                .focus_visible(|style| style.border_color(theme.accent))
+                .h(px(26.0))
+                .px(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .cursor_default()
+                .text_size(sp(12.0))
+                .text_color(theme.text_secondary)
+                .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                .child(icon(
+                    if copied {
+                        "icons/check.svg"
+                    } else {
+                        "icons/copy.svg"
+                    },
+                    11.0,
+                    if copied {
+                        theme.success
+                    } else {
+                        theme.text_tertiary
+                    },
+                ))
+                .child(if copied {
+                    tr!("common.copied")
+                } else {
+                    tr!("providers.account_copy_login")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_login_cmd.clone()));
+                    this.show_control_copied(&click_feedback_id, cx);
+                    this.show_success_toast(tr!("providers.account_login_copied"));
+                }))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(key_login_cmd.clone()));
+                        this.show_control_copied(&key_feedback_id, cx);
+                        this.show_success_toast(tr!("providers.account_login_copied"));
+                        cx.stop_propagation();
+                    }
+                }));
+
+            let edit_account = account.clone();
+            let key_edit_account = account.clone();
+            let edit_button = div()
+                .id(SharedString::from(format!(
+                    "provider-account-edit-{account_id}"
+                )))
+                .tab_index(0)
+                .focus_visible(|style| style.border_color(theme.accent))
+                .h(px(26.0))
+                .px(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .items_center()
+                .cursor_default()
+                .text_size(sp(12.0))
+                .text_color(theme.text_secondary)
+                .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                .child(tr!("providers.edit_account"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.begin_edit_provider_account(edit_account.clone(), window, cx);
+                }))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.begin_edit_provider_account(key_edit_account.clone(), window, cx);
+                        cx.stop_propagation();
+                    }
+                }));
+
+            let remove_host = host_key.clone();
+            let key_remove_host = host_key.clone();
+            let remove_id = account_id.clone();
+            let key_remove_id = account_id.clone();
+            let remove_button = div()
+                .id(SharedString::from(format!(
+                    "provider-account-remove-{account_id}"
+                )))
+                .tab_index(0)
+                .focus_visible(|style| style.border_color(theme.accent))
+                .h(px(26.0))
+                .px(px(9.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .items_center()
+                .cursor_default()
+                .text_size(sp(12.0))
+                .text_color(theme.text_secondary)
+                .hover(|element| element.bg(theme.overlay).text_color(theme.danger))
+                .tooltip(Tooltip::text(tr!("providers.account_remove")))
+                .child(tr!("common.remove"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_provider_account(remove_host.clone(), kind, remove_id.clone(), cx);
+                }))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.remove_provider_account(
+                            key_remove_host.clone(),
+                            kind,
+                            key_remove_id.clone(),
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                }));
+
+            list = list.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .when(!is_last, |row| row.border_b_1().border_color(theme.border))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(sp(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .truncate()
+                                    .child(SharedString::from(account.label)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .font_family(crate::md::render::MONO_FAMILY)
+                                    .text_size(sp(11.5))
+                                    .text_color(theme.text_tertiary)
+                                    .truncate()
+                                    .child(SharedString::from(dir_display)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(copy_button)
+                            .child(edit_button)
+                            .child(remove_button),
+                    ),
+            );
+        }
+
+        let form_active = self
+            .account_form_mode
+            .as_ref()
+            .is_some_and(|mode| mode.provider() == kind);
+
+        let footer = if form_active {
+            let browse_button = local.then(|| {
+                div()
+                    .id(SharedString::from(format!(
+                        "provider-account-browse-{}",
+                        kind.id()
+                    )))
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .h(px(29.0))
+                    .px(px(10.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .cursor_default()
+                    .text_size(sp(12.5))
+                    .text_color(theme.text_secondary)
+                    .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                    .child(tr!("providers.account_browse_dir"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.browse_provider_account_dir(cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.browse_provider_account_dir(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+            });
+
+            let cancel_button = div()
+                .id(SharedString::from(format!(
+                    "provider-account-cancel-{}",
+                    kind.id()
+                )))
+                .tab_index(0)
+                .focus_visible(|style| style.border_color(theme.accent))
+                .h(px(28.0))
+                .px(px(11.0))
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .items_center()
+                .cursor_default()
+                .text_size(sp(12.5))
+                .text_color(theme.text_secondary)
+                .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                .child(tr!("providers.account_cancel"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cancel_provider_account_form(cx);
+                    cx.notify();
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.cancel_provider_account_form(cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                }));
+
+            let save_button = div()
+                .id(SharedString::from(format!(
+                    "provider-account-save-{}",
+                    kind.id()
+                )))
+                .tab_index(0)
+                .focus_visible(|style| style.border_1().border_color(theme.text))
+                .h(px(28.0))
+                .px(px(12.0))
+                .rounded(px(7.0))
+                .bg(theme.accent)
+                .flex()
+                .items_center()
+                .cursor_default()
+                .text_size(sp(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(0xffffff))
+                .hover(|element| element.opacity(0.92))
+                .child(tr!("providers.account_save"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.save_provider_account_form(cx);
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.save_provider_account_form(cx);
+                        cx.stop_propagation();
+                    }
+                }));
+
+            div()
+                .mt(px(8.0))
+                .p(px(12.0))
+                .rounded(px(9.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(sp(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_secondary)
+                                .child(tr!("providers.account_name")),
+                        )
+                        .child(
+                            TextField::new(
+                                SharedString::from(format!(
+                                    "provider-account-name-field-{}",
+                                    kind.id()
+                                )),
+                                self.account_label_input.clone(),
+                            )
+                            .max_w(px(280.0)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(sp(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_secondary)
+                                .child(tr!("providers.account_config_dir")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    TextField::new(
+                                        SharedString::from(format!(
+                                            "provider-account-dir-field-{}",
+                                            kind.id()
+                                        )),
+                                        self.account_dir_input.clone(),
+                                    )
+                                    .flex_1()
+                                    .max_w(px(430.0)),
+                                )
+                                .when_some(browse_button, |row, button| row.child(button)),
+                        ),
+                )
+                .when_some(self.account_form_error.as_ref(), |form, error| {
+                    form.child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(theme.danger)
+                            .child(SharedString::from(error.clone())),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(2.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(save_button)
+                        .child(cancel_button),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .mt(px(8.0))
+                .flex()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "provider-account-add-{}",
+                            kind.id()
+                        )))
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .h(px(28.0))
+                        .px(px(11.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(theme.text_secondary)
+                        .hover(|element| element.bg(theme.overlay).text_color(theme.text))
+                        .child(icon("icons/plus.svg", 11.0, theme.text_tertiary))
+                        .child(tr!("providers.add_account"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.begin_add_provider_account(kind, window, cx);
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if !event.keystroke.modifiers.modified()
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.begin_add_provider_account(kind, window, cx);
+                                cx.stop_propagation();
+                            }
+                        })),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .mt(px(14.0))
+            .pt(px(12.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .text_size(sp(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(tr!("providers.accounts")),
+            )
+            .child(
+                div()
+                    .text_size(sp(12.5))
+                    .line_height(sp(15.0))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::from(tr!(
+                        "providers.accounts_description",
+                        provider = kind.short_name()
+                    ))),
+            )
+            .child(list)
+            .child(footer)
+    }
+
+    fn begin_add_provider_account(
+        &mut self,
+        kind: ProviderKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_form_mode = Some(AccountFormMode::Add(kind));
+        self.account_form_error = None;
+        self.account_label_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.account_dir_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                tr!(
+                    "providers.account_config_dir_placeholder",
+                    path = default_account_example_dir(kind)
+                ),
+                cx,
+            );
+            input.clear(cx);
+        });
+        let focus = self.account_label_input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn begin_edit_provider_account(
+        &mut self,
+        account: waku_client::ProviderAccount,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = account.provider;
+        let local = self.provider_settings_host == waku_client::hosts::HostKey::Local;
+        let home = local.then_some(self.home_directory.as_deref()).flatten();
+        let dir_text = abbreviate_home_path(Path::new(&account.config_dir), home);
+        self.account_form_mode = Some(AccountFormMode::Edit {
+            provider: kind,
+            id: account.id,
+        });
+        self.account_form_error = None;
+        self.account_label_input
+            .update(cx, |input, cx| input.set_content(account.label, cx));
+        self.account_dir_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                tr!(
+                    "providers.account_config_dir_placeholder",
+                    path = default_account_example_dir(kind)
+                ),
+                cx,
+            );
+            input.set_content(dir_text, cx);
+        });
+        let focus = self.account_label_input.read(cx).focus();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    pub(super) fn cancel_provider_account_form(&mut self, cx: &mut Context<Self>) {
+        self.account_form_mode = None;
+        self.account_form_error = None;
+        self.account_label_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.account_dir_input
+            .update(cx, |input, cx| input.clear(cx));
+    }
+
+    fn browse_provider_account_dir(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr!("providers.account_config_dir").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| {
+                    let display = abbreviate_home_path(&path, this.home_directory.as_deref());
+                    this.account_dir_input
+                        .update(cx, |input, cx| input.set_content(display, cx));
+                    this.account_form_error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn save_provider_account_form(&mut self, cx: &mut Context<Self>) {
+        let Some(mode) = self.account_form_mode.clone() else {
+            return;
+        };
+        let kind = mode.provider();
+        let label = self
+            .account_label_input
+            .read(cx)
+            .content()
+            .trim()
+            .to_owned();
+        if label.is_empty() {
+            self.account_form_error = Some(tr!("providers.account_error_empty_name"));
+            cx.notify();
+            return;
+        }
+        let raw_dir = self.account_dir_input.read(cx).content().trim().to_owned();
+        if raw_dir.is_empty() {
+            self.account_form_error = Some(tr!("providers.account_error_empty_dir"));
+            cx.notify();
+            return;
+        }
+
+        let host_key = self.provider_settings_host.clone();
+        let local = host_key == waku_client::hosts::HostKey::Local;
+        let home = local.then_some(self.home_directory.as_deref()).flatten();
+        let config_dir = expand_account_config_dir(&raw_dir, home, local);
+        let candidate_key = normalized_config_dir_key(&config_dir);
+
+        let default_hint = default_account_hint_path(kind, home, local);
+        let matches_default = if local {
+            default_provider_config_dir(kind, home)
+                .is_some_and(|default_dir| normalized_config_dir_key(&default_dir) == candidate_key)
+        } else {
+            normalized_config_dir_key(Path::new(&default_hint)) == candidate_key
+        };
+        if matches_default {
+            self.account_form_error = Some(tr!(
+                "providers.account_error_default_dir",
+                path = default_hint
+            ));
+            cx.notify();
+            return;
+        }
+
+        let editing_id = match &mode {
+            AccountFormMode::Add(_) => None,
+            AccountFormMode::Edit { id, .. } => Some(id.as_str()),
+        };
+        let duplicate = self
+            .provider_accounts_for(&host_key)
+            .iter()
+            .any(|existing| {
+                existing.provider == kind
+                    && editing_id != Some(existing.id.as_str())
+                    && normalized_config_dir_key(Path::new(&existing.config_dir)) == candidate_key
+            });
+        if duplicate {
+            self.account_form_error = Some(tr!(
+                "providers.account_error_duplicate_dir",
+                provider = kind.short_name()
+            ));
+            cx.notify();
+            return;
+        }
+
+        let config_dir_string = config_dir.to_string_lossy().into_owned();
+        let updated_id = match mode {
+            AccountFormMode::Add(_) => {
+                let id = format!(
+                    "{}-{}",
+                    kind.id(),
+                    &Uuid::new_v4().simple().to_string()[..8]
+                );
+                let entry = waku_client::ProviderAccount {
+                    id: id.clone(),
+                    provider: kind,
+                    label,
+                    config_dir: config_dir_string,
+                    binary_override: None,
+                };
+                if local {
+                    self.state.provider_accounts.push(entry);
+                    self.save();
+                } else if !self.mutate_remote_provider_accounts(&host_key, |accounts| {
+                    accounts.push(entry);
+                }) {
+                    cx.notify();
+                    return;
+                }
+                id
+            }
+            AccountFormMode::Edit { id, .. } => {
+                if local {
+                    if let Some(existing) = self
+                        .state
+                        .provider_accounts
+                        .iter_mut()
+                        .find(|account| account.id == id && account.provider == kind)
+                    {
+                        existing.label = label;
+                        existing.config_dir = config_dir_string;
+                    }
+                    self.save();
+                } else if !self.mutate_remote_provider_accounts(&host_key, |accounts| {
+                    if let Some(existing) = accounts
+                        .iter_mut()
+                        .find(|account| account.id == id && account.provider == kind)
+                    {
+                        existing.label = label;
+                        existing.config_dir = config_dir_string;
+                    }
+                }) {
+                    cx.notify();
+                    return;
+                }
+                id
+            }
+        };
+
+        let usage_key = (host_key.clone(), kind, Some(updated_id));
+        self.plan_usage_unconfigured.remove(&usage_key);
+        self.plan_usage_stale.insert(usage_key);
+        self.cancel_provider_account_form(cx);
+        self.invalidate_composer_sources(cx);
+        self.maybe_refresh_plan_usage(cx);
+        cx.notify();
+    }
+
+    fn remove_provider_account(
+        &mut self,
+        host_key: waku_client::hosts::HostKey,
+        kind: ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let local = host_key == waku_client::hosts::HostKey::Local;
+        if local {
+            self.state
+                .provider_accounts
+                .retain(|account| !(account.provider == kind && account.id == account_id));
+        } else if !self.mutate_remote_provider_accounts(&host_key, |accounts| {
+            accounts.retain(|account| !(account.provider == kind && account.id == account_id));
+        }) {
+            cx.notify();
+            return;
+        }
+
+        if matches!(
+            &self.account_form_mode,
+            Some(AccountFormMode::Edit { id, .. }) if id == &account_id
+        ) {
+            self.cancel_provider_account_form(cx);
+        }
+
+        if local && self.state.last_account_id.as_deref() == Some(account_id.as_str()) {
+            self.state.last_account_id = None;
+        }
+        if self
+            .model_picker_account
+            .get(&kind)
+            .and_then(Option::as_deref)
+            == Some(account_id.as_str())
+        {
+            self.model_picker_account.remove(&kind);
+        }
+
+        let usage_key = (host_key.clone(), kind, Some(account_id.clone()));
+        self.plan_usage.remove(&usage_key);
+        self.plan_usage_error.remove(&usage_key);
+        self.plan_usage_pending.remove(&usage_key);
+        self.plan_usage_unconfigured.remove(&usage_key);
+        self.plan_usage_checked_at.remove(&usage_key);
+        self.plan_usage_stale.remove(&usage_key);
+
+        let affected_sessions = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| {
+                self.hosts.ownership.session(session.id) == host_key
+                    && session.provider == kind
+                    && session.account_id.as_deref() == Some(account_id.as_str())
+                    && !session.is_busy()
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        for session_id in affected_sessions {
+            if let Some(session) = self.state.session_mut(session_id) {
+                session.switch_agent(kind, None);
+            }
+            self.reset_session_runtime(session_id);
+        }
+
+        if local {
+            self.save();
+        }
+        self.invalidate_composer_sources(cx);
+        self.maybe_refresh_plan_usage(cx);
+        cx.notify();
+    }
+
+    fn mutate_remote_provider_accounts(
+        &mut self,
+        host_key: &waku_client::hosts::HostKey,
+        mutate: impl FnOnce(&mut Vec<waku_client::ProviderAccount>),
+    ) -> bool {
+        let Some(host) = self.hosts.get(host_key) else {
+            return false;
+        };
+        let mut settings = host.daemon.settings();
+        mutate(&mut settings.provider_accounts);
+        let name = host.name.clone();
+        if let Err(error) = host.daemon.update_settings(settings) {
+            self.show_toast(tr!(
+                "errors.save_remote_settings",
+                name = name.as_str(),
+                error = error.to_string()
+            ));
+            return false;
+        }
+        self.sync_host_provider_settings(host_key);
+        true
     }
 
     fn toggle_provider_expanded(
@@ -2211,6 +3034,7 @@ impl Waku {
         // Commit any pending edit for the previously expanded provider before
         // the input is handed to another row.
         self.apply_provider_path_override(cx);
+        self.cancel_provider_account_form(cx);
         if self.expanded_provider_settings == Some(provider) {
             self.expanded_provider_settings = None;
         } else {
@@ -2315,6 +3139,7 @@ impl Waku {
                 && self.state.last_provider == provider
             {
                 self.state.last_provider = fallback;
+                self.state.last_account_id = None;
                 self.state.last_model = None;
                 self.state.last_reasoning_effort = None;
                 self.state.last_service_tier = None;
@@ -2334,6 +3159,7 @@ impl Waku {
             for id in draft_ids {
                 if let Some(session) = self.state.session_mut(id) {
                     session.provider = fallback;
+                    session.account_id = None;
                     session.model = None;
                     session.reasoning_effort = None;
                     session.service_tier = None;
@@ -2772,6 +3598,23 @@ impl Waku {
         self.provider_path_input.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.detected_automatically"), cx)
         });
+        self.account_label_input.update(cx, |input, cx| {
+            input.set_placeholder(tr!("providers.account_name_placeholder"), cx)
+        });
+        let account_example_dir = self
+            .account_form_mode
+            .as_ref()
+            .map(|mode| default_account_example_dir(mode.provider()))
+            .unwrap_or("~/.claude-work");
+        self.account_dir_input.update(cx, |input, cx| {
+            input.set_placeholder(
+                tr!(
+                    "providers.account_config_dir_placeholder",
+                    path = account_example_dir
+                ),
+                cx,
+            )
+        });
         self.usage_project_filter.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.filter_projects"), cx)
         });
@@ -2850,6 +3693,82 @@ fn abbreviate_home_path(path: &Path, home: Option<&Path>) -> String {
         Some(relative) => format!("~/{}", relative.display()),
         None => path.display().to_string(),
     }
+}
+
+fn default_account_example_dir(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Claude => "~/.claude-work",
+        ProviderKind::Codex => "~/.codex-work",
+        _ => "~/.config-work",
+    }
+}
+
+fn default_account_tilde_dir(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Claude => "~/.claude",
+        ProviderKind::Codex => "~/.codex",
+        _ => "~",
+    }
+}
+
+fn default_provider_config_dir(kind: ProviderKind, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    match kind {
+        ProviderKind::Claude => Some(home.join(".claude")),
+        ProviderKind::Codex => Some(home.join(".codex")),
+        _ => None,
+    }
+}
+
+fn format_account_login_command(kind: ProviderKind, config_dir: &str) -> String {
+    let trimmed = config_dir.trim();
+    let quoted = if trimmed.contains(' ') {
+        format!("\"{trimmed}\"")
+    } else {
+        trimmed.to_owned()
+    };
+    match kind {
+        ProviderKind::Claude => format!("CLAUDE_CONFIG_DIR={quoted} claude auth login"),
+        ProviderKind::Codex => format!("CODEX_HOME={quoted} codex login"),
+        _ => String::new(),
+    }
+}
+
+fn default_account_hint_path(kind: ProviderKind, home: Option<&Path>, local: bool) -> String {
+    if local {
+        default_provider_config_dir(kind, home)
+            .map(|path| abbreviate_home_path(&path, home))
+            .unwrap_or_else(|| default_account_tilde_dir(kind).to_owned())
+    } else {
+        default_account_tilde_dir(kind).to_owned()
+    }
+}
+
+fn expand_account_config_dir(raw: &str, home: Option<&Path>, local: bool) -> PathBuf {
+    let trimmed = raw.trim();
+    if local && let Some(home) = home {
+        if trimmed == "~" {
+            return home.to_path_buf();
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("~/")
+            .or_else(|| trimmed.strip_prefix("~\\"))
+        {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+fn normalized_config_dir_key(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text.make_ascii_lowercase();
+    }
+    text
 }
 
 fn permission_status_row(

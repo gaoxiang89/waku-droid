@@ -265,11 +265,55 @@ pub fn resolve_binary_override(spec: &str) -> Option<PathBuf> {
     if spec.is_empty() {
         return None;
     }
-    if let Some(rest) = spec.strip_prefix("~/") {
+    if let Some(rest) = spec.strip_prefix("~/").or_else(|| spec.strip_prefix("~\\")) {
         let candidate = dirs::home_dir()?.join(rest);
         return candidate.is_file().then_some(candidate);
     }
     find_executable(spec)
+}
+
+/// Resolve an account-scoped configuration directory on the daemon host.
+///
+/// Expands `~` against the daemon host's home directory without requiring the
+/// directory to exist yet — provider CLIs initialize missing directories on
+/// first sign-in or launch.
+pub fn resolve_config_dir(spec: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    if spec == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = spec.strip_prefix("~/").or_else(|| spec.strip_prefix("~\\")) {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(spec))
+}
+
+/// Inject the provider-specific configuration root environment variable when a
+/// custom account directory is active.
+///
+/// When `config_dir` is `None` (the default account), no variable is set:
+/// setting `CLAUDE_CONFIG_DIR` even to `~/.claude` makes Claude Code hash the
+/// path for its macOS Keychain lookup and miss the default login item.
+pub fn apply_provider_config_dir(
+    command: &mut Command,
+    provider: crate::model::ProviderKind,
+    config_dir: Option<&Path>,
+) {
+    let Some(dir) = config_dir else {
+        return;
+    };
+    match provider {
+        crate::model::ProviderKind::Claude => {
+            command.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        crate::model::ProviderKind::Codex => {
+            command.env("CODEX_HOME", dir);
+        }
+        _ => {}
+    }
 }
 
 pub fn executable_search_path() -> Option<std::ffi::OsString> {
@@ -1326,5 +1370,64 @@ mod tests {
         );
         let _ = fs::remove_file(shell);
         let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn resolve_config_dir_expands_tilde_without_requiring_existing_path() {
+        assert_eq!(resolve_config_dir("   "), None);
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(resolve_config_dir("~"), Some(home.clone()));
+            assert_eq!(
+                resolve_config_dir("~/.claude_work"),
+                Some(home.join(".claude_work"))
+            );
+            assert_eq!(
+                resolve_config_dir("~\\.codex_work"),
+                Some(home.join(".codex_work"))
+            );
+        }
+        assert_eq!(
+            resolve_config_dir(" /tmp/custom-claude "),
+            Some(PathBuf::from("/tmp/custom-claude"))
+        );
+    }
+
+    #[test]
+    fn apply_provider_config_dir_sets_only_custom_account_env() {
+        let mut default_claude = plain_command("echo");
+        apply_provider_config_dir(
+            &mut default_claude,
+            crate::model::ProviderKind::Claude,
+            None,
+        );
+        assert!(default_claude.get_envs().count() == 0);
+
+        let mut work_claude = plain_command("echo");
+        apply_provider_config_dir(
+            &mut work_claude,
+            crate::model::ProviderKind::Claude,
+            Some(Path::new("/tmp/claude-work")),
+        );
+        assert_eq!(
+            work_claude.get_envs().collect::<Vec<_>>(),
+            vec![(
+                OsStr::new("CLAUDE_CONFIG_DIR"),
+                Some(OsStr::new("/tmp/claude-work"))
+            )]
+        );
+
+        let mut work_codex = plain_command("echo");
+        apply_provider_config_dir(
+            &mut work_codex,
+            crate::model::ProviderKind::Codex,
+            Some(Path::new("/tmp/codex-work")),
+        );
+        assert_eq!(
+            work_codex.get_envs().collect::<Vec<_>>(),
+            vec![(
+                OsStr::new("CODEX_HOME"),
+                Some(OsStr::new("/tmp/codex-work"))
+            )]
+        );
     }
 }

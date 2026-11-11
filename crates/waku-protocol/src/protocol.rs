@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -150,12 +150,16 @@ pub enum Command {
     ProbeProvider {
         provider: ProviderKind,
         binary_override: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
         discover_models: bool,
         probe_version: bool,
     },
     FetchPlanUsage {
         provider: ProviderKind,
         binary_override: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
         cli_version: Option<String>,
     },
     ProbeComputerPermissions {
@@ -199,11 +203,15 @@ pub enum Command {
     /// List one provider's resumable CLI conversations on the daemon host.
     ListProviderSessions {
         provider: ProviderKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
         limit: usize,
     },
     /// Load the user-visible transcript for one provider-native conversation.
     LoadProviderSession {
         cursor: ProviderResumeCursor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
         cwd: PathBuf,
     },
     LoadComposerDrafts,
@@ -286,6 +294,8 @@ pub enum Command {
 pub struct WireDriverStartOptions {
     pub provider: String,
     pub binary: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
     pub cwd: PathBuf,
     pub mode: String,
     pub model: Option<String>,
@@ -576,7 +586,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -585,18 +595,20 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
     fn provider_session_commands_use_stable_wire_fields() {
         let list = serde_json::to_value(Command::ListProviderSessions {
             provider: ProviderKind::Codex,
+            account_id: Some("work".into()),
             limit: 250,
         })
         .unwrap();
         assert_eq!(list["type"], "listProviderSessions");
         assert_eq!(list["provider"], "codex");
+        assert_eq!(list["accountId"], "work");
         assert_eq!(list["limit"], 250);
 
         let load = serde_json::to_value(Command::LoadProviderSession {
@@ -604,6 +616,7 @@ mod tests {
                 thread_id: "01900000-0000-7000-8000-000000000001".into(),
             },
             cwd: PathBuf::from("/tmp/project"),
+            account_id: None,
         })
         .unwrap();
         assert_eq!(load["type"], "loadProviderSession");

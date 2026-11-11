@@ -605,6 +605,22 @@ enum RightPanelSurface {
     GitGraph,
 }
 
+pub(super) type PlanUsageKey = (waku_client::hosts::HostKey, ProviderKind, Option<String>);
+
+pub(super) type SlashCommandCacheKey = (
+    waku_client::hosts::HostKey,
+    ProviderKind,
+    PathBuf,
+    Option<String>,
+    Option<String>,
+);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TurnAgentBadge {
+    pub(super) provider: ProviderKind,
+    pub(super) label: SharedString,
+}
+
 /// A turn whose checkpoint still has to be captured.
 struct PendingCheckpointCapture {
     session_id: Uuid,
@@ -1356,6 +1372,10 @@ pub struct Waku {
     /// override input below edits this provider's entry.
     expanded_provider_settings: Option<ProviderKind>,
     provider_path_input: Entity<TextInput>,
+    account_form_mode: Option<settings::AccountFormMode>,
+    account_label_input: Entity<TextInput>,
+    account_dir_input: Entity<TextInput>,
+    account_form_error: Option<String>,
     /// The host whose catalog the Providers page is showing. The binary
     /// override edits this host's daemon settings, not the desktop's own.
     provider_settings_host: waku_client::hosts::HostKey,
@@ -1364,40 +1384,43 @@ pub struct Waku {
     /// the daemon's live settings are touched in click handlers alone.
     host_provider_overrides: HashMap<waku_client::hosts::HostKey, HashMap<ProviderKind, String>>,
     host_disabled_providers: HashMap<waku_client::hosts::HostKey, Vec<ProviderKind>>,
+    host_provider_accounts: HashMap<waku_client::hosts::HostKey, Vec<waku_client::ProviderAccount>>,
     computer_permissions: ComputerPermissions,
     computer_permission_tx: Sender<Result<ComputerPermissions, String>>,
     computer_permission_events: Receiver<Result<ComputerPermissions, String>>,
     computer_permission_request_pending: bool,
-    /// Account rate-limit meters per provider, fetched off-thread (Claude,
-    /// Codex, and OpenCode Go over HTTPS; Grok through a stdio probe) and
-    /// refreshed live by Codex's own stream. Frames read only this snapshot.
-    plan_usage: HashMap<(waku_client::hosts::HostKey, ProviderKind), crate::usage::PlanUsage>,
+    /// Account rate-limit meters per provider/account, fetched off-thread
+    /// (Claude, Codex, and OpenCode Go over HTTPS; Grok through a stdio probe)
+    /// and refreshed live by Codex's own stream. Frames read only this snapshot.
+    plan_usage: HashMap<PlanUsageKey, crate::usage::PlanUsage>,
     /// Why a provider's last fetch failed, kept alongside stale data for the
     /// meter's tooltip. Cleared by that provider's next success.
-    plan_usage_error: HashMap<(waku_client::hosts::HostKey, ProviderKind), String>,
+    plan_usage_error: HashMap<PlanUsageKey, String>,
     plan_usage_tx: Sender<(
         waku_client::hosts::HostKey,
         u64,
         ProviderKind,
+        Option<String>,
         Result<Option<crate::usage::PlanUsage>, String>,
     )>,
     plan_usage_events: Receiver<(
         waku_client::hosts::HostKey,
         u64,
         ProviderKind,
+        Option<String>,
         Result<Option<crate::usage::PlanUsage>, String>,
     )>,
-    plan_usage_pending: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
+    plan_usage_pending: HashSet<PlanUsageKey>,
     /// Fetchable providers with no matching account credential. Unlike a
     /// request failure, this hides the plan section until a later refresh
     /// discovers a newly configured account.
-    plan_usage_unconfigured: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
+    plan_usage_unconfigured: HashSet<PlanUsageKey>,
     /// When each provider's last fetch settled, successful or not — the
     /// refresh backoff measures from here.
-    plan_usage_checked_at: HashMap<(waku_client::hosts::HostKey, ProviderKind), Instant>,
+    plan_usage_checked_at: HashMap<PlanUsageKey, Instant>,
     /// Providers whose turn settled since the last fetch, so the meters have
     /// moved.
-    plan_usage_stale: HashSet<(waku_client::hosts::HostKey, ProviderKind)>,
+    plan_usage_stale: HashSet<PlanUsageKey>,
     /// The settings Usage page's snapshot: historical token/cost usage
     /// scanned from provider transcripts off-thread. Frames read only this.
     usage_history: Option<crate::usage_history::UsageHistory>,
@@ -1451,6 +1474,7 @@ pub struct Waku {
     /// nothing to offer) and hides the control.
     open_in_apps: Rc<Vec<crate::platform::ExternalApp>>,
     model_picker_tab: ModelPickerTab,
+    model_picker_account: HashMap<ProviderKind, Option<String>>,
     /// Keyboard cursor over the model picker's filtered rows. `None` means the
     /// keyboard has not moved yet, so `enter` takes the first row.
     model_picker_highlight: Option<usize>,
@@ -1532,27 +1556,14 @@ pub struct Waku {
     /// started them. Keeping the operation on the app also lets every
     /// Environment surface reflect and gate the same in-flight action.
     commit_operation: Option<commit_dialog::CommitOperationState>,
-    /// Slash commands discovered per (host, provider, project root, CLI override).
+    /// Slash commands discovered per (host, provider, project root, CLI override, account).
     /// Filesystem and CLI probes live off the UI thread; frames read this cache.
-    slash_commands: QueryCache<
-        (
-            waku_client::hosts::HostKey,
-            ProviderKind,
-            PathBuf,
-            Option<String>,
-        ),
-        Vec<SlashCommand>,
-    >,
+    slash_commands: QueryCache<SlashCommandCacheKey, Vec<SlashCommand>>,
     /// The merged command list the autocomplete popup draws, and the key it
     /// was built for — a stale key means "no commands", never another
     /// provider's list.
     slash_command_index: Rc<Vec<SlashCommand>>,
-    slash_command_index_key: Option<(
-        waku_client::hosts::HostKey,
-        ProviderKind,
-        PathBuf,
-        Option<String>,
-    )>,
+    slash_command_index_key: Option<SlashCommandCacheKey>,
     slash_command_index_loading: bool,
     /// Workspace file index per project scope, for `@` mentions.
     mention_files: QueryCache<PanelScope, Vec<FileEntry>>,
@@ -1881,7 +1892,7 @@ pub struct Waku {
     /// Provider badge per visible assistant message index in a mixed-agent
     /// session, rebuilt in one linear pass when the row-kinds fingerprint
     /// moves so `transcript_row` stays O(1) per visible row.
-    assistant_turn_provider_cache: RefCell<HashMap<usize, ProviderKind>>,
+    assistant_turn_provider_cache: RefCell<HashMap<usize, TurnAgentBadge>>,
     /// The row-kinds fingerprint `assistant_turn_provider_cache` was built under.
     assistant_turn_provider_fingerprint: Cell<Option<u64>>,
     /// Selected `(session_id, has_mixed_providers)` last reconciled with the
@@ -2509,6 +2520,19 @@ impl Waku {
             TextInput::new(window, cx)
                 .select_all_on_focus_click()
                 .placeholder(tr!("input.detected_automatically"))
+        });
+        let account_label_input = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .select_all_on_focus_click()
+                .placeholder(tr!("providers.account_name_placeholder"))
+        });
+        let account_dir_input = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .select_all_on_focus_click()
+                .placeholder(tr!(
+                    "providers.account_config_dir_placeholder",
+                    path = "~/.claude-work"
+                ))
         });
         let usage_project_filter =
             cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("input.filter_projects")));
@@ -3191,6 +3215,21 @@ impl Waku {
                 },
             )
             .detach();
+            for input in [&account_label_input, &account_dir_input] {
+                cx.subscribe(
+                    input,
+                    |this: &mut Self, _, event: &InputEvent, cx| match event {
+                        InputEvent::Submit(_) => this.save_provider_account_form(cx),
+                        InputEvent::Edited => {
+                            if this.account_form_error.take().is_some() {
+                                cx.notify();
+                            }
+                        }
+                        _ => {}
+                    },
+                )
+                .detach();
+            }
 
             // Like T3 Code's adapter subscriptions feeding its ingestion
             // worker, provider threads push an edge into this bounded wake
@@ -3370,9 +3409,14 @@ impl Waku {
                 provider_detection_checked_at: None,
                 expanded_provider_settings: None,
                 provider_path_input,
+                account_form_mode: None,
+                account_label_input,
+                account_dir_input,
+                account_form_error: None,
                 provider_settings_host: waku_client::hosts::HostKey::Local,
                 host_provider_overrides: HashMap::new(),
                 host_disabled_providers: HashMap::new(),
+                host_provider_accounts: HashMap::new(),
                 computer_permissions: ComputerPermissions::default(),
                 computer_permission_tx,
                 computer_permission_events,
@@ -3408,6 +3452,7 @@ impl Waku {
                 computer_use_app_icon_loads: RefCell::new(HashSet::new()),
                 open_in_apps: Rc::new(Vec::new()),
                 model_picker_tab,
+                model_picker_account: HashMap::new(),
                 model_picker_highlight: None,
                 model_picker_scroll: ScrollHandle::new(),
                 model_picker_scrollbar: ScrollbarState::new(),

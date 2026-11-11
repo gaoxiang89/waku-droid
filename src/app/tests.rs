@@ -2110,7 +2110,7 @@ fn switched_off_providers_leave_the_picker() {
 
 #[test]
 fn model_picker_subtitle_deduplicates_the_provider_name() {
-    use super::composer::model_picker_subtitle;
+    use super::composer::{model_picker_entry_subtitle, model_picker_subtitle};
 
     assert_eq!(
         model_picker_subtitle(ProviderKind::DeepSeek, Some("DeepSeek")),
@@ -2120,6 +2120,94 @@ fn model_picker_subtitle_deduplicates_the_provider_name() {
         model_picker_subtitle(ProviderKind::DeepSeek, Some("OpenAI")),
         "OpenAI · DeepSeek"
     );
+    assert_eq!(
+        model_picker_entry_subtitle(ProviderKind::Claude, Some("Work"), None),
+        "Claude · Work"
+    );
+    assert_eq!(
+        model_picker_entry_subtitle(ProviderKind::DeepSeek, Some("Work"), Some("OpenAI")),
+        "OpenAI · DeepSeek · Work"
+    );
+}
+
+#[test]
+fn model_picker_entries_expand_accounts_in_search_and_filter_provider_tab_by_account() {
+    use super::ModelPickerTab;
+    use super::composer::visible_picker_entries;
+    use crate::model::{ProviderModel, ProviderProbe};
+    use waku_protocol::ProviderAccount;
+
+    let probes = [
+        ProviderProbe {
+            provider: ProviderKind::Claude,
+            installed: true,
+            path: Some("/bin/claude".into()),
+            models: vec![ProviderModel::new("claude-sonnet-4-6", "Sonnet 4.6")],
+            agent_presets: Vec::new(),
+            discovery_error: None,
+        },
+        ProviderProbe {
+            provider: ProviderKind::Codex,
+            installed: true,
+            path: Some("/bin/codex".into()),
+            models: vec![ProviderModel::new("gpt-5.4", "GPT-5.4")],
+            agent_presets: Vec::new(),
+            discovery_error: None,
+        },
+    ];
+    let accounts = [ProviderAccount {
+        id: "work".into(),
+        provider: ProviderKind::Claude,
+        label: "Work".into(),
+        config_dir: "/tmp/claude-work".into(),
+        binary_override: None,
+    }];
+
+    // Provider tab with no account filter selects only the Default account.
+    let no_active = std::collections::HashMap::new();
+    let default_entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &no_active,
+        ModelPickerTab::Provider(ProviderKind::Claude),
+        "",
+    );
+    assert_eq!(default_entries.len(), 1);
+    assert_eq!(default_entries[0].account_id, None);
+    assert_eq!(default_entries[0].account_label, None);
+
+    // Selecting the named account scopes the Provider tab to that account.
+    let work_active =
+        std::collections::HashMap::from([(ProviderKind::Claude, Some("work".to_owned()))]);
+    let work_entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &work_active,
+        ModelPickerTab::Provider(ProviderKind::Claude),
+        "",
+    );
+    assert_eq!(work_entries.len(), 1);
+    assert_eq!(work_entries[0].account_id.as_deref(), Some("work"));
+    assert_eq!(work_entries[0].account_label.as_deref(), Some("Work"));
+
+    // Querying from Favorites expands both Default and configured accounts and
+    // matches against the account label (`claude work`).
+    let search_entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &no_active,
+        ModelPickerTab::Favorites,
+        "claude work",
+    );
+    assert_eq!(search_entries.len(), 1);
+    assert_eq!(search_entries[0].provider, ProviderKind::Claude);
+    assert_eq!(search_entries[0].account_id.as_deref(), Some("work"));
 }
 
 #[test]

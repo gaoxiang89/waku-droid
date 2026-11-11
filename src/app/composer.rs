@@ -934,10 +934,21 @@ impl Waku {
 
     pub(super) fn render_provider_model_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
+        let host_key = self.selected_host_key();
         let session = self.selected_session();
         let provider = session.map(|session| session.provider).unwrap_or_default();
+        let session_account_id = session.and_then(|session| {
+            self.validated_account_id_for_host(&host_key, provider, session.account_id.as_deref())
+        });
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
-        let selected_model_name = self.model_display_name(provider, selected_model);
+        let base_model_name = self.model_display_name(provider, selected_model);
+        let selected_model_name = if let Some(account) =
+            self.account_for_host(&host_key, provider, session_account_id.as_deref())
+        {
+            format!("{base_model_name} · {}", account.label)
+        } else {
+            base_model_name
+        };
         let picker_enabled = session.is_some_and(|session| session.can_choose_model());
 
         if !picker_enabled {
@@ -968,9 +979,9 @@ impl Waku {
         let selected_tab = self.model_picker_tab;
         let selected_model = selected_model.map(str::to_owned);
         let probes = self.provider_probes().to_vec();
-        let disabled_providers = self
-            .disabled_providers_for(&self.selected_host_key())
-            .to_vec();
+        let disabled_providers = self.disabled_providers_for(&host_key).to_vec();
+        let host_accounts = self.provider_accounts_for(&host_key).to_vec();
+        let active_accounts = self.model_picker_account.clone();
         let pending_discoveries = self.pending_model_discoveries().clone();
         let favorites = self.state.favorite_models.clone();
         let weak = cx.entity().downgrade();
@@ -991,25 +1002,36 @@ impl Waku {
                 let _ = reset_weak.update(cx, |this, cx| {
                     if open {
                         empty = this.model_picker_has_no_providers();
-                        let provider = this
+                        let open_host = this.selected_host_key();
+                        let (session_provider, session_account) = this
                             .selected_session()
-                            .map(|session| session.provider)
+                            .map(|session| (session.provider, session.account_id.clone()))
                             .unwrap_or_default();
                         // A task can sit on a provider that was since switched
                         // off; open onto the first usable provider instead of a
                         // tab whose rows the filter would leave empty.
                         let provider = if this
-                            .disabled_providers_for(&this.selected_host_key())
-                            .contains(&provider)
+                            .disabled_providers_for(&open_host)
+                            .contains(&session_provider)
                         {
                             ProviderKind::ALL
                                 .into_iter()
                                 .find(|kind| this.provider_enabled(*kind))
-                                .unwrap_or(provider)
+                                .unwrap_or(session_provider)
                         } else {
-                            provider
+                            session_provider
+                        };
+                        let open_account = if provider == session_provider {
+                            this.validated_account_id_for_host(
+                                &open_host,
+                                provider,
+                                session_account.as_deref(),
+                            )
+                        } else {
+                            None
                         };
                         this.model_picker_tab = ModelPickerTab::Provider(provider);
+                        this.model_picker_account.insert(provider, open_account);
                         // Opening re-runs the tab's catalog discovery so models
                         // authored since launch appear without a restart; the
                         // other rails refresh when selected, not all at once.
@@ -1056,10 +1078,12 @@ impl Waku {
         // rendered rows index one ordering and cannot disagree about what
         // `enter` selects.
         let available_models = Rc::new(if handle.is_open() {
-            visible_picker_models(
+            visible_picker_entries(
                 &probes,
                 &favorites,
                 &disabled_providers,
+                &host_accounts,
+                &active_accounts,
                 selected_tab,
                 &normalized_query,
             )
@@ -1223,6 +1247,165 @@ impl Waku {
                             .child(div().flex_1().min_w_0().child(search.clone())),
                     );
 
+                let account_bar = if !searching
+                    && let ModelPickerTab::Provider(tab_provider) = selected_tab
+                    && tab_provider.supports_multiple_accounts()
+                {
+                    let tab_accounts = host_accounts
+                        .iter()
+                        .filter(|account| account.provider == tab_provider)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (!tab_accounts.is_empty()).then(|| {
+                        let active_account = active_accounts
+                            .get(&tab_provider)
+                            .and_then(Option::as_deref)
+                            .filter(|id| tab_accounts.iter().any(|account| account.id == *id));
+                        let mut pills = div()
+                            .px(px(12.0))
+                            .pb(px(6.0))
+                            .flex_none()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(5.0));
+
+                        let default_selected = active_account.is_none();
+                        let default_weak = weak.clone();
+                        let key_default_weak = weak.clone();
+                        pills = pills.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "model-picker-account-default-{}",
+                                    tab_provider.id()
+                                )))
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .h(px(24.0))
+                                .px(px(9.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(if default_selected {
+                                    theme.border_strong
+                                } else {
+                                    theme.border
+                                })
+                                .when(default_selected, |pill| pill.bg(theme.overlay_strong))
+                                .when(!default_selected, |pill| {
+                                    pill.hover(|pill| pill.bg(theme.overlay))
+                                })
+                                .flex()
+                                .items_center()
+                                .cursor_default()
+                                .text_size(sp(11.5))
+                                .font_weight(if default_selected {
+                                    FontWeight::MEDIUM
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(if default_selected {
+                                    theme.text
+                                } else {
+                                    theme.text_secondary
+                                })
+                                .child(tr!("providers.default_account"))
+                                .on_click(move |_, _, cx| {
+                                    let _ = default_weak.update(cx, |this, cx| {
+                                        this.select_model_picker_account(tab_provider, None, cx);
+                                    });
+                                })
+                                .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                    if !event.keystroke.modifiers.modified()
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        let _ = key_default_weak.update(cx, |this, cx| {
+                                            this.select_model_picker_account(
+                                                tab_provider,
+                                                None,
+                                                cx,
+                                            );
+                                        });
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                        );
+
+                        for account in tab_accounts {
+                            let pill_selected = active_account == Some(account.id.as_str());
+                            let click_id = account.id.clone();
+                            let key_id = account.id.clone();
+                            let pill_weak = weak.clone();
+                            let key_pill_weak = weak.clone();
+                            pills = pills.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "model-picker-account-{}",
+                                        account.id
+                                    )))
+                                    .tab_index(0)
+                                    .focus_visible(|style| style.border_color(theme.accent))
+                                    .h(px(24.0))
+                                    .px(px(9.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(if pill_selected {
+                                        theme.border_strong
+                                    } else {
+                                        theme.border
+                                    })
+                                    .when(pill_selected, |pill| pill.bg(theme.overlay_strong))
+                                    .when(!pill_selected, |pill| {
+                                        pill.hover(|pill| pill.bg(theme.overlay))
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .cursor_default()
+                                    .text_size(sp(11.5))
+                                    .font_weight(if pill_selected {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(if pill_selected {
+                                        theme.text
+                                    } else {
+                                        theme.text_secondary
+                                    })
+                                    .child(SharedString::from(account.label))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = pill_weak.update(cx, |this, cx| {
+                                            this.select_model_picker_account(
+                                                tab_provider,
+                                                Some(click_id.clone()),
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                        if !event.keystroke.modifiers.modified()
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            let _ = key_pill_weak.update(cx, |this, cx| {
+                                                this.select_model_picker_account(
+                                                    tab_provider,
+                                                    Some(key_id.clone()),
+                                                    cx,
+                                                );
+                                            });
+                                            cx.stop_propagation();
+                                        }
+                                    }),
+                            );
+                        }
+                        pills
+                    })
+                } else {
+                    None
+                };
+
                 let mut rows = div()
                     .id("model-picker-list")
                     .size_full()
@@ -1264,25 +1447,38 @@ impl Waku {
                     );
                 }
 
-                for (row_index, (kind, model)) in available_models.iter().enumerate() {
-                    let kind = *kind;
-                    let is_selected =
-                        kind == provider && selected_model.as_deref() == Some(model.id.as_str());
+                for (row_index, entry) in available_models.iter().enumerate() {
+                    let kind = entry.provider;
+                    let model = &entry.model;
+                    let is_selected = kind == provider
+                        && entry.account_id == session_account_id
+                        && selected_model.as_deref() == Some(model.id.as_str());
                     let is_highlighted = highlight == Some(row_index);
                     let is_favorite = favorites
                         .iter()
                         .any(|favorite| favorite.provider == kind && favorite.model == model.id);
                     let model_id = model.id.clone();
+                    let row_account_id = entry.account_id.clone();
                     let select_weak = weak.clone();
                     let select_popover = popover.clone();
                     let favorite_model_id = model.id.clone();
                     let favorite_weak = weak.clone();
-                    let subtitle = model_picker_subtitle(kind, model.sub_provider.as_deref());
+                    let show_account_in_subtitle =
+                        searching || selected_tab == ModelPickerTab::Favorites;
+                    let subtitle = model_picker_entry_subtitle(
+                        kind,
+                        show_account_in_subtitle
+                            .then_some(entry.account_label.as_deref())
+                            .flatten(),
+                        model.sub_provider.as_deref(),
+                    );
+                    let row_suffix = entry.account_id.as_deref().unwrap_or("default");
                     rows = rows.child(
                         div()
                             .id(SharedString::from(format!(
-                                "model-row-{}-{}",
+                                "model-row-{}-{}-{}",
                                 kind.id(),
+                                row_suffix,
                                 model.id
                             )))
                             .h(px(58.0))
@@ -1340,8 +1536,9 @@ impl Waku {
                             .child(
                                 div()
                                     .id(SharedString::from(format!(
-                                        "favorite-model-{}-{}",
+                                        "favorite-model-{}-{}-{}",
                                         kind.id(),
+                                        row_suffix,
                                         model.id
                                     )))
                                     .w(px(28.0))
@@ -1377,7 +1574,12 @@ impl Waku {
                             )
                             .on_click(move |_, window, cx| {
                                 let _ = select_weak.update(cx, |this, cx| {
-                                    this.choose_model(kind, model_id.clone(), cx);
+                                    this.choose_agent_model(
+                                        kind,
+                                        row_account_id.clone(),
+                                        model_id.clone(),
+                                        cx,
+                                    );
                                 });
                                 select_popover.close(window, cx);
                             }),
@@ -1446,6 +1648,7 @@ impl Waku {
                             .rounded_br(px(12.0))
                             .bg(theme.surface)
                             .child(search_input)
+                            .when_some(account_bar, |panel, bar| panel.child(bar))
                             .child(
                                 div()
                                     .flex_1()
@@ -1460,12 +1663,30 @@ impl Waku {
         )
     }
 
+    fn select_model_picker_account(
+        &mut self,
+        provider: ProviderKind,
+        account_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let host_key = self.selected_host_key();
+        let validated =
+            self.validated_account_id_for_host(&host_key, provider, account_id.as_deref());
+        if self.model_picker_account.get(&provider) == Some(&validated) {
+            return;
+        }
+        self.model_picker_account.insert(provider, validated);
+        self.model_picker_highlight = None;
+        self.reveal_selected_picker_model();
+        cx.notify();
+    }
+
     /// Move the picker's drawn selection. Nothing is focused: the filter field
     /// keeps focus so typing continues to narrow the list.
     fn move_model_picker_highlight(
         &mut self,
         key: &str,
-        models: &[(ProviderKind, ProviderModel)],
+        models: &[PickerModelEntry],
         cx: &mut Context<Self>,
     ) {
         let current = self
@@ -1508,37 +1729,46 @@ impl Waku {
     /// they arrive. Without a row to reveal it falls back to the top, so a
     /// scroll offset from an earlier open never leaks into a fresh list.
     pub(super) fn reveal_selected_picker_model(&self) {
+        let host_key = self.selected_host_key();
         let session = self.selected_session();
         let provider = session.map(|session| session.provider).unwrap_or_default();
+        let session_account_id = session.and_then(|session| {
+            self.validated_account_id_for_host(&host_key, provider, session.account_id.as_deref())
+        });
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
-        let disabled = self
-            .disabled_providers_for(&self.selected_host_key())
-            .to_vec();
-        let index = visible_picker_models(
+        let disabled = self.disabled_providers_for(&host_key).to_vec();
+        let accounts = self.provider_accounts_for(&host_key).to_vec();
+        let index = visible_picker_entries(
             self.provider_probes(),
             &self.state.favorite_models,
             &disabled,
+            &accounts,
+            &self.model_picker_account,
             self.model_picker_tab,
             "",
         )
         .iter()
-        .position(|(kind, model)| *kind == provider && selected_model == Some(model.id.as_str()))
+        .position(|entry| {
+            entry.provider == provider
+                && entry.account_id == session_account_id
+                && selected_model == Some(entry.model.id.as_str())
+        })
         .unwrap_or(0);
         self.model_picker_scroll.scroll_to_item(index);
     }
 
     /// Take the row the selection is on, defaulting to the first so `enter`
     /// works the moment the panel opens.
-    fn choose_highlighted_model(
-        &mut self,
-        models: &[(ProviderKind, ProviderModel)],
-        cx: &mut Context<Self>,
-    ) {
-        let Some((kind, model)) = models.get(self.model_picker_highlight.unwrap_or(0)) else {
+    fn choose_highlighted_model(&mut self, models: &[PickerModelEntry], cx: &mut Context<Self>) {
+        let Some(entry) = models.get(self.model_picker_highlight.unwrap_or(0)) else {
             return;
         };
-        let (kind, model_id) = (*kind, model.id.clone());
-        self.choose_model(kind, model_id, cx);
+        let (kind, account_id, model_id) = (
+            entry.provider,
+            entry.account_id.clone(),
+            entry.model.id.clone(),
+        );
+        self.choose_agent_model(kind, account_id, model_id, cx);
     }
 
     pub(super) fn render_model_traits_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3997,12 +4227,36 @@ pub(super) fn picker_rail_shows_provider(
     installed && !disabled_providers.contains(&kind)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PickerModelEntry {
+    pub(super) provider: ProviderKind,
+    pub(super) account_id: Option<String>,
+    pub(super) account_label: Option<String>,
+    pub(super) model: ProviderModel,
+}
+
+#[cfg(test)]
 pub(super) fn model_picker_subtitle(provider: ProviderKind, sub_provider: Option<&str>) -> String {
+    model_picker_entry_subtitle(provider, None, sub_provider)
+}
+
+pub(super) fn model_picker_entry_subtitle(
+    provider: ProviderKind,
+    account_label: Option<&str>,
+    sub_provider: Option<&str>,
+) -> String {
     let provider_name = provider.short_name();
-    match sub_provider.map(str::trim).filter(|name| !name.is_empty()) {
+    let base = match sub_provider.map(str::trim).filter(|name| !name.is_empty()) {
         Some(name) if name.eq_ignore_ascii_case(provider_name) => provider_name.to_owned(),
         Some(name) => format!("{name} · {provider_name}"),
         None => provider_name.to_owned(),
+    };
+    match account_label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        Some(label) => format!("{base} · {label}"),
+        None => base,
     }
 }
 
@@ -4028,6 +4282,7 @@ pub(super) fn picker_has_no_providers(
 ///
 /// Shared by the panel body and by `enter`'s handler so a keyboard cursor index
 /// always means the same row in both.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn visible_picker_models(
     probes: &[ProviderProbe],
     favorites: &[FavoriteModel],
@@ -4035,48 +4290,125 @@ pub(super) fn visible_picker_models(
     selected_tab: ModelPickerTab,
     normalized_query: &str,
 ) -> Vec<(ProviderKind, ProviderModel)> {
+    visible_picker_entries(
+        probes,
+        favorites,
+        disabled_providers,
+        &[],
+        &HashMap::new(),
+        selected_tab,
+        normalized_query,
+    )
+    .into_iter()
+    .map(|entry| (entry.provider, entry.model))
+    .collect()
+}
+
+pub(super) fn visible_picker_entries(
+    probes: &[ProviderProbe],
+    favorites: &[FavoriteModel],
+    disabled_providers: &[ProviderKind],
+    accounts: &[waku_client::ProviderAccount],
+    active_accounts: &HashMap<ProviderKind, Option<String>>,
+    selected_tab: ModelPickerTab,
+    normalized_query: &str,
+) -> Vec<PickerModelEntry> {
     let searching = !normalized_query.is_empty();
-    let mut models = probes
-        .iter()
-        .filter(|probe| probe.installed)
-        .flat_map(|probe| {
-            probe
-                .models
+    let default_label = tr!("providers.default_account");
+    let mut entries = Vec::new();
+
+    for probe in probes.iter().filter(|probe| probe.installed) {
+        let kind = probe.provider;
+        if disabled_providers.contains(&kind) {
+            continue;
+        }
+        let kind_accounts = if kind.supports_multiple_accounts() {
+            accounts
                 .iter()
-                .cloned()
-                .map(move |model| (probe.provider, model))
-        })
-        // A switched-off provider offers nothing, including favorites.
-        .filter(|(kind, _)| !disabled_providers.contains(kind))
-        .filter(|(kind, model)| {
-            if searching {
-                let searchable = format!(
-                    "{} {} {} {}",
-                    model.name,
-                    model.id,
-                    kind.short_name(),
-                    model.sub_provider.as_deref().unwrap_or("")
-                )
-                .to_ascii_lowercase();
-                return normalized_query
-                    .split_whitespace()
-                    .all(|token| searchable.contains(token));
+                .filter(|account| account.provider == kind)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let has_extra_accounts = !kind_accounts.is_empty();
+
+        let account_targets: Vec<(Option<String>, Option<String>)> = if searching {
+            let mut targets = vec![(None, has_extra_accounts.then(|| default_label.clone()))];
+            for account in &kind_accounts {
+                targets.push((Some(account.id.clone()), Some(account.label.clone())));
             }
+            targets
+        } else {
             match selected_tab {
-                ModelPickerTab::Favorites => favorites
-                    .iter()
-                    .any(|favorite| favorite.provider == *kind && favorite.model == model.id),
-                ModelPickerTab::Provider(provider) => provider == *kind,
+                ModelPickerTab::Provider(tab_provider) if tab_provider != kind => continue,
+                ModelPickerTab::Provider(_) | ModelPickerTab::Favorites => {
+                    let chosen = active_accounts
+                        .get(&kind)
+                        .and_then(Option::as_deref)
+                        .and_then(|id| {
+                            kind_accounts
+                                .iter()
+                                .find(|account| account.id == id)
+                                .copied()
+                        });
+                    match chosen {
+                        Some(account) => {
+                            vec![(Some(account.id.clone()), Some(account.label.clone()))]
+                        }
+                        None => vec![(
+                            None,
+                            (selected_tab == ModelPickerTab::Favorites && has_extra_accounts)
+                                .then(|| default_label.clone()),
+                        )],
+                    }
+                }
             }
-        })
-        .collect::<Vec<_>>();
+        };
+
+        for (account_id, account_label) in account_targets {
+            for model in &probe.models {
+                if searching {
+                    let searchable = format!(
+                        "{} {} {} {} {}",
+                        model.name,
+                        model.id,
+                        kind.short_name(),
+                        model.sub_provider.as_deref().unwrap_or(""),
+                        account_label.as_deref().unwrap_or("")
+                    )
+                    .to_ascii_lowercase();
+                    if !normalized_query
+                        .split_whitespace()
+                        .all(|token| searchable.contains(token))
+                    {
+                        continue;
+                    }
+                } else if selected_tab == ModelPickerTab::Favorites
+                    && !favorites
+                        .iter()
+                        .any(|favorite| favorite.provider == kind && favorite.model == model.id)
+                {
+                    continue;
+                }
+                entries.push(PickerModelEntry {
+                    provider: kind,
+                    account_id: account_id.clone(),
+                    account_label: account_label.clone(),
+                    model: model.clone(),
+                });
+            }
+        }
+    }
+
     if !searching && selected_tab == ModelPickerTab::Favorites {
-        models.sort_by_key(|(kind, model)| {
+        entries.sort_by_key(|entry| {
             favorites
                 .iter()
-                .position(|favorite| favorite.provider == *kind && favorite.model == model.id)
+                .position(|favorite| {
+                    favorite.provider == entry.provider && favorite.model == entry.model.id
+                })
                 .unwrap_or(usize::MAX)
         });
     }
-    models
+    entries
 }

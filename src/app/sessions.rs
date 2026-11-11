@@ -406,15 +406,22 @@ impl Waku {
         if let Some((
             project_id,
             provider,
+            account_id,
             runtime_mode,
             model,
             reasoning_effort,
             service_tier,
             context_window,
         )) = self.selected_session().map(|session| {
+            let host = self.hosts.ownership.session(session.id);
             (
                 session.project_id,
                 session.provider,
+                self.validated_account_id_for_host(
+                    &host,
+                    session.provider,
+                    session.account_id.as_deref(),
+                ),
                 session.runtime_mode,
                 session.model.clone(),
                 session.reasoning_effort.clone(),
@@ -424,6 +431,7 @@ impl Waku {
         }) {
             self.state.selected_project = Some(project_id);
             self.state.last_provider = provider;
+            self.state.last_account_id = account_id;
             self.state.last_runtime_mode = runtime_mode;
             self.state.last_model = model;
             self.state.last_reasoning_effort = reasoning_effort;
@@ -515,7 +523,17 @@ impl Waku {
         // new draft starts on.
         let host = self.hosts.ownership.project(project_id);
         let provider = self.provider_enabled_for_new_session(&host, provider);
+        let remembered_account = (provider == self.state.last_provider)
+            .then(|| {
+                self.validated_account_id_for_host(
+                    &host,
+                    provider,
+                    self.state.last_account_id.as_deref(),
+                )
+            })
+            .flatten();
         let mut session = self.state.new_session(project_id, provider);
+        session.account_id = remembered_account;
         session.runtime_mode = runtime_mode;
         let id = session.id;
         self.hosts
@@ -1273,20 +1291,53 @@ impl Waku {
         );
     }
 
+    #[allow(dead_code)]
     pub(super) fn choose_model(
         &mut self,
         provider: ProviderKind,
         model: String,
         cx: &mut Context<Self>,
     ) {
-        let Some((session_id, provider_changed)) = self
+        let account_id = self
+            .selected_session()
+            .filter(|session| session.provider == provider)
+            .and_then(|session| session.account_id.clone());
+        self.choose_agent_model(provider, account_id, model, cx);
+    }
+
+    pub(super) fn choose_agent_model(
+        &mut self,
+        provider: ProviderKind,
+        account_id: Option<String>,
+        model: String,
+        cx: &mut Context<Self>,
+    ) {
+        let host_key = self.selected_host_key();
+        let account_id =
+            self.validated_account_id_for_host(&host_key, provider, account_id.as_deref());
+        let Some((session_id, agent_changed)) = self
             .selected_session()
             .filter(|session| {
+                let current_account = self.validated_account_id_for_host(
+                    &host_key,
+                    session.provider,
+                    session.account_id.as_deref(),
+                );
+                let agent_changed = session.provider != provider || current_account != account_id;
                 session.can_choose_model()
-                    && (session.provider != provider
-                        || session.model.as_deref() != Some(model.as_str()))
+                    && (agent_changed || session.model.as_deref() != Some(model.as_str()))
             })
-            .map(|session| (session.id, session.provider != provider))
+            .map(|session| {
+                let current_account = self.validated_account_id_for_host(
+                    &host_key,
+                    session.provider,
+                    session.account_id.as_deref(),
+                );
+                (
+                    session.id,
+                    session.provider != provider || current_account != account_id,
+                )
+            })
         else {
             return;
         };
@@ -1297,53 +1348,62 @@ impl Waku {
         let mut carried_turns = 0;
         let mut resumed_agent = false;
         if let Some(session) = self.selected_session_mut() {
-            if provider_changed {
+            if agent_changed {
                 // Switching parks the outgoing agent's cursor and adopts the
-                // incoming one's, so returning to an agent resumes its own
-                // conversation instead of starting over.
-                resumed_agent = session.switch_provider(provider);
+                // incoming one's (keyed by provider + account), so returning
+                // to an account resumes its own conversation instead of
+                // starting over.
+                resumed_agent = session.switch_agent(provider, account_id.clone());
                 carried_turns = session.turns.len();
                 session.agent_preset = None;
+            } else {
+                session.account_id = account_id.clone();
             }
             session.model = Some(model.clone());
             session.reasoning_effort.clone_from(&reasoning_effort);
             session.service_tier.clone_from(&service_tier);
             session.context_window.clone_from(&context_window);
             self.state.last_provider = provider;
+            self.state.last_account_id = account_id.clone();
             self.state.last_model = Some(model);
             self.state.last_reasoning_effort = reasoning_effort;
             self.state.last_service_tier = service_tier;
             self.state.last_context_window = context_window;
             self.model_picker_tab = ModelPickerTab::Provider(provider);
-            // A different provider is a different binary and protocol; only a
-            // model change within one provider can be applied in session.
-            if provider_changed {
+            self.model_picker_account
+                .insert(provider, account_id.clone());
+            // A different provider or account is a different environment/cursor;
+            // only a model change within one agent instance applies in session.
+            if agent_changed {
                 self.reset_session_runtime(session_id);
-                // A different provider is also a different command registry.
+                // A different provider or account is also a different command
+                // registry and rate-limit meter.
                 self.refresh_composer_sources(cx);
+                self.plan_usage_stale
+                    .insert((host_key.clone(), provider, account_id.clone()));
+                self.maybe_refresh_plan_usage(cx);
             } else {
                 self.apply_session_options(session_id, cx);
             }
             self.save();
             cx.notify();
         }
-        if provider_changed && carried_turns > 0 {
+        if agent_changed && carried_turns > 0 {
+            let agent_name =
+                self.agent_display_name_for_host(&host_key, provider, account_id.as_deref());
             let message = if resumed_agent {
-                tr!(
-                    "session.agent_switch_resumed",
-                    provider = provider.display_name()
-                )
+                tr!("session.agent_switch_resumed", provider = agent_name)
             } else if carried_turns == 1 {
                 tr!(
                     "session.agent_switch_carried_one",
                     count = carried_turns,
-                    provider = provider.display_name()
+                    provider = agent_name
                 )
             } else {
                 tr!(
                     "session.agent_switch_carried_many",
                     count = carried_turns,
-                    provider = provider.display_name()
+                    provider = agent_name
                 )
             };
             self.show_success_toast(message);

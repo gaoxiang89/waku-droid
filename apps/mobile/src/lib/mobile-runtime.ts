@@ -72,6 +72,7 @@ export function beginTurn(
         completed_at: null,
         checkpoint: null,
         provider: session.provider,
+        ...(session.account_id ? { account_id: session.account_id } : {}),
         // Without a cursor for this agent the provider opens a new native
         // conversation, which native rollback and fork counts start from.
         ...(session.provider_cursor?.provider !== session.provider

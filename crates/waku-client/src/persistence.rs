@@ -315,6 +315,8 @@ struct AppState {
     selected_session: Option<Uuid>,
     #[serde(default = "default_provider")]
     last_provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_account_id: Option<String>,
     #[serde(default)]
     last_runtime_mode: RuntimeMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +376,8 @@ pub struct PersistedState {
     pub selected_project: Option<Uuid>,
     pub selected_session: Option<Uuid>,
     pub last_provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_account_id: Option<String>,
     #[serde(default)]
     pub last_runtime_mode: RuntimeMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +449,8 @@ pub struct PersistedState {
     pub disabled_providers: Vec<ProviderKind>,
     #[serde(default)]
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
+    #[serde(default)]
+    pub provider_accounts: Vec<waku_protocol::ProviderAccount>,
     #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
@@ -477,6 +483,7 @@ impl PersistedState {
             selected_project: None,
             selected_session: None,
             last_provider: ProviderKind::Codex,
+            last_account_id: None,
             last_runtime_mode: RuntimeMode::default(),
             last_model: None,
             last_reasoning_effort: None,
@@ -511,6 +518,7 @@ impl PersistedState {
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
+            provider_accounts: Vec::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
         }
@@ -532,6 +540,9 @@ impl PersistedState {
         let mut session = AgentSession::new(project_id, provider);
         session.runtime_mode = self.last_runtime_mode;
         if provider == self.last_provider {
+            if provider.supports_multiple_accounts() {
+                session.account_id.clone_from(&self.last_account_id);
+            }
             session.model.clone_from(&self.last_model);
             session
                 .reasoning_effort
@@ -605,6 +616,7 @@ impl PersistedState {
             computer_use_allowed_apps: self.computer_use_allowed_apps.clone(),
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
+            provider_accounts: self.provider_accounts.clone(),
             extra: self.daemon_settings_extra.clone(),
         }
     }
@@ -618,6 +630,7 @@ impl PersistedState {
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
+        self.provider_accounts = settings.provider_accounts;
         self.daemon_settings_extra = settings.extra;
     }
 
@@ -642,6 +655,7 @@ impl PersistedState {
             selected_project: self.selected_project,
             selected_session: self.persistable_selected_session(),
             last_provider: self.last_provider,
+            last_account_id: self.last_account_id.clone(),
             last_runtime_mode: self.last_runtime_mode,
             last_model: self.last_model.clone(),
             last_reasoning_effort: self.last_reasoning_effort.clone(),
@@ -683,6 +697,7 @@ impl PersistedState {
         self.selected_project = app_state.selected_project;
         self.selected_session = app_state.selected_session;
         self.last_provider = app_state.last_provider;
+        self.last_account_id = app_state.last_account_id;
         self.last_runtime_mode = app_state.last_runtime_mode;
         self.last_model = app_state.last_model;
         self.last_reasoning_effort = app_state.last_reasoning_effort;
@@ -996,6 +1011,7 @@ impl StateStore {
     pub fn provider_sessions(
         &self,
         provider: ProviderKind,
+        account_id: Option<String>,
         limit: usize,
     ) -> impl FnOnce() -> io::Result<Vec<ProviderSessionSummary>> + Send + 'static {
         let daemon = self.daemon.clone();
@@ -1004,7 +1020,11 @@ impl StateStore {
             .request(
                 Uuid::nil(),
                 Uuid::nil(),
-                Command::ListProviderSessions { provider, limit },
+                Command::ListProviderSessions {
+                    provider,
+                    limit,
+                    account_id,
+                },
             )
             .map_err(to_io_error)?
         {
@@ -1019,6 +1039,7 @@ impl StateStore {
         &self,
         cursor: ProviderResumeCursor,
         cwd: PathBuf,
+        account_id: Option<String>,
     ) -> impl FnOnce() -> io::Result<ProviderSessionHistory> + Send + 'static {
         let daemon = self.daemon.clone();
         move || match daemon
@@ -1026,7 +1047,11 @@ impl StateStore {
             .request(
                 Uuid::nil(),
                 Uuid::nil(),
-                Command::LoadProviderSession { cursor, cwd },
+                Command::LoadProviderSession {
+                    cursor,
+                    cwd,
+                    account_id,
+                },
             )
             .map_err(to_io_error)?
         {

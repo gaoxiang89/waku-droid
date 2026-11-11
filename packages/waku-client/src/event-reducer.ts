@@ -168,6 +168,7 @@ export function reduceRuntimeEvent(
           completed_at: null,
           checkpoint: null,
           provider: session.provider,
+          ...(session.account_id ? { account_id: session.account_id } : {}),
         })
         session.status = 'working'
       }
@@ -424,6 +425,7 @@ function adoptSubmittedPrompt(
     completed_at: null,
     checkpoint: null,
     provider: session.provider,
+    ...(session.account_id ? { account_id: session.account_id } : {}),
     ...(handoff ? { handoff: handoff.record } : {}),
     ...(opensNativeConversation ? { native_conversation_start: true } : {}),
   })

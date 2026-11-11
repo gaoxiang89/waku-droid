@@ -216,6 +216,7 @@ impl PiDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
+            config_dir: _,
         } = options;
         if mode != RuntimeMode::FullAccess {
             return Err(anyhow!(
@@ -1762,6 +1763,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )
@@ -2009,6 +2011,7 @@ mod tests {
                 agent_preset: None,
                 computer_use_enabled: false,
                 provider_cursor: None,
+                config_dir: None,
             },
             events,
         )

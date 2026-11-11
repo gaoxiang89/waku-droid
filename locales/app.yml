@@ -456,6 +456,46 @@ providers.checked_minutes_ago:
   en: Checked %{count}m ago
 providers.checked_hours_ago:
   en: Checked %{count}h ago
+providers.accounts:
+  en: Accounts
+providers.accounts_description:
+  en: Add separate configuration directories to switch between personal, work, or team logins for %{provider}
+providers.default_account:
+  en: Default
+providers.default_account_hint:
+  en: Uses %{path}
+providers.add_account:
+  en: Add account
+providers.edit_account:
+  en: Edit account
+providers.account_name:
+  en: Name
+providers.account_name_placeholder:
+  en: e.g. Work
+providers.account_config_dir:
+  en: Config directory
+providers.account_config_dir_placeholder:
+  en: e.g. %{path}
+providers.account_browse_dir:
+  en: Browse…
+providers.account_save:
+  en: Save
+providers.account_cancel:
+  en: Cancel
+providers.account_remove:
+  en: Remove account
+providers.account_copy_login:
+  en: Copy sign-in command
+providers.account_login_copied:
+  en: Sign-in command copied to clipboard
+providers.account_error_empty_name:
+  en: Enter a name for this account
+providers.account_error_empty_dir:
+  en: Enter a separate configuration directory
+providers.account_error_default_dir:
+  en: Choose a directory other than the default %{path}
+providers.account_error_duplicate_dir:
+  en: Another %{provider} account already uses this directory
 
 computer_use.allow_apps:
   en: Let Waku use apps

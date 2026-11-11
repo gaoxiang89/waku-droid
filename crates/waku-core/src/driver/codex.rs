@@ -134,6 +134,7 @@ pub struct CodexDriver {
     commands: Sender<CommandMessage>,
     binary: PathBuf,
     cwd: PathBuf,
+    config_dir: Option<PathBuf>,
     mode: RuntimeMode,
     computer_use_process_directory: Option<PathBuf>,
     computer_use_server_path: Option<PathBuf>,
@@ -214,6 +215,7 @@ impl CodexDriver {
         let DriverStartOptions {
             binary,
             cwd,
+            config_dir,
             mode,
             model,
             reasoning_effort,
@@ -247,7 +249,13 @@ impl CodexDriver {
             .map(|config| config.server_path.clone());
         let title_binary = binary.clone();
         let title_cwd = cwd.clone();
+        let title_config_dir = config_dir.clone();
         let mut command = crate::command_env::command(&binary);
+        crate::command_env::apply_provider_config_dir(
+            &mut command,
+            crate::model::ProviderKind::Codex,
+            config_dir.as_deref(),
+        );
         command.args(["app-server", "--stdio"]);
         configure_computer_use_command(&mut command, computer_use.as_ref());
         let command = command
@@ -780,6 +788,7 @@ impl CodexDriver {
                                         if let Some(request) = request {
                                             let binary = title_binary.clone();
                                             let cwd = title_cwd.clone();
+                                            let config_dir = title_config_dir.clone();
                                             let commands = reader_commands.clone();
                                             let _ = thread::Builder::new()
                                                 .name("waku-codex-title".into())
@@ -787,6 +796,7 @@ impl CodexDriver {
                                                     if let Ok(title) = generate_codex_title(
                                                         &binary,
                                                         &cwd,
+                                                        config_dir.as_deref(),
                                                         &request.prompt,
                                                     ) {
                                                         let _ = commands.send(
@@ -864,6 +874,7 @@ impl CodexDriver {
             commands,
             binary,
             cwd,
+            config_dir,
             mode,
             computer_use_process_directory,
             computer_use_server_path,
@@ -1088,6 +1099,7 @@ impl DriverControl for CodexDriver {
         crate::codex_session::fork_session_at_turn(
             &self.binary,
             &self.cwd,
+            self.config_dir.as_deref(),
             &thread_id,
             &last_turn_id,
         )
@@ -1160,8 +1172,18 @@ fn codex_title_turn_params(thread_id: &str, user_message: &str) -> Value {
 /// Codex app-server can persist a thread name but does not generate one. Match
 /// Codex Desktop's client-owned behavior with an isolated ephemeral turn, then
 /// hand the result back to the main writer for `thread/name/set`.
-fn generate_codex_title(binary: &Path, cwd: &Path, prompt: &str) -> anyhow::Result<String> {
+fn generate_codex_title(
+    binary: &Path,
+    cwd: &Path,
+    config_dir: Option<&Path>,
+    prompt: &str,
+) -> anyhow::Result<String> {
     let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(
+        &mut command,
+        crate::model::ProviderKind::Codex,
+        config_dir,
+    );
     let command = command
         .args(["app-server", "--stdio"])
         .current_dir(cwd)
@@ -2596,6 +2618,7 @@ mod tests {
                     agent_preset: None,
                     computer_use_enabled: false,
                     provider_cursor: cursor,
+                    config_dir: None,
                 },
                 events,
             )
@@ -2913,6 +2936,7 @@ mod tests {
         let title = generate_codex_title(
             &binary,
             &std::env::temp_dir(),
+            None,
             "Find why provider-generated task titles never replace the first prompt and fix it.",
         )
         .expect("Codex should generate a task title");
@@ -2972,6 +2996,7 @@ mod tests {
             commands,
             binary: PathBuf::from("codex"),
             cwd: std::env::temp_dir(),
+            config_dir: None,
             mode: RuntimeMode::FullAccess,
             computer_use_process_directory: None,
             computer_use_server_path: None,

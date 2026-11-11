@@ -32,6 +32,7 @@ import {
   persistSession,
   probeProvider,
   removeDaemonSession,
+  resolveProviderAccount,
   type TaskState,
 } from './daemon-api';
 import { persistentStorageSync } from './composer-preferences-store';
@@ -551,7 +552,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
     if (!entries.current.has(current.id)) await attachSession(current);
     let runtime = entries.current.get(current.id);
-    let startup: { binary: string; cwd: string } | null = null;
+    let startup: { binary: string; cwd: string; configDir: string | null } | null = null;
     if (!runtime) {
       const state = await loadTaskState(client);
       const project = state.projects.find((item) => item.id === current.project_id);
@@ -567,7 +568,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         current = await persistOrdered(current);
       }
       const settings = await loadDaemonSettings(client);
-      const probe = await probeProvider(client, current.provider, settings);
+      const account = resolveProviderAccount(settings, current.provider, current.account_id);
+      const binaryOverride = account?.binaryOverride?.trim()
+        || settings.provider_binary_overrides?.[current.provider]
+        || null;
+      const configDir = account?.configDir ?? null;
+      const probe = await probeProvider(client, current.provider, settings, {
+        accountId: current.account_id ?? null,
+        configDir,
+      });
       if (!probe.installed || !probe.path) {
         throw new Error(`${current.provider} is not installed on the daemon host`);
       }
@@ -576,11 +585,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           persistentStorageSync(),
           daemon.activeProfile.address,
           current.provider,
-          settings.provider_binary_overrides?.[current.provider] ?? null,
+          binaryOverride,
           probe,
         );
       }
-      startup = { binary: probe.path, cwd: sessionCwd(current, project) };
+      startup = { binary: probe.path, cwd: sessionCwd(current, project), configDir };
     }
 
     current = beginTurn(current, prompt, clock, attachments, providerPrompt);
@@ -599,6 +608,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           options: {
             provider: current.provider,
             binary: startup!.binary,
+            ...(startup!.configDir ? { configDir: startup!.configDir } : {}),
             cwd: startup!.cwd,
             mode: current.runtime_mode,
             model: current.model ?? null,
@@ -721,7 +731,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       const project = state.projects.find((item) => item.id === current.project_id);
       if (!project) throw new Error('This task’s project is no longer available on the daemon');
       const settings = await loadDaemonSettings(client);
-      const probe = await probeProvider(client, current.provider, settings);
+      const account = resolveProviderAccount(settings, current.provider, current.account_id);
+      const configDir = account?.configDir ?? null;
+      const probe = await probeProvider(client, current.provider, settings, {
+        accountId: current.account_id ?? null,
+        configDir,
+      });
       if (!probe.installed || !probe.path) throw new Error('Codex is not installed on the daemon host');
       current = await materializeWorktree(
         client, current, project.path,
@@ -737,6 +752,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           options: {
             provider: current.provider,
             binary: probe.path,
+            ...(configDir ? { configDir } : {}),
             cwd: sessionCwd(current, project),
             mode: current.runtime_mode,
             model: current.model ?? null,

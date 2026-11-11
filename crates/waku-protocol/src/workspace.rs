@@ -135,6 +135,8 @@ pub enum WorkspaceOperation {
         project_root: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary_override: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
     },
     CreateProjectlessWorkspace {
         prompt: Option<String>,

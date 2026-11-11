@@ -134,27 +134,65 @@ pub fn discover_slash_commands(
     project_root: &Path,
     binary_override: Option<&str>,
 ) -> Vec<SlashCommand> {
+    discover_slash_commands_for_account(provider, project_root, binary_override, None)
+}
+
+pub fn discover_slash_commands_for_account(
+    provider: ProviderKind,
+    project_root: &Path,
+    binary_override: Option<&str>,
+    config_dir: Option<&str>,
+) -> Vec<SlashCommand> {
+    let resolved_config_dir = config_dir.and_then(crate::command_env::resolve_config_dir);
     let cli_commands = match binary_override {
         Some(binary) => crate::command_env::resolve_binary_override(binary),
         None => crate::model::default_provider_executable(provider),
     }
     .as_deref()
-    .and_then(|binary| crate::slash_command_catalog::discover(provider, binary, project_root))
+    .and_then(|binary| {
+        crate::slash_command_catalog::discover(
+            provider,
+            binary,
+            project_root,
+            resolved_config_dir.as_deref(),
+        )
+    })
     .unwrap_or_default();
-    assemble_slash_commands(provider, project_root, cli_commands)
+    assemble_slash_commands(
+        provider,
+        project_root,
+        resolved_config_dir.as_deref(),
+        cli_commands,
+    )
 }
 
 fn assemble_slash_commands(
     provider: ProviderKind,
     project_root: &Path,
+    account_config_dir: Option<&Path>,
     cli_commands: Vec<SlashCommand>,
 ) -> Vec<SlashCommand> {
     let home = dirs::home_dir();
-    let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+    let claude_config_dir = account_config_dir
+        .filter(|_| provider == ProviderKind::Claude)
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var("CLAUDE_CONFIG_DIR")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        })
         .or_else(|| home.as_deref().map(|home| home.join(".claude")));
+    let codex_config_dir = account_config_dir
+        .filter(|_| provider == ProviderKind::Codex)
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var("CODEX_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        })
+        .or_else(|| home.as_deref().map(|home| home.join(".codex")));
     let mut commands = Vec::new();
     match provider {
         ProviderKind::Claude => {
@@ -183,14 +221,14 @@ fn assemble_slash_commands(
         }
         ProviderKind::Codex => {
             scan_skill_files(provider, &project_root.join(".codex/skills"), &mut commands);
-            if let Some(home) = home.as_deref() {
+            if let Some(config_dir) = codex_config_dir.as_deref() {
                 scan_command_files(
-                    &home.join(".codex/prompts"),
+                    &config_dir.join("prompts"),
                     CommandScope::User,
                     true,
                     &mut commands,
                 );
-                scan_skill_files(provider, &home.join(".codex/skills"), &mut commands);
+                scan_skill_files(provider, &config_dir.join("skills"), &mut commands);
             }
         }
         ProviderKind::OpenCode => {
@@ -1336,6 +1374,7 @@ mod tests {
         let commands = assemble_slash_commands(
             ProviderKind::Claude,
             &root,
+            None,
             vec![SlashCommand {
                 name: "waku-test-dynamic-command".into(),
                 description: "Reported by the CLI".into(),
@@ -1372,6 +1411,7 @@ mod tests {
         let commands = assemble_slash_commands(
             ProviderKind::OpenCode,
             &root,
+            None,
             vec![SlashCommand {
                 name: "init".into(),
                 description: "Initialize".into(),
@@ -1417,7 +1457,7 @@ mod tests {
         )
         .unwrap();
         for provider in ProviderKind::ALL {
-            let commands = assemble_slash_commands(provider, &root, Vec::new());
+            let commands = assemble_slash_commands(provider, &root, None, Vec::new());
             let skill = commands
                 .iter()
                 .find(|command| command.name == "deploy-runbook")
@@ -1429,7 +1469,7 @@ mod tests {
             );
         }
         // Raw passthrough end to end: no expansion applies at submit.
-        let commands = assemble_slash_commands(ProviderKind::Amp, &root, Vec::new());
+        let commands = assemble_slash_commands(ProviderKind::Amp, &root, None, Vec::new());
         assert_eq!(
             resolved_submission(ProviderKind::Amp, "/deploy-runbook staging", &commands),
             None
@@ -1467,7 +1507,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                assemble_slash_commands(provider, &root, Vec::new())
+                assemble_slash_commands(provider, &root, None, Vec::new())
                     .iter()
                     .any(|command| command.name == "native-skill"),
                 "{} misses its project skill tree",
@@ -1479,6 +1519,49 @@ mod tests {
     }
 
     #[test]
+    fn account_config_dir_supplies_isolated_claude_and_codex_commands_and_skills() {
+        let root =
+            std::env::temp_dir().join(format!("waku-account-commands-{}", uuid::Uuid::new_v4()));
+        let claude_work = root.join("claude_work");
+        let codex_work = root.join("codex_work");
+        std::fs::create_dir_all(claude_work.join("commands")).unwrap();
+        std::fs::create_dir_all(claude_work.join("skills/work-skill")).unwrap();
+        std::fs::write(
+            claude_work.join("commands/work-cmd.md"),
+            "---\ndescription: Work command\n---\nRun work",
+        )
+        .unwrap();
+        std::fs::write(
+            claude_work.join("skills/work-skill/SKILL.md"),
+            "---\nname: work-skill\ndescription: Work skill\n---\nSteps",
+        )
+        .unwrap();
+        let claude_commands =
+            assemble_slash_commands(ProviderKind::Claude, &root, Some(&claude_work), Vec::new());
+        assert!(claude_commands.iter().any(|c| c.name == "work-cmd"));
+        assert!(claude_commands.iter().any(|c| c.name == "work-skill"));
+
+        std::fs::create_dir_all(codex_work.join("prompts")).unwrap();
+        std::fs::create_dir_all(codex_work.join("skills/codex-work-skill")).unwrap();
+        std::fs::write(
+            codex_work.join("prompts/codex-work-prompt.md"),
+            "Prompt $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_work.join("skills/codex-work-skill/SKILL.md"),
+            "---\nname: codex-work-skill\n---\nSteps",
+        )
+        .unwrap();
+        let codex_commands =
+            assemble_slash_commands(ProviderKind::Codex, &root, Some(&codex_work), Vec::new());
+        assert!(codex_commands.iter().any(|c| c.name == "codex-work-prompt"));
+        assert!(codex_commands.iter().any(|c| c.name == "codex-work-skill"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn waku_resume_is_reserved_and_listed_for_every_provider() {
         let root = std::env::temp_dir().join(format!("waku-resume-command-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1486,7 +1569,7 @@ mod tests {
         std::fs::write(root.join(".waku/commands/resume.md"), "Project override").unwrap();
 
         for provider in ProviderKind::ALL {
-            let commands = assemble_slash_commands(provider, &root, Vec::new());
+            let commands = assemble_slash_commands(provider, &root, None, Vec::new());
             let resume = commands
                 .iter()
                 .filter(|command| command.name == "resume")

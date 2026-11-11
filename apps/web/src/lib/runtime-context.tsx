@@ -33,6 +33,7 @@ import {
   materializeWorktree,
   persistSession,
   probeProvider,
+  resolveProviderAccount,
   sessionCwd,
   type TaskState,
 } from './daemon-api'
@@ -290,6 +291,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             && previous
             && (
               previous.provider !== session.provider
+                || (previous.account_id ?? null) !== (session.account_id ?? null)
                 || previous.agent_preset !== session.agent_preset
             ),
         )
@@ -657,7 +659,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
       let project: Project
       let runtime = entries.current.get(currentSession.id)
-      let startup: { probe: ProviderProbe; settings: DaemonSettings } | null = null
+      let startup: { probe: ProviderProbe; settings: DaemonSettings; configDir: string | null } | null = null
       try {
         const state = await loadTaskState(client)
         const foundProject = state.projects.find((item) => item.id === currentSession.project_id)
@@ -670,16 +672,24 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             queryFn: () => loadDaemonSettings(client),
             staleTime: 60_000,
           })
-          const binaryOverride = settings.provider_binary_overrides?.[currentSession.provider] ?? null
+          const account = resolveProviderAccount(settings, currentSession.provider, currentSession.account_id)
+          const binaryOverride = account?.binaryOverride?.trim()
+            || settings.provider_binary_overrides?.[currentSession.provider]
+            || null
+          const configDir = account?.configDir ?? null
+          const probeCacheKey = configDir ? `${binaryOverride ?? ''}|${configDir}` : binaryOverride
           const providerProbe = await queryClient.fetchQuery({
-            queryKey: daemonKeys.provider(config.address, currentSession.provider, binaryOverride),
+            queryKey: daemonKeys.provider(config.address, currentSession.provider, probeCacheKey),
             queryFn: async () => {
-              const data = await probeProvider(client, currentSession.provider, settings)
+              const data = await probeProvider(client, currentSession.provider, settings, {
+                accountId: currentSession.account_id ?? null,
+                configDir,
+              })
               writeProviderProbeCache(
                 browserProviderProbeStorage(),
                 config.address,
                 currentSession.provider,
-                binaryOverride,
+                probeCacheKey,
                 data,
               )
               return data
@@ -691,7 +701,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
               provider: providerName(currentSession.provider),
             }))
           }
-          startup = { probe: providerProbe, settings }
+          startup = { probe: providerProbe, settings, configDir }
         }
 
         session = await materializeWorktree(
@@ -732,6 +742,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
               options: {
                 provider: session.provider,
                 binary: startup!.probe.path!,
+                ...(startup!.configDir ? { configDir: startup!.configDir } : {}),
                 cwd: sessionCwd(session, project),
                 mode: session.runtime_mode,
                 model: session.model ?? null,
@@ -915,16 +926,24 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         queryFn: () => loadDaemonSettings(client),
         staleTime: 60_000,
       })
-      const binaryOverride = settings.provider_binary_overrides?.[currentSession.provider] ?? null
+      const account = resolveProviderAccount(settings, currentSession.provider, currentSession.account_id)
+      const binaryOverride = account?.binaryOverride?.trim()
+        || settings.provider_binary_overrides?.[currentSession.provider]
+        || null
+      const configDir = account?.configDir ?? null
+      const probeCacheKey = configDir ? `${binaryOverride ?? ''}|${configDir}` : binaryOverride
       const providerProbe = await queryClient.fetchQuery({
-        queryKey: daemonKeys.provider(config.address, currentSession.provider, binaryOverride),
+        queryKey: daemonKeys.provider(config.address, currentSession.provider, probeCacheKey),
         queryFn: async () => {
-          const data = await probeProvider(client, currentSession.provider, settings)
+          const data = await probeProvider(client, currentSession.provider, settings, {
+            accountId: currentSession.account_id ?? null,
+            configDir,
+          })
           writeProviderProbeCache(
             browserProviderProbeStorage(),
             config.address,
             currentSession.provider,
-            binaryOverride,
+            probeCacheKey,
             data,
           )
           return data
@@ -958,6 +977,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             options: {
               provider: session.provider,
               binary: providerProbe.path,
+              ...(configDir ? { configDir } : {}),
               cwd: sessionCwd(session, project),
               mode: session.runtime_mode,
               model: session.model ?? null,
@@ -1393,6 +1413,7 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
     project_id: next.project_id,
     workspace: next.workspace,
     provider: next.provider,
+    account_id: next.account_id,
     model: next.model,
     runtime_mode: next.runtime_mode,
     reasoning_effort: next.reasoning_effort,
@@ -1402,6 +1423,8 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
     updated_at: next.updated_at,
     last_reply_at: next.last_reply_at,
     provider_cursor: next.provider_cursor,
+    provider_cursors: next.provider_cursors,
+    account_cursors: next.account_cursors,
     context_usage: next.context_usage,
     runtime_event_cursor: next.runtime_event_cursor,
   }

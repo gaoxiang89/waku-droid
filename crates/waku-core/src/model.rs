@@ -74,12 +74,19 @@ fn apply_cached_models(
     probe
 }
 
-pub fn discover_provider_models(mut probe: ProviderProbe) -> ProviderProbe {
+pub fn discover_provider_models(probe: ProviderProbe) -> ProviderProbe {
+    discover_provider_models_in(probe, None)
+}
+
+pub fn discover_provider_models_in(
+    mut probe: ProviderProbe,
+    config_dir: Option<&Path>,
+) -> ProviderProbe {
     if probe.provider.supports_model_discovery()
         && let Some(path) = probe.path.as_deref()
     {
         let (models, agent_presets, discovery_error) =
-            crate::model_catalog::discover_catalog_reporting(probe.provider, path);
+            crate::model_catalog::discover_catalog_reporting_in(probe.provider, path, config_dir);
         probe.models = models;
         probe.agent_presets = agent_presets;
         probe.discovery_error = discovery_error;
