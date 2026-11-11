@@ -14,6 +14,14 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.45]
+
+- Add Google Antigravity as a coding agent through the installed `agy` CLI and its ACP server, using the Google sign-in `agy` already has
+- Pick Antigravity's account models and thinking level: Waku reads the available model families, keeps each family's own effort choices, and maps saved variant ids onto the family and level the CLI accepts
+- Answer Antigravity's multiple-choice questions above the composer, including under Full access, and show the provider's warning when an Allow always answer carries one
+- Recover turns Antigravity reports as successful when the provider actually returned an API or quota error, with a localized message instead of a misleading answer
+- Resume Antigravity tasks with their conversation intact, and import their native session history alongside the other ACP agents
+
 ## [0.1.44]
 
 - Switch agents mid-task between turns: pick a different coding agent at any point without restarting the task. The transcript, workspace files, queued follow-ups, and checkpoints all stay intact
