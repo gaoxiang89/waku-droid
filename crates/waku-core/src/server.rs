@@ -2086,6 +2086,7 @@ mod tests {
                     transcript_message: None,
                     turn_id: None,
                     message_id: None,
+                    handoff: None,
                 },
             )
             .unwrap();
@@ -3530,6 +3531,7 @@ mod tests {
                     transcript_message: None,
                     turn_id: None,
                     message_id: None,
+                    handoff: None,
                 },
             },
             second_client_outgoing,

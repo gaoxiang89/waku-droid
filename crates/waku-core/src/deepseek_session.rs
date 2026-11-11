@@ -134,6 +134,7 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         checkpoint: None,
         provider: Some(ProviderKind::DeepSeek),
         handoff: None,
+        native_conversation_start: false,
         handoff_preamble: None,
     });
     id

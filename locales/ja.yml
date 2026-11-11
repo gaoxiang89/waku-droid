@@ -353,7 +353,8 @@ session.handoff_notice_one: "%{provider} が引き継ぎます。%{agents} に�
 session.handoff_notice_many: "%{provider} が引き継ぎます。%{agents} による以前の %{count} ターンをコンテキストとして渡しました。ツールの状態と推論は含まれません。"
 session.handoff_notice_resumed_one: "%{provider} に戻り、自身の会話を再開します。未確認の 1 ターンをコンテキストとして渡しました。"
 session.handoff_notice_resumed_many: "%{provider} に戻り、自身の会話を再開します。未確認の %{count} ターンをコンテキストとして渡しました。"
-session.handoff_notice_omitted: 古い %{count} ターンはこのモデルのコンテキストウィンドウに収まらないため、アプリ内に残しました。
+session.handoff_notice_omitted_one: 以前の 1 ターンはこのモデルのコンテキストウィンドウに収まらないため、アプリ内に残しました。
+session.handoff_notice_omitted_many: 以前の %{count} ターンはこのモデルのコンテキストウィンドウに収まらないため、アプリ内に残しました。
 
 time.yesterday_at: 昨日 %{time}
 time.weekday_at: "%{weekday} %{time}"

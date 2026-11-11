@@ -690,8 +690,10 @@ session.handoff_notice_resumed_one:
   en: "Back with %{provider}, resuming its own conversation: 1 turn it had not seen is carried over as context."
 session.handoff_notice_resumed_many:
   en: "Back with %{provider}, resuming its own conversation: %{count} turns it had not seen are carried over as context."
-session.handoff_notice_omitted:
-  en: "%{count} older turns did not fit this model's context window and stayed in the app."
+session.handoff_notice_omitted_one:
+  en: "1 earlier turn did not fit this model's context window and stayed in the app."
+session.handoff_notice_omitted_many:
+  en: "%{count} earlier turns did not fit this model's context window and stayed in the app."
 
 time.yesterday_at:
   en: Yesterday %{time}

@@ -9,7 +9,7 @@ use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
+    ProviderSessionHistory, ProviderSessionSummary, SubmittedHandoff, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -98,6 +98,10 @@ pub enum Command {
         turn_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
+        /// The handoff notice and record this turn opened with, republished
+        /// with the submission so attached clients record the same rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff: Option<SubmittedHandoff>,
     },
     Steer {
         prompt: String,
@@ -572,7 +576,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -581,7 +585,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -669,6 +673,7 @@ mod tests {
             transcript_message: None,
             turn_id: None,
             message_id: None,
+            handoff: None,
         })
         .unwrap();
         assert_eq!(plain["type"], "prompt");
@@ -680,6 +685,7 @@ mod tests {
             transcript_message: Some("hello".into()),
             turn_id: None,
             message_id: None,
+            handoff: None,
         })
         .unwrap();
         assert_eq!(with_handoff["transcriptMessage"], "hello");

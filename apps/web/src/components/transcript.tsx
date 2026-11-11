@@ -40,6 +40,7 @@ import {
   formatDuration,
   formatMessageTime,
   formatWorkingElapsed,
+  providerTurnsThrough,
   reasoningTitle,
   shouldVirtualizeActivityText,
   turnAnswerStart,
@@ -714,9 +715,13 @@ function responseForkTurnCount(
     !footer
     || message.role !== 'assistant'
     || !['idle', 'failed'].includes(session.status)
-    || !session.provider_cursor
-    || session.provider_cursor.provider !== session.provider
     || !turn?.provider_turn_started
+  ) return null
+  // A fork through turns the current agent never ran starts a fresh native
+  // conversation, so only a fork that keeps some of its turns needs its cursor.
+  if (
+    providerTurnsThrough(session, turn.turn_count) > 0
+    && session.provider_cursor?.provider !== session.provider
   ) return null
   return turn.turn_count
 }

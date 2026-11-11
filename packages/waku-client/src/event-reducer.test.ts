@@ -113,6 +113,43 @@ describe('promptSubmitted', () => {
     expect(result.session.auto_title).toBe('Add a dark mode toggle to settings')
     expect(result.session.turns.at(-1)?.turn_count).toBe(1)
   })
+
+  test('mirrors the submitter’s handoff notice and record on the new turn', () => {
+    const session: AgentSession = { ...idleSession(), provider: 'claude' }
+    const handoff = {
+      noticeId: '30000000-0000-4000-8000-000000000003',
+      notice: 'Continuing with Claude',
+      record: { from_providers: ['codex'], covered_turns: 1, omitted_turns: 0, resumed: false },
+    }
+    const result = reduceRuntimeEvent(
+      session,
+      event('promptSubmitted', { ...SUBMISSION, handoff }),
+      clock,
+    ).session
+
+    expect(result.turns.at(-1)).toMatchObject({
+      id: SUBMISSION.turnId,
+      provider: 'claude',
+      handoff: handoff.record,
+      native_conversation_start: true,
+    })
+    expect(result.messages.slice(-2)).toMatchObject([
+      { id: handoff.noticeId, turn_id: SUBMISSION.turnId, role: 'system', content: handoff.notice },
+      { id: SUBMISSION.messageId, turn_id: SUBMISSION.turnId, role: 'user' },
+    ])
+  })
+
+  test('a turn that resumes the agent’s conversation does not open a new one', () => {
+    const session: AgentSession = {
+      ...idleSession(),
+      provider_cursor: { provider: 'codex', threadId: 'thread' },
+    }
+    const result = reduceRuntimeEvent(session, event('promptSubmitted', SUBMISSION), clock).session
+
+    expect(result.turns.at(-1)?.native_conversation_start).toBeUndefined()
+    expect(result.turns.at(-1)?.handoff).toBeUndefined()
+    expect(result.messages.filter((message) => message.role === 'system')).toHaveLength(0)
+  })
 })
 
 test('MCP tool identity survives partial updates and stays separate in expanded details', () => {

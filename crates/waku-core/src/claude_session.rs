@@ -543,6 +543,7 @@ fn provider_session_history_in(
                 checkpoint: None,
                 provider: Some(ProviderKind::Claude),
                 handoff: None,
+                native_conversation_start: false,
                 handoff_preamble: None,
             });
             if let Some(content) = message_text(entry) {

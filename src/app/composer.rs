@@ -995,16 +995,12 @@ impl Waku {
                             .selected_session()
                             .map(|session| session.provider)
                             .unwrap_or_default();
-                        // A draft can sit on a provider that was since switched
+                        // A task can sit on a provider that was since switched
                         // off; open onto the first usable provider instead of a
                         // tab whose rows the filter would leave empty.
-                        let locked = this
-                            .selected_session()
-                            .is_some_and(|session| !session.messages.is_empty());
-                        let provider = if !locked
-                            && this
-                                .disabled_providers_for(&this.selected_host_key())
-                                .contains(&provider)
+                        let provider = if this
+                            .disabled_providers_for(&this.selected_host_key())
+                            .contains(&provider)
                         {
                             ProviderKind::ALL
                                 .into_iter()

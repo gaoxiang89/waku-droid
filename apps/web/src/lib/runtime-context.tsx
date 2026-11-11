@@ -866,6 +866,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             started_at: now,
             completed_at: null,
             checkpoint: null,
+            provider: optimisticSession.provider,
           })
           window.setTimeout(() => {
             const cached = queryClient.getQueryData<AgentSession>(

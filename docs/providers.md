@@ -137,22 +137,39 @@ Three pieces make that work:
   conversation.
 - **A deterministic transcript handoff.** `src/app/handoff.rs` builds what the
   incoming agent gets on its first turn. The selection is real messages, not a
-  model-written summary: the newest turn first, then the task's original request,
-  then older turns newest-first until the budget runs out. The budget is the
-  target model's context window minus what this turn already uses minus
-  `max(16_000, window / 4)` reserved for the reply, capped by
-  `WAKU_CONTEXT_HANDOFF_TOKEN_CAP`. Each turn is rendered as
+  model-written summary: the newest turn first (or only its request when the
+  whole turn does not fit), then the task's original request, then older turns
+  newest-first, stopping at the first one that does not fit so the recent run
+  has no gaps. A resumed agent already holds the original request and skips it.
+  The budget is the target model's context window minus
+  `max(16_000, window / 4)` reserved for the reply minus the user's own prompt,
+  capped by `WAKU_CONTEXT_HANDOFF_TOKEN_CAP`; live context usage is subtracted
+  only when the agent resumes the conversation it was reported for, because a
+  fresh conversation starts empty. Each turn is rendered as
   `### Turn N — <Provider>` with its user and assistant text, command lines and
-  changed-file paths; reasoning, tool results, approvals and attachments are not
-  replayed, and the preamble says so. When the incoming agent resumes its own
+  changed-file paths; command output, reasoning, approvals and attachments are
+  not replayed, and the preamble says so. The turns sit inside one
+  `<task-transcript>` block (tags quoted in the transcript are neutralized), and
+  the user's new message follows under its own label, so the incoming agent can
+  tell background from the request. When the incoming agent resumes its own
   conversation, only the turns it has not seen are sent.
+- **Native conversation boundaries.** A turn that begins with no resume cursor
+  for its agent sets `AgentTurn::native_conversation_start`: the provider opens
+  a new native conversation that holds none of that agent's earlier turns.
+  `provider_turns_through`, `provider_turns_after` and
+  `provider_resume_at_through` count only the current agent's started turns
+  from its latest such turn, so a rewind or fork never asks a provider to roll
+  back or copy turns its conversation does not contain.
 
 The preamble is prepended to the prompt once, at the seam where provider syntax
 resolves, and is taken off the turn as it is read (`AgentTurn::handoff_preamble`
 is `#[serde(skip)]` runtime state), so a retry cannot send it twice. A prompt that
 is still a provider-native slash command travels without it. The transcript
 records the transfer as a centred notice naming both agents, and a resumed
-provider gets a delta rather than the whole task.
+provider gets a delta rather than the whole task. The notice and the
+`TurnHandoff` record travel with the submission (`Command::Prompt::handoff`,
+echoed as `PromptSubmitted.handoff`), so every client attached to the runtime
+records the same rows instead of saving a projection without them.
 
 Rewinding past a switch drops the parked cursors (`truncate_after_turn`), so no
 rewound task can resume a conversation that no longer matches its transcript.

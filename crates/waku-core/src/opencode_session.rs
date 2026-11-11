@@ -226,6 +226,7 @@ fn history_from_messages(messages: &[MessageInfo]) -> ProviderSessionHistory {
                         checkpoint: None,
                         provider: Some(ProviderKind::OpenCode),
                         handoff: None,
+                        native_conversation_start: false,
                         handoff_preamble: None,
                     });
                     turn_id = Some(id);

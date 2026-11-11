@@ -21,7 +21,7 @@ use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
     ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, PermissionOption,
-    Project, ProviderKind, ProviderResumeCursor, SessionStatus,
+    Project, ProviderKind, ProviderResumeCursor, SessionStatus, SubmittedHandoff,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -1054,6 +1054,7 @@ fn prompt_submission_wire_event(command: &Command) -> anyhow::Result<Option<Wire
         transcript_message,
         turn_id,
         message_id,
+        handoff,
     } = command
     else {
         return Ok(None);
@@ -1062,6 +1063,7 @@ fn prompt_submission_wire_event(command: &Command) -> anyhow::Result<Option<Wire
         message: transcript_message.clone().unwrap_or_else(|| prompt.clone()),
         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
         message_id: message_id.unwrap_or_else(Uuid::new_v4),
+        handoff: handoff.clone(),
     })
     .map(Some)
 }
@@ -1103,12 +1105,16 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         if existing.provider != incoming.provider && !existing.status.is_busy() {
             existing.switch_provider(incoming.provider);
         }
-        existing.model = incoming.model;
+        // A busy task keeps its agent, so the incoming model and options
+        // belong to an agent it is not running and must not be applied to it.
+        if existing.provider == incoming.provider {
+            existing.model = incoming.model;
+            existing.reasoning_effort = incoming.reasoning_effort;
+            existing.service_tier = incoming.service_tier;
+            existing.context_window = incoming.context_window;
+            existing.agent_preset = incoming.agent_preset;
+        }
         existing.runtime_mode = incoming.runtime_mode;
-        existing.reasoning_effort = incoming.reasoning_effort;
-        existing.service_tier = incoming.service_tier;
-        existing.context_window = incoming.context_window;
-        existing.agent_preset = incoming.agent_preset;
         existing.updated_at = incoming.updated_at;
         existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
@@ -2118,10 +2124,15 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             message,
             turn_id,
             message_id,
-        } => (
-            "promptSubmitted",
-            json!({ "message": message, "turnId": turn_id, "messageId": message_id }),
-        ),
+            handoff,
+        } => {
+            let mut payload =
+                json!({ "message": message, "turnId": turn_id, "messageId": message_id });
+            if let Some(handoff) = handoff {
+                payload["handoff"] = serde_json::to_value(handoff)?;
+            }
+            ("promptSubmitted", payload)
+        }
         DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
         DriverEvent::SteerRejected { message, reason } => (
             "steerRejected",
@@ -2205,6 +2216,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 message: submitted.message,
                 turn_id: submitted.turn_id,
                 message_id: submitted.message_id,
+                handoff: submitted.handoff,
             }
         }
         "steerAccepted" => {
@@ -2248,6 +2260,8 @@ struct SubmittedPromptWire {
     message: String,
     turn_id: Uuid,
     message_id: Uuid,
+    #[serde(default)]
+    handoff: Option<SubmittedHandoff>,
 }
 
 #[derive(Deserialize)]
@@ -2456,17 +2470,48 @@ mod tests {
             message: "ship it".into(),
             turn_id,
             message_id,
+            handoff: None,
         })
         .unwrap();
         assert_eq!(wire.kind, "promptSubmitted");
         assert_eq!(wire.payload["message"], "ship it");
         assert_eq!(wire.payload["turnId"], turn_id.to_string());
         assert_eq!(wire.payload["messageId"], message_id.to_string());
+        assert!(wire.payload.get("handoff").is_none());
         assert!(matches!(
             event_from_wire(wire).unwrap(),
-            DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
+            DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message, handoff: None }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
+    }
+
+    #[test]
+    fn wire_event_round_trip_preserves_prompt_submission_handoff() {
+        let handoff = SubmittedHandoff {
+            notice_id: Uuid::new_v4(),
+            notice: "Continuing with Claude".into(),
+            record: crate::model::TurnHandoff {
+                from_providers: vec![ProviderKind::Codex],
+                covered_turns: 2,
+                omitted_turns: 1,
+                resumed: false,
+            },
+        };
+        let wire = event_to_wire(DriverEvent::PromptSubmitted {
+            message: "ship it".into(),
+            turn_id: Uuid::new_v4(),
+            message_id: Uuid::new_v4(),
+            handoff: Some(handoff.clone()),
+        })
+        .unwrap();
+        assert_eq!(wire.payload["handoff"]["notice"], "Continuing with Claude");
+        let DriverEvent::PromptSubmitted {
+            handoff: decoded, ..
+        } = event_from_wire(wire).unwrap()
+        else {
+            panic!("the event changed variants during its wire round trip");
+        };
+        assert_eq!(decoded, Some(handoff));
     }
 
     #[test]
@@ -2479,6 +2524,7 @@ mod tests {
             transcript_message: Some("ship it".into()),
             turn_id: Some(turn_id),
             message_id: Some(message_id),
+            handoff: None,
         };
         let wire = prompt_submission_wire_event(&command)
             .unwrap()
@@ -2491,6 +2537,7 @@ mod tests {
                 message,
                 turn_id: decoded_turn,
                 message_id: decoded_message,
+                ..
             } if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
 
@@ -2499,6 +2546,7 @@ mod tests {
             transcript_message: None,
             turn_id: Some(turn_id),
             message_id: Some(message_id),
+            handoff: None,
         };
         let fallback_wire = prompt_submission_wire_event(&fallback)
             .unwrap()
@@ -2551,11 +2599,14 @@ mod tests {
         let mut busy = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
         busy.status = SessionStatus::Working;
         busy.updated_at = 10;
+        busy.model = Some("gpt-5.5".into());
         busy.provider_cursor = Some(ProviderResumeCursor::Codex {
             thread_id: "codex-live".into(),
         });
         merge_stale_session_metadata(&mut busy, incoming);
         assert_eq!(busy.provider, ProviderKind::Codex);
+        // Claude's model must not ride onto the Codex task that kept running.
+        assert_eq!(busy.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(
             busy.provider_cursor,
             Some(ProviderResumeCursor::Codex {

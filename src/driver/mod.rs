@@ -11,8 +11,8 @@ use crossbeam_channel::{Sender, bounded, select};
 use parking_lot::Mutex;
 
 pub use waku_client::driver::{
-    DriverControl, DriverEventSender, DriverHandle, DriverStartOptions, SessionOptions,
-    event_channel,
+    DriverControl, DriverEventSender, DriverHandle, DriverStartOptions, PromptSubmission,
+    SessionOptions, event_channel,
 };
 
 pub(crate) fn start_remote(
@@ -233,18 +233,20 @@ impl RemoteDriverControl {
 }
 
 impl DriverControl for RemoteDriverControl {
-    fn prompt(
-        &self,
-        prompt: String,
-        transcript_message: Option<String>,
-        turn_id: Option<uuid::Uuid>,
-        message_id: Option<uuid::Uuid>,
-    ) {
+    fn prompt(&self, submission: PromptSubmission) {
+        let PromptSubmission {
+            prompt,
+            transcript_message,
+            handoff,
+            turn_id,
+            message_id,
+        } = submission;
         self.notify(waku_client::Command::Prompt {
             prompt,
             transcript_message,
             turn_id,
             message_id,
+            handoff,
         });
     }
 

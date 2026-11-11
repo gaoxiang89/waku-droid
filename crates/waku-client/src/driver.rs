@@ -8,8 +8,23 @@ use uuid::Uuid;
 use waku_protocol::computer_use::ComputerToolRequest;
 use waku_protocol::model::{
     BackgroundWorkKey, DriverEvent, GoalOperation, ProviderResumeCursor, RuntimeMode,
-    UserInputAnswer,
+    SubmittedHandoff, UserInputAnswer,
 };
+
+/// A prompt for the provider and what the daemon republishes alongside it to
+/// every client attached to the runtime.
+pub struct PromptSubmission {
+    pub prompt: String,
+    /// What the transcript shows when `prompt` carries more than the user
+    /// typed, such as a handoff preamble.
+    pub transcript_message: Option<String>,
+    /// The handoff notice and record the turn opened with.
+    pub handoff: Option<SubmittedHandoff>,
+    /// The ids this client gave the turn it opened and that turn's user
+    /// message, so other clients mirror the same rows.
+    pub turn_id: Option<Uuid>,
+    pub message_id: Option<Uuid>,
+}
 
 #[derive(Clone)]
 pub struct DriverEventSender {
@@ -42,22 +57,8 @@ impl DriverHandle {
         Self { inner: control }
     }
 
-    /// Send a prompt along with the ids this client gave the turn it opened
-    /// and that turn's user message, so the daemon can publish the same
-    /// identity to every other client attached to the runtime.
-    pub fn prompt(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>) {
-        self.prompt_with_transcript(prompt, None, turn_id, message_id);
-    }
-
-    pub fn prompt_with_transcript(
-        &self,
-        prompt: String,
-        transcript_message: Option<String>,
-        turn_id: Option<Uuid>,
-        message_id: Option<Uuid>,
-    ) {
-        self.inner
-            .prompt(prompt, transcript_message, turn_id, message_id);
+    pub fn prompt(&self, submission: PromptSubmission) {
+        self.inner.prompt(submission);
     }
 
     pub fn supports_steer(&self) -> bool {
@@ -124,13 +125,7 @@ impl DriverHandle {
 }
 
 pub trait DriverControl: Send + Sync {
-    fn prompt(
-        &self,
-        prompt: String,
-        transcript_message: Option<String>,
-        turn_id: Option<Uuid>,
-        message_id: Option<Uuid>,
-    );
+    fn prompt(&self, submission: PromptSubmission);
     fn supports_steer(&self) -> bool {
         false
     }

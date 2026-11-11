@@ -852,6 +852,13 @@ pub struct AgentTurn {
     /// it. Present only on the first turn after a switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<TurnHandoff>,
+    /// Whether this turn began with no resume cursor for its agent, so the
+    /// provider started a new native conversation that holds none of that
+    /// agent's earlier turns. Native rollback and fork counts start at the
+    /// latest such turn of the current agent; see
+    /// [`AgentSession::provider_turns_through`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_conversation_start: bool,
     /// The provider-facing preamble built from `handoff`. Runtime state, not
     /// stored: it is rebuilt from the transcript when a turn begins, and a
     /// process that dies before the prompt is sent simply starts the turn
@@ -879,6 +886,17 @@ pub struct TurnHandoff {
     /// Whether the target agent resumed its own native conversation, in which
     /// case the handoff covers only the turns it had not seen.
     pub resumed: bool,
+}
+
+/// The handoff a submitted turn opened with. It travels with the submission so
+/// every client attached to the runtime records the same notice row and
+/// record, instead of saving a projection that silently drops them.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmittedHandoff {
+    pub notice_id: Uuid,
+    pub notice: String,
+    pub record: TurnHandoff,
 }
 
 /// How full the provider's context window is, from the latest main-thread
@@ -1507,6 +1525,7 @@ impl AgentSession {
                 checkpoint: None,
                 provider: None,
                 handoff: None,
+                native_conversation_start: false,
                 handoff_preamble: None,
             });
         }
@@ -1540,6 +1559,7 @@ impl AgentSession {
     ) -> Uuid {
         let id = Uuid::new_v4();
         let now = unix_time();
+        let native_conversation_start = self.opens_native_conversation();
         let mut handoff = None;
         if let Some((notice, record)) = notice {
             let mut message = Message::new_for_turn(MessageRole::System, notice, id);
@@ -1558,6 +1578,7 @@ impl AgentSession {
             checkpoint: None,
             provider: Some(self.provider),
             handoff,
+            native_conversation_start,
             handoff_preamble: preamble,
         });
         self.messages.push(
@@ -1588,6 +1609,7 @@ impl AgentSession {
             checkpoint: None,
             provider: Some(self.provider),
             handoff: None,
+            native_conversation_start: false,
             handoff_preamble: None,
         });
         self.last_reply_at = Some(now);
@@ -1605,12 +1627,14 @@ impl AgentSession {
     /// client was following; the submission becomes its prompt. With no
     /// running turn the submission opens one here exactly as it did on the
     /// submitting client, reusing that client's ids so the projections every
-    /// client saves agree on the rows. Returns whether the session changed.
+    /// client saves agree on the rows, including the handoff notice the
+    /// submitter recorded. Returns whether the session changed.
     pub fn adopt_submitted_prompt(
         &mut self,
         message: &str,
         turn_id: Uuid,
         message_id: Uuid,
+        handoff: Option<&SubmittedHandoff>,
     ) -> bool {
         let now = unix_time();
         if let Some(active) = self.active_turn_id() {
@@ -1627,6 +1651,14 @@ impl AgentSession {
             return true;
         }
         self.set_title_from_prompt(message);
+        let native_conversation_start = self.opens_native_conversation();
+        if let Some(handoff) = handoff {
+            let mut notice =
+                Message::new_for_turn(MessageRole::System, handoff.notice.clone(), turn_id);
+            notice.id = handoff.notice_id;
+            notice.created_at = now;
+            self.messages.push(notice);
+        }
         self.turns.push(AgentTurn {
             id: turn_id,
             turn_count: self.turns.len() + 1,
@@ -1637,7 +1669,8 @@ impl AgentSession {
             completed_at: None,
             checkpoint: None,
             provider: Some(self.provider),
-            handoff: None,
+            handoff: handoff.map(|handoff| handoff.record.clone()),
+            native_conversation_start,
             handoff_preamble: None,
         });
         let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
@@ -1715,34 +1748,67 @@ impl AgentSession {
         }
     }
 
-    /// Turns the session's current agent itself ran, counted from the start of
-    /// the transcript. A task may change agents, so "how many turns does this
-    /// provider know about" is not "how many turns the transcript has": the
-    /// provider's own thread never saw the ones another agent ran.
+    /// Whether a turn beginning now starts a new native conversation: the
+    /// current agent has no cursor to resume, so whatever it ran before is not
+    /// in the conversation this turn opens.
+    fn opens_native_conversation(&self) -> bool {
+        self.provider_cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.provider() != self.provider)
+    }
+
+    /// Index of the turn that opened the current agent's native conversation.
+    /// Turns before it, including the agent's own from a conversation it could
+    /// no longer resume, are not in that conversation.
+    fn native_conversation_floor(&self) -> usize {
+        self.turns
+            .iter()
+            .rposition(|turn| {
+                turn.native_conversation_start && self.turn_provider(turn) == self.provider
+            })
+            .unwrap_or(0)
+    }
+
+    fn is_native_conversation_turn(&self, turn: &AgentTurn) -> bool {
+        turn.provider_turn_started && self.turn_provider(turn) == self.provider
+    }
+
+    /// Turns among the first `turn_count` that the current agent's native
+    /// conversation holds. A task may change agents, so "how many turns does
+    /// this provider know about" is not "how many turns the transcript has":
+    /// the provider's own conversation never saw the ones another agent ran,
+    /// nor the ones it ran in a conversation it started over from.
     pub fn provider_turns_through(&self, turn_count: usize) -> usize {
+        let floor = self.native_conversation_floor();
         self.turns
             .iter()
             .take(turn_count)
-            .filter(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
+            .skip(floor)
+            .filter(|turn| self.is_native_conversation_turn(turn))
             .count()
     }
 
-    /// Turns after `turn_count` that the current agent itself ran, which is how
-    /// many of its own turns a rollback has to undo.
+    /// Turns after `turn_count` that the current agent's native conversation
+    /// holds, which is how many of its own turns a rollback has to undo.
     pub fn provider_turns_after(&self, turn_count: usize) -> usize {
+        let floor = self.native_conversation_floor();
         self.turns
             .iter()
-            .skip(turn_count)
-            .filter(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
+            .skip(turn_count.max(floor))
+            .filter(|turn| self.is_native_conversation_turn(turn))
             .count()
     }
 
+    /// The resume point of the latest turn among the first `turn_count` that
+    /// the current agent's native conversation holds.
     pub fn provider_resume_at_through(&self, turn_count: usize) -> Option<String> {
+        let floor = self.native_conversation_floor();
         self.turns
             .iter()
             .take(turn_count)
+            .skip(floor)
             .rev()
-            .find(|turn| turn.provider_turn_started && self.turn_provider(turn) == self.provider)
+            .find(|turn| self.is_native_conversation_turn(turn))
             .and_then(|turn| turn.provider_resume_at.clone())
     }
 
@@ -2125,6 +2191,7 @@ pub enum DriverEvent {
         message: String,
         turn_id: Uuid,
         message_id: Uuid,
+        handoff: Option<SubmittedHandoff>,
     },
     TurnStarted,
     /// The provider's turn ended while detached work it will wake the
@@ -4904,9 +4971,12 @@ mod tests {
     fn native_rollback_counts_only_the_current_agents_own_turns() {
         let project = Project::from_path(PathBuf::from("/tmp/waku"));
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        // Like a real driver, the agent reports its conversation once it starts.
         let run = |session: &mut AgentSession, prompt: &str| {
             session.begin_turn(prompt);
             session.mark_active_turn_provider_started();
+            let cursor = ProviderResumeCursor::from_session_id(session.provider, "thread".into());
+            session.set_live_provider_cursor(Some(cursor));
             let _ = session.finish_active_turn(TurnStatus::Completed);
         };
 
@@ -4932,12 +5002,96 @@ mod tests {
     }
 
     #[test]
+    fn native_rollback_counts_start_at_the_agents_current_conversation() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        let run = |session: &mut AgentSession, prompt: &str, resume_at: &str| {
+            session.begin_turn(prompt);
+            session.mark_active_turn_provider_started();
+            session.mark_active_turn_provider_resume_at(resume_at.into());
+            let cursor = ProviderResumeCursor::from_session_id(session.provider, "thread".into());
+            session.set_live_provider_cursor(Some(cursor));
+            let _ = session.finish_active_turn(TurnStatus::Completed);
+        };
+
+        run(&mut session, "codex one", "codex-a-1");
+        session.switch_provider(ProviderKind::Claude);
+        run(&mut session, "claude one", "claude-1");
+        // Codex comes back without a conversation to resume, so the thread it
+        // starts holds none of the turns it ran before.
+        session.provider_cursors.clear();
+        session.switch_provider(ProviderKind::Codex);
+        assert!(session.provider_cursor.is_none());
+        run(&mut session, "codex two", "codex-b-1");
+        run(&mut session, "codex three", "codex-b-2");
+
+        assert!(session.turns[0].native_conversation_start);
+        assert!(
+            session.turns[1].native_conversation_start,
+            "Claude's first turn"
+        );
+        assert!(session.turns[2].native_conversation_start);
+        assert!(!session.turns[3].native_conversation_start);
+        assert_eq!(session.provider_turns_through(4), 2);
+        assert_eq!(session.provider_turns_through(3), 1);
+        assert_eq!(session.provider_turns_through(2), 0);
+        assert_eq!(session.provider_turns_through(1), 0);
+        assert_eq!(session.provider_turns_after(0), 2);
+        assert_eq!(session.provider_turns_after(2), 2);
+        assert_eq!(session.provider_turns_after(3), 1);
+        assert_eq!(session.provider_resume_at_through(2), None);
+        assert_eq!(
+            session.provider_resume_at_through(4).as_deref(),
+            Some("codex-b-2")
+        );
+    }
+
+    #[test]
+    fn a_follower_records_the_submitters_handoff() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.begin_turn("first");
+        session.mark_active_turn_provider_started();
+        session.finish_active_turn(TurnStatus::Completed);
+        session.switch_provider(ProviderKind::Claude);
+        session.status = SessionStatus::Idle;
+        let handoff = SubmittedHandoff {
+            notice_id: Uuid::new_v4(),
+            notice: "Continuing with Claude".into(),
+            record: TurnHandoff {
+                from_providers: vec![ProviderKind::Codex],
+                covered_turns: 1,
+                omitted_turns: 0,
+                resumed: false,
+            },
+        };
+        let turn_id = Uuid::new_v4();
+
+        assert!(session.adopt_submitted_prompt("second", turn_id, Uuid::new_v4(), Some(&handoff)));
+
+        let turn = session.turns.last().unwrap();
+        assert_eq!(turn.provider, Some(ProviderKind::Claude));
+        assert_eq!(turn.handoff, Some(handoff.record.clone()));
+        assert!(turn.native_conversation_start);
+        let notice = session
+            .messages
+            .iter()
+            .find(|message| message.id == handoff.notice_id)
+            .expect("the notice row is mirrored");
+        assert_eq!(notice.role, MessageRole::System);
+        assert_eq!(notice.turn_id, Some(turn_id));
+        assert_eq!(notice.content, "Continuing with Claude");
+    }
+
+    #[test]
     fn native_rollback_count_ignores_turns_that_never_reached_the_provider() {
         let project = Project::from_path(PathBuf::from("/tmp/waku"));
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
 
         session.begin_turn("first");
         session.mark_active_turn_provider_started();
+        session.set_live_provider_cursor(Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-thread".into(),
+        }));
         session.finish_active_turn(TurnStatus::Completed);
         session.begin_turn("failed locally");
         session.finish_active_turn(TurnStatus::Failed);
@@ -5204,7 +5358,7 @@ mod tests {
         let turn_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("second", turn_id, message_id));
+        assert!(session.adopt_submitted_prompt("second", turn_id, message_id, None));
 
         assert_eq!(session.status, SessionStatus::Connecting);
         assert_eq!(session.active_turn_id(), Some(turn_id));
@@ -5225,7 +5379,7 @@ mod tests {
         session.status = SessionStatus::Connecting;
         let message_id = session.messages[0].id;
 
-        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id));
+        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id, None));
 
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.messages.len(), 1);
@@ -5240,7 +5394,7 @@ mod tests {
         session.status = SessionStatus::Working;
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id));
+        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id, None));
 
         assert_eq!(session.turns.len(), 1);
         let prompt = session.messages.last().unwrap();
@@ -5312,6 +5466,7 @@ mod tests {
             checkpoint: None,
             provider: None,
             handoff: None,
+            native_conversation_start: false,
             handoff_preamble: None,
         });
 
@@ -5353,12 +5508,19 @@ mod tests {
         session.begin_turn("claude 1");
         session.mark_active_turn_provider_started();
         session.mark_active_turn_provider_resume_at("claude-msg-1".into());
+        session.set_live_provider_cursor(Some(ProviderResumeCursor::Claude {
+            session_id: "claude-session".into(),
+            resume_at: Some("claude-msg-1".into()),
+        }));
         session.finish_active_turn(TurnStatus::Completed);
 
         session.switch_provider(ProviderKind::Codex);
         session.begin_turn("codex 1");
         session.mark_active_turn_provider_started();
         session.mark_active_turn_provider_resume_at("codex-item-1".into());
+        session.set_live_provider_cursor(Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-thread".into(),
+        }));
         session.finish_active_turn(TurnStatus::Completed);
 
         session.switch_provider(ProviderKind::Claude);

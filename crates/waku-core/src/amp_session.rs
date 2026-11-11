@@ -144,6 +144,7 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 checkpoint: None,
                 provider: Some(ProviderKind::Amp),
                 handoff: None,
+                native_conversation_start: false,
                 handoff_preamble: None,
             });
             if let Some(text) = message_text(&native) {

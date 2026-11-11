@@ -16,4 +16,12 @@ provider?: ProviderKind | null,
  * What this turn carried over from the agents that ran the turns before
  * it. Present only on the first turn after a switch.
  */
-handoff?: TurnHandoff | null, };
+handoff?: TurnHandoff | null,
+/**
+ * Whether this turn began with no resume cursor for its agent, so the
+ * provider started a new native conversation that holds none of that
+ * agent's earlier turns. Native rollback and fork counts start at the
+ * latest such turn of the current agent; see
+ * [`AgentSession::provider_turns_through`].
+ */
+native_conversation_start?: boolean, };

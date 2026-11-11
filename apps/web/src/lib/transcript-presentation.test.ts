@@ -17,6 +17,8 @@ import {
   shouldVirtualizeActivityText,
   turnAnswerStart,
   turnFoldLabel,
+  providerTurnsAfter,
+  providerTurnsThrough,
   userMessageRewindTurnCount,
   formatMessageTime,
   formatWorkingElapsed,
@@ -270,6 +272,37 @@ describe('desktop transcript language', () => {
     session.provider_cursor = { provider: 'codex', threadId: 'thread' }
     session.status = 'working'
     expect(userMessageRewindTurnCount(session, firstMessage, new Set([0]))).toBeNull()
+  })
+
+  test('counts only the current agent’s turns in its current native conversation', () => {
+    const session = transcriptSession()
+    const started = (id: string, count: number, provider: 'codex' | 'claude', start = false) => ({
+      ...turn('completed', 100, 200),
+      id,
+      turn_count: count,
+      provider,
+      ...(start ? { native_conversation_start: true } : {}),
+    })
+    // Codex ran turn 1, Claude turn 2, then Codex came back without a cursor
+    // and opened a new conversation for turns 3 and 4.
+    session.turns = [
+      started('t1', 1, 'codex', true),
+      started('t2', 2, 'claude', true),
+      started('t3', 3, 'codex', true),
+      started('t4', 4, 'codex'),
+    ]
+    expect(providerTurnsThrough(session, 4)).toBe(2)
+    expect(providerTurnsThrough(session, 2)).toBe(0)
+    expect(providerTurnsAfter(session, 0)).toBe(2)
+    expect(providerTurnsAfter(session, 3)).toBe(1)
+
+    // A task Codex just took over from Claude has nothing of Codex's to roll
+    // back, so rewinding needs no Codex cursor.
+    session.turns = [started('t1', 1, 'claude', true), started('t2', 2, 'claude')]
+    session.provider_cursor = null
+    const firstMessage = { ...session.messages[0]!, turn_id: 't1' }
+    expect(providerTurnsAfter(session, 0)).toBe(0)
+    expect(userMessageRewindTurnCount(session, firstMessage, new Set([0]))).toBe(1)
   })
 })
 

@@ -19,12 +19,52 @@ export function userMessageRewindTurnCount(
   if (!turn) return null
   const retainedTurnCount = Math.max(0, turn.turn_count - 1)
   if (!availableRetainedTurnCounts.has(retainedTurnCount)) return null
-  const rollbackTurns = session.turns
-    .slice(retainedTurnCount)
-    .filter((candidate) => candidate.provider_turn_started)
-    .length
+  const rollbackTurns = providerTurnsAfter(session, retainedTurnCount)
   if (rollbackTurns > 0 && !session.provider_cursor) return null
   return turn.turn_count
+}
+
+type SessionTurn = AgentSession['turns'][number]
+
+/** The agent that ran `turn`. Turns recorded before a task could change
+ * agents carry none, and belong to the session's provider. */
+export function turnProvider(session: AgentSession, turn: SessionTurn) {
+  return turn.provider ?? session.provider
+}
+
+/** Index of the turn that opened the current agent's native conversation;
+ * mirrors `AgentSession::native_conversation_floor`. */
+function nativeConversationFloor(session: AgentSession) {
+  for (let index = session.turns.length - 1; index >= 0; index--) {
+    const turn = session.turns[index]!
+    if (turn.native_conversation_start && turnProvider(session, turn) === session.provider) {
+      return index
+    }
+  }
+  return 0
+}
+
+function isNativeConversationTurn(session: AgentSession, turn: SessionTurn) {
+  return turn.provider_turn_started && turnProvider(session, turn) === session.provider
+}
+
+/** Turns among the first `turnCount` that the current agent's native
+ * conversation holds; mirrors `AgentSession::provider_turns_through`. */
+export function providerTurnsThrough(session: AgentSession, turnCount: number) {
+  const floor = nativeConversationFloor(session)
+  return session.turns
+    .slice(floor, Math.max(floor, turnCount))
+    .filter((turn) => isNativeConversationTurn(session, turn))
+    .length
+}
+
+/** Turns after `turnCount` that the current agent's native conversation
+ * holds; mirrors `AgentSession::provider_turns_after`. */
+export function providerTurnsAfter(session: AgentSession, turnCount: number) {
+  return session.turns
+    .slice(Math.max(turnCount, nativeConversationFloor(session)))
+    .filter((turn) => isNativeConversationTurn(session, turn))
+    .length
 }
 
 /** How many kinds the collapsed group summary names before folding the rest

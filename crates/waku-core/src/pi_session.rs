@@ -410,6 +410,7 @@ fn history_from_session(provider: ProviderKind, session: &ParsedSession) -> Prov
                 checkpoint: None,
                 provider: Some(provider),
                 handoff: None,
+                native_conversation_start: false,
                 handoff_preamble: None,
             });
             if let Some(text) = entry.text.as_deref() {

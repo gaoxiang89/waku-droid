@@ -2,9 +2,11 @@ import type {
   ActivityItem,
   ActivityKind,
   AgentSession,
+  ProviderKind,
   ProviderResumeCursor,
   ReportedCommand,
   SequencedEvent,
+  SubmittedHandoff,
   ThreadGoal,
   TranscriptBlock,
   TurnStatus,
@@ -137,6 +139,7 @@ export function reduceRuntimeEvent(
         value.message,
         typeof value.turnId === 'string' ? value.turnId : clock.randomUUID(),
         typeof value.messageId === 'string' ? value.messageId : clock.randomUUID(),
+        submittedHandoff(value.handoff),
         clock,
       )
       break
@@ -164,6 +167,7 @@ export function reduceRuntimeEvent(
           started_at: clock.nowSeconds(),
           completed_at: null,
           checkpoint: null,
+          provider: session.provider,
         })
         session.status = 'working'
       }
@@ -376,6 +380,7 @@ function adoptSubmittedPrompt(
   message: string,
   turnId: string,
   messageId: string,
+  handoff: SubmittedHandoff | null,
   clock: ReducerClock,
 ) {
   const now = clock.nowSeconds()
@@ -396,6 +401,19 @@ function adoptSubmittedPrompt(
     return
   }
   setTitleFromPrompt(session, message)
+  // Without a cursor for the current agent the provider opens a new native
+  // conversation, which native rollback and fork counts start from.
+  const opensNativeConversation = session.provider_cursor?.provider !== session.provider
+  if (handoff) {
+    session.messages.push({
+      id: handoff.noticeId,
+      turn_id: turnId,
+      role: 'system',
+      content: handoff.notice,
+      created_at: now,
+      streaming: false,
+    })
+  }
   session.turns.push({
     id: turnId,
     turn_count: session.turns.length + 1,
@@ -405,6 +423,9 @@ function adoptSubmittedPrompt(
     started_at: now,
     completed_at: null,
     checkpoint: null,
+    provider: session.provider,
+    ...(handoff ? { handoff: handoff.record } : {}),
+    ...(opensNativeConversation ? { native_conversation_start: true } : {}),
   })
   session.messages.push({
     id: messageId,
@@ -416,6 +437,33 @@ function adoptSubmittedPrompt(
   })
   session.status = 'connecting'
   session.last_reply_at = now
+}
+
+function submittedHandoff(payload: unknown): SubmittedHandoff | null {
+  const value = asRecord(payload)
+  const record = asRecord(value?.record)
+  if (
+    !value
+    || typeof value.noticeId !== 'string'
+    || typeof value.notice !== 'string'
+    || !record
+    || !Array.isArray(record.from_providers)
+    || typeof record.covered_turns !== 'number'
+    || typeof record.omitted_turns !== 'number'
+    || typeof record.resumed !== 'boolean'
+  ) return null
+  return {
+    noticeId: value.noticeId,
+    notice: value.notice,
+    record: {
+      from_providers: record.from_providers.filter(
+        (provider): provider is ProviderKind => typeof provider === 'string',
+      ),
+      covered_turns: record.covered_turns,
+      omitted_turns: record.omitted_turns,
+      resumed: record.resumed,
+    },
+  }
 }
 
 function appendText(session: AgentSession, delta: string, clock: ReducerClock) {

@@ -115,6 +115,25 @@ pub(super) fn submitted_prompt_identity(session: &AgentSession) -> (Option<Uuid>
     (Some(turn_id), message_id)
 }
 
+/// The handoff notice and record the active turn opened with, so the daemon
+/// can republish them and every attached client records the same rows.
+pub(super) fn submitted_handoff(session: &AgentSession) -> Option<crate::model::SubmittedHandoff> {
+    let turn = session
+        .turns
+        .last()
+        .filter(|turn| turn.status == TurnStatus::Running)?;
+    let record = turn.handoff.clone()?;
+    let notice = session
+        .messages
+        .iter()
+        .find(|message| message.turn_id == Some(turn.id) && message.role == MessageRole::System)?;
+    Some(crate::model::SubmittedHandoff {
+        notice_id: notice.id,
+        notice: notice.content.clone(),
+        record,
+    })
+}
+
 pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
     session.is_busy()
         && session
@@ -152,7 +171,14 @@ pub(super) fn merge_remote_session_catalog(
             local.pinned = remote.pinned;
             local.archived = remote.archived;
             local.project_id = remote.project_id;
-            local.provider = remote.provider;
+            if local.provider != remote.provider {
+                // Parks the outgoing agent's cursor and attributes the turns
+                // it ran before `turn_provider` starts reading them as the
+                // new agent's. The remote timestamps stay authoritative.
+                let updated_at = local.updated_at;
+                local.switch_provider(remote.provider);
+                local.updated_at = updated_at;
+            }
             local.model = remote.model;
             local.created_at = remote.created_at;
             local.last_reply_at = remote.last_reply_at;
@@ -3747,24 +3773,31 @@ impl Waku {
             // travels alone; the incoming agent still resumes its own
             // conversation, it simply misses this one turn's recap.
             if !driver_prompt.trim_start().starts_with('/') {
-                driver_prompt = format!("{preamble}\n\n---\n\n{driver_prompt}");
+                driver_prompt = super::handoff::compose_prompt(&preamble, &driver_prompt);
             }
         }
         // The turn and its user message landed at accept time. Their ids go
         // with the prompt so every other client attached to the runtime
         // mirrors the same rows instead of minting its own.
-        let (turn_id, message_id) = self
+        let (turn_id, message_id, handoff) = self
             .state
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .map(submitted_prompt_identity)
-            .unwrap_or((None, None));
+            .map(|session| {
+                let (turn_id, message_id) = submitted_prompt_identity(session);
+                (turn_id, message_id, submitted_handoff(session))
+            })
+            .unwrap_or((None, None, None));
         let mut failed_to_start = false;
         match driver {
-            Ok(driver) => {
-                driver.prompt_with_transcript(driver_prompt, Some(prompt), turn_id, message_id)
-            }
+            Ok(driver) => driver.prompt(crate::driver::PromptSubmission {
+                prompt: driver_prompt,
+                transcript_message: Some(prompt),
+                handoff,
+                turn_id,
+                message_id,
+            }),
             Err(error) => {
                 failed_to_start = true;
                 let message = tr!("errors.start_agent", error = error);

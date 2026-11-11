@@ -315,6 +315,7 @@ fn parse_session_history(response: &Value) -> ProviderSessionHistory {
             checkpoint: None,
             provider: Some(ProviderKind::Codex),
             handoff: None,
+            native_conversation_start: false,
             handoff_preamble: None,
         });
 
