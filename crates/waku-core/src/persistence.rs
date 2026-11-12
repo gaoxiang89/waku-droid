@@ -30,8 +30,8 @@ use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
 use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
-    AgentSession, FavoriteModel, Message, MessageAttachment, MessageRole, Project, ProviderKind,
-    RuntimeMode, SessionWorkspace, TranscriptBlock,
+    AgentSession, FavoriteModel, Message, MessageAttachment, MessageRole, ParkedAccountCursor,
+    Project, ProviderKind, ProviderResumeCursor, RuntimeMode, SessionWorkspace, TranscriptBlock,
 };
 use crate::theme::ThemePreference;
 pub use waku_protocol::persistence::{
@@ -1286,6 +1286,60 @@ impl StateStore {
             },
         });
         Ok(state)
+    }
+
+    /// Native identities already owned by Waku, including unopened sessions.
+    /// Resume discovery runs off the UI thread. Read only cursor fields here,
+    /// not entire transcripts, and let hydrated/unsaved state override storage.
+    pub(crate) fn imported_provider_session_keys(
+        &self,
+        sessions: &[AgentSession],
+    ) -> io::Result<HashSet<(ProviderKind, String)>> {
+        let mut keys: HashSet<_> = sessions
+            .iter()
+            .flat_map(AgentSession::all_provider_cursors)
+            .map(|cursor| (cursor.provider(), cursor.native_id().to_owned()))
+            .collect();
+        let unloaded: HashSet<_> = sessions
+            .iter()
+            .filter(|session| !session.detail_loaded)
+            .map(|session| session.id.to_string())
+            .collect();
+        if unloaded.is_empty() {
+            return Ok(keys);
+        }
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, json_extract(data,
+                    '$.provider_cursor', '$.provider_cursors', '$.account_cursors')
+                 FROM session_details",
+            )
+            .map_err(to_io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(to_io_error)?;
+        for row in rows {
+            let (id, cursors) = row.map_err(to_io_error)?;
+            if !unloaded.contains(&id) {
+                continue;
+            }
+            let (active, parked, accounts): (
+                Option<ProviderResumeCursor>,
+                Option<Vec<ProviderResumeCursor>>,
+                Option<Vec<ParkedAccountCursor>>,
+            ) = serde_json::from_str(&cursors).map_err(to_io_error)?;
+            keys.extend(
+                active
+                    .into_iter()
+                    .chain(parked.into_iter().flatten())
+                    .chain(accounts.into_iter().flatten().map(|entry| entry.cursor))
+                    .map(|cursor| (cursor.provider(), cursor.native_id().to_owned())),
+            );
+        }
+        Ok(keys)
     }
 
     /// Fills in a session's transcript, turns and messages.
@@ -3838,6 +3892,86 @@ mod tests {
         let state = store_in(&directory).load_or_fresh(PathBuf::from("/"));
         assert!(state.projects.is_empty());
         assert!(state.selected_session.is_none());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn imported_provider_keys_include_unopened_sessions_without_loading_history() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(directory.join("project"));
+        let session_id = state.sessions[0].id;
+        let session = state.session_mut(session_id).unwrap();
+        session.begin_turn("A persisted conversation");
+        session.provider_cursor = Some(ProviderResumeCursor::Droid {
+            session_id: "droid-existing".into(),
+        });
+        session.provider_cursors.push(ProviderResumeCursor::Codex {
+            thread_id: "codex-parked".into(),
+        });
+        session.account_cursors.push(ParkedAccountCursor {
+            account_id: "other-account".into(),
+            cursor: ProviderResumeCursor::Claude {
+                session_id: "claude-parked-account".into(),
+                resume_at: None,
+            },
+        });
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        // This is the startup state the old in-memory-only check missed.
+        assert_eq!(restored.sessions[0].all_provider_cursors().count(), 0);
+        let expected = HashSet::from([
+            (ProviderKind::Droid, "droid-existing".into()),
+            (ProviderKind::Codex, "codex-parked".into()),
+            (ProviderKind::Claude, "claude-parked-account".into()),
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                reopened
+                    .imported_provider_session_keys(&restored.sessions)
+                    .unwrap(),
+                expected
+            );
+            assert!(!restored.sessions[0].detail_loaded);
+            assert!(restored.sessions[0].messages.is_empty());
+            assert!(restored.sessions[0].turns.is_empty());
+        }
+
+        // A hydrated session is authoritative, including a cursor cleared
+        // or changed since its last save. Never revive its old stored cursor.
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(
+            reopened
+                .imported_provider_session_keys(&restored.sessions)
+                .unwrap(),
+            expected
+        );
+        restored.sessions[0].provider_cursor = Some(ProviderResumeCursor::Droid {
+            session_id: "droid-new".into(),
+        });
+        let keys = reopened
+            .imported_provider_session_keys(&restored.sessions)
+            .unwrap();
+        assert!(keys.contains(&(ProviderKind::Droid, "droid-new".into())));
+        assert!(!keys.contains(&(ProviderKind::Droid, "droid-existing".into())));
+        restored.sessions[0].provider_cursor = None;
+        assert!(
+            !reopened
+                .imported_provider_session_keys(&restored.sessions)
+                .unwrap()
+                .iter()
+                .any(|(provider, _)| *provider == ProviderKind::Droid)
+        );
+
+        // Removed sessions must not suppress a later explicit import.
+        assert!(
+            reopened
+                .imported_provider_session_keys(&[])
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(directory).ok();
     }
 

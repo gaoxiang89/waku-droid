@@ -673,7 +673,8 @@ impl Backend for WakuBackend {
                 });
                 let imported = {
                     let state = self.task_state.lock();
-                    imported_provider_session_keys(&state.sessions)
+                    self.task_store
+                        .imported_provider_session_keys(&state.sessions)?
                 };
                 sessions.retain(|session| {
                     !imported.contains(&(session.provider(), session.cursor.native_id().to_owned()))
@@ -1102,14 +1103,6 @@ impl Backend for WakuBackend {
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
     }
-}
-
-fn imported_provider_session_keys(sessions: &[AgentSession]) -> HashSet<(ProviderKind, String)> {
-    sessions
-        .iter()
-        .flat_map(AgentSession::all_provider_cursors)
-        .map(|cursor| (cursor.provider(), cursor.native_id().to_owned()))
-        .collect()
 }
 
 fn prompt_submission_wire_event(command: &Command) -> anyhow::Result<Option<WireDriverEvent>> {
@@ -2688,23 +2681,6 @@ mod tests {
             .unwrap()
             .expect("prompt command emits submission event");
         assert_eq!(fallback_wire.payload["message"], "legacy client prompt");
-    }
-
-    #[test]
-    fn imported_provider_keys_include_parked_cursors() {
-        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
-        session.provider_cursor = Some(ProviderResumeCursor::Codex {
-            thread_id: "codex-parked".into(),
-        });
-        session.switch_provider(ProviderKind::Claude);
-        session.provider_cursor = Some(ProviderResumeCursor::Claude {
-            session_id: "claude-active".into(),
-            resume_at: None,
-        });
-
-        let keys = imported_provider_session_keys(&[session]);
-        assert!(keys.contains(&(ProviderKind::Codex, "codex-parked".into())));
-        assert!(keys.contains(&(ProviderKind::Claude, "claude-active".into())));
     }
 
     #[test]
