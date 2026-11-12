@@ -176,17 +176,31 @@ impl DaemonProcess {
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
             && record.protocol_version == PROTOCOL_VERSION
             && record.token == token
-            && let Ok(address) = desktop_client_address(&record.address)
-            && let Ok(client) = DaemonClient::connect(&address, token.clone())
         {
-            return Ok(Self {
-                client: Mutex::new(client),
-                address,
-                token,
-                child: None,
-                state_file,
-                pid: record.pid,
-            });
+            if resident_daemon_tainted(record.pid) {
+                if let Ok(address) = desktop_client_address(&record.address)
+                    && let Ok(client) = DaemonClient::connect(&address, token.clone())
+                {
+                    client.shutdown();
+                    let _ = std::fs::remove_file(&state_file);
+                    if !wait_for_resident_exit(record.pid, Duration::from_secs(5)) {
+                        bail!(
+                            "a sandboxed resident daemon is still exiting; try again once it releases its port"
+                        );
+                    }
+                }
+            } else if let Ok(address) = desktop_client_address(&record.address)
+                && let Ok(client) = DaemonClient::connect(&address, token.clone())
+            {
+                return Ok(Self {
+                    client: Mutex::new(client),
+                    address,
+                    token,
+                    child: None,
+                    state_file,
+                    pid: record.pid,
+                });
+            }
         }
         if let Ok(bytes) = std::fs::read(&state_file)
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
@@ -1012,6 +1026,73 @@ fn resident_process_alive(pid: u32) -> bool {
     }
 }
 
+fn wait_for_resident_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while resident_process_alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
+/// A Windows daemon originally spawned inside an agent sandbox inherits
+/// `ProcessRedirectionTrustPolicy` (`EnforceRedirectionTrust`), which blocks
+/// every provider CLI it spawns from traversing user-created NTFS symlinks.
+/// When a normal desktop process sees such a resident daemon, replace it
+/// instead of inheriting the sandbox restriction across sessions.
+#[cfg(not(windows))]
+fn resident_daemon_tainted(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn resident_daemon_tainted(pid: u32) -> bool {
+    !current_process_enforces_redirection_trust() && process_enforces_redirection_trust(pid)
+}
+
+#[cfg(windows)]
+fn current_process_enforces_redirection_trust() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe { handle_enforces_redirection_trust(GetCurrentProcess()) }
+}
+
+#[cfg(windows)]
+fn process_enforces_redirection_trust(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let enforced = handle_enforces_redirection_trust(handle);
+        CloseHandle(handle);
+        enforced
+    }
+}
+
+#[cfg(windows)]
+unsafe fn handle_enforces_redirection_trust(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessMitigationPolicy, ProcessRedirectionTrustPolicy,
+    };
+    const ENFORCE_REDIRECTION_TRUST_MASK: u32 = 0x1;
+    let mut flags: u32 = 0;
+    let ok = unsafe {
+        GetProcessMitigationPolicy(
+            handle,
+            ProcessRedirectionTrustPolicy,
+            (&raw mut flags).cast(),
+            std::mem::size_of::<u32>(),
+        )
+    };
+    ok != 0 && (flags & ENFORCE_REDIRECTION_TRUST_MASK) != 0
+}
+
 fn queue_settings_refresh(inner: &SupervisorInner) {
     let settings = inner.settings.lock().clone();
     *inner.persisted_settings.lock() = None;
@@ -1094,5 +1175,16 @@ mod tests {
             "127.0.0.1:34123"
         );
         assert_eq!(desktop_client_address("[::]:34123").unwrap(), "[::1]:34123");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn redirection_trust_probe_matches_current_process_and_never_taints_self() {
+        let pid = std::process::id();
+        assert_eq!(
+            process_enforces_redirection_trust(pid),
+            current_process_enforces_redirection_trust()
+        );
+        assert!(!resident_daemon_tainted(pid));
     }
 }
