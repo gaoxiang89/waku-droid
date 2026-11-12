@@ -567,13 +567,17 @@ fn user_tool_directories(home: &Path) -> Vec<PathBuf> {
         home.join("AppData/Local/Microsoft/WindowsApps"),
         home.join(".local/bin"),
     ];
-    // Volta, pnpm, and the user-scoped Node installer default to LocalAppData
-    // (the same list T3 Code probes); it can be redirected away from home.
+    // Antigravity (`agy`), Volta, pnpm, and the user-scoped Node installer
+    // default to LocalAppData (the same list T3 Code probes); it can be
+    // redirected away from home.
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         let local_app_data = PathBuf::from(local_app_data);
+        directories.push(local_app_data.join("agy/bin"));
         directories.push(local_app_data.join("Volta/bin"));
         directories.push(local_app_data.join("pnpm"));
         directories.push(local_app_data.join("Programs/nodejs"));
+    } else {
+        directories.push(home.join("AppData/Local/agy/bin"));
     }
     directories
 }
@@ -1129,9 +1133,12 @@ mod tests {
         assert!(paths.contains(&home.join(".local/bin")));
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
             let local_app_data = PathBuf::from(local_app_data);
+            assert!(paths.contains(&local_app_data.join("agy/bin")));
             assert!(paths.contains(&local_app_data.join("Volta/bin")));
             assert!(paths.contains(&local_app_data.join("pnpm")));
             assert!(paths.contains(&local_app_data.join("Programs/nodejs")));
+        } else {
+            assert!(paths.contains(&home.join("AppData/Local/agy/bin")));
         }
         assert_eq!(
             paths
