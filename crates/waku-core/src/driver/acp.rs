@@ -82,6 +82,10 @@ enum CommandMessage {
         turns_to_remove: usize,
         reply: smol::channel::Sender<anyhow::Result<ProviderResumeCursor>>,
     },
+    /// The provider no longer has the native session a prompt was sent to;
+    /// start a fresh one and resend the prompt. Raised internally by the
+    /// prompt callback, never by the handle.
+    RecoverLostSession(String),
     Shutdown,
 }
 
@@ -873,7 +877,7 @@ async fn run_sdk_connection(
                 .session_capabilities
                 .fork
                 .is_some();
-            let (session_id, modes, initial_config_options) = establish_session(
+            let (mut session_id, modes, initial_config_options) = establish_session(
                 &connection,
                 provider,
                 &initialize,
@@ -911,7 +915,7 @@ async fn run_sdk_connection(
                 }
                 droid_autonomy_ready.store(true, Ordering::Release);
             }
-            let native_session_id = session_id.to_string();
+            let mut native_session_id = session_id.to_string();
             let _ = events.send(DriverEvent::Connected {
                 provider_cursor: Some(ProviderResumeCursor::from_session_id(
                     provider,
@@ -937,9 +941,99 @@ async fn run_sdk_connection(
             .await;
             let mut fork_context = fork_context;
             let mut computer_use_instructions = computer_use_instructions;
+            // Prompt callbacks raise lost-session recovery here rather than on
+            // `commands`: a clone of the handle's sender would keep this loop
+            // alive after the handle is dropped.
+            let (recovery_tx, recovery_rx) = smol::channel::unbounded::<CommandMessage>();
 
-            while let Ok(command) = commands.recv().await {
+            loop {
+                let next = smol::future::or(async { recovery_rx.recv().await.ok() }, async {
+                    commands.recv().await.ok()
+                })
+                .await;
+                let Some(command) = next else {
+                    break;
+                };
                 match command {
+                    CommandMessage::RecoverLostSession(text) => {
+                        match establish_session(
+                            &connection,
+                            provider,
+                            &initialize,
+                            None,
+                            &cwd,
+                            &acp_mcp_servers,
+                            &suppress_session_updates,
+                        )
+                        .await
+                        {
+                            Ok((fresh_session_id, modes, fresh_config_options)) => {
+                                session_id = fresh_session_id;
+                                native_session_id = session_id.to_string();
+                                *config_options.lock() = fresh_config_options;
+                                let live_mode = *access_mode.lock();
+                                if let Some(mode_id) =
+                                    desired_access_mode(provider, modes.as_ref(), live_mode)
+                                {
+                                    let _ = connection
+                                        .send_request(SetSessionModeRequest::new(
+                                            session_id.clone(),
+                                            mode_id,
+                                        ))
+                                        .block_task()
+                                        .await;
+                                }
+                                sync_cached_session_model(
+                                    &connection,
+                                    provider,
+                                    &session_id,
+                                    &config_options,
+                                    current_model.as_deref(),
+                                    current_effort.as_deref(),
+                                    current_tier.as_deref(),
+                                    current_window.as_deref(),
+                                    &events,
+                                )
+                                .await;
+                                let _ = events.send(DriverEvent::Connected {
+                                    provider_cursor: Some(ProviderResumeCursor::from_session_id(
+                                        provider,
+                                        native_session_id.clone(),
+                                    )),
+                                });
+                                // The turn already started; only resend it,
+                                // and never recover the same prompt twice.
+                                if let Err(error) = send_prompt(
+                                    &connection,
+                                    &session_id,
+                                    text,
+                                    &cwd,
+                                    &prompt_capabilities,
+                                    &prompt_requests,
+                                    &events,
+                                    provider,
+                                    &native_session_id,
+                                    grok_title_home.clone(),
+                                    title_refresh.clone(),
+                                    stream_state.clone(),
+                                    None,
+                                ) {
+                                    let _ = events.send(DriverEvent::Error(error.to_string()));
+                                    let _ = events.send(DriverEvent::TurnFinished {
+                                        success: false,
+                                        summary: None,
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                let _ = events.send(DriverEvent::Error(error.to_string()));
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                            }
+                        }
+                    }
                     CommandMessage::Prompt(text) => {
                         let text = fork_context
                             .take()
@@ -965,6 +1059,7 @@ async fn run_sdk_connection(
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
+                            (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
                         ) {
                             let _ = events.send(DriverEvent::Error(error.to_string()));
                             let _ = events.send(DriverEvent::TurnFinished {
@@ -997,6 +1092,7 @@ async fn run_sdk_connection(
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
+                            None,
                         ) {
                             Ok(()) => {
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
@@ -2243,8 +2339,10 @@ fn send_prompt(
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
+    lost_session_recovery: Option<smol::channel::Sender<CommandMessage>>,
 ) -> agent_client_protocol::Result<()> {
     stream_state.lock().produced_content = false;
+    let retry_text = lost_session_recovery.as_ref().map(|_| text.clone());
     // Read before the turn runs, so the failure lookup cannot mistake an
     // earlier turn's record for this one's.
     let kimi_offset = (provider == ProviderKind::Kimi)
@@ -2274,6 +2372,18 @@ fn send_prompt(
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
+            // The resumed session no longer exists on the provider's side, so
+            // every prompt to it would fail the same way. Hand the prompt back
+            // to the loop to start a fresh session instead of failing the turn.
+            if let (Some(recovery), Some(text), Err(error)) =
+                (lost_session_recovery, retry_text, &result)
+                && is_lost_native_session(&error.to_string())
+                && recovery
+                    .try_send(CommandMessage::RecoverLostSession(text))
+                    .is_ok()
+            {
+                return Ok(());
+            }
             // Only an empty turn pays for Kimi's lookup. Antigravity always
             // checks its own step log once, because it reports upstream API
             // failures as a chat message and a clean `end_turn`.
@@ -2306,6 +2416,14 @@ fn send_prompt(
         prompt_requests.lock().settle_request(&request_id);
     }
     registered
+}
+
+/// Antigravity answers `session/load` for a conversation it never saved, then
+/// rejects the first prompt with `not_found: trajectory not found: <id>` —
+/// observed when its conversation store was unwritable, so the original turn
+/// never persisted.
+fn is_lost_native_session(error: &str) -> bool {
+    error.contains("trajectory not found")
 }
 
 const MAX_PROMPT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -4701,6 +4819,16 @@ mod tests {
         let launch = launch_for(ProviderKind::Fx, None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn recognizes_antigravity_lost_trajectory_errors() {
+        // Verbatim from `agy acp` after a turn that never persisted.
+        assert!(is_lost_native_session(
+            "Failed to send user message: not_found: trajectory not found: \
+             ea82b742-509e-420b-9367-b85b48b375fa: not found"
+        ));
+        assert!(!is_lost_native_session("Internal error: quota exceeded"));
     }
 
     #[test]

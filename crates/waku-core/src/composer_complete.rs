@@ -1661,7 +1661,8 @@ mod tests {
                 .any(|command| command.name == "mattpocock-skills:to-spec"),
             "Codex plugin skill is missing its catalog key: {commands:?}"
         );
-        let claude_commands = assemble_slash_commands(ProviderKind::Claude, &root, None, Vec::new());
+        let claude_commands =
+            assemble_slash_commands(ProviderKind::Claude, &root, None, Vec::new());
         assert!(
             claude_commands
                 .iter()
