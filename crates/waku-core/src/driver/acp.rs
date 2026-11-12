@@ -2392,11 +2392,20 @@ fn send_prompt(
                     .then(|| crate::kimi_session::turn_failure(&native_session_id, offset))
                     .flatten()
             } else if let Some(offset) = antigravity_offset {
-                let refusal = matches!(
-                    &result,
-                    Ok(response) if matches!(response.stop_reason, StopReason::Refusal)
-                );
-                crate::antigravity_session::turn_failure(&native_session_id, offset, refusal)
+                let (refusal, empty_end_turn) = match &result {
+                    Ok(response) => (
+                        matches!(response.stop_reason, StopReason::Refusal),
+                        matches!(response.stop_reason, StopReason::EndTurn)
+                            && !stream_state.lock().produced_content,
+                    ),
+                    Err(_) => (false, false),
+                };
+                crate::antigravity_session::turn_failure(
+                    &native_session_id,
+                    offset,
+                    refusal,
+                    empty_end_turn,
+                )
             } else {
                 None
             };
