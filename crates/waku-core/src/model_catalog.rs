@@ -24,10 +24,6 @@ const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// resources and model catalog, which can outlast a live request's budget.
 const PI_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CURSOR_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-const DROID_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
-/// Selecting a model answers in roughly 100-200 ms, so this covers a catalog
-/// of about a hundred models while leaving the overall timeout room to spare.
-const DROID_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
 const ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 const ANTIGRAVITY_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
 
@@ -145,9 +141,7 @@ pub fn discover_catalog(
 }
 
 /// [`discover_catalog`], plus why live discovery failed when the provider
-/// can say. Droid reports a reason when its login or `FACTORY_API_KEY` is
-/// rejected, and Antigravity when `agy` refuses its session, either of which
-/// otherwise looks exactly like a provider with no models.
+/// can say, instead of making a failed probe look like an empty catalog.
 pub fn discover_catalog_reporting(
     provider: ProviderKind,
     binary: &Path,
@@ -958,80 +952,143 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
         .collect()
 }
 
-/// Factory Droid advertises its account catalog on `session/new` as the
-/// `model` config option. There is no separate models command, and an
-/// invented fallback would name a route the account cannot use.
-///
-/// `reasoning_effort` lists only the selected model's levels, and they differ
-/// per model, so discovery selects each model in the throwaway session and
-/// records the levels Droid answers with. Selecting a model there leaves the
-/// user's Droid defaults untouched.
+/// Help includes the installed CLI's models, custom routes and per-model
+/// reasoning levels. Unlike ACP `session/new`, it does not persist a probe
+/// session or sync a "New Session" in our temporary directory to Factory web.
 fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
     let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
-    let agent = crate::driver::catalog_agent(ProviderKind::Droid, binary, &cwd)
-        .map_err(|error| error.to_string())?;
-    let request = Client
-        .builder()
-        .name("waku-droid-model-discovery")
-        .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
-            connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(ClientCapabilities::new().terminal(false))
-                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
-                )
-                .block_task()
-                .await?;
-            let response = connection
-                .send_request(NewSessionRequest::new(cwd))
-                .block_task()
-                .await?;
-            let options = response.config_options.unwrap_or_default();
-            let mut efforts = AcpModelEfforts::new();
-            if let Some(model_option) = acp_config_option(&options, "model") {
-                if let Some(current) = acp_select_current(model_option) {
-                    efforts.insert(
-                        current.to_owned(),
-                        acp_effort_choices(&options, "reasoning_effort"),
-                    );
-                }
-                let probe_until = Instant::now() + DROID_EFFORT_PROBE_BUDGET;
-                for (id, _) in acp_select_choices(model_option) {
-                    if Instant::now() >= probe_until {
-                        break;
-                    }
-                    if id.is_empty() || efforts.contains_key(&id) {
-                        continue;
-                    }
-                    if let Ok(updated) = connection
-                        .send_request(SetSessionConfigOptionRequest::new(
-                            response.session_id.clone(),
-                            model_option.id.clone(),
-                            id.as_str(),
-                        ))
-                        .block_task()
-                        .await
-                    {
-                        efforts.insert(
-                            id,
-                            acp_effort_choices(&updated.config_options, "reasoning_effort"),
-                        );
-                    }
-                }
+    let mut command = crate::command_env::command(binary);
+    command
+        .args(["exec", "--help"])
+        .current_dir(cwd)
+        .env("DROID_DISABLE_AUTO_UPDATE", "true")
+        .env("FACTORY_DROID_AUTO_UPDATE_ENABLED", "false");
+    let output = crate::command_env::output(&mut command).map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Droid model discovery exited with {}",
+            output.status
+        ));
+    }
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut models = parse_droid_models(&help);
+    if models.is_empty() {
+        return Err("Droid help did not include a model catalog".to_owned());
+    }
+    // Some CLI versions list custom routes without capability details. Keep
+    // their last provider-reported levels rather than erase existing choices
+    // or invent levels from the user-supplied model name.
+    if let Some(cached) = cached_models(ProviderKind::Droid) {
+        retain_droid_custom_reasoning(&mut models, &help, &cached);
+    }
+    Ok(models)
+}
+
+fn retain_droid_custom_reasoning(
+    models: &mut [ProviderModel],
+    help: &str,
+    cached: &[ProviderModel],
+) {
+    let help = strip_ansi(help);
+    for model in models
+        .iter_mut()
+        .filter(|model| model.id.starts_with("custom:"))
+    {
+        let detail_prefix = format!("- {}: supports reasoning: ", model.name);
+        if help
+            .lines()
+            .any(|line| line.trim().starts_with(&detail_prefix))
+        {
+            continue;
+        }
+        if let Some(previous) = cached.iter().find(|previous| previous.id == model.id) {
+            model.reasoning_efforts = previous.reasoning_efforts.clone();
+            model.default_reasoning_effort = previous.default_reasoning_effort.clone();
+        }
+    }
+}
+
+fn parse_droid_models(output: &str) -> Vec<ProviderModel> {
+    let cleaned = strip_ansi(output);
+    let mut models = Vec::<ProviderModel>::new();
+    let mut in_models = false;
+    let mut in_details = false;
+    for line in cleaned.lines() {
+        let text = line.trim();
+        match text {
+            "Available Models:" | "Custom Models:" => {
+                in_models = true;
+                in_details = false;
+                continue;
             }
-            Ok((options, efforts))
-        });
-    let (options, efforts) = smol::block_on(smol::future::race(
-        async move { request.await.map_err(|error| acp_discovery_error(&error)) },
-        async move {
-            smol::Timer::after(DROID_ACP_DISCOVERY_TIMEOUT).await;
-            Err(format!(
-                "Droid did not answer within {} seconds",
-                DROID_ACP_DISCOVERY_TIMEOUT.as_secs()
-            ))
-        },
-    ))?;
-    Ok(acp_models_from_config(&options, &efforts))
+            "Model details:" => {
+                in_models = false;
+                in_details = true;
+                continue;
+            }
+            _ => {}
+        }
+        if text.is_empty() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            in_models = false;
+            in_details = false;
+        }
+        if in_models {
+            let Some((id, name)) = text.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let name = name.trim();
+            let is_default = name.ends_with(" (default)");
+            let name = name.strip_suffix(" (default)").unwrap_or(name);
+            if name.is_empty() || models.iter().any(|model| model.id == id) {
+                continue;
+            }
+            let mut model = ProviderModel::new(id, name);
+            model.is_default = is_default;
+            models.push(model);
+        } else if in_details {
+            let Some((name, detail)) = text
+                .strip_prefix("- ")
+                .and_then(|text| text.split_once(": supports reasoning: "))
+            else {
+                continue;
+            };
+            let Some((levels, default)) = detail
+                .split_once("; supported: [")
+                .and_then(|(_, rest)| rest.split_once("]; default: "))
+            else {
+                continue;
+            };
+            let options: Vec<_> = levels
+                .split(',')
+                .map(str::trim)
+                .filter(|level| !level.is_empty())
+                .map(|level| ProviderModelOption::new(level, reasoning_effort_label(level)))
+                .collect();
+            // A single level (Auto's `none`, for example) offers no choice.
+            if options.len() <= 1 {
+                continue;
+            }
+            let default = default.trim();
+            let default = options
+                .iter()
+                .find(|option| option.id == default)
+                .unwrap_or(&options[0])
+                .id
+                .clone();
+            for model in models.iter_mut().filter(|model| model.name == name) {
+                model.reasoning_efforts = options.clone();
+                model.default_reasoning_effort = Some(default.clone());
+            }
+        }
+    }
+    models
 }
 
 /// Antigravity advertises its model families on `session/new` as the `model`
@@ -1912,6 +1969,121 @@ fn deduplicate(models: Vec<ProviderModel>) -> Vec<ProviderModel> {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+
+    #[test]
+    fn droid_help_catalog_preserves_models_defaults_and_reasoning() {
+        let models = parse_droid_models(
+            "\
+Usage: droid exec [options] [prompt]
+  -m, --model <id> Model ID
+Available Models:
+  auto                 Auto Model
+  glm-5.3-flash         GLM-5.3-Flash (default)
+  gpt-6-sol            GPT-6 Sol
+  old-model            Old Model [Deprecated]
+
+Custom Models:
+  custom:local-0       Local model
+  custom:other-0       Other model
+
+Model details:
+  - Auto Model: supports reasoning: No; supported: [none]; default: none
+  - GLM-5.3-Flash: supports reasoning: Yes; supported: [low, high, max]; default: high
+  - GPT-6 Sol: supports reasoning: Yes; supported: [none, low, medium, high]; default: medium
+  - Old Model [Deprecated]: supports reasoning: Yes; supported: [off, high]; default: high
+  - Local model: supports reasoning: Yes; supported: [low, high]; default: high
+
+Authentication:
+  Some unrelated indented text
+",
+        );
+        assert_eq!(models.len(), 6);
+        assert_eq!(models[0].id, "auto");
+        assert!(models[0].reasoning_efforts.is_empty());
+        assert!(models[1].is_default);
+        assert_eq!(models[1].name, "GLM-5.3-Flash");
+        assert_eq!(
+            models[1]
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high", "max"]
+        );
+        assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            models[2].default_reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(models[3].name, "Old Model [Deprecated]");
+        assert_eq!(models[4].id, "custom:local-0");
+        assert_eq!(models[4].reasoning_efforts.len(), 2);
+        assert!(models[5].reasoning_efforts.is_empty());
+        assert_eq!(models.iter().filter(|model| model.is_default).count(), 1);
+    }
+
+    #[test]
+    fn droid_help_catalog_handles_ansi_crlf_and_missing_details() {
+        let models = parse_droid_models(
+            "\x1b[1mAvailable Models:\x1b[0m\r\n  auto  Auto\r\n  auto  Auto\r\n\r\nCustom Models:\r\n  custom:test  My Model (default)\r\n\r\nExamples:\r\n  not-a-model Example text\r\n",
+        );
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].id, "custom:test");
+        assert!(models[1].is_default);
+        assert!(
+            models
+                .iter()
+                .all(|model| model.reasoning_efforts.is_empty())
+        );
+        assert!(parse_droid_models("Usage: droid exec\n  --help Show help\n").is_empty());
+    }
+
+    #[test]
+    fn droid_help_preserves_cached_custom_levels_only_when_details_are_missing() {
+        let help = "Available Models:\n  auto  Auto\nCustom Models:\n  custom:a  A\n  custom:b  B\n  custom:new  New\nModel details:\n  - B: supports reasoning: No; supported: [none]; default: none\n";
+        let mut models = parse_droid_models(help);
+        let cached = ["auto", "custom:a", "custom:b", "custom:removed"].map(|id| {
+            ProviderModel::new(id, id).reasoning(reasoning_options(["low", "high"]), "high")
+        });
+        retain_droid_custom_reasoning(&mut models, help, &cached);
+        assert_eq!(models.len(), 4);
+        assert!(models[0].reasoning_efforts.is_empty());
+        assert_eq!(models[1].reasoning_efforts.len(), 2);
+        assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
+        assert!(models[2].reasoning_efforts.is_empty());
+        assert!(models[3].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn droid_discovery_only_invokes_help_even_when_repeated() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-droid-help-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(windows)]
+        let (name, script) = (
+            "droid.cmd",
+            "@echo off\r\nif not \"%~1\"==\"exec\" exit /b 2\r\nif not \"%~2\"==\"--help\" exit /b 2\r\nif not \"%~3\"==\"\" exit /b 2\r\necho Available Models:\r\necho   auto  Auto Model (default)\r\n",
+        );
+        #[cfg(not(windows))]
+        let (name, script) = (
+            "droid",
+            "#!/bin/sh\n[ \"$#\" = 2 ] && [ \"$1\" = exec ] && [ \"$2\" = --help ] || exit 2\nprintf 'Available Models:\\n  auto  Auto Model (default)\\n'\n",
+        );
+        let binary = directory.join(name);
+        std::fs::write(&binary, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for _ in 0..2 {
+            let models = discover_droid_models(&binary).unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, "auto");
+            assert!(models[0].is_default);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn droid_effort_option(current: &str, levels: &[&str]) -> SessionConfigOption {
         SessionConfigOption::select(
