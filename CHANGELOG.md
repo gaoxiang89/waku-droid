@@ -14,6 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.47]
+
+- Stop a turn that failed before answering from looking finished: when Antigravity aborts after an executor or trajectory-store error, Waku shows the provider's own error from its server log instead of an empty reply, and finds the CLI where the Windows installer places it
+- Keep imported sessions imported: after a restart, Waku no longer offers native conversations you already imported as new sessions
+- List your Droid models without a probe session: discovery reads the installed CLI's catalog, including custom models and their reasoning levels, instead of starting a throwaway session in your account
+- Keep provider CLIs working after Waku has run inside an agent sandbox: a resident background service that inherited the sandbox's file restriction is replaced rather than reused across sessions
+
 ## [0.1.46]
 
 - See how fast the model is writing: the live turn shows an estimated tokens-per-second rate beside its working indicator, and each finished turn keeps its average in the "Worked for" summary. The estimate comes from streamed text and reasoning, so tool-call pauses do not drag it down
