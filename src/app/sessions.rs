@@ -963,6 +963,9 @@ impl Waku {
                 self.right_panel_file_tree_width = width;
                 width
             }
+            PanelResizeTarget::GitGraphColumn => {
+                self.current_git_graph_column_width(right_panel_width)
+            }
         };
         self.panel_resize_drag = Some(PanelResizeDrag {
             target,
@@ -1034,6 +1037,21 @@ impl Waku {
                 }
                 self.right_panel_file_tree_width = width;
             }
+            PanelResizeTarget::GitGraphColumn => {
+                let min_w = git_graph::GIT_GRAPH_MIN_COLUMN_WIDTH;
+                let max_w = (right_panel_width - git_graph::GIT_GRAPH_MIN_COMMIT_WIDTH)
+                    .max(min_w)
+                    .min(right_panel_width * 0.62);
+                let width = (drag.start_size + delta).clamp(min_w, max_w);
+                let next_ratio = (width / right_panel_width.max(1.0)).clamp(0.08, 0.62);
+                if self
+                    .git_graph_column_ratio
+                    .is_some_and(|old| ((old - next_ratio) * right_panel_width).abs() < 0.5)
+                {
+                    return;
+                }
+                self.git_graph_column_ratio = Some(next_ratio);
+            }
         }
         cx.notify();
     }
@@ -1047,7 +1065,10 @@ impl Waku {
         if event.button == MouseButton::Left
             && let Some(drag) = self.panel_resize_drag.take()
         {
-            if drag.target != PanelResizeTarget::FileTree {
+            if !matches!(
+                drag.target,
+                PanelResizeTarget::FileTree | PanelResizeTarget::GitGraphColumn
+            ) {
                 self.persist_panel_layout();
             }
             cx.notify();

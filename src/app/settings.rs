@@ -3586,6 +3586,9 @@ impl Waku {
         self.branch_create_input.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.new_branch_name"), cx)
         });
+        self.git_graph_search.update(cx, |input, cx| {
+            input.set_placeholder(tr!("git_graph.search"), cx)
+        });
         self.project_search.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.search_projects"), cx)
         });

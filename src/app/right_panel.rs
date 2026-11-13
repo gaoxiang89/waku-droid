@@ -2792,10 +2792,13 @@ impl Waku {
             }
             self.refresh_right_panel_diff(cx);
         }
-        if surface == RightPanelSurface::GitGraph
-            && let Some(scope) = self.selected_panel_scope()
-        {
-            self.git_graph_snapshots.invalidate(&scope);
+        if surface == RightPanelSurface::GitGraph {
+            if reusable_index.is_none() {
+                self.right_panel_width = widened_panel_width_for_review(self.right_panel_width);
+            }
+            if let Some(scope) = self.selected_panel_scope() {
+                self.git_graph_snapshots.invalidate(&scope);
+            }
         }
         if matches!(
             surface,
@@ -3319,7 +3322,7 @@ impl Waku {
             Some(RightPanelSurface::Diff) => self
                 .render_right_panel_diff(width, window, cx)
                 .into_any_element(),
-            Some(RightPanelSurface::GitGraph) => self.render_git_graph(cx),
+            Some(RightPanelSurface::GitGraph) => self.render_git_graph(width, cx),
             Some(RightPanelSurface::Terminal(terminal_id)) => {
                 let content_height = (f32::from(window.viewport_size().height)
                     - WINDOW_HEADER_HEIGHT

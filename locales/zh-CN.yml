@@ -934,6 +934,19 @@ git_graph.done.file_staged: "已暂存 %{name}"
 git_graph.done.file_unstaged: "已取消暂存 %{name}"
 git_graph.done.file_discarded: "已丢弃 %{name} 的更改"
 git_graph.done.discarded: 改动已丢弃
+git_graph.column_graph: 分支图
+git_graph.column_commit: 提交
+git_graph.column_meta: 时间 · 哈希
+git_graph.jump_to_ref: 跳转到分支或标签
+git_graph.refs_branches: 本地分支
+git_graph.refs_tags: 标签
+git_graph.refs_remotes: 远程分支
+git_graph.no_refs: 暂无分支或标签
+git_graph.clear_filter: 清除筛选
+git_graph.next_match: 下一个匹配 (Enter)
+git_graph.prev_match: 上一个匹配 (Shift+Enter)
+git_graph.resize_graph_hint: 拖动调整分支图宽度 · 双击恢复自适应
+git_graph.merge_badge: 合并
 bottom_panel.toggle: 显示或隐藏底部面板
 bottom_panel.resize: 调整底部面板高度
 bottom_panel.new_terminal: 新建终端

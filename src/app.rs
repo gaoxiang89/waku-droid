@@ -280,6 +280,7 @@ enum PanelResizeTarget {
     BottomPanel,
     FileTree,
     FilesPanel,
+    GitGraphColumn,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1522,10 +1523,16 @@ pub struct Waku {
     /// Workspace scope the list state was last sized for; a switch resets scroll.
     git_graph_list_path: Option<PanelScope>,
     git_graph_matches: Option<git_graph::GitGraphMatches>,
+    git_graph_refs_cache: Option<git_graph::GitGraphRefsCache>,
+    git_graph_column_ratio: Option<f32>,
     git_graph_scrollbar: Rc<ScrollbarState>,
     git_graph_search: Entity<TextInput>,
     git_graph_focus: FocusHandle,
     git_graph_refresh_focus: FocusHandle,
+    git_graph_refs_focus: FocusHandle,
+    git_graph_clear_search_focus: FocusHandle,
+    git_graph_prev_match_focus: FocusHandle,
+    git_graph_next_match_focus: FocusHandle,
     git_graph_load_more_focus: FocusHandle,
     git_graph_copy_focus: FocusHandle,
     git_graph_detail_scroll: ScrollHandle,
@@ -2836,6 +2843,10 @@ impl Waku {
             let model_picker_empty_focus = cx.focus_handle();
             let git_graph_focus = cx.focus_handle();
             let git_graph_refresh_focus = cx.focus_handle();
+            let git_graph_refs_focus = cx.focus_handle();
+            let git_graph_clear_search_focus = cx.focus_handle();
+            let git_graph_prev_match_focus = cx.focus_handle();
+            let git_graph_next_match_focus = cx.focus_handle();
             let git_graph_load_more_focus = cx.focus_handle();
             let git_graph_copy_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
@@ -3183,6 +3194,15 @@ impl Waku {
             .detach();
             git_graph_ui.subscribe(cx);
             cx.subscribe(
+                &git_graph_search,
+                |this: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Edited) {
+                        this.on_git_graph_search_edited(cx);
+                    }
+                },
+            )
+            .detach();
+            cx.subscribe(
                 &right_panel_file_rename_input,
                 |this: &mut Self, _, event: &InputEvent, cx| match event {
                     InputEvent::Submit(_) => this.commit_right_panel_file_rename(cx),
@@ -3482,10 +3502,16 @@ impl Waku {
                 git_graph_list_rows: 0,
                 git_graph_list_path: None,
                 git_graph_matches: None,
+                git_graph_refs_cache: None,
+                git_graph_column_ratio: None,
                 git_graph_scrollbar: ScrollbarState::new(),
                 git_graph_search,
                 git_graph_focus,
                 git_graph_refresh_focus,
+                git_graph_refs_focus,
+                git_graph_clear_search_focus,
+                git_graph_prev_match_focus,
+                git_graph_next_match_focus,
                 git_graph_load_more_focus,
                 git_graph_copy_focus,
                 git_graph_detail_scroll: ScrollHandle::new(),

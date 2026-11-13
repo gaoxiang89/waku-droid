@@ -32,7 +32,8 @@ impl Waku {
             PanelResizeTarget::RightPanel => (-7.0, 8.0),
             PanelResizeTarget::Sidebar
             | PanelResizeTarget::FileTree
-            | PanelResizeTarget::FilesPanel => (-5.0, 10.0),
+            | PanelResizeTarget::FilesPanel
+            | PanelResizeTarget::GitGraphColumn => (-5.0, 10.0),
             // The bottom panel's edge is horizontal, so it renders its own
             // handle; this vertical bar is never built for it.
             PanelResizeTarget::BottomPanel => (-5.0, 10.0),

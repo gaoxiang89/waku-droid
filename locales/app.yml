@@ -1741,6 +1741,32 @@ git_graph.copied_name:
   en: Copied name
 git_graph.action_failed:
   en: "Git failed: %{error}"
+git_graph.column_graph:
+  en: Graph
+git_graph.column_commit:
+  en: Commit
+git_graph.column_meta:
+  en: Time · Hash
+git_graph.jump_to_ref:
+  en: Jump to branch or tag
+git_graph.refs_branches:
+  en: Branches
+git_graph.refs_tags:
+  en: Tags
+git_graph.refs_remotes:
+  en: Remotes
+git_graph.no_refs:
+  en: No branches or tags
+git_graph.clear_filter:
+  en: Clear filter
+git_graph.next_match:
+  en: Next match (Enter)
+git_graph.prev_match:
+  en: Previous match (Shift+Enter)
+git_graph.resize_graph_hint:
+  en: Drag to resize graph column · Double-click to auto-fit
+git_graph.merge_badge:
+  en: Merge
 git_graph.menu.view_changes:
   en: View changes
 git_graph.menu.compare_with_selected:

@@ -604,6 +604,54 @@ impl Waku {
                     .to_string()
             })
             .unwrap_or_default();
+        let lane_color = self
+            .visible_git_graph
+            .as_ref()
+            .and_then(|(_, snapshot)| {
+                let pos = snapshot
+                    .commits
+                    .iter()
+                    .position(|candidate| candidate.hash == commit.hash)?;
+                let row = snapshot.rows.get(pos)?;
+                row.lanes
+                    .get(row.node_lane as usize)
+                    .map(|lane| lane.color)
+            });
+        let ref_chips = (!commit.refs.is_empty()).then(|| {
+            let weak = cx.entity().downgrade();
+            let grouped = super::git_graph::group_commit_refs(&commit.refs);
+            let chips = grouped
+                .into_iter()
+                .enumerate()
+                .map(|(position, display_ref)| {
+                    let handle =
+                        self.menu_handle(format!("git-graph-detail-ref-{position}"), cx);
+                    let weak = weak.clone();
+                    let menu_ref = display_ref.clone();
+                    let menu_hash = commit.hash.clone();
+                    let chip =
+                        super::git_graph::git_ref_chip(&display_ref, lane_color, None, theme);
+                    context_menu(
+                        chip,
+                        SharedString::from(format!("git-graph-detail-ref-menu-{position}")),
+                        &handle,
+                        move |_| {
+                            Waku::git_graph_display_ref_menu(
+                                weak.clone(),
+                                &menu_ref,
+                                &menu_hash,
+                            )
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(5.0))
+                .children(chips)
+        });
         body = body
             .child(
                 div()
@@ -614,6 +662,7 @@ impl Waku {
                     .whitespace_normal()
                     .child(commit.subject.clone()),
             )
+            .when_some(ref_chips, |element, chips| element.child(chips))
             .child(
                 div()
                     .text_size(sp(11.5))
@@ -1752,6 +1801,30 @@ impl Waku {
             })
             .icon("icons/copy.svg"),
         );
+        items
+    }
+
+    pub(super) fn git_graph_display_ref_menu(
+        weak: WeakEntity<Waku>,
+        display_ref: &super::git_graph::DisplayGitRef,
+        hash: &str,
+    ) -> Vec<MenuItem> {
+        let mut items = Self::git_graph_ref_menu(weak.clone(), &display_ref.primary, hash);
+        if !display_ref.synced_remotes.is_empty() {
+            items.push(MenuItem::Separator);
+            for remote in &display_ref.synced_remotes {
+                let weak = weak.clone();
+                let remote = remote.clone();
+                let hash = hash.to_owned();
+                items.push(MenuItem::Submenu {
+                    label: remote.name.clone().into(),
+                    value: None,
+                    items: Rc::new(move |_| {
+                        Self::git_graph_ref_menu(weak.clone(), &remote, &hash)
+                    }),
+                });
+            }
+        }
         items
     }
 }

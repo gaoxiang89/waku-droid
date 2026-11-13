@@ -971,6 +971,19 @@ git_graph.done.file_staged: "%{name} をステージしました"
 git_graph.done.file_unstaged: "%{name} のステージを解除しました"
 git_graph.done.file_discarded: "%{name} の変更を破棄しました"
 git_graph.done.discarded: 変更を破棄しました
+git_graph.column_graph: グラフ
+git_graph.column_commit: コミット
+git_graph.column_meta: 日時 · ハッシュ
+git_graph.jump_to_ref: ブランチ・タグへ移動
+git_graph.refs_branches: ブランチ
+git_graph.refs_tags: タグ
+git_graph.refs_remotes: リモート
+git_graph.no_refs: ブランチやタグがありません
+git_graph.clear_filter: 絞り込みをクリア
+git_graph.next_match: 次の一致 (Enter)
+git_graph.prev_match: 前の一致 (Shift+Enter)
+git_graph.resize_graph_hint: ドラッグでグラフ幅を調整 · ダブルクリックで自動調整
+git_graph.merge_badge: マージ
 bottom_panel.toggle: 下パネルの表示を切り替える
 bottom_panel.resize: 下パネルの高さを変更
 bottom_panel.new_terminal: 新規ターミナル
