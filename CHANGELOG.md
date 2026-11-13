@@ -14,6 +14,12 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.48]
+
+- Make Git Graph branches easy to read at a glance: branch and tag capsules now sit ahead of each commit subject along the graph divider, match their lane colors, and combine synced local and remote branches into one pill with a toolbar jump menu for branches and tags
+- Scale the Git Graph column with the panel and window: widening the Git Graph panel expands lane spacing and node proportions automatically, with a draggable column divider (double-click to reset) and cleaner rounded metro connectors with crossing bridges
+- Improve Git Graph commit filtering and detail headers: typing in the filter box jumps to matching commits with match counts and Enter/Shift+Enter navigation, and commit headers now display their branch and tag capsules
+
 ## [0.1.47]
 
 - Stop a turn that failed before answering from looking finished: when Antigravity aborts after an executor or trajectory-store error, Waku shows the provider's own error from its server log instead of an empty reply, and finds the CLI where the Windows installer places it
