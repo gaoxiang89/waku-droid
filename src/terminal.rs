@@ -250,6 +250,10 @@ fn osc_working_directory(payload: &[u8]) -> Option<PathBuf> {
         }
         if matches!(url.host_str(), None | Some("" | "localhost"))
             && let Ok(path) = url.to_file_path()
+            && !path
+                .to_str()
+                .and_then(|s| s.strip_prefix('/'))
+                .is_some_and(has_windows_drive_prefix)
         {
             return Some(path);
         }
