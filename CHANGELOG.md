@@ -14,6 +14,12 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.49]
+
+- Connect to remote Windows hosts over SSH: Waku probes available Windows shells (PowerShell, cmd.exe, Git Bash, MSYS, Cygwin), deploys and starts `waku-daemon` without keeping the SSH transport open, secures daemon credentials with owner-only ACLs, and handles Windows drive and UNC paths when browsing or opening remote workspaces
+- Manage SSH connections and credentials from Settings: configure hosts with password or encrypted-key passphrase authentication (with masked password inputs, ProxyJump, key file picker, credential edit/clear, and disconnect/reconnect controls) and navigate the remote folder picker from the keyboard
+- Improve cross-OS path handling and Windows process containment: handle Windows and POSIX paths cleanly across remote terminals (OSC 7, `file://`, drive/UNC links), attachments, markdown images, sidebar, settings, and commit dialogs, and contain Windows `ssh` and `wsl` child processes in Job Objects so they clean up reliably on exit or update
+
 ## [0.1.48]
 
 - Make Git Graph branches easy to read at a glance: branch and tag capsules now sit ahead of each commit subject along the graph divider, match their lane colors, and combine synced local and remote branches into one pill with a toolbar jump menu for branches and tags
