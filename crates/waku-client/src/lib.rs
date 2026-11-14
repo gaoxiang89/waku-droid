@@ -11,6 +11,7 @@ pub mod computer_use;
 pub mod driver;
 pub mod hosts;
 pub mod persistence;
+pub mod pid;
 mod process;
 pub mod remote;
 mod workspace_client;

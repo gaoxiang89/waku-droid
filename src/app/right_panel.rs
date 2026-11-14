@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use base64::Engine as _;
 use gpui::{KeyBinding, actions};
+use waku_protocol::lexical_path;
 
 use super::*;
 
@@ -243,46 +244,10 @@ fn posix_workspace(workspace: &Path) -> Option<&str> {
     workspace.to_str().filter(|path| path.starts_with('/'))
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum WindowsRoot<'a> {
-    Drive(&'a str),
-    Unc(&'a str, &'a str),
-}
-
-fn split_windows_path(raw: &str) -> Option<(WindowsRoot<'_>, Vec<&str>)> {
-    let unc_rest = raw.strip_prefix(r"\\?\UNC\").or_else(|| {
-        (!raw.starts_with(r"\\?\"))
-            .then(|| raw.strip_prefix(r"\\"))
-            .flatten()
-    });
-    if let Some(unc_tail) = unc_rest {
-        let mut raw_parts = unc_tail
-            .split(['\\', '/'])
-            .filter(|part| !part.is_empty() && *part != ".");
-        let server = raw_parts.next()?;
-        let share = raw_parts.next()?;
-        return Some((WindowsRoot::Unc(server, share), raw_parts.collect()));
-    }
-    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(raw);
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
-    {
-        let segs = trimmed[2..]
-            .split(['\\', '/'])
-            .filter(|part| !part.is_empty() && *part != ".")
-            .collect();
-        return Some((WindowsRoot::Drive(&trimmed[..2]), segs));
-    }
-    None
-}
-
 fn windows_workspace(workspace: &Path) -> Option<&str> {
     workspace
         .to_str()
-        .filter(|path| split_windows_path(path).is_some())
+        .filter(|path| lexical_path::parse(path).is_some_and(|path| path.is_windows()))
 }
 
 fn workspace_separator(workspace: &Path) -> char {
@@ -325,40 +290,11 @@ fn join_workspace_path(workspace: &Path, relative_path: &str) -> PathBuf {
     workspace.join(relative_path)
 }
 
-fn normalize_windows_parts<'a>(
-    root: WindowsRoot<'a>,
-    raw_parts: Vec<&'a str>,
-) -> (WindowsRoot<'a>, Vec<&'a str>, String) {
-    let mut parts = Vec::new();
-    for part in raw_parts {
-        if part == ".." {
-            parts.pop();
-        } else {
-            parts.push(part);
-        }
-    }
-    let formatted = match root {
-        WindowsRoot::Drive(drive) => {
-            if parts.is_empty() {
-                format!(r"{drive}\")
-            } else {
-                format!(r"{drive}\{}", parts.join(r"\"))
-            }
-        }
-        WindowsRoot::Unc(server, share) => {
-            if parts.is_empty() {
-                format!(r"\\{server}\{share}")
-            } else {
-                format!(r"\\{server}\{share}\{}", parts.join(r"\"))
-            }
-        }
-    };
-    (root, parts, formatted)
-}
-
 fn normalized_windows_path(path: &str) -> Option<String> {
-    let (root, raw_parts) = split_windows_path(path)?;
-    Some(normalize_windows_parts(root, raw_parts).2)
+    let parsed = lexical_path::parse(path)?;
+    parsed
+        .is_windows()
+        .then(|| parsed.normalized().to_path_string())
 }
 
 fn windows_file_url_path(trimmed: &str) -> Option<String> {
@@ -388,21 +324,15 @@ fn windows_file_url_path(trimmed: &str) -> Option<String> {
     }
 }
 
-fn windows_roots_match(a: WindowsRoot<'_>, b: WindowsRoot<'_>) -> bool {
-    match (a, b) {
-        (WindowsRoot::Drive(da), WindowsRoot::Drive(db)) => da.eq_ignore_ascii_case(db),
-        (WindowsRoot::Unc(sa, sha), WindowsRoot::Unc(sb, shb)) => {
-            sa.eq_ignore_ascii_case(sb) && sha.eq_ignore_ascii_case(shb)
-        }
-        _ => false,
-    }
-}
-
 fn windows_parent(path: &str) -> Option<String> {
-    let (root, raw_parts) = split_windows_path(path)?;
-    let (root, mut parts, _) = normalize_windows_parts(root, raw_parts);
-    parts.pop()?;
-    Some(normalize_windows_parts(root, parts).2)
+    let parsed = lexical_path::parse(path)?;
+    if !parsed.is_windows() {
+        return None;
+    }
+    parsed
+        .normalized()
+        .parent()
+        .map(|parent| parent.to_path_string())
 }
 
 /// Home directory of a Windows daemon host, derived from a registered
@@ -439,21 +369,13 @@ fn daemon_windows_home(workspace: &str) -> Option<String> {
 }
 
 fn windows_workspace_relative_file_path(workspace: &str, target: &str) -> Option<String> {
-    let (ws_root, ws_raw) = split_windows_path(workspace)?;
-    let (tgt_root, tgt_raw) = split_windows_path(target)?;
-    let (ws_root, ws_parts, _) = normalize_windows_parts(ws_root, ws_raw);
-    let (tgt_root, tgt_parts, _) = normalize_windows_parts(tgt_root, tgt_raw);
-    if !windows_roots_match(ws_root, tgt_root) || tgt_parts.len() <= ws_parts.len() {
+    let workspace = lexical_path::parse(workspace)?.normalized();
+    let target = lexical_path::parse(target)?.normalized();
+    if !workspace.is_windows() {
         return None;
     }
-    if !tgt_parts[..ws_parts.len()]
-        .iter()
-        .zip(&ws_parts)
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    {
-        return None;
-    }
-    Some(tgt_parts[ws_parts.len()..].join(r"\"))
+    let rest = target.strip_prefix(&workspace)?;
+    (!rest.is_empty()).then(|| rest.join(r"\"))
 }
 
 fn windows_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkRoute {

@@ -4036,12 +4036,7 @@ fn append_directory_mention_separator(mention: &mut String) {
     if mention.ends_with('/') || mention.ends_with('\\') {
         return;
     }
-    let bytes = mention.as_bytes();
-    let is_windows_path = mention.starts_with("\\\\")
-        || (bytes.len() >= 2
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/')));
+    let is_windows_path = waku_protocol::lexical_path::is_windows_absolute(mention);
     mention.push(if is_windows_path { '\\' } else { '/' });
 }
 

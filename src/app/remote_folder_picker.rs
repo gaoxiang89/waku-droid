@@ -483,17 +483,32 @@ fn resolve_typed_remote_path(typed: &str, current: Option<&Path>, home: Option<&
 }
 
 fn is_absolute_remote_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
     path.starts_with('/')
         || path.starts_with('\\')
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\'))
+        || waku_protocol::lexical_path::has_drive_prefix(path)
 }
 
 fn join_remote_relative_path(current: &Path, relative: &str) -> PathBuf {
     let current_text = current.to_string_lossy();
+    if let Some(parsed) = waku_protocol::lexical_path::parse(&current_text) {
+        let mut segments = parsed.segments;
+        for segment in relative.split(['/', '\\']) {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                other => segments.push(other),
+            }
+        }
+        return PathBuf::from(
+            waku_protocol::lexical_path::LexicalPath {
+                root: parsed.root,
+                segments,
+            }
+            .to_path_string(),
+        );
+    }
     let separator = remote_path_separator(&current_text);
     let (prefix, tail) = split_remote_prefix(&current_text, separator);
     let mut parts: Vec<String> = tail
@@ -563,6 +578,9 @@ fn home_relative_path(home: &Path, rest: &str) -> PathBuf {
 }
 
 fn remote_path_separator(home: &str) -> char {
+    if let Some(path) = waku_protocol::lexical_path::parse(home) {
+        return path.separator();
+    }
     let bytes = home.as_bytes();
     if home.starts_with('/') {
         '/'

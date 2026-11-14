@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
             .name("waku-daemon-parent".into())
             .spawn(move || {
                 while !monitor_shutdown.load(Ordering::Acquire) {
-                    if !process_is_alive(parent_pid) {
+                    if !waku_client::pid::is_alive(parent_pid) {
                         monitor_shutdown.store(true, Ordering::Release);
                         break;
                     }
@@ -183,74 +183,6 @@ impl Arguments {
     }
 }
 
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Windows reuses process ids, so the handle is opened for the narrowest
-/// right that answers the question and closed immediately. A pid that no
-/// longer exists fails to open; one that has exited but is still held open by
-/// another handle reports an exit code instead of `STILL_ACTIVE`.
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
-    };
-
-    if pid == 0 {
-        return false;
-    }
-    unsafe {
-        let synch_handle = OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        );
-        if !synch_handle.is_null() {
-            // STILL_ACTIVE (259) is also a legal exit code; WaitForSingleObject
-            // is signaled only once the process actually terminates.
-            let wait = WaitForSingleObject(synch_handle, 0);
-            if wait == WAIT_TIMEOUT {
-                CloseHandle(synch_handle);
-                return true;
-            }
-            if wait == WAIT_OBJECT_0 {
-                CloseHandle(synch_handle);
-                return false;
-            }
-            let mut exit_code = 0_u32;
-            let read = GetExitCodeProcess(synch_handle, &mut exit_code);
-            CloseHandle(synch_handle);
-            return read == 0 || exit_code == STILL_ACTIVE as u32;
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
-            return false;
-        }
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return std::io::Error::last_os_error().raw_os_error()
-                == Some(ERROR_ACCESS_DENIED as i32);
-        }
-        let mut exit_code = 0_u32;
-        let read = GetExitCodeProcess(handle, &mut exit_code);
-        CloseHandle(handle);
-        // A failed read leaves the parent's state unknown; outliving the app
-        // is the safer error than shutting a live daemon down.
-        read == 0 || exit_code == STILL_ACTIVE as u32
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,21 +217,5 @@ mod tests {
     fn parses_explicit_non_loopback_opt_in() {
         let arguments = Arguments::parse(["--allow-non-loopback".into()]).unwrap();
         assert!(arguments.allow_non_loopback);
-    }
-
-    #[test]
-    fn parent_watchdog_distinguishes_live_and_exited_259_processes() {
-        assert!(process_is_alive(std::process::id()));
-        assert!(!process_is_alive(0));
-        #[cfg(windows)]
-        let mut child = std::process::Command::new("cmd.exe")
-            .args(["/d", "/c", "exit 259"])
-            .spawn()
-            .unwrap();
-        #[cfg(unix)]
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        let _ = child.wait();
-        assert!(!process_is_alive(pid));
     }
 }

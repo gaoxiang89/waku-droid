@@ -2297,8 +2297,8 @@ impl Waku {
             let is_last = index + 1 == account_count;
             let account_id = account.id.clone();
             let dir_display = abbreviate_home_path(Path::new(&account.config_dir), home);
-            let windows_shell =
-                (local && cfg!(windows)) || looks_like_windows_path(account.config_dir.trim());
+            let windows_shell = (local && cfg!(windows))
+                || waku_protocol::lexical_path::is_windows_absolute(account.config_dir.trim());
             let login_cmd =
                 format_account_login_command(account.provider, &account.config_dir, windows_shell);
             let copy_login_cmd = login_cmd.clone();
@@ -3881,20 +3881,11 @@ fn expand_account_config_dir(raw: &str, home: Option<&Path>, local: bool) -> Pat
     PathBuf::from(trimmed)
 }
 
-fn looks_like_windows_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with(r"\\")
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\'))
-}
-
 fn account_config_dir_key(path: &Path, local: bool) -> String {
     let raw = path.to_string_lossy();
     normalized_config_dir_key(
         path,
-        (local && cfg!(windows)) || looks_like_windows_path(&raw),
+        (local && cfg!(windows)) || waku_protocol::lexical_path::is_windows_absolute(&raw),
     )
 }
 

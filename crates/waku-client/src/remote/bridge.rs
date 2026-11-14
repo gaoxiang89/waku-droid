@@ -18,7 +18,9 @@ use waku_protocol::bridge::{BridgeBlocked, BridgeReady, IncompatibleDaemon};
 
 use super::connection::{Connection, ConnectionKind};
 use super::deploy::{self, DeployOutcome, RemoteTarget};
-use super::process_util::{ChildJob, StderrTail, adopt_child_into_kill_job, with_detail};
+use super::process_util::{
+    ChildJob, StderrTail, adopt_child_into_kill_job, wait_with_deadline, with_detail,
+};
 use super::{ssh, wsl};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,10 +104,18 @@ impl BridgeSession {
         }
     }
 
-    /// Start a bridge against an already installed daemon. Reconnects use this
-    /// directly; the install cannot have changed under a running desktop.
-    pub fn spawn(connection: &Connection, target: RemoteTarget) -> anyhow::Result<Self> {
-        Self::spawn_with(connection, target, false)
+    /// Start a bridge against the installed daemon on reconnect. Only failures a
+    /// reinstall can fix fall back to a full probe and deploy; transport failures
+    /// and timeouts return the original error so the monitor backs off.
+    pub fn reconnect(connection: &Connection, target: RemoteTarget) -> Result<Self, BridgeError> {
+        match Self::spawn_with(connection, target, false) {
+            Ok(session) => Ok(session),
+            Err(error) if deploy_may_fix(connection, &error) => Self::open_with(connection, false),
+            Err(error) => Err(BridgeError {
+                stage: BridgeStage::Bridge,
+                error,
+            }),
+        }
     }
 
     fn spawn_with(
@@ -166,7 +176,17 @@ impl BridgeSession {
             .context("could not start the bridge reader")?;
         let (ready, stdout) = match ready_rx.recv_timeout(READY_TIMEOUT) {
             Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => return Err(fail(&mut child, &mut job, error)),
+            Ok(Err(error)) => {
+                let error = if error.downcast_ref::<BridgeExited>().is_some() {
+                    anyhow::Error::new(BridgeExited {
+                        code: wait_with_deadline(&mut child, Duration::from_secs(2))
+                            .and_then(|status| status.code()),
+                    })
+                } else {
+                    error
+                };
+                return Err(fail(&mut child, &mut job, error));
+            }
             Err(_) => {
                 return Err(fail(
                     &mut child,
@@ -246,6 +266,30 @@ impl Drop for BridgeSession {
     }
 }
 
+/// The bridge process exited before announcing readiness. `code` is its exit
+/// status when known; OpenSSH reports transport, DNS, auth, and host-key
+/// failures as 255.
+#[derive(Debug)]
+pub struct BridgeExited {
+    pub code: Option<i32>,
+}
+
+impl std::fmt::Display for BridgeExited {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => {
+                write!(
+                    formatter,
+                    "the bridge exited with status {code} before it was ready"
+                )
+            }
+            None => write!(formatter, "the bridge exited before it was ready"),
+        }
+    }
+}
+
+impl std::error::Error for BridgeExited {}
+
 #[derive(Debug)]
 pub struct ProtocolMismatch {
     pub remote: u32,
@@ -294,6 +338,16 @@ impl IncompatibleDaemonError {
     }
 }
 
+fn deploy_may_fix(connection: &Connection, error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<ProtocolMismatch>().is_some() {
+        return true;
+    }
+    error
+        .downcast_ref::<BridgeExited>()
+        .and_then(|exited| exited.code)
+        .is_some_and(|code| !(code == 255 && matches!(connection.kind, ConnectionKind::Ssh { .. })))
+}
+
 fn read_ready_from_reader<R: Read>(
     mut reader: BufReader<R>,
 ) -> anyhow::Result<(BridgeReady, BufReader<R>)> {
@@ -306,7 +360,7 @@ fn read_ready_from_reader<R: Read>(
             Ok(0) => {
                 return Err(match last_invalid {
                     Some(invalid) => anyhow!("the bridge sent an invalid ready line {invalid:?}"),
-                    None => anyhow!("the bridge exited before it was ready"),
+                    None => BridgeExited { code: None }.into(),
                 });
             }
             Ok(_) => {
@@ -329,7 +383,7 @@ fn read_ready_from_reader<R: Read>(
     }
     Err(match last_invalid {
         Some(invalid) => anyhow!("the bridge sent an invalid ready line {invalid:?}"),
-        None => anyhow!("the bridge exited before it was ready"),
+        None => BridgeExited { code: None }.into(),
     })
 }
 
@@ -490,5 +544,67 @@ mod tests {
             .err()
             .expect("invalid ready line");
         assert!(err.to_string().contains("invalid ready line \"nonsense\""));
+    }
+
+    #[test]
+    fn empty_ready_stream_reports_bridge_exit() {
+        let err = read_ready_from_reader(BufReader::new([].as_slice()))
+            .err()
+            .expect("empty stream error");
+        assert_eq!(err.downcast_ref::<BridgeExited>().unwrap().code, None);
+        assert_eq!(err.to_string(), "the bridge exited before it was ready");
+    }
+
+    fn ssh_connection() -> Connection {
+        Connection {
+            id: "ssh:test".to_owned(),
+            name: "test".to_owned(),
+            kind: ConnectionKind::Ssh {
+                target: crate::remote::connection::SshTarget::ConfigHost {
+                    host: "example".to_owned(),
+                    auth_method: Default::default(),
+                },
+            },
+        }
+    }
+
+    fn wsl_connection() -> Connection {
+        Connection {
+            id: "wsl:ubuntu".to_owned(),
+            name: "ubuntu".to_owned(),
+            kind: ConnectionKind::Wsl {
+                distro: "Ubuntu".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn deploy_may_fix_only_for_failures_a_reinstall_can_fix() {
+        let ssh = ssh_connection();
+        let wsl = wsl_connection();
+        let mismatch = || {
+            anyhow::Error::new(ProtocolMismatch {
+                remote: PROTOCOL_VERSION + 1,
+            })
+        };
+        assert!(deploy_may_fix(&ssh, &mismatch()));
+        assert!(deploy_may_fix(&wsl, &mismatch()));
+
+        let exited = |code| anyhow::Error::new(BridgeExited { code });
+        assert!(deploy_may_fix(&ssh, &exited(Some(127))));
+        assert!(deploy_may_fix(&ssh, &exited(Some(1))));
+        assert!(!deploy_may_fix(&ssh, &exited(Some(255))));
+        assert!(deploy_may_fix(&wsl, &exited(Some(255))));
+        assert!(!deploy_may_fix(&ssh, &exited(None)));
+        assert!(!deploy_may_fix(&wsl, &exited(None)));
+
+        assert!(!deploy_may_fix(
+            &ssh,
+            &anyhow!("timed out waiting for the remote daemon")
+        ));
+        assert!(deploy_may_fix(
+            &ssh,
+            &anyhow::Error::new(BridgeExited { code: Some(127) }).context("stderr detail")
+        ));
     }
 }

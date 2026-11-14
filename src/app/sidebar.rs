@@ -373,56 +373,19 @@ fn visible_project_sessions(
     (visible, older_seen > revealed_older_sessions)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum LexicalRoot {
-    Drive(u8),
-    Unc,
-    Posix,
-    Relative,
-}
-
-fn lexical_path_parts(path: &Path) -> (LexicalRoot, Vec<String>, bool) {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let bytes = normalized.as_bytes();
-    let (root, rest, case_insensitive) = if normalized.starts_with("//") {
-        (LexicalRoot::Unc, &normalized[2..], true)
-    } else if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        (
-            LexicalRoot::Drive(bytes[0].to_ascii_lowercase()),
-            &normalized[2..],
-            true,
-        )
-    } else if normalized.starts_with('/') {
-        (LexicalRoot::Posix, &normalized[1..], false)
-    } else {
-        (LexicalRoot::Relative, normalized.as_str(), cfg!(windows))
-    };
-    let segments = rest
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_owned)
-        .collect();
-    (root, segments, case_insensitive)
-}
-
 fn lexical_path_starts_with(path: &Path, root: &Path) -> bool {
-    let (path_root, path_segments, path_ci) = lexical_path_parts(path);
-    let (root_kind, root_segments, root_ci) = lexical_path_parts(root);
-    if path_root != root_kind || root_segments.is_empty() || path_segments.len() < root_segments.len()
-    {
+    let path_text = path.to_string_lossy().replace('\\', "/");
+    let root_text = root.to_string_lossy().replace('\\', "/");
+    let (Some(parsed_path), Some(parsed_root)) = (
+        waku_protocol::lexical_path::parse(&path_text),
+        waku_protocol::lexical_path::parse(&root_text),
+    ) else {
+        return path.starts_with(root);
+    };
+    if parsed_root.segments.is_empty() {
         return false;
     }
-    let case_insensitive = path_ci || root_ci;
-    root_segments
-        .iter()
-        .zip(path_segments.iter())
-        .all(|(root_segment, path_segment)| {
-            if case_insensitive {
-                root_segment.eq_ignore_ascii_case(path_segment)
-            } else {
-                root_segment == path_segment
-            }
-        })
+    parsed_path.starts_with(&parsed_root)
 }
 
 fn sidebar_project_is_projectless(project: &Project, projectless_roots: &[PathBuf]) -> bool {

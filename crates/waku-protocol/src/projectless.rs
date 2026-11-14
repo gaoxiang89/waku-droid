@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
+use crate::lexical_path;
+
 /// Projectless workspace roots. The primary root belongs to the daemon the
 /// process was started for; desktop windows connected to WSL or SSH daemons
 /// add theirs, so one process can classify paths from several hosts. Roots
@@ -113,128 +115,27 @@ fn is_legacy_workspace_path(path: &Path, legacy_root: &Path) -> bool {
     is_date_component(date)
 }
 
-#[derive(Clone, Copy)]
-enum LexicalRoot<'a> {
-    Posix,
-    WindowsDrive(&'a str),
-    WindowsUnc(&'a str, &'a str),
-}
-
-fn parse_lexical(path: &Path) -> Option<(LexicalRoot<'_>, Vec<&str>)> {
-    let raw = path.to_str()?;
-    let unc_tail = raw
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| {
-            (!raw.starts_with(r"\\?\"))
-                .then(|| raw.strip_prefix(r"\\"))
-                .flatten()
-        })
-        .or_else(|| raw.strip_prefix("//"));
-    if let Some(unc_tail) = unc_tail {
-        let mut parts = unc_tail
-            .split(['\\', '/'])
-            .filter(|part| !part.is_empty() && *part != ".");
-        let server = parts.next()?;
-        let share = parts.next()?;
-        return Some((LexicalRoot::WindowsUnc(server, share), parts.collect()));
-    }
-    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(raw);
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
-    {
-        let segs = trimmed[2..]
-            .split(['\\', '/'])
-            .filter(|part| !part.is_empty() && *part != ".")
-            .collect();
-        return Some((LexicalRoot::WindowsDrive(&trimmed[..2]), segs));
-    }
-    if trimmed.starts_with('/') && !trimmed.starts_with("//") {
-        let segs = trimmed
-            .split('/')
-            .filter(|part| !part.is_empty() && *part != ".")
-            .collect();
-        return Some((LexicalRoot::Posix, segs));
-    }
-    None
-}
-
-fn format_lexical(root: LexicalRoot<'_>, segs: &[&str]) -> PathBuf {
-    match root {
-        LexicalRoot::Posix => {
-            if segs.is_empty() {
-                PathBuf::from("/")
-            } else {
-                PathBuf::from(format!("/{}", segs.join("/")))
-            }
-        }
-        LexicalRoot::WindowsDrive(drive) => {
-            if segs.is_empty() {
-                PathBuf::from(format!(r"{drive}\"))
-            } else {
-                PathBuf::from(format!(r"{drive}\{}", segs.join(r"\")))
-            }
-        }
-        LexicalRoot::WindowsUnc(server, share) => {
-            if segs.is_empty() {
-                PathBuf::from(format!(r"\\{server}\{share}"))
-            } else {
-                PathBuf::from(format!(r"\\{server}\{share}\{}", segs.join(r"\")))
-            }
-        }
-    }
-}
-
-fn roots_match(a: LexicalRoot<'_>, b: LexicalRoot<'_>) -> bool {
-    match (a, b) {
-        (LexicalRoot::Posix, LexicalRoot::Posix) => true,
-        (LexicalRoot::WindowsDrive(da), LexicalRoot::WindowsDrive(db)) => {
-            da.eq_ignore_ascii_case(db)
-        }
-        (LexicalRoot::WindowsUnc(sa, sha), LexicalRoot::WindowsUnc(sb, shb)) => {
-            sa.eq_ignore_ascii_case(sb) && sha.eq_ignore_ascii_case(shb)
-        }
-        _ => false,
-    }
-}
-
-fn segments_equal(root: LexicalRoot<'_>, a: &[&str], b: &[&str]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    match root {
-        LexicalRoot::Posix => a == b,
-        LexicalRoot::WindowsDrive(_) | LexicalRoot::WindowsUnc(_, _) => {
-            a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
-        }
-    }
-}
-
 fn lexical_parent(path: &Path) -> Option<PathBuf> {
-    let Some((root, mut segs)) = parse_lexical(path) else {
+    let Some(parsed) = path.to_str().and_then(lexical_path::parse) else {
         return path.parent().map(Path::to_path_buf);
     };
-    segs.pop()?;
-    Some(format_lexical(root, &segs))
+    parsed
+        .parent()
+        .map(|parent| PathBuf::from(parent.to_path_string()))
 }
 
 fn lexical_strip_prefix<'a>(path: &'a Path, base: &Path) -> Option<Vec<&'a str>> {
-    let (Some((p_root, p_segs)), Some((b_root, b_segs))) =
-        (parse_lexical(path), parse_lexical(base))
-    else {
+    let (Some(path), Some(base)) = (
+        path.to_str().and_then(lexical_path::parse),
+        base.to_str().and_then(lexical_path::parse),
+    ) else {
         return path.strip_prefix(base).ok().map(|rel| {
             rel.components()
                 .filter_map(|component| component.as_os_str().to_str())
                 .collect()
         });
     };
-    if !roots_match(p_root, b_root) || p_segs.len() < b_segs.len() {
-        return None;
-    }
-    segments_equal(b_root, &p_segs[..b_segs.len()], &b_segs)
-        .then(|| p_segs[b_segs.len()..].to_vec())
+    path.strip_prefix(&base).map(|rest| rest.to_vec())
 }
 
 fn lexical_starts_with(path: &Path, base: &Path) -> bool {
@@ -242,11 +143,13 @@ fn lexical_starts_with(path: &Path, base: &Path) -> bool {
 }
 
 fn lexical_eq(a: &Path, b: &Path) -> bool {
-    let (Some((a_root, a_segs)), Some((b_root, b_segs))) = (parse_lexical(a), parse_lexical(b))
-    else {
+    let (Some(a), Some(b)) = (
+        a.to_str().and_then(lexical_path::parse),
+        b.to_str().and_then(lexical_path::parse),
+    ) else {
         return a == b;
     };
-    roots_match(a_root, b_root) && segments_equal(a_root, &a_segs, &b_segs)
+    a.lexical_eq(&b)
 }
 
 fn is_date_component(value: &str) -> bool {

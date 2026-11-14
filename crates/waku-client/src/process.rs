@@ -165,7 +165,7 @@ impl DaemonProcess {
         launch_lock.lock().context("lock resident daemon startup")?;
         if let Ok(bytes) = std::fs::read(&state_file)
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
-            && resident_process_alive(record.pid)
+            && crate::pid::is_alive(record.pid)
             && (record.protocol_version != PROTOCOL_VERSION || record.token != token)
         {
             bail!(
@@ -204,7 +204,7 @@ impl DaemonProcess {
         }
         if let Ok(bytes) = std::fs::read(&state_file)
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
-            && resident_process_alive(record.pid)
+            && crate::pid::is_alive(record.pid)
         {
             bail!("resident daemon is running but unreachable; leaving its sessions intact");
         }
@@ -353,7 +353,7 @@ impl DaemonProcess {
     fn has_exited(&mut self) -> bool {
         match self.child.as_mut() {
             Some(child) => !matches!(child.try_wait(), Ok(None)),
-            None => !resident_process_alive(self.pid),
+            None => !crate::pid::is_alive(self.pid),
         }
     }
 
@@ -475,10 +475,7 @@ impl RemoteEndpoint {
                 connection,
                 session,
             } => {
-                let session = Arc::new(match BridgeSession::spawn(connection, session.target()) {
-                    Ok(session) => session,
-                    Err(_) => BridgeSession::open_with(connection, false)?,
-                });
+                let session = Arc::new(BridgeSession::reconnect(connection, session.target())?);
                 let client = DaemonClient::connect_with_resume(
                     session.address(),
                     session.token().to_owned(),
@@ -1062,60 +1059,9 @@ fn replace_local_daemon(
     Ok(())
 }
 
-#[cfg(unix)]
-fn resident_process_alive(pid: u32) -> bool {
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-#[cfg(windows)]
-fn resident_process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
-    };
-    if pid == 0 {
-        return false;
-    }
-    unsafe {
-        let synch_handle = OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            0,
-            pid,
-        );
-        if !synch_handle.is_null() {
-            // `STILL_ACTIVE` (259) is also a legal process exit code; `WaitForSingleObject`
-            // is signaled (`WAIT_OBJECT_0`) only once the process actually terminates.
-            let wait = WaitForSingleObject(synch_handle, 0);
-            let mut code = 0_u32;
-            let result = GetExitCodeProcess(synch_handle, &mut code);
-            CloseHandle(synch_handle);
-            if wait == WAIT_OBJECT_0 {
-                return false;
-            }
-            if wait == WAIT_TIMEOUT {
-                return result == 0 || code == STILL_ACTIVE as u32;
-            }
-            return result == 0 || code == STILL_ACTIVE as u32;
-        }
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let mut code = 0_u32;
-        let result = GetExitCodeProcess(handle, &mut code);
-        CloseHandle(handle);
-        result == 0 || code == STILL_ACTIVE as u32
-    }
-}
-
 fn wait_for_resident_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while resident_process_alive(pid) {
+    while crate::pid::is_alive(pid) {
         if Instant::now() >= deadline {
             return false;
         }
@@ -1273,39 +1219,6 @@ mod tests {
             current_process_enforces_redirection_trust()
         );
         assert!(!resident_daemon_tainted(pid));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resident_process_alive_distinguishes_live_and_exited_259_processes() {
-        assert!(!resident_process_alive(0));
-        assert!(resident_process_alive(std::process::id()));
-
-        let mut child = ProcessCommand::new("cmd.exe")
-            .args(["/d", "/c", "exit 259"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "exit-259 child did not finish");
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(status.code(), Some(259));
-        // `child` is still in scope holding the Windows process handle, so
-        // `OpenProcess` still observes exit code 259 (`STILL_ACTIVE`).
-        assert!(
-            !resident_process_alive(pid),
-            "exited process with exit code 259 must not be reported alive"
-        );
-        drop(child);
-        assert!(!resident_process_alive(pid));
     }
 
     #[test]

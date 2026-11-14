@@ -715,7 +715,7 @@ impl Project {
         // treat backslashes as separators for drive and UNC paths there. On
         // POSIX, a backslash in an ordinary path is a legal file-name byte and
         // must not split the project name.
-        let windows = cfg!(windows) || looks_like_windows_path(&raw);
+        let windows = cfg!(windows) || crate::lexical_path::is_windows_absolute(&raw);
         let separators: &[char] = if windows { &['/', '\\'] } else { &['/'] };
         let trimmed = raw.trim_end_matches(separators);
         let name = trimmed
@@ -735,17 +735,6 @@ impl Project {
     pub fn is_projectless(&self) -> bool {
         crate::projectless::is_projectless_path(&self.path)
     }
-}
-
-/// True for an absolute drive or UNC path, which tells a remote Windows
-/// workspace apart from a POSIX file name that happens to contain a backslash.
-fn looks_like_windows_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with(r"\\")
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]

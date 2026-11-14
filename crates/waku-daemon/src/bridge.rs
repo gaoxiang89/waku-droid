@@ -317,7 +317,7 @@ fn end_daemon_and_sessions(pid: u32) {
 fn read_live_state(state_dir: &Path) -> Option<BridgeState> {
     let text = fs::read_to_string(state_dir.join(STATE_FILE)).ok()?;
     let state = serde_json::from_str::<BridgeState>(&text).ok()?;
-    if !platform::process_is_alive(state.pid) {
+    if !waku_client::pid::is_alive(state.pid) {
         return None;
     }
     Some(state)
@@ -576,7 +576,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let self_pid = std::process::id();
-        assert!(platform::process_is_alive(self_pid));
+        assert!(waku_client::pid::is_alive(self_pid));
 
         let table = platform::process_table();
         assert!(table.iter().any(|entry| entry.pid == self_pid));
@@ -591,7 +591,7 @@ mod tests {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let exited_pid = child.id();
         let _ = child.wait();
-        assert!(!platform::process_is_alive(exited_pid));
+        assert!(!waku_client::pid::is_alive(exited_pid));
     }
 
     #[test]
@@ -753,7 +753,7 @@ mod tests {
         }
 
         child.kill();
-        assert!(!platform::process_is_alive(child.id()));
+        assert!(!waku_client::pid::is_alive(child.id()));
         let logged = String::from_utf8_lossy(&fs::read(&log_path).unwrap()).into_owned();
         assert!(logged.contains("isolated_ok"), "unexpected log: {logged:?}");
 
@@ -809,16 +809,11 @@ mod platform {
         Ok(Lock(file))
     }
 
-    pub fn process_is_alive(pid: u32) -> bool {
-        let result = unsafe { libc::kill(pid as i32, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-
     pub fn terminate(pid: u32) {
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if !process_is_alive(pid) {
+            if !waku_client::pid::is_alive(pid) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -836,11 +831,11 @@ mod platform {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && pids.iter().any(|&pid| process_is_alive(pid)) {
+        while Instant::now() < deadline && pids.iter().any(|&pid| waku_client::pid::is_alive(pid)) {
             std::thread::sleep(Duration::from_millis(50));
         }
         for &pid in pids {
-            if process_is_alive(pid) {
+            if waku_client::pid::is_alive(pid) {
                 unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
         }
@@ -936,8 +931,7 @@ mod platform {
     use anyhow::{Context as _, bail};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1128,31 +1122,6 @@ mod platform {
         file.lock()
             .with_context(|| format!("could not lock {}", path.display()))?;
         Ok(Lock(file))
-    }
-
-    pub fn process_is_alive(pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        unsafe {
-            let handle = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            );
-            if handle.is_null() {
-                return std::io::Error::last_os_error().raw_os_error()
-                    == Some(ERROR_ACCESS_DENIED as i32);
-            }
-            let mut exit_code = 0_u32;
-            let read = GetExitCodeProcess(handle, &mut exit_code);
-            // STILL_ACTIVE is also a legal exit code (259). The wait is
-            // signaled only after the process exits, so it disambiguates a
-            // live process from one that happened to return that value.
-            let wait = WaitForSingleObject(handle, 0);
-            CloseHandle(handle);
-            read != 0 && exit_code == STILL_ACTIVE as u32 && wait == WAIT_TIMEOUT
-        }
     }
 
     pub fn terminate(pid: u32) {
@@ -1561,10 +1530,6 @@ mod platform {
 
     pub fn restrict_file_permissions(_file: &fs::File) -> anyhow::Result<()> {
         Ok(())
-    }
-
-    pub fn process_is_alive(_pid: u32) -> bool {
-        false
     }
 
     pub fn terminate(_pid: u32) {}

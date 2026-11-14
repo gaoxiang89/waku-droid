@@ -37,6 +37,7 @@ use parking_lot::Mutex;
 use crate::persistence::DEFAULT_RIGHT_PANEL_WIDTH;
 use crate::theme::{Theme, sp};
 use crate::ui::scrollbar::{self, ScrollbarState};
+use waku_protocol::lexical_path;
 
 /// Fallback advance width, used only until the font has been measured.
 const TERMINAL_CELL_WIDTH: f32 = 7.8;
@@ -232,7 +233,7 @@ fn osc_alert(payload: &[u8]) -> Option<TerminalAlert> {
 fn remote_file_url_path(url: &url::Url) -> Option<PathBuf> {
     let decoded = decode_percent_path(url.path())?;
     let normalized = if let Some(rest) = decoded.strip_prefix('/')
-        && has_windows_drive_prefix(rest)
+        && lexical_path::has_drive_prefix(rest)
     {
         rest.to_owned()
     } else {
@@ -253,7 +254,7 @@ fn osc_working_directory(payload: &[u8]) -> Option<PathBuf> {
             && !path
                 .to_str()
                 .and_then(|s| s.strip_prefix('/'))
-                .is_some_and(has_windows_drive_prefix)
+                .is_some_and(lexical_path::has_drive_prefix)
         {
             return Some(path);
         }
@@ -1739,7 +1740,7 @@ fn shell_quote_path(path: &Path) -> String {
 
 fn shell_quote_path_for_target(path: &Path, windows_target: bool) -> String {
     let path_str = path.to_string_lossy();
-    let windows_path = path_str.contains('\\') || has_windows_drive_prefix(&path_str);
+    let windows_path = path_str.contains('\\') || lexical_path::has_drive_prefix(&path_str);
     let is_safe = !path_str.is_empty()
         && path_str.chars().all(|c| {
             c.is_ascii_alphanumeric()
@@ -3691,7 +3692,7 @@ fn terminal_link_target(
         return Some(TerminalLinkTarget::File { path, location });
     }
 
-    if has_windows_drive_prefix(value) || value.starts_with("\\\\") {
+    if lexical_path::has_drive_prefix(value) || value.starts_with("\\\\") {
         return None;
     }
 
@@ -3700,14 +3701,6 @@ fn terminal_link_target(
         return None;
     }
     Some(TerminalLinkTarget::Url(url.to_string()))
-}
-
-fn has_windows_drive_prefix(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn mouse_button_code(button: MouseButton) -> Option<u8> {
@@ -3751,8 +3744,7 @@ fn is_wide_terminal_char(ch: char) -> bool {
 }
 
 fn is_windows_target_path(path: &Path) -> bool {
-    let text = path.to_string_lossy();
-    has_windows_drive_prefix(&text) || text.starts_with("\\\\")
+    lexical_path::is_windows_absolute(&path.to_string_lossy())
 }
 
 fn is_windows_drive_colon(prefix: &str) -> bool {
@@ -3783,7 +3775,7 @@ fn terminal_file_path_with_location(
     } else {
         is_windows_target_path(working_directory)
     };
-    let url_parsed = (!has_windows_drive_prefix(value))
+    let url_parsed = (!lexical_path::has_drive_prefix(value))
         .then(|| url::Url::parse(value).ok())
         .flatten();
     let mut path = match url_parsed {
@@ -3808,13 +3800,13 @@ fn terminal_file_path_with_location(
                 }
             } else if local_terminal {
                 let path = Path::new(value);
-                if path.is_absolute() || has_windows_drive_prefix(value) {
+                if path.is_absolute() || lexical_path::has_drive_prefix(value) {
                     path.to_path_buf()
                 } else {
                     working_directory.join(path)
                 }
             } else if windows_target {
-                if has_windows_drive_prefix(value) || value.starts_with("\\\\") {
+                if lexical_path::has_drive_prefix(value) || value.starts_with("\\\\") {
                     PathBuf::from(value)
                 } else {
                     let pathlike = value.starts_with("./")
@@ -3834,7 +3826,7 @@ fn terminal_file_path_with_location(
                         value.replace('/', "\\")
                     ))
                 }
-            } else if has_windows_drive_prefix(value) {
+            } else if lexical_path::has_drive_prefix(value) {
                 return None;
             } else if value.starts_with('/') {
                 PathBuf::from(value)
@@ -6492,9 +6484,9 @@ mod tests {
             plain_link_value(&term, terminal_point_for(content, "terminal")),
             Some("src\\terminal.rs:42:8".to_owned())
         );
-        assert!(has_windows_drive_prefix("C:\\Users\\waku\\main.rs"));
-        assert!(has_windows_drive_prefix("d:/work/main.rs"));
-        assert!(!has_windows_drive_prefix("https://example.com"));
+        assert!(lexical_path::has_drive_prefix("C:\\Users\\waku\\main.rs"));
+        assert!(lexical_path::has_drive_prefix("d:/work/main.rs"));
+        assert!(!lexical_path::has_drive_prefix("https://example.com"));
 
         assert_eq!(utf16_prefix_columns("你好a", 0), 0);
         assert_eq!(utf16_prefix_columns("你好a", 1), 2);

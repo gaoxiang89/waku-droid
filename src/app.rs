@@ -2226,11 +2226,11 @@ impl Waku {
                 self.reset_updater_button_animation();
                 self.show_toast(tr!("updater.failed", error = error));
             }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             crate::updater::UpdaterEvent::QuitAndInstall => {
-                // Stop any resident local daemon cleanly before quitting so the
-                // Windows installer can swap `waku-daemon.exe`, then let GPUI's
-                // normal asynchronous quit hooks flush drafts and window state.
+                // Windows cannot replace a running `waku-daemon.exe`, so stop
+                // the resident local daemon first, then let GPUI's normal
+                // asynchronous quit hooks flush drafts and window state.
                 let daemon = self.daemon.clone();
                 cx.spawn(async move |_: WeakEntity<Self>, cx| {
                     cx.background_executor()
@@ -2239,6 +2239,13 @@ impl Waku {
                     let _ = cx.update(|cx| cx.quit());
                 })
                 .detach();
+            }
+            #[cfg(target_os = "linux")]
+            crate::updater::UpdaterEvent::QuitAndInstall => {
+                // The handoff helper or installer has launched and now
+                // waits for GPUI's normal asynchronous quit hooks to finish
+                // saving drafts and window state before it swaps them.
+                cx.quit();
             }
         }
         cx.notify();
