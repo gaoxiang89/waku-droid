@@ -23,11 +23,20 @@ DaemonClient ─TCP─▶ loopback relay
 - **Transport is the user's own `wsl.exe` or `ssh`.** `~/.ssh/config`,
   ssh-agent, `ProxyJump`, and known hosts apply as in a terminal. No port is
   opened on the remote host's network; the daemon binds its loopback only.
+  On Windows hosts, the probe, install, and bridge commands run through
+  `powershell.exe -EncodedCommand`, so `cmd.exe`, `pwsh`, Git Bash, MSYS, and
+  Cygwin default shells all work; Windows PowerShell 5.1 must be installed.
 - **The remote daemon outlives the connection.** `waku-daemon bridge` starts
-  the daemon in its own session (`setsid`) and records its address and token
-  in `~/.cache/waku/server/daemon.json` (mode `0600`). A dropped network
+  the daemon in its own session (`setsid`) on Unix and records its address and
+  token in `~/.cache/waku/server/daemon.json` (mode `0600`). A dropped network
   only kills the bridge; the desktop starts a new one and resumes every
-  runtime from its replay cursor, so a running agent keeps going.
+  runtime from its replay cursor, so a running agent keeps going. On Windows
+  the daemon asks to break away from the SSH session's job object with
+  `CREATE_BREAKAWAY_FROM_JOB`. If the host's job object does not allow
+  breakaway, it falls back to a process inside that job, so closing the SSH
+  session can also stop the daemon and its agents; use a long-lived SSH
+  connection or verify breakaway on your OpenSSH host if reconnect survival
+  matters.
 - **Idle exit.** A bridge-managed daemon exits after 30 minutes with no client
   and no live provider runtime or terminal.
 - **One daemon per host and build.** Bridges serialize on `daemon.lock`. A
@@ -38,13 +47,16 @@ DaemonClient ─TCP─▶ loopback relay
 
 On connect the desktop:
 
-1. probes the host with `uname -s; uname -m` (Linux or macOS, x86_64 or
-   aarch64);
-2. compares `~/.cache/waku/server/waku-daemon --fingerprint` with the
-   daemon it carries for that target, and reuses the install when they match;
+1. probes the host with `uname -s; uname -m` on POSIX, then falls back to a
+   PowerShell probe on Windows (Linux, macOS, or Windows; x86_64 or aarch64);
+2. compares `~/.cache/waku/server/waku-daemon --fingerprint` (or
+   `%USERPROFILE%\.cache\waku\server\waku-daemon.exe --fingerprint` on
+   Windows) with the daemon it carries for that target, and reuses the
+   install when they match;
 3. otherwise copies (WSL, via `wslpath`) or streams over ssh's stdin (SSH)
    the binary into a temporary file, verifies its fingerprint, and moves it
-   into place atomically;
+   into place atomically. On Windows the running `.exe` is renamed aside
+   before the verified temporary binary is moved in;
 4. launches `waku-daemon bridge`. A reused install that reports another
    protocol version is reinstalled once.
 
@@ -52,7 +64,8 @@ Settings → General → About lists the version each connected daemon announced
 in its handshake, so a host still running an older install is visible at a
 glance.
 
-Development builds use `~/.cache/waku-dev/server` so they never replace a
+Development builds use `~/.cache/waku-dev/server` (or
+`%USERPROFILE%\.cache\waku-dev\server` on Windows) so they never replace a
 released app's daemon.
 
 The fingerprint is a 64-bit FNV-1a hash of the binary's bytes. It decides
@@ -63,21 +76,27 @@ reuse only; integrity in transit is the transport's job.
 For a target such as Linux x86_64 the desktop looks, in order, for:
 
 1. `WAKU_REMOTE_DAEMON_LINUX_X86_64` (likewise `_LINUX_AARCH64`,
-   `_DARWIN_AARCH64`, `_DARWIN_X86_64`);
-2. `waku-daemon-linux-x86_64` in the package's `remote/` directory: next to
-   `waku.exe` on Windows, `Contents/Resources/remote/` on macOS, and
+   `_DARWIN_AARCH64`, `_DARWIN_X86_64`, `_WINDOWS_X86_64`, and
+   `_WINDOWS_AARCH64`);
+2. `waku-daemon-linux-x86_64` (or
+   `waku-daemon-windows-x86_64.exe`) in the package's `remote/` directory:
+   next to `waku.exe` on Windows, `Contents/Resources/remote/` on macOS, and
    `share/waku/remote/` in the Linux archive;
 3. in development, `target/remote-dev/`, then
-   `target/<triple>/{debug,release}/waku-daemon` for the musl and gnu triples;
+   `target/<triple>/{debug,release}/waku-daemon` for the musl, gnu, and
+   Windows triples;
 4. the app's own `waku-daemon` when the host has the same platform.
 
 Release CI builds statically linked `*-unknown-linux-musl` daemons for
-x86_64 and aarch64 (the `remote-daemon` job) and every desktop package
-carries both, so the daemon never depends on the host's glibc. The bundle
-scripts stage whatever `WAKU_REMOTE_DAEMONS_DIR` holds, and warn about an
-architecture it does not hold rather than failing — a local package can
-carry just the one your WSL distribution needs. Building one by hand: see
-Development below.
+x86_64 and aarch64 (the `remote-daemon` job), so they never depend on the
+host's glibc, and the Windows x64 package carries both next to `waku.exe`.
+It also carries the package's own `waku-daemon.exe`, which serves a Windows
+x64 host. The current release workflow does not build a Windows ARM64
+daemon, and packages for other desktop platforms do not carry a Windows
+daemon; for those targets, supply one with the environment variable above
+or place it in `remote/`. The bundle scripts stage whatever
+`WAKU_REMOTE_DAEMONS_DIR` holds, and warn about an architecture it does not
+hold rather than failing. Building one by hand: see Development below.
 
 ## Using it
 
@@ -198,8 +217,10 @@ on some machines and keeps the debug app from starting.
 directory, and with `--drop` kills the remote bridge to confirm the
 supervisor reconnects to the same daemon.
 
-Remote state lives in `~/.cache/waku[-dev]/server/`: `waku-daemon`,
-`daemon.json`, `daemon.lock`, and `daemon.log` (the daemon's stderr).
+Remote state lives in `~/.cache/waku[-dev]/server/` on Unix and
+`%USERPROFILE%\.cache\waku[-dev]\server\` on Windows: `waku-daemon` (or
+`waku-daemon.exe`), `daemon.json`, `daemon.lock`, and `daemon.log` (the
+daemon's stderr).
 
 ## Current limitations
 
@@ -211,7 +232,13 @@ Remote state lives in `~/.cache/waku[-dev]/server/`: `waku-daemon`,
 - The Connections page has no password field yet; password authentication
   needs the credential entry created by other means. Prefer ssh-agent or a
   key.
-- Hosts must be Linux or macOS on x86_64 or aarch64.
+- Hosts can be Linux, macOS, or Windows on x86_64 or aarch64, but a Windows
+  host needs a `waku-daemon-windows-<arch>.exe` for that architecture. The
+  Windows x64 package carries one; the current release workflow does not
+  build a Windows ARM64 daemon.
+- On Windows, keeping the daemon alive after the SSH session closes depends
+  on the OpenSSH job object allowing `CREATE_BREAKAWAY_FROM_JOB`. When it
+  does not, the fallback process is stopped with the session.
 - `StrictHostKeyChecking=accept-new` trusts a new SSH host on first use and
   refuses a changed key; fix `known_hosts` in a terminal.
 - On Linux desktops, SSH passwords use the kernel keyring and do not survive

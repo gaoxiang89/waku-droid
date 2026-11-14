@@ -88,12 +88,23 @@ fn report(daemon: &DaemonSupervisor) -> anyhow::Result<()> {
 }
 
 fn kill_remote_bridge(connection: &Connection) -> anyhow::Result<()> {
-    let script = "pkill -f '[w]aku-daemon bridge' || true";
     let mut command = match &connection.kind {
-        ConnectionKind::Wsl { distro } => waku_client::remote::wsl::command(distro, script, &[]),
+        ConnectionKind::Wsl { distro } => waku_client::remote::wsl::command(
+            distro,
+            "pkill -f '[w]aku-daemon bridge' || true",
+            &[],
+        ),
         ConnectionKind::Ssh { .. } => {
+            let target = waku_client::remote::deploy::probe(connection)?;
             let mut command = waku_client::remote::ssh::command(connection)?;
-            command.arg(waku_client::remote::ssh::wrap_posix_script(script));
+            if target.os == waku_client::remote::deploy::RemoteOs::Windows {
+                let ps = "Get-CimInstance Win32_Process -Filter \"Name='waku-daemon.exe' OR Name='waku-debug-daemon.exe'\" | Where-Object { $_.CommandLine -match '\\bbridge\\b' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
+                command.arg(waku_client::remote::ssh::wrap_powershell_script(ps));
+            } else {
+                command.arg(waku_client::remote::ssh::wrap_posix_script(
+                    "pkill -f '[w]aku-daemon bridge' || true",
+                ));
+            }
             command
         }
         ConnectionKind::Local => bail!("local has no bridge"),

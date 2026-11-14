@@ -471,8 +471,11 @@ impl RemoteEndpoint {
                     },
                 ))
             }
-            Self::Bridged { connection, .. } => {
-                let session = Arc::new(BridgeSession::spawn(connection)?);
+            Self::Bridged {
+                connection,
+                session,
+            } => {
+                let session = Arc::new(BridgeSession::spawn(connection, session.target())?);
                 let client = DaemonClient::connect_with_resume(
                     session.address(),
                     session.token().to_owned(),

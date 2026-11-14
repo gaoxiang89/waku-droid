@@ -330,9 +330,12 @@ fn start_daemon(
             data.join(waku_protocol::identity::DATA_DIRECTORY_NAME),
         );
     }
-    platform::detach(&mut command);
-    let mut child = command
-        .spawn()
+    // The bridge's stdio is the SSH/WSL transport. Windows inherits every
+    // inheritable handle by default, so the daemon would keep the transport's
+    // stderr pipe open after the bridge exits. Its own stdio is configured
+    // above; clear the parent's flags before spawning it.
+    platform::disable_stdio_inheritance();
+    let mut child = platform::spawn_detached(&mut command)
         .with_context(|| format!("could not launch {}", executable.display()))?;
     let deadline = std::time::Instant::now() + START_TIMEOUT;
     loop {
@@ -524,6 +527,33 @@ mod tests {
             MAX_COMMAND_CHARS + 1
         );
     }
+
+    #[test]
+    fn platform_lock_process_check_and_table_work() {
+        let dir = std::env::temp_dir().join(format!("waku-bridge-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let lock = platform::lock(&dir.join(LOCK_FILE)).unwrap();
+        drop(lock);
+        let _ = fs::remove_dir_all(&dir);
+
+        let self_pid = std::process::id();
+        assert!(platform::process_is_alive(self_pid));
+
+        let table = platform::process_table();
+        assert!(table.iter().any(|entry| entry.pid == self_pid));
+
+        // 259 is STILL_ACTIVE; the wait must still report the process as dead.
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 259"])
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let exited_pid = child.id();
+        let _ = child.wait();
+        assert!(!platform::process_is_alive(exited_pid));
+    }
 }
 
 #[cfg(unix)]
@@ -630,26 +660,204 @@ mod platform {
         })
     }
 
+    /// Unix replaces the child's stdio and closes every other descriptor
+    /// during `Command::spawn`, so there is nothing to clear here.
+    pub fn disable_stdio_inheritance() {}
+
     /// A new session detaches the daemon from the SSH or WSL session, so a
     /// hangup on disconnect does not take running agents down with it.
-    pub fn detach(command: &mut std::process::Command) {
+    pub fn spawn_detached(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
                 Ok(())
             });
         }
+        command.spawn()
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod platform {
+    use std::fs;
+    use std::os::windows::process::CommandExt as _;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use anyhow::Context as _;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        STILL_ACTIVE, SetHandleInformation, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetExitCodeProcess,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
+    };
+
+    pub struct Lock(#[allow(dead_code)] fs::File);
+
+    /// Windows inherits every inheritable handle into the child. The bridge's
+    /// stdio is the SSH or WSL transport, so clear those flags before starting
+    /// the daemon; its own stdio is already redirected to NUL and the log.
+    pub fn disable_stdio_inheritance() {
+        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(std_handle) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+    }
+
+    pub fn lock(path: &Path) -> anyhow::Result<Lock> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("could not open {}", path.display()))?;
+        // std::fs::File handles are non-inheritable and LockFileEx is dropped
+        // by the kernel if the bridge exits unexpectedly.
+        file.lock()
+            .with_context(|| format!("could not lock {}", path.display()))?;
+        Ok(Lock(file))
+    }
+
+    pub fn process_is_alive(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
+            if handle.is_null() {
+                return std::io::Error::last_os_error().raw_os_error()
+                    == Some(ERROR_ACCESS_DENIED as i32);
+            }
+            let mut exit_code = 0_u32;
+            let read = GetExitCodeProcess(handle, &mut exit_code);
+            // STILL_ACTIVE is also a legal exit code (259). The wait is
+            // signaled only after the process exits, so it disambiguates a
+            // live process from one that happened to return that value.
+            let wait = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            read != 0 && exit_code == STILL_ACTIVE as u32 && wait == WAIT_TIMEOUT
+        }
+    }
+
+    pub fn terminate(pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return;
+            }
+            TerminateProcess(handle, 1);
+            WaitForSingleObject(handle, 3_000);
+            CloseHandle(handle);
+        }
+    }
+
+    pub fn end_children(pids: &[u32]) {
+        let handles: Vec<HANDLE> = pids
+            .iter()
+            .copied()
+            .filter(|&pid| pid != 0)
+            .filter_map(|pid| unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+                (!handle.is_null()).then_some(handle)
+            })
+            .collect();
+        for &handle in &handles {
+            unsafe {
+                TerminateProcess(handle, 1);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for &handle in &handles {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
+            unsafe {
+                WaitForSingleObject(handle, remaining);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    pub fn process_table() -> Vec<super::ProcessEntry> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut table = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while has_entry {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&ch| ch == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let command =
+                super::shorten_command(&String::from_utf16_lossy(&entry.szExeFile[..len]));
+            table.push(super::ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+                command,
+            });
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        unsafe { CloseHandle(snapshot) };
+        table
+    }
+
+    /// Break the resident daemon out of the SSH session's job object when
+    /// allowed so closing the SSH connection leaves it running, and hide its
+    /// console without using `DETACHED_PROCESS` (invalid with `CREATE_NO_WINDOW`).
+    pub fn spawn_detached(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        command.creation_flags(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
+        match command.spawn() {
+            Ok(child) => Ok(child),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+                command.spawn()
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod platform {
     use std::path::Path;
 
     pub struct Lock;
 
     pub fn lock(_path: &Path) -> anyhow::Result<Lock> {
-        anyhow::bail!("waku-daemon bridge runs only on Linux and macOS hosts")
+        anyhow::bail!("waku-daemon bridge runs only on Linux, macOS, and Windows hosts")
     }
 
     pub fn process_is_alive(_pid: u32) -> bool {
@@ -664,5 +872,11 @@ mod platform {
         Vec::new()
     }
 
-    pub fn detach(_command: &mut std::process::Command) {}
+    pub fn disable_stdio_inheritance() {}
+
+    pub fn spawn_detached(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        command.spawn()
+    }
 }

@@ -17,7 +17,7 @@ use waku_protocol::PROTOCOL_VERSION;
 use waku_protocol::bridge::{BridgeBlocked, BridgeReady, IncompatibleDaemon};
 
 use super::connection::{Connection, ConnectionKind};
-use super::deploy::{self, DeployOutcome};
+use super::deploy::{self, DeployOutcome, RemoteTarget};
 use super::process_util::{StderrTail, with_detail};
 use super::{ssh, wsl};
 
@@ -59,6 +59,7 @@ impl std::error::Error for BridgeError {}
 /// A live `wsl.exe`/`ssh` child relaying one daemon connection. Dropping it
 /// kills the child; the remote daemon keeps running.
 pub struct BridgeSession {
+    target: RemoteTarget,
     address: String,
     token: String,
     remote_pid: u32,
@@ -84,7 +85,7 @@ impl BridgeSession {
         let target = deploy::probe(connection).map_err(stage(BridgeStage::Probe))?;
         let outcome =
             deploy::deploy(connection, target, false).map_err(stage(BridgeStage::Deploy))?;
-        match Self::spawn_with(connection, replace_incompatible) {
+        match Self::spawn_with(connection, target, replace_incompatible) {
             Ok(session) => Ok(session),
             // A reused install that speaks another protocol is the one case a
             // reinstall can fix, e.g. two Waku builds sharing a host.
@@ -93,7 +94,7 @@ impl BridgeSession {
                     && error.downcast_ref::<ProtocolMismatch>().is_some() =>
             {
                 deploy::deploy(connection, target, true).map_err(stage(BridgeStage::Deploy))?;
-                Self::spawn_with(connection, replace_incompatible)
+                Self::spawn_with(connection, target, replace_incompatible)
                     .map_err(stage(BridgeStage::Bridge))
             }
             Err(error) => Err(stage(BridgeStage::Bridge)(error)),
@@ -102,18 +103,24 @@ impl BridgeSession {
 
     /// Start a bridge against an already installed daemon. Reconnects use this
     /// directly; the install cannot have changed under a running desktop.
-    pub fn spawn(connection: &Connection) -> anyhow::Result<Self> {
-        Self::spawn_with(connection, false)
+    pub fn spawn(connection: &Connection, target: RemoteTarget) -> anyhow::Result<Self> {
+        Self::spawn_with(connection, target, false)
     }
 
-    fn spawn_with(connection: &Connection, replace_incompatible: bool) -> anyhow::Result<Self> {
-        let script = deploy::bridge_script(replace_incompatible);
+    fn spawn_with(
+        connection: &Connection,
+        target: RemoteTarget,
+        replace_incompatible: bool,
+    ) -> anyhow::Result<Self> {
         let mut command = match &connection.kind {
             ConnectionKind::Local => bail!("the local connection does not use a bridge"),
-            ConnectionKind::Wsl { distro } => wsl::command(distro, &script, &[]),
+            ConnectionKind::Wsl { distro } => {
+                let script = deploy::bridge_script(replace_incompatible);
+                wsl::command(distro, &script, &[])
+            }
             ConnectionKind::Ssh { .. } => {
                 let mut command = ssh::command(connection)?;
-                command.arg(ssh::wrap_posix_script(&script));
+                command.arg(deploy::ssh_bridge_command(target, replace_incompatible));
                 command
             }
         };
@@ -151,14 +158,7 @@ impl BridgeSession {
         std::thread::Builder::new()
             .name("waku-bridge-ready".into())
             .spawn(move || {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                let result = match reader.read_line(&mut line) {
-                    Ok(0) => Err(anyhow!("the bridge exited before it was ready")),
-                    Ok(_) => parse_ready_line(line.trim()),
-                    Err(error) => Err(anyhow!("could not read the bridge: {error}")),
-                };
-                let _ = ready_tx.send(result.map(|ready| (ready, reader)));
+                let _ = ready_tx.send(read_ready_from_reader(BufReader::new(stdout)));
             })
             .context("could not start the bridge reader")?;
         let (ready, stdout) = match ready_rx.recv_timeout(READY_TIMEOUT) {
@@ -193,12 +193,17 @@ impl BridgeSession {
             .spawn(move || relay(listener, stdin, stdout))
             .context("could not start the bridge relay")?;
         Ok(Self {
+            target,
             address,
             token: ready.token,
             remote_pid: ready.pid,
             child: Mutex::new(child),
             stderr,
         })
+    }
+
+    pub fn target(&self) -> RemoteTarget {
+        self.target
     }
 
     /// Loopback address the daemon client connects to, once.
@@ -278,6 +283,45 @@ impl IncompatibleDaemonError {
             })
         })
     }
+}
+
+fn read_ready_from_reader<R: Read>(
+    mut reader: BufReader<R>,
+) -> anyhow::Result<(BridgeReady, BufReader<R>)> {
+    const MAX_LEADING_LINES: usize = 64;
+    let mut line = String::new();
+    let mut last_invalid = None;
+    for _ in 0..MAX_LEADING_LINES {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                return Err(match last_invalid {
+                    Some(invalid) => anyhow!("the bridge sent an invalid ready line {invalid:?}"),
+                    None => anyhow!("the bridge exited before it was ready"),
+                });
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match parse_ready_line(trimmed) {
+                    Ok(ready) => return Ok((ready, reader)),
+                    Err(error) if error.downcast_ref::<IncompatibleDaemonError>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        last_invalid = Some(trimmed.to_owned());
+                    }
+                }
+            }
+            Err(error) => return Err(anyhow!("could not read the bridge: {error}")),
+        }
+    }
+    Err(match last_invalid {
+        Some(invalid) => anyhow!("the bridge sent an invalid ready line {invalid:?}"),
+        None => anyhow!("the bridge exited before it was ready"),
+    })
 }
 
 fn parse_ready_line(line: &str) -> anyhow::Result<BridgeReady> {
@@ -401,5 +445,33 @@ mod tests {
         let line = r#"{"token":"t","protocolVersion":8,"fingerprint":"f","pid":3}"#;
         assert_eq!(parse_ready_line(line).unwrap().pid, 3);
         assert!(parse_ready_line("nonsense").is_err());
+    }
+
+    #[test]
+    fn ready_reader_skips_profile_noise_and_keeps_trailing_bytes() {
+        let mut payload = b"Welcome banner\r\n\r\n{\"token\":\"t\",\"protocolVersion\":8,\"fingerprint\":\"f\",\"pid\":3}\n".to_vec();
+        let binary_tail = [0x81_u8, 0x02, 0x00, 0xFF];
+        payload.extend_from_slice(&binary_tail);
+        let (ready, mut reader) =
+            read_ready_from_reader(BufReader::new(payload.as_slice())).unwrap();
+        assert_eq!(ready.pid, 3);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, binary_tail);
+    }
+
+    #[test]
+    fn ready_reader_surfaces_incompatible_daemon_and_invalid_eof() {
+        let blocked = b"profile banner\n{\"incompatibleDaemon\":{\"pid\":9,\"protocolVersion\":7,\"processes\":[]}}\n";
+        let err = read_ready_from_reader(BufReader::new(blocked.as_slice()))
+            .err()
+            .expect("incompatible daemon error");
+        assert!(err.downcast_ref::<IncompatibleDaemonError>().is_some());
+
+        let invalid = b"nonsense\n";
+        let err = read_ready_from_reader(BufReader::new(invalid.as_slice()))
+            .err()
+            .expect("invalid ready line");
+        assert!(err.to_string().contains("invalid ready line \"nonsense\""));
     }
 }

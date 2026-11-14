@@ -710,10 +710,18 @@ impl Project {
     }
 
     pub fn from_path(path: PathBuf) -> Self {
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
+        let raw = path.to_string_lossy();
+        // A remote Windows workspace can be registered on a POSIX desktop, so
+        // treat backslashes as separators for drive and UNC paths there. On
+        // POSIX, a backslash in an ordinary path is a legal file-name byte and
+        // must not split the project name.
+        let windows = cfg!(windows) || looks_like_windows_path(&raw);
+        let separators: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+        let trimmed = raw.trim_end_matches(separators);
+        let name = trimmed
+            .rsplit(separators)
+            .next()
+            .filter(|value| !value.is_empty() && !value.ends_with(':'))
             .unwrap_or("Project")
             .to_owned();
         Self {
@@ -727,6 +735,17 @@ impl Project {
     pub fn is_projectless(&self) -> bool {
         crate::projectless::is_projectless_path(&self.path)
     }
+}
+
+/// True for an absolute drive or UNC path, which tells a remote Windows
+/// workspace apart from a POSIX file name that happens to contain a backslash.
+fn looks_like_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with(r"\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -5803,5 +5822,32 @@ mod tests {
         session.truncate_after_turn(1);
         assert!(session.provider_cursors.is_empty());
         assert!(session.account_cursors.is_empty());
+    }
+
+    #[test]
+    fn project_from_path_handles_posix_and_windows_paths() {
+        assert_eq!(
+            Project::from_path(PathBuf::from("/home/user/repo/")).name,
+            "repo"
+        );
+        assert_eq!(
+            Project::from_path(PathBuf::from(r"C:\Users\Brainco\repo\")).name,
+            "repo"
+        );
+        assert_eq!(
+            Project::from_path(PathBuf::from("C:/Users/Brainco/repo")).name,
+            "repo"
+        );
+        assert_eq!(
+            Project::from_path(PathBuf::from(r"\\server\share\repo")).name,
+            "repo"
+        );
+        assert_eq!(Project::from_path(PathBuf::from("/")).name, "Project");
+        assert_eq!(Project::from_path(PathBuf::from(r"C:\")).name, "Project");
+        #[cfg(not(windows))]
+        assert_eq!(
+            Project::from_path(PathBuf::from(r"/home/user/foo\bar")).name,
+            r"foo\bar"
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! on the background executor and a generation counter discards results
 //! from superseded navigations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -139,7 +139,7 @@ impl Waku {
             return;
         }
         let path = match (typed.strip_prefix('~'), picker.home.as_ref()) {
-            (Some(rest), Some(home)) => home.join(rest.trim_start_matches(['/', '\\'])),
+            (Some(rest), Some(home)) => home_relative_path(home, rest),
             _ => PathBuf::from(typed),
         };
         self.browse_remote_folder(Some(path), cx);
@@ -323,6 +323,35 @@ impl Waku {
     }
 }
 
+/// Join a `~/` suffix against the daemon host's home directory using that
+/// host's separator. The home path, not the desktop platform, decides: a
+/// remote Windows home may be drive-qualified or UNC, while a POSIX home is
+/// rooted at `/` even if one of its directory names contains a backslash.
+fn home_relative_path(home: &Path, rest: &str) -> PathBuf {
+    let rest = rest.trim_start_matches(['/', '\\']);
+    if rest.is_empty() {
+        return home.to_path_buf();
+    }
+    let home_text = home.to_string_lossy();
+    let separator = remote_path_separator(&home_text);
+    let base = home_text.trim_end_matches(['/', '\\']);
+    let normalized_rest = rest.replace(['/', '\\'], &separator.to_string());
+    PathBuf::from(format!("{base}{separator}{normalized_rest}"))
+}
+
+fn remote_path_separator(home: &str) -> char {
+    let bytes = home.as_bytes();
+    if home.starts_with('/') {
+        '/'
+    } else if home.starts_with(r"\\")
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        '\\'
+    } else {
+        std::path::MAIN_SEPARATOR
+    }
+}
+
 fn folder_row(
     id: SharedString,
     icon_path: &'static str,
@@ -400,4 +429,34 @@ fn dialog_button(
                 }))
         })
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilde_expansion_uses_the_hosts_separator() {
+        assert_eq!(
+            home_relative_path(Path::new(r"C:\Users\me"), ""),
+            PathBuf::from(r"C:\Users\me")
+        );
+        assert_eq!(
+            home_relative_path(Path::new(r"C:\Users\me"), "/src/app"),
+            PathBuf::from(r"C:\Users\me\src\app")
+        );
+        assert_eq!(
+            home_relative_path(Path::new(r"\\server\share\me"), "src"),
+            PathBuf::from(r"\\server\share\me\src")
+        );
+        assert_eq!(
+            home_relative_path(Path::new("/home/me"), r"\src\app"),
+            PathBuf::from("/home/me/src/app")
+        );
+        // A backslash in a POSIX directory name is data, not a separator.
+        assert_eq!(
+            home_relative_path(Path::new(r"/home/me/odd\name"), "x"),
+            PathBuf::from(r"/home/me/odd\name/x")
+        );
+    }
 }

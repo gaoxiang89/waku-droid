@@ -163,11 +163,104 @@ pub fn wrap_posix_script(script: &str) -> String {
     format!("/bin/sh -c {}", shell_quote(script))
 }
 
+/// Encode `script` as UTF-16LE Base64 for `powershell.exe -EncodedCommand`.
+/// Base64 contains no metacharacters in `cmd.exe`, `powershell.exe`, `pwsh`,
+/// or `/bin/sh`, so it runs identically under any Windows OpenSSH DefaultShell
+/// while `-NoProfile` isolates it from broken user profiles.
+pub fn wrap_powershell_script(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -NoLogo -ExecutionPolicy Bypass -EncodedCommand {}",
+        encode_base64(&utf16le)
+    )
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn strip_ansi_escapes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1B {
+            if bytes.get(i + 1) == Some(&b'[') {
+                let mut j = i + 2;
+                while j < bytes.len() && (0x30..=0x3F).contains(&bytes[j]) {
+                    j += 1;
+                }
+                while j < bytes.len() && (0x20..=0x2F).contains(&bytes[j]) {
+                    j += 1;
+                }
+                if bytes.get(j).is_some_and(|b| (0x40..=0x7E).contains(b)) {
+                    out.push_str(&text[last..i]);
+                    i = j + 1;
+                    last = i;
+                    continue;
+                }
+                if j == bytes.len() {
+                    out.push_str(&text[last..i]);
+                    last = j;
+                    break;
+                }
+            } else if bytes.get(i + 1) == Some(&b']') {
+                let mut j = i + 2;
+                let mut terminated = false;
+                while j < bytes.len() {
+                    if bytes[j] == 0x07 {
+                        j += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if bytes[j] == 0x1B && bytes.get(j + 1) == Some(&b'\\') {
+                        j += 2;
+                        terminated = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if terminated || j == bytes.len() {
+                    out.push_str(&text[last..i]);
+                    i = j;
+                    last = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 pub fn stderr_without_askpass_diagnostics(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
+    let filtered: String = String::from_utf8_lossy(stderr)
         .split_inclusive('\n')
         .filter(|line| !line.starts_with(ASKPASS_DIAGNOSTIC_PREFIX))
-        .collect()
+        .collect();
+    strip_ansi_escapes(&filtered)
 }
 
 /// Askpass entry point. When ssh launches Waku as `SSH_ASKPASS`, print the
@@ -286,11 +379,31 @@ mod tests {
     }
 
     #[test]
-    fn askpass_diagnostics_are_filtered() {
-        let stderr = b"[waku-ssh-askpass] missing\nPermission denied\n";
+    fn askpass_diagnostics_are_filtered_and_ansi_stripped() {
+        let stderr =
+            b"[waku-ssh-askpass] missing\n\x1b[31;1mPermission\x1b[0m denied\n\x1b]0;title\x07ok\n";
         assert_eq!(
             stderr_without_askpass_diagnostics(stderr),
-            "Permission denied\n"
+            "Permission denied\nok\n"
+        );
+    }
+
+    #[test]
+    fn base64_encodes_all_padding_lengths_and_alphabet() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
+        assert_eq!(encode_base64(&[0xfb, 0xff, 0xbf]), "+/+/");
+    }
+
+    #[test]
+    fn wrap_powershell_script_encodes_utf16le_with_noprofile_flags() {
+        let wrapped = wrap_powershell_script("ok>?");
+        assert_eq!(
+            wrapped,
+            "powershell.exe -NoProfile -NonInteractive -NoLogo -ExecutionPolicy Bypass -EncodedCommand bwBrAD4APwA="
         );
     }
 }

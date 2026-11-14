@@ -48,12 +48,14 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         },
         WorkspaceOperation::BrowseDirectory { path } => {
             let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory is unavailable"))?;
-            let path = fs::canonicalize(path.as_deref().unwrap_or(&home)).with_context(|| {
-                format!(
-                    "could not open directory {}",
-                    path.as_deref().unwrap_or(&home).display()
-                )
-            })?;
+            let path = strip_windows_verbatim(
+                fs::canonicalize(path.as_deref().unwrap_or(&home)).with_context(|| {
+                    format!(
+                        "could not open directory {}",
+                        path.as_deref().unwrap_or(&home).display()
+                    )
+                })?,
+            );
             if !fs::metadata(&path)?.is_dir() {
                 bail!("not a directory: {}", path.display());
             }
@@ -750,7 +752,10 @@ mod tests {
             panic!("unexpected workspace response")
         };
 
-        assert_eq!(path, fs::canonicalize(&directory).unwrap());
+        assert_eq!(
+            path,
+            strip_windows_verbatim(fs::canonicalize(&directory).unwrap())
+        );
         assert_eq!(parent, path.parent().map(Path::to_owned));
         assert_eq!(
             entries
@@ -1135,5 +1140,32 @@ mod tests {
         assert_eq!(numstat_summary(&data.numstat), (1, 1, 0));
         assert!(data.numstat.ends_with("\tsrc/lib.rs\n"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn strip_windows_verbatim_removes_drive_and_unc_prefixes() {
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\C:\Users\Brainco\repo")),
+            PathBuf::from(r"C:\Users\Brainco\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from("/home/user/repo")),
+            PathBuf::from("/home/user/repo")
+        );
+    }
+}
+
+fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
     }
 }
