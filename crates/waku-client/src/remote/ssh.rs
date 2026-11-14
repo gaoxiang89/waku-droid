@@ -4,6 +4,7 @@
 //! `~/.ssh/config`, ssh-agent, `ProxyJump`, and known hosts all apply as they
 //! do in a terminal.
 
+use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, bail};
@@ -56,11 +57,30 @@ pub fn base_args(target: &SshTarget) -> anyhow::Result<Vec<String>> {
 /// `ssh <options> <destination>` with askpass wiring for password auth. The
 /// caller appends the remote command.
 pub fn command(connection: &Connection) -> anyhow::Result<Command> {
+    command_with_options(connection, &[])
+}
+
+/// `ssh` configured for streaming a binary upload, with `-C` compression so
+/// large daemon binaries traverse slow or relayed links faster.
+pub fn upload_command(connection: &Connection) -> anyhow::Result<Command> {
+    command_with_options(connection, &["-C"])
+}
+
+fn command_with_options(
+    connection: &Connection,
+    extra_options: &[&str],
+) -> anyhow::Result<Command> {
     let ConnectionKind::Ssh { target } = &connection.kind else {
         bail!("an SSH command requires an SSH connection");
     };
+    let mut args = base_args(target)?;
+    if !extra_options.is_empty() {
+        let destination = args.pop().context("missing SSH destination")?;
+        args.extend(extra_options.iter().map(|option| (*option).to_owned()));
+        args.push(destination);
+    }
     let mut command = Command::new("ssh");
-    command.args(base_args(target)?);
+    command.args(args);
     if matches!(target.auth_method(), SshAuthMethod::Password) {
         super::credentials::get_ssh_password(&connection.id)?;
         let executable = std::env::current_exe()
@@ -166,11 +186,23 @@ pub fn wrap_posix_script(script: &str) -> String {
 /// Encode `script` as UTF-16LE Base64 for `powershell.exe -EncodedCommand`.
 /// Base64 contains no metacharacters in `cmd.exe`, `powershell.exe`, `pwsh`,
 /// or `/bin/sh`, so it runs identically under any Windows OpenSSH DefaultShell
-/// while `-NoProfile` isolates it from broken user profiles.
+/// while `-NoProfile` isolates it from broken user profiles and
+/// `-OutputFormat Text` suppresses CLIXML progress serialization.
 pub fn wrap_powershell_script(script: &str) -> String {
     let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     format!(
-        "powershell.exe -NoProfile -NonInteractive -NoLogo -ExecutionPolicy Bypass -EncodedCommand {}",
+        "powershell.exe -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {}",
+        encode_base64(&utf16le)
+    )
+}
+
+/// Encode `script` to run directly inside an outer PowerShell `DefaultShell`
+/// session (`pwsh.exe` or `powershell.exe`) so redirected `stdin` stays owned
+/// by the script instead of being held by a parent PowerShell host.
+pub fn wrap_powershell_in_process(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    format!(
+        "& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))))",
         encode_base64(&utf16le)
     )
 }
@@ -255,27 +287,191 @@ fn strip_ansi_escapes(text: &str) -> String {
     out
 }
 
+fn strip_powershell_clixml_progress(text: &str) -> String {
+    let mut without_marker = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find("#< CLIXML") {
+        let pos = cursor + offset;
+        without_marker.push_str(&text[cursor..pos]);
+        let mut next = pos + "#< CLIXML".len();
+        if text[next..].starts_with("\r\n") {
+            next += 2;
+        } else if text[next..].starts_with('\n') {
+            next += 1;
+        }
+        cursor = next;
+    }
+    without_marker.push_str(&text[cursor..]);
+
+    let mut out = String::with_capacity(without_marker.len());
+    let mut pos = 0;
+    while let Some(start_rel) = without_marker[pos..].find("<Objs ") {
+        let start = pos + start_rel;
+        let (end, span, truncated) = match without_marker[start..].find("</Objs>") {
+            Some(end_rel) => {
+                let end = start + end_rel + "</Objs>".len();
+                (end, &without_marker[start..end], false)
+            }
+            None => (without_marker.len(), &without_marker[start..], true),
+        };
+        let is_ps_clixml = span.contains("http://schemas.microsoft.com/powershell");
+        if is_ps_clixml {
+            out.push_str(&without_marker[pos..start]);
+            let extracted = extract_clixml_diagnostics(span);
+            if !extracted.is_empty() {
+                out.push_str(&extracted);
+                if !extracted.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            let mut next = end;
+            if !truncated && (start == 0 || without_marker[..start].ends_with('\n')) {
+                if without_marker[next..].starts_with("\r\n") {
+                    next += 2;
+                } else if without_marker[next..].starts_with('\n') {
+                    next += 1;
+                }
+            }
+            pos = next;
+        } else {
+            out.push_str(&without_marker[pos..end]);
+            pos = end;
+        }
+    }
+    out.push_str(&without_marker[pos..]);
+    out
+}
+
+fn extract_clixml_diagnostics(span: &str) -> String {
+    let mut extracted = String::new();
+    let mut cursor = 0;
+    while let Some(tag_rel) = span[cursor..].find("<S S=\"") {
+        let attr_start = cursor + tag_rel + "<S S=\"".len();
+        let Some(quote_rel) = span[attr_start..].find('"') else {
+            break;
+        };
+        let stream_name = &span[attr_start..attr_start + quote_rel];
+        let after_quote = attr_start + quote_rel + 1;
+        let Some(gt_rel) = span[after_quote..].find('>') else {
+            break;
+        };
+        let content_start = after_quote + gt_rel + 1;
+        let Some(close_rel) = span[content_start..].find("</S>") else {
+            break;
+        };
+        let content_end = content_start + close_rel;
+        if stream_name.eq_ignore_ascii_case("error") || stream_name.eq_ignore_ascii_case("warning")
+        {
+            let unescaped = decode_xml_entities(&span[content_start..content_end]);
+            extracted.push_str(&decode_clixml_escapes(&unescaped));
+        }
+        cursor = content_end + "</S>".len();
+    }
+    extracted
+}
+
+fn decode_xml_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(amp_rel) = input[cursor..].find('&') {
+        let amp = cursor + amp_rel;
+        out.push_str(&input[cursor..amp]);
+        let rest = &input[amp..];
+        if let Some(after) = rest.strip_prefix("&lt;") {
+            out.push('<');
+            cursor = input.len() - after.len();
+        } else if let Some(after) = rest.strip_prefix("&gt;") {
+            out.push('>');
+            cursor = input.len() - after.len();
+        } else if let Some(after) = rest.strip_prefix("&quot;") {
+            out.push('"');
+            cursor = input.len() - after.len();
+        } else if let Some(after) = rest.strip_prefix("&apos;") {
+            out.push('\'');
+            cursor = input.len() - after.len();
+        } else if let Some(after) = rest.strip_prefix("&amp;") {
+            out.push('&');
+            cursor = input.len() - after.len();
+        } else {
+            out.push('&');
+            cursor = amp + 1;
+        }
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+fn decode_clixml_escapes(input: &str) -> String {
+    if !input.contains("_x") {
+        return input.to_owned();
+    }
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut pending_utf16: Vec<u16> = Vec::new();
+    let flush_utf16 = |pending: &mut Vec<u16>, out: &mut String| {
+        if pending.is_empty() {
+            return;
+        }
+        for decoded in char::decode_utf16(pending.drain(..)) {
+            out.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+    };
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes.get(cursor..cursor + 2) == Some(b"_x")
+            && bytes.get(cursor + 6) == Some(&b'_')
+            && let Some(hex) = input.get(cursor + 2..cursor + 6)
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+        {
+            pending_utf16.push(code_unit);
+            cursor += 7;
+            continue;
+        }
+        flush_utf16(&mut pending_utf16, &mut out);
+        let ch = input[cursor..].chars().next().unwrap();
+        out.push(ch);
+        cursor += ch.len_utf8();
+    }
+    flush_utf16(&mut pending_utf16, &mut out);
+    out
+}
+
 pub fn stderr_without_askpass_diagnostics(stderr: &[u8]) -> String {
     let filtered: String = String::from_utf8_lossy(stderr)
         .split_inclusive('\n')
         .filter(|line| !line.starts_with(ASKPASS_DIAGNOSTIC_PREFIX))
         .collect();
-    strip_ansi_escapes(&filtered)
+    strip_powershell_clixml_progress(&strip_ansi_escapes(&filtered))
 }
 
 /// Askpass entry point. When ssh launches Waku as `SSH_ASKPASS`, print the
-/// stored password and report that the process should exit before any UI or
-/// daemon initialization. Must run first in `main`.
-pub fn handle_askpass() -> bool {
-    let Some(connection_id) = std::env::var_os(ASKPASS_CONNECTION_ENV) else {
-        return false;
-    };
+/// stored password, flush stdout, and return an exit status so `main` exits
+/// before any UI or daemon initialization. A failed lookup must exit non-zero
+/// so OpenSSH aborts instead of submitting an empty password.
+pub fn handle_askpass() -> Option<i32> {
+    let connection_id = std::env::var_os(ASKPASS_CONNECTION_ENV)?;
     let connection_id = connection_id.to_string_lossy();
     match super::credentials::get_ssh_password(&connection_id) {
-        Ok(password) => print!("{password}"),
-        Err(error) => eprintln!("{ASKPASS_DIAGNOSTIC_PREFIX} {error:#}"),
+        Ok(password) => {
+            let mut stdout = std::io::stdout();
+            if let Err(error) = stdout
+                .write_all(password.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                eprintln!("{ASKPASS_DIAGNOSTIC_PREFIX} {error:#}");
+                return Some(1);
+            }
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("{ASKPASS_DIAGNOSTIC_PREFIX} {error:#}");
+            Some(1)
+        }
     }
-    true
 }
 
 #[cfg(test)]
@@ -403,7 +599,59 @@ mod tests {
         let wrapped = wrap_powershell_script("ok>?");
         assert_eq!(
             wrapped,
-            "powershell.exe -NoProfile -NonInteractive -NoLogo -ExecutionPolicy Bypass -EncodedCommand bwBrAD4APwA="
+            "powershell.exe -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand bwBrAD4APwA="
         );
+    }
+
+    #[test]
+    fn wrap_powershell_in_process_avoids_quotes_and_uses_same_payload() {
+        let wrapped = wrap_powershell_in_process("ok>?");
+        assert_eq!(
+            wrapped,
+            "& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('bwBrAD4APwA='))))"
+        );
+        assert!(!wrapped.contains('"'));
+    }
+
+    #[test]
+    fn askpass_diagnostics_strip_clixml_progress_but_keep_errors() {
+        let raw = concat!(
+            "real failure\n",
+            "#< CLIXML\r\n",
+            "<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+            "<Obj S=\"progress\" RefId=\"0\"><PR N=\"Record\"><AV>Preparing</AV></PR></Obj>",
+            "</Objs>\r\n",
+            "<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+            "<Obj S=\"progress\" RefId=\"1\"><PR N=\"Record\"><AV>Preparing</AV></PR></Obj>",
+            "<S S=\"error\">boom</S>",
+            "</Objs>\n",
+            "#< CLIXML\r\n",
+            "<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+            "<S S=\"Error\">Access &lt;denied&gt; &amp; blocked._x000D__x000A_</S>",
+            "</Objs>daemon_failed_to_run\tbad dll\n",
+            "#< CLIXML\r\n",
+            "<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+            "<Obj S=\"progress\" RefId=\"2\"><AV>truncated",
+        );
+        let cleaned = stderr_without_askpass_diagnostics(raw.as_bytes());
+        assert!(cleaned.contains("real failure\n"), "{cleaned:?}");
+        assert!(!cleaned.contains("#< CLIXML"), "{cleaned:?}");
+        assert!(!cleaned.contains("<Objs"), "{cleaned:?}");
+        assert!(!cleaned.contains("Preparing"), "{cleaned:?}");
+        assert!(cleaned.contains("boom\n"), "{cleaned:?}");
+        assert!(
+            cleaned.contains("Access <denied> & blocked.\r\n"),
+            "{cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("daemon_failed_to_run\tbad dll\n"),
+            "{cleaned:?}"
+        );
+    }
+
+    #[test]
+    fn clixml_literal_underscore_x_escape_and_surrogates_decode_cleanly() {
+        assert_eq!(decode_clixml_escapes("_x005F_x000A_"), "_x000A_");
+        assert_eq!(decode_clixml_escapes("_xD83D__xDE00_"), "😀");
     }
 }

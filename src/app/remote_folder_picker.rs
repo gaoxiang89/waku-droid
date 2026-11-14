@@ -149,7 +149,7 @@ impl Waku {
         let Some(path) = self
             .remote_folder_picker
             .as_ref()
-            .filter(|picker| !picker.loading)
+            .filter(|picker| can_confirm_folder_path(picker.path.as_deref(), picker.loading))
             .and_then(|picker| picker.path.clone())
         else {
             return;
@@ -228,7 +228,7 @@ impl Waku {
             );
         }
 
-        let can_confirm = !picker.loading && picker.path.is_some();
+        let can_confirm = can_confirm_folder_path(picker.path.as_deref(), picker.loading);
         let card = div()
             .id("remote-folder-card")
             .track_focus(&picker.focus)
@@ -431,6 +431,10 @@ fn dialog_button(
         .child(label)
 }
 
+fn can_confirm_folder_path(path: Option<&Path>, loading: bool) -> bool {
+    !loading && path.is_some_and(|path| !path.as_os_str().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +462,13 @@ mod tests {
             home_relative_path(Path::new(r"/home/me/odd\name"), "x"),
             PathBuf::from(r"/home/me/odd\name/x")
         );
+    }
+
+    #[test]
+    fn windows_drive_root_list_cannot_be_confirmed_as_workspace() {
+        assert!(!can_confirm_folder_path(None, false));
+        assert!(!can_confirm_folder_path(Some(Path::new("")), false));
+        assert!(can_confirm_folder_path(Some(Path::new(r"C:\")), false));
+        assert!(!can_confirm_folder_path(Some(Path::new(r"C:\")), true));
     }
 }

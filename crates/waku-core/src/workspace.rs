@@ -48,13 +48,32 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         },
         WorkspaceOperation::BrowseDirectory { path } => {
             let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory is unavailable"))?;
+            #[cfg(windows)]
+            if path.as_deref() == Some(Path::new("")) {
+                return Ok(WorkspaceResult::Directory {
+                    path: PathBuf::new(),
+                    parent: None,
+                    entries: list_logical_drives(),
+                    home,
+                    filesystem_root: PathBuf::new(),
+                });
+            }
+            #[cfg(windows)]
+            let requested = path.as_deref().map(|candidate| {
+                let raw = candidate.to_string_lossy();
+                let bytes = raw.as_bytes();
+                if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                    PathBuf::from(format!("{raw}\\"))
+                } else {
+                    candidate.to_path_buf()
+                }
+            });
+            #[cfg(not(windows))]
+            let requested = path;
+            let target = requested.as_deref().unwrap_or(&home);
             let path = strip_windows_verbatim(
-                fs::canonicalize(path.as_deref().unwrap_or(&home)).with_context(|| {
-                    format!(
-                        "could not open directory {}",
-                        path.as_deref().unwrap_or(&home).display()
-                    )
-                })?,
+                fs::canonicalize(target)
+                    .with_context(|| format!("could not open directory {}", target.display()))?,
             );
             if !fs::metadata(&path)?.is_dir() {
                 bail!("not a directory: {}", path.display());
@@ -64,8 +83,12 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
                 .last()
                 .map(Path::to_owned)
                 .unwrap_or_else(|| path.clone());
+            #[cfg(windows)]
+            let parent = Some(path.parent().map(Path::to_owned).unwrap_or_default());
+            #[cfg(not(windows))]
+            let parent = path.parent().map(Path::to_owned);
             WorkspaceResult::Directory {
-                parent: path.parent().map(Path::to_owned),
+                parent,
                 entries: list_directory(&path)?,
                 path,
                 home,
@@ -1157,6 +1180,63 @@ mod tests {
             PathBuf::from("/home/user/repo")
         );
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn browse_directory_supports_windows_drives_and_bare_drive_letters() {
+        let WorkspaceResult::Directory {
+            path,
+            parent,
+            entries,
+            filesystem_root,
+            ..
+        } = execute(WorkspaceOperation::BrowseDirectory {
+            path: Some(PathBuf::new()),
+        })
+        .unwrap()
+        else {
+            panic!("expected directory result");
+        };
+        assert!(path.as_os_str().is_empty());
+        assert!(parent.is_none());
+        assert!(filesystem_root.as_os_str().is_empty());
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.absolute_path == Path::new(r"C:\")),
+            "expected C:\\ in logical drives: {entries:?}"
+        );
+
+        let WorkspaceResult::Directory { path, parent, .. } =
+            execute(WorkspaceOperation::BrowseDirectory {
+                path: Some(PathBuf::from("C:")),
+            })
+            .unwrap()
+        else {
+            panic!("expected directory result");
+        };
+        assert_eq!(path, Path::new(r"C:\"));
+        assert_eq!(parent, Some(PathBuf::new()));
+    }
+}
+
+#[cfg(windows)]
+fn list_logical_drives() -> Vec<WorkingTreeEntry> {
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26_u8)
+        .filter(|bit| mask & (1_u32 << bit) != 0)
+        .map(|bit| {
+            let drive = format!("{}:\\", (b'A' + bit) as char);
+            WorkingTreeEntry {
+                relative_path: drive.clone(),
+                absolute_path: PathBuf::from(&drive),
+                name: drive,
+                is_dir: true,
+                expanded: false,
+                depth: 0,
+            }
+        })
+        .collect()
 }
 
 fn strip_windows_verbatim(path: PathBuf) -> PathBuf {

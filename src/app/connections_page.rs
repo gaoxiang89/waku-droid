@@ -95,6 +95,11 @@ impl ConnectionsUi {
 fn ssh_target_from_fields(host: &str, identity: &str) -> anyhow::Result<SshTarget> {
     let host = host.trim();
     let identity = identity.trim();
+    let identity = identity
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(identity)
+        .trim();
     if host.is_empty() {
         anyhow::bail!("{}", tr!("connections.ssh_host_required"));
     }
@@ -102,14 +107,35 @@ fn ssh_target_from_fields(host: &str, identity: &str) -> anyhow::Result<SshTarge
         Some((user, rest)) => (Some(user.to_owned()), rest),
         None => (None, host),
     };
-    let (hostname, port) = match rest.rsplit_once(':') {
-        Some((hostname, port)) if !hostname.contains(':') => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("{}", tr!("connections.ssh_port_invalid")))?;
-            (hostname.to_owned(), Some(port))
+    let (hostname, port) = if let Some(after_open) = rest.strip_prefix('[') {
+        let Some((bracketed, trailing)) = after_open.split_once(']') else {
+            anyhow::bail!("{}", tr!("connections.ssh_port_invalid"));
+        };
+        let bracketed = bracketed.trim();
+        if bracketed.is_empty() {
+            anyhow::bail!("{}", tr!("connections.ssh_host_required"));
         }
-        _ => (rest.to_owned(), None),
+        let port = if trailing.is_empty() {
+            None
+        } else if let Some(port) = trailing.strip_prefix(':') {
+            Some(
+                port.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("{}", tr!("connections.ssh_port_invalid")))?,
+            )
+        } else {
+            anyhow::bail!("{}", tr!("connections.ssh_port_invalid"));
+        };
+        (bracketed.to_owned(), port)
+    } else {
+        match rest.rsplit_once(':') {
+            Some((hostname, port)) if !hostname.contains(':') => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("{}", tr!("connections.ssh_port_invalid")))?;
+                (hostname.to_owned(), Some(port))
+            }
+            _ => (rest.to_owned(), None),
+        }
     };
     let target = if user.is_none() && port.is_none() && identity.is_empty() {
         SshTarget::ConfigHost {
@@ -945,5 +971,41 @@ mod tests {
         assert!(ssh_target_from_fields("", "").is_err());
         assert!(ssh_target_from_fields("host:notaport", "").is_err());
         assert!(ssh_target_from_fields("-oProxyCommand=x", "").is_err());
+
+        assert_eq!(
+            ssh_target_from_fields("[::1]:2222", "").unwrap(),
+            SshTarget::Direct {
+                hostname: "::1".into(),
+                port: Some(2222),
+                user: None,
+                identity_file: None,
+                auth_method: SshAuthMethod::Agent,
+                proxy_jump: None,
+            }
+        );
+        assert_eq!(
+            ssh_target_from_fields(
+                "admin@[2001:db8::1]:2200",
+                r#""C:\Users\me\.ssh\id_ed25519""#
+            )
+            .unwrap(),
+            SshTarget::Direct {
+                hostname: "2001:db8::1".into(),
+                port: Some(2200),
+                user: Some("admin".into()),
+                identity_file: Some(r"C:\Users\me\.ssh\id_ed25519".into()),
+                auth_method: SshAuthMethod::Key,
+                proxy_jump: None,
+            }
+        );
+        assert_eq!(
+            ssh_target_from_fields("[2001:db8::1]", "").unwrap(),
+            SshTarget::ConfigHost {
+                host: "2001:db8::1".into(),
+                auth_method: SshAuthMethod::Agent,
+            }
+        );
+        assert!(ssh_target_from_fields("[::1", "").is_err());
+        assert!(ssh_target_from_fields("[]", "").is_err());
     }
 }

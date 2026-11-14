@@ -4,6 +4,7 @@
 //! is the transport and must carry nothing but the [`BridgeReady`] line and
 //! the relayed bytes. Diagnostics go to stderr, which the desktop reports.
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::net::TcpStream;
@@ -56,9 +57,16 @@ pub fn write_state(path: &Path, state: &BridgeState) -> anyhow::Result<()> {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_WRITE, WRITE_DAC};
+            options.access_mode(FILE_GENERIC_WRITE | WRITE_DAC);
+        }
         let mut file = options
             .open(&temporary)
             .with_context(|| format!("could not write {}", temporary.display()))?;
+        platform::restrict_file_permissions(&file)?;
         file.write_all(serde_json::to_string(state)?.as_bytes())?;
         file.sync_all()?;
     }
@@ -303,40 +311,46 @@ fn start_daemon(
         .append(true)
         .open(state_dir.join(LOG_FILE))
         .context("could not open the waku-daemon log")?;
+    let mut diagnostic_log = log.try_clone().ok();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let mut command = std::process::Command::new(executable);
-    command
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .arg("--state-file")
-        .arg(&state_path)
-        .arg("--idle-exit-secs")
-        .arg(IDLE_EXIT_SECONDS.to_string())
-        .env(waku_protocol::DAEMON_TOKEN_ENV, &token)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log);
-    if let Some(home) = dirs::home_dir() {
-        command.current_dir(home);
-    }
+    let idle_secs = IDLE_EXIT_SECONDS.to_string();
+    let args = [
+        OsStr::new("--bind"),
+        OsStr::new("127.0.0.1:0"),
+        OsStr::new("--state-file"),
+        state_path.as_os_str(),
+        OsStr::new("--idle-exit-secs"),
+        OsStr::new(&idle_secs),
+    ];
+    let mut owned_envs: Vec<(&OsStr, OsString)> = vec![(
+        OsStr::new(waku_protocol::DAEMON_TOKEN_ENV),
+        OsString::from(&token),
+    )];
     // A debug build would otherwise use the checkout path it was compiled
     // in, which on WSL is often the Windows host's own data via /mnt/c.
     if cfg!(debug_assertions)
         && std::env::var_os(waku_core::persistence::DATA_DIRECTORY_ENV).is_none()
         && let Some(data) = dirs::data_local_dir()
     {
-        command.env(
-            waku_core::persistence::DATA_DIRECTORY_ENV,
-            data.join(waku_protocol::identity::DATA_DIRECTORY_NAME),
+        owned_envs.push((
+            OsStr::new(waku_core::persistence::DATA_DIRECTORY_ENV),
+            data.join(waku_protocol::identity::DATA_DIRECTORY_NAME)
+                .into_os_string(),
+        ));
+    }
+    let envs: Vec<(&OsStr, &OsStr)> = owned_envs
+        .iter()
+        .map(|(key, value)| (*key, value.as_os_str()))
+        .collect();
+    let home = dirs::home_dir();
+    let (mut child, broke_away) =
+        platform::spawn_detached(executable, &args, &envs, home.as_deref(), log)
+            .with_context(|| format!("could not launch {}", executable.display()))?;
+    if !broke_away && let Some(ref mut log) = diagnostic_log {
+        let _ = log.write_all(
+            b"waku-daemon bridge: CREATE_BREAKAWAY_FROM_JOB was denied by the host job object; the daemon will exit when the SSH session closes\n",
         );
     }
-    // The bridge's stdio is the SSH/WSL transport. Windows inherits every
-    // inheritable handle by default, so the daemon would keep the transport's
-    // stderr pipe open after the bridge exits. Its own stdio is configured
-    // above; clear the parent's flags before spawning it.
-    platform::disable_stdio_inheritance();
-    let mut child = platform::spawn_detached(&mut command)
-        .with_context(|| format!("could not launch {}", executable.display()))?;
     let deadline = std::time::Instant::now() + START_TIMEOUT;
     loop {
         if let Ok(text) = fs::read_to_string(&state_path)
@@ -355,7 +369,7 @@ fn start_daemon(
             );
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
+            child.kill();
             bail!("timed out waiting for waku-daemon to start");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -554,10 +568,175 @@ mod tests {
         let _ = child.wait();
         assert!(!platform::process_is_alive(exited_pid));
     }
+
+    #[test]
+    fn write_state_creates_owner_only_credentials() {
+        let dir = std::env::temp_dir().join(format!("waku-state-acl-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join(STATE_FILE);
+        let state = BridgeState {
+            address: "127.0.0.1:4242".into(),
+            token: "secret-token".into(),
+            pid: std::process::id(),
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: "abcd".into(),
+        };
+        write_state(&state_path, &state).unwrap();
+        let loaded: BridgeState =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(loaded, state);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
+            use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+            use windows_sys::Win32::Security::{
+                ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+                GetAclInformation, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+                SE_DACL_PROTECTED,
+            };
+
+            let file = fs::File::open(&state_path).unwrap();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let err = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut sd,
+                )
+            };
+            assert_eq!(err, 0, "GetSecurityInfo failed with {err}");
+            assert!(!dacl.is_null());
+            let mut control = 0_u16;
+            let mut revision = 0_u32;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) },
+                0
+            );
+            assert_ne!(control & SE_DACL_PROTECTED, 0);
+            let mut acl_size = ACL_SIZE_INFORMATION::default();
+            assert_ne!(
+                unsafe {
+                    GetAclInformation(
+                        dacl,
+                        (&mut acl_size as *mut ACL_SIZE_INFORMATION).cast(),
+                        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                        AclSizeInformation,
+                    )
+                },
+                0
+            );
+            assert_eq!(acl_size.AceCount, 3);
+            unsafe { LocalFree(sd) };
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_quoting_preserves_spaces_quotes_and_backslashes() {
+        let wide = platform::build_command_line(
+            Path::new(r"C:\Program Files\Waku\waku-daemon.exe"),
+            &[
+                OsStr::new("--arg"),
+                OsStr::new(""),
+                OsStr::new(r"C:\Users\BrainCo\"),
+                OsStr::new(r#"a"b\"c"#),
+                OsStr::new(r"C:\Program Files\"),
+            ],
+        );
+        assert_eq!(wide.last().copied(), Some(0));
+        let rendered = String::from_utf16(&wide[..wide.len() - 1]).unwrap();
+        assert_eq!(
+            rendered,
+            r#""C:\Program Files\Waku\waku-daemon.exe" --arg "" C:\Users\BrainCo\ "a\"b\\\"c" "C:\Program Files\\""#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_detached_isolates_unrelated_inheritable_handles() {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        let dir = std::env::temp_dir().join(format!("waku-detached-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join(LOG_FILE);
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        assert_ne!(
+            unsafe {
+                SetHandleInformation(
+                    writer.as_raw_handle() as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            },
+            0
+        );
+
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe"));
+        let args = [
+            OsStr::new("/d"),
+            OsStr::new("/c"),
+            OsStr::new("echo %WAKU_TEST_MARKER% 1>&2 & ping -n 6 127.0.0.1 >NUL"),
+        ];
+        let envs = [(OsStr::new("WAKU_TEST_MARKER"), OsStr::new("isolated_ok"))];
+        let (mut child, _) =
+            platform::spawn_detached(Path::new(&comspec), &args, &envs, Some(&dir), log).unwrap();
+
+        // Only the child's configured NUL/log handles should be inherited.
+        drop(writer);
+        let mut buffer = [0_u8; 16];
+        let read = reader.read(&mut buffer).unwrap();
+        assert_eq!(read, 0, "unrelated inheritable pipe was inherited by child");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child should still be running after parent closed unrelated pipe"
+        );
+
+        let log_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < log_deadline {
+            if fs::read_to_string(&log_path)
+                .map(|text| text.contains("isolated_ok"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        child.kill();
+        assert!(!platform::process_is_alive(child.id()));
+        let logged = fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("isolated_ok"), "unexpected log: {logged:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(unix)]
 mod platform {
+    use std::ffi::OsStr;
     use std::fs;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -567,6 +746,25 @@ mod platform {
     use anyhow::Context as _;
 
     pub struct Lock(#[allow(dead_code)] fs::File);
+
+    pub struct DetachedChild(std::process::Child);
+
+    impl DetachedChild {
+        pub fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        pub fn try_wait(&mut self) -> std::io::Result<Option<String>> {
+            self.0
+                .try_wait()
+                .map(|status| status.map(|status| status.to_string()))
+        }
+
+        pub fn kill(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     pub fn lock(path: &Path) -> anyhow::Result<Lock> {
         let file = fs::OpenOptions::new()
@@ -660,62 +858,234 @@ mod platform {
         })
     }
 
-    /// Unix replaces the child's stdio and closes every other descriptor
-    /// during `Command::spawn`, so there is nothing to clear here.
-    pub fn disable_stdio_inheritance() {}
+    pub fn restrict_file_permissions(file: &fs::File) -> anyhow::Result<()> {
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not set owner-only permissions on credential file");
+        }
+        Ok(())
+    }
 
     /// A new session detaches the daemon from the SSH or WSL session, so a
     /// hangup on disconnect does not take running agents down with it.
     pub fn spawn_detached(
-        command: &mut std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
+        executable: &Path,
+        args: &[&OsStr],
+        envs: &[(&OsStr, &OsStr)],
+        current_dir: Option<&Path>,
+        stderr_log: fs::File,
+    ) -> std::io::Result<(DetachedChild, bool)> {
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(args)
+            .envs(envs.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr_log);
+        if let Some(directory) = current_dir {
+            command.current_dir(directory);
+        }
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
                 Ok(())
             });
         }
-        command.spawn()
+        command.spawn().map(|child| (DetachedChild(child), true))
     }
 }
 
 #[cfg(windows)]
 mod platform {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
     use std::fs;
-    use std::os::windows::process::CommandExt as _;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use anyhow::Context as _;
+    use anyhow::{Context as _, bail};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        STILL_ACTIVE, SetHandleInformation, WAIT_TIMEOUT,
+        LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-    use windows_sys::Win32::System::Console::{
-        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetExitCodeProcess,
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+        OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     pub struct Lock(#[allow(dead_code)] fs::File);
 
-    /// Windows inherits every inheritable handle into the child. The bridge's
-    /// stdio is the SSH or WSL transport, so clear those flags before starting
-    /// the daemon; its own stdio is already redirected to NUL and the log.
-    pub fn disable_stdio_inheritance() {
-        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            let handle = unsafe { GetStdHandle(std_handle) };
-            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    pub struct DetachedChild {
+        handle: OwnedHandle,
+        pid: u32,
+    }
+
+    impl DetachedChild {
+        pub fn id(&self) -> u32 {
+            self.pid
+        }
+
+        pub fn try_wait(&mut self) -> io::Result<Option<String>> {
+            let wait = unsafe { WaitForSingleObject(self.handle.0, 0) };
+            if wait == WAIT_TIMEOUT {
+                return Ok(None);
+            }
+            if wait == WAIT_OBJECT_0 {
+                let mut exit_code = 0_u32;
+                if unsafe { GetExitCodeProcess(self.handle.0, &mut exit_code) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(Some(format!("exit code {exit_code}")));
+            }
+            Err(io::Error::last_os_error())
+        }
+
+        pub fn kill(&mut self) {
+            unsafe {
+                TerminateProcess(self.handle.0, 1);
+                WaitForSingleObject(self.handle.0, 3_000);
             }
         }
+    }
+
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    struct OwnedLocalMem(*mut core::ffi::c_void);
+    impl Drop for OwnedLocalMem {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    struct ProcThreadAttrGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for ProcThreadAttrGuard {
+        fn drop(&mut self) {
+            unsafe { DeleteProcThreadAttributeList(self.0) };
+        }
+    }
+
+    pub fn restrict_file_permissions(file: &fs::File) -> anyhow::Result<()> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not open process token for credential ACL");
+        }
+        let token = OwnedHandle(token);
+
+        let mut needed = 0_u32;
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not size process token user");
+        }
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("could not query process token user");
+        }
+        let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+
+        let mut sid_wide: *mut u16 = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_wide) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not format owner SID for credential ACL");
+        }
+        let _sid_guard = OwnedLocalMem(sid_wide.cast());
+        let mut len = 0;
+        while unsafe { *sid_wide.add(len) } != 0 {
+            len += 1;
+        }
+        let sid_string =
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_wide, len) });
+
+        let sddl: Vec<u16> = format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid_string})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("could not build owner-only credential security descriptor");
+        }
+        let _sd_guard = OwnedLocalMem(sd);
+
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            bail!("generated credential security descriptor contained no DACL");
+        }
+
+        let err = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err as i32))
+                .context("could not apply owner-only ACL to credential file");
+        }
+        Ok(())
     }
 
     pub fn lock(path: &Path) -> anyhow::Result<Lock> {
@@ -830,34 +1200,289 @@ mod platform {
         table
     }
 
-    /// Break the resident daemon out of the SSH session's job object when
-    /// allowed so closing the SSH connection leaves it running, and hide its
-    /// console without using `DETACHED_PROCESS` (invalid with `CREATE_NO_WINDOW`).
-    pub fn spawn_detached(
-        command: &mut std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
-        command.creation_flags(
-            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
-        );
-        match command.spawn() {
-            Ok(child) => Ok(child),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-                command.spawn()
-            }
-            Err(error) => Err(error),
+    fn append_quoted_arg(out: &mut Vec<u16>, arg: &OsStr) {
+        let wide: Vec<u16> = arg.encode_wide().collect();
+        let needs_quotes = wide.is_empty()
+            || wide.iter().any(|&ch| {
+                ch == b' ' as u16
+                    || ch == b'\t' as u16
+                    || ch == b'\n' as u16
+                    || ch == 0x0b
+                    || ch == b'"' as u16
+            });
+        if !needs_quotes {
+            out.extend_from_slice(&wide);
+            return;
         }
+        out.push(b'"' as u16);
+        let mut backslashes = 0_usize;
+        for &ch in &wide {
+            if ch == b'\\' as u16 {
+                backslashes += 1;
+            } else if ch == b'"' as u16 {
+                out.resize(out.len() + backslashes * 2 + 1, b'\\' as u16);
+                backslashes = 0;
+                out.push(b'"' as u16);
+            } else {
+                out.resize(out.len() + backslashes, b'\\' as u16);
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+        out.resize(out.len() + backslashes * 2, b'\\' as u16);
+        out.push(b'"' as u16);
+    }
+
+    pub(super) fn build_command_line(executable: &Path, args: &[&OsStr]) -> Vec<u16> {
+        let mut cmd = Vec::new();
+        append_quoted_arg(&mut cmd, executable.as_os_str());
+        for &arg in args {
+            cmd.push(b' ' as u16);
+            append_quoted_arg(&mut cmd, arg);
+        }
+        cmd.push(0);
+        cmd
+    }
+
+    fn fold_env_key_upper(key: &OsStr) -> Vec<u16> {
+        let mut folded = Vec::new();
+        for decoded in char::decode_utf16(key.encode_wide()) {
+            match decoded {
+                Ok(ch) => {
+                    let mut buf = [0_u16; 2];
+                    for upper in ch.to_uppercase() {
+                        folded.extend_from_slice(upper.encode_utf16(&mut buf));
+                    }
+                }
+                Err(unpaired) => folded.push(unpaired.unpaired_surrogate()),
+            }
+        }
+        folded
+    }
+
+    fn build_environment_block(overrides: &[(&OsStr, &OsStr)]) -> io::Result<Vec<u16>> {
+        let mut entries: BTreeMap<Vec<u16>, (Vec<u16>, Vec<u16>)> = BTreeMap::new();
+        for (key, value) in std::env::vars_os() {
+            let orig_key: Vec<u16> = key.encode_wide().collect();
+            let val_wide: Vec<u16> = value.encode_wide().collect();
+            if orig_key.contains(&0) || val_wide.contains(&0) {
+                continue;
+            }
+            entries.insert(fold_env_key_upper(&key), (orig_key, val_wide));
+        }
+        for &(key, value) in overrides {
+            let orig_key: Vec<u16> = key.encode_wide().collect();
+            let val_wide: Vec<u16> = value.encode_wide().collect();
+            if orig_key.is_empty()
+                || orig_key.contains(&0)
+                || orig_key.contains(&(b'=' as u16))
+                || val_wide.contains(&0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid Windows environment override",
+                ));
+            }
+            entries.insert(fold_env_key_upper(key), (orig_key, val_wide));
+        }
+        if entries.is_empty() {
+            return Ok(vec![0, 0]);
+        }
+        let mut block = Vec::new();
+        for (_, (key, value)) in entries {
+            block.extend_from_slice(&key);
+            block.push(b'=' as u16);
+            block.extend_from_slice(&value);
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    fn encode_wide_nul_checked(value: &OsStr) -> io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = value.encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interior NUL in Windows process path or directory",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn enable_inheritance(handle: HANDLE) -> io::Result<()> {
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Launch the resident daemon isolated from extraneous OpenSSH/PowerShell
+    /// handles via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and break it out of
+    /// the SSH session's job object when allowed.
+    pub fn spawn_detached(
+        executable: &Path,
+        args: &[&OsStr],
+        envs: &[(&OsStr, &OsStr)],
+        current_dir: Option<&Path>,
+        stderr_log: fs::File,
+    ) -> io::Result<(DetachedChild, bool)> {
+        let nul = fs::OpenOptions::new().read(true).write(true).open("NUL")?;
+        let nul_handle = nul.as_raw_handle() as HANDLE;
+        let log_handle = stderr_log.as_raw_handle() as HANDLE;
+        enable_inheritance(nul_handle)?;
+        if log_handle != nul_handle {
+            enable_inheritance(log_handle)?;
+        }
+
+        let handles = if log_handle == nul_handle {
+            vec![nul_handle]
+        } else {
+            vec![nul_handle, log_handle]
+        };
+
+        let mut attr_size = 0_usize;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+        }
+        if attr_size == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut attr_buf = vec![0_usize; attr_size.div_ceil(std::mem::size_of::<usize>())];
+        let attr_list: LPPROC_THREAD_ATTRIBUTE_LIST = attr_buf.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _attr_guard = ProcThreadAttrGuard(attr_list);
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                handles.len() * std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut cmd_wide = build_command_line(executable, args);
+        if cmd_wide[..cmd_wide.len() - 1].contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interior NUL in Windows process argument",
+            ));
+        }
+        let app_wide = encode_wide_nul_checked(executable.as_os_str())?;
+        let env_wide = build_environment_block(envs)?;
+        let cwd_wide = current_dir
+            .map(|directory| encode_wide_nul_checked(directory.as_os_str()))
+            .transpose()?;
+        let cwd_ptr = cwd_wide
+            .as_ref()
+            .map_or(std::ptr::null(), |wide| wide.as_ptr());
+
+        let mut startup_info = STARTUPINFOEXW::default();
+        startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup_info.StartupInfo.hStdInput = nul_handle;
+        startup_info.StartupInfo.hStdOutput = nul_handle;
+        startup_info.StartupInfo.hStdError = log_handle;
+        startup_info.lpAttributeList = attr_list;
+
+        let base_flags = CREATE_NO_WINDOW
+            | CREATE_NEW_PROCESS_GROUP
+            | CREATE_UNICODE_ENVIRONMENT
+            | EXTENDED_STARTUPINFO_PRESENT;
+        let mut process_info = PROCESS_INFORMATION::default();
+        let mut broke_away = true;
+        let mut created = unsafe {
+            CreateProcessW(
+                app_wide.as_ptr(),
+                cmd_wide.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                base_flags | CREATE_BREAKAWAY_FROM_JOB,
+                env_wide.as_ptr().cast(),
+                cwd_ptr,
+                (&startup_info as *const STARTUPINFOEXW).cast::<STARTUPINFOW>(),
+                &mut process_info,
+            )
+        };
+        if created == 0
+            && io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+        {
+            broke_away = false;
+            let mut cmd_retry = build_command_line(executable, args);
+            created = unsafe {
+                CreateProcessW(
+                    app_wide.as_ptr(),
+                    cmd_retry.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    base_flags,
+                    env_wide.as_ptr().cast(),
+                    cwd_ptr,
+                    (&startup_info as *const STARTUPINFOEXW).cast::<STARTUPINFOW>(),
+                    &mut process_info,
+                )
+            };
+        }
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !process_info.hThread.is_null() && process_info.hThread != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(process_info.hThread) };
+        }
+        Ok((
+            DetachedChild {
+                handle: OwnedHandle(process_info.hProcess),
+                pid: process_info.dwProcessId,
+            },
+            broke_away,
+        ))
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 mod platform {
+    use std::ffi::OsStr;
+    use std::fs;
     use std::path::Path;
 
     pub struct Lock;
 
+    pub struct DetachedChild(std::process::Child);
+
+    impl DetachedChild {
+        pub fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        pub fn try_wait(&mut self) -> std::io::Result<Option<String>> {
+            self.0
+                .try_wait()
+                .map(|status| status.map(|status| status.to_string()))
+        }
+
+        pub fn kill(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     pub fn lock(_path: &Path) -> anyhow::Result<Lock> {
         anyhow::bail!("waku-daemon bridge runs only on Linux, macOS, and Windows hosts")
+    }
+
+    pub fn restrict_file_permissions(_file: &fs::File) -> anyhow::Result<()> {
+        Ok(())
     }
 
     pub fn process_is_alive(_pid: u32) -> bool {
@@ -872,11 +1497,23 @@ mod platform {
         Vec::new()
     }
 
-    pub fn disable_stdio_inheritance() {}
-
     pub fn spawn_detached(
-        command: &mut std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
-        command.spawn()
+        executable: &Path,
+        args: &[&OsStr],
+        envs: &[(&OsStr, &OsStr)],
+        current_dir: Option<&Path>,
+        stderr_log: fs::File,
+    ) -> std::io::Result<(DetachedChild, bool)> {
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(args)
+            .envs(envs.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr_log);
+        if let Some(directory) = current_dir {
+            command.current_dir(directory);
+        }
+        command.spawn().map(|child| (DetachedChild(child), true))
     }
 }

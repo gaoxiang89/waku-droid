@@ -9,8 +9,8 @@
 fn main() {
     // ssh launches this executable as SSH_ASKPASS for password-authenticated
     // connections. Answer and exit before any UI or daemon starts.
-    if waku_client::remote::ssh::handle_askpass() {
-        return;
+    if let Some(code) = waku_client::remote::ssh::handle_askpass() {
+        std::process::exit(code);
     }
     waku::run();
 }

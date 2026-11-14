@@ -21,7 +21,7 @@ use super::deploy::{self, DeployOutcome, RemoteTarget};
 use super::process_util::{StderrTail, with_detail};
 use super::{ssh, wsl};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(20);
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connection stage reported on failure, so the UI can say where it broke.

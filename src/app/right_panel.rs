@@ -119,6 +119,24 @@ pub(super) fn ancestor_directories(workspace: &Path, relative_path: &str) -> Vec
         }
         return ancestors;
     }
+    if let Some(workspace) = windows_workspace(workspace) {
+        let normalized = normalized_windows_path(workspace).unwrap_or_else(|| workspace.to_owned());
+        let mut directory = normalized.trim_end_matches(['\\', '/']).to_owned();
+        let mut ancestors = Vec::new();
+        let mut parts = relative_path
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            directory.push('\\');
+            directory.push_str(part);
+            ancestors.push(PathBuf::from(&directory));
+        }
+        return ancestors;
+    }
     let mut directory = workspace.to_path_buf();
     let mut ancestors = Vec::new();
     let mut components = Path::new(relative_path).components().peekable();
@@ -170,11 +188,20 @@ fn markdown_file_link_path(target: &str) -> Option<PathBuf> {
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
     {
-        return url::Url::parse(target).ok()?.to_file_path().ok();
+        return url::Url::parse(target)
+            .ok()?
+            .to_file_path()
+            .ok()
+            .or_else(|| windows_file_url_path(target).map(PathBuf::from));
     }
 
-    let path = PathBuf::from(percent_decode_file_path(target));
-    path.is_absolute().then_some(path)
+    let decoded = percent_decode_file_path(target);
+    let path = PathBuf::from(&decoded);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        normalized_windows_path(&decoded).map(PathBuf::from)
+    }
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
@@ -214,6 +241,261 @@ fn workspace_relative_file_path(workspace: &Path, target: &Path) -> Option<Strin
 /// these hosts are routed as strings instead.
 fn posix_workspace(workspace: &Path) -> Option<&str> {
     workspace.to_str().filter(|path| path.starts_with('/'))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WindowsRoot<'a> {
+    Drive(&'a str),
+    Unc(&'a str, &'a str),
+}
+
+fn split_windows_path(raw: &str) -> Option<(WindowsRoot<'_>, Vec<&str>)> {
+    let unc_rest = raw.strip_prefix(r"\\?\UNC\").or_else(|| {
+        (!raw.starts_with(r"\\?\"))
+            .then(|| raw.strip_prefix(r"\\"))
+            .flatten()
+    });
+    if let Some(unc_tail) = unc_rest {
+        let mut raw_parts = unc_tail
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".");
+        let server = raw_parts.next()?;
+        let share = raw_parts.next()?;
+        return Some((WindowsRoot::Unc(server, share), raw_parts.collect()));
+    }
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
+    {
+        let segs = trimmed[2..]
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        return Some((WindowsRoot::Drive(&trimmed[..2]), segs));
+    }
+    None
+}
+
+fn windows_workspace(workspace: &Path) -> Option<&str> {
+    workspace
+        .to_str()
+        .filter(|path| split_windows_path(path).is_some())
+}
+
+fn workspace_separator(workspace: &Path) -> char {
+    if posix_workspace(workspace).is_some() {
+        '/'
+    } else if windows_workspace(workspace).is_some() {
+        '\\'
+    } else {
+        std::path::MAIN_SEPARATOR
+    }
+}
+
+fn join_workspace_path(workspace: &Path, relative_path: &str) -> PathBuf {
+    if let Some(workspace) = posix_workspace(workspace) {
+        let mut joined = workspace.trim_end_matches('/').to_owned();
+        for part in relative_path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            if !joined.ends_with('/') {
+                joined.push('/');
+            }
+            joined.push_str(part);
+        }
+        return PathBuf::from(joined);
+    }
+    if let Some(workspace) = windows_workspace(workspace) {
+        let mut joined = workspace.trim_end_matches(['\\', '/']).to_owned();
+        for part in relative_path
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            if !joined.ends_with(['\\', '/']) {
+                joined.push('\\');
+            }
+            joined.push_str(part);
+        }
+        return PathBuf::from(normalized_windows_path(&joined).unwrap_or(joined));
+    }
+    workspace.join(relative_path)
+}
+
+fn normalize_windows_parts<'a>(
+    root: WindowsRoot<'a>,
+    raw_parts: Vec<&'a str>,
+) -> (WindowsRoot<'a>, Vec<&'a str>, String) {
+    let mut parts = Vec::new();
+    for part in raw_parts {
+        if part == ".." {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+    let formatted = match root {
+        WindowsRoot::Drive(drive) => {
+            if parts.is_empty() {
+                format!(r"{drive}\")
+            } else {
+                format!(r"{drive}\{}", parts.join(r"\"))
+            }
+        }
+        WindowsRoot::Unc(server, share) => {
+            if parts.is_empty() {
+                format!(r"\\{server}\{share}")
+            } else {
+                format!(r"\\{server}\{share}\{}", parts.join(r"\"))
+            }
+        }
+    };
+    (root, parts, formatted)
+}
+
+fn normalized_windows_path(path: &str) -> Option<String> {
+    let (root, raw_parts) = split_windows_path(path)?;
+    Some(normalize_windows_parts(root, raw_parts).2)
+}
+
+fn windows_file_url_path(trimmed: &str) -> Option<String> {
+    let url = url::Url::parse(trimmed).ok()?;
+    if !url.scheme().eq_ignore_ascii_case("file") {
+        return None;
+    }
+    match url.host_str() {
+        None | Some("" | "localhost") => {
+            let decoded = percent_decode_file_path(url.path());
+            let bytes = decoded.as_bytes();
+            let candidate = if bytes.len() >= 3
+                && bytes[0] == b'/'
+                && bytes[1].is_ascii_alphabetic()
+                && bytes[2] == b':'
+            {
+                &decoded[1..]
+            } else {
+                &decoded
+            };
+            normalized_windows_path(candidate)
+        }
+        Some(server) => {
+            let decoded_tail = percent_decode_file_path(url.path());
+            normalized_windows_path(&format!(r"\\{server}{decoded_tail}"))
+        }
+    }
+}
+
+fn windows_roots_match(a: WindowsRoot<'_>, b: WindowsRoot<'_>) -> bool {
+    match (a, b) {
+        (WindowsRoot::Drive(da), WindowsRoot::Drive(db)) => da.eq_ignore_ascii_case(db),
+        (WindowsRoot::Unc(sa, sha), WindowsRoot::Unc(sb, shb)) => {
+            sa.eq_ignore_ascii_case(sb) && sha.eq_ignore_ascii_case(shb)
+        }
+        _ => false,
+    }
+}
+
+fn windows_parent(path: &str) -> Option<String> {
+    let (root, raw_parts) = split_windows_path(path)?;
+    let (root, mut parts, _) = normalize_windows_parts(root, raw_parts);
+    parts.pop()?;
+    Some(normalize_windows_parts(root, parts).2)
+}
+
+/// Home directory of a Windows daemon host, derived from a registered
+/// projectless root on that host. On non-Windows desktops we must never fall back
+/// to `dirs::home_dir()`, because that would inject the local POSIX path.
+fn daemon_windows_home(workspace: &str) -> Option<String> {
+    let homes = crate::projectless::workspace_roots()
+        .into_iter()
+        .filter_map(|root| {
+            let s = windows_workspace(&root)?;
+            let parent = windows_parent(s)?;
+            windows_parent(&parent)
+        })
+        .collect::<Vec<_>>();
+    if let Some(matched) = homes.iter().find(|home| {
+        normalized_windows_path(workspace).is_some_and(|ws| {
+            home.eq_ignore_ascii_case(&ws)
+                || windows_workspace_relative_file_path(home, &ws).is_some()
+        })
+    }) {
+        return Some(matched.clone());
+    }
+    if let Some(first) = homes.into_iter().next() {
+        return Some(first);
+    }
+    #[cfg(windows)]
+    {
+        dirs::home_dir().and_then(|home| normalized_windows_path(&home.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn windows_workspace_relative_file_path(workspace: &str, target: &str) -> Option<String> {
+    let (ws_root, ws_raw) = split_windows_path(workspace)?;
+    let (tgt_root, tgt_raw) = split_windows_path(target)?;
+    let (ws_root, ws_parts, _) = normalize_windows_parts(ws_root, ws_raw);
+    let (tgt_root, tgt_parts, _) = normalize_windows_parts(tgt_root, tgt_raw);
+    if !windows_roots_match(ws_root, tgt_root) || tgt_parts.len() <= ws_parts.len() {
+        return None;
+    }
+    if !tgt_parts[..ws_parts.len()]
+        .iter()
+        .zip(&ws_parts)
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    {
+        return None;
+    }
+    Some(tgt_parts[ws_parts.len()..].join(r"\"))
+}
+
+fn windows_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkRoute {
+    let trimmed = crate::md::parser::strip_file_location(target.trim());
+    let path = if trimmed
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        let Some(url_path) = windows_file_url_path(trimmed) else {
+            return TranscriptLinkRoute::External;
+        };
+        url_path
+    } else if let Some(direct) = normalized_windows_path(&percent_decode_file_path(trimmed)) {
+        direct
+    } else {
+        let Some(reference) = crate::md::parser::file_reference_link(target) else {
+            return TranscriptLinkRoute::External;
+        };
+        let relative = percent_decode_file_path(crate::md::parser::strip_file_location(reference));
+        if relative.is_empty() {
+            return TranscriptLinkRoute::NoWorkspace;
+        }
+        if let Some(rest) = home_relative_path(&relative) {
+            return match daemon_windows_home(workspace) {
+                Some(home) => {
+                    let joined = format!("{}\\{rest}", home.trim_end_matches(['\\', '/']));
+                    let path = normalized_windows_path(&joined).unwrap_or(joined);
+                    match windows_workspace_relative_file_path(workspace, &path) {
+                        Some(relative_path) => TranscriptLinkRoute::ProjectFile(relative_path),
+                        None => TranscriptLinkRoute::Finder(PathBuf::from(path)),
+                    }
+                }
+                None => TranscriptLinkRoute::Finder(PathBuf::from(relative)),
+            };
+        }
+        format!("{}\\{relative}", workspace.trim_end_matches(['\\', '/']))
+    };
+    let path = normalized_windows_path(&path).unwrap_or(path);
+    match windows_workspace_relative_file_path(workspace, &path) {
+        Some(relative_path) => TranscriptLinkRoute::ProjectFile(relative_path),
+        None => TranscriptLinkRoute::Finder(PathBuf::from(path)),
+    }
 }
 
 fn normalized_posix_path(path: &str) -> String {
@@ -312,6 +594,9 @@ fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLi
     if let Some(workspace) = workspace.and_then(posix_workspace) {
         return posix_transcript_link_route(target, workspace);
     }
+    if let Some(workspace) = workspace.and_then(windows_workspace) {
+        return windows_transcript_link_route(target, workspace);
+    }
     if let Some(path) = markdown_file_link_path(target) {
         let path = normalized_path(&path);
         return if let Some(relative_path) =
@@ -381,9 +666,9 @@ pub(super) enum ReviewDiffTreeRow {
 /// shipping its entire icon catalog. The SVG path is resolved once per entry
 /// during the directory scan, not on every row paint.
 pub(super) fn file_icon_for_path(path: &str) -> &'static str {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
+    let name = path
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
         .unwrap_or(path);
     file_icon_for_name(name)
 }
@@ -1628,6 +1913,62 @@ mod tests {
         assert!(ancestor_directories(workspace, "README.md").is_empty());
     }
 
+    #[test]
+    fn remote_windows_workspaces_route_with_backslashes_on_every_desktop() {
+        let workspace = Path::new(r"C:\Users\me\proj");
+
+        assert_eq!(
+            transcript_link_route("docs/guide.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(r"docs\guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route(r"docs\guide.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(r"docs\guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route(r"C:\Users\me\proj\docs\guide.md:12", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(r"docs\guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("c:/users/me/proj/docs/My%20Guide.md", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(r"docs\My Guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route("file:///C:/Users/me/proj/docs/guide.md#L3", Some(workspace)),
+            TranscriptLinkRoute::ProjectFile(r"docs\guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route(r"..\other\notes.md", Some(workspace)),
+            TranscriptLinkRoute::Finder(PathBuf::from(r"C:\Users\me\other\notes.md"))
+        );
+
+        let unc = Path::new(r"\\srv\share\proj");
+        assert_eq!(
+            transcript_link_route(r"docs\guide.md", Some(unc)),
+            TranscriptLinkRoute::ProjectFile(r"docs\guide.md".into())
+        );
+        assert_eq!(
+            transcript_link_route(r"..\outside.txt", Some(unc)),
+            TranscriptLinkRoute::Finder(PathBuf::from(r"\\srv\share\outside.txt"))
+        );
+
+        assert_eq!(
+            ancestor_directories(Path::new(r"C:\Users\me\proj\"), r"docs\api\guide.md"),
+            vec![
+                PathBuf::from(r"C:\Users\me\proj\docs"),
+                PathBuf::from(r"C:\Users\me\proj\docs\api"),
+            ]
+        );
+        assert_eq!(
+            join_workspace_path(Path::new(r"C:\Users\me\proj\"), "src/main.rs"),
+            PathBuf::from(r"C:\Users\me\proj\src\main.rs")
+        );
+        assert_eq!(
+            file_icon_for_path(r"src\main.rs"),
+            file_icon_for_path("src/main.rs")
+        );
+    }
+
     /// Selection resolves rows by key, so a repeated key makes a drag jump
     /// between the duplicates. Numbered rows keep their number-derived keys
     /// (stable across Review's gap expansion); rows a provider never
@@ -2475,6 +2816,20 @@ impl Waku {
                 path.to_owned()
             } else {
                 format!("{}/{path}", workspace.trim_end_matches('/'))
+            };
+            self.open_transcript_link(&resolved, cx);
+            return;
+        }
+        if let Some(workspace) = self.selected_workspace_path().and_then(windows_workspace) {
+            let path = path.trim();
+            let resolved = if normalized_windows_path(path).is_some()
+                || path
+                    .get(..5)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+            {
+                path.to_owned()
+            } else {
+                format!("{}\\{path}", workspace.trim_end_matches(['\\', '/']))
             };
             self.open_transcript_link(&resolved, cx);
             return;
@@ -5680,11 +6035,16 @@ impl Waku {
                 let relative_path = if parent_relative_path.is_empty() {
                     new_name
                 } else {
-                    let sep = if parent_relative_path.contains('\\') {
-                        '\\'
-                    } else {
-                        '/'
-                    };
+                    let sep = self
+                        .selected_workspace_path()
+                        .map(workspace_separator)
+                        .unwrap_or_else(|| {
+                            if parent_relative_path.contains('\\') {
+                                '\\'
+                            } else {
+                                '/'
+                            }
+                        });
                     format!("{parent_relative_path}{sep}{new_name}")
                 };
                 let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf)
@@ -5733,7 +6093,7 @@ impl Waku {
                             Ok(()) => {
                                 if is_dir {
                                     waku.right_panel_expanded_paths
-                                        .insert(project_path.join(&relative_path));
+                                        .insert(join_workspace_path(&project_path, &relative_path));
                                 }
                                 waku.refresh_right_panel_working_tree(cx);
                                 waku.invalidate_composer_sources(cx);

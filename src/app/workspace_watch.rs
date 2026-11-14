@@ -106,14 +106,12 @@ impl Waku {
                         directories.extend(
                             this.right_panel_expanded_paths
                                 .iter()
-                                .filter_map(|path| {
-                                    path.strip_prefix(&scope.workspace).ok().map(Path::to_owned)
-                                })
+                                .filter_map(|path| relative_watch_directory(&scope.workspace, path))
                                 .take(2048),
                         );
                     }
                     if editor && let Some(path) = this.visible_right_panel_file_path() {
-                        directories.extend(Path::new(&path).parent().map(Path::to_owned));
+                        directories.extend(parent_relative_directory(&path));
                     }
                     directories.sort();
                     directories.dedup();
@@ -238,6 +236,109 @@ impl Waku {
     }
 }
 
+enum LexicalRoot<'a> {
+    Posix,
+    WindowsDrive(u8),
+    WindowsUnc(&'a str, &'a str),
+}
+
+fn split_lexical_path(raw: &str) -> Option<(LexicalRoot<'_>, Vec<&str>)> {
+    if let Some(unc_tail) = raw.strip_prefix(r"\\?\UNC\") {
+        let mut parts = unc_tail
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".");
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some((LexicalRoot::WindowsUnc(server, share), parts.collect()));
+    }
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(raw);
+    if let Some(unc_tail) = trimmed
+        .strip_prefix(r"\\")
+        .or_else(|| trimmed.strip_prefix("//"))
+    {
+        let mut parts = unc_tail
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".");
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some((LexicalRoot::WindowsUnc(server, share), parts.collect()));
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
+    {
+        let segs = trimmed[2..]
+            .split(['\\', '/'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        return Some((
+            LexicalRoot::WindowsDrive(bytes[0].to_ascii_uppercase()),
+            segs,
+        ));
+    }
+    if trimmed.starts_with('/') {
+        let segs = trimmed
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        return Some((LexicalRoot::Posix, segs));
+    }
+    None
+}
+
+/// Computes the workspace-relative directory of an expanded row purely
+/// lexically so cross-OS remote hosts (Windows desktop watching POSIX, or
+/// POSIX desktop watching Windows) never fail `Path::strip_prefix`.
+fn relative_watch_directory(workspace: &Path, expanded: &Path) -> Option<PathBuf> {
+    let (Some(ws_str), Some(exp_str)) = (workspace.to_str(), expanded.to_str()) else {
+        return expanded.strip_prefix(workspace).ok().map(Path::to_owned);
+    };
+    let (Some((ws_root, ws_segs)), Some((exp_root, exp_segs))) =
+        (split_lexical_path(ws_str), split_lexical_path(exp_str))
+    else {
+        return expanded.strip_prefix(workspace).ok().map(Path::to_owned);
+    };
+    if exp_segs.len() < ws_segs.len() {
+        return None;
+    }
+    let win_rest = match (ws_root, exp_root) {
+        (LexicalRoot::Posix, LexicalRoot::Posix) => {
+            return (exp_segs[..ws_segs.len()] == ws_segs[..])
+                .then(|| PathBuf::from(exp_segs[ws_segs.len()..].join("/")));
+        }
+        (LexicalRoot::WindowsDrive(wd), LexicalRoot::WindowsDrive(ed)) if wd == ed => true,
+        (LexicalRoot::WindowsUnc(ws_s, ws_sh), LexicalRoot::WindowsUnc(es_s, es_sh))
+            if ws_s.eq_ignore_ascii_case(es_s) && ws_sh.eq_ignore_ascii_case(es_sh) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    (win_rest
+        && exp_segs[..ws_segs.len()]
+            .iter()
+            .zip(&ws_segs)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b)))
+    .then(|| PathBuf::from(exp_segs[ws_segs.len()..].join("\\")))
+}
+
+fn parent_relative_directory(relative_file_path: &str) -> Option<PathBuf> {
+    if relative_file_path.is_empty() {
+        return None;
+    }
+    let trimmed = relative_file_path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rfind(['/', '\\']) {
+        Some(0) => Some(PathBuf::from(&trimmed[..1])),
+        Some(idx) => Some(PathBuf::from(&trimmed[..idx])),
+        None => Some(PathBuf::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +408,51 @@ mod tests {
             Some(&before),
             &after
         ));
+    }
+
+    #[test]
+    fn cross_os_watch_directories_strip_workspace_lexically() {
+        // POSIX workspace on any desktop OS (including Windows).
+        assert_eq!(
+            relative_watch_directory(
+                Path::new("/home/me/proj"),
+                Path::new("/home/me/proj/src/app")
+            ),
+            Some(PathBuf::from("src/app"))
+        );
+        assert_eq!(
+            relative_watch_directory(Path::new("/home/me/proj"), Path::new("/home/me/other/src")),
+            None
+        );
+
+        // Windows drive & UNC workspaces on any desktop OS (including macOS/Linux).
+        assert_eq!(
+            relative_watch_directory(
+                Path::new(r"C:\Users\Me\proj"),
+                Path::new(r"c:\users\me\proj\src\app")
+            ),
+            Some(PathBuf::from(r"src\app"))
+        );
+        assert_eq!(
+            relative_watch_directory(
+                Path::new(r"\\srv\share\proj"),
+                Path::new(r"\\SRV\Share\proj\docs\api")
+            ),
+            Some(PathBuf::from(r"docs\api"))
+        );
+        assert_eq!(
+            relative_watch_directory(Path::new(r"C:\Users\Me\proj"), Path::new(r"D:\other\src")),
+            None
+        );
+
+        assert_eq!(
+            parent_relative_directory(r"src\app\lib.rs"),
+            Some(PathBuf::from(r"src\app"))
+        );
+        assert_eq!(
+            parent_relative_directory("src/app/lib.rs"),
+            Some(PathBuf::from("src/app"))
+        );
+        assert_eq!(parent_relative_directory("README.md"), Some(PathBuf::new()));
     }
 }
