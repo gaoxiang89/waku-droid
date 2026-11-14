@@ -229,6 +229,18 @@ fn osc_alert(payload: &[u8]) -> Option<TerminalAlert> {
     })
 }
 
+fn remote_file_url_path(url: &url::Url) -> Option<PathBuf> {
+    let decoded = decode_percent_path(url.path())?;
+    let normalized = if let Some(rest) = decoded.strip_prefix('/')
+        && has_windows_drive_prefix(rest)
+    {
+        rest.to_owned()
+    } else {
+        decoded
+    };
+    (!normalized.is_empty()).then(|| PathBuf::from(normalized))
+}
+
 fn osc_working_directory(payload: &[u8]) -> Option<PathBuf> {
     let payload = std::str::from_utf8(payload).ok()?;
     if let Some(uri) = payload.strip_prefix("7;") {
@@ -236,14 +248,12 @@ fn osc_working_directory(payload: &[u8]) -> Option<PathBuf> {
         if url.scheme() != "file" {
             return None;
         }
-        if let Ok(path) = url.to_file_path() {
+        if matches!(url.host_str(), None | Some("" | "localhost"))
+            && let Ok(path) = url.to_file_path()
+        {
             return Some(path);
         }
-        let path = decode_percent_path(url.path())?;
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-        return None;
+        return remote_file_url_path(&url);
     }
     if let Some(path) = payload.strip_prefix("9;9;") {
         let path = path.trim().trim_matches('"');
@@ -737,7 +747,6 @@ impl RemoteTerminal {
                     };
                     client = replacement;
                     events = client.subscribe(self.session_id, self.runtime_id);
-                    needs_snapshot = true;
                     // A daemon that restarted has lost the PTY; a resize is
                     // the cheapest request that proves it still exists.
                     let (cols, rows) = {
@@ -754,6 +763,7 @@ impl RemoteTerminal {
                         exited(&ui_events);
                         return;
                     }
+                    needs_snapshot = true;
                 }
             }
         }
@@ -1718,7 +1728,12 @@ fn clipboard_has_paste_content(clipboard: &ClipboardItem) -> bool {
     extract_terminal_paste_content(clipboard).is_some()
 }
 
+#[cfg(test)]
 fn shell_quote_path(path: &Path) -> String {
+    shell_quote_path_for_target(path, cfg!(windows))
+}
+
+fn shell_quote_path_for_target(path: &Path, windows_target: bool) -> String {
     let path_str = path.to_string_lossy();
     let windows_path = path_str.contains('\\') || has_windows_drive_prefix(&path_str);
     let is_safe = !path_str.is_empty()
@@ -1731,7 +1746,7 @@ fn shell_quote_path(path: &Path) -> String {
         return path_str.into_owned();
     }
 
-    if windows_path || (cfg!(windows) && !path_str.starts_with('/')) {
+    if windows_path || (windows_target && !path_str.starts_with('/')) {
         if (path_str.contains('$') || path_str.contains('`')) && !path_str.contains('\'') {
             format!("'{path_str}'")
         } else {
@@ -1810,10 +1825,10 @@ fn save_pasted_image(
     Ok(temp_path)
 }
 
-fn join_shell_paths(paths: &[PathBuf]) -> String {
+fn join_shell_paths_for_target(paths: &[PathBuf], windows_target: bool) -> String {
     paths
         .iter()
-        .map(|path| shell_quote_path(path))
+        .map(|path| shell_quote_path_for_target(path, windows_target))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1828,6 +1843,7 @@ fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
         "tif" | "tiff" => "image/tiff",
         _ => return None,
     };
@@ -1911,6 +1927,7 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     working_directory: PathBuf,
     title: String,
+    custom_title: bool,
     exited: bool,
     reconnecting: bool,
     scroll_accumulator: f32,
@@ -2097,6 +2114,7 @@ impl TerminalView {
             error: None,
             focus_handle: cx.focus_handle(),
             title: tr!("right_panel.terminal"),
+            custom_title: false,
             working_directory,
             exited: false,
             reconnecting: false,
@@ -2135,6 +2153,7 @@ impl TerminalView {
             error: None,
             focus_handle: cx.focus_handle(),
             title: String::new(),
+            custom_title: false,
             working_directory: PathBuf::new(),
             exited: false,
             reconnecting: false,
@@ -2204,7 +2223,7 @@ impl TerminalView {
     }
 
     pub fn refresh_localized_text(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.title.as_str(), "Terminal" | "终端") {
+        if !self.custom_title {
             self.title = tr!("right_panel.terminal");
             cx.notify();
         }
@@ -2221,8 +2240,14 @@ impl TerminalView {
         while let Ok(event) = session.ui_events.try_recv() {
             changed = true;
             match event {
-                TerminalUiEvent::Title(title) => self.title = title,
-                TerminalUiEvent::ResetTitle => self.title = tr!("right_panel.terminal"),
+                TerminalUiEvent::Title(title) => {
+                    self.title = title;
+                    self.custom_title = true;
+                }
+                TerminalUiEvent::ResetTitle => {
+                    self.title = tr!("right_panel.terminal");
+                    self.custom_title = false;
+                }
                 TerminalUiEvent::WorkingDirectory(cwd) => self.working_directory = cwd,
                 TerminalUiEvent::ClipboardStore(text) => {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
@@ -2750,12 +2775,23 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn is_windows_target(&self) -> bool {
+        if self.launcher.is_local() {
+            cfg!(windows)
+        } else {
+            is_windows_target_path(&self.working_directory)
+        }
+    }
+
     fn paste_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if paths.is_empty() || self.session.is_none() {
             return;
         }
         if self.launcher.is_local() {
-            self.paste(join_shell_paths(&paths), cx);
+            self.paste(
+                join_shell_paths_for_target(&paths, self.is_windows_target()),
+                cx,
+            );
             return;
         }
         self.pause_cursor_blink(cx);
@@ -2767,7 +2803,11 @@ impl TerminalView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if !uploaded.paths.is_empty() {
-                    this.paste(join_shell_paths(&uploaded.paths), cx);
+                    let windows_target = this.is_windows_target();
+                    this.paste(
+                        join_shell_paths_for_target(&uploaded.paths, windows_target),
+                        cx,
+                    );
                 }
                 if uploaded.skipped > 0 {
                     cx.emit(TerminalNotice(tr!(
@@ -2807,7 +2847,10 @@ impl TerminalView {
                         .spawn(async move { save_pasted_image(launcher, format, bytes) })
                         .await;
                     let _ = this.update(cx, |this, cx| match saved_path {
-                        Ok(path) => this.paste(shell_quote_path(&path), cx),
+                        Ok(path) => {
+                            let windows_target = this.is_windows_target();
+                            this.paste(shell_quote_path_for_target(&path, windows_target), cx);
+                        }
                         Err(error) => cx.emit(TerminalNotice(tr!(
                             "terminal.paste_image_failed",
                             error = error.to_string()
@@ -3104,11 +3147,7 @@ impl Render for TerminalView {
         } else {
             self.title.clone()
         };
-        let directory = self
-            .working_directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
+        let directory = working_directory_label(&self.working_directory)
             .unwrap_or_else(|| tr!("workspace.workspace"));
 
         let mut screen = div()
@@ -3648,6 +3687,10 @@ fn terminal_link_target(
         return Some(TerminalLinkTarget::File { path, location });
     }
 
+    if has_windows_drive_prefix(value) || value.starts_with("\\\\") {
+        return None;
+    }
+
     let url = url::Url::parse(value).ok()?;
     if url.scheme() == "file" {
         return None;
@@ -3703,12 +3746,39 @@ fn is_wide_terminal_char(ch: char) -> bool {
     )
 }
 
+fn is_windows_target_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    has_windows_drive_prefix(&text) || text.starts_with("\\\\")
+}
+
+fn is_windows_drive_colon(prefix: &str) -> bool {
+    let trimmed = prefix.trim_start_matches('/');
+    trimmed.len() == 1 && trimmed.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn working_directory_label(path: &Path) -> Option<String> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    let tail = trimmed
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())?;
+    let is_drive_root = tail.len() == 2
+        && tail.as_bytes()[0].is_ascii_alphabetic()
+        && tail.as_bytes()[1] == b':';
+    (!is_drive_root).then(|| tail.to_owned())
+}
+
 fn terminal_file_path_with_location(
     value: &str,
     working_directory: &Path,
     local_terminal: bool,
 ) -> Option<(PathBuf, Option<(usize, Option<usize>)>)> {
     let location = crate::md::parser::parse_file_location(value).1;
+    let windows_target = if local_terminal {
+        cfg!(windows)
+    } else {
+        is_windows_target_path(working_directory)
+    };
     let url_parsed = (!has_windows_drive_prefix(value))
         .then(|| url::Url::parse(value).ok())
         .flatten();
@@ -3720,7 +3790,7 @@ fn terminal_file_path_with_location(
             if local_terminal {
                 url.to_file_path().ok()?
             } else {
-                PathBuf::from(url.path())
+                remote_file_url_path(&url)?
             }
         }
         Some(_) => return None,
@@ -3732,32 +3802,53 @@ fn terminal_file_path_with_location(
                     // The POSIX workspace route expands the daemon's home.
                     PathBuf::from(value)
                 }
-            } else {
+            } else if local_terminal {
                 let path = Path::new(value);
-                if local_terminal {
-                    if path.is_absolute() || has_windows_drive_prefix(value) {
-                        path.to_path_buf()
-                    } else {
-                        working_directory.join(path)
-                    }
-                } else if value.starts_with('/') {
+                if path.is_absolute() || has_windows_drive_prefix(value) {
+                    path.to_path_buf()
+                } else {
+                    working_directory.join(path)
+                }
+            } else if windows_target {
+                if has_windows_drive_prefix(value) || value.starts_with("\\\\") {
                     PathBuf::from(value)
                 } else {
-                    let pathlike =
-                        value.starts_with("./") || value.starts_with("../") || value.contains('/');
+                    let pathlike = value.starts_with("./")
+                        || value.starts_with(".\\")
+                        || value.starts_with("../")
+                        || value.starts_with("..\\")
+                        || value.contains('/')
+                        || value.contains('\\');
                     if !pathlike {
                         return None;
                     }
-                    // Remote paths always use forward slashes: PathBuf::join
-                    // would insert the desktop's separator and break routing.
                     PathBuf::from(format!(
-                        "{}/{}",
+                        "{}\\{}",
                         working_directory
                             .to_string_lossy()
                             .trim_end_matches(|character| character == '/' || character == '\\'),
-                        value
+                        value.replace('/', "\\")
                     ))
                 }
+            } else if has_windows_drive_prefix(value) {
+                return None;
+            } else if value.starts_with('/') {
+                PathBuf::from(value)
+            } else {
+                let pathlike =
+                    value.starts_with("./") || value.starts_with("../") || value.contains('/');
+                if !pathlike {
+                    return None;
+                }
+                // Remote paths always use forward slashes: PathBuf::join
+                // would insert the desktop's separator and break routing.
+                PathBuf::from(format!(
+                    "{}/{}",
+                    working_directory
+                        .to_string_lossy()
+                        .trim_end_matches(|character| character == '/' || character == '\\'),
+                    value
+                ))
             }
         }
     };
@@ -3769,7 +3860,10 @@ fn terminal_file_path_with_location(
             }
             let value = path.to_string_lossy();
             let (prefix, suffix) = value.rsplit_once(':')?;
-            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            if is_windows_drive_colon(prefix)
+                || suffix.is_empty()
+                || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+            {
                 return None;
             }
             path = PathBuf::from(prefix);
@@ -3781,7 +3875,10 @@ fn terminal_file_path_with_location(
         let Some((prefix, suffix)) = value.rsplit_once(':') else {
             return Some((path, location));
         };
-        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        if is_windows_drive_colon(prefix)
+            || suffix.is_empty()
+            || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
             return Some((path, location));
         }
         path = PathBuf::from(prefix);
@@ -5016,6 +5113,7 @@ mod tests {
                 focus_handle: cx.focus_handle(),
                 working_directory: PathBuf::new(),
                 title: String::new(),
+                custom_title: false,
                 exited: false,
                 reconnecting: false,
                 scroll_accumulator: 0.0,
@@ -5182,6 +5280,7 @@ mod tests {
                 focus_handle: cx.focus_handle(),
                 working_directory: PathBuf::new(),
                 title: String::new(),
+                custom_title: false,
                 exited: false,
                 reconnecting: false,
                 scroll_accumulator: 0.0,
@@ -5445,6 +5544,85 @@ mod tests {
         assert_eq!(
             terminal_link_target("README.md", working_directory, false),
             None
+        );
+        assert_eq!(
+            terminal_link_target(
+                "file:///home/waku/my%20proj/src/main.rs:12:3",
+                working_directory,
+                false
+            ),
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("/home/waku/my proj/src/main.rs"),
+                location: Some((12, Some(3))),
+            })
+        );
+        assert_eq!(
+            terminal_link_target("C:\\Users\\waku\\main.rs", working_directory, false),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_remote_windows_terminal_paths_and_osc_cwds() {
+        assert_eq!(
+            osc_working_directory(b"7;file://ubuntu-box/home/waku/my%20proj"),
+            Some(PathBuf::from("/home/waku/my proj"))
+        );
+        assert_eq!(
+            osc_working_directory(b"7;file:///home/waku/proj"),
+            Some(PathBuf::from("/home/waku/proj"))
+        );
+        assert_eq!(
+            osc_working_directory(b"7;file://win-box/C:/Users/waku/proj"),
+            Some(PathBuf::from("C:/Users/waku/proj"))
+        );
+
+        let win_cwd = Path::new("C:\\Users\\waku\\project");
+        assert_eq!(
+            terminal_link_target("C:\\Users\\waku\\project\\src\\main.rs:42:7", win_cwd, false),
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("C:\\Users\\waku\\project\\src\\main.rs"),
+                location: Some((42, Some(7))),
+            })
+        );
+        let relative = terminal_link_target(".\\src\\main.rs:19", win_cwd, false)
+            .expect("remote Windows relative path resolves");
+        let TerminalLinkTarget::File { path, location } = relative else {
+            panic!("expected a file link");
+        };
+        assert_eq!(location, Some((19, None)));
+        assert_eq!(
+            path.to_string_lossy(),
+            "C:\\Users\\waku\\project\\.\\src\\main.rs"
+        );
+        assert_eq!(
+            terminal_link_target("\\\\server\\share\\file.rs:5", win_cwd, false),
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("\\\\server\\share\\file.rs"),
+                location: Some((5, None)),
+            })
+        );
+        assert_eq!(
+            terminal_link_target("file://localhost/C:/Users/waku/my%20file.rs:8", win_cwd, false),
+            Some(TerminalLinkTarget::File {
+                path: PathBuf::from("C:/Users/waku/my file.rs"),
+                location: Some((8, None)),
+            })
+        );
+        assert_eq!(terminal_link_target("README.md", win_cwd, false), None);
+
+        assert_eq!(
+            working_directory_label(Path::new("C:\\Users\\waku\\my-app\\")),
+            Some("my-app".to_owned())
+        );
+        assert_eq!(
+            working_directory_label(Path::new("/home/waku/my-app/")),
+            Some("my-app".to_owned())
+        );
+        assert_eq!(working_directory_label(Path::new("C:\\")), None);
+        assert_eq!(
+            image_format_for_path(Path::new("diagram.svg")),
+            Some(ImageFormat::Svg)
         );
     }
 
@@ -6004,6 +6182,16 @@ mod tests {
         assert_eq!(
             shell_quote_path(&quoted_posix),
             "'/tmp/bob'\\''s photo.png'"
+        );
+
+        let relative_with_spaces = PathBuf::from("dir with spaces/file.png");
+        assert_eq!(
+            shell_quote_path_for_target(&relative_with_spaces, false),
+            "'dir with spaces/file.png'"
+        );
+        assert_eq!(
+            shell_quote_path_for_target(&relative_with_spaces, true),
+            "\"dir with spaces/file.png\""
         );
     }
 

@@ -857,8 +857,8 @@ pub(super) fn diff_tree_rows_for_paths(
             indexes.sort_by(|&left, &right| {
                 let left_path = file_paths[left];
                 let right_path = file_paths[right];
-                let left_name = left_path.rsplit('/').next().unwrap_or(left_path);
-                let right_name = right_path.rsplit('/').next().unwrap_or(right_path);
+                let left_name = left_path.rsplit(['/', '\\']).next().unwrap_or(left_path);
+                let right_name = right_path.rsplit(['/', '\\']).next().unwrap_or(right_path);
                 left_name
                     .to_ascii_lowercase()
                     .cmp(&right_name.to_ascii_lowercase())
@@ -1382,10 +1382,9 @@ fn visible_working_tree_entries(
 /// The language name for a file, as understood by [`crate::md::highlight`].
 /// Names the lexer does not know simply render unhighlighted.
 fn file_highlighter_language(relative_path: &str) -> &'static str {
-    let path = Path::new(relative_path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
+    let file_name = relative_path
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
         .unwrap_or("");
     let normalized_file_name = file_name.to_ascii_lowercase();
 
@@ -1419,7 +1418,7 @@ fn file_highlighter_language(relative_path: &str) -> &'static str {
         return "dockerfile";
     }
 
-    match path
+    match Path::new(file_name)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
@@ -1522,7 +1521,11 @@ impl RightPanelSurface {
             Self::Files => tr!("right_panel.files"),
             Self::Diff => tr!("right_panel.diff"),
             Self::GitGraph => tr!("right_panel.git_graph"),
-            Self::File(path) => path.rsplit('/').next().unwrap_or(path).to_owned(),
+            Self::File(path) => path
+                .rsplit(['/', '\\'])
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(path)
+                .to_owned(),
         }
     }
 
@@ -1542,9 +1545,7 @@ impl RightPanelSurface {
 fn right_panel_tab_label(surface: &RightPanelSurface, files_selected_path: Option<&str>) -> String {
     let label = match surface {
         RightPanelSurface::Files => files_selected_path
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
+            .and_then(|path| path.rsplit(['/', '\\']).find(|segment| !segment.is_empty()))
             .map(str::to_owned)
             .unwrap_or_else(|| tr!("right_panel.files")),
         _ => surface.label(),
@@ -2398,6 +2399,20 @@ mod tests {
         assert_eq!(file_highlighter_language("Makefile"), "make");
         assert_eq!(file_highlighter_language("src/native.hpp"), "cpp");
         assert_eq!(file_highlighter_language("LICENSE"), "text");
+        assert_eq!(file_highlighter_language("src\\app\\mod.rs"), "rust");
+        assert_eq!(
+            file_highlighter_language("deploy\\v1.0\\Dockerfile"),
+            "dockerfile"
+        );
+        assert_eq!(file_highlighter_language("crates\\sub\\Cargo.lock"), "toml");
+        assert_eq!(
+            RightPanelSurface::File("src\\app\\mod.rs".into()).label(),
+            "mod.rs"
+        );
+        assert_eq!(
+            right_panel_tab_label(&RightPanelSurface::Files, Some("src\\app\\mod.rs")),
+            "mod.rs"
+        );
 
         for (path, expected_language) in [
             ("bun.lock", "json"),

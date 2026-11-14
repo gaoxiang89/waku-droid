@@ -69,12 +69,24 @@ fn system_tool_directories() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn system_tool_directories() -> Vec<PathBuf> {
+    windows_system_tool_directories(
+        std::env::var_os("ProgramFiles").as_deref(),
+        std::env::var_os("SystemRoot").as_deref(),
+    )
+}
+
+#[cfg(windows)]
+fn windows_system_tool_directories(
+    program_files: Option<&std::ffi::OsStr>,
+    system_root: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
     let mut directories = Vec::new();
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+    if let Some(program_files) = program_files.filter(|value| !value.is_empty()) {
         directories.push(PathBuf::from(program_files).join("nodejs"));
     }
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
+    if let Some(system_root) = system_root.filter(|value| !value.is_empty()) {
         let system32 = PathBuf::from(system_root).join("System32");
+        directories.push(system32.join("OpenSSH"));
         directories.push(system32.join("WindowsPowerShell/v1.0"));
         directories.push(system32);
     }
@@ -231,10 +243,11 @@ fn account_default_shell() -> Option<PathBuf> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn the_accounts_login_shell_outranks_an_inherited_shell_variable() {
         let candidates = unix_terminal_shell_candidates(
@@ -246,6 +259,7 @@ mod tests {
         assert_eq!(candidates[1], PathBuf::from("/bin/zsh"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_exported_shell_is_still_used_when_the_account_has_none() {
         let candidates = unix_terminal_shell_candidates(None, Some(OsStr::new("/bin/bash")));
@@ -253,11 +267,65 @@ mod tests {
         assert_eq!(candidates[0], PathBuf::from("/bin/bash"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_empty_shell_variable_is_ignored_and_a_platform_shell_remains() {
         let candidates = unix_terminal_shell_candidates(None, Some(OsStr::new("")));
 
         assert!(!candidates.is_empty());
         assert!(!candidates.contains(&PathBuf::new()));
+    }
+
+    #[test]
+    fn executable_search_path_includes_system_tool_directories_without_duplicates() {
+        let search_path = executable_search_path().expect("executable search path");
+        let entries: Vec<PathBuf> = std::env::split_paths(&search_path).collect();
+        let mut seen = HashSet::new();
+        for entry in &entries {
+            assert!(seen.insert(entry.clone()), "duplicate PATH entry: {entry:?}");
+        }
+        for directory in system_tool_directories() {
+            assert!(
+                entries.contains(&directory),
+                "missing system tool directory {directory:?} in {entries:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_tool_directories_place_openssh_before_system32() {
+        use std::ffi::OsStr;
+
+        let directories = windows_system_tool_directories(
+            Some(OsStr::new(r"C:\Program Files")),
+            Some(OsStr::new(r"C:\Windows")),
+        );
+        let openssh = PathBuf::from(r"C:\Windows\System32\OpenSSH");
+        let system32 = PathBuf::from(r"C:\Windows\System32");
+        let openssh_index = directories
+            .iter()
+            .position(|directory| directory == &openssh)
+            .expect("OpenSSH directory missing");
+        let system32_index = directories
+            .iter()
+            .position(|directory| directory == &system32)
+            .expect("System32 directory missing");
+        assert!(openssh_index < system32_index);
+
+        if let Some(system_root) = std::env::var_os("SystemRoot").filter(|value| !value.is_empty()) {
+            let live_directories = system_tool_directories();
+            let live_system32 = PathBuf::from(system_root).join("System32");
+            let live_openssh = live_system32.join("OpenSSH");
+            let live_openssh_index = live_directories
+                .iter()
+                .position(|directory| directory == &live_openssh)
+                .expect("live OpenSSH directory missing");
+            let live_system32_index = live_directories
+                .iter()
+                .position(|directory| directory == &live_system32)
+                .expect("live System32 directory missing");
+            assert!(live_openssh_index < live_system32_index);
+        }
     }
 }

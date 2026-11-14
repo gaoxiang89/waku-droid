@@ -13,6 +13,7 @@
 //   WINDOWS_CERTIFICATE_PASSWORD  password for it
 //   WAKU_REMOTE_DAEMONS_DIR       directory with waku-daemon-linux-{x86_64,aarch64}
 //                                 for WSL and SSH hosts (release CI sets it)
+//   WAKU_REQUIRE_REMOTE_DAEMONS   set to "1" to fail if Linux daemons are missing
 import { $ } from "bun";
 import { bundleComputerUse } from "./cua-driver";
 import { existsSync, readdirSync, statSync } from "node:fs";
@@ -87,44 +88,73 @@ function findSigntool(): string {
 }
 
 /** Linux daemons for WSL and SSH hosts, which this Windows build cannot
- *  compile. Release CI stages both; a local package usually carries only the
- *  one its WSL distribution needs and then cannot reach Linux hosts of the
- *  other architecture. A missing architecture is therefore a warning, not a
- *  failure — CI cannot stage a partial set anyway, because one failed matrix
- *  leg skips every packaging job. */
-const remoteDaemonNames = [
+ *  compile. Release CI stages both and sets WAKU_REQUIRE_REMOTE_DAEMONS=1 to
+ *  enforce them; a local package usually carries only the one its WSL
+ *  distribution needs, so missing architectures warn unless required. */
+const expectedLinuxDaemons = [
   "waku-daemon-linux-x86_64",
   "waku-daemon-linux-aarch64",
 ];
 
-async function stageRemoteDaemons(destination: string): Promise<void> {
+interface StagedRemoteDaemons {
+  windowsExecutables: string[];
+  hasRemoteDaemons: boolean;
+}
+
+async function stageRemoteDaemons(
+  destination: string,
+): Promise<StagedRemoteDaemons> {
+  const requireRemoteDaemons = process.env.WAKU_REQUIRE_REMOTE_DAEMONS === "1";
   const source = process.env.WAKU_REMOTE_DAEMONS_DIR;
   if (!source) {
-    console.warn(
-      "WAKU_REMOTE_DAEMONS_DIR is not set; this package cannot connect to WSL or Linux SSH hosts.",
-    );
-    return;
+    const message =
+      "WAKU_REMOTE_DAEMONS_DIR is not set; this package cannot connect to WSL or Linux SSH hosts.";
+    if (requireRemoteDaemons) {
+      throw new Error(message);
+    }
+    console.warn(message);
+    return { windowsExecutables: [], hasRemoteDaemons: false };
   }
   const directory = resolve(source);
-  if (!existsSync(directory)) {
+  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
     throw new Error(`WAKU_REMOTE_DAEMONS_DIR does not exist: ${directory}`);
   }
-  await mkdir(destination, { recursive: true });
-  const missing: string[] = [];
-  for (const name of remoteDaemonNames) {
+  const stagedWindowsExecutables: string[] = [];
+  let stagedCount = 0;
+  for (const name of readdirSync(directory).sort()) {
+    if (!/^waku-daemon-[A-Za-z0-9_.-]+$/.test(name)) continue;
     const file = join(directory, name);
-    if (!existsSync(file)) {
-      missing.push(name);
-      continue;
+    if (!statSync(file).isFile()) continue;
+    if (stagedCount === 0) {
+      await mkdir(destination, { recursive: true });
     }
-    await copyFile(file, join(destination, name));
+    const target = join(destination, name);
+    await copyFile(file, target);
+    stagedCount += 1;
+    if (name.toLowerCase().endsWith(".exe")) {
+      stagedWindowsExecutables.push(target);
+    }
   }
-  if (missing.length > 0) {
-    console.warn(
-      `WAKU_REMOTE_DAEMONS_DIR has no ${missing.join(", ")}; ` +
-        "this package cannot connect to those Linux hosts.",
-    );
+  const invalid = expectedLinuxDaemons.flatMap((name) => {
+    const target = join(destination, name);
+    if (!existsSync(target)) return [`${name} (missing)`];
+    const stats = statSync(target);
+    if (!stats.isFile() || stats.size === 0) return [`${name} (empty)`];
+    return [];
+  });
+  if (invalid.length > 0) {
+    const message =
+      `WAKU_REMOTE_DAEMONS_DIR has missing or empty ${invalid.join(", ")}; ` +
+      "this package cannot connect to those Linux hosts.";
+    if (requireRemoteDaemons) {
+      throw new Error(message);
+    }
+    console.warn(message);
   }
+  return {
+    windowsExecutables: stagedWindowsExecutables,
+    hasRemoteDaemons: stagedCount > 0,
+  };
 }
 
 async function sign(
@@ -197,7 +227,10 @@ try {
     join(projectRoot, "LICENSE"),
     join(packageDirectory, "LICENSE"),
   );
-  await stageRemoteDaemons(join(packageDirectory, "remote"));
+  const {
+    windowsExecutables: stagedRemoteWindowsDaemons,
+    hasRemoteDaemons,
+  } = await stageRemoteDaemons(join(packageDirectory, "remote"));
 
   // Authenticode has to be applied before anything is packaged, so the
   // executables inside the zip and the installer are all signed. Unsigned
@@ -217,6 +250,7 @@ try {
       join(packageDirectory, "waku_computer_use.exe"),
       join(packageDirectory, "cua_driver_sdk.dll"),
       join(packageDirectory, "cua-driver-uia.exe"),
+      ...stagedRemoteWindowsDaemons,
     ]);
   } else {
     console.log("No WINDOWS_CERTIFICATE set; packaging unsigned binaries.");
@@ -233,7 +267,7 @@ try {
   // The installer is what the in-app updater downloads and re-runs, so it
   // ships from the same signed staging directory as the zip.
   await rm(installer, { force: true });
-  await $`${findInnoSetupCompiler()} ${`/DAppVersion=${version}`} ${`/DArch=${architecture}`} ${`/DStageDir=${packageDirectory}`} ${`/DOutputDir=${releaseDirectory}`} ${join(projectRoot, "resources", "windows", "waku.iss")}`;
+  await $`${findInnoSetupCompiler()} ${`/DAppVersion=${version}`} ${`/DArch=${architecture}`} ${`/DStageDir=${packageDirectory}`} ${`/DOutputDir=${releaseDirectory}`} ${`/DHasRemoteDaemons=${hasRemoteDaemons ? 1 : 0}`} ${join(projectRoot, "resources", "windows", "waku.iss")}`;
   if (!existsSync(installer)) {
     throw new Error(`ISCC did not produce ${installer}`);
   }

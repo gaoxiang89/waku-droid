@@ -565,9 +565,19 @@ impl Waku {
                             .hover(|element| element.bg(theme.overlay).text_color(theme.text))
                     })
                     .active(|element| element.opacity(0.8))
+                    .tab_index(0)
+                    .focus_visible(|element| element.border_1().border_color(theme.accent))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.respond_computer_permission(decision, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            this.respond_computer_permission(decision, cx);
+                            cx.stop_propagation();
+                        }
                     })),
             );
         }
@@ -2356,8 +2366,8 @@ impl Waku {
             return false;
         }
         let mut mention = path.display().to_string();
-        if is_dir && !mention.ends_with('/') {
-            mention.push('/');
+        if is_dir {
+            append_directory_mention_separator(&mut mention);
         }
         self.composer_attachments.push(ComposerAttachment {
             path,
@@ -3985,10 +3995,10 @@ fn attachment_upload_from_path(
             if total_bytes > MAX_ATTACHMENT_BYTES {
                 anyhow::bail!("attachment directory is larger than 32 MB");
             }
-            let relative_path = path
+            let stripped = path
                 .strip_prefix(source)
-                .context("attachment entry escaped its source directory")?
-                .to_path_buf();
+                .context("attachment entry escaped its source directory")?;
+            let relative_path = normalize_upload_relative_path(stripped)?;
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("could not read attachment {}", path.display()))?;
             entries.push(waku_client::attachments::AttachmentUploadEntry {
@@ -4004,23 +4014,53 @@ fn attachment_upload_from_path(
     ))
 }
 
+fn normalize_upload_relative_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(
+                part.to_str()
+                    .context("attachment entry path is not valid UTF-8")?,
+            ),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("attachment entry escaped its source directory"),
+        }
+    }
+    if parts.is_empty() {
+        anyhow::bail!("attachment entry escaped its source directory");
+    }
+    Ok(PathBuf::from(parts.join("/")))
+}
+
+fn append_directory_mention_separator(mention: &mut String) {
+    if mention.ends_with('/') || mention.ends_with('\\') {
+        return;
+    }
+    let bytes = mention.as_bytes();
+    let is_windows_path = mention.starts_with("\\\\")
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/')));
+    mention.push(if is_windows_path { '\\' } else { '/' });
+}
+
 #[cfg(test)]
 pub(super) fn dropped_file_mention(
     root: Option<&std::path::Path>,
     path: &std::path::Path,
     is_dir: bool,
 ) -> String {
-    let mention = root
+    let mut mention = root
         .and_then(|root| path.strip_prefix(root).ok())
         .filter(|relative| !relative.as_os_str().is_empty())
         .unwrap_or(path)
         .display()
         .to_string();
-    if is_dir && !mention.ends_with('/') {
-        format!("{mention}/")
-    } else {
-        mention
+    if is_dir {
+        append_directory_mention_separator(&mut mention);
     }
+    mention
 }
 
 fn is_image_attachment_path(path: &Path) -> bool {

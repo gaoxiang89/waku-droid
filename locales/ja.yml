@@ -1378,15 +1378,23 @@ connections.connecting: 接続中…
 connections.open: 接続
 connections.connected: 接続済み
 connections.disconnect: 接続を解除
+connections.reconnect: 再接続
 connections.ssh_title: SSH
 connections.ssh_description: "お使いの ssh を使用するため、~/.ssh/config、ssh-agent、ProxyJump がそのまま適用されます。Host エイリアスまたは user@host:port を入力し、必要に応じて秘密鍵を指定してください。"
 connections.auth_key: 秘密鍵
 connections.auth_password: パスワード
 connections.test: テスト
+connections.edit: 編集
 connections.remove: 削除
 connections.add: 追加
+connections.save: 保存
+connections.clear_password: パスワードを消去
+connections.browse_key: 参照…
 connections.ssh_host_placeholder: "Host エイリアスまたは user@host:port"
 connections.ssh_key_placeholder: 秘密鍵（任意）
+connections.ssh_password_placeholder: パスワードまたはパスフレーズ（任意）
+connections.ssh_password_saved_placeholder: 保存済みのパスワード（空欄で維持）
+connections.ssh_proxy_jump_placeholder: 踏み台ホスト ProxyJump（任意）
 connections.ssh_host_required: SSH ホストを入力してください
 connections.ssh_port_invalid: SSH ポートは 1〜65535 の数値で指定してください
 connections.ssh_duplicate: この SSH ホストは既に保存されています
@@ -1401,6 +1409,8 @@ connections.replace_daemon_confirm: セッションを終了してアップグ�
 remote_folder.title: "%{host} のフォルダを選択"
 remote_folder.loading: 読み込み中…
 remote_folder.invalid_response: デーモンが無効なディレクトリ一覧を返しました
+remote_folder.empty: サブフォルダはありません
+remote_folder.go: 開く
 remote_folder.cancel: キャンセル
 remote_folder.add: プロジェクトを追加
 

@@ -4,7 +4,9 @@
 //! `~/.ssh/config`, ssh-agent, `ProxyJump`, and known hosts all apply as they
 //! do in a terminal.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, bail};
@@ -15,11 +17,49 @@ use super::process_util::hide_console_window;
 const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const ASKPASS_CONNECTION_ENV: &str = "WAKU_SSH_ASKPASS_CONNECTION_ID";
 pub const ASKPASS_DIAGNOSTIC_PREFIX: &str = "[waku-ssh-askpass]";
+const WINDOWS_AUTH_HINT: &str =
+    "Hint: if your key uses a passphrase, save it in Connections or start the Windows ssh-agent service.";
+
+pub fn resolve_ssh_program() -> PathBuf {
+    resolve_ssh_program_with(
+        std::env::var_os("WAKU_SSH_BINARY").as_deref(),
+        std::env::var_os("SystemRoot").as_deref(),
+    )
+}
+
+fn resolve_ssh_program_with(
+    override_binary: Option<&OsStr>,
+    system_root: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(binary) = override_binary.filter(|value| !value.is_empty()) {
+        return PathBuf::from(binary);
+    }
+    #[cfg(windows)]
+    if let Some(system_root) = system_root.filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(system_root)
+            .join("System32")
+            .join("OpenSSH")
+            .join("ssh.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = system_root;
+    PathBuf::from("ssh")
+}
 
 /// Options shared by every ssh invocation. The destination is always the last
 /// element, so callers can pop it to insert options before it.
 pub fn base_args(target: &SshTarget) -> anyhow::Result<Vec<String>> {
     let password = matches!(target.auth_method(), SshAuthMethod::Password);
+    let has_proxy_jump = matches!(
+        target,
+        SshTarget::Direct {
+            proxy_jump: Some(jump),
+            ..
+        } if !jump.trim().is_empty()
+    );
     let mut args = vec![
         "-T".to_owned(),
         "-o".to_owned(),
@@ -41,14 +81,15 @@ pub fn base_args(target: &SshTarget) -> anyhow::Result<Vec<String>> {
         "ServerAliveCountMax=3".to_owned(),
     ];
     if password {
-        args.extend([
-            "-o".to_owned(),
-            "PreferredAuthentications=password,keyboard-interactive".to_owned(),
-            "-o".to_owned(),
-            "PubkeyAuthentication=no".to_owned(),
-            "-o".to_owned(),
-            "NumberOfPasswordPrompts=1".to_owned(),
-        ]);
+        if !has_proxy_jump {
+            args.extend([
+                "-o".to_owned(),
+                "PreferredAuthentications=password,keyboard-interactive".to_owned(),
+                "-o".to_owned(),
+                "PubkeyAuthentication=no".to_owned(),
+            ]);
+        }
+        args.extend(["-o".to_owned(), "NumberOfPasswordPrompts=1".to_owned()]);
     }
     append_target_args(&mut args, target)?;
     Ok(args)
@@ -73,22 +114,55 @@ fn command_with_options(
     let ConnectionKind::Ssh { target } = &connection.kind else {
         bail!("an SSH command requires an SSH connection");
     };
+    let use_askpass = match target.auth_method() {
+        SshAuthMethod::Password => {
+            super::credentials::get_ssh_password(&connection.id)?;
+            true
+        }
+        SshAuthMethod::Key => super::credentials::has_ssh_password(&connection.id),
+        SshAuthMethod::Agent => false,
+    };
+    build_command_with_options(connection, extra_options, use_askpass)
+}
+
+fn build_command_with_options(
+    connection: &Connection,
+    extra_options: &[&str],
+    use_askpass: bool,
+) -> anyhow::Result<Command> {
+    let ConnectionKind::Ssh { target } = &connection.kind else {
+        bail!("an SSH command requires an SSH connection");
+    };
     let mut args = base_args(target)?;
-    if !extra_options.is_empty() {
+    let key_passphrase_askpass =
+        use_askpass && matches!(target.auth_method(), SshAuthMethod::Key);
+    if key_passphrase_askpass {
+        for arg in &mut args {
+            if arg == "BatchMode=yes" {
+                *arg = "BatchMode=no".to_owned();
+            }
+        }
+    }
+    if key_passphrase_askpass || !extra_options.is_empty() {
         let destination = args.pop().context("missing SSH destination")?;
+        if key_passphrase_askpass {
+            args.extend(["-o".to_owned(), "NumberOfPasswordPrompts=1".to_owned()]);
+        }
         args.extend(extra_options.iter().map(|option| (*option).to_owned()));
         args.push(destination);
     }
-    let mut command = Command::new("ssh");
+    let mut command = Command::new(resolve_ssh_program());
     command.args(args);
-    if matches!(target.auth_method(), SshAuthMethod::Password) {
-        super::credentials::get_ssh_password(&connection.id)?;
+    if let Some(path) = crate::command_env::executable_search_path() {
+        command.env("PATH", path);
+    }
+    if use_askpass {
         let executable = std::env::current_exe()
             .context("could not locate the Waku executable for SSH askpass")?;
         command.env("SSH_ASKPASS", executable);
         command.env("SSH_ASKPASS_REQUIRE", "force");
         command.env(ASKPASS_CONNECTION_ENV, &connection.id);
-        if std::env::var_os("DISPLAY").is_none() {
+        if std::env::var_os("DISPLAY").is_none_or(|v| v.is_empty()) {
             command.env("DISPLAY", "waku:0");
         }
         command.stdin(Stdio::null());
@@ -118,7 +192,7 @@ fn append_target_args(args: &mut Vec<String>, target: &SshTarget) -> anyhow::Res
             if let Some(port) = port {
                 args.extend(["-p".to_owned(), port.to_string()]);
             }
-            if let Some(user) = user.as_deref().filter(|user| !user.is_empty()) {
+            if let Some(user) = user.as_deref().map(str::trim).filter(|user| !user.is_empty()) {
                 validate_option_value(user, "SSH user")?;
                 args.extend(["-l".to_owned(), user.to_owned()]);
             }
@@ -137,7 +211,11 @@ fn append_target_args(args: &mut Vec<String>, target: &SshTarget) -> anyhow::Res
                     args.extend(["-o".to_owned(), "IdentitiesOnly=yes".to_owned()]);
                 }
             }
-            if let Some(proxy_jump) = proxy_jump.as_deref().filter(|jump| !jump.is_empty()) {
+            if let Some(proxy_jump) = proxy_jump
+                .as_deref()
+                .map(str::trim)
+                .filter(|jump| !jump.is_empty())
+            {
                 validate_destination(proxy_jump, "SSH proxy jump")?;
                 args.extend(["-J".to_owned(), proxy_jump.to_owned()]);
             }
@@ -162,7 +240,8 @@ fn validate_destination(value: &str, label: &str) -> anyhow::Result<()> {
 }
 
 fn validate_option_value(value: &str, label: &str) -> anyhow::Result<()> {
-    if value.trim().is_empty()
+    let value = value.trim();
+    if value.is_empty()
         || value.starts_with('-')
         || value
             .chars()
@@ -189,22 +268,44 @@ pub fn wrap_posix_script(script: &str) -> String {
 /// while `-NoProfile` isolates it from broken user profiles and
 /// `-OutputFormat Text` suppresses CLIXML progress serialization.
 pub fn wrap_powershell_script(script: &str) -> String {
-    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = encode_powershell_utf16le(script);
     format!(
-        "powershell.exe -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {}",
-        encode_base64(&utf16le)
+        "powershell.exe -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded}"
     )
+}
+
+/// Fallback for `cmd.exe` `DefaultShell` hosts whose `PATH` omits
+/// `%SystemRoot%\System32\WindowsPowerShell\v1.0`.
+pub fn wrap_cmd_systemroot_powershell_script(script: &str) -> String {
+    let encoded = encode_powershell_utf16le(script);
+    format!(
+        "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    )
+}
+
+/// Fallback for Git Bash / MSYS2 / Cygwin `DefaultShell` hosts on Windows,
+/// resolving `powershell.exe` from `SYSTEMROOT` when non-login `PATH` omits it.
+pub fn wrap_posix_powershell_script(script: &str) -> String {
+    let encoded = encode_powershell_utf16le(script);
+    let posix = format!(
+        "ps=\"powershell.exe\"; command -v \"$ps\" >/dev/null 2>&1 || ps=\"${{SYSTEMROOT:-C:/Windows}}/System32/WindowsPowerShell/v1.0/powershell.exe\"; exec \"$ps\" -NoProfile -NonInteractive -NoLogo -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    );
+    wrap_posix_script(&posix)
 }
 
 /// Encode `script` to run directly inside an outer PowerShell `DefaultShell`
 /// session (`pwsh.exe` or `powershell.exe`) so redirected `stdin` stays owned
 /// by the script instead of being held by a parent PowerShell host.
 pub fn wrap_powershell_in_process(script: &str) -> String {
-    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = encode_powershell_utf16le(script);
     format!(
-        "& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))))",
-        encode_base64(&utf16le)
+        "$ProgressPreference='SilentlyContinue'; & ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}'))))"
     )
+}
+
+fn encode_powershell_utf16le(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    encode_base64(&utf16le)
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -448,6 +549,48 @@ pub fn stderr_without_askpass_diagnostics(stderr: &[u8]) -> String {
     strip_powershell_clixml_progress(&strip_ansi_escapes(&filtered))
 }
 
+pub fn append_auth_hint(connection: &Connection, detail: String) -> String {
+    if !cfg!(windows) {
+        return detail;
+    }
+    let ConnectionKind::Ssh { target } = &connection.kind else {
+        return detail;
+    };
+    let auth_method = target.auth_method();
+    if !detail.contains("Permission denied")
+        || matches!(auth_method, SshAuthMethod::Password)
+        || detail.contains(WINDOWS_AUTH_HINT)
+    {
+        return detail;
+    }
+    let has_passphrase = matches!(auth_method, SshAuthMethod::Key)
+        && super::credentials::has_ssh_password(&connection.id);
+    append_windows_auth_hint_if_needed(detail, auth_method, has_passphrase, true)
+}
+
+fn append_windows_auth_hint_if_needed(
+    detail: String,
+    auth_method: SshAuthMethod,
+    has_passphrase: bool,
+    is_windows: bool,
+) -> String {
+    if !is_windows
+        || !detail.contains("Permission denied")
+        || detail.contains(WINDOWS_AUTH_HINT)
+    {
+        return detail;
+    }
+    let missing_secret = match auth_method {
+        SshAuthMethod::Agent => true,
+        SshAuthMethod::Key => !has_passphrase,
+        SshAuthMethod::Password => false,
+    };
+    if !missing_secret {
+        return detail;
+    }
+    format!("{}\n{WINDOWS_AUTH_HINT}", detail.trim_end())
+}
+
 /// Askpass entry point. When ssh launches Waku as `SSH_ASKPASS`, print the
 /// stored password, flush stdout, and return an exit status so `main` exits
 /// before any UI or daemon initialization. A failed lookup must exit non-zero
@@ -608,9 +751,23 @@ mod tests {
         let wrapped = wrap_powershell_in_process("ok>?");
         assert_eq!(
             wrapped,
-            "& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('bwBrAD4APwA='))))"
+            "$ProgressPreference='SilentlyContinue'; & ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('bwBrAD4APwA='))))"
         );
         assert!(!wrapped.contains('"'));
+    }
+
+    #[test]
+    fn wrap_powershell_fallbacks_preserve_encoded_payload() {
+        let cmd_wrapped = wrap_cmd_systemroot_powershell_script("ok>?");
+        assert!(cmd_wrapped.starts_with(
+            "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile "
+        ));
+        assert!(cmd_wrapped.ends_with(" -EncodedCommand bwBrAD4APwA="));
+
+        let posix_wrapped = wrap_posix_powershell_script("ok>?");
+        assert!(posix_wrapped.starts_with("/bin/sh -c '"));
+        assert!(posix_wrapped.contains("WindowsPowerShell/v1.0/powershell.exe"));
+        assert!(posix_wrapped.contains("-EncodedCommand bwBrAD4APwA="));
     }
 
     #[test]
@@ -653,5 +810,199 @@ mod tests {
     fn clixml_literal_underscore_x_escape_and_surrogates_decode_cleanly() {
         assert_eq!(decode_clixml_escapes("_x005F_x000A_"), "_x000A_");
         assert_eq!(decode_clixml_escapes("_xD83D__xDE00_"), "😀");
+    }
+
+    #[test]
+    fn password_auth_with_proxy_jump_keeps_jump_pubkey_auth_enabled() {
+        let args = base_args(&SshTarget::Direct {
+            hostname: "target.internal".into(),
+            port: None,
+            user: Some("deploy".into()),
+            identity_file: None,
+            auth_method: SshAuthMethod::Password,
+            proxy_jump: Some("bastion.example.com".into()),
+        })
+        .unwrap();
+        assert!(has_pair(&args, "-o", "BatchMode=no"));
+        assert!(has_pair(&args, "-o", "NumberOfPasswordPrompts=1"));
+        assert!(has_pair(&args, "-J", "bastion.example.com"));
+        assert!(!args.iter().any(|arg| arg == "PubkeyAuthentication=no"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("PreferredAuthentications="))
+        );
+
+        let whitespace_jump_args = base_args(&SshTarget::Direct {
+            hostname: "target.internal".into(),
+            port: None,
+            user: None,
+            identity_file: None,
+            auth_method: SshAuthMethod::Password,
+            proxy_jump: Some("   ".into()),
+        })
+        .unwrap();
+        assert!(
+            whitespace_jump_args
+                .iter()
+                .any(|arg| arg == "PubkeyAuthentication=no")
+        );
+        assert!(
+            whitespace_jump_args
+                .iter()
+                .any(|arg| arg == "PreferredAuthentications=password,keyboard-interactive")
+        );
+        assert!(!whitespace_jump_args.iter().any(|arg| arg == "-J"));
+    }
+
+    #[test]
+    fn option_trimming_handles_user_proxy_jump_and_leading_dash() {
+        let args = base_args(&SshTarget::Direct {
+            hostname: "  example.com  ".into(),
+            port: None,
+            user: Some("  deploy  ".into()),
+            identity_file: None,
+            auth_method: SshAuthMethod::Agent,
+            proxy_jump: Some("  jump.example.com  ".into()),
+        })
+        .unwrap();
+        assert!(has_pair(&args, "-l", "deploy"));
+        assert!(has_pair(&args, "-J", "jump.example.com"));
+        assert_eq!(args.last().map(String::as_str), Some("example.com"));
+
+        assert!(validate_option_value(" -oProxyCommand=bad ", "SSH user").is_err());
+        assert!(validate_option_value("  alice  ", "SSH user").is_ok());
+    }
+
+    #[test]
+    fn key_passphrase_askpass_wiring_rewrites_batch_mode_and_envs() {
+        let connection = Connection {
+            id: "ssh:key-passphrase-test".into(),
+            name: "SSH · test".into(),
+            kind: ConnectionKind::Ssh {
+                target: SshTarget::Direct {
+                    hostname: "example.com".into(),
+                    port: None,
+                    user: Some("alice".into()),
+                    identity_file: Some("C:/Users/alice/.ssh/id_ed25519".into()),
+                    auth_method: SshAuthMethod::Key,
+                    proxy_jump: None,
+                },
+            },
+        };
+
+        let wired = build_command_with_options(&connection, &["-C"], true).unwrap();
+        let wired_args: Vec<String> = wired
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(has_pair(&wired_args, "-o", "BatchMode=no"));
+        assert!(!wired_args.iter().any(|arg| arg == "BatchMode=yes"));
+        assert!(has_pair(&wired_args, "-o", "NumberOfPasswordPrompts=1"));
+        assert!(has_pair(&wired_args, "-o", "IdentitiesOnly=yes"));
+        assert!(wired_args.iter().any(|arg| arg == "-C"));
+        assert_eq!(wired_args.last().map(String::as_str), Some("example.com"));
+
+        let wired_envs: Vec<(String, Option<String>)> = wired
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            wired_envs
+                .iter()
+                .any(|(k, v)| k == "SSH_ASKPASS" && v.as_deref().is_some_and(|p| !p.is_empty()))
+        );
+        assert!(
+            wired_envs
+                .iter()
+                .any(|(k, v)| k == "SSH_ASKPASS_REQUIRE" && v.as_deref() == Some("force"))
+        );
+        assert!(
+            wired_envs.iter().any(|(k, v)| k == ASKPASS_CONNECTION_ENV
+                && v.as_deref() == Some("ssh:key-passphrase-test"))
+        );
+        assert!(wired_envs.iter().any(|(k, _)| k == "PATH"));
+
+        let plain = build_command_with_options(&connection, &[], false).unwrap();
+        let plain_args: Vec<String> = plain
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(has_pair(&plain_args, "-o", "BatchMode=yes"));
+        assert!(
+            !plain_args
+                .iter()
+                .any(|arg| arg == "NumberOfPasswordPrompts=1")
+        );
+        assert!(
+            !plain
+                .get_envs()
+                .any(|(k, _)| k == OsStr::new("SSH_ASKPASS"))
+        );
+    }
+
+    #[test]
+    fn resolve_ssh_program_prefers_override_then_windows_openssh() {
+        assert_eq!(
+            resolve_ssh_program_with(
+                Some(OsStr::new("/custom/ssh")),
+                Some(OsStr::new("C:\\Windows"))
+            ),
+            PathBuf::from("/custom/ssh")
+        );
+        assert_eq!(
+            resolve_ssh_program_with(Some(OsStr::new("")), None),
+            PathBuf::from("ssh")
+        );
+
+        #[cfg(windows)]
+        {
+            let root = std::env::temp_dir().join(format!("waku-ssh-bin-{}", uuid::Uuid::new_v4()));
+            let openssh_dir = root.join("System32").join("OpenSSH");
+            std::fs::create_dir_all(&openssh_dir).unwrap();
+            let ssh_exe = openssh_dir.join("ssh.exe");
+            std::fs::write(&ssh_exe, b"").unwrap();
+            assert_eq!(
+                resolve_ssh_program_with(None, Some(root.as_os_str())),
+                ssh_exe
+            );
+            let _ = std::fs::remove_dir_all(&root);
+
+            let empty_root =
+                std::env::temp_dir().join(format!("waku-ssh-empty-{}", uuid::Uuid::new_v4()));
+            assert_eq!(
+                resolve_ssh_program_with(None, Some(empty_root.as_os_str())),
+                PathBuf::from("ssh")
+            );
+        }
+    }
+
+    #[test]
+    fn windows_auth_hint_applies_only_to_agent_or_key_without_passphrase() {
+        let denied = "alice@host: Permission denied (publickey).".to_owned();
+        let with_agent =
+            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Agent, false, true);
+        assert!(with_agent.contains(WINDOWS_AUTH_HINT));
+
+        let key_no_pass =
+            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Key, false, true);
+        assert!(key_no_pass.contains(WINDOWS_AUTH_HINT));
+
+        let key_with_pass =
+            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Key, true, true);
+        assert_eq!(key_with_pass, denied);
+
+        let with_password =
+            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Password, false, true);
+        assert_eq!(with_password, denied);
+
+        let non_windows =
+            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Agent, false, false);
+        assert_eq!(non_windows, denied);
     }
 }

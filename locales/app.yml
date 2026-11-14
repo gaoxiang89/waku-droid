@@ -2706,6 +2706,8 @@ connections.connected:
   en: Connected
 connections.disconnect:
   en: Disconnect
+connections.reconnect:
+  en: Reconnect
 connections.ssh_title:
   en: SSH
 connections.ssh_description:
@@ -2716,14 +2718,28 @@ connections.auth_password:
   en: password
 connections.test:
   en: Test
+connections.edit:
+  en: Edit
 connections.remove:
   en: Remove
 connections.add:
   en: Add
+connections.save:
+  en: Save
+connections.clear_password:
+  en: Clear password
+connections.browse_key:
+  en: Browse…
 connections.ssh_host_placeholder:
   en: "Host alias or user@host:port"
 connections.ssh_key_placeholder:
   en: Private key (optional)
+connections.ssh_password_placeholder:
+  en: Password or key passphrase (optional)
+connections.ssh_password_saved_placeholder:
+  en: Saved password (leave blank to keep)
+connections.ssh_proxy_jump_placeholder:
+  en: ProxyJump host (optional)
 connections.ssh_host_required:
   en: Enter an SSH host
 connections.ssh_port_invalid:
@@ -2752,6 +2768,10 @@ remote_folder.loading:
   en: Loading…
 remote_folder.invalid_response:
   en: The daemon returned an invalid directory listing
+remote_folder.empty:
+  en: No subfolders
+remote_folder.go:
+  en: Open
 remote_folder.cancel:
   en: Cancel
 remote_folder.add:

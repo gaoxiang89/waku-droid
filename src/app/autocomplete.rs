@@ -277,8 +277,8 @@ impl Waku {
                 scope.host.clone(),
                 provider,
                 scope.workspace.clone(),
-                account_id,
                 binary_override,
+                account_id,
             ));
             self.mention_files.invalidate(&scope);
         }

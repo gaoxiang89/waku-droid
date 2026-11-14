@@ -23,12 +23,15 @@ DaemonClient ─TCP─▶ loopback relay
 - **Transport is the user's own `wsl.exe` or `ssh`.** `~/.ssh/config`,
   ssh-agent, `ProxyJump`, and known hosts apply as in a terminal. No port is
   opened on the remote host's network; the daemon binds its loopback only.
-  On Windows hosts, the probe, install, and bridge commands run through
-  `powershell.exe -EncodedCommand`, so `cmd.exe`, `pwsh`, Git Bash, MSYS, and
-  Cygwin default shells all work; Windows PowerShell 5.1 must be installed.
+  On Windows hosts, `pwsh` and `powershell` default shells run the encoded
+  payload in-process so redirected `stdin` stays with the script, while
+  `cmd.exe`, Git Bash, MSYS, and Cygwin default shells invoke
+  `powershell.exe -EncodedCommand` (resolving `%SystemRoot%` when `PATH` omits
+  it).
 - **The remote daemon outlives the connection.** `waku-daemon bridge` starts
   the daemon in its own session (`setsid`) on Unix and records its address and
-  token in `~/.cache/waku/server/daemon.json` (mode `0600`). A dropped network
+  token in `~/.cache/waku/server/daemon.json` (mode `0600`, or an owner-only
+  DACL on Windows). A dropped network
   only kills the bridge; the desktop starts a new one and resumes every
   runtime from its replay cursor, so a running agent keeps going. On Windows
   the daemon asks to break away from the SSH session's job object with

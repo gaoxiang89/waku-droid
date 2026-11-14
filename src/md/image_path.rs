@@ -100,7 +100,7 @@ pub fn classify<'a>(url: &'a str, base: &ImageBase) -> ImageTarget<'a> {
             // Already a path inside the root: the absolute reading is the
             // only sensible one.
             Some(root) if is_within(&absolute, root) => ImagePath::new(absolute),
-            Some(root) if !is_windows_absolute(root) => ImagePath {
+            Some(root) if !is_windows_base(root) => ImagePath {
                 path: join(root, &path),
                 fallback: Some(absolute),
             },
@@ -116,18 +116,24 @@ pub fn classify<'a>(url: &'a str, base: &ImageBase) -> ImageTarget<'a> {
 
 /// Split an absolute host path into its directory and file name.
 pub fn split_parent(path: &str) -> Option<(&str, &str)> {
-    let separators: &[char] = if is_windows_absolute(path) {
+    let separators: &[char] = if is_windows_base(path) {
         &['/', '\\']
     } else {
         &['/']
     };
     let index = path.rfind(separators)?;
+    if let Some(prefix_end) = windows_unc_prefix_end(path)
+        && index < prefix_end
+    {
+        return None;
+    }
     let name = &path[index + 1..];
     if name.is_empty() {
         return None;
     }
     let parent = &path[..index];
-    // Keep the root's separator: `/a.png` lives in `/`, `C:\a.png` in `C:\`.
+    // Keep the root's separator: `/a.png` lives in `/`, `C:\a.png` in `C:\`,
+    // while `\\server\share\a.png` lives in `\\server\share`.
     let parent = if parent.is_empty() || parent.ends_with(':') {
         &path[..=index]
     } else {
@@ -162,6 +168,28 @@ fn is_windows_absolute(path: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// Byte offset right after `\\server\share` for a Windows UNC workspace path.
+/// Raw `\\...` URLs inside Markdown stay `Unsupported` so untrusted documents
+/// never initiate outbound SMB connections, while a workspace already rooted
+/// on a UNC share can still resolve its own relative image paths.
+fn windows_unc_prefix_end(path: &str) -> Option<usize> {
+    let rest = path.strip_prefix("\\\\")?;
+    let slash = rest.find(['\\', '/'])?;
+    if slash == 0 {
+        return None;
+    }
+    let after_server = &rest[slash + 1..];
+    let share_end = after_server.find(['\\', '/']).unwrap_or(after_server.len());
+    if share_end == 0 {
+        return None;
+    }
+    Some(2 + slash + 1 + share_end)
+}
+
+fn is_windows_base(path: &str) -> bool {
+    is_windows_absolute(path) || windows_unc_prefix_end(path).is_some()
 }
 
 /// The path a `file:` URL names. Only local URLs: `file:///p` and
@@ -214,7 +242,7 @@ fn percent_decode(path: &str) -> String {
 
 /// `base` joined with a relative `path`, normalized in `base`'s syntax.
 fn join(base: &str, path: &str) -> String {
-    if is_windows_absolute(base) {
+    if is_windows_base(base) {
         normalize_windows(&format!("{base}\\{path}"))
     } else {
         normalize_posix(&format!("{base}/{path}"))
@@ -222,6 +250,9 @@ fn join(base: &str, path: &str) -> String {
 }
 
 fn is_within(path: &str, root: &str) -> bool {
+    if is_windows_base(root) {
+        return false;
+    }
     let root = normalize_posix(root);
     root == "/"
         || path
@@ -244,6 +275,25 @@ fn normalize_posix(path: &str) -> String {
 }
 
 fn normalize_windows(path: &str) -> String {
+    if let Some(prefix_end) = windows_unc_prefix_end(path) {
+        let prefix = path[..prefix_end].replace('/', "\\");
+        let rest = &path[prefix_end..];
+        let mut parts = Vec::new();
+        for part in rest.split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        return if parts.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}\\{}", parts.join("\\"))
+        };
+    }
     let (drive, rest) = path.split_at(2);
     let mut parts = Vec::new();
     for part in rest.split(['/', '\\']) {
@@ -376,6 +426,24 @@ mod tests {
             classify("\\\\server\\a.png", &base),
             ImageTarget::Unsupported
         );
+
+        let unc_base = ImageBase::document("\\\\server\\share\\repo", "docs\\README.md");
+        assert_eq!(
+            classify("img/a.png", &unc_base),
+            path("\\\\server\\share\\repo\\docs\\img\\a.png")
+        );
+        assert_eq!(
+            classify("..\\a.png", &unc_base),
+            path("\\\\server\\share\\repo\\a.png")
+        );
+        assert_eq!(
+            classify("/assets/logo.png", &unc_base),
+            path("\\\\server\\share\\repo\\assets\\logo.png")
+        );
+        assert_eq!(
+            classify("\\\\evil\\share\\a.png", &unc_base),
+            ImageTarget::Unsupported
+        );
     }
 
     #[test]
@@ -384,6 +452,14 @@ mod tests {
         assert_eq!(split_parent("/b.png"), Some(("/", "b.png")));
         assert_eq!(split_parent("C:\\x\\b.png"), Some(("C:\\x", "b.png")));
         assert_eq!(split_parent("C:\\b.png"), Some(("C:\\", "b.png")));
+        assert_eq!(
+            split_parent("\\\\server\\share\\b.png"),
+            Some(("\\\\server\\share", "b.png"))
+        );
+        assert_eq!(
+            split_parent("\\\\server\\share\\x\\b.png"),
+            Some(("\\\\server\\share\\x", "b.png"))
+        );
         assert_eq!(split_parent("/a/"), None);
     }
 }

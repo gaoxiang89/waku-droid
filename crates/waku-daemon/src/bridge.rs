@@ -277,17 +277,41 @@ fn children_of(pid: u32, table: &[ProcessEntry]) -> impl DoubleEndedIterator<Ite
     table.iter().filter(move |entry| entry.parent == pid)
 }
 
-/// End an incompatible daemon and the sessions it owns. Its direct children
-/// are terminal shells and agent processes; closing the daemon's PTY masters
-/// already hangs up their foreground jobs, but agents run on pipes and a
-/// shell ignores SIGTERM, so each child is hung up and terminated as well.
-/// Processes a user deliberately detached from those sessions are left alone.
-fn end_daemon_and_sessions(pid: u32) {
-    let children: Vec<u32> = children_of(pid, &platform::process_table())
+fn descendant_pids(pid: u32, table: &[ProcessEntry]) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut stack: Vec<u32> = children_of(pid, table)
+        .rev()
         .map(|entry| entry.pid)
         .collect();
+    let mut seen = std::collections::HashSet::from([pid]);
+    while let Some(child) = stack.pop() {
+        if !seen.insert(child) {
+            continue;
+        }
+        if !table.iter().any(|entry| entry.pid == child) {
+            continue;
+        }
+        descendants.push(child);
+        stack.extend(children_of(child, table).rev().map(|entry| entry.pid));
+    }
+    descendants
+}
+
+/// End an incompatible daemon and the sessions it owns. On Unix, direct
+/// children are terminal shells and agent processes; closing the daemon's PTY
+/// masters hangs up foreground jobs while detached processes reparented to
+/// PID 1 are left alone. On Windows, pipe-based agent wrappers (`cmd.exe` /
+/// `pwsh.exe` -> `node.exe`) receive no PTY hangup cascade, so all live
+/// descendants rooted at `pid` are terminated.
+fn end_daemon_and_sessions(pid: u32) {
+    let table = platform::process_table();
+    let targets: Vec<u32> = if cfg!(windows) {
+        descendant_pids(pid, &table)
+    } else {
+        children_of(pid, &table).map(|entry| entry.pid).collect()
+    };
     platform::terminate(pid);
-    platform::end_children(&children);
+    platform::end_children(&targets);
 }
 
 fn read_live_state(state_dir: &Path) -> Option<BridgeState> {
@@ -492,6 +516,7 @@ mod tests {
             .map(|process| (process.pid, process.depth))
             .collect();
         assert_eq!(rows, [(11, 0), (12, 1), (13, 0)]);
+        assert_eq!(descendant_pids(10, &table), vec![11, 12, 13]);
         assert_eq!(daemon.omitted, 0);
         assert_eq!(daemon.protocol_version, 7);
     }
@@ -698,7 +723,9 @@ mod tests {
         let args = [
             OsStr::new("/d"),
             OsStr::new("/c"),
-            OsStr::new("echo %WAKU_TEST_MARKER% 1>&2 & ping -n 6 127.0.0.1 >NUL"),
+            OsStr::new(
+                "echo %WAKU_TEST_MARKER% 1>&2 & \"%SystemRoot%\\System32\\ping.exe\" -n 6 127.0.0.1 >NUL",
+            ),
         ];
         let envs = [(OsStr::new("WAKU_TEST_MARKER"), OsStr::new("isolated_ok"))];
         let (mut child, _) =
@@ -716,8 +743,8 @@ mod tests {
 
         let log_deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < log_deadline {
-            if fs::read_to_string(&log_path)
-                .map(|text| text.contains("isolated_ok"))
+            if fs::read(&log_path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).contains("isolated_ok"))
                 .unwrap_or(false)
             {
                 break;
@@ -727,7 +754,7 @@ mod tests {
 
         child.kill();
         assert!(!platform::process_is_alive(child.id()));
-        let logged = fs::read_to_string(&log_path).unwrap();
+        let logged = String::from_utf8_lossy(&fs::read(&log_path).unwrap()).into_owned();
         assert!(logged.contains("isolated_ok"), "unexpected log: {logged:?}");
 
         let _ = fs::remove_dir_all(&dir);
@@ -908,8 +935,9 @@ mod platform {
 
     use anyhow::{Context as _, bail};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -927,7 +955,7 @@ mod platform {
     use windows_sys::Win32::System::Threading::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
         CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
         OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
@@ -1197,7 +1225,57 @@ mod platform {
             has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
         unsafe { CloseHandle(snapshot) };
+        // Windows never clears `th32ParentProcessID` when a parent exits, so
+        // drop stale parent links whose PID no longer exists or was recycled
+        // by a newer process created after the child.
+        let live_pids: std::collections::HashSet<u32> =
+            table.iter().map(|entry| entry.pid).collect();
+        let mut creation_cache = std::collections::HashMap::new();
+        for row in &mut table {
+            if row.parent == 0 || row.parent == row.pid || !live_pids.contains(&row.parent) {
+                row.parent = 0;
+                continue;
+            }
+            let parent_start = *creation_cache
+                .entry(row.parent)
+                .or_insert_with(|| process_creation_time(row.parent));
+            let child_start = *creation_cache
+                .entry(row.pid)
+                .or_insert_with(|| process_creation_time(row.pid));
+            if let (Some(parent_time), Some(child_time)) = (parent_start, child_start)
+                && child_time < parent_time
+            {
+                row.parent = 0;
+            }
+        }
         table
+    }
+
+    fn process_creation_time(pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            let ok = GetProcessTimes(
+                handle,
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            );
+            CloseHandle(handle);
+            (ok != 0).then_some(
+                ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64),
+            )
+        }
     }
 
     fn append_quoted_arg(out: &mut Vec<u16>, arg: &OsStr) {
@@ -1265,7 +1343,7 @@ mod platform {
         for (key, value) in std::env::vars_os() {
             let orig_key: Vec<u16> = key.encode_wide().collect();
             let val_wide: Vec<u16> = value.encode_wide().collect();
-            if orig_key.contains(&0) || val_wide.contains(&0) {
+            if orig_key.is_empty() || orig_key.contains(&0) || val_wide.contains(&0) {
                 continue;
             }
             entries.insert(fold_env_key_upper(&key), (orig_key, val_wide));

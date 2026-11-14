@@ -1838,7 +1838,8 @@ impl Waku {
             None
         };
 
-        let refresh_host = host_key.clone();
+        let refresh_click_host = host_key.clone();
+        let refresh_key_host = host_key.clone();
         let refresh = div()
             .id("refresh-providers")
             .tab_index(0)
@@ -1863,12 +1864,15 @@ impl Waku {
                 tr!("common.refresh")
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                if refresh_host == waku_client::hosts::HostKey::Local {
-                    this.refresh_provider_detection(None);
-                } else {
-                    this.refresh_host_catalog(refresh_host.clone(), None, true);
+                this.refresh_providers_for_host(refresh_click_host.clone(), cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.refresh_providers_for_host(refresh_key_host.clone(), cx);
+                    cx.stop_propagation();
                 }
-                cx.notify();
             }));
 
         let host_tabs = self
@@ -1889,7 +1893,13 @@ impl Waku {
             let binary_path = probe
                 .filter(|probe| probe.installed)
                 .and_then(|probe| probe.path.as_deref())
-                .map(|path| abbreviate_home_path(path, self.home_directory.as_deref()));
+                .map(|path| {
+                    if local {
+                        abbreviate_home_path(path, self.home_directory.as_deref())
+                    } else {
+                        path.display().to_string()
+                    }
+                });
             let model_count = probe.map(|probe| probe.models.len()).unwrap_or(0);
             let version = local
                 .then(|| self.provider_versions.get(&kind))
@@ -2164,9 +2174,15 @@ impl Waku {
             .hover(|element| element.bg(theme.overlay))
             .child(tr!("common.reset"))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.provider_path_input
-                    .update(cx, |input, cx| input.clear(cx));
-                this.apply_provider_path_override(cx);
+                this.reset_provider_path_override(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.reset_provider_path_override(cx);
+                    cx.stop_propagation();
+                }
             }));
 
         div()
@@ -2281,7 +2297,10 @@ impl Waku {
             let is_last = index + 1 == account_count;
             let account_id = account.id.clone();
             let dir_display = abbreviate_home_path(Path::new(&account.config_dir), home);
-            let login_cmd = format_account_login_command(account.provider, &account.config_dir);
+            let windows_shell =
+                (local && cfg!(windows)) || looks_like_windows_path(account.config_dir.trim());
+            let login_cmd =
+                format_account_login_command(account.provider, &account.config_dir, windows_shell);
             let copy_login_cmd = login_cmd.clone();
             let key_login_cmd = login_cmd;
             let feedback_id = format!("provider-account-login-{account_id}");
@@ -2827,14 +2846,14 @@ impl Waku {
         let local = host_key == waku_client::hosts::HostKey::Local;
         let home = local.then_some(self.home_directory.as_deref()).flatten();
         let config_dir = expand_account_config_dir(&raw_dir, home, local);
-        let candidate_key = normalized_config_dir_key(&config_dir);
+        let candidate_key = account_config_dir_key(&config_dir, local);
 
         let default_hint = default_account_hint_path(kind, home, local);
         let matches_default = if local {
             default_provider_config_dir(kind, home)
-                .is_some_and(|default_dir| normalized_config_dir_key(&default_dir) == candidate_key)
+                .is_some_and(|default_dir| account_config_dir_key(&default_dir, local) == candidate_key)
         } else {
-            normalized_config_dir_key(Path::new(&default_hint)) == candidate_key
+            account_config_dir_key(Path::new(&default_hint), local) == candidate_key
         };
         if matches_default {
             self.account_form_error = Some(tr!(
@@ -2855,7 +2874,7 @@ impl Waku {
             .any(|existing| {
                 existing.provider == kind
                     && editing_id != Some(existing.id.as_str())
-                    && normalized_config_dir_key(Path::new(&existing.config_dir)) == candidate_key
+                    && account_config_dir_key(Path::new(&existing.config_dir), local) == candidate_key
             });
         if duplicate {
             self.account_form_error = Some(tr!(
@@ -3173,6 +3192,32 @@ impl Waku {
 
     fn render_computer_use_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
+        if self.daemon.is_remote() {
+            return div()
+                .mt(px(15.0))
+                .w_full()
+                .px(px(20.0))
+                .py(px(16.0))
+                .rounded(px(13.0))
+                .bg(theme.raised)
+                .child(
+                    div()
+                        .text_size(sp(13.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(tr!("daemon.external_title")),
+                )
+                .child(
+                    div()
+                        .mt(px(5.0))
+                        .text_size(sp(12.5))
+                        .line_height(sp(18.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("daemon.external_description")),
+                )
+                .into_any_element();
+        }
+
         let enabled = self.state.computer_use_enabled;
         let permissions = self.computer_permissions.clone();
         let pending = self.computer_permission_request_pending;
@@ -3189,6 +3234,8 @@ impl Waku {
         } else {
             for (index, grant) in self.state.computer_use_allowed_apps.iter().enumerate() {
                 let key = grant.key();
+                let click_key = key.clone();
+                let key_key = key.clone();
                 let is_last = index + 1 == self.state.computer_use_allowed_apps.len();
                 let app_icon = self.computer_use_app_icon(&grant.bundle_id, cx);
                 allowed_apps = allowed_apps.child(
@@ -3233,6 +3280,8 @@ impl Waku {
                         .child(
                             div()
                                 .id(SharedString::from(format!("revoke-computer-app-{key}")))
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_color(theme.accent))
                                 .h(px(25.0))
                                 .px(px(9.0))
                                 .rounded(px(6.0))
@@ -3246,7 +3295,15 @@ impl Waku {
                                 .hover(|element| element.bg(theme.overlay).text_color(theme.danger))
                                 .child(tr!("common.revoke"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.revoke_computer_app(&key, cx);
+                                    this.revoke_computer_app(&click_key, cx);
+                                }))
+                                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                                    if !event.keystroke.modifiers.modified()
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        this.revoke_computer_app(&key_key, cx);
+                                        cx.stop_propagation();
+                                    }
                                 })),
                         ),
                 );
@@ -3274,10 +3331,29 @@ impl Waku {
                             .min_w_0()
                             .child(
                                 div()
-                                    .text_size(sp(13.5))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(tr!("computer_use.allow_apps")),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .text_size(sp(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(tr!("computer_use.allow_apps")),
+                                    )
+                                    .when(self.selected_daemon().is_remote(), |element| {
+                                        element.child(
+                                            div()
+                                                .px(px(7.0))
+                                                .py(px(2.0))
+                                                .rounded(px(999.0))
+                                                .bg(theme.overlay)
+                                                .text_size(sp(11.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.text_secondary)
+                                                .child(tr!("daemon.status_local")),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -3341,6 +3417,8 @@ impl Waku {
                             div().mt(px(11.0)).flex().items_center().gap(px(8.0)).child(
                                 div()
                                     .id("recheck-computer-permissions")
+                                    .tab_index(0)
+                                    .focus_visible(|style| style.border_color(theme.accent))
                                     .h(px(28.0))
                                     .px(px(11.0))
                                     .rounded(px(7.0))
@@ -3359,6 +3437,17 @@ impl Waku {
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.request_computer_permissions(false, cx);
+                                    }))
+                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                        if !event.keystroke.modifiers.modified()
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            this.request_computer_permissions(false, cx);
+                                            cx.stop_propagation();
+                                        }
                                     })),
                             ),
                         ),
@@ -3427,7 +3516,8 @@ impl Waku {
     }
 
     pub(super) fn request_computer_permissions(&mut self, prompt: bool, cx: &mut Context<Self>) {
-        if !cfg!(target_os = "macos")
+        if self.daemon.is_remote()
+            || !cfg!(target_os = "macos")
             || !crate::computer_use::is_available()
             || self.computer_permission_request_pending
         {
@@ -3465,6 +3555,25 @@ impl Waku {
             .retain(|grant| grant.key() != key);
         self.save();
         cx.notify();
+    }
+
+    fn refresh_providers_for_host(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        if host == waku_client::hosts::HostKey::Local {
+            self.refresh_provider_detection(None);
+        } else {
+            self.refresh_host_catalog(host, None, true);
+        }
+        cx.notify();
+    }
+
+    fn reset_provider_path_override(&mut self, cx: &mut Context<Self>) {
+        self.provider_path_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.apply_provider_path_override(cx);
     }
 
     fn computer_use_app_icon(
@@ -3624,6 +3733,7 @@ impl Waku {
         self.refresh_command_palette_localized_text(cx);
         self.refresh_file_search_localized_text(cx);
         self.refresh_transcript_search_localized_text(cx);
+        self.refresh_connections_localized_text(cx);
         for browser in self.right_panel_browsers.values() {
             browser.update(cx, |browser, cx| browser.refresh_localized_text(cx));
         }
@@ -3723,16 +3833,24 @@ fn default_provider_config_dir(kind: ProviderKind, home: Option<&Path>) -> Optio
     }
 }
 
-fn format_account_login_command(kind: ProviderKind, config_dir: &str) -> String {
+fn format_account_login_command(
+    kind: ProviderKind,
+    config_dir: &str,
+    windows_shell: bool,
+) -> String {
     let trimmed = config_dir.trim();
     let quoted = if trimmed.contains(' ') {
         format!("\"{trimmed}\"")
     } else {
         trimmed.to_owned()
     };
-    match kind {
-        ProviderKind::Claude => format!("CLAUDE_CONFIG_DIR={quoted} claude auth login"),
-        ProviderKind::Codex => format!("CODEX_HOME={quoted} codex login"),
+    match (kind, windows_shell) {
+        (ProviderKind::Claude, true) => {
+            format!("$env:CLAUDE_CONFIG_DIR={quoted}; claude auth login")
+        }
+        (ProviderKind::Claude, false) => format!("CLAUDE_CONFIG_DIR={quoted} claude auth login"),
+        (ProviderKind::Codex, true) => format!("$env:CODEX_HOME={quoted}; codex login"),
+        (ProviderKind::Codex, false) => format!("CODEX_HOME={quoted} codex login"),
         _ => String::new(),
     }
 }
@@ -3763,12 +3881,29 @@ fn expand_account_config_dir(raw: &str, home: Option<&Path>, local: bool) -> Pat
     PathBuf::from(trimmed)
 }
 
-fn normalized_config_dir_key(path: &Path) -> String {
+fn looks_like_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with(r"\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn account_config_dir_key(path: &Path, local: bool) -> String {
+    let raw = path.to_string_lossy();
+    normalized_config_dir_key(
+        path,
+        (local && cfg!(windows)) || looks_like_windows_path(&raw),
+    )
+}
+
+fn normalized_config_dir_key(path: &Path, case_insensitive: bool) -> String {
     let mut text = path.to_string_lossy().replace('\\', "/");
     while text.len() > 1 && text.ends_with('/') {
         text.pop();
     }
-    if cfg!(windows) {
+    if case_insensitive {
         text.make_ascii_lowercase();
     }
     text
@@ -3799,6 +3934,8 @@ fn permission_status_row(
     } else {
         div()
             .id(id)
+            .tab_index(0)
+            .focus_visible(|style| style.border_color(theme.accent))
             .h(px(25.0))
             .px(px(9.0))
             .rounded(px(6.0))
@@ -3813,6 +3950,14 @@ fn permission_status_row(
             .child(tr!("computer_use.grant_access"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.request_computer_permissions(true, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.request_computer_permissions(true, cx);
+                    cx.stop_propagation();
+                }
             }))
     };
 
@@ -3848,7 +3993,10 @@ fn permission_status_row(
 
 #[cfg(test)]
 mod tests {
-    use super::abbreviate_home_path;
+    use super::{
+        ProviderKind, abbreviate_home_path, format_account_login_command,
+        normalized_config_dir_key,
+    };
     use std::path::Path;
 
     #[test]
@@ -3862,6 +4010,42 @@ mod tests {
         assert_eq!(
             abbreviate_home_path(Path::new("/opt/homebrew/bin/codex"), Some(home)),
             "/opt/homebrew/bin/codex"
+        );
+    }
+
+    #[test]
+    fn config_dir_keys_preserve_posix_case_when_case_sensitive() {
+        assert_eq!(
+            normalized_config_dir_key(Path::new("/home/Alice/.claude-Work/"), false),
+            "/home/Alice/.claude-Work"
+        );
+        assert_eq!(
+            normalized_config_dir_key(Path::new(r"C:\Users\Alice\.claude-Work\"), true),
+            "c:/users/alice/.claude-work"
+        );
+    }
+
+    #[test]
+    fn account_login_commands_use_powershell_only_for_windows_shells() {
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Claude,
+                r"C:\Users\My Name\.claude-alt",
+                true
+            ),
+            r#"$env:CLAUDE_CONFIG_DIR="C:\Users\My Name\.claude-alt"; claude auth login"#
+        );
+        assert_eq!(
+            format_account_login_command(ProviderKind::Codex, "~/.codex-work", true),
+            "$env:CODEX_HOME=~/.codex-work; codex login"
+        );
+        assert_eq!(
+            format_account_login_command(ProviderKind::Claude, "/home/alice/.claude work", false),
+            "CLAUDE_CONFIG_DIR=\"/home/alice/.claude work\" claude auth login"
+        );
+        assert_eq!(
+            format_account_login_command(ProviderKind::Codex, "~/.codex-work", false),
+            "CODEX_HOME=~/.codex-work codex login"
         );
     }
 }

@@ -192,13 +192,16 @@ done
 # one is a warning: CI always stages both.
 if [ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]; then
   mkdir -p "$contents/Resources/remote"
-  for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
-    if [ ! -f "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" ]; then
-      echo "warning: WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon; Linux hosts of that architecture cannot be reached." >&2
-      continue
-    fi
-    cp "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" "$contents/Resources/remote/$remote_daemon"
+  for candidate in "$WAKU_REMOTE_DAEMONS_DIR"/waku-daemon-*; do
+    [ -f "$candidate" ] || continue
+    remote_daemon="$(basename "$candidate")"
+    cp "$candidate" "$contents/Resources/remote/$remote_daemon"
     chmod 755 "$contents/Resources/remote/$remote_daemon"
+  done
+  for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
+    if [ ! -f "$contents/Resources/remote/$remote_daemon" ]; then
+      echo "warning: WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon; Linux hosts of that architecture cannot be reached." >&2
+    fi
   done
 elif [ "$profile" = "release" ]; then
   echo "warning: WAKU_REMOTE_DAEMONS_DIR is not set; this bundle cannot connect to Linux hosts." >&2

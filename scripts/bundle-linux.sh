@@ -28,11 +28,13 @@ install -Dm755 "$target_dir/release/waku-daemon" "$package_dir/bin/waku-daemon"
 # A local build usually stages only this machine's architecture, so a missing
 # one is a warning: CI always stages both.
 if [[ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]]; then
+  for candidate in "$WAKU_REMOTE_DAEMONS_DIR"/waku-daemon-*; do
+    [[ -f "$candidate" ]] || continue
+    remote_daemon="$(basename "$candidate")"
+    install -Dm755 "$candidate" "$package_dir/share/waku/remote/$remote_daemon"
+  done
   for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
-    if [[ -f "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" ]]; then
-      install -Dm755 "$WAKU_REMOTE_DAEMONS_DIR/$remote_daemon" \
-        "$package_dir/share/waku/remote/$remote_daemon"
-    else
+    if [[ ! -f "$package_dir/share/waku/remote/$remote_daemon" ]]; then
       echo "warning: WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon; SSH hosts of that architecture cannot be reached." >&2
     fi
   done

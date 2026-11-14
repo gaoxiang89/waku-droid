@@ -3,7 +3,7 @@ use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
@@ -361,7 +361,7 @@ impl DaemonProcess {
         self.client.lock().shutdown();
         let _ = std::fs::remove_file(&self.state_file);
         let Some(child) = self.child.as_mut() else {
-            std::thread::sleep(SHUTDOWN_TIMEOUT);
+            let _ = wait_for_resident_exit(self.pid, SHUTDOWN_TIMEOUT);
             return;
         };
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
@@ -475,7 +475,10 @@ impl RemoteEndpoint {
                 connection,
                 session,
             } => {
-                let session = Arc::new(BridgeSession::spawn(connection, session.target())?);
+                let session = Arc::new(match BridgeSession::spawn(connection, session.target()) {
+                    Ok(session) => session,
+                    Err(_) => BridgeSession::open_with(connection, false)?,
+                });
                 let client = DaemonClient::connect_with_resume(
                     session.address(),
                     session.token().to_owned(),
@@ -501,6 +504,19 @@ impl DaemonTarget {
             Self::Remote { client, .. } => client.clone(),
         }
     }
+
+    fn take_local(&mut self) -> Option<DaemonProcess> {
+        match self {
+            Self::Local(process) => {
+                let disconnected = process.client();
+                match std::mem::replace(self, Self::Restarting(disconnected)) {
+                    Self::Local(process) => Some(process),
+                    _ => unreachable!("local daemon target changed while locked"),
+                }
+            }
+            Self::Restarting(_) | Self::Remote { .. } => None,
+        }
+    }
 }
 
 /// A disconnected transport the monitor should re-establish this tick.
@@ -518,9 +534,11 @@ enum DisconnectedTarget {
 
 /// Owns the current daemon and, in development, swaps it after a successful
 /// rebuild without requiring the desktop process to relaunch.
-#[derive(Clone)]
 pub struct DaemonSupervisor {
     inner: Arc<SupervisorInner>,
+    // Track external supervisor handles independently of `Arc::strong_count(&inner)`
+    // because background monitor/settings threads temporarily upgrade `Weak<SupervisorInner>`.
+    handles: Arc<AtomicUsize>,
 }
 
 impl DaemonSupervisor {
@@ -667,7 +685,10 @@ impl DaemonSupervisor {
             .name("waku-daemon-settings".into())
             .spawn(move || persist_settings(weak_inner, settings_update_rx))
             .context("could not start Waku daemon settings writer")?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            handles: Arc::new(AtomicUsize::new(1)),
+        })
     }
 
     pub fn client(&self) -> DaemonClient {
@@ -744,11 +765,36 @@ impl DaemonSupervisor {
             .send(settings)
             .map_err(|_| anyhow::anyhow!("Waku daemon settings writer is closed"))
     }
+
+    /// Stops monitoring and shuts down the desktop-managed local daemon, if any.
+    pub fn stop_local(&self) {
+        self.inner.running.store(false, Ordering::Release);
+        if self.inner.executable.is_none()
+            && matches!(&*self.inner.target.lock(), DaemonTarget::Remote { .. })
+        {
+            return;
+        }
+        let _restart = self.inner.restart.lock();
+        let previous = self.inner.target.lock().take_local();
+        if let Some(mut process) = previous {
+            process.stop();
+        }
+    }
+}
+
+impl Clone for DaemonSupervisor {
+    fn clone(&self) -> Self {
+        self.handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+            handles: Arc::clone(&self.handles),
+        }
+    }
 }
 
 impl Drop for DaemonSupervisor {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.inner.running.store(false, Ordering::Release);
         }
     }
@@ -809,6 +855,9 @@ fn monitor_daemon(
             }) => {
                 if Instant::now() >= next_remote_attempt {
                     let _restart = inner.restart.lock();
+                    if !inner.running.load(Ordering::Acquire) {
+                        return;
+                    }
                     let still_current = matches!(
                         &*inner.target.lock(),
                         DaemonTarget::Remote { client, .. }
@@ -820,6 +869,10 @@ fn monitor_daemon(
                         // wait behind it.
                         match endpoint.reconnect(resume_from) {
                             Ok((replacement, endpoint)) => {
+                                if !inner.running.load(Ordering::Acquire) {
+                                    replacement.disconnect();
+                                    return;
+                                }
                                 remote_backoff = REBUILD_POLL_INTERVAL;
                                 *inner.target.lock() = DaemonTarget::Remote {
                                     client: replacement.clone(),
@@ -831,6 +884,9 @@ fn monitor_daemon(
                                 });
                             }
                             Err(error) => {
+                                if !inner.running.load(Ordering::Acquire) {
+                                    return;
+                                }
                                 eprintln!("could not reconnect to the Waku daemon: {error:#}");
                                 remote_backoff = (remote_backoff * 2).min(MAX_REMOTE_BACKOFF);
                                 next_remote_attempt = Instant::now() + remote_backoff;
@@ -848,6 +904,9 @@ fn monitor_daemon(
                 // the crashed-process path below stays reachable because a
                 // backoff-gated tick matches no arm above and falls through.
                 let _restart = inner.restart.lock();
+                if !inner.running.load(Ordering::Acquire) {
+                    return;
+                }
                 let current = {
                     let target = inner.target.lock();
                     match &*target {
@@ -876,6 +935,10 @@ fn monitor_daemon(
                             // UI-side `client()` calls must not wait.
                             match DaemonClient::connect_with_resume(&address, token, resume_from) {
                                 Ok(replacement) => {
+                                    if !inner.running.load(Ordering::Acquire) {
+                                        replacement.disconnect();
+                                        return;
+                                    }
                                     local_backoff = REBUILD_POLL_INTERVAL;
                                     next_local_attempt = Instant::now();
                                     let mut target = inner.target.lock();
@@ -897,6 +960,9 @@ fn monitor_daemon(
                                     }
                                 }
                                 Err(error) => {
+                                    if !inner.running.load(Ordering::Acquire) {
+                                        return;
+                                    }
                                     eprintln!("could not reconnect to the Waku daemon: {error:#}");
                                     local_backoff = (local_backoff * 2).min(MAX_REMOTE_BACKOFF);
                                     next_local_attempt = Instant::now() + local_backoff;
@@ -926,6 +992,9 @@ fn monitor_daemon(
             continue;
         }
         let _restart = inner.restart.lock();
+        if !inner.running.load(Ordering::Acquire) {
+            return;
+        }
         let Some(exposure) = inner.exposure.lock().clone() else {
             return;
         };
@@ -973,21 +1042,10 @@ fn replace_local_daemon(
     }
     let previous = {
         let mut target = inner.target.lock();
-        match &*target {
-            DaemonTarget::Remote { .. } => {
-                bail!("the connected daemon is managed outside Waku Desktop")
-            }
-            DaemonTarget::Restarting(_) => None,
-            DaemonTarget::Local(process) => {
-                let disconnected = process.client();
-                let previous =
-                    std::mem::replace(&mut *target, DaemonTarget::Restarting(disconnected));
-                match previous {
-                    DaemonTarget::Local(process) => Some(process),
-                    _ => unreachable!("local daemon target changed while locked"),
-                }
-            }
+        if matches!(&*target, DaemonTarget::Remote { .. }) {
+            bail!("the connected daemon is managed outside Waku Desktop");
         }
+        target.take_local()
     };
     // Dropping can wait briefly for graceful shutdown, but the target lock is
     // already released so UI actions never block behind process teardown.
@@ -1013,16 +1071,42 @@ fn resident_process_alive(pid: u32) -> bool {
 }
 #[cfg(windows)]
 fn resident_process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+    if pid == 0 {
+        return false;
+    }
     unsafe {
+        let synch_handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        );
+        if !synch_handle.is_null() {
+            // `STILL_ACTIVE` (259) is also a legal process exit code; `WaitForSingleObject`
+            // is signaled (`WAIT_OBJECT_0`) only once the process actually terminates.
+            let wait = WaitForSingleObject(synch_handle, 0);
+            let mut code = 0_u32;
+            let result = GetExitCodeProcess(synch_handle, &mut code);
+            CloseHandle(synch_handle);
+            if wait == WAIT_OBJECT_0 {
+                return false;
+            }
+            if wait == WAIT_TIMEOUT {
+                return result == 0 || code == STILL_ACTIVE as u32;
+            }
+            return result == 0 || code == STILL_ACTIVE as u32;
+        }
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
             return false;
         }
-        let mut code = 0;
+        let mut code = 0_u32;
         let result = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
         result == 0 || code == STILL_ACTIVE as u32
@@ -1189,5 +1273,142 @@ mod tests {
             current_process_enforces_redirection_trust()
         );
         assert!(!resident_daemon_tainted(pid));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_process_alive_distinguishes_live_and_exited_259_processes() {
+        assert!(!resident_process_alive(0));
+        assert!(resident_process_alive(std::process::id()));
+
+        let mut child = ProcessCommand::new("cmd.exe")
+            .args(["/d", "/c", "exit 259"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "exit-259 child did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(259));
+        // `child` is still in scope holding the Windows process handle, so
+        // `OpenProcess` still observes exit code 259 (`STILL_ACTIVE`).
+        assert!(
+            !resident_process_alive(pid),
+            "exited process with exit code 259 must not be reported alive"
+        );
+        drop(child);
+        assert!(!resident_process_alive(pid));
+    }
+
+    #[test]
+    fn supervisor_handle_drop_stops_monitoring_and_stop_local_shuts_down_local_daemon() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let Ok(stream) = stream else { break };
+                let shutdown_tx = shutdown_tx.clone();
+                handlers.push(std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let hello = match ws.read().unwrap() {
+                        tungstenite::Message::Text(text) => {
+                            serde_json::from_str::<waku_protocol::ClientMessage>(text.as_ref())
+                                .unwrap()
+                        }
+                        other => panic!("unexpected handshake frame: {other:?}"),
+                    };
+                    assert!(matches!(hello, waku_protocol::ClientMessage::Hello { .. }));
+                    ws.send(tungstenite::Message::Text(
+                        serde_json::to_string(&waku_protocol::ServerMessage::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_version: "test".into(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .unwrap();
+                    while let Ok(msg) = ws.read() {
+                        if let tungstenite::Message::Text(text) = msg {
+                            if let Ok(waku_protocol::ClientMessage::Shutdown) =
+                                serde_json::from_str(text.as_ref())
+                            {
+                                let _ = shutdown_tx.send(());
+                                break;
+                            }
+                        } else if matches!(msg, tungstenite::Message::Close(_)) {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let client1 = DaemonClient::connect(&addr, "tok".into()).unwrap();
+        let supervisor = DaemonSupervisor::from_target(
+            DaemonTarget::Restarting(client1.clone()),
+            None,
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        // Simulate `monitor_daemon` holding an upgraded `Arc<SupervisorInner>`.
+        let active_monitor_arc = Arc::clone(&supervisor.inner);
+        let cloned = supervisor.clone();
+        assert!(active_monitor_arc.running.load(Ordering::Acquire));
+        drop(supervisor);
+        assert!(active_monitor_arc.running.load(Ordering::Acquire));
+        drop(cloned);
+        assert!(!active_monitor_arc.running.load(Ordering::Acquire));
+        client1.disconnect();
+
+        let client2 = DaemonClient::connect(&addr, "tok".into()).unwrap();
+        let child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let state_file =
+            std::env::temp_dir().join(format!("waku-supervisor-test-{}.json", Uuid::new_v4()));
+        let process = DaemonProcess {
+            client: Mutex::new(client2),
+            address: addr,
+            token: "tok".into(),
+            child: Some(child),
+            state_file,
+            pid: std::process::id(),
+        };
+        let local_supervisor = DaemonSupervisor::from_target(
+            DaemonTarget::Local(process),
+            None,
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        local_supervisor.stop_local();
+        assert!(!local_supervisor.inner.running.load(Ordering::Acquire));
+        assert!(matches!(
+            &*local_supervisor.inner.target.lock(),
+            DaemonTarget::Restarting(_)
+        ));
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stop_local should send ClientMessage::Shutdown");
+        server.join().unwrap();
     }
 }

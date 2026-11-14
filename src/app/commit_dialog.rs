@@ -147,8 +147,10 @@ impl Waku {
                 reasoning_effort,
                 config_dir,
             });
+        let host = self.selected_host_key();
+        let workspace_client = self.workspace_client_for_host(&host);
         let scope = PanelScope {
-            host: self.selected_host_key(),
+            host,
             workspace: workspace.clone(),
         };
         let cached_branch = self
@@ -194,8 +196,6 @@ impl Waku {
         });
         cx.notify();
 
-        let workspace_client =
-            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -330,6 +330,18 @@ impl Waku {
         cx.notify();
     }
 
+    fn workspace_client_for_host(
+        &self,
+        host: &waku_client::hosts::HostKey,
+    ) -> waku_client::WorkspaceClient {
+        let daemon = self
+            .hosts
+            .get(host)
+            .map(|entry| entry.daemon.clone())
+            .unwrap_or_else(|| self.selected_daemon().clone());
+        waku_client::WorkspaceClient::for_daemon(daemon)
+    }
+
     fn spawn_commit_message_generation(
         &mut self,
         id: Uuid,
@@ -340,8 +352,7 @@ impl Waku {
         window_handle: gpui::AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let workspace_client =
-            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        let workspace_client = self.workspace_client_for_host(&scope.host);
         cx.spawn(async move |waku, cx| {
             let generation_workspace = scope.workspace.clone();
             let result = cx
@@ -423,8 +434,7 @@ impl Waku {
         window_handle: gpui::AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
-        let workspace_client =
-            waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        let workspace_client = self.workspace_client_for_host(&scope.host);
         cx.spawn(async move |waku, cx| {
             let operation_workspace = scope.workspace.clone();
             let result = cx

@@ -373,10 +373,63 @@ fn visible_project_sessions(
     (visible, older_seen > revealed_older_sessions)
 }
 
-fn sidebar_project_is_projectless(project: &Project, projectless_roots: &[PathBuf]) -> bool {
-    projectless_roots
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LexicalRoot {
+    Drive(u8),
+    Unc,
+    Posix,
+    Relative,
+}
+
+fn lexical_path_parts(path: &Path) -> (LexicalRoot, Vec<String>, bool) {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let (root, rest, case_insensitive) = if normalized.starts_with("//") {
+        (LexicalRoot::Unc, &normalized[2..], true)
+    } else if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        (
+            LexicalRoot::Drive(bytes[0].to_ascii_lowercase()),
+            &normalized[2..],
+            true,
+        )
+    } else if normalized.starts_with('/') {
+        (LexicalRoot::Posix, &normalized[1..], false)
+    } else {
+        (LexicalRoot::Relative, normalized.as_str(), cfg!(windows))
+    };
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (root, segments, case_insensitive)
+}
+
+fn lexical_path_starts_with(path: &Path, root: &Path) -> bool {
+    let (path_root, path_segments, path_ci) = lexical_path_parts(path);
+    let (root_kind, root_segments, root_ci) = lexical_path_parts(root);
+    if path_root != root_kind || root_segments.is_empty() || path_segments.len() < root_segments.len()
+    {
+        return false;
+    }
+    let case_insensitive = path_ci || root_ci;
+    root_segments
         .iter()
-        .any(|root| project.path.starts_with(root))
+        .zip(path_segments.iter())
+        .all(|(root_segment, path_segment)| {
+            if case_insensitive {
+                root_segment.eq_ignore_ascii_case(path_segment)
+            } else {
+                root_segment == path_segment
+            }
+        })
+}
+
+fn sidebar_project_is_projectless(project: &Project, projectless_roots: &[PathBuf]) -> bool {
+    project.is_projectless()
+        || projectless_roots
+            .iter()
+            .any(|root| lexical_path_starts_with(&project.path, root))
 }
 
 fn persisted_sidebar_branch_label(workspace: &SessionWorkspace) -> Option<&str> {
@@ -3328,6 +3381,30 @@ mod tests {
         assert!(sidebar_project_is_projectless(&projectless, &roots));
         assert!(!sidebar_project_is_projectless(&ordinary, &roots));
         assert!(!sidebar_project_is_projectless(&projectless, &[]));
+    }
+
+    #[test]
+    fn projectless_roots_match_cross_os_paths_lexically() {
+        let windows_projectless = Project {
+            id: Uuid::from_u128(3),
+            name: "WinTask".to_owned(),
+            path: PathBuf::from(r"c:\Users\Me\.waku\projects\2026-08-23\task"),
+            created_at: 0,
+        };
+        let win_roots = [PathBuf::from(r"C:\users\me\.waku\projects/")];
+        assert!(sidebar_project_is_projectless(
+            &windows_projectless,
+            &win_roots
+        ));
+
+        let unc_projectless = Project {
+            id: Uuid::from_u128(4),
+            name: "UncTask".to_owned(),
+            path: PathBuf::from(r"\\Host\Share\.waku\projects\2026-08-23\task"),
+            created_at: 0,
+        };
+        let unc_roots = [PathBuf::from("//host/share/.waku/projects")];
+        assert!(sidebar_project_is_projectless(&unc_projectless, &unc_roots));
     }
 
     #[test]

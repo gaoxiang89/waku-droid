@@ -17,6 +17,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::{Theme, sp};
 
+const MASK_CHAR: char = '\u{2022}';
+
 actions!(
     composer,
     [
@@ -632,6 +634,7 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     mode: FieldMode,
     read_only: bool,
+    masked: bool,
     /// Enter submits this multi-line field instead of inserting a newline;
     /// Shift+Enter still breaks the line. (One-line fields always submit.)
     submit_on_enter: bool,
@@ -738,6 +741,7 @@ impl TextInput {
             focus_handle,
             mode: FieldMode::SingleLine,
             read_only: false,
+            masked: false,
             submit_on_enter: false,
             auto_height: false,
             accepts_media_paste: false,
@@ -922,6 +926,73 @@ impl TextInput {
         self.read_only = read_only;
     }
 
+    /// Mask entered characters with bullet glyphs and disable copying text out.
+    pub fn masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
+        self
+    }
+
+    /// Toggle masked display after construction.
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked != masked {
+            self.masked = masked;
+            self.vertical_navigation = None;
+            self.caret_reconciled = None;
+            cx.notify();
+        }
+    }
+
+    fn display_byte_len(&self) -> usize {
+        if self.masked {
+            self.content.chars().count() * MASK_CHAR.len_utf8()
+        } else {
+            self.content.len()
+        }
+    }
+
+    fn display_content(&self) -> SharedString {
+        if self.masked {
+            std::iter::repeat_n(MASK_CHAR, self.content.chars().count())
+                .collect::<String>()
+                .into()
+        } else {
+            self.content.clone()
+        }
+    }
+
+    fn floor_char_boundary(&self, offset: usize) -> usize {
+        let mut clamped = offset.min(self.content.len());
+        while clamped > 0 && !self.content.is_char_boundary(clamped) {
+            clamped -= 1;
+        }
+        clamped
+    }
+
+    /// Map a byte offset in `self.content` into a byte offset in `display_content()`.
+    fn to_display_offset(&self, offset: usize) -> usize {
+        let boundary = self.floor_char_boundary(offset);
+        if !self.masked {
+            return boundary;
+        }
+        self.content[..boundary].chars().count() * MASK_CHAR.len_utf8()
+    }
+
+    fn to_display_range(&self, range: &Range<usize>) -> Range<usize> {
+        self.to_display_offset(range.start)..self.to_display_offset(range.end)
+    }
+
+    /// Map a byte offset in `display_content()` back into a byte offset in `self.content`.
+    fn from_display_offset(&self, display_offset: usize) -> usize {
+        if !self.masked {
+            return self.floor_char_boundary(display_offset);
+        }
+        let char_index = display_offset / MASK_CHAR.len_utf8();
+        self.content
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.content.len(), |(offset, _)| offset)
+    }
+
     /// Re-tokenize after a content change. Cheap for a composer (no language),
     /// one linear pass for a code editor.
     fn refresh_highlight(&mut self) {
@@ -1066,7 +1137,7 @@ impl TextInput {
     /// field has painted once.
     pub fn position_for_offset(&self, offset: usize) -> Option<(Point<Pixels>, Pixels)> {
         let layout = self.last_layout.as_ref()?;
-        let position = layout.position_for_index(offset.min(self.content.len()))?;
+        let position = layout.position_for_index(self.to_display_offset(offset))?;
         Some((position, layout.line_height()))
     }
 
@@ -1218,7 +1289,7 @@ impl TextInput {
         let Some(layout) = self
             .last_layout
             .as_ref()
-            .filter(|layout| layout.len() == self.content.len())
+            .filter(|layout| layout.len() == self.display_byte_len())
         else {
             // The field normally has a current layout whenever it can receive
             // a key. If an edit and this action race the next paint, let an
@@ -1248,7 +1319,7 @@ impl TextInput {
         let (current_row, goal_x) = if let Some(navigation) = continuing {
             (navigation.visual_row, navigation.goal_x)
         } else {
-            let Some(position) = layout.position_for_index(anchor) else {
+            let Some(position) = layout.position_for_index(self.to_display_offset(anchor)) else {
                 self.vertical_navigation = None;
                 cx.propagate();
                 return;
@@ -1274,11 +1345,13 @@ impl TextInput {
             return;
         }
 
-        let Some((offset, cursor_x)) = visual_row_offset_for_x(layout, target_row, goal_x) else {
+        let Some((display_offset, cursor_x)) = visual_row_offset_for_x(layout, target_row, goal_x)
+        else {
             self.vertical_navigation = None;
             cx.propagate();
             return;
         };
+        let offset = self.from_display_offset(display_offset);
 
         let previous_range = self.selected_range.clone();
         let previous_row = continuing.map(|navigation| navigation.visual_row);
@@ -1367,7 +1440,7 @@ impl TextInput {
         let layout = self
             .last_layout
             .as_ref()
-            .filter(|layout| layout.len() == self.content.len())?;
+            .filter(|layout| layout.len() == self.display_byte_len())?;
         let row_count = visual_row_count(layout);
         if row_count == 0 {
             return None;
@@ -1386,12 +1459,13 @@ impl TextInput {
             })
             .map(|navigation| navigation.visual_row)
             .or_else(|| {
-                let position = layout.position_for_index(cursor)?;
+                let position = layout.position_for_index(self.to_display_offset(cursor))?;
                 let row = ((position.y - bounds.top()) / layout.line_height()) as usize;
                 Some(row.min(row_count - 1))
             })?;
         let goal_x = if to_end { layout_width } else { px(0.) };
-        let (offset, cursor_x) = visual_row_offset_for_x(layout, row, goal_x)?;
+        let (display_offset, cursor_x) = visual_row_offset_for_x(layout, row, goal_x)?;
+        let offset = self.from_display_offset(display_offset);
         Some((
             offset,
             VerticalNavigation {
@@ -1772,6 +1846,9 @@ impl TextInput {
             cx.propagate();
             return;
         }
+        if self.masked {
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(
             self.content[self.selected_range.clone()].to_string(),
         ));
@@ -1779,9 +1856,11 @@ impl TextInput {
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            if !self.masked {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    self.content[self.selected_range.clone()].to_string(),
+                ));
+            }
             // Like paste, a cut never coalesces with surrounding deletions.
             self.history.seal();
             self.replace_text_in_range(None, "", window, cx);
@@ -1953,10 +2032,10 @@ impl TextInput {
         let Some(layout) = self.last_layout.as_ref() else {
             return 0;
         };
-        layout
+        let display_index = layout
             .index_for_position(position)
-            .unwrap_or_else(|index| index)
-            .min(self.content.len())
+            .unwrap_or_else(|index| index);
+        self.from_display_offset(display_index)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -2210,8 +2289,9 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        let display_range = self.to_display_range(&range);
+        let start = layout.position_for_index(display_range.start)?;
+        let end = layout.position_for_index(display_range.end)?;
         let line_height = layout.line_height();
         if start.y == end.y {
             Some(Bounds::from_corners(
@@ -2233,10 +2313,10 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let layout = self.last_layout.as_ref()?;
-        let utf8_index = layout
+        let display_index = layout
             .index_for_position(point)
-            .unwrap_or_else(|index| index)
-            .min(self.content.len());
+            .unwrap_or_else(|index| index);
+        let utf8_index = self.from_display_offset(display_index);
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -2394,9 +2474,9 @@ impl InputElement {
             (
                 input.is_visually_focused(window),
                 (
-                    input.selected_range.start,
-                    input.cursor_offset(),
-                    input.selected_range.end,
+                    input.to_display_offset(input.selected_range.start),
+                    input.to_display_offset(input.cursor_offset()),
+                    input.to_display_offset(input.selected_range.end),
                 ),
                 !input.content.is_empty() && input.selected_range == (0..input.content.len()),
                 input.scroll_offset,
@@ -2589,18 +2669,28 @@ impl Element for InputElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let input = self.input.read(cx);
-        let content = input.content.clone();
         let style = window.text_style();
         let theme = Theme::current(cx);
-        let content_is_empty = content.is_empty();
+        let content_is_empty = input.content.is_empty();
+        let masked = input.masked && !content_is_empty;
         let (display_text, text_color, selected_range, marked_range) = if content_is_empty {
             (input.placeholder.clone(), theme.text_ghost, None, None)
+        } else if masked {
+            (
+                input.display_content(),
+                style.color,
+                Some(input.to_display_range(&input.selected_range)),
+                input
+                    .marked_range
+                    .as_ref()
+                    .map(|range| input.to_display_range(range)),
+            )
         } else {
             (
-                content,
+                input.content.clone(),
                 style.color,
-                Some(&input.selected_range),
-                input.marked_range.as_ref(),
+                Some(input.selected_range.clone()),
+                input.marked_range.clone(),
             )
         };
         let base_run = TextRun {
@@ -2612,7 +2702,7 @@ impl Element for InputElement {
             strikethrough: None,
         };
         let palette = crate::md::render::Palette::from_theme(&theme);
-        let search = if content_is_empty {
+        let search = if content_is_empty || masked {
             SearchPaint::none()
         } else {
             SearchPaint {
@@ -2627,10 +2717,10 @@ impl Element for InputElement {
         let runs = input_text_runs(
             display_text.len(),
             base_run,
-            selected_range,
-            marked_range,
+            selected_range.as_ref(),
+            marked_range.as_ref(),
             theme.inverse.opacity(0.18),
-            if content_is_empty {
+            if content_is_empty || masked {
                 &[]
             } else {
                 &input.highlight
@@ -2674,6 +2764,7 @@ impl Element for InputElement {
         let (cursor_position, cursor, follow) = {
             let input = self.input.read(cx);
             let cursor = input.cursor_offset();
+            let display_cursor = input.to_display_offset(cursor);
             let cursor_visible = cursor_should_be_visible(
                 window.is_window_active(),
                 input.focus_handle.is_focused(window),
@@ -2695,7 +2786,7 @@ impl Element for InputElement {
                         layout.bounds().top() + layout.line_height() * navigation.visual_row as f32,
                     )
                 })
-                .or_else(|| layout.position_for_index(cursor));
+                .or_else(|| layout.position_for_index(display_cursor));
             let quad = (input.selected_range.is_empty() && cursor_visible)
                 .then_some(cursor_position)
                 .flatten()
@@ -2870,14 +2961,14 @@ impl Render for TextInput {
             "composer-context-menu",
             &self.context_menu,
             move |cx| {
-                let (has_selection, has_content, all_selected) = {
+                let (has_selection, has_content, all_selected, is_masked) = {
                     let input = context_menu_input.read(cx);
                     let has_selection = !input.selected_range.is_empty();
                     let has_content = !input.content.is_empty();
                     let all_selected = has_content
                         && input.selected_range.start == 0
                         && input.selected_range.end == input.content.len();
-                    (has_selection, has_content, all_selected)
+                    (has_selection, has_content, all_selected, input.masked)
                 };
                 let can_paste = cx
                     .read_from_clipboard()
@@ -2915,7 +3006,7 @@ impl Render for TextInput {
                             input.copy(&Copy, window, cx)
                         }),
                     )
-                    .disabled(!has_selection),
+                    .disabled(!has_selection || is_masked),
                     MenuItem::new(
                         tr!("menu.paste"),
                         run(&context_menu_input, |input, window, cx| {
@@ -4172,5 +4263,154 @@ mod tests {
             ),
             px(300.)
         );
+    }
+
+    #[gpui::test]
+    fn masked_input_maps_offsets_and_ime_bounds_across_unicode(cx: &mut TestAppContext) {
+        cx.update(super::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut input = TextInput::new(window, cx).masked(true);
+                input.set_content("päss中🔑", cx);
+                input
+            });
+            InputHarness {
+                input,
+                width: px(300.),
+            }
+        });
+        let input = cx.read_entity(&harness, |harness, _| harness.input.clone());
+        cx.update(|window, cx| window.focus(&input.read(cx).focus(), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                assert_eq!(input.display_content().as_ref(), "••••••");
+                assert_eq!(input.display_byte_len(), 18);
+                let layout_bounds = input
+                    .last_layout
+                    .as_ref()
+                    .expect("layout after initial frame")
+                    .bounds();
+                assert_eq!(input.last_layout.as_ref().unwrap().len(), 18);
+
+                for (content_offset, display_offset) in
+                    [(0, 0), (1, 3), (3, 6), (4, 9), (5, 12), (8, 15), (12, 18)]
+                {
+                    assert_eq!(input.to_display_offset(content_offset), display_offset);
+                    assert_eq!(input.from_display_offset(display_offset), content_offset);
+                }
+                assert_eq!(input.to_display_offset(2), 3);
+                assert_eq!(input.to_display_offset(7), 12);
+                assert_eq!(input.to_display_offset(99), 18);
+                assert_eq!(input.from_display_offset(4), 1);
+                assert_eq!(input.from_display_offset(99), 12);
+
+                let full = input
+                    .bounds_for_range(0..7, layout_bounds, window, cx)
+                    .expect("full UTF-16 range");
+                let cjk = input
+                    .bounds_for_range(4..5, layout_bounds, window, cx)
+                    .expect("CJK char UTF-16 range");
+                let emoji = input
+                    .bounds_for_range(5..7, layout_bounds, window, cx)
+                    .expect("emoji surrogate pair UTF-16 range");
+                assert!(full.size.width > px(0.));
+                assert!(cjk.size.width > px(0.));
+                assert!(emoji.size.width > px(0.));
+                assert!(cjk.right() <= emoji.left() + px(0.5));
+                assert!(emoji.right() <= full.right() + px(0.5));
+
+                assert_eq!(
+                    input.character_index_for_point(
+                        gpui::point(layout_bounds.left(), cjk.center().y),
+                        window,
+                        cx,
+                    ),
+                    Some(0)
+                );
+                assert_eq!(
+                    input.character_index_for_point(
+                        gpui::point(cjk.left() + px(0.5), cjk.center().y),
+                        window,
+                        cx,
+                    ),
+                    Some(4)
+                );
+                assert_eq!(
+                    input.character_index_for_point(
+                        gpui::point(emoji.right(), emoji.center().y),
+                        window,
+                        cx,
+                    ),
+                    Some(7)
+                );
+                assert_eq!(
+                    input.index_for_mouse_position(gpui::point(
+                        cjk.left() + px(0.5),
+                        cjk.center().y,
+                    )),
+                    5
+                );
+                let (end_pos, _) = input.position_for_offset(12).expect("end cursor position");
+                assert!((end_pos.x - emoji.right()).abs() < px(1.));
+
+                input.set_masked(false, cx);
+            });
+        });
+
+        cx.run_until_parked();
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.last_layout.as_ref().unwrap().len(), 12);
+        });
+    }
+
+    #[gpui::test]
+    fn masked_input_suppresses_clipboard_writes_on_copy_and_cut(cx: &mut TestAppContext) {
+        cx.update(super::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut input = TextInput::new(window, cx).masked(true);
+                input.set_content("top-secret", cx);
+                input
+            });
+            InputHarness {
+                input,
+                width: px(300.),
+            }
+        });
+        let input = cx.read_entity(&harness, |harness, _| harness.input.clone());
+        cx.update(|window, cx| window.focus(&input.read(cx).focus(), cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned()));
+            input.update(cx, |input, cx| {
+                input.select_range(0..3, cx);
+                input.copy(&super::Copy, window, cx);
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_owned())
+            );
+        });
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.content(), "top-secret");
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.select_range(0..4, cx);
+                input.cut(&super::Cut, window, cx);
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_owned())
+            );
+        });
+        cx.read_entity(&input, |input, _| {
+            assert_eq!(input.content(), "secret");
+            assert_eq!(input.selected_range, 0..0);
+        });
     }
 }

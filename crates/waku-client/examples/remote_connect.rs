@@ -98,8 +98,11 @@ fn kill_remote_bridge(connection: &Connection) -> anyhow::Result<()> {
             let target = waku_client::remote::deploy::probe(connection)?;
             let mut command = waku_client::remote::ssh::command(connection)?;
             if target.os == waku_client::remote::deploy::RemoteOs::Windows {
-                let ps = "([wmisearcher]\"SELECT ProcessId,CommandLine FROM Win32_Process WHERE Name='waku-daemon.exe' OR Name='waku-debug-daemon.exe'\").Get() | ForEach-Object { if ($_.CommandLine -match '\\bbridge\\b') { try { [Diagnostics.Process]::GetProcessById([int]$_.ProcessId).Kill() } catch {} } }";
-                command.arg(waku_client::remote::ssh::wrap_powershell_script(ps));
+                let ps = "Get-CimInstance Win32_Process -Filter \"Name='waku-daemon.exe' OR Name='waku-debug-daemon.exe'\" | ForEach-Object { if ($_.CommandLine -match '\\bbridge\\b') { try { [Diagnostics.Process]::GetProcessById([int]$_.ProcessId).Kill() } catch {} } }";
+                command.arg(waku_client::remote::deploy::wrap_windows_script(
+                    target.windows_shell,
+                    ps,
+                ));
             } else {
                 command.arg(waku_client::remote::ssh::wrap_posix_script(
                     "pkill -f '[w]aku-daemon bridge' || true",

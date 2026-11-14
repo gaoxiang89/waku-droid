@@ -328,18 +328,51 @@ fn safe_name(name: &str) -> io::Result<String> {
     Ok(name.to_owned())
 }
 
-fn safe_relative_path(path: &Path) -> io::Result<&Path> {
-    if path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+/// Normalizes Windows/POSIX separators and validates every segment lexically so
+/// uploads from Windows clients unpack into nested directories on POSIX daemons
+/// while traversal and drive-prefixed paths are rejected everywhere.
+fn safe_relative_path(path: &Path) -> io::Result<PathBuf> {
+    let raw = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment entry path is not valid UTF-8",
+        )
+    })?;
+    if raw.is_empty() || raw.starts_with('/') || raw.starts_with('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "attachment entry escapes its root",
         ));
     }
-    Ok(path)
+
+    let normalized = raw.replace('\\', "/");
+    let mut safe = PathBuf::new();
+    for (index, segment) in normalized.split('/').enumerate() {
+        let is_drive_prefix = index == 0
+            && segment.len() >= 2
+            && segment.as_bytes()[0].is_ascii_alphabetic()
+            && segment.as_bytes()[1] == b':';
+        if segment.is_empty()
+            || matches!(segment, "." | "..")
+            || segment.contains('\0')
+            || is_drive_prefix
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment entry escapes its root",
+            ));
+        }
+        safe.push(segment);
+    }
+
+    if safe.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment entry escapes its root",
+        ));
+    }
+
+    Ok(safe)
 }
 
 #[cfg(test)]
@@ -349,7 +382,22 @@ mod tests {
     #[test]
     fn rejects_parent_components() {
         assert!(safe_relative_path(Path::new("../secret")).is_err());
-        assert!(safe_relative_path(Path::new("nested/file.txt")).is_ok());
+        assert!(safe_relative_path(Path::new("..\\secret")).is_err());
+        assert!(safe_relative_path(Path::new("C:\\evil")).is_err());
+        assert!(safe_relative_path(Path::new("C:evil")).is_err());
+        assert!(safe_relative_path(Path::new("/abs/file.txt")).is_err());
+        assert!(safe_relative_path(Path::new("\\abs\\file.txt")).is_err());
+        assert!(safe_relative_path(Path::new("nested//file.txt")).is_err());
+        assert!(safe_relative_path(Path::new("./nested/file.txt")).is_err());
+        assert!(safe_relative_path(Path::new("")).is_err());
+        assert_eq!(
+            safe_relative_path(Path::new("nested\\sub\\file.txt")).unwrap(),
+            PathBuf::from("nested").join("sub").join("file.txt")
+        );
+        assert_eq!(
+            safe_relative_path(Path::new("nested/file.txt")).unwrap(),
+            PathBuf::from("nested").join("file.txt")
+        );
         assert!(safe_name("../secret.txt").is_err());
         assert_eq!(safe_name("secret.txt").unwrap(), "secret.txt");
         assert!(ensure_size(MAX_ATTACHMENT_BYTES).is_ok());

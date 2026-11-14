@@ -58,6 +58,13 @@ pub(super) struct ConnectionsUi {
     pub(super) pending: HashSet<String>,
     host_input: Entity<TextInput>,
     identity_input: Entity<TextInput>,
+    password_input: Entity<TextInput>,
+    proxy_jump_input: Entity<TextInput>,
+    editing_id: Option<String>,
+    /// Connection ids known to have a password or key passphrase in the
+    /// credential store. Populated once at startup and updated on
+    /// save/clear/remove so frames never query the keyring synchronously.
+    saved_passwords: HashSet<String>,
     replace_confirm: Option<DaemonReplaceConfirm>,
     replace_cancel_focus: FocusHandle,
     replace_confirm_focus: FocusHandle,
@@ -68,6 +75,13 @@ impl ConnectionsUi {
         let file = ConnectionsFile::load()
             .inspect_err(|error| eprintln!("could not read saved connections: {error}"))
             .unwrap_or_default();
+        let saved_passwords = file
+            .connections
+            .iter()
+            .filter(|connection| matches!(connection.kind, ConnectionKind::Ssh { .. }))
+            .filter(|connection| waku_client::remote::credentials::has_ssh_password(&connection.id))
+            .map(|connection| connection.id.clone())
+            .collect();
         Self {
             file,
             distributions: None,
@@ -79,20 +93,55 @@ impl ConnectionsUi {
             identity_input: cx.new(|cx| {
                 TextInput::new(window, cx).placeholder(tr!("connections.ssh_key_placeholder"))
             }),
+            password_input: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .masked(true)
+                    .placeholder(tr!("connections.ssh_password_placeholder"))
+            }),
+            proxy_jump_input: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder(tr!("connections.ssh_proxy_jump_placeholder"))
+            }),
+            editing_id: None,
+            saved_passwords,
             replace_confirm: None,
             replace_cancel_focus: cx.focus_handle(),
             replace_confirm_focus: cx.focus_handle(),
         }
     }
 
-    pub(super) fn inputs(&self) -> [&Entity<TextInput>; 2] {
-        [&self.host_input, &self.identity_input]
+    pub(super) fn inputs(&self) -> [&Entity<TextInput>; 4] {
+        [
+            &self.host_input,
+            &self.identity_input,
+            &self.password_input,
+            &self.proxy_jump_input,
+        ]
+    }
+
+    fn password_placeholder(&self) -> String {
+        if self
+            .editing_id
+            .as_deref()
+            .is_some_and(|id| self.saved_passwords.contains(id))
+        {
+            tr!("connections.ssh_password_saved_placeholder")
+        } else {
+            tr!("connections.ssh_password_placeholder")
+        }
     }
 }
 
 /// Parse the SSH form. A bare word is a `Host` alias from `~/.ssh/config`;
-/// `user@host:port` is spelled out. A key path switches to key-only auth.
-fn ssh_target_from_fields(host: &str, identity: &str) -> anyhow::Result<SshTarget> {
+/// `user@host:port` is spelled out. A key path switches to key-only auth; an
+/// empty key path with a saved/entered password switches to password auth; an
+/// optional ProxyJump routes the connection through `-J`.
+fn ssh_target_from_fields(
+    host: &str,
+    identity: &str,
+    proxy_jump: &str,
+    has_password: bool,
+) -> anyhow::Result<SshTarget> {
     let host = host.trim();
     let identity = identity.trim();
     let identity = identity
@@ -100,6 +149,7 @@ fn ssh_target_from_fields(host: &str, identity: &str) -> anyhow::Result<SshTarge
         .and_then(|value| value.strip_suffix('"'))
         .unwrap_or(identity)
         .trim();
+    let proxy_jump = proxy_jump.trim();
     if host.is_empty() {
         anyhow::bail!("{}", tr!("connections.ssh_host_required"));
     }
@@ -137,29 +187,63 @@ fn ssh_target_from_fields(host: &str, identity: &str) -> anyhow::Result<SshTarge
             _ => (rest.to_owned(), None),
         }
     };
-    let target = if user.is_none() && port.is_none() && identity.is_empty() {
-        SshTarget::ConfigHost {
-            host: hostname,
-            auth_method: SshAuthMethod::Agent,
-        }
+    let auth_method = if !identity.is_empty() {
+        SshAuthMethod::Key
+    } else if has_password {
+        SshAuthMethod::Password
     } else {
-        SshTarget::Direct {
-            hostname,
-            port,
-            user,
-            identity_file: (!identity.is_empty()).then(|| identity.to_owned()),
-            auth_method: if identity.is_empty() {
-                SshAuthMethod::Agent
-            } else {
-                SshAuthMethod::Key
-            },
-            proxy_jump: None,
-        }
+        SshAuthMethod::Agent
     };
+    let target =
+        if user.is_none() && port.is_none() && identity.is_empty() && proxy_jump.is_empty() {
+            SshTarget::ConfigHost {
+                host: hostname,
+                auth_method,
+            }
+        } else {
+            SshTarget::Direct {
+                hostname,
+                port,
+                user,
+                identity_file: (!identity.is_empty()).then(|| identity.to_owned()),
+                auth_method,
+                proxy_jump: (!proxy_jump.is_empty()).then(|| proxy_jump.to_owned()),
+            }
+        };
     // Reuse the transport's own validation so the form rejects exactly what
     // ssh would be handed.
     waku_client::remote::ssh::base_args(&target)?;
     Ok(target)
+}
+
+fn format_ssh_target_host_field(target: &SshTarget) -> String {
+    match target {
+        SshTarget::ConfigHost { host, .. } => host.clone(),
+        SshTarget::Direct {
+            hostname,
+            user,
+            port,
+            ..
+        } => {
+            let mut label = String::new();
+            if let Some(user) = user {
+                label.push_str(user);
+                label.push('@');
+            }
+            if hostname.contains(':') {
+                label.push('[');
+                label.push_str(hostname);
+                label.push(']');
+            } else {
+                label.push_str(hostname);
+            }
+            if let Some(port) = port {
+                label.push(':');
+                label.push_str(&port.to_string());
+            }
+            label
+        }
+    }
 }
 
 impl Waku {
@@ -540,13 +624,156 @@ impl Waku {
                     Err(error) => this.show_toast(tr!(
                         "connections.connect_failed",
                         name = name.as_str(),
-                        error = error.to_string()
+                        error = format!("{error:#}")
                     )),
                 }
                 cx.notify();
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    pub(super) fn refresh_connections_localized_text(&mut self, cx: &mut Context<Self>) {
+        self.connections.host_input.update(cx, |input, cx| {
+            input.set_placeholder(tr!("connections.ssh_host_placeholder"), cx);
+        });
+        self.connections.identity_input.update(cx, |input, cx| {
+            input.set_placeholder(tr!("connections.ssh_key_placeholder"), cx);
+        });
+        let password_placeholder = self.connections.password_placeholder();
+        self.connections.password_input.update(cx, |input, cx| {
+            input.set_placeholder(password_placeholder, cx);
+        });
+        self.connections.proxy_jump_input.update(cx, |input, cx| {
+            input.set_placeholder(tr!("connections.ssh_proxy_jump_placeholder"), cx);
+        });
+    }
+
+    fn reconnect_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {
+        let key = waku_client::hosts::HostKey::Connection(connection.id.clone());
+        self.disconnect_host(&key, cx);
+        self.open_connection(connection, cx);
+    }
+
+    fn browse_ssh_key(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!("connections.ssh_key_placeholder").into()),
+        });
+        cx.spawn(async move |this, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |this, cx| {
+                        let display = path.to_string_lossy().into_owned();
+                        this.connections
+                            .identity_input
+                            .update(cx, |input, cx| input.set_content(display, cx));
+                        cx.notify();
+                    });
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                eprintln!("could not open SSH key file prompt: {error:#}");
+            }
+            Err(error) => {
+                eprintln!("SSH key file prompt cancelled: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn begin_edit_ssh_connection(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .connections
+            .file
+            .get(&id)
+            .and_then(|connection| match &connection.kind {
+                ConnectionKind::Ssh { target } => Some(target.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let host_text = format_ssh_target_host_field(&target);
+        let (identity_text, proxy_jump_text) = match &target {
+            SshTarget::ConfigHost { .. } => (String::new(), String::new()),
+            SshTarget::Direct {
+                identity_file,
+                proxy_jump,
+                ..
+            } => (
+                identity_file.clone().unwrap_or_default(),
+                proxy_jump.clone().unwrap_or_default(),
+            ),
+        };
+        self.connections.editing_id = Some(id);
+        self.connections
+            .host_input
+            .update(cx, |input, cx| input.set_content(host_text, cx));
+        self.connections
+            .identity_input
+            .update(cx, |input, cx| input.set_content(identity_text, cx));
+        self.connections
+            .password_input
+            .update(cx, |input, cx| input.set_content(String::new(), cx));
+        self.connections
+            .proxy_jump_input
+            .update(cx, |input, cx| input.set_content(proxy_jump_text, cx));
+        self.refresh_connections_localized_text(cx);
+        cx.notify();
+    }
+
+    fn clear_ssh_form(&mut self, cx: &mut Context<Self>) {
+        self.connections.editing_id = None;
+        for input in self.connections.inputs() {
+            input.update(cx, |input, cx| input.set_content(String::new(), cx));
+        }
+        self.refresh_connections_localized_text(cx);
+    }
+
+    fn cancel_edit_ssh_connection(&mut self, cx: &mut Context<Self>) {
+        self.clear_ssh_form(cx);
+        cx.notify();
+    }
+
+    fn clear_ssh_password(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.connections.editing_id.clone() else {
+            return;
+        };
+        if let Err(error) = waku_client::remote::credentials::delete_ssh_password(&id) {
+            let message = format!("{error:#}");
+            eprintln!("could not delete SSH password for {id}: {message}");
+            self.show_toast(message);
+            return;
+        }
+        self.connections.saved_passwords.remove(&id);
+        self.connections
+            .password_input
+            .update(cx, |input, cx| input.set_content(String::new(), cx));
+        if let Some(existing) = self
+            .connections
+            .file
+            .connections
+            .iter_mut()
+            .find(|connection| connection.id == id)
+            && let ConnectionKind::Ssh { target } = &mut existing.kind
+        {
+            match target {
+                SshTarget::ConfigHost { auth_method, .. }
+                | SshTarget::Direct { auth_method, .. }
+                    if *auth_method == SshAuthMethod::Password =>
+                {
+                    *auth_method = SshAuthMethod::Agent;
+                    self.save_connections();
+                }
+                _ => {}
+            }
+        }
+        self.refresh_connections_localized_text(cx);
         cx.notify();
     }
 
@@ -558,7 +785,37 @@ impl Waku {
             .read(cx)
             .content()
             .to_owned();
-        let target = match ssh_target_from_fields(&host, &identity) {
+        let password = self
+            .connections
+            .password_input
+            .read(cx)
+            .content()
+            .to_owned();
+        let proxy_jump = self
+            .connections
+            .proxy_jump_input
+            .read(cx)
+            .content()
+            .to_owned();
+
+        let editing_target = self.connections.editing_id.as_ref().and_then(|id| {
+            self.connections
+                .file
+                .get(id)
+                .and_then(|connection| match &connection.kind {
+                    ConnectionKind::Ssh { target } => Some((id.clone(), target.clone())),
+                    _ => None,
+                })
+        });
+        let editing_id = editing_target.as_ref().map(|(id, _)| id.clone());
+        let keep_saved_password = password.is_empty()
+            && editing_target.as_ref().is_some_and(|(id, existing)| {
+                self.connections.saved_passwords.contains(id)
+                    && existing.auth_method() == SshAuthMethod::Password
+            });
+        let has_password = !password.is_empty() || keep_saved_password;
+
+        let target = match ssh_target_from_fields(&host, &identity, &proxy_jump, has_password) {
             Ok(target) => target,
             Err(error) => {
                 self.show_toast(format!("{error:#}"));
@@ -566,28 +823,70 @@ impl Waku {
             }
         };
         if self.connections.file.connections.iter().any(|existing| {
-            matches!(&existing.kind, ConnectionKind::Ssh { target: saved } if *saved == target)
+            Some(existing.id.as_str()) != editing_id.as_deref()
+                && matches!(&existing.kind, ConnectionKind::Ssh { target: saved } if *saved == target)
         }) {
             self.show_toast(tr!("connections.ssh_duplicate"));
             return;
         }
-        let connection = Connection::ssh(target);
+
+        let mut connection = Connection::ssh(target.clone());
+        if let Some(id) = editing_id {
+            connection.id = id;
+        }
+
+        if !password.is_empty() {
+            if let Err(error) =
+                waku_client::remote::credentials::set_ssh_password(&connection.id, &password)
+            {
+                let message = format!("{error:#}");
+                eprintln!(
+                    "could not save SSH password for {}: {message}",
+                    connection.id
+                );
+                self.show_toast(message);
+                return;
+            }
+            self.connections
+                .saved_passwords
+                .insert(connection.id.clone());
+        } else if matches!(target.auth_method(), SshAuthMethod::Agent)
+            && self.connections.saved_passwords.contains(&connection.id)
+        {
+            if let Err(error) =
+                waku_client::remote::credentials::delete_ssh_password(&connection.id)
+            {
+                let message = format!("{error:#}");
+                eprintln!(
+                    "could not delete SSH password for {}: {message}",
+                    connection.id
+                );
+                self.show_toast(message);
+                return;
+            }
+            self.connections.saved_passwords.remove(&connection.id);
+        }
+
         self.connections.file.upsert(connection);
         self.save_connections();
-        self.connections
-            .host_input
-            .update(cx, |input, cx| input.set_content(String::new(), cx));
-        self.connections
-            .identity_input
-            .update(cx, |input, cx| input.set_content(String::new(), cx));
+        self.clear_ssh_form(cx);
         cx.notify();
     }
 
     pub(super) fn remove_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         self.disconnect_host(&waku_client::hosts::HostKey::Connection(id.to_owned()), cx);
+        if self.connections.editing_id.as_deref() == Some(id) {
+            self.clear_ssh_form(cx);
+        }
         if let Some(removed) = self.connections.file.remove(id) {
             if matches!(removed.kind, ConnectionKind::Ssh { .. }) {
-                let _ = waku_client::remote::credentials::delete_ssh_password(id);
+                if let Err(error) = waku_client::remote::credentials::delete_ssh_password(id) {
+                    let message = format!("{error:#}");
+                    eprintln!("could not delete SSH password for {id}: {message}");
+                    self.show_toast(message);
+                } else {
+                    self.connections.saved_passwords.remove(id);
+                }
             }
             self.save_connections();
         }
@@ -600,33 +899,75 @@ impl Waku {
             .child(card_title(theme, tr!("connections.connected_hosts")))
             .child(card_description(theme, tr!("connections.description")));
         for host in &self.hosts.hosts {
-            let name = if host.key == waku_client::hosts::HostKey::Local {
+            let is_local = host.key == waku_client::hosts::HostKey::Local;
+            let name = if is_local {
                 tr!("connections.local")
             } else {
                 host.name.clone()
             };
+            let reconnecting = self.host_disconnected.contains(&host.key);
+            let chip = status_chip(
+                theme,
+                if reconnecting {
+                    tr!("connections.reconnecting")
+                } else {
+                    tr!("connections.connected")
+                },
+                if reconnecting {
+                    theme.warning
+                } else {
+                    theme.text_secondary
+                },
+            );
+            let mut actions = div().flex().items_center().gap(px(6.0)).child(chip);
+            if !is_local {
+                let host_id = match &host.key {
+                    waku_client::hosts::HostKey::Connection(id) => id.as_str(),
+                    waku_client::hosts::HostKey::Local => "local",
+                };
+                if reconnecting
+                    && let waku_client::hosts::HostKey::Connection(id) = &host.key
+                    && let Some(connection) = self
+                        .connections
+                        .file
+                        .get(id)
+                        .cloned()
+                        .or_else(|| id.strip_prefix("wsl:").map(Connection::wsl))
+                {
+                    let pending = self.connections.pending.contains(id);
+                    actions = actions.child(action_button(
+                        SharedString::from(format!("connected-reconnect-{host_id}")),
+                        if pending {
+                            tr!("connections.connecting")
+                        } else {
+                            tr!("connections.reconnect")
+                        },
+                        pending,
+                        theme,
+                        cx,
+                        move |this, cx| this.reconnect_connection(connection.clone(), cx),
+                    ));
+                }
+                let disconnect_key = host.key.clone();
+                actions = actions.child(action_button(
+                    SharedString::from(format!("connected-disconnect-{host_id}")),
+                    tr!("connections.disconnect"),
+                    false,
+                    theme,
+                    cx,
+                    move |this, cx| this.disconnect_host(&disconnect_key, cx),
+                ));
+            }
             connected = connected.child(connection_row(
                 theme,
-                if host.key == waku_client::hosts::HostKey::Local {
+                if is_local {
                     "icons/laptop.svg"
                 } else {
                     "icons/server.svg"
                 },
                 name,
                 None,
-                status_chip(
-                    theme,
-                    if self.host_disconnected.contains(&host.key) {
-                        tr!("connections.reconnecting")
-                    } else {
-                        tr!("connections.connected")
-                    },
-                    if self.host_disconnected.contains(&host.key) {
-                        theme.warning
-                    } else {
-                        theme.text_secondary
-                    },
-                ),
+                actions,
             ));
         }
         let mut column = div()
@@ -677,18 +1018,33 @@ impl Waku {
             Some(Ok(distributions)) => {
                 for distro in distributions {
                     let id = format!("wsl:{distro}");
+                    let host_key = waku_client::hosts::HostKey::Connection(id.clone());
                     let pending = self.connections.pending.contains(&id);
-                    let connected = self
-                        .hosts
-                        .get(&waku_client::hosts::HostKey::Connection(id.clone()))
-                        .is_some();
+                    let connected = self.hosts.get(&host_key).is_some();
+                    let reconnecting = connected && self.host_disconnected.contains(&host_key);
                     let open_distro = distro.clone();
-                    card = card.child(connection_row(
-                        theme,
-                        "icons/terminal-square.svg",
-                        distro.clone(),
-                        None,
-                        div().flex().gap(px(6.0)).child(action_button(
+                    let mut actions = div().flex().items_center().gap(px(6.0));
+                    if connected && reconnecting {
+                        let reconnect = self
+                            .connections
+                            .file
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| Connection::wsl(distro));
+                        actions = actions.child(action_button(
+                            SharedString::from(format!("wsl-reconnect-{distro}")),
+                            if pending {
+                                tr!("connections.connecting")
+                            } else {
+                                tr!("connections.reconnect")
+                            },
+                            pending,
+                            theme,
+                            cx,
+                            move |this, cx| this.reconnect_connection(reconnect.clone(), cx),
+                        ));
+                    } else {
+                        actions = actions.child(action_button(
                             SharedString::from(format!("wsl-open-{distro}")),
                             if pending {
                                 tr!("connections.connecting")
@@ -701,7 +1057,25 @@ impl Waku {
                             theme,
                             cx,
                             move |this, cx| this.open_wsl_connection(open_distro.clone(), cx),
-                        )),
+                        ));
+                    }
+                    if connected {
+                        let disconnect_key = host_key.clone();
+                        actions = actions.child(action_button(
+                            SharedString::from(format!("wsl-disconnect-{distro}")),
+                            tr!("connections.disconnect"),
+                            false,
+                            theme,
+                            cx,
+                            move |this, cx| this.disconnect_host(&disconnect_key, cx),
+                        ));
+                    }
+                    card = card.child(connection_row(
+                        theme,
+                        "icons/terminal-square.svg",
+                        distro.clone(),
+                        reconnecting.then(|| tr!("connections.reconnecting")),
+                        actions,
                     ));
                 }
             }
@@ -725,69 +1099,153 @@ impl Waku {
                 _ => None,
             });
         for (connection, target) in saved {
+            let host_key = waku_client::hosts::HostKey::Connection(connection.id.clone());
             let pending = self.connections.pending.contains(&connection.id);
-            let connected = self
-                .hosts
-                .get(&waku_client::hosts::HostKey::Connection(
-                    connection.id.clone(),
-                ))
-                .is_some();
+            let connected = self.hosts.get(&host_key).is_some();
+            let reconnecting = connected && self.host_disconnected.contains(&host_key);
             let open = connection.clone();
             let test = connection.clone();
+            let edit_id = connection.id.clone();
             let remove_id = connection.id.clone();
-            let detail = match target.auth_method() {
-                SshAuthMethod::Agent => target.display_host(),
-                SshAuthMethod::Key => {
-                    format!(
-                        "{} · {}",
-                        target.display_host(),
-                        tr!("connections.auth_key")
-                    )
-                }
-                SshAuthMethod::Password => format!(
-                    "{} · {}",
-                    target.display_host(),
-                    tr!("connections.auth_password")
-                ),
-            };
+            let mut detail_parts = vec![target.display_host()];
+            match target.auth_method() {
+                SshAuthMethod::Agent => {}
+                SshAuthMethod::Key => detail_parts.push(tr!("connections.auth_key")),
+                SshAuthMethod::Password => detail_parts.push(tr!("connections.auth_password")),
+            }
+            if let SshTarget::Direct {
+                proxy_jump: Some(jump),
+                ..
+            } = target
+            {
+                detail_parts.push(format!("-J {jump}"));
+            }
+            if reconnecting {
+                detail_parts.push(tr!("connections.reconnecting"));
+            }
+            let detail = detail_parts.join(" · ");
+
+            let mut actions = div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(action_button(
+                    SharedString::from(format!("ssh-test-{}", connection.id)),
+                    tr!("connections.test"),
+                    pending,
+                    theme,
+                    cx,
+                    move |this, cx| this.test_connection(test.clone(), cx),
+                ));
+            if connected && reconnecting {
+                let reconnect = connection.clone();
+                actions = actions.child(action_button(
+                    SharedString::from(format!("ssh-reconnect-{}", connection.id)),
+                    if pending {
+                        tr!("connections.connecting")
+                    } else {
+                        tr!("connections.reconnect")
+                    },
+                    pending,
+                    theme,
+                    cx,
+                    move |this, cx| this.reconnect_connection(reconnect.clone(), cx),
+                ));
+            } else {
+                actions = actions.child(action_button(
+                    SharedString::from(format!("ssh-open-{}", connection.id)),
+                    if pending {
+                        tr!("connections.connecting")
+                    } else if connected {
+                        tr!("connections.connected")
+                    } else {
+                        tr!("connections.open")
+                    },
+                    pending || connected,
+                    theme,
+                    cx,
+                    move |this, cx| this.open_connection(open.clone(), cx),
+                ));
+            }
+            if connected {
+                let disconnect_key = host_key.clone();
+                actions = actions.child(action_button(
+                    SharedString::from(format!("ssh-disconnect-{}", connection.id)),
+                    tr!("connections.disconnect"),
+                    false,
+                    theme,
+                    cx,
+                    move |this, cx| this.disconnect_host(&disconnect_key, cx),
+                ));
+            }
+            actions = actions
+                .child(action_button(
+                    SharedString::from(format!("ssh-edit-{}", connection.id)),
+                    tr!("connections.edit"),
+                    pending,
+                    theme,
+                    cx,
+                    move |this, cx| this.begin_edit_ssh_connection(edit_id.clone(), cx),
+                ))
+                .child(action_button(
+                    SharedString::from(format!("ssh-remove-{}", connection.id)),
+                    tr!("connections.remove"),
+                    pending,
+                    theme,
+                    cx,
+                    move |this, cx| this.remove_connection(&remove_id, cx),
+                ));
+
             card = card.child(connection_row(
                 theme,
                 "icons/globe.svg",
                 connection.name.clone(),
                 Some(detail),
-                div()
-                    .flex()
-                    .gap(px(6.0))
-                    .child(action_button(
-                        SharedString::from(format!("ssh-test-{}", connection.id)),
-                        tr!("connections.test"),
-                        pending,
-                        theme,
-                        cx,
-                        move |this, cx| this.test_connection(test.clone(), cx),
-                    ))
-                    .child(action_button(
-                        SharedString::from(format!("ssh-open-{}", connection.id)),
-                        if pending {
-                            tr!("connections.connecting")
-                        } else if connected {
-                            tr!("connections.connected")
-                        } else {
-                            tr!("connections.open")
-                        },
-                        pending || connected,
-                        theme,
-                        cx,
-                        move |this, cx| this.open_connection(open.clone(), cx),
-                    ))
-                    .child(action_button(
-                        SharedString::from(format!("ssh-remove-{}", connection.id)),
-                        tr!("connections.remove"),
-                        pending,
-                        theme,
-                        cx,
-                        move |this, cx| this.remove_connection(&remove_id, cx),
-                    )),
+                actions,
+            ));
+        }
+
+        let editing_id = self.connections.editing_id.as_deref();
+        let has_saved_password =
+            editing_id.is_some_and(|id| self.connections.saved_passwords.contains(id));
+
+        let mut form_actions = div().flex().items_center().gap(px(6.0));
+        if editing_id.is_some() {
+            if has_saved_password {
+                form_actions = form_actions.child(action_button(
+                    "ssh-clear-password",
+                    tr!("connections.clear_password"),
+                    false,
+                    theme,
+                    cx,
+                    |this, cx| this.clear_ssh_password(cx),
+                ));
+            }
+            form_actions = form_actions
+                .child(action_button(
+                    "ssh-cancel-edit",
+                    tr!("common.cancel"),
+                    false,
+                    theme,
+                    cx,
+                    |this, cx| this.cancel_edit_ssh_connection(cx),
+                ))
+                .child(action_button(
+                    "ssh-save",
+                    tr!("connections.save"),
+                    false,
+                    theme,
+                    cx,
+                    |this, cx| this.add_ssh_connection(cx),
+                ));
+        } else {
+            form_actions = form_actions.child(action_button(
+                "ssh-add",
+                tr!("connections.add"),
+                false,
+                theme,
+                cx,
+                |this, cx| this.add_ssh_connection(cx),
             ));
         }
 
@@ -795,24 +1253,45 @@ impl Waku {
             div()
                 .mt(px(14.0))
                 .flex()
-                .items_center()
+                .flex_col()
                 .gap(px(8.0))
-                .child(div().flex_1().min_w_0().child(TextField::new(
-                    "ssh-host-field",
-                    self.connections.host_input.clone(),
-                )))
-                .child(div().w(px(220.0)).flex_none().child(TextField::new(
-                    "ssh-key-field",
-                    self.connections.identity_input.clone(),
-                )))
-                .child(action_button(
-                    "ssh-add",
-                    tr!("connections.add"),
-                    false,
-                    theme,
-                    cx,
-                    |this, cx| this.add_ssh_connection(cx),
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().child(TextField::new(
+                            "ssh-host-field",
+                            self.connections.host_input.clone(),
+                        )))
+                        .child(div().w(px(220.0)).flex_none().child(TextField::new(
+                            "ssh-key-field",
+                            self.connections.identity_input.clone(),
+                        )))
+                        .child(action_button(
+                            "ssh-browse-key",
+                            tr!("connections.browse_key"),
+                            false,
+                            theme,
+                            cx,
+                            |this, cx| this.browse_ssh_key(cx),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().child(TextField::new(
+                            "ssh-password-field",
+                            self.connections.password_input.clone(),
+                        )))
+                        .child(div().w(px(220.0)).flex_none().child(TextField::new(
+                            "ssh-proxy-jump-field",
+                            self.connections.proxy_jump_input.clone(),
+                        )))
+                        .child(form_actions),
+                ),
         )
     }
 }
@@ -905,7 +1384,6 @@ fn action_button(
     let on_key = on_press.clone();
     div()
         .id(id)
-        .tab_index(0)
         .h(px(27.0))
         .px(px(10.0))
         .rounded(px(6.0))
@@ -922,6 +1400,7 @@ fn action_button(
         .focus_visible(|style| style.border_color(theme.accent))
         .when(!disabled, |element| {
             element
+                .tab_index(0)
                 .hover(|element| element.bg(theme.overlay))
                 .active(|element| element.bg(theme.overlay_strong))
                 .on_click(cx.listener(move |this, _, _, cx| on_press(this, cx)))
@@ -944,14 +1423,21 @@ mod tests {
     #[test]
     fn ssh_form_distinguishes_aliases_from_explicit_targets() {
         assert_eq!(
-            ssh_target_from_fields(" devbox ", "").unwrap(),
+            ssh_target_from_fields(" devbox ", "", "", false).unwrap(),
             SshTarget::ConfigHost {
                 host: "devbox".into(),
                 auth_method: SshAuthMethod::Agent,
             }
         );
         assert_eq!(
-            ssh_target_from_fields("deploy@build.example.com:2222", "").unwrap(),
+            ssh_target_from_fields(" devbox ", "", "", true).unwrap(),
+            SshTarget::ConfigHost {
+                host: "devbox".into(),
+                auth_method: SshAuthMethod::Password,
+            }
+        );
+        assert_eq!(
+            ssh_target_from_fields("deploy@build.example.com:2222", "", "", false).unwrap(),
             SshTarget::Direct {
                 hostname: "build.example.com".into(),
                 port: Some(2222),
@@ -961,19 +1447,36 @@ mod tests {
                 proxy_jump: None,
             }
         );
-        assert!(matches!(
-            ssh_target_from_fields("devbox", "~/.ssh/id_ed25519").unwrap(),
+        assert_eq!(
+            ssh_target_from_fields("deploy@build.example.com:2222", "", "bastion", true).unwrap(),
             SshTarget::Direct {
-                auth_method: SshAuthMethod::Key,
-                ..
+                hostname: "build.example.com".into(),
+                port: Some(2222),
+                user: Some("deploy".into()),
+                identity_file: None,
+                auth_method: SshAuthMethod::Password,
+                proxy_jump: Some("bastion".into()),
             }
-        ));
-        assert!(ssh_target_from_fields("", "").is_err());
-        assert!(ssh_target_from_fields("host:notaport", "").is_err());
-        assert!(ssh_target_from_fields("-oProxyCommand=x", "").is_err());
+        );
+        assert_eq!(
+            ssh_target_from_fields("devbox", "~/.ssh/id_ed25519", "jump@bastion:2200", true)
+                .unwrap(),
+            SshTarget::Direct {
+                hostname: "devbox".into(),
+                port: None,
+                user: None,
+                identity_file: Some("~/.ssh/id_ed25519".into()),
+                auth_method: SshAuthMethod::Key,
+                proxy_jump: Some("jump@bastion:2200".into()),
+            }
+        );
+        assert!(ssh_target_from_fields("", "", "", false).is_err());
+        assert!(ssh_target_from_fields("host:notaport", "", "", false).is_err());
+        assert!(ssh_target_from_fields("-oProxyCommand=x", "", "", false).is_err());
+        assert!(ssh_target_from_fields("devbox", "", "-oProxyCommand=x", false).is_err());
 
         assert_eq!(
-            ssh_target_from_fields("[::1]:2222", "").unwrap(),
+            ssh_target_from_fields("[::1]:2222", "", "", false).unwrap(),
             SshTarget::Direct {
                 hostname: "::1".into(),
                 port: Some(2222),
@@ -983,12 +1486,15 @@ mod tests {
                 proxy_jump: None,
             }
         );
+        let ipv6_target = ssh_target_from_fields(
+            "admin@[2001:db8::1]:2200",
+            r#""C:\Users\me\.ssh\id_ed25519""#,
+            "",
+            false,
+        )
+        .unwrap();
         assert_eq!(
-            ssh_target_from_fields(
-                "admin@[2001:db8::1]:2200",
-                r#""C:\Users\me\.ssh\id_ed25519""#
-            )
-            .unwrap(),
+            ipv6_target,
             SshTarget::Direct {
                 hostname: "2001:db8::1".into(),
                 port: Some(2200),
@@ -999,13 +1505,17 @@ mod tests {
             }
         );
         assert_eq!(
-            ssh_target_from_fields("[2001:db8::1]", "").unwrap(),
+            format_ssh_target_host_field(&ipv6_target),
+            "admin@[2001:db8::1]:2200"
+        );
+        assert_eq!(
+            ssh_target_from_fields("[2001:db8::1]", "", "", false).unwrap(),
             SshTarget::ConfigHost {
                 host: "2001:db8::1".into(),
                 auth_method: SshAuthMethod::Agent,
             }
         );
-        assert!(ssh_target_from_fields("[::1", "").is_err());
-        assert!(ssh_target_from_fields("[]", "").is_err());
+        assert!(ssh_target_from_fields("[::1", "", "", false).is_err());
+        assert!(ssh_target_from_fields("[]", "", "", false).is_err());
     }
 }

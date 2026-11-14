@@ -18,7 +18,10 @@ use parking_lot::Mutex;
 use waku_protocol::bridge::Fingerprint;
 
 use super::connection::{Connection, ConnectionKind};
-use super::process_util::{StderrTail, output_with_timeout, wait_with_deadline, with_detail};
+use super::process_util::{
+    ChildJob, StderrTail, adopt_child_into_kill_job, output_with_timeout, wait_with_deadline,
+    with_detail,
+};
 use super::{ssh, wsl};
 
 /// Install directory below the remote `$HOME`. Development builds keep their
@@ -68,7 +71,9 @@ pub enum RemoteArch {
 pub enum WindowsShell {
     #[default]
     Cmd,
+    CmdSystemRoot,
     PowerShell,
+    Posix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,28 +185,28 @@ pub fn parse_target_probe(output: &[u8]) -> anyhow::Result<RemoteTarget> {
     let os_raw = parts.next().unwrap_or_default();
     let arch_raw = parts.next().unwrap_or_default();
     let shell_raw = parts.next().unwrap_or_default();
-    let os = match os_raw.trim().to_ascii_lowercase().as_str() {
+    let os_lower = os_raw.trim().to_ascii_lowercase();
+    let is_posix_windows = os_lower.starts_with("mingw")
+        || os_lower.starts_with("msys")
+        || os_lower.starts_with("cygwin");
+    let os = match os_lower.as_str() {
         "linux" => RemoteOs::Linux,
         "darwin" => RemoteOs::Darwin,
         "windows" | "windows_nt" => RemoteOs::Windows,
-        other
-            if other.starts_with("mingw")
-                || other.starts_with("msys")
-                || other.starts_with("cygwin") =>
-        {
-            RemoteOs::Windows
-        }
+        _ if is_posix_windows => RemoteOs::Windows,
         other => bail!("remote operating system {other:?} is not supported"),
     };
     let arch = parse_arch(arch_raw)?;
-    let windows_shell = if os == RemoteOs::Windows
-        && matches!(
-            shell_raw.trim().to_ascii_lowercase().as_str(),
-            "ps" | "pwsh" | "powershell"
-        ) {
-        WindowsShell::PowerShell
-    } else {
+    let windows_shell = if os != RemoteOs::Windows {
         WindowsShell::Cmd
+    } else {
+        match shell_raw.trim().to_ascii_lowercase().as_str() {
+            "ps" | "pwsh" | "powershell" => WindowsShell::PowerShell,
+            "cmd_sysroot" => WindowsShell::CmdSystemRoot,
+            "posix" => WindowsShell::Posix,
+            "" if is_posix_windows => WindowsShell::Posix,
+            _ => WindowsShell::Cmd,
+        }
     };
     Ok(RemoteTarget {
         os,
@@ -220,6 +225,14 @@ try { \
   if ([Diagnostics.Process]::GetProcessById([int]$mo.ParentProcessId).ProcessName -match '^(pwsh|powershell)$') { $sh = 'ps' } \
 } catch {}; \
 [Console]::Out.WriteLine(\"Windows`t$arch`t$sh\")";
+const WINDOWS_IN_PROCESS_PROBE_SCRIPT: &str = "\
+$ProgressPreference='SilentlyContinue';\
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }; \
+[Console]::Out.WriteLine(\"Windows`t$arch`tps\")";
+const WINDOWS_CMD_SYSROOT_PROBE_SCRIPT: &str = "\
+$ProgressPreference='SilentlyContinue';\
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }; \
+[Console]::Out.WriteLine(\"Windows`t$arch`tcmd_sysroot\")";
 
 pub fn probe(connection: &Connection) -> anyhow::Result<RemoteTarget> {
     match &connection.kind {
@@ -246,6 +259,34 @@ pub fn probe(connection: &Connection) -> anyhow::Result<RemoteTarget> {
     }
 }
 
+fn has_tab_line(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(str::trim)
+        .any(|line| line.contains('\t'))
+}
+
+fn combine_probe_details<'a>(
+    connection: &Connection,
+    posix_error: Option<String>,
+    stderrs: impl IntoIterator<Item = &'a [u8]>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push_unique = |text: String| {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() && !parts.iter().any(|existing| existing == trimmed) {
+            parts.push(trimmed.to_owned());
+        }
+    };
+    if let Some(error) = posix_error {
+        push_unique(error);
+    }
+    for stderr in stderrs {
+        push_unique(stderr_text(connection, stderr));
+    }
+    ssh::append_auth_hint(connection, parts.join("\n"))
+}
+
 fn probe_ssh(connection: &Connection) -> anyhow::Result<RemoteTarget> {
     let mut command = ssh::command(connection)?;
     command.arg(ssh::wrap_posix_script(PROBE_SCRIPT));
@@ -254,18 +295,24 @@ fn probe_ssh(connection: &Connection) -> anyhow::Result<RemoteTarget> {
     if output.status.success() {
         match parse_target_probe(&output.stdout) {
             Ok(target) => return Ok(target),
-            Err(error) => posix_error = Some(error.to_string()),
+            Err(error) => {
+                // If `uname` produced a tab-separated line and parsing still
+                // rejected the OS or architecture, this is an unsupported
+                // POSIX host — do not burn 3 more PowerShell roundtrips.
+                if has_tab_line(&output.stdout) {
+                    return Err(error);
+                }
+                posix_error = Some(error.to_string());
+            }
         }
     }
     // OpenSSH exits 255 on transport, DNS, auth, or host-key failures; do not
     // waste another timeout or prompt cycle retrying PowerShell against a dead link.
     if output.status.code() == Some(255) {
+        let detail = ssh::append_auth_hint(connection, stderr_text(connection, &output.stderr));
         bail!(
             "{}",
-            with_detail(
-                &format!("could not reach {}", connection.name),
-                &stderr_text(connection, &output.stderr),
-            )
+            with_detail(&format!("could not reach {}", connection.name), &detail)
         );
     }
     let mut win_command = ssh::command(connection)?;
@@ -274,21 +321,36 @@ fn probe_ssh(connection: &Connection) -> anyhow::Result<RemoteTarget> {
     if win_output.status.success() {
         return parse_target_probe(&win_output.stdout);
     }
-    let detail = stderr_text(connection, &win_output.stderr);
-    let detail = if let Some(posix_error) = posix_error {
-        // The POSIX probe ran and returned an unsupported OS or an
-        // unparsable line. Keep that fact alongside the failed Windows
-        // fallback instead of replacing it with "powershell.exe not found".
-        if detail.is_empty() {
-            posix_error
-        } else {
-            format!("{posix_error}\n{detail}")
+    let mut fallback_stderrs: Vec<Vec<u8>> = Vec::new();
+    if win_output.status.code() != Some(255) {
+        // Recover when a Windows host omits `WindowsPowerShell\v1.0` from
+        // `PATH`: try in-process PowerShell first (covers `pwsh.exe` /
+        // `powershell.exe` `DefaultShell`), then `%SystemRoot%` under `cmd.exe`.
+        for wrapped in [
+            ssh::wrap_powershell_in_process(WINDOWS_IN_PROCESS_PROBE_SCRIPT),
+            ssh::wrap_cmd_systemroot_powershell_script(WINDOWS_CMD_SYSROOT_PROBE_SCRIPT),
+        ] {
+            let mut fallback = ssh::command(connection)?;
+            fallback.arg(wrapped);
+            let fallback_output =
+                output_with_timeout(fallback, PROBE_TIMEOUT, "the platform probe")?;
+            if fallback_output.status.success() {
+                return parse_target_probe(&fallback_output.stdout);
+            }
+            let exit_255 = fallback_output.status.code() == Some(255);
+            fallback_stderrs.push(fallback_output.stderr);
+            if exit_255 {
+                break;
+            }
         }
-    } else if detail.is_empty() {
-        stderr_text(connection, &output.stderr)
-    } else {
-        detail
-    };
+    }
+    let detail = combine_probe_details(
+        connection,
+        posix_error,
+        [output.stderr.as_slice(), win_output.stderr.as_slice()]
+            .into_iter()
+            .chain(fallback_stderrs.iter().map(Vec::as_slice)),
+    );
     bail!(
         "{}",
         with_detail(&format!("could not reach {}", connection.name), &detail)
@@ -314,10 +376,18 @@ fn explain_install_stderr(stderr: &str) -> String {
     stderr
         .split_inclusive('\n')
         .map(|line| {
-            if let Some(reason) = line.strip_prefix(RUN_MARKER) {
-                format!("the uploaded daemon could not run: {reason}")
-            } else if let Some(detail) = line.strip_prefix(MISMATCH_MARKER) {
-                format!("the uploaded daemon did not match this build: {detail}")
+            if let Some((prefix, reason)) = line.split_once(RUN_MARKER) {
+                if prefix.is_empty() {
+                    format!("the uploaded daemon could not run: {reason}")
+                } else {
+                    format!("{prefix}\nthe uploaded daemon could not run: {reason}")
+                }
+            } else if let Some((prefix, detail)) = line.split_once(MISMATCH_MARKER) {
+                if prefix.is_empty() {
+                    format!("the uploaded daemon did not match this build: {detail}")
+                } else {
+                    format!("{prefix}\nthe uploaded daemon did not match this build: {detail}")
+                }
             } else {
                 line.to_owned()
             }
@@ -422,25 +492,20 @@ fn artifact_path(target: RemoteTarget) -> anyhow::Result<PathBuf> {
                 }
             }
             if RemoteTarget::host().is_some_and(|host| host.matches_platform(target)) {
-                candidates.push(
-                    target_directory
-                        .join("debug")
-                        .join(format!("waku-debug-daemon{}", target.executable_suffix())),
-                );
-                candidates.push(
-                    target_directory
-                        .join("debug")
-                        .join(target.daemon_binary_name()),
+                push_host_daemon_candidates(
+                    &mut candidates,
+                    &target_directory.join("debug"),
+                    &executable,
+                    target,
                 );
             }
         }
         if RemoteTarget::host().is_some_and(|host| host.matches_platform(target)) {
             if cfg!(debug_assertions) {
-                candidates.push(
-                    directory.join(format!("waku-debug-daemon{}", target.executable_suffix())),
-                );
+                push_host_daemon_candidates(&mut candidates, directory, &executable, target);
+            } else {
+                candidates.push(directory.join(target.daemon_binary_name()));
             }
-            candidates.push(directory.join(target.daemon_binary_name()));
         }
     }
     candidates
@@ -453,6 +518,42 @@ fn artifact_path(target: RemoteTarget) -> anyhow::Result<PathBuf> {
                 target.arch_name()
             )
         })
+}
+
+/// Push `waku-debug-daemon` and `waku-daemon` from `directory`, preferring
+/// whichever binary was built more recently so `cargo build -p waku-daemon`
+/// never deploys a stale `waku-debug-daemon` left behind by an earlier dev run.
+fn push_host_daemon_candidates(
+    candidates: &mut Vec<PathBuf>,
+    directory: &Path,
+    executable: &Path,
+    target: RemoteTarget,
+) {
+    let debug_daemon = directory.join(format!("waku-debug-daemon{}", target.executable_suffix()));
+    let standard_daemon = directory.join(target.daemon_binary_name());
+    let debug_mtime = std::fs::metadata(&debug_daemon)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let standard_mtime = std::fs::metadata(&standard_daemon)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let prefer_debug_on_tie = executable
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with("waku-debug"));
+    let standard_first = match (debug_mtime, standard_mtime) {
+        (Some(debug_time), Some(standard_time)) => {
+            standard_time > debug_time || (standard_time == debug_time && !prefer_debug_on_tie)
+        }
+        _ => !prefer_debug_on_tie,
+    };
+    if standard_first {
+        candidates.push(standard_daemon);
+        candidates.push(debug_daemon);
+    } else {
+        candidates.push(debug_daemon);
+        candidates.push(standard_daemon);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,10 +593,12 @@ fn windows_remote_directory() -> String {
     REMOTE_DIRECTORY.replace('/', "\\")
 }
 
-fn wrap_windows_script(shell: WindowsShell, script: &str) -> String {
+pub fn wrap_windows_script(shell: WindowsShell, script: &str) -> String {
     match shell {
         WindowsShell::Cmd => ssh::wrap_powershell_script(script),
+        WindowsShell::CmdSystemRoot => ssh::wrap_cmd_systemroot_powershell_script(script),
         WindowsShell::PowerShell => ssh::wrap_powershell_in_process(script),
+        WindowsShell::Posix => ssh::wrap_posix_powershell_script(script),
     }
 }
 
@@ -503,7 +606,8 @@ const WINDOWS_OPEN_STDIN_FN: &str = "\
 function Stdin{\
   $t=[int].Assembly.GetType('Microsoft.Win32.Win32Native');\
   if(-not $t){$t=[Console].Assembly.GetType('Interop+Kernel32')};\
-  $s=if($t){$t.GetMethod('GetStdHandle',[Reflection.BindingFlags]40).Invoke($null,@(-10))}else{(Add-Type '[DllImport(\"kernel32\")]public static extern IntPtr GetStdHandle(int n);' -Name I -Pass)::GetStdHandle(-10)};\
+  $m=if($t){$t.GetMethod('GetStdHandle',[Reflection.BindingFlags]40)};\
+  $s=if($m){$m.Invoke($null,@(-10))}else{(('W.K'-as[type])-or(Add-Type '[DllImport(\"kernel32\")]public static extern IntPtr GetStdHandle(int n);' -Name K -Namespace W -Pass))>$null;[W.K]::GetStdHandle(-10)};\
   $f=[Microsoft.Win32.SafeHandles.SafeFileHandle]::new($s,$false);\
   try{[IO.FileStream]::new($f,1,65536,$true)}catch{[IO.FileStream]::new($f,1,65536,$false)}\
 };";
@@ -525,7 +629,7 @@ fn windows_install_script(fingerprint: &str, size: u64, force: bool) -> String {
          function _q([int]$c){{_d $m;$O.Flush();$E.Flush();[Environment]::Exit($c)}};\
          try{{\
            $h=if($env:USERPROFILE){{$env:USERPROFILE}}else{{$HOME}};\
-           $d=Join-Path $h '{dir_rel}';$dst=\"$d\\{daemon_exe}\";$exp='{fingerprint}';\
+           $d=\"$h\\{dir_rel}\";$dst=\"$d\\{daemon_exe}\";$exp='{fingerprint}';\
            {WINDOWS_OPEN_STDIN_FN}\
            function _f($p){{\
              $i=[Diagnostics.ProcessStartInfo]::new($p,'--fingerprint');\
@@ -676,6 +780,7 @@ fn deploy_ssh(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().context("could not run ssh")?;
+    let mut job = adopt_child_into_kill_job(&child);
     let mut stdin = child.stdin.take().context("ssh stdin is unavailable")?;
     let stdout = child.stdout.take().context("ssh stdout is unavailable")?;
     let stderr = StderrTail::capture(child.stderr.take().context("ssh stderr is unavailable")?);
@@ -688,37 +793,51 @@ fn deploy_ssh(
             }
         }
     });
-    let failure = |child: &mut std::process::Child, message: &str| {
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow!(
-            "{}",
-            with_detail(message, &explain_install_stderr(&stderr.text()))
+    let format_stderr = || {
+        ssh::append_auth_hint(
+            connection,
+            explain_install_stderr(&stderr.finish_and_text()),
         )
+    };
+    let finish_child = |child: &mut std::process::Child, job: &mut Option<ChildJob>| {
+        if wait_with_deadline(child, Duration::from_secs(5)).is_none() {
+            let _ = child.kill();
+            drop(job.take());
+            let _ = child.wait();
+        } else {
+            drop(job.take());
+        }
+    };
+    let failure = |child: &mut std::process::Child, job: &mut Option<ChildJob>, message: &str| {
+        let _ = child.kill();
+        drop(job.take());
+        let _ = child.wait();
+        anyhow!("{}", with_detail(message, &format_stderr()))
     };
 
     let status_line = match wait_for_status_line(&lines, &["ready", "upload"], SSH_STATUS_TIMEOUT) {
         Ok(line) => line,
         Err(StatusWaitError::Timeout) => {
-            return Err(failure(&mut child, "timed out preparing the remote daemon"));
+            return Err(failure(
+                &mut child,
+                &mut job,
+                "timed out preparing the remote daemon",
+            ));
         }
         Err(StatusWaitError::Disconnected(Some(unexpected))) => {
             drop(stdin);
-            let _ = wait_with_deadline(&mut child, Duration::from_secs(5));
+            finish_child(&mut child, &mut job);
             let message = format!("unexpected remote install status {unexpected:?}");
-            return Err(anyhow!(
-                "{}",
-                with_detail(&message, &explain_install_stderr(&stderr.text()))
-            ));
+            return Err(anyhow!("{}", with_detail(&message, &format_stderr())));
         }
         Err(StatusWaitError::Disconnected(None)) => {
             drop(stdin);
-            let _ = wait_with_deadline(&mut child, Duration::from_secs(5));
+            finish_child(&mut child, &mut job);
             return Err(anyhow!(
                 "{}",
                 with_detail(
                     &format!("could not prepare the daemon on {}", connection.name),
-                    &explain_install_stderr(&stderr.text())
+                    &format_stderr()
                 )
             ));
         }
@@ -730,12 +849,23 @@ fn deploy_ssh(
             if status.is_some_and(|status| status.success()) {
                 return Ok(DeployOutcome::Reused);
             }
-            return Err(failure(&mut child, "could not reuse the remote daemon"));
+            if status.is_none() {
+                return Err(failure(
+                    &mut child,
+                    &mut job,
+                    "could not reuse the remote daemon",
+                ));
+            }
+            drop(job.take());
+            return Err(anyhow!(
+                "{}",
+                with_detail("could not reuse the remote daemon", &format_stderr())
+            ));
         }
         "upload" => {}
         other => {
             let message = format!("unexpected remote install status {other:?}");
-            return Err(failure(&mut child, &message));
+            return Err(failure(&mut child, &mut job, &message));
         }
     }
 
@@ -758,7 +888,7 @@ fn deploy_ssh(
     let upload_timeout = install_deadline.saturating_duration_since(std::time::Instant::now());
     let uploaded = match upload_rx.recv_timeout(upload_timeout) {
         Ok(result) => result,
-        Err(_) => return Err(failure(&mut child, "timed out uploading waku-daemon")),
+        Err(_) => return Err(failure(&mut child, &mut job, "timed out uploading waku-daemon")),
     };
     match uploaded {
         Ok(copied) if copied == artifact.size => {}
@@ -767,28 +897,36 @@ fn deploy_ssh(
                 "daemon upload was truncated: wrote {copied} of {} bytes",
                 artifact.size
             );
-            return Err(failure(&mut child, &message));
+            return Err(failure(&mut child, &mut job, &message));
         }
         Err(error) => {
             let message = format!("could not upload waku-daemon: {error}");
-            return Err(failure(&mut child, &message));
+            return Err(failure(&mut child, &mut job, &message));
         }
     }
     let install_timeout = install_deadline.saturating_duration_since(std::time::Instant::now());
     let installed = wait_for_status_line(&lines, &["installed"], install_timeout);
     if let Err(StatusWaitError::Timeout) = installed {
-        return Err(failure(&mut child, "timed out installing waku-daemon"));
+        return Err(failure(
+            &mut child,
+            &mut job,
+            "timed out installing waku-daemon",
+        ));
     }
     let status = wait_with_deadline(&mut child, Duration::from_secs(10));
     if installed.is_ok() && status.is_some_and(|status| status.success()) {
         return Ok(DeployOutcome::Installed);
     }
+    if status.is_none() {
+        let _ = child.kill();
+        drop(job.take());
+        let _ = child.wait();
+    } else {
+        drop(job.take());
+    }
     Err(anyhow!(
         "{}",
-        with_detail(
-            "could not install waku-daemon",
-            &explain_install_stderr(&stderr.text())
-        )
+        with_detail("could not install waku-daemon", &format_stderr())
     ))
 }
 
@@ -817,24 +955,24 @@ fn windows_bridge_script(replace_incompatible: bool) -> String {
         "Set-StrictMode -Off;$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';\
          {WINDOWS_OPEN_STDIN_FN}\
          $h=if($env:USERPROFILE){{$env:USERPROFILE}}else{{$HOME}};\
-         $dst=Join-Path (Join-Path $h '{dir_rel}') '{daemon_exe}';\
-         $i=New-Object Diagnostics.ProcessStartInfo $dst,'{}';\
+         $dst=[IO.Path]::Combine($h,'{dir_rel}','{daemon_exe}');\
+         $i=[Diagnostics.ProcessStartInfo]::new($dst,'{}');\
          $i.UseShellExecute=$false;$i.RedirectStandardInput=$true;$i.CreateNoWindow=$true;\
          $p=[Diagnostics.Process]::Start($i);\
-         $in=$null;\
+         $in=$null;$wh=$null;\
          try{{\
+           $wh=[Threading.ManualResetEvent]::new($false);\
+           $wh.SafeWaitHandle=[Microsoft.Win32.SafeHandles.SafeWaitHandle]::new($p.Handle,$false);\
            $in=Stdin;$out=$p.StandardInput.BaseStream;\
-           $buf=New-Object byte[] 65536;\
+           $buf=[byte[]]::new(65536);\
            $rt=$in.ReadAsync($buf,0,$buf.Length);\
-           while(-not $p.HasExited){{\
-             if($rt.Wait(100)){{\
-               $n=$rt.GetAwaiter().GetResult();\
-               if($n -le 0){{break}};\
-               $out.Write($buf,0,$n);$out.Flush();\
-               $rt=$in.ReadAsync($buf,0,$buf.Length)\
-             }}\
+           while([Threading.WaitHandle]::WaitAny(@(([IAsyncResult]$rt).AsyncWaitHandle,$wh)) -eq 0){{\
+             $n=$rt.GetAwaiter().GetResult();\
+             if($n -le 0){{break}};\
+             $out.Write($buf,0,$n);$out.Flush();\
+             $rt=$in.ReadAsync($buf,0,$buf.Length)\
            }}\
-         }}catch{{}}finally{{if($in){{try{{$in.Dispose()}}catch{{}}}};try{{$p.StandardInput.Close()}}catch{{}}}};\
+         }}catch{{}}finally{{if($wh){{try{{$wh.Dispose()}}catch{{}}}};if($in){{try{{$in.Dispose()}}catch{{}}}};try{{$p.StandardInput.Close()}}catch{{}}}};\
          $p.WaitForExit();\
          [Console]::Out.Flush();[Console]::Error.Flush();\
          [Environment]::Exit($p.ExitCode)",
@@ -891,15 +1029,35 @@ mod tests {
         );
         assert_eq!(
             parse_target_probe(b"MINGW64_NT-10.0-22631\tx86_64\n").unwrap(),
-            RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64)
+            RemoteTarget {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                windows_shell: WindowsShell::Posix,
+            }
         );
         assert_eq!(
             parse_target_probe(b"MSYS_NT-10.0\tx86_64\n").unwrap(),
-            RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64)
+            RemoteTarget {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                windows_shell: WindowsShell::Posix,
+            }
         );
         assert_eq!(
             parse_target_probe(b"CYGWIN_NT-10.0\tx86_64\n").unwrap(),
-            RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64)
+            RemoteTarget {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                windows_shell: WindowsShell::Posix,
+            }
+        );
+        assert_eq!(
+            parse_target_probe(b"Windows\tAMD64\tcmd_sysroot\r\n").unwrap(),
+            RemoteTarget {
+                os: RemoteOs::Windows,
+                arch: RemoteArch::X86_64,
+                windows_shell: WindowsShell::CmdSystemRoot,
+            }
         );
         assert!(parse_target_probe(b"FreeBSD\tamd64\n").is_err());
         assert!(parse_target_probe(b"Linux\triscv64\n").is_err());
@@ -945,21 +1103,38 @@ mod tests {
             },
             false,
         );
-        assert!(ps_command.starts_with("& ([scriptblock]::Create("));
+        assert!(
+            ps_command.starts_with("$ProgressPreference='SilentlyContinue'; & ([scriptblock]::Create(")
+        );
         assert!(ps_command.len() < 8191);
     }
 
     #[test]
     fn windows_install_command_fits_cmd_length_limit() {
-        let wrapped = ssh::wrap_powershell_script(&windows_install_script(
-            "0123456789abcdef",
-            28_922_880,
-            false,
-        ));
+        let script = windows_install_script("0123456789abcdef", 28_922_880, false);
+        let wrapped = ssh::wrap_powershell_script(&script);
         assert!(
             wrapped.len() < 7500,
             "wrapped powershell command length {} exceeded 7500",
             wrapped.len()
+        );
+        let cmd_sysroot = ssh::wrap_cmd_systemroot_powershell_script(&script);
+        assert!(
+            cmd_sysroot.len() < 8000,
+            "wrapped cmd_sysroot command length {} exceeded 8000",
+            cmd_sysroot.len()
+        );
+        let posix = ssh::wrap_posix_powershell_script(&script);
+        assert!(
+            posix.len() < 8000,
+            "wrapped posix powershell command length {} exceeded 8000",
+            posix.len()
+        );
+        let in_process = ssh::wrap_powershell_in_process(&script);
+        assert!(
+            in_process.len() < 8000,
+            "wrapped in-process powershell command length {} exceeded 8000",
+            in_process.len()
         );
     }
 
@@ -1147,7 +1322,7 @@ mod tests {
         let src_exe = root.join("sample-daemon.exe");
         let fp = "0123456789abcdef";
         let csharp = format!(
-            "using System;\npublic class P {{\n  public static void Main(string[] args) {{\n    if (args.Length > 0 && args[0] == \"--fingerprint\") {{ Console.WriteLine(\"{fp}\"); }}\n  }}\n}}"
+            "using System;\npublic class P {{\n  public static void Main(string[] args) {{\n    if (args.Length > 0 && args[0] == \"--fingerprint\") {{ Console.WriteLine(\"{fp}\"); return; }}\n    if (args.Length > 0 && args[0] == \"bridge\") {{ Console.Out.WriteLine(\"ready_bridge\"); Console.Out.Flush(); string line = Console.In.ReadLine(); Console.Out.WriteLine(\"relayed:\" + (line ?? \"eof\")); Console.Out.Flush(); }}\n  }}\n}}"
         );
         let compile_cmd = format!(
             "Add-Type -TypeDefinition '{}' -OutputAssembly '{}' -OutputType ConsoleApplication",
@@ -1244,9 +1419,82 @@ mod tests {
         stdout.read_to_string(&mut rest).unwrap();
         drop(writer);
         let status = wait_with_deadline(&mut child, Duration::from_secs(15)).expect("timed out");
-        let _ = std::fs::remove_dir_all(&root);
         assert!(status.success(), "overlapped upload failed");
         assert_eq!(rest.trim(), "installed");
+
+        // Verify `windows_bridge_script` relays bytes from an overlapped pipe
+        // without closing stdin early, then exits promptly when the bridge
+        // child exits even if the outer pipe writer stays open.
+        let bridge_pipe_name: Vec<u16> =
+            format!(r"\\.\pipe\waku-ovl-bridge-{}", uuid::Uuid::new_v4())
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+        let bridge_server_raw = unsafe {
+            CreateNamedPipeW(
+                bridge_pipe_name.as_ptr(),
+                PIPE_ACCESS_OUTBOUND,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                65536,
+                65536,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(bridge_server_raw, INVALID_HANDLE_VALUE);
+        let bridge_server = unsafe { OwnedHandle::from_raw_handle(bridge_server_raw as _) };
+        let bridge_client_raw = unsafe {
+            CreateFileW(
+                bridge_pipe_name.as_ptr(),
+                GENERIC_READ,
+                0,
+                &sa,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(bridge_client_raw, INVALID_HANDLE_VALUE);
+        let bridge_client = unsafe { OwnedHandle::from_raw_handle(bridge_client_raw as _) };
+        let mut bridge_writer = std::fs::File::from(bridge_server);
+
+        let bridge_wrapped = ssh::wrap_powershell_script(&windows_bridge_script(false));
+        let bridge_encoded = bridge_wrapped.split_whitespace().last().unwrap();
+        let mut bridge_child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-NoLogo",
+                "-OutputFormat",
+                "Text",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                bridge_encoded,
+            ])
+            .env("USERPROFILE", &root)
+            .env("HOME", &root)
+            .stdin(Stdio::from(bridge_client))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let mut bridge_stdout = BufReader::new(bridge_child.stdout.take().unwrap());
+        let mut ready_line = String::new();
+        bridge_stdout.read_line(&mut ready_line).unwrap();
+        assert_eq!(ready_line.trim(), "ready_bridge");
+        bridge_writer.write_all(b"ping_payload\n").unwrap();
+        bridge_writer.flush().unwrap();
+        let mut relayed_line = String::new();
+        bridge_stdout.read_line(&mut relayed_line).unwrap();
+        assert_eq!(relayed_line.trim(), "relayed:ping_payload");
+        let bridge_status = wait_with_deadline(&mut bridge_child, Duration::from_secs(10))
+            .expect("bridge relay hung after child exited");
+        drop(bridge_writer);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(bridge_status.success(), "overlapped bridge relay failed");
     }
 
     #[test]
@@ -1288,6 +1536,111 @@ mod tests {
         assert_eq!(
             explain_install_stderr("Permission denied\n"),
             "Permission denied\n"
+        );
+        assert_eq!(
+            explain_install_stderr("profile warningdaemon_failed_to_run\tbad dll\n"),
+            "profile warning\nthe uploaded daemon could not run: bad dll\n"
+        );
+    }
+
+    #[test]
+    fn host_daemon_candidates_prefer_newer_binary_over_stale_debug_daemon() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-daemon-candidates-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64);
+        let debug_bin = dir.join("waku-debug-daemon.exe");
+        let standard_bin = dir.join("waku-daemon.exe");
+        std::fs::write(&debug_bin, b"stale-debug").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&standard_bin, b"fresh-standard").unwrap();
+
+        let mut candidates = Vec::new();
+        push_host_daemon_candidates(&mut candidates, &dir, &dir.join("waku-debug.exe"), target);
+        assert_eq!(candidates, vec![standard_bin.clone(), debug_bin.clone()]);
+
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&debug_bin, b"fresh-debug").unwrap();
+        candidates.clear();
+        push_host_daemon_candidates(
+            &mut candidates,
+            &dir,
+            &dir.join("remote_connect.exe"),
+            target,
+        );
+        assert_eq!(candidates, vec![debug_bin, standard_bin]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_fingerprint_hashes_empty_small_and_multichunk_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-fingerprint-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.bin");
+        let small = dir.join("small.bin");
+        let large = dir.join("large.bin");
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::write(&small, b"waku-daemon-payload").unwrap();
+        // Exceeds the 64 KiB read buffer in `file_fingerprint` to exercise multi-chunk hashing.
+        let large_bytes: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&large, &large_bytes).unwrap();
+
+        let empty_expected = Fingerprint::default().finish();
+        assert_eq!(file_fingerprint(&empty).unwrap(), empty_expected);
+
+        let mut small_fp = Fingerprint::default();
+        small_fp.update(b"waku-daemon-payload");
+        assert_eq!(file_fingerprint(&small).unwrap(), small_fp.finish());
+
+        let mut large_fp = Fingerprint::default();
+        large_fp.update(&large_bytes);
+        assert_eq!(file_fingerprint(&large).unwrap(), large_fp.finish());
+        assert!(file_fingerprint(&dir.join("missing.bin")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_helpers_short_circuit_tab_errors_and_deduplicate_stderr() {
+        assert!(has_tab_line(b"FreeBSD\tamd64\n"));
+        assert!(parse_target_probe(b"FreeBSD\tamd64\n").is_err());
+        assert!(!has_tab_line(b"Welcome banner\n"));
+
+        let conn = Connection {
+            id: "test-ssh".into(),
+            name: "host".into(),
+            kind: super::super::connection::ConnectionKind::Ssh {
+                target: super::super::connection::SshTarget::Direct {
+                    hostname: "example.invalid".into(),
+                    port: None,
+                    user: Some("alice".into()),
+                    identity_file: None,
+                    auth_method: super::super::connection::SshAuthMethod::Agent,
+                    proxy_jump: None,
+                },
+            },
+        };
+        let combined = combine_probe_details(
+            &conn,
+            Some("invalid platform probe response \"\"".into()),
+            [
+                b"first probe error\n".as_slice(),
+                b"   \n".as_slice(),
+                b"first probe error\n".as_slice(),
+                b"second fallback error\n".as_slice(),
+            ],
+        );
+        assert_eq!(
+            combined,
+            "invalid platform probe response \"\"\nfirst probe error\nsecond fallback error"
         );
     }
 }

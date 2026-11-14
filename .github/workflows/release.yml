@@ -168,23 +168,27 @@ jobs:
             windows-latest-rust-1.97.0-release-
 
       # `target/` is restored from the release cache, so the previous
-      # release's bundles are still sitting in `target/release` when this one
-      # starts. Cargo does not own them, so nothing else clears them.
+      # release's bundles and downloaded remote daemons can still be sitting in
+      # `target/` when this one starts. Cargo does not own them, so nothing else
+      # clears them.
       - name: Clear stale bundles
-        run: Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
+        run: |
+          Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/remote-daemons
 
       - uses: actions/download-artifact@v8
         with:
           pattern: remote-daemon-linux-*
           path: target/remote-daemons
           merge-multiple: true
-          # Both legs must land: the packaging scripts warn (rather than fail)
-          # on an architecture they cannot find, for local builds' sake.
+          # Both legs must land; WAKU_REQUIRE_REMOTE_DAEMONS=1 enforces them
+          # during bundling while local builds only warn.
           if-no-files-found: error
 
       - name: Bundle
         env:
           WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
+          WAKU_REQUIRE_REMOTE_DAEMONS: "1"
           WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
           WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}

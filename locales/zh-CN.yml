@@ -1325,15 +1325,23 @@ connections.connecting: 正在连接…
 connections.open: 连接
 connections.connected: 已连接
 connections.disconnect: 断开连接
+connections.reconnect: 重新连接
 connections.ssh_title: SSH
 connections.ssh_description: "使用本机的 ssh，~/.ssh/config、ssh-agent 和 ProxyJump 均会生效。输入 Host 别名或 user@host:port，可选填私钥路径。"
 connections.auth_key: 私钥
 connections.auth_password: 密码
 connections.test: 测试
+connections.edit: 编辑
 connections.remove: 移除
 connections.add: 添加
+connections.save: 保存
+connections.clear_password: 清除密码
+connections.browse_key: 浏览…
 connections.ssh_host_placeholder: "Host 别名或 user@host:port"
 connections.ssh_key_placeholder: 私钥（可选）
+connections.ssh_password_placeholder: 密码或私钥口令（可选）
+connections.ssh_password_saved_placeholder: 已保存密码（留空则保持不变）
+connections.ssh_proxy_jump_placeholder: 跳板机 ProxyJump（可选）
 connections.ssh_host_required: 请输入 SSH 主机
 connections.ssh_port_invalid: SSH 端口必须是 1 到 65535 之间的数字
 connections.ssh_duplicate: 该 SSH 主机已保存
@@ -1348,6 +1356,8 @@ connections.replace_daemon_confirm: 结束会话并升级
 remote_folder.title: "选择 %{host} 上的文件夹"
 remote_folder.loading: 正在加载…
 remote_folder.invalid_response: 守护进程返回了无效的目录列表
+remote_folder.empty: 没有子文件夹
+remote_folder.go: 打开
 remote_folder.cancel: 取消
 remote_folder.add: 添加项目
 

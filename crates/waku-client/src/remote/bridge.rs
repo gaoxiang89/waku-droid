@@ -18,7 +18,7 @@ use waku_protocol::bridge::{BridgeBlocked, BridgeReady, IncompatibleDaemon};
 
 use super::connection::{Connection, ConnectionKind};
 use super::deploy::{self, DeployOutcome, RemoteTarget};
-use super::process_util::{StderrTail, with_detail};
+use super::process_util::{ChildJob, StderrTail, adopt_child_into_kill_job, with_detail};
 use super::{ssh, wsl};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,6 +64,7 @@ pub struct BridgeSession {
     token: String,
     remote_pid: u32,
     child: Mutex<Child>,
+    _job: Option<ChildJob>,
     stderr: StderrTail,
 }
 
@@ -131,6 +132,7 @@ impl BridgeSession {
         let mut child = command
             .spawn()
             .with_context(|| format!("could not start the bridge to {}", connection.name))?;
+        let mut job = adopt_child_into_kill_job(&child);
         let stdin = child.stdin.take().context("bridge stdin is unavailable")?;
         let stdout = child
             .stdout
@@ -143,10 +145,11 @@ impl BridgeSession {
                 .context("bridge stderr is unavailable")?,
         );
 
-        let fail = |child: &mut Child, error: anyhow::Error| {
+        let fail = |child: &mut Child, job: &mut Option<ChildJob>, error: anyhow::Error| {
             let _ = child.kill();
+            drop(job.take());
             let _ = child.wait();
-            let detail = stderr.text();
+            let detail = ssh::append_auth_hint(connection, stderr.finish_and_text());
             if detail.is_empty() {
                 error
             } else {
@@ -163,10 +166,11 @@ impl BridgeSession {
             .context("could not start the bridge reader")?;
         let (ready, stdout) = match ready_rx.recv_timeout(READY_TIMEOUT) {
             Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => return Err(fail(&mut child, error)),
+            Ok(Err(error)) => return Err(fail(&mut child, &mut job, error)),
             Err(_) => {
                 return Err(fail(
                     &mut child,
+                    &mut job,
                     anyhow!("timed out waiting for the remote daemon"),
                 ));
             }
@@ -174,19 +178,23 @@ impl BridgeSession {
         if ready.protocol_version != PROTOCOL_VERSION {
             return Err(fail(
                 &mut child,
+                &mut job,
                 anyhow::Error::new(ProtocolMismatch {
                     remote: ready.protocol_version,
                 }),
             ));
         }
+        // Discard non-fatal login/profile stderr emitted before the bridge
+        // announced readiness so a later disconnect reports only runtime errors.
+        stderr.clear();
 
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
-            Err(error) => return Err(fail(&mut child, error.into())),
+            Err(error) => return Err(fail(&mut child, &mut job, error.into())),
         };
         let address = match listener.local_addr() {
             Ok(address) => address.to_string(),
-            Err(error) => return Err(fail(&mut child, error.into())),
+            Err(error) => return Err(fail(&mut child, &mut job, error.into())),
         };
         std::thread::Builder::new()
             .name("waku-bridge-relay".into())
@@ -198,6 +206,7 @@ impl BridgeSession {
             token: ready.token,
             remote_pid: ready.pid,
             child: Mutex::new(child),
+            _job: job,
             stderr,
         })
     }
@@ -412,13 +421,21 @@ fn accept_one(listener: &TcpListener) -> Option<TcpStream> {
 /// settings page "Test" button. Returns the remote daemon's pid.
 pub fn test_connection(connection: &Connection) -> Result<u32, BridgeError> {
     let session = BridgeSession::open(connection)?;
-    let client = crate::DaemonClient::connect(session.address(), session.token().to_owned())
-        .map_err(|error| BridgeError {
-            stage: BridgeStage::Bridge,
-            error: anyhow!("{}", with_detail(&format!("{error:#}"), &session.stderr())),
-        })?;
-    drop(client);
-    Ok(session.remote_pid())
+    match crate::DaemonClient::connect(session.address(), session.token().to_owned()) {
+        Ok(client) => {
+            drop(client);
+            Ok(session.remote_pid())
+        }
+        Err(error) => {
+            let stderr = session.stderr.clone();
+            drop(session);
+            let detail = ssh::append_auth_hint(connection, stderr.finish_and_text());
+            Err(BridgeError {
+                stage: BridgeStage::Bridge,
+                error: anyhow!("{}", with_detail(&format!("{error:#}"), &detail)),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

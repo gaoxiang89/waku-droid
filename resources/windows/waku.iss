@@ -7,6 +7,7 @@
 ; Built by scripts/bundle-windows.ts, which supplies:
 ;   /DAppVersion=<version>  /DArch=<x86_64|aarch64>
 ;   /DStageDir=<dir with the built executables>  /DOutputDir=<dir>
+;   /DHasRemoteDaemons=<0|1> (optional; defaults to 0)
 
 #ifndef AppVersion
   #error AppVersion must be defined (ISCC /DAppVersion=...)
@@ -19,6 +20,9 @@
 #endif
 #ifndef OutputDir
   #define OutputDir "."
+#endif
+#ifndef HasRemoteDaemons
+  #define HasRemoteDaemons 0
 #endif
 
 ; An x64 build is worth allowing on Arm, where it runs emulated; an arm64
@@ -86,6 +90,13 @@ Source: "{#StageDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignorevers
 ; Linux daemons for WSL and SSH hosts. A local build may package without them.
 Source: "{#StageDir}\remote\*"; DestDir: "{app}\remote"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+; ISCC /D defines values as strings, so Int(..., 0) handles both command-line
+; "0"/"1" and the numeric default 0 uniformly.
+#if Int(HasRemoteDaemons, 0) != 0
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\remote"
+#endif
 
 [Icons]
 Name: "{group}\Waku"; Filename: "{app}\waku.exe"
