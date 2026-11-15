@@ -123,7 +123,7 @@ export function RemoteProjectPicker({
       presentationStyle="pageSheet"
       visible={visible}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'web' ? undefined : 'padding'}
         style={[styles.screen, { backgroundColor: theme.background }]}>
         <SafeAreaView edges={['top', 'bottom']} style={styles.screen}>
           <View style={[styles.header, { borderBottomColor: theme.separator }]}>

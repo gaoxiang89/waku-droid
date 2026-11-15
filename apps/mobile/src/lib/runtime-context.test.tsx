@@ -77,6 +77,7 @@ function fixture(options: { attached?: boolean } = {}) {
         case 'loadTaskState':
           return {
             type: 'taskState',
+            deletedProjectIds: [],
             defaultCwd: '/repo',
             projectlessRoot: null,
             projects: [{ id: 'project', name: 'Project', path: '/repo', created_at: 0 }],

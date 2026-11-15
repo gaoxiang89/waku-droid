@@ -293,7 +293,7 @@ function TaskDrawerContent({
 
       {(daemon.profiles.length > 0 || daemon.phase === 'booting') && (
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'position' : undefined}
+          behavior={Platform.OS === 'web' ? undefined : 'position'}
           keyboardVerticalOffset={SearchDockGap}
           pointerEvents="box-none"
           style={[styles.searchDockAvoider, { bottom: insets.bottom + SearchDockGap }]}>

@@ -363,7 +363,7 @@ export default function NewTaskScreen() {
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'web' ? undefined : 'padding'}
       style={[styles.screen, { backgroundColor: theme.background }]}>
       {/* Title and back button are the native navigation bar's; keep clear of it. */}
       <View style={{ height: headerInset }} />

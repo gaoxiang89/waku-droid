@@ -390,7 +390,7 @@ export function SessionView({
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'web' ? undefined : 'padding'}
       style={[styles.screen, { backgroundColor: theme.background }]}>
       <Stack.Screen options={headerOptions} />
       <View style={styles.body}>
