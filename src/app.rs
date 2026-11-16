@@ -309,12 +309,19 @@ enum ToastTone {
     Success,
 }
 
-/// One workspace file being streamed to a user-chosen local path. The flag is
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransferKind {
+    Download,
+    Upload,
+}
+
+/// One workspace transfer being streamed to or from a local path. The flag is
 /// the cancel signal the transfer loop polls between chunks; the card reads
 /// only the counters, so rendering never touches the transfer itself.
 #[derive(Debug)]
 pub(crate) struct ActiveDownload {
     id: u64,
+    pub(crate) kind: TransferKind,
     name: String,
     total_bytes: u64,
     written: u64,
@@ -1752,6 +1759,10 @@ pub struct Waku {
     right_panel_file_rename_input: Entity<TextInput>,
     /// Pending destructive delete awaiting the confirm dialog.
     right_panel_delete_confirm: Option<right_panel::RightPanelDeleteConfirm>,
+    /// Pending conflicting upload awaiting the replace confirm dialog.
+    right_panel_upload_confirm: Option<right_panel::RightPanelUploadConfirm>,
+    /// Working-tree drop target currently highlighted by an external drag.
+    right_panel_files_drop_target: Option<right_panel::FilesDropTarget>,
     /// Find-and-replace over the visible file editor. Created on first use of
     /// the primary find shortcut and kept for the window's lifetime so the
     /// query and toggles survive closing the bar; `open` says whether it shows.
@@ -2281,13 +2292,35 @@ impl Waku {
         name: String,
         cx: &mut Context<Self>,
     ) -> (u64, Arc<AtomicBool>) {
+        self.begin_transfer(TransferKind::Download, name, 0, cx)
+    }
+
+    /// Registers a streaming upload card with its precomputed total byte count
+    /// and returns its handle and cancel flag.
+    pub(super) fn begin_upload(
+        &mut self,
+        name: String,
+        total_bytes: u64,
+        cx: &mut Context<Self>,
+    ) -> (u64, Arc<AtomicBool>) {
+        self.begin_transfer(TransferKind::Upload, name, total_bytes, cx)
+    }
+
+    fn begin_transfer(
+        &mut self,
+        kind: TransferKind,
+        name: String,
+        total_bytes: u64,
+        cx: &mut Context<Self>,
+    ) -> (u64, Arc<AtomicBool>) {
         self.download_generation = self.download_generation.wrapping_add(1);
         let id = self.download_generation;
         let cancel = Arc::new(AtomicBool::new(false));
         self.downloads.push(ActiveDownload {
             id,
+            kind,
             name,
-            total_bytes: 0,
+            total_bytes,
             written: 0,
             cancel: cancel.clone(),
         });
@@ -3589,6 +3622,8 @@ impl Waku {
                 right_panel_file_rename: None,
                 right_panel_file_rename_input,
                 right_panel_delete_confirm: None,
+                right_panel_upload_confirm: None,
+                right_panel_files_drop_target: None,
                 sidebar_collapsed_groups,
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),

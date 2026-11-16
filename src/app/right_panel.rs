@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use anyhow::Context as _;
 use base64::Engine as _;
-use gpui::{KeyBinding, actions};
+use gpui::{ClipboardEntry, KeyBinding, actions};
 use waku_protocol::lexical_path;
 
 use super::*;
@@ -13,21 +14,27 @@ actions!(
     [
         CancelRightPanelFileRename,
         ConfirmRightPanelFileDelete,
-        DismissRightPanelFileDelete
+        DismissRightPanelFileDelete,
+        ConfirmRightPanelFileUpload,
+        DismissRightPanelFileUpload
     ]
 );
 
 const FILE_RENAME_PARENT_CONTEXT: &str = "RightPanelFileRename";
 const FILE_RENAME_FIELD_CONTEXT: &str = "RightPanelFileRename > TextInput";
 const FILE_DELETE_DIALOG_CONTEXT: &str = "RightPanelFileDeleteDialog";
+const FILE_UPLOAD_DIALOG_CONTEXT: &str = "RightPanelFileUploadDialog";
 
 /// Bytes requested per chunk of a streamed download. The daemon clamps to its
 /// own cap; this keeps every wire message small and gives the progress card
 /// fine-grained updates even for multi-gigabyte files.
 const DOWNLOAD_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+/// Bytes encoded per chunk of a streamed upload. Stays safely under the
+/// daemon's 8 MiB per-chunk decoded cap after base64 framing.
+const UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Keep Escape inside the focused inline editor so it cancels the rename,
-/// and give the delete confirm dialog its confirm/dismiss keys.
+/// and give the delete and upload confirm dialogs their confirm/dismiss keys.
 pub fn init(cx: &mut App) {
     super::git_graph::init(cx);
     cx.bind_keys([
@@ -45,6 +52,16 @@ pub fn init(cx: &mut App) {
             "escape",
             DismissRightPanelFileDelete,
             Some(FILE_DELETE_DIALOG_CONTEXT),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            ConfirmRightPanelFileUpload,
+            Some(FILE_UPLOAD_DIALOG_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            DismissRightPanelFileUpload,
+            Some(FILE_UPLOAD_DIALOG_CONTEXT),
         ),
     ]);
 }
@@ -87,6 +104,26 @@ pub(super) struct RightPanelDeleteConfirm {
     pub(super) name: String,
     pub(super) is_dir: bool,
     /// Keyboard focus for the safe choice, so Enter cannot confirm by accident.
+    pub(super) cancel_focus: FocusHandle,
+    pub(super) confirm_focus: FocusHandle,
+}
+
+/// Which directory in the working tree an active OS drag will drop into.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum FilesDropTarget {
+    Root,
+    Directory(String),
+}
+
+/// An upload with destination collisions parked behind a replace prompt.
+#[derive(Clone, Debug)]
+pub(super) struct RightPanelUploadConfirm {
+    pub(super) target_dir: String,
+    pub(super) paths: Vec<PathBuf>,
+    pub(super) conflict_count: usize,
+    pub(super) first_conflict_name: String,
+    pub(super) project_path: PathBuf,
+    pub(super) host_key: waku_client::hosts::HostKey,
     pub(super) cancel_focus: FocusHandle,
     pub(super) confirm_focus: FocusHandle,
 }
@@ -288,6 +325,43 @@ fn join_workspace_path(workspace: &Path, relative_path: &str) -> PathBuf {
         return PathBuf::from(normalized_windows_path(&joined).unwrap_or(joined));
     }
     workspace.join(relative_path)
+}
+
+/// Resolves which directory a working-tree row accepts OS drops into,
+/// matching Zed's project panel: folders accept into themselves, files
+/// accept into their parent folder (or the workspace root for top-level files).
+pub(super) fn files_drop_target_for_entry(relative_path: &str, is_dir: bool) -> FilesDropTarget {
+    if is_dir {
+        FilesDropTarget::Directory(relative_path.to_owned())
+    } else {
+        match relative_path.rfind(['/', '\\']) {
+            Some(index) if index > 0 => {
+                FilesDropTarget::Directory(relative_path[..index].to_owned())
+            }
+            _ => FilesDropTarget::Root,
+        }
+    }
+}
+
+/// Joins `child_name` onto `base_relative` while normalizing path separators
+/// to `sep`, keeping POSIX remote paths free of Windows backslashes.
+pub(super) fn join_workspace_relative_path(
+    base_relative: &str,
+    child_name: &str,
+    sep: char,
+) -> String {
+    let mut joined = String::new();
+    for segment in base_relative
+        .split(['/', '\\'])
+        .chain(child_name.split(['/', '\\']))
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if !joined.is_empty() {
+            joined.push(sep);
+        }
+        joined.push_str(segment);
+    }
+    joined
 }
 
 fn normalized_windows_path(path: &str) -> Option<String> {
@@ -1673,6 +1747,339 @@ pub(super) fn tab_scroll_fade(
     .w(px(TAB_SCROLL_FADE_WIDTH))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UploadTopLevelCandidate {
+    source_path: PathBuf,
+    name: String,
+    is_dir: bool,
+    ui_rel: String,
+    rpc_rel: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlannedUploadOp {
+    EnsureDir {
+        rpc_rel: PathBuf,
+        overwrite: bool,
+    },
+    WriteFile {
+        local_path: PathBuf,
+        rpc_rel: PathBuf,
+        size: u64,
+        overwrite: bool,
+        existed_before: bool,
+    },
+}
+
+#[derive(Debug)]
+struct UploadPlan {
+    ops: Vec<PlannedUploadOp>,
+    total_bytes: u64,
+    display_name: String,
+    item_count: usize,
+    single_uploaded_dir_rel: Option<String>,
+}
+
+fn upload_display_label(candidates: &[UploadTopLevelCandidate]) -> String {
+    match candidates {
+        [] => String::new(),
+        [single] => single.name.clone(),
+        [first, rest @ ..] => tr!(
+            "files.upload_many_label",
+            name = first.name,
+            rest = rest.len()
+        ),
+    }
+}
+
+fn expand_workspace_directory_and_ancestors(
+    workspace: &Path,
+    dir_relative: &str,
+    expanded_paths: &mut HashSet<PathBuf>,
+) {
+    let sep = workspace_separator(workspace);
+    let mut prefix = String::new();
+    for segment in dir_relative
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if !prefix.is_empty() {
+            prefix.push(sep);
+        }
+        prefix.push_str(segment);
+        expanded_paths.insert(join_workspace_path(workspace, &prefix));
+    }
+}
+
+fn prepare_upload_candidates(
+    paths: &[PathBuf],
+    project_path: &Path,
+    target_dir: &str,
+    is_local: bool,
+) -> anyhow::Result<Vec<UploadTopLevelCandidate>> {
+    let sep = workspace_separator(project_path);
+    let normalized_target = join_workspace_relative_path("", target_dir, sep);
+    let dest_dir_canon = if is_local {
+        let dest_dir_path = if normalized_target.is_empty() {
+            project_path.to_path_buf()
+        } else {
+            join_workspace_path(project_path, &normalized_target)
+        };
+        std::fs::canonicalize(&dest_dir_path).ok()
+    } else {
+        None
+    };
+
+    let mut candidates: Vec<UploadTopLevelCandidate> = Vec::new();
+    for source_path in paths {
+        let Some(name) = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty() && name != "." && name != "..")
+        else {
+            continue;
+        };
+        // Follow symlinks for top-level dropped items so a dragged alias/symlink
+        // uploads its target file or directory cleanly.
+        let source_meta = std::fs::metadata(source_path)
+            .with_context(|| format!("could not read {}", source_path.display()))?;
+        if !source_meta.is_dir() && !source_meta.is_file() {
+            anyhow::bail!("unsupported file type: {}", source_path.display());
+        }
+        if is_local
+            && let Some(dest_dir_canon) = &dest_dir_canon
+            && let Ok(source_canon) = std::fs::canonicalize(source_path)
+        {
+            if source_canon == dest_dir_canon.join(&name) {
+                continue;
+            }
+            if source_meta.is_dir()
+                && dest_dir_canon.starts_with(&source_canon)
+                && *dest_dir_canon != source_canon
+            {
+                anyhow::bail!("{}", tr!("files.upload_into_self_failed"));
+            }
+        }
+        let ui_rel = join_workspace_relative_path(&normalized_target, &name, sep);
+        let rpc_rel = PathBuf::from(&ui_rel);
+        let candidate = UploadTopLevelCandidate {
+            source_path: source_path.clone(),
+            name: name.clone(),
+            is_dir: source_meta.is_dir(),
+            ui_rel,
+            rpc_rel,
+        };
+        if let Some(existing_index) = candidates.iter().position(|existing| {
+            if sep == '\\' {
+                existing.name.eq_ignore_ascii_case(&name)
+            } else {
+                existing.name == name
+            }
+        }) {
+            candidates[existing_index] = candidate;
+        } else {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+fn collect_directory_upload_ops(
+    local_dir: &Path,
+    rel_dir: &str,
+    sep: char,
+    overwrite: bool,
+    dir_existed_before: bool,
+    ops: &mut Vec<PlannedUploadOp>,
+    total_bytes: &mut u64,
+) -> anyhow::Result<()> {
+    let mut entries = std::fs::read_dir(local_dir)
+        .with_context(|| format!("could not read directory {}", local_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("could not read directory {}", local_dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("could not inspect {}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            // Skip symlinks inside directories so cyclic links cannot recurse
+            // and outside files are never pulled into the workspace.
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        let child_rel = join_workspace_relative_path(rel_dir, &name, sep);
+        let child_path = entry.path();
+        if file_type.is_dir() {
+            ops.push(PlannedUploadOp::EnsureDir {
+                rpc_rel: PathBuf::from(&child_rel),
+                overwrite,
+            });
+            collect_directory_upload_ops(
+                &child_path,
+                &child_rel,
+                sep,
+                overwrite,
+                dir_existed_before,
+                ops,
+                total_bytes,
+            )?;
+        } else if file_type.is_file() {
+            let meta = entry
+                .metadata()
+                .with_context(|| format!("could not inspect {}", child_path.display()))?;
+            let size = meta.len();
+            *total_bytes = total_bytes
+                .checked_add(size)
+                .context("upload total size overflowed")?;
+            ops.push(PlannedUploadOp::WriteFile {
+                local_path: child_path,
+                rpc_rel: PathBuf::from(&child_rel),
+                size,
+                overwrite,
+                existed_before: dir_existed_before,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn build_upload_plan(
+    candidates: &[UploadTopLevelCandidate],
+    sep: char,
+    overwrite_top_level: bool,
+    existing_top_level: &HashSet<PathBuf>,
+) -> anyhow::Result<UploadPlan> {
+    let mut ops = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for candidate in candidates {
+        let top_existed = existing_top_level.contains(&candidate.rpc_rel);
+        if candidate.is_dir {
+            ops.push(PlannedUploadOp::EnsureDir {
+                rpc_rel: candidate.rpc_rel.clone(),
+                overwrite: overwrite_top_level,
+            });
+            collect_directory_upload_ops(
+                &candidate.source_path,
+                &candidate.ui_rel,
+                sep,
+                overwrite_top_level,
+                top_existed,
+                &mut ops,
+                &mut total_bytes,
+            )?;
+        } else {
+            let meta = std::fs::metadata(&candidate.source_path)
+                .with_context(|| format!("could not read {}", candidate.source_path.display()))?;
+            let size = meta.len();
+            total_bytes = total_bytes
+                .checked_add(size)
+                .context("upload total size overflowed")?;
+            ops.push(PlannedUploadOp::WriteFile {
+                local_path: candidate.source_path.clone(),
+                rpc_rel: candidate.rpc_rel.clone(),
+                size,
+                overwrite: overwrite_top_level,
+                existed_before: top_existed,
+            });
+        }
+    }
+    let single_uploaded_dir_rel = match candidates {
+        [single] if single.is_dir => Some(single.ui_rel.clone()),
+        _ => None,
+    };
+    Ok(UploadPlan {
+        ops,
+        total_bytes,
+        display_name: upload_display_label(candidates),
+        item_count: candidates.len(),
+        single_uploaded_dir_rel,
+    })
+}
+
+fn check_workspace_paths_exist(
+    workspace: &waku_client::WorkspaceClient,
+    project_path: PathBuf,
+    relative_paths: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if relative_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    match workspace.request(waku_client::WorkspaceOperation::CheckPathsExist {
+        root: project_path,
+        relative_paths,
+    })? {
+        waku_client::WorkspaceResult::ExistingPaths { relative_paths } => Ok(relative_paths),
+        _ => anyhow::bail!("the daemon returned an invalid path check response"),
+    }
+}
+
+fn prepare_and_check_upload_paths(
+    workspace: &waku_client::WorkspaceClient,
+    paths: &[PathBuf],
+    project_path: &Path,
+    target_dir: &str,
+    is_local: bool,
+) -> anyhow::Result<Option<(Vec<UploadTopLevelCandidate>, Vec<PathBuf>)>> {
+    let candidates = prepare_upload_candidates(paths, project_path, target_dir, is_local)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let top_level_candidates = candidates
+        .iter()
+        .map(|candidate| candidate.rpc_rel.clone())
+        .collect::<Vec<_>>();
+    let existing =
+        check_workspace_paths_exist(workspace, project_path.to_path_buf(), top_level_candidates)?;
+    Ok(Some((candidates, existing)))
+}
+
+fn upload_file_chunk(
+    workspace: &waku_client::WorkspaceClient,
+    project_path: PathBuf,
+    local_path: &Path,
+    rpc_rel: PathBuf,
+    expected_size: u64,
+    file_offset: u64,
+    overwrite: bool,
+) -> anyhow::Result<u64> {
+    let mut file = std::fs::File::open(local_path)
+        .with_context(|| format!("could not open {}", local_path.display()))?;
+    let actual_len = file
+        .metadata()
+        .with_context(|| format!("could not inspect {}", local_path.display()))?
+        .len();
+    if actual_len != expected_size {
+        anyhow::bail!(
+            "the file {} changed size from {expected_size} to {actual_len} bytes while uploading",
+            local_path.display()
+        );
+    }
+    let remaining = expected_size.saturating_sub(file_offset);
+    let want = remaining.min(UPLOAD_CHUNK_BYTES as u64) as usize;
+    let mut buffer = vec![0u8; want];
+    if want > 0 {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        file.seek(SeekFrom::Start(file_offset))?;
+        file.read_exact(&mut buffer)
+            .with_context(|| format!("the file {} changed while uploading", local_path.display()))?;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.encode(&buffer);
+    match workspace.request(waku_client::WorkspaceOperation::WriteFileChunk {
+        root: project_path,
+        relative_path: rpc_rel,
+        offset: file_offset,
+        bytes,
+        overwrite,
+    })? {
+        waku_client::WorkspaceResult::Ack => Ok(want as u64),
+        _ => anyhow::bail!("the daemon returned an invalid upload response"),
+    }
+}
+
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
@@ -2705,6 +3112,217 @@ mod tests {
             px(0.0)
         );
     }
+
+    #[test]
+    fn files_drop_target_resolves_directories_and_parent_folders() {
+        assert_eq!(
+            files_drop_target_for_entry("src/ui", true),
+            FilesDropTarget::Directory("src/ui".into())
+        );
+        assert_eq!(
+            files_drop_target_for_entry("src\\ui", true),
+            FilesDropTarget::Directory("src\\ui".into())
+        );
+        assert_eq!(
+            files_drop_target_for_entry("src/ui/menu.rs", false),
+            FilesDropTarget::Directory("src/ui".into())
+        );
+        assert_eq!(
+            files_drop_target_for_entry("src\\ui\\menu.rs", false),
+            FilesDropTarget::Directory("src\\ui".into())
+        );
+        assert_eq!(
+            files_drop_target_for_entry("Cargo.toml", false),
+            FilesDropTarget::Root
+        );
+    }
+
+    #[test]
+    fn join_workspace_relative_path_follows_target_workspace_separator() {
+        let posix_sep = workspace_separator(Path::new("/home/dev/repo"));
+        assert_eq!(posix_sep, '/');
+        assert_eq!(
+            join_workspace_relative_path("", "Cargo.toml", posix_sep),
+            "Cargo.toml"
+        );
+        assert_eq!(
+            join_workspace_relative_path("src\\ui", "menu.rs", posix_sep),
+            "src/ui/menu.rs"
+        );
+        assert_eq!(
+            join_workspace_relative_path("src/ui/", "nested\\file.txt", posix_sep),
+            "src/ui/nested/file.txt"
+        );
+
+        let win_sep = workspace_separator(Path::new(r"C:\repo"));
+        assert_eq!(win_sep, '\\');
+        assert_eq!(
+            join_workspace_relative_path("", "Cargo.toml", win_sep),
+            "Cargo.toml"
+        );
+        assert_eq!(
+            join_workspace_relative_path("src/ui", "menu.rs", win_sep),
+            r"src\ui\menu.rs"
+        );
+        assert_eq!(
+            join_workspace_relative_path(r"src\ui\", "nested/file.txt", win_sep),
+            r"src\ui\nested\file.txt"
+        );
+    }
+
+    #[test]
+    fn upload_planner_handles_self_copy_into_self_and_nested_directories() {
+        let root = std::env::temp_dir().join(format!("waku-upload-plan-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let external = root.join("external");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("dir_a/sub")).unwrap();
+        std::fs::write(workspace.join("existing.txt"), "keep").unwrap();
+        std::fs::create_dir_all(external.join("bundle/empty_sub")).unwrap();
+        std::fs::create_dir_all(external.join("bundle/nested")).unwrap();
+        std::fs::write(external.join("bundle/nested/hello.txt"), "hello").unwrap();
+        std::fs::write(external.join("bundle/root.bin"), "1234567").unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let symlink_path = external.join("bundle/linked_sub");
+        #[cfg(unix)]
+        let symlink_created = std::os::unix::fs::symlink(&outside, &symlink_path).is_ok();
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_dir(&outside, &symlink_path).is_ok();
+
+        // Identical source == target is skipped as a no-op.
+        let self_copy = prepare_upload_candidates(
+            &[workspace.join("existing.txt")],
+            &workspace,
+            "",
+            true,
+        )
+        .unwrap();
+        assert!(self_copy.is_empty());
+
+        // Copying a directory into its own subdirectory fails with the localized error.
+        let err = prepare_upload_candidates(
+            &[workspace.join("dir_a")],
+            &workspace,
+            "dir_a/sub",
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(&*tr!("files.upload_into_self_failed")));
+
+        // Nested files and empty directories are collected with accurate byte total,
+        // and any symlinked subdirectory inside the folder is skipped.
+        let candidates = prepare_upload_candidates(
+            &[external.join("bundle")],
+            &workspace,
+            "dir_a",
+            true,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].is_dir);
+
+        let sep = workspace_separator(&workspace);
+        let plan = build_upload_plan(&candidates, sep, false, &HashSet::new()).unwrap();
+        assert_eq!(plan.total_bytes, 12);
+        assert_eq!(
+            plan.single_uploaded_dir_rel.as_deref(),
+            Some(if sep == '\\' {
+                r"dir_a\bundle"
+            } else {
+                "dir_a/bundle"
+            })
+        );
+
+        let expected_rel = |sub: &str| PathBuf::from(join_workspace_relative_path("dir_a", sub, sep));
+        assert!(plan.ops.contains(&PlannedUploadOp::EnsureDir {
+            rpc_rel: expected_rel("bundle"),
+            overwrite: false,
+        }));
+        assert!(plan.ops.contains(&PlannedUploadOp::EnsureDir {
+            rpc_rel: expected_rel("bundle/empty_sub"),
+            overwrite: false,
+        }));
+        assert!(plan.ops.contains(&PlannedUploadOp::EnsureDir {
+            rpc_rel: expected_rel("bundle/nested"),
+            overwrite: false,
+        }));
+        assert!(plan.ops.contains(&PlannedUploadOp::WriteFile {
+            local_path: external.join("bundle/nested/hello.txt"),
+            rpc_rel: expected_rel("bundle/nested/hello.txt"),
+            size: 5,
+            overwrite: false,
+            existed_before: false,
+        }));
+        assert!(plan.ops.contains(&PlannedUploadOp::WriteFile {
+            local_path: external.join("bundle/root.bin"),
+            rpc_rel: expected_rel("bundle/root.bin"),
+            size: 7,
+            overwrite: false,
+            existed_before: false,
+        }));
+        if symlink_created {
+            assert!(!plan.ops.iter().any(|op| match op {
+                PlannedUploadOp::EnsureDir { rpc_rel, .. }
+                | PlannedUploadOp::WriteFile { rpc_rel, .. } => {
+                    rpc_rel.to_string_lossy().contains("linked_sub")
+                        || rpc_rel.to_string_lossy().contains("secret.txt")
+                }
+            }));
+        }
+
+        // Check deduplication, overwrite flags, and ancestor expansion as well.
+        std::fs::write(external.join("dup_a.txt"), "first").unwrap();
+        std::fs::create_dir_all(external.join("other")).unwrap();
+        std::fs::write(external.join("other/dup_a.txt"), "second").unwrap();
+        let deduped = prepare_upload_candidates(
+            &[external.join("dup_a.txt"), external.join("other/dup_a.txt")],
+            &workspace,
+            "dir_a",
+            true,
+        )
+        .unwrap();
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].source_path, external.join("other/dup_a.txt"));
+
+        let overwrite_plan = build_upload_plan(
+            &candidates,
+            sep,
+            true,
+            &HashSet::from([expected_rel("bundle")]),
+        )
+        .unwrap();
+        assert!(overwrite_plan.ops.iter().all(|op| match op {
+            PlannedUploadOp::EnsureDir { overwrite, .. } => *overwrite,
+            PlannedUploadOp::WriteFile {
+                overwrite,
+                existed_before,
+                ..
+            } => *overwrite && *existed_before,
+        }));
+
+        let mut posix_expanded = HashSet::new();
+        expand_workspace_directory_and_ancestors(
+            Path::new("/home/dev/repo"),
+            "src\\ui\\icons",
+            &mut posix_expanded,
+        );
+        assert!(posix_expanded.contains(&PathBuf::from("/home/dev/repo/src")));
+        assert!(posix_expanded.contains(&PathBuf::from("/home/dev/repo/src/ui")));
+        assert!(posix_expanded.contains(&PathBuf::from("/home/dev/repo/src/ui/icons")));
+
+        let mut win_expanded = HashSet::new();
+        expand_workspace_directory_and_ancestors(
+            Path::new(r"C:\repo"),
+            "src/ui",
+            &mut win_expanded,
+        );
+        assert!(win_expanded.contains(&PathBuf::from(r"C:\repo\src")));
+        assert!(win_expanded.contains(&PathBuf::from(r"C:\repo\src\ui")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 impl Waku {
@@ -2983,10 +3601,13 @@ impl Waku {
         self.right_panel_files_selected_path = state.files_selected_path;
         self.right_panel_file_tree_width = state.file_tree_width;
         self.right_panel_file_editors = state.file_editors;
-        // A rename or delete confirm belongs to the tree it was opened on;
-        // switching sessions abandons it rather than retargeting the wrong row.
+        // A rename or delete/upload confirm belongs to the tree it was opened
+        // on; switching sessions abandons it rather than retargeting the wrong
+        // row or workspace.
         self.right_panel_file_rename = None;
         self.right_panel_delete_confirm = None;
+        self.right_panel_upload_confirm = None;
+        self.right_panel_files_drop_target = None;
         self.right_panel_diff_refresh.reset();
         self.right_panel_diff_selection.clear();
         self.right_panel_diff_source = state.diff_source;
@@ -4556,7 +5177,28 @@ impl Waku {
                             cx,
                         );
                     })),
-            );
+            )
+            .when(self.selected_project().is_some(), |header| {
+                let focus = self.transcript_control_focus("files-upload", cx);
+                header.child(
+                    icon_button("files-upload", "icons/cloud-upload.svg", *theme)
+                        .track_focus(&focus)
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .tooltip(Tooltip::text(tr!("files.upload")))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.prompt_upload_to_right_panel(String::new(), window, cx);
+                        }))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            if !event.keystroke.modifiers.modified()
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                this.prompt_upload_to_right_panel(String::new(), window, cx);
+                                cx.stop_propagation();
+                            }
+                        })),
+                )
+            });
         if closable {
             let focus = self.transcript_control_focus("close-files-panel", cx);
             header = header.child(
@@ -4624,11 +5266,25 @@ impl Waku {
                 ));
         };
         let project_name = project.display_name();
-        // Read only. The walk is filesystem I/O, so it happens in
+        // Read only. The walk runs off-thread in
         // `refresh_right_panel_working_tree`, never in a frame.
         let entries = self.right_panel_working_tree.clone();
+        let active_drop_target = cx
+            .has_active_drag()
+            .then_some(self.right_panel_files_drop_target.as_ref())
+            .flatten()
+            .cloned();
 
-        let mut list = div().flex().flex_col().py(px(6.0));
+        let mut list = div().flex().flex_col();
+        list = list.child(self.attach_files_drop_handlers(
+            div()
+                .id("right-panel-files-drop-top-spacer")
+                .w_full()
+                .h(px(6.0))
+                .flex_none(),
+            FilesDropTarget::Root,
+            cx,
+        ));
         if let Some(RightPanelFileRename::Create {
             parent_relative_path,
             depth,
@@ -4636,8 +5292,11 @@ impl Waku {
         }) = &self.right_panel_file_rename
             && parent_relative_path.is_empty()
         {
-            list = list
-                .child(self.render_right_panel_file_create_row("", *depth, *is_dir, &theme, cx));
+            list = list.child(
+                self.attach_files_drop_handlers(div().w_full(), FilesDropTarget::Root, cx).child(
+                    self.render_right_panel_file_create_row("", *depth, *is_dir, &theme, cx),
+                ),
+            );
         }
         for entry in entries {
             let relative_path = entry.relative_path.clone();
@@ -4646,6 +5305,14 @@ impl Waku {
             let is_dir = entry.is_dir;
             let entry_depth = entry.depth;
             let selected = selected_path == Some(relative_path.as_str());
+            let drop_target = files_drop_target_for_entry(&relative_path, is_dir);
+            let target_dir = match &drop_target {
+                FilesDropTarget::Root => String::new(),
+                FilesDropTarget::Directory(dir) => dir.clone(),
+            };
+            let drop_highlighted = is_dir
+                && active_drop_target.as_ref()
+                    == Some(&FilesDropTarget::Directory(relative_path.clone()));
             let renaming = matches!(
                 self.right_panel_file_rename.as_ref(),
                 Some(RightPanelFileRename::Rename {
@@ -4662,6 +5329,7 @@ impl Waku {
             let keyboard_menu = menu.clone();
             let key_relative_path = relative_path.clone();
             let key_absolute_path = absolute_path.clone();
+            let paste_target_dir = target_dir.clone();
             let click_relative_path = relative_path.clone();
             let click_absolute_path = absolute_path.clone();
             let menu_relative_path = relative_path.clone();
@@ -4681,6 +5349,12 @@ impl Waku {
                 .gap(px(6.0))
                 .cursor_default()
                 .when(selected, |element| element.bg(theme.overlay_strong))
+                .when(drop_highlighted, |element| {
+                    element
+                        .bg(theme.accent.opacity(0.14))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.7))
+                })
                 .hover(|element| element.bg(theme.overlay))
                 .child(if is_dir {
                     icon(
@@ -4756,6 +5430,28 @@ impl Waku {
                             } else if key == "f10" && event.keystroke.modifiers.shift {
                                 keyboard_menu.open_context_menu(window, cx);
                                 cx.stop_propagation();
+                            } else if key.eq_ignore_ascii_case("v")
+                                && event.keystroke.modifiers.secondary()
+                                && !event.keystroke.modifiers.shift
+                                && !event.keystroke.modifiers.alt
+                                && let Some(paths) = cx.read_from_clipboard().and_then(|clipboard| {
+                                    clipboard.entries().iter().find_map(|entry| match entry {
+                                        ClipboardEntry::ExternalPaths(external)
+                                            if !external.paths().is_empty() =>
+                                        {
+                                            Some(external.paths().to_vec())
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                            {
+                                this.drop_external_paths_to_right_panel(
+                                    paths,
+                                    paste_target_dir.clone(),
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
                             }
                         }))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -4771,11 +5467,12 @@ impl Waku {
                             }
                         }))
                 });
+            let row_wrapper = self
+                .attach_files_drop_handlers(div().w_full(), drop_target, cx)
+                .child(row);
             let row_relative = relative_path.clone();
             let row = if renaming {
-                div()
-                    .w_full()
-                    .child(row)
+                row_wrapper
                     .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                         if matches!(
                             this.right_panel_file_rename.as_ref(),
@@ -4790,7 +5487,7 @@ impl Waku {
                     .into_any_element()
             } else {
                 context_menu(
-                    div().w_full().child(row),
+                    row_wrapper,
                     SharedString::from(format!("right-panel-file-menu-{relative_path}")),
                     &menu,
                     move |_| {
@@ -4798,6 +5495,7 @@ impl Waku {
                         let new_folder_waku = waku.clone();
                         let copy_rel_waku = waku.clone();
                         let copy_abs_waku = waku.clone();
+                        let upload_waku = waku.clone();
                         let download_waku = waku.clone();
                         let rename_waku = waku.clone();
                         let delete_waku = waku.clone();
@@ -4809,6 +5507,7 @@ impl Waku {
                                 .map(|idx| menu_relative_path[..idx].to_owned())
                                 .unwrap_or_default()
                         };
+                        let upload_parent_dir = parent_for_create.clone();
                         let create_depth = if is_dir { entry_depth + 1 } else { entry_depth };
                         let expand_dir = is_dir.then(|| menu_absolute_path.clone());
                         let mut items = Vec::new();
@@ -4878,6 +5577,21 @@ impl Waku {
                             );
                         }
                         items.push(MenuItem::Separator);
+                        {
+                            let target_dir = upload_parent_dir;
+                            items.push(
+                                MenuItem::new(tr!("files.upload"), move |window, cx| {
+                                    let _ = upload_waku.update(cx, |waku, cx| {
+                                        waku.prompt_upload_to_right_panel(
+                                            target_dir.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                })
+                                .icon("icons/cloud-upload.svg"),
+                            );
+                        }
                         if !is_dir {
                             let relative_path = menu_relative_path.clone();
                             let item_name = name.clone();
@@ -4893,8 +5607,8 @@ impl Waku {
                                 })
                                 .icon("icons/download.svg"),
                             );
-                            items.push(MenuItem::Separator);
                         }
+                        items.push(MenuItem::Separator);
                         let rename_relative_path = menu_relative_path.clone();
                         items.push(
                             MenuItem::new(tr!("common.rename"), move |window, cx| {
@@ -4938,13 +5652,20 @@ impl Waku {
                 && is_dir
                 && parent_relative_path == &relative_path
             {
-                list = list.child(self.render_right_panel_file_create_row(
-                    parent_relative_path,
-                    *depth,
-                    *create_is_dir,
-                    &theme,
-                    cx,
-                ));
+                list = list.child(
+                    self.attach_files_drop_handlers(
+                        div().w_full(),
+                        FilesDropTarget::Directory(parent_relative_path.clone()),
+                        cx,
+                    )
+                    .child(self.render_right_panel_file_create_row(
+                        parent_relative_path,
+                        *depth,
+                        *create_is_dir,
+                        &theme,
+                        cx,
+                    )),
+                );
             }
         }
 
@@ -4970,13 +5691,93 @@ impl Waku {
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.right_panel_files_scroll_handle)
-                            .child(list),
+                            .flex()
+                            .flex_col()
+                            .when(active_drop_target == Some(FilesDropTarget::Root), |el| {
+                                el.bg(theme.accent.opacity(0.06))
+                                    .border_1()
+                                    .border_color(theme.accent.opacity(0.65))
+                            })
+                            .on_drag_move::<ExternalPaths>(cx.listener(
+                                |this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
+                                    if !event.bounds.contains(&event.event.position)
+                                        && this.right_panel_files_drop_target.take().is_some()
+                                    {
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                            .on_drop::<ExternalPaths>(cx.listener(
+                                |this, paths: &ExternalPaths, window, cx| {
+                                    this.right_panel_files_drop_target = None;
+                                    this.drop_external_paths_to_right_panel(
+                                        paths.paths().to_vec(),
+                                        String::new(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                },
+                            ))
+                            .child(list)
+                            .child(self.attach_files_drop_handlers(
+                                div()
+                                    .id("right-panel-files-drop-filler")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h(px(16.0)),
+                                FilesDropTarget::Root,
+                                cx,
+                            )),
                     )
                     .child(scrollbar::vertical(
                         &self.right_panel_files_scroll_handle,
                         &self.right_panel_files_scrollbar,
                     )),
             )
+    }
+
+    fn attach_files_drop_handlers<E>(
+        &self,
+        element: E,
+        drop_target: FilesDropTarget,
+        cx: &mut Context<Self>,
+    ) -> E
+    where
+        E: InteractiveElement,
+    {
+        let target_dir = match &drop_target {
+            FilesDropTarget::Root => String::new(),
+            FilesDropTarget::Directory(dir) => dir.clone(),
+        };
+        let move_target = drop_target;
+        element
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
+                    if this
+                        .right_panel_files_scroll_handle
+                        .bounds()
+                        .contains(&event.event.position)
+                        && event.bounds.contains(&event.event.position)
+                        && this.right_panel_files_drop_target.as_ref() != Some(&move_target)
+                    {
+                        this.right_panel_files_drop_target = Some(move_target.clone());
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<ExternalPaths>(cx.listener(
+                move |this, paths: &ExternalPaths, window, cx| {
+                    this.right_panel_files_drop_target = None;
+                    this.drop_external_paths_to_right_panel(
+                        paths.paths().to_vec(),
+                        target_dir.clone(),
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            ))
     }
 
     fn render_right_panel_file_create_row(
@@ -5061,35 +5862,16 @@ impl Waku {
         let confirm_state = self.right_panel_delete_confirm.clone()?;
         let theme = Theme::current(cx);
 
-        let cancel = div()
-            .id("right-panel-delete-cancel")
-            .track_focus(&confirm_state.cancel_focus)
-            .tab_index(0)
-            .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .h(px(32.0))
-            .px(px(14.0))
-            .rounded(px(8.0))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .cursor_default()
-            .text_size(sp(13.0))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.text_secondary)
-            .bg(theme.overlay)
-            .hover(|element| element.bg(theme.overlay_strong))
-            .child(tr_cow!("common.cancel"))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    this.right_panel_delete_confirm = None;
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
+        let cancel = self.render_right_panel_confirm_cancel_button(
+            "right-panel-delete-cancel",
+            confirm_state.cancel_focus,
+            &theme,
+            |this, cx| {
                 this.right_panel_delete_confirm = None;
                 cx.notify();
-            }));
+            },
+            cx,
+        );
         let confirm = div()
             .id("right-panel-delete-confirm")
             .track_focus(&confirm_state.confirm_focus)
@@ -5135,9 +5917,17 @@ impl Waku {
         } else {
             tr!("files.delete_confirm_message", name = confirm_state.name)
         };
-        let card = div()
-            .id("right-panel-delete-confirm-card")
-            .key_context(FILE_DELETE_DIALOG_CONTEXT)
+        let card = self
+            .render_right_panel_confirm_card(
+                "right-panel-delete-confirm-card",
+                FILE_DELETE_DIALOG_CONTEXT,
+                theme.danger,
+                tr_cow!("files.delete_confirm_title"),
+                message,
+                cancel,
+                confirm,
+                &theme,
+            )
             .on_action(
                 cx.listener(|waku, _: &ConfirmRightPanelFileDelete, window, cx| {
                     waku.confirm_right_panel_file_delete_action(
@@ -5155,7 +5945,186 @@ impl Waku {
                         cx,
                     );
                 }),
+            );
+
+        Some(self.render_right_panel_confirm_scrim(
+            "right-panel-delete-confirm-layer",
+            card,
+            &theme,
+            cx.listener(|waku, _, window, cx| {
+                waku.dismiss_right_panel_file_delete_action(
+                    &DismissRightPanelFileDelete,
+                    window,
+                    cx,
+                );
+            }),
+        ))
+    }
+
+    /// The upload replace confirm dialog: a deferred scrim layer shown when
+    /// dropped or selected items collide with existing entries at the target.
+    pub(super) fn render_right_panel_upload_confirm(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let confirm_state = self.right_panel_upload_confirm.clone()?;
+        let theme = Theme::current(cx);
+
+        let cancel = self.render_right_panel_confirm_cancel_button(
+            "right-panel-upload-cancel",
+            confirm_state.cancel_focus,
+            &theme,
+            |this, cx| {
+                this.right_panel_upload_confirm = None;
+                cx.notify();
+            },
+            cx,
+        );
+        let confirm = div()
+            .id("right-panel-upload-confirm")
+            .track_focus(&confirm_state.confirm_focus)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.danger))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.danger)
+            .bg(theme.danger_soft)
+            .hover(|element| element.bg(theme.danger.opacity(0.16)))
+            .child(icon("icons/replace.svg", 13.0, theme.danger))
+            .child(tr_cow!("files.upload_replace"))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.confirm_right_panel_file_upload_action(
+                        &ConfirmRightPanelFileUpload,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_right_panel_file_upload_action(
+                    &ConfirmRightPanelFileUpload,
+                    window,
+                    cx,
+                );
+            }));
+
+        let message = if confirm_state.conflict_count > 1 {
+            tr!(
+                "files.upload_replace_confirm_message_many",
+                count = confirm_state.conflict_count,
+                name = confirm_state.first_conflict_name
             )
+        } else {
+            tr!(
+                "files.upload_replace_confirm_message",
+                name = confirm_state.first_conflict_name
+            )
+        };
+        let card = self
+            .render_right_panel_confirm_card(
+                "right-panel-upload-confirm-card",
+                FILE_UPLOAD_DIALOG_CONTEXT,
+                theme.warning,
+                tr_cow!("files.upload_replace_confirm_title"),
+                message,
+                cancel,
+                confirm,
+                &theme,
+            )
+            .on_action(
+                cx.listener(|waku, _: &ConfirmRightPanelFileUpload, window, cx| {
+                    waku.confirm_right_panel_file_upload_action(
+                        &ConfirmRightPanelFileUpload,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(|waku, _: &DismissRightPanelFileUpload, window, cx| {
+                    waku.dismiss_right_panel_file_upload_action(
+                        &DismissRightPanelFileUpload,
+                        window,
+                        cx,
+                    );
+                }),
+            );
+
+        Some(self.render_right_panel_confirm_scrim(
+            "right-panel-upload-confirm-layer",
+            card,
+            &theme,
+            cx.listener(|waku, _, window, cx| {
+                waku.dismiss_right_panel_file_upload_action(
+                    &DismissRightPanelFileUpload,
+                    window,
+                    cx,
+                );
+            }),
+        ))
+    }
+
+    fn render_right_panel_confirm_cancel_button(
+        &self,
+        id: &'static str,
+        focus_handle: FocusHandle,
+        theme: &Theme,
+        on_cancel: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let on_cancel = std::rc::Rc::new(on_cancel);
+        let on_key = on_cancel.clone();
+        div()
+            .id(id)
+            .track_focus(&focus_handle)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .h(px(32.0))
+            .px(px(14.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_default()
+            .text_size(sp(13.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_secondary)
+            .bg(theme.overlay)
+            .hover(|element| element.bg(theme.overlay_strong))
+            .child(tr_cow!("common.cancel"))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    on_key(this, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| on_cancel(this, cx)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_right_panel_confirm_card(
+        &self,
+        id: &'static str,
+        key_context: &'static str,
+        icon_color: Hsla,
+        title: std::borrow::Cow<'static, str>,
+        message: String,
+        cancel: impl IntoElement,
+        confirm: impl IntoElement,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .key_context(key_context)
             .tab_group()
             .tab_stop(false)
             .w_full()
@@ -5177,8 +6146,8 @@ impl Waku {
                     .gap(px(9.0))
                     .text_size(sp(14.0))
                     .text_color(theme.text)
-                    .child(icon("icons/alert.svg", 15.0, theme.danger))
-                    .child(tr_cow!("files.delete_confirm_title")),
+                    .child(icon("icons/alert.svg", 15.0, icon_color))
+                    .child(title),
             )
             .child(
                 div()
@@ -5199,15 +6168,23 @@ impl Waku {
                     .gap(px(8.0))
                     .child(cancel)
                     .child(confirm),
-            );
+            )
+    }
 
+    fn render_right_panel_confirm_scrim(
+        &self,
+        id: &'static str,
+        card: impl IntoElement,
+        theme: &Theme,
+        on_scrim_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
         let scrim = if theme.is_dark {
             gpui::hsla(0.0, 0.0, 0.0, 0.34)
         } else {
             gpui::hsla(0.0, 0.0, 0.0, 0.16)
         };
         let layer = div()
-            .id("right-panel-delete-confirm-layer")
+            .id(id)
             .absolute()
             .inset_0()
             .occlude()
@@ -5216,18 +6193,9 @@ impl Waku {
             .flex()
             .items_center()
             .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|waku, _, window, cx| {
-                    waku.dismiss_right_panel_file_delete_action(
-                        &DismissRightPanelFileDelete,
-                        window,
-                        cx,
-                    );
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, on_scrim_down)
             .child(card);
-        Some(gpui::deferred(layer).with_priority(4).into_any_element())
+        gpui::deferred(layer).with_priority(4).into_any_element()
     }
 
     fn render_right_panel_file(
@@ -6468,6 +7436,534 @@ impl Waku {
     ) {
         self.right_panel_delete_confirm = None;
         cx.notify();
+    }
+
+    pub(super) fn drop_external_paths_to_right_panel(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target_dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let window_handle = window.window_handle();
+        self.start_right_panel_upload_paths(paths, target_dir, Some(window_handle), cx);
+    }
+
+    pub(super) fn prompt_upload_to_right_panel(
+        &mut self,
+        target_dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_workspace_path().is_none() {
+            return;
+        }
+        let window_handle = window.window_handle();
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |waku, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let _ = waku.update(cx, |waku, cx| {
+                waku.start_right_panel_upload_paths(paths, target_dir, Some(window_handle), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn start_right_panel_upload_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        target_dir: String,
+        window_handle: Option<gpui::AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let host_key = self.selected_host_key();
+        let daemon = self.selected_daemon().clone();
+        let is_local = !daemon.is_remote();
+        let workspace = waku_client::WorkspaceClient::for_daemon(daemon.clone());
+        cx.spawn(async move |waku, cx| {
+            let phase1 = cx
+                .background_executor()
+                .spawn({
+                    let workspace = workspace.clone();
+                    let paths = paths.clone();
+                    let target_dir = target_dir.clone();
+                    let project_path = project_path.clone();
+                    async move {
+                        prepare_and_check_upload_paths(
+                            &workspace,
+                            &paths,
+                            &project_path,
+                            &target_dir,
+                            is_local,
+                        )
+                    }
+                })
+                .await;
+
+            let confirm_focus = waku.update(cx, |waku, cx| -> Option<FocusHandle> {
+                if waku.selected_host_key() != host_key
+                    || waku
+                        .selected_workspace_path()
+                        .is_none_or(|path| path != project_path)
+                {
+                    return None;
+                }
+                match phase1 {
+                    Ok(None) => None,
+                    Ok(Some((candidates, existing))) => {
+                        if existing.is_empty() {
+                            waku.execute_right_panel_upload(
+                                candidates,
+                                target_dir,
+                                project_path,
+                                host_key,
+                                daemon,
+                                false,
+                                HashSet::new(),
+                                cx,
+                            );
+                            None
+                        } else {
+                            let first_conflict_name = candidates
+                                .iter()
+                                .find(|candidate| candidate.rpc_rel == existing[0])
+                                .map(|candidate| candidate.name.clone())
+                                .or_else(|| {
+                                    existing[0]
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .map(str::to_owned)
+                                })
+                                .unwrap_or_else(|| existing[0].to_string_lossy().into_owned());
+                            let cancel_focus = cx.focus_handle();
+                            let confirm_focus = cx.focus_handle();
+                            let deduped_paths = candidates
+                                .into_iter()
+                                .map(|candidate| candidate.source_path)
+                                .collect();
+                            waku.right_panel_upload_confirm = Some(RightPanelUploadConfirm {
+                                target_dir,
+                                paths: deduped_paths,
+                                conflict_count: existing.len(),
+                                first_conflict_name,
+                                project_path,
+                                host_key,
+                                cancel_focus,
+                                confirm_focus: confirm_focus.clone(),
+                            });
+                            cx.notify();
+                            Some(confirm_focus)
+                        }
+                    }
+                    Err(error) => {
+                        waku.show_toast(tr!(
+                            "files.upload_failed",
+                            error = error.to_string()
+                        ));
+                        cx.notify();
+                        None
+                    }
+                }
+            });
+
+            if let Ok(Some(confirm_focus)) = confirm_focus
+                && let Some(window_handle) = window_handle
+            {
+                let _ = window_handle.update(cx, |_, window, _cx| {
+                    window.on_next_frame(move |window, _| {
+                        window.on_next_frame(move |window, cx| window.focus(&confirm_focus, cx));
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn confirm_right_panel_file_upload_action(
+        &mut self,
+        _: &ConfirmRightPanelFileUpload,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(confirm) = self.right_panel_upload_confirm.take() else {
+            return;
+        };
+        if self.selected_host_key() != confirm.host_key
+            || self
+                .selected_workspace_path()
+                .is_none_or(|path| path != confirm.project_path)
+        {
+            cx.notify();
+            return;
+        }
+        let daemon = self.selected_daemon().clone();
+        let is_local = !daemon.is_remote();
+        let workspace = waku_client::WorkspaceClient::for_daemon(daemon.clone());
+        cx.spawn(async move |waku, cx| {
+            let prepared = cx
+                .background_executor()
+                .spawn({
+                    let paths = confirm.paths.clone();
+                    let project_path = confirm.project_path.clone();
+                    let target_dir = confirm.target_dir.clone();
+                    async move {
+                        prepare_and_check_upload_paths(
+                            &workspace,
+                            &paths,
+                            &project_path,
+                            &target_dir,
+                            is_local,
+                        )
+                    }
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                if waku.selected_host_key() != confirm.host_key
+                    || waku
+                        .selected_workspace_path()
+                        .is_none_or(|path| path != confirm.project_path)
+                {
+                    return;
+                }
+                match prepared {
+                    Ok(Some((candidates, existing))) => {
+                        waku.execute_right_panel_upload(
+                            candidates,
+                            confirm.target_dir,
+                            confirm.project_path,
+                            confirm.host_key,
+                            daemon,
+                            true,
+                            existing.into_iter().collect(),
+                            cx,
+                        );
+                    }
+                    Ok(None) => cx.notify(),
+                    Err(error) => {
+                        waku.show_toast(tr!(
+                            "files.upload_failed",
+                            error = error.to_string()
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn dismiss_right_panel_file_upload_action(
+        &mut self,
+        _: &DismissRightPanelFileUpload,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_panel_upload_confirm = None;
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_right_panel_upload(
+        &mut self,
+        candidates: Vec<UploadTopLevelCandidate>,
+        target_dir: String,
+        project_path: PathBuf,
+        host_key: waku_client::hosts::HostKey,
+        daemon: waku_client::DaemonSupervisor,
+        overwrite_top_level: bool,
+        existing_top_level: HashSet<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if candidates.is_empty() {
+            return;
+        }
+        let workspace = waku_client::WorkspaceClient::for_daemon(daemon);
+        cx.spawn(async move |waku, cx| {
+            let sep = workspace_separator(&project_path);
+            let plan_result = cx
+                .background_executor()
+                .spawn({
+                    let workspace = workspace.clone();
+                    let project_path = project_path.clone();
+                    let existing_top_level = existing_top_level.clone();
+                    async move {
+                        let mut plan = build_upload_plan(
+                            &candidates,
+                            sep,
+                            overwrite_top_level,
+                            &existing_top_level,
+                        )?;
+                        if overwrite_top_level {
+                            let nested_write_rels = plan
+                                .ops
+                                .iter()
+                                .filter_map(|op| match op {
+                                    PlannedUploadOp::WriteFile {
+                                        rpc_rel,
+                                        existed_before: true,
+                                        ..
+                                    } if !existing_top_level.contains(rpc_rel) => {
+                                        Some(rpc_rel.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            if !nested_write_rels.is_empty() {
+                                let nested_existing = check_workspace_paths_exist(
+                                    &workspace,
+                                    project_path,
+                                    nested_write_rels,
+                                )?
+                                .into_iter()
+                                .collect::<HashSet<_>>();
+                                for op in &mut plan.ops {
+                                    if let PlannedUploadOp::WriteFile {
+                                        rpc_rel,
+                                        existed_before,
+                                        ..
+                                    } = op
+                                        && !existing_top_level.contains(rpc_rel)
+                                    {
+                                        *existed_before = nested_existing.contains(rpc_rel);
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(plan)
+                    }
+                })
+                .await;
+
+            let plan = match plan_result {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let _ = waku.update(cx, |waku, cx| {
+                        waku.show_toast(tr!(
+                            "files.upload_failed",
+                            error = error.to_string()
+                        ));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let Ok((upload_id, cancel)) = waku.update(cx, |waku, cx| {
+                waku.begin_upload(plan.display_name.clone(), plan.total_bytes, cx)
+            }) else {
+                return;
+            };
+
+            enum Outcome {
+                Complete,
+                Canceled,
+                Failed(anyhow::Error),
+            }
+
+            let mut total_written: u64 = 0;
+            let mut any_mutated = false;
+            let mut partial_to_delete: Option<PathBuf> = None;
+            let mut outcome = Outcome::Complete;
+
+            'ops: for op in plan.ops {
+                if cancel.load(Ordering::Acquire) {
+                    outcome = Outcome::Canceled;
+                    break 'ops;
+                }
+                match op {
+                    PlannedUploadOp::EnsureDir { rpc_rel, overwrite } => {
+                        let step = cx
+                            .background_executor()
+                            .spawn({
+                                let workspace = workspace.clone();
+                                let project_path = project_path.clone();
+                                async move {
+                                    match workspace.request(
+                                        waku_client::WorkspaceOperation::EnsureDirectory {
+                                            root: project_path,
+                                            relative_path: rpc_rel,
+                                            overwrite,
+                                        },
+                                    )? {
+                                        waku_client::WorkspaceResult::Ack => Ok(()),
+                                        _ => anyhow::bail!(
+                                            "the daemon returned an invalid directory response"
+                                        ),
+                                    }
+                                }
+                            })
+                            .await;
+                        match step {
+                            Ok(()) => any_mutated = true,
+                            Err(error) => {
+                                outcome = Outcome::Failed(error);
+                                break 'ops;
+                            }
+                        }
+                    }
+                    PlannedUploadOp::WriteFile {
+                        local_path,
+                        rpc_rel,
+                        size,
+                        overwrite,
+                        existed_before,
+                    } => {
+                        let mut file_offset: u64 = 0;
+                        loop {
+                            if cancel.load(Ordering::Acquire) {
+                                if !existed_before && file_offset > 0 {
+                                    partial_to_delete = Some(rpc_rel.clone());
+                                }
+                                outcome = Outcome::Canceled;
+                                break 'ops;
+                            }
+                            let step = cx
+                                .background_executor()
+                                .spawn({
+                                    let workspace = workspace.clone();
+                                    let project_path = project_path.clone();
+                                    let local_path = local_path.clone();
+                                    let rpc_rel = rpc_rel.clone();
+                                    async move {
+                                        upload_file_chunk(
+                                            &workspace,
+                                            project_path,
+                                            &local_path,
+                                            rpc_rel,
+                                            size,
+                                            file_offset,
+                                            overwrite,
+                                        )
+                                    }
+                                })
+                                .await;
+                            match step {
+                                Ok(chunk_bytes) => {
+                                    any_mutated = true;
+                                    file_offset += chunk_bytes;
+                                    total_written += chunk_bytes;
+                                    if waku
+                                        .update(cx, |waku, cx| {
+                                            waku.update_download_progress(
+                                                upload_id,
+                                                total_written,
+                                                plan.total_bytes,
+                                                cx,
+                                            )
+                                        })
+                                        .is_err()
+                                    {
+                                        if !existed_before && file_offset > 0 && file_offset < size {
+                                            partial_to_delete = Some(rpc_rel.clone());
+                                        }
+                                        outcome = Outcome::Canceled;
+                                        break 'ops;
+                                    }
+                                    if file_offset >= size {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    if !existed_before && file_offset > 0 {
+                                        partial_to_delete = Some(rpc_rel.clone());
+                                    }
+                                    outcome = Outcome::Failed(error);
+                                    break 'ops;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(partial_rel) = partial_to_delete {
+                cx.background_executor()
+                    .spawn({
+                        let workspace = workspace.clone();
+                        let project_path = project_path.clone();
+                        async move {
+                            let _ = workspace.request(
+                                waku_client::WorkspaceOperation::DeletePath {
+                                    root: project_path,
+                                    relative_path: partial_rel,
+                                },
+                            );
+                        }
+                    })
+                    .await;
+            }
+
+            let _ = waku.update(cx, |waku, cx| {
+                waku.end_download(upload_id, cx);
+                let same_workspace = waku.selected_host_key() == host_key
+                    && waku
+                        .selected_workspace_path()
+                        .is_some_and(|path| path == project_path);
+                if same_workspace {
+                    if matches!(outcome, Outcome::Complete) {
+                        expand_workspace_directory_and_ancestors(
+                            &project_path,
+                            &target_dir,
+                            &mut waku.right_panel_expanded_paths,
+                        );
+                        if let Some(dir_rel) = &plan.single_uploaded_dir_rel {
+                            expand_workspace_directory_and_ancestors(
+                                &project_path,
+                                dir_rel,
+                                &mut waku.right_panel_expanded_paths,
+                            );
+                        }
+                    }
+                    if matches!(outcome, Outcome::Complete) || any_mutated {
+                        waku.refresh_right_panel_working_tree(cx);
+                        waku.invalidate_composer_sources(cx);
+                        waku.reload_clean_right_panel_file_editors(cx);
+                    }
+                }
+                match outcome {
+                    Outcome::Complete => {
+                        if plan.item_count == 1 {
+                            waku.show_success_toast(tr!(
+                                "files.upload_completed",
+                                name = plan.display_name
+                            ));
+                        } else {
+                            waku.show_success_toast(tr!(
+                                "files.upload_completed_many",
+                                count = plan.item_count
+                            ));
+                        }
+                    }
+                    Outcome::Canceled => {
+                        waku.show_toast(tr!("files.upload_canceled", name = plan.display_name));
+                    }
+                    Outcome::Failed(error) => {
+                        waku.show_toast(tr!(
+                            "files.upload_failed",
+                            error = error.to_string()
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Closes every open editor and tab that a deleted path leaves dangling:

@@ -302,6 +302,7 @@ impl Render for Waku {
             let commit_dialog = self.render_commit_dialog(cx);
             let goal_dialog = self.render_goal_dialog(window, cx);
             let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
+            let right_panel_upload_confirm = self.render_right_panel_upload_confirm(cx);
             let session_delete_dialog = self.render_session_delete_dialog(cx);
             let daemon_replace_dialog = self.render_daemon_replace_dialog(window, cx);
             let git_graph_dialog = self.render_git_graph_dialog(cx);
@@ -325,6 +326,7 @@ impl Render for Waku {
                 .children(commit_dialog)
                 .children(goal_dialog)
                 .children(right_panel_delete_confirm)
+                .children(right_panel_upload_confirm)
                 .children(session_delete_dialog)
                 .children(daemon_replace_dialog)
                 .children(git_graph_dialog)
@@ -346,6 +348,7 @@ impl Render for Waku {
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
         let right_panel_delete_confirm = self.render_right_panel_delete_confirm(cx);
+        let right_panel_upload_confirm = self.render_right_panel_upload_confirm(cx);
         let session_delete_dialog = self.render_session_delete_dialog(cx);
         let daemon_replace_dialog = self.render_daemon_replace_dialog(window, cx);
         let git_graph_dialog = self.render_git_graph_dialog(cx);
@@ -549,6 +552,7 @@ impl Render for Waku {
             .children(commit_dialog)
             .children(goal_dialog)
             .children(right_panel_delete_confirm)
+            .children(right_panel_upload_confirm)
             .children(session_delete_dialog)
             .children(daemon_replace_dialog)
             .children(git_graph_dialog)
@@ -589,12 +593,13 @@ impl Waku {
             .toast
             .as_ref()
             .map(|toast| (toast.message.clone(), toast.tone, toast.id));
-        let downloads: Vec<(u64, String, u64, u64)> = self
+        let downloads: Vec<(u64, TransferKind, String, u64, u64)> = self
             .downloads
             .iter()
             .map(|download| {
                 (
                     download.id,
+                    download.kind,
                     download.name.clone(),
                     download.written,
                     download.total_bytes,
@@ -617,8 +622,9 @@ impl Waku {
         if let Some((message, tone, generation)) = toast {
             column = column.child(self.render_toast(message, tone, generation, cx));
         }
-        for (id, name, written, total_bytes) in downloads {
-            column = column.child(self.render_download_card(id, name, written, total_bytes, cx));
+        for (id, kind, name, written, total_bytes) in downloads {
+            column =
+                column.child(self.render_download_card(id, kind, name, written, total_bytes, cx));
         }
         Some(column.into_any_element())
     }
@@ -718,19 +724,24 @@ impl Waku {
             )
     }
 
-    /// One live card in the notification column for a file being streamed to
-    /// disk: name, share, byte counts, and a cancel that stops the transfer
-    /// at its next chunk. The moving bar is decorative; the percent label
-    /// carries the same meaning without it.
+    /// One live card in the notification column for a file transfer: name,
+    /// progress share, and a cancel button that stops the transfer at its next
+    /// chunk. The moving bar is decorative; the percent label carries the same
+    /// meaning without it.
     fn render_download_card(
         &self,
         id: u64,
+        kind: TransferKind,
         name: String,
         written: u64,
         total_bytes: u64,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = Theme::current(cx);
+        let (icon_path, card_prefix, cancel_prefix) = match kind {
+            TransferKind::Download => ("icons/download.svg", "download-card", "cancel-download"),
+            TransferKind::Upload => ("icons/cloud-upload.svg", "upload-card", "cancel-upload"),
+        };
         let fraction = if total_bytes > 0 {
             (written as f32 / total_bytes as f32).clamp(0.0, 1.0)
         } else {
@@ -738,7 +749,7 @@ impl Waku {
         };
         let percent = (fraction * 100.0).round() as u32;
         let cancel = div()
-            .id(SharedString::from(format!("cancel-download-{id}")))
+            .id(SharedString::from(format!("{cancel_prefix}-{id}")))
             .tab_index(0)
             .size(px(26.0))
             .flex_none()
@@ -765,7 +776,7 @@ impl Waku {
             }));
 
         div()
-            .id(SharedString::from(format!("download-card-{id}")))
+            .id(SharedString::from(format!("{card_prefix}-{id}")))
             .occlude()
             .min_w(px(360.0))
             .max_w(px(560.0))
@@ -789,7 +800,7 @@ impl Waku {
                     .items_center()
                     .gap(px(8.0))
                     .min_w_0()
-                    .child(icon("icons/download.svg", 14.0, theme.accent))
+                    .child(icon(icon_path, 14.0, theme.accent))
                     .child(
                         div()
                             .flex_1()

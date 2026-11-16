@@ -2093,6 +2093,28 @@ files.download_failed:
   en: "Could not download the file: %{error}"
 files.download_canceled:
   en: "Canceled the download of %{name}"
+files.upload:
+  en: Upload…
+files.upload_completed:
+  en: "Uploaded %{name}"
+files.upload_completed_many:
+  en: "Uploaded %{count} items"
+files.upload_failed:
+  en: "Could not upload files: %{error}"
+files.upload_canceled:
+  en: "Canceled the upload of %{name}"
+files.upload_many_label:
+  en: "%{name} (+%{rest})"
+files.upload_replace:
+  en: Replace
+files.upload_replace_confirm_title:
+  en: Replace existing items?
+files.upload_replace_confirm_message:
+  en: "“%{name}” already exists in the destination folder. Replace it?"
+files.upload_replace_confirm_message_many:
+  en: "%{count} items (including “%{name}”) already exist in the destination folder. Replace them?"
+files.upload_into_self_failed:
+  en: Cannot copy a folder into itself
 files.delete:
   en: Delete
 files.delete_confirm_title:

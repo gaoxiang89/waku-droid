@@ -1069,6 +1069,17 @@ files.download: ダウンロード…
 files.download_saved: "%{name} を %{path} に保存しました"
 files.download_failed: "ファイルをダウンロードできませんでした：%{error}"
 files.download_canceled: "%{name} のダウンロードをキャンセルしました"
+files.upload: アップロード…
+files.upload_completed: "%{name} をアップロードしました"
+files.upload_completed_many: "%{count} 件をアップロードしました"
+files.upload_failed: "ファイルをアップロードできませんでした：%{error}"
+files.upload_canceled: "%{name} のアップロードをキャンセルしました"
+files.upload_many_label: "%{name}（ほか %{rest} 件）"
+files.upload_replace: 置き換える
+files.upload_replace_confirm_title: 既存の項目を置き換えますか？
+files.upload_replace_confirm_message: "移動先のフォルダに「%{name}」が既に存在します。置き換えますか？"
+files.upload_replace_confirm_message_many: "移動先のフォルダに「%{name}」など %{count} 件の項目が既に存在します。すべて置き換えますか？"
+files.upload_into_self_failed: フォルダをそれ自体の中にコピーすることはできません
 files.delete: 削除
 files.delete_confirm_title: 完全に削除しますか？
 files.delete_confirm_message: "「%{name}」は完全に削除されます。この操作は元に戻せません。"
