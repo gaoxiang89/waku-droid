@@ -1,5 +1,35 @@
 use gpui::Window;
 
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+pub fn report_startup_error(message: &str) -> ! {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+
+    let title: Vec<u16> = std::ffi::OsStr::new("Waku")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let body: Vec<u16> = std::ffi::OsStr::new(message)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+    std::process::exit(1);
+}
+
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+pub fn report_startup_error(message: &str) -> ! {
+    panic!("{message}");
+}
+
 #[cfg(target_os = "macos")]
 pub fn show_about_panel() {
     use objc2::MainThreadMarker;

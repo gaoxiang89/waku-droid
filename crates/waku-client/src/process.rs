@@ -21,7 +21,7 @@ use waku_protocol::{
     ReplayCursor, ResponsePayload,
 };
 const START_TIMEOUT: Duration = Duration::from_secs(15);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound between attempts to reach an unreachable remote host.
 const MAX_REMOTE_BACKOFF: Duration = Duration::from_secs(30);
@@ -165,29 +165,42 @@ impl DaemonProcess {
         launch_lock.lock().context("lock resident daemon startup")?;
         if let Ok(bytes) = std::fs::read(&state_file)
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
-            && crate::pid::is_alive(record.pid)
-            && (record.protocol_version != PROTOCOL_VERSION || record.token != token)
+            && crate::pid::is_daemon_process(record.pid)
         {
-            bail!(
-                "a resident daemon is still running with different protocol or credentials; end its sessions before replacing it"
-            );
-        }
-        if let Ok(bytes) = std::fs::read(&state_file)
-            && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
-            && record.protocol_version == PROTOCOL_VERSION
-            && record.token == token
-        {
-            if resident_daemon_tainted(record.pid) {
+            if record.protocol_version != PROTOCOL_VERSION || record.token != token {
+                if record.token == token
+                    && let Ok(address) = desktop_client_address(&record.address)
+                    && matches!(
+                        crate::client::shutdown_daemon_at(&address, &token),
+                        crate::client::ShutdownProbeOutcome::ShuttingDown
+                    )
+                {
+                    if !wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT)
+                        && (!crate::pid::terminate_daemon(record.pid)
+                            || !wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT))
+                    {
+                        bail!(
+                            "an older resident daemon (pid {}) is still exiting; try again in a moment",
+                            record.pid
+                        );
+                    }
+                    let _ = std::fs::remove_file(&state_file);
+                } else {
+                    bail!(
+                        "a resident daemon is still running with different protocol or credentials; end its sessions before replacing it"
+                    );
+                }
+            } else if resident_daemon_tainted(record.pid) {
                 if let Ok(address) = desktop_client_address(&record.address)
                     && let Ok(client) = DaemonClient::connect(&address, token.clone())
                 {
                     client.shutdown();
-                    let _ = std::fs::remove_file(&state_file);
-                    if !wait_for_resident_exit(record.pid, Duration::from_secs(5)) {
+                    if !wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
                         bail!(
                             "a sandboxed resident daemon is still exiting; try again once it releases its port"
                         );
                     }
+                    let _ = std::fs::remove_file(&state_file);
                 }
             } else if let Ok(address) = desktop_client_address(&record.address)
                 && let Ok(client) = DaemonClient::connect(&address, token.clone())
@@ -200,17 +213,41 @@ impl DaemonProcess {
                     state_file,
                     pid: record.pid,
                 });
+            } else {
+                bail!("resident daemon is running but unreachable; leaving its sessions intact");
             }
-        }
-        if let Ok(bytes) = std::fs::read(&state_file)
-            && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
-            && crate::pid::is_alive(record.pid)
-        {
-            bail!("resident daemon is running but unreachable; leaving its sessions intact");
         }
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        match Self::spawn_child_process(executable, &settings, &token, &state_file) {
+            Ok(process) => Ok(process),
+            Err(first_error) if settings.enabled => {
+                // If `resident-daemon.json` was lost while an orphaned daemon
+                // (possibly from an older protocol version) with our token is
+                // still holding the fixed port, shut it down cleanly and retry
+                // once instead of failing startup.
+                if let Ok(probe_address) = desktop_client_address(&settings.bind_address())
+                    && matches!(
+                        crate::client::shutdown_daemon_at(&probe_address, &token),
+                        crate::client::ShutdownProbeOutcome::ShuttingDown
+                    )
+                {
+                    wait_for_port_release(&settings.bind_address(), SHUTDOWN_TIMEOUT);
+                    return Self::spawn_child_process(executable, &settings, &token, &state_file);
+                }
+                Err(first_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn spawn_child_process(
+        executable: &Path,
+        settings: &DaemonExposureSettings,
+        token: &str,
+        state_file: &Path,
+    ) -> anyhow::Result<Self> {
         let app_executable = std::env::current_exe().context("could not locate Waku executable")?;
         let mut command = ProcessCommand::new(executable);
         // The desktop is a GUI-subsystem binary on Windows, so a console
@@ -227,7 +264,7 @@ impl DaemonProcess {
             .arg("--bind")
             .arg(settings.bind_address())
             .arg("--state-file")
-            .arg(&state_file)
+            .arg(state_file)
             .arg("--allow-shutdown")
             .arg("--idle-exit-secs")
             .arg("1800");
@@ -250,7 +287,7 @@ impl DaemonProcess {
             command.arg("--allow-origin").arg(origin);
         }
         let mut child = command
-            .env(DAEMON_TOKEN_ENV, &token)
+            .env(DAEMON_TOKEN_ENV, token)
             .env(APP_EXECUTABLE_ENV, app_executable)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -313,7 +350,7 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        let client = match DaemonClient::connect(&client_address, token.clone()) {
+        let client = match DaemonClient::connect(&client_address, token.to_owned()) {
             Ok(client) => client,
             Err(error) => {
                 let _ = child.kill();
@@ -324,9 +361,9 @@ impl DaemonProcess {
         Ok(Self {
             client: Mutex::new(client),
             address: client_address,
-            token,
+            token: token.to_owned(),
             child: Some(child),
-            state_file,
+            state_file: state_file.to_path_buf(),
             pid: ready.pid,
         })
     }
@@ -359,21 +396,35 @@ impl DaemonProcess {
 
     fn stop(&mut self) {
         self.client.lock().shutdown();
-        let _ = std::fs::remove_file(&self.state_file);
-        let Some(child) = self.child.as_mut() else {
-            let _ = wait_for_resident_exit(self.pid, SHUTDOWN_TIMEOUT);
-            return;
-        };
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
+        let exited = match self.child.as_mut() {
+            None => {
+                wait_for_resident_exit(self.pid, SHUTDOWN_TIMEOUT)
+                    || (crate::pid::terminate_daemon(self.pid)
+                        && wait_for_resident_exit(self.pid, SHUTDOWN_TIMEOUT))
             }
+            Some(child) => {
+                let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+                let mut clean = false;
+                while Instant::now() < deadline {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            clean = true;
+                            break;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                        Err(_) => break,
+                    }
+                }
+                if !clean {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                true
+            }
+        };
+        if exited || !crate::pid::is_alive(self.pid) {
+            let _ = std::fs::remove_file(&self.state_file);
         }
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -1070,6 +1121,16 @@ fn wait_for_resident_exit(pid: u32, timeout: Duration) -> bool {
     true
 }
 
+fn wait_for_port_release(address: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::net::TcpListener::bind(address).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// A Windows daemon originally spawned inside an agent sandbox inherits
 /// `ProcessRedirectionTrustPolicy` (`EnforceRedirectionTrust`), which blocks
 /// every provider CLI it spawns from traversing user-created NTFS symlinks.
@@ -1322,6 +1383,72 @@ mod tests {
         shutdown_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("stop_local should send ClientMessage::Shutdown");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stop_does_not_terminate_unrelated_process_if_pid_was_reused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(6)));
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read();
+            ws.send(tungstenite::Message::Text(
+                serde_json::to_string(&waku_protocol::ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .unwrap();
+            while let Ok(msg) = ws.read() {
+                if matches!(msg, tungstenite::Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let client = DaemonClient::connect(&addr, "tok".into()).unwrap();
+        #[cfg(windows)]
+        let mut child = ProcessCommand::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let mut child = ProcessCommand::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let state_file =
+            std::env::temp_dir().join(format!("waku-reattach-stop-{}.json", Uuid::new_v4()));
+        std::fs::write(&state_file, "{}").unwrap();
+
+        let mut process = DaemonProcess {
+            client: Mutex::new(client),
+            address: addr,
+            token: "tok".into(),
+            child: None,
+            state_file: state_file.clone(),
+            pid,
+        };
+        process.stop();
+        // Because the PID belongs to an unrelated executable (not `waku-daemon`),
+        // `stop()` must refuse to kill it even after SHUTDOWN_TIMEOUT.
+        assert!(crate::pid::is_alive(pid));
+        assert!(state_file.exists());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&state_file);
         server.join().unwrap();
     }
 }

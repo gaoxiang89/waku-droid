@@ -282,6 +282,127 @@ impl DaemonClient {
     }
 }
 
+/// Result of asking a running daemon at `address` to shut down cleanly.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ShutdownProbeOutcome {
+    /// Authenticated with the daemon and sent `ClientMessage::Shutdown`.
+    ShuttingDown,
+    /// The daemon rejected our credentials or refused shutdown.
+    Rejected(String),
+    /// Could not reach a daemon at `address` or handshake failed.
+    Unreachable(String),
+}
+
+/// Connect to a daemon at `address`, negotiate its protocol version if it
+/// announces a different one, authenticate with `token`, and send
+/// `ClientMessage::Shutdown`.
+///
+/// Only a daemon holding the matching `token` accepts `Shutdown`, so probing an
+/// address never affects an unrelated service or another user's daemon.
+pub(crate) fn shutdown_daemon_at(address: &str, token: &str) -> ShutdownProbeOutcome {
+    match shutdown_with_protocol(address, PROTOCOL_VERSION, token) {
+        Ok(ShutdownStep::Outcome(outcome)) => outcome,
+        Ok(ShutdownStep::ProtocolMismatch(expected)) if expected != PROTOCOL_VERSION => {
+            match shutdown_with_protocol(address, expected, token) {
+                Ok(ShutdownStep::Outcome(outcome)) => outcome,
+                Ok(ShutdownStep::ProtocolMismatch(other)) => ShutdownProbeOutcome::Rejected(
+                    format!("daemon expected protocol {other} after reporting {expected}"),
+                ),
+                Err(error) => ShutdownProbeOutcome::Unreachable(format!("{error:#}")),
+            }
+        }
+        Ok(ShutdownStep::ProtocolMismatch(expected)) => ShutdownProbeOutcome::Rejected(format!(
+            "daemon rejected matching protocol {expected}"
+        )),
+        Err(error) => ShutdownProbeOutcome::Unreachable(format!("{error:#}")),
+    }
+}
+
+enum ShutdownStep {
+    Outcome(ShutdownProbeOutcome),
+    ProtocolMismatch(u32),
+}
+
+fn shutdown_with_protocol(
+    address: &str,
+    protocol_version: u32,
+    token: &str,
+) -> anyhow::Result<ShutdownStep> {
+    let url = daemon_url(address)?;
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WIRE_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WIRE_MESSAGE_BYTES));
+    let (mut socket, _) =
+        tungstenite::client::connect_with_config(url.as_str(), Some(config), 3)
+            .context("could not connect to Waku daemon")?;
+    set_client_timeouts(
+        &mut socket,
+        Some(Duration::from_secs(2)),
+        Some(WRITE_STALL_TIMEOUT),
+    )?;
+    write_json(
+        &mut socket,
+        &ClientMessage::Hello {
+            protocol_version,
+            token: token.to_owned(),
+            client_id: Uuid::new_v4(),
+            resume_from: Vec::new(),
+        },
+    )?;
+    match read_server_message(&mut socket)? {
+        ServerMessage::Hello { .. } => {}
+        ServerMessage::Rejected { message } => {
+            if let Some(expected) = parse_expected_protocol_version(&message) {
+                return Ok(ShutdownStep::ProtocolMismatch(expected));
+            }
+            return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::Rejected(
+                message,
+            )));
+        }
+        other => bail!("daemon sent an invalid handshake response: {other:?}"),
+    }
+    write_json(&mut socket, &ClientMessage::Shutdown)?;
+    let _ = socket.flush();
+    loop {
+        match socket.read() {
+            Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(text.as_ref()) {
+                Ok(ServerMessage::ShuttingDown) => {
+                    return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
+                }
+                Ok(ServerMessage::Rejected { message }) => {
+                    return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::Rejected(
+                        message,
+                    )));
+                }
+                _ => {}
+            },
+            Ok(Message::Ping(_)) => {
+                let _ = socket.flush();
+            }
+            Ok(Message::Close(_))
+            | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
+            }
+            Err(_) => {
+                return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_expected_protocol_version(message: &str) -> Option<u32> {
+    let tail = message.split("expected ").nth(1)?;
+    let digits: String = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn daemon_url(address: &str) -> anyhow::Result<String> {
     let normalized = if address.starts_with("ws://") || address.starts_with("wss://") {
         address.to_owned()
@@ -529,5 +650,88 @@ mod tests {
             daemon_url("wss://waku.example.test/old?ignored=1").unwrap(),
             "wss://waku.example.test/v1"
         );
+    }
+
+    #[test]
+    fn parses_expected_protocol_from_rejection_message() {
+        assert_eq!(
+            parse_expected_protocol_version("protocol 12 is unsupported; expected 11"),
+            Some(11)
+        );
+        assert_eq!(parse_expected_protocol_version("authentication failed"), None);
+    }
+
+    #[test]
+    fn shutdown_daemon_at_negotiates_older_protocol_and_rejects_wrong_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let older_protocol = PROTOCOL_VERSION.saturating_sub(1).max(1);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let Message::Text(text) = ws.read().unwrap() else {
+                    panic!("expected text hello");
+                };
+                let ClientMessage::Hello {
+                    protocol_version,
+                    token,
+                    ..
+                } = serde_json::from_str(text.as_ref()).unwrap()
+                else {
+                    panic!("expected hello");
+                };
+                if protocol_version != older_protocol {
+                    let _ = write_json(
+                        &mut ws,
+                        &ServerMessage::Rejected {
+                            message: format!(
+                                "protocol {protocol_version} is unsupported; expected {older_protocol}"
+                            ),
+                        },
+                    );
+                    continue;
+                }
+                if token != "right-token" {
+                    let _ = write_json(
+                        &mut ws,
+                        &ServerMessage::Rejected {
+                            message: "authentication failed".into(),
+                        },
+                    );
+                    continue;
+                }
+                write_json(
+                    &mut ws,
+                    &ServerMessage::Hello {
+                        protocol_version: older_protocol,
+                        daemon_version: "0.1.49".into(),
+                    },
+                )
+                .unwrap();
+                if let Ok(Message::Text(text)) = ws.read()
+                    && let Ok(ClientMessage::Shutdown) = serde_json::from_str(text.as_ref())
+                {
+                    let _ = write_json(&mut ws, &ServerMessage::ShuttingDown);
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            }
+        });
+
+        let wrong = shutdown_daemon_at(&addr, "wrong-token");
+        assert_eq!(
+            wrong,
+            ShutdownProbeOutcome::Rejected("authentication failed".into())
+        );
+
+        let ok = shutdown_daemon_at(&addr, "right-token");
+        assert_eq!(ok, ShutdownProbeOutcome::ShuttingDown);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old-protocol daemon should receive shutdown");
+        server.join().unwrap();
     }
 }

@@ -210,8 +210,9 @@ impl WakuApplicationExt for Application {
 }
 
 pub fn run() {
-    let daemon = crate::daemon::start_process()
-        .unwrap_or_else(|error| panic!("failed to start Waku daemon: {error:#}"));
+    let daemon = crate::daemon::start_process().unwrap_or_else(|error| {
+        crate::platform::report_startup_error(&format!("Failed to start Waku daemon:\n\n{error:#}"))
+    });
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()

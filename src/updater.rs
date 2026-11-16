@@ -1020,6 +1020,7 @@ mod windows {
     pub struct Updater {
         status: Arc<Mutex<UpdateStatus>>,
         staged: Arc<Mutex<Option<StagedUpdate>>>,
+        pending_install: Arc<Mutex<Option<PathBuf>>>,
         /// A check is running. Separate from `status` because a silent check
         /// is deliberately invisible, so the published status cannot be what
         /// keeps two checks from overlapping.
@@ -1053,6 +1054,7 @@ mod windows {
             let updater = Self {
                 status: Arc::new(Mutex::new(UpdateStatus::Idle)),
                 staged: Arc::new(Mutex::new(None)),
+                pending_install: Arc::new(Mutex::new(None)),
                 checking: Arc::new(AtomicBool::new(false)),
                 explicit_check: Arc::new(AtomicBool::new(false)),
                 automatic,
@@ -1188,8 +1190,8 @@ mod windows {
             }
         }
 
-        /// Run the staged installer and leave. Inno Setup closes this process,
-        /// replaces it in place, and starts the new build.
+        /// Stage the update for installation and ask the app to stop the local
+        /// daemon before launching the installer.
         pub fn install_available_update(&self) -> bool {
             let installer = {
                 let mut staged = self
@@ -1198,6 +1200,28 @@ mod windows {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match staged.take() {
                     Some(update) => update.installer,
+                    None => return false,
+                }
+            };
+            *self
+                .pending_install
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(installer);
+            self.set_status(UpdateStatus::Updating);
+            let _ = self.events.try_send(UpdaterEvent::QuitAndInstall);
+            true
+        }
+
+        /// Spawn the staged Inno Setup installer after `daemon.stop_local()` has
+        /// finished, so `CloseApplications=force` never races with daemon teardown.
+        pub fn launch_staged_installer(&self) -> bool {
+            let installer = {
+                let mut pending = self
+                    .pending_install
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match pending.take() {
+                    Some(installer) => installer,
                     None => return false,
                 }
             };
@@ -1215,12 +1239,15 @@ mod windows {
                 command.creation_flags(CREATE_NO_WINDOW);
             }
             match command.spawn() {
-                Ok(_) => {
-                    self.set_status(UpdateStatus::Updating);
-                    let _ = self.events.try_send(UpdaterEvent::QuitAndInstall);
-                    true
-                }
+                Ok(_) => true,
                 Err(error) => {
+                    *self
+                        .staged
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StagedUpdate {
+                        installer: installer.clone(),
+                    });
+                    self.set_status(UpdateStatus::Available);
                     let _ = self
                         .events
                         .try_send(UpdaterEvent::Failed(format!("{installer:?}: {error}")));

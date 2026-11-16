@@ -2240,14 +2240,21 @@ impl Waku {
             #[cfg(target_os = "windows")]
             crate::updater::UpdaterEvent::QuitAndInstall => {
                 // Windows cannot replace a running `waku-daemon.exe`, so stop
-                // the resident local daemon first, then let GPUI's normal
-                // asynchronous quit hooks flush drafts and window state.
+                // the resident local daemon first, then spawn the installer and
+                // let GPUI's asynchronous quit hooks flush drafts and window state.
                 let daemon = self.daemon.clone();
                 cx.spawn(async move |_: WeakEntity<Self>, cx| {
                     cx.background_executor()
                         .spawn(async move { daemon.stop_local() })
                         .await;
-                    let _ = cx.update(|cx| cx.quit());
+                    let launched = cx.update(|cx| {
+                        cx.try_global::<crate::updater::UpdaterState>()
+                            .and_then(|state| state.0.as_ref())
+                            .is_some_and(|updater| updater.launch_staged_installer())
+                    });
+                    if launched {
+                        let _ = cx.update(|cx| cx.quit());
+                    }
                 })
                 .detach();
             }
