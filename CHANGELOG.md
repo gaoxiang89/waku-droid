@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.50]
+
+- Drag and drop or upload files and folders into the Files sidebar across local and remote (SSH/WSL) workspaces: hover highlights the target folder or workspace root, prompts before replacing existing entries, streams chunks over the daemon RPC with a live progress and cancel card, and supports keyboard upload via the toolbar button, context menu, and paste (`Ctrl+V` / `Cmd+V`)
+
 ## [0.1.49]
 
 - Connect to remote Windows hosts over SSH: Waku probes available Windows shells (PowerShell, cmd.exe, Git Bash, MSYS, Cygwin), deploys and starts `waku-daemon` without keeping the SSH transport open, secures daemon credentials with owner-only ACLs, and handles Windows drive and UNC paths when browsing or opening remote workspaces
