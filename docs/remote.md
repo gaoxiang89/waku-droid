@@ -124,6 +124,8 @@ The local-only sidebar keeps its existing layout.
 - Task submissions, transcripts, attachments, checkpoints, Git, files, and
   right-panel terminals use the task's host. Models and CLI availability are
   cached separately for each host; account meters also stay host-specific.
+- Dragging files or folders onto the Files panel (or choosing **Upload**)
+  streams them in chunks to the active host's workspace over the daemon RPC.
 - Disconnecting detaches this desktop without deleting daemon data or
   stopping running agents. Removing a saved connection also disables its
   next-launch reconnect. Disconnecting alone lasts for this app session.

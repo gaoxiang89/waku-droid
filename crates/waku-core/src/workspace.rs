@@ -150,6 +150,30 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
                 total_bytes,
             }
         }
+        WorkspaceOperation::CheckPathsExist {
+            root,
+            relative_paths,
+        } => WorkspaceResult::ExistingPaths {
+            relative_paths: check_paths_exist(&root, relative_paths)?,
+        },
+        WorkspaceOperation::EnsureDirectory {
+            root,
+            relative_path,
+            overwrite,
+        } => {
+            ensure_directory(&root, &relative_path, overwrite)?;
+            WorkspaceResult::Ack
+        }
+        WorkspaceOperation::WriteFileChunk {
+            root,
+            relative_path,
+            offset,
+            bytes,
+            overwrite,
+        } => {
+            write_file_chunk(&root, &relative_path, offset, &bytes, overwrite)?;
+            WorkspaceResult::Ack
+        }
         WorkspaceOperation::RenamePath {
             root,
             from_relative_path,
@@ -389,15 +413,160 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
 }
 
 fn resolve_workspace_path(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
         bail!("workspace path must be a non-empty relative path");
     }
-    Ok(root.join(relative))
+    let mut resolved = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            bail!("workspace path must be a non-empty relative path");
+        };
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+/// Resolves `relative` inside `root` while refusing to traverse any existing
+/// intermediate parent directory that is a symbolic link.
+fn resolve_upload_workspace_path(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    let path = resolve_workspace_path(root, relative)?;
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to traverse symlink outside workspace");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(path)
+}
+
+/// Removes a regular file or symlink (including directory symlinks on Windows)
+/// without traversing into a symlink target.
+fn remove_non_dir(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        if metadata.file_type().is_symlink_dir() {
+            fs::remove_dir(path)
+                .with_context(|| format!("could not remove symlink {}", path.display()))?;
+            return Ok(());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = metadata;
+    fs::remove_file(path).with_context(|| format!("could not remove {}", path.display()))?;
+    Ok(())
+}
+
+fn check_paths_exist(root: &Path, relative_paths: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut existing = Vec::new();
+    for relative_path in relative_paths {
+        let path = resolve_workspace_path(root, &relative_path)?;
+        if fs::symlink_metadata(&path).is_ok() {
+            existing.push(relative_path);
+        }
+    }
+    Ok(existing)
+}
+
+fn ensure_directory(root: &Path, relative_path: &Path, overwrite: bool) -> anyhow::Result<()> {
+    let path = resolve_upload_workspace_path(root, relative_path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) if !overwrite => bail!("{} already exists", path.display()),
+        Ok(metadata) => {
+            remove_non_dir(&path, &metadata)?;
+            fs::create_dir_all(&path)
+                .with_context(|| format!("could not create directory {}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&path)
+                .with_context(|| format!("could not create directory {}", path.display()))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn write_file_chunk(
+    root: &Path,
+    relative_path: &Path,
+    offset: u64,
+    bytes: &str,
+    overwrite: bool,
+) -> anyhow::Result<()> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(bytes.trim())
+        .context("invalid base64 file chunk")?;
+    if decoded.len() > MAX_FILE_CHUNK_BYTES {
+        bail!(
+            "file chunk of {} bytes exceeds maximum {} bytes",
+            decoded.len(),
+            MAX_FILE_CHUNK_BYTES
+        );
+    }
+    let path = resolve_upload_workspace_path(root, relative_path)?;
+    use std::io::{Seek, SeekFrom, Write};
+    if offset == 0 {
+        match fs::symlink_metadata(&path) {
+            Ok(_) if !overwrite => bail!("{} already exists", path.display()),
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    remove_non_dir(&path, &metadata)?;
+                } else if metadata.file_type().is_dir() {
+                    fs::remove_dir_all(&path)
+                        .with_context(|| format!("could not remove directory {}", path.display()))?;
+                } else if !metadata.file_type().is_file() {
+                    bail!("not a regular file: {}", path.display());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create directory {}", parent.display()))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| format!("could not open file {}", path.display()))?;
+        file.write_all(&decoded)
+            .with_context(|| format!("could not write file {}", path.display()))?;
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("could not open file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("not a regular file: {}", path.display());
+    }
+    if metadata.len() != offset {
+        bail!(
+            "upload offset {offset} does not match current file length {}",
+            metadata.len()
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open file {}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("could not seek in file {}", path.display()))?;
+    file.write_all(&decoded)
+        .with_context(|| format!("could not write file {}", path.display()))?;
+    Ok(())
 }
 
 fn list_tree(root: &Path, expanded_paths: &HashSet<PathBuf>) -> Vec<WorkingTreeEntry> {
@@ -1217,6 +1386,441 @@ mod tests {
         };
         assert_eq!(path, Path::new(r"C:\"));
         assert_eq!(parent, Some(PathBuf::new()));
+    }
+
+    fn try_symlink(original: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            crate::fs_ext::symlink(original, link).unwrap();
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            crate::fs_ext::symlink(original, link).is_ok()
+        }
+    }
+
+    fn encode_chunk(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn write_file_chunk_round_trips_multi_chunk_binary_and_empty_files() {
+        let root = std::env::temp_dir().join(format!("waku-upload-chunks-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(50_000).collect();
+        let relative = PathBuf::from("nested/sub/blob.bin");
+        let mut offset = 0usize;
+        let chunk_size = 7_919usize;
+        while offset < bytes.len() {
+            let end = (offset + chunk_size).min(bytes.len());
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: relative.clone(),
+                offset: offset as u64,
+                bytes: encode_chunk(&bytes[offset..end]),
+                overwrite: false,
+            })
+            .unwrap();
+            offset = end;
+        }
+
+        let mut restored = Vec::new();
+        let mut read_offset = 0u64;
+        loop {
+            let WorkspaceResult::FileChunk {
+                bytes: encoded,
+                total_bytes,
+            } = execute(WorkspaceOperation::ReadFileChunk {
+                root: root.clone(),
+                relative_path: relative.clone(),
+                offset: read_offset,
+                length: 4_096,
+            })
+            .unwrap()
+            else {
+                panic!("unexpected workspace response");
+            };
+            assert_eq!(total_bytes, bytes.len() as u64);
+            let chunk = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            restored.extend_from_slice(&chunk);
+            read_offset += chunk.len() as u64;
+        }
+        assert_eq!(restored, bytes);
+
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: PathBuf::from("nested/empty.txt"),
+            offset: 0,
+            bytes: String::new(),
+            overwrite: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("nested/empty.txt")).unwrap(), b"");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_chunk_rejects_oversized_payload_without_mutating_existing_file() {
+        let root = std::env::temp_dir().join(format!("waku-upload-cap-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("existing.bin");
+        fs::write(&target, b"keep-existing").unwrap();
+
+        let oversized = encode_chunk(&vec![0xAB; MAX_FILE_CHUNK_BYTES + 1]);
+        let error = execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: PathBuf::from("existing.bin"),
+            offset: 0,
+            bytes: oversized.clone(),
+            overwrite: true,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds maximum"));
+        assert_eq!(fs::read(&target).unwrap(), b"keep-existing");
+
+        let offset_error = execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: PathBuf::from("existing.bin"),
+            offset: 13,
+            bytes: oversized,
+            overwrite: false,
+        })
+        .unwrap_err();
+        assert!(offset_error.to_string().contains("exceeds maximum"));
+        assert_eq!(fs::read(&target).unwrap(), b"keep-existing");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_chunk_enforces_overwrite_and_offset_rules() {
+        let root = std::env::temp_dir().join(format!("waku-upload-overwrite-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("waku-upload-outside-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        fs::write(root.join("file.txt"), b"longer-previous-content").unwrap();
+        assert!(
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("file.txt"),
+                offset: 0,
+                bytes: encode_chunk(b"new"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(root.join("file.txt")).unwrap(),
+            b"longer-previous-content"
+        );
+
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: PathBuf::from("file.txt"),
+            offset: 0,
+            bytes: encode_chunk(b"new"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"new");
+
+        fs::create_dir_all(root.join("dir_target/inner")).unwrap();
+        fs::write(root.join("dir_target/inner/a.txt"), "data").unwrap();
+        assert!(
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("dir_target"),
+                offset: 0,
+                bytes: encode_chunk(b"replaced"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert!(root.join("dir_target/inner/a.txt").is_file());
+
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: PathBuf::from("dir_target"),
+            offset: 0,
+            bytes: encode_chunk(b"replaced"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("dir_target")).unwrap(), b"replaced");
+
+        // Later offsets must target an existing regular file at exact length.
+        assert!(
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("missing.bin"),
+                offset: 5,
+                bytes: encode_chunk(b"tail"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert!(
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("file.txt"),
+                offset: 2,
+                bytes: encode_chunk(b"tail"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert!(
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("file.txt"),
+                offset: 10,
+                bytes: encode_chunk(b"tail"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"new");
+
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, b"untouched").unwrap();
+        let file_link = root.join("file_link.txt");
+        if try_symlink(&outside_file, &file_link) {
+            assert!(
+                execute(WorkspaceOperation::WriteFileChunk {
+                    root: root.clone(),
+                    relative_path: PathBuf::from("file_link.txt"),
+                    offset: 0,
+                    bytes: encode_chunk(b"local"),
+                    overwrite: false,
+                })
+                .is_err()
+            );
+            assert!(
+                execute(WorkspaceOperation::WriteFileChunk {
+                    root: root.clone(),
+                    relative_path: PathBuf::from("file_link.txt"),
+                    offset: 9,
+                    bytes: encode_chunk(b"append"),
+                    overwrite: true,
+                })
+                .is_err()
+            );
+            execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("file_link.txt"),
+                offset: 0,
+                bytes: encode_chunk(b"local"),
+                overwrite: true,
+            })
+            .unwrap();
+            assert!(!fs::symlink_metadata(&file_link).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(&file_link).unwrap(), b"local");
+            assert_eq!(fs::read(&outside_file).unwrap(), b"untouched");
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn ensure_directory_is_idempotent_and_handles_conflicts() {
+        let root = std::env::temp_dir().join(format!("waku-ensure-dir-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("waku-ensure-outside-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        execute(WorkspaceOperation::EnsureDirectory {
+            root: root.clone(),
+            relative_path: PathBuf::from("a/b/c"),
+            overwrite: false,
+        })
+        .unwrap();
+        assert!(root.join("a/b/c").is_dir());
+
+        fs::write(root.join("a/b/c/keep.txt"), "keep").unwrap();
+        execute(WorkspaceOperation::EnsureDirectory {
+            root: root.clone(),
+            relative_path: PathBuf::from("a/b/c"),
+            overwrite: false,
+        })
+        .unwrap();
+        execute(WorkspaceOperation::EnsureDirectory {
+            root: root.clone(),
+            relative_path: PathBuf::from("a/b/c"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a/b/c/keep.txt")).unwrap(),
+            "keep"
+        );
+
+        fs::write(root.join("occupied"), "file-bytes").unwrap();
+        assert!(
+            execute(WorkspaceOperation::EnsureDirectory {
+                root: root.clone(),
+                relative_path: PathBuf::from("occupied"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert!(root.join("occupied").is_file());
+
+        execute(WorkspaceOperation::EnsureDirectory {
+            root: root.clone(),
+            relative_path: PathBuf::from("occupied"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert!(root.join("occupied").is_dir());
+
+        fs::write(outside.join("keep.txt"), "outside").unwrap();
+        let dir_link = root.join("dir_link");
+        if try_symlink(&outside, &dir_link) {
+            assert!(
+                execute(WorkspaceOperation::EnsureDirectory {
+                    root: root.clone(),
+                    relative_path: PathBuf::from("dir_link"),
+                    overwrite: false,
+                })
+                .is_err()
+            );
+            execute(WorkspaceOperation::EnsureDirectory {
+                root: root.clone(),
+                relative_path: PathBuf::from("dir_link"),
+                overwrite: true,
+            })
+            .unwrap();
+            let meta = fs::symlink_metadata(&dir_link).unwrap();
+            assert!(meta.file_type().is_dir());
+            assert!(!meta.file_type().is_symlink());
+            assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "outside");
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn upload_operations_check_existence_and_block_escapes_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("waku-upload-guards-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("waku-upload-escape-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("existing_dir")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("existing.txt"), "ok").unwrap();
+        fs::write(outside.join("outside.txt"), "secret").unwrap();
+
+        let broken_link = root.join("broken_link");
+        let has_broken_link = try_symlink(&outside.join("does_not_exist"), &broken_link);
+
+        let mut query = vec![
+            PathBuf::from("existing.txt"),
+            PathBuf::from("missing.txt"),
+            PathBuf::from("existing_dir"),
+        ];
+        let mut expected = vec![
+            PathBuf::from("existing.txt"),
+            PathBuf::from("existing_dir"),
+        ];
+        if has_broken_link {
+            query.push(PathBuf::from("broken_link"));
+            expected.push(PathBuf::from("broken_link"));
+        }
+
+        let WorkspaceResult::ExistingPaths { relative_paths } =
+            execute(WorkspaceOperation::CheckPathsExist {
+                root: root.clone(),
+                relative_paths: query,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected workspace response");
+        };
+        assert_eq!(relative_paths, expected);
+
+        let absolute_path = if cfg!(windows) {
+            PathBuf::from(r"C:\outside\evil.txt")
+        } else {
+            PathBuf::from("/outside/evil.txt")
+        };
+        for invalid in [
+            PathBuf::from("../outside"),
+            PathBuf::from("a/../../outside"),
+            PathBuf::new(),
+            absolute_path,
+        ] {
+            assert!(
+                execute(WorkspaceOperation::CheckPathsExist {
+                    root: root.clone(),
+                    relative_paths: vec![invalid.clone()],
+                })
+                .is_err()
+            );
+            assert!(
+                execute(WorkspaceOperation::EnsureDirectory {
+                    root: root.clone(),
+                    relative_path: invalid.clone(),
+                    overwrite: true,
+                })
+                .is_err()
+            );
+            assert!(
+                execute(WorkspaceOperation::WriteFileChunk {
+                    root: root.clone(),
+                    relative_path: invalid,
+                    offset: 0,
+                    bytes: encode_chunk(b"x"),
+                    overwrite: true,
+                })
+                .is_err()
+            );
+        }
+
+        let linked_dir = root.join("linked_dir");
+        if try_symlink(&outside, &linked_dir) {
+            let dir_err = execute(WorkspaceOperation::EnsureDirectory {
+                root: root.clone(),
+                relative_path: PathBuf::from("linked_dir/sub"),
+                overwrite: true,
+            })
+            .unwrap_err();
+            assert!(dir_err.to_string().contains("symlink"));
+            assert!(!outside.join("sub").exists());
+
+            let write_err = execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("linked_dir/nested/pwn.txt"),
+                offset: 0,
+                bytes: encode_chunk(b"pwn"),
+                overwrite: true,
+            })
+            .unwrap_err();
+            assert!(write_err.to_string().contains("symlink"));
+            assert!(!outside.join("nested").exists());
+
+            let append_err = execute(WorkspaceOperation::WriteFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from("linked_dir/outside.txt"),
+                offset: 6,
+                bytes: encode_chunk(b"!"),
+                overwrite: true,
+            })
+            .unwrap_err();
+            assert!(append_err.to_string().contains("symlink"));
+            assert_eq!(fs::read(outside.join("outside.txt")).unwrap(), b"secret");
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
 

@@ -98,6 +98,37 @@ pub enum WorkspaceOperation {
         /// Bytes requested; the daemon clamps this to its own per-chunk cap.
         length: u64,
     },
+    /// Checks which workspace-relative paths currently exist on the daemon host
+    /// (using `symlink_metadata`, so broken symlinks also count as existing).
+    CheckPathsExist {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string[]")]
+        relative_paths: Vec<PathBuf>,
+    },
+    /// Ensures a directory exists inside the workspace. Idempotent when `path`
+    /// is already a directory; replaces a file/symlink only when `overwrite` is true.
+    EnsureDirectory {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+        overwrite: bool,
+    },
+    /// Writes one bounded chunk of a file starting at `offset`, creating parent
+    /// directories as needed. `offset == 0` creates or truncates the file
+    /// (refusing to replace an existing path unless `overwrite` is true); later
+    /// offsets write at `offset` in the existing regular file.
+    WriteFileChunk {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+        offset: u64,
+        /// Base64-encoded chunk bytes, capped at `MAX_FILE_CHUNK_BYTES` (8 MiB) decoded.
+        bytes: String,
+        overwrite: bool,
+    },
     RenamePath {
         #[ts(type = "string")]
         root: PathBuf,
@@ -314,6 +345,10 @@ pub enum WorkspaceResult {
         bytes: String,
         /// File length in bytes when the chunk was read.
         total_bytes: u64,
+    },
+    ExistingPaths {
+        #[ts(type = "string[]")]
+        relative_paths: Vec<PathBuf>,
     },
     ProjectFiles {
         entries: Vec<FileEntry>,
