@@ -1,6 +1,6 @@
 use super::composer::{
-    ComposerSubmitAction, composer_submit_action, dropped_file_mention, merged_submission,
-    next_picker_highlight, visible_branch_entries,
+    ComposerSubmitAction, PastedAttachmentPayload, composer_submit_action, dropped_file_mention,
+    merged_submission, next_picker_highlight, pasted_attachment_payload, visible_branch_entries,
 };
 use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
 use super::settings::visible_settings_pages;
@@ -359,6 +359,62 @@ fn submissions_append_attachment_mentions_after_the_prompt() {
     );
     assert_eq!(merged_submission(" plain ", &[]).as_deref(), Some("plain"));
     assert_eq!(merged_submission("   ", &[]), None);
+}
+
+#[test]
+fn pasted_attachment_payload_stages_paths_or_images_exclusively() {
+    use gpui::{ClipboardEntry, ExternalPaths, Image, ImageFormat};
+    use std::path::PathBuf;
+
+    let path = PathBuf::from("/tmp/screenshot.png");
+    let paths = ExternalPaths(vec![path.clone()].into());
+    let image = Image {
+        format: ImageFormat::Bmp,
+        bytes: vec![1, 2, 3],
+        id: 1,
+    };
+
+    assert_eq!(
+        pasted_attachment_payload(vec![
+            ClipboardEntry::Image(image.clone()),
+            ClipboardEntry::ExternalPaths(paths.clone()),
+        ]),
+        Some(PastedAttachmentPayload::Paths(vec![path.clone()]))
+    );
+    assert_eq!(
+        pasted_attachment_payload(vec![
+            ClipboardEntry::ExternalPaths(paths),
+            ClipboardEntry::Image(image.clone()),
+        ]),
+        Some(PastedAttachmentPayload::Paths(vec![path]))
+    );
+    assert_eq!(
+        pasted_attachment_payload(vec![ClipboardEntry::Image(image.clone())]),
+        Some(PastedAttachmentPayload::Images(vec![image.clone()]))
+    );
+    assert_eq!(
+        pasted_attachment_payload(vec![
+            ClipboardEntry::ExternalPaths(ExternalPaths(Vec::new().into())),
+            ClipboardEntry::Image(image),
+        ]),
+        Some(PastedAttachmentPayload::Images(vec![Image {
+            format: ImageFormat::Bmp,
+            bytes: vec![1, 2, 3],
+            id: 1,
+        }]))
+    );
+    assert_eq!(
+        pasted_attachment_payload(vec![
+            ClipboardEntry::from("plain text".to_owned()),
+            ClipboardEntry::ExternalPaths(ExternalPaths(Vec::new().into())),
+            ClipboardEntry::Image(Image {
+                format: ImageFormat::Png,
+                bytes: Vec::new(),
+                id: 2,
+            }),
+        ]),
+        None
+    );
 }
 
 #[test]

@@ -571,9 +571,13 @@ pub enum InputEvent {
 #[derive(Clone)]
 pub struct MediaPaste(pub Vec<ClipboardEntry>);
 
-/// Respect the representation priority chosen by the source application.
-/// Finder puts paths first (and a text fallback second), while screenshots put
-/// an image first. Text-first clipboard content remains ordinary text paste.
+/// Respect the representation priority chosen by the source application:
+/// text-first clipboard content remains ordinary text paste, while media-first
+/// clipboards yield attachments. Windows apps often write both `ExternalPaths`
+/// (`CF_HDROP`) and `Image` (`CF_DIB`/`PNG`) for a single copied image; keep
+/// only one representation and prefer non-empty `ExternalPaths` so original
+/// filenames and compressed formats survive instead of staging the same image
+/// twice.
 fn media_paste_entries(clipboard: &ClipboardItem) -> Option<Vec<ClipboardEntry>> {
     if !matches!(
         clipboard.entries().first(),
@@ -581,18 +585,27 @@ fn media_paste_entries(clipboard: &ClipboardItem) -> Option<Vec<ClipboardEntry>>
     ) {
         return None;
     }
-    let entries = clipboard
+    let paths = clipboard
         .entries()
         .iter()
         .filter(|entry| {
             matches!(
                 entry,
-                ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_)
+                ClipboardEntry::ExternalPaths(external) if !external.paths().is_empty()
             )
         })
         .cloned()
         .collect::<Vec<_>>();
-    (!entries.is_empty()).then_some(entries)
+    if !paths.is_empty() {
+        return Some(paths);
+    }
+    let images = clipboard
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry, ClipboardEntry::Image(image) if !image.bytes.is_empty()))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!images.is_empty()).then_some(images)
 }
 
 /// The web's input/textarea split, because it is the load-bearing one: a
@@ -3632,6 +3645,87 @@ mod tests {
             ],
         };
         assert!(media_paste_entries(&clipboard).is_none());
+    }
+
+    #[test]
+    fn dual_format_clipboard_prefers_paths_over_image_in_either_order() {
+        let image = Image {
+            format: ImageFormat::Bmp,
+            bytes: vec![1, 2, 3],
+            id: 9,
+        };
+        let paths = ExternalPaths(vec![PathBuf::from("/tmp/copied.png")].into());
+
+        let image_then_paths = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Image(image.clone()),
+                ClipboardEntry::ExternalPaths(paths.clone()),
+            ],
+        };
+        assert!(matches!(
+            media_paste_entries(&image_then_paths).as_deref(),
+            Some([ClipboardEntry::ExternalPaths(found)]) if found == &paths
+        ));
+
+        let paths_then_image = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(paths.clone()),
+                ClipboardEntry::Image(image),
+                ClipboardEntry::from("fallback".to_owned()),
+            ],
+        };
+        assert!(matches!(
+            media_paste_entries(&paths_then_image).as_deref(),
+            Some([ClipboardEntry::ExternalPaths(found)]) if found == &paths
+        ));
+    }
+
+    #[test]
+    fn empty_media_entries_fall_back_to_other_media_or_none() {
+        let image = Image {
+            format: ImageFormat::Png,
+            bytes: vec![1, 2, 3],
+            id: 10,
+        };
+        let empty_image = Image {
+            format: ImageFormat::Png,
+            bytes: Vec::new(),
+            id: 11,
+        };
+        let paths = ExternalPaths(vec![PathBuf::from("/tmp/copied.png")].into());
+        let empty_paths = ExternalPaths(Vec::new().into());
+
+        let empty_paths_then_image = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::ExternalPaths(empty_paths.clone()),
+                ClipboardEntry::Image(image.clone()),
+            ],
+        };
+        assert!(matches!(
+            media_paste_entries(&empty_paths_then_image).as_deref(),
+            Some([ClipboardEntry::Image(found)]) if found == &image
+        ));
+
+        let empty_image_then_paths = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Image(empty_image.clone()),
+                ClipboardEntry::ExternalPaths(paths.clone()),
+            ],
+        };
+        assert!(matches!(
+            media_paste_entries(&empty_image_then_paths).as_deref(),
+            Some([ClipboardEntry::ExternalPaths(found)]) if found == &paths
+        ));
+
+        let only_empty_paths = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(empty_paths)],
+        };
+        assert!(media_paste_entries(&only_empty_paths).is_none());
+
+        let only_empty_image = ClipboardItem {
+            entries: vec![ClipboardEntry::Image(empty_image)],
+        };
+        assert!(media_paste_entries(&only_empty_image).is_none());
     }
 
     #[test]

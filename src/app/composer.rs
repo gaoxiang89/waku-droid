@@ -2389,21 +2389,14 @@ impl Waku {
         entries: Vec<ClipboardEntry>,
         cx: &mut Context<Self>,
     ) {
-        let mut paths = Vec::new();
-        let mut images = Vec::new();
-        for entry in entries {
-            match entry {
-                ClipboardEntry::Image(image) if !image.bytes.is_empty() => images.push(image),
-                ClipboardEntry::ExternalPaths(external) => {
-                    paths.extend(external.paths().iter().cloned())
-                }
-                ClipboardEntry::String(_) | ClipboardEntry::Image(_) => {}
+        let images = match pasted_attachment_payload(entries) {
+            Some(PastedAttachmentPayload::Paths(paths)) => {
+                self.stage_attachment_paths(&paths, cx);
+                return;
             }
-        }
-        self.stage_attachment_paths(&paths, cx);
-        if images.is_empty() {
-            return;
-        }
+            Some(PastedAttachmentPayload::Images(images)) => images,
+            None => return,
+        };
 
         let daemon = self.selected_daemon().clone();
         let draft_owner = self.selected_composer_draft_key();
@@ -4080,6 +4073,38 @@ fn is_image_attachment_path(path: &Path) -> bool {
                     | "ppm"
             )
         })
+}
+
+/// Mutually exclusive media payload extracted from a clipboard paste.
+/// Non-empty `ExternalPaths` takes precedence over raw `Image` bytes so a
+/// dual-format clipboard item is never staged as both an attachment and a blob.
+#[derive(Debug, PartialEq)]
+pub(super) enum PastedAttachmentPayload {
+    Paths(Vec<PathBuf>),
+    Images(Vec<gpui::Image>),
+}
+
+pub(super) fn pasted_attachment_payload(
+    entries: Vec<ClipboardEntry>,
+) -> Option<PastedAttachmentPayload> {
+    let mut paths = Vec::new();
+    let mut images = Vec::new();
+    for entry in entries {
+        match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => images.push(image),
+            ClipboardEntry::ExternalPaths(external) => {
+                paths.extend(external.paths().iter().cloned())
+            }
+            ClipboardEntry::String(_) | ClipboardEntry::Image(_) => {}
+        }
+    }
+    if !paths.is_empty() {
+        Some(PastedAttachmentPayload::Paths(paths))
+    } else if !images.is_empty() {
+        Some(PastedAttachmentPayload::Images(images))
+    } else {
+        None
+    }
 }
 
 /// The prompt a submission sends: the typed text plus one `@` mention per
