@@ -87,20 +87,8 @@ pub fn provider_session_history(
 }
 
 fn claude_config_dir_from_env() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            crate::command_env::shell_environment()
-                .into_iter()
-                .find(|(name, value)| {
-                    #[cfg(windows)]
-                    let matches = name.to_string_lossy().eq_ignore_ascii_case("CLAUDE_CONFIG_DIR");
-                    #[cfg(not(windows))]
-                    let matches = name == "CLAUDE_CONFIG_DIR";
-                    matches && !value.is_empty()
-                })
-                .map(|(_, value)| value)
-        })
+    crate::command_env::env_var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
         .map(PathBuf::from)
 }
 

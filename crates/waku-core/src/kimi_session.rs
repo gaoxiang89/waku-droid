@@ -29,53 +29,16 @@ const TURN_RECORD_POLL: Duration = Duration::from_millis(25);
 /// arbitrarily large.
 const WIRE_TAIL_BYTES: u64 = 128 * 1024;
 
-fn env_var_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    name: &str,
-) -> Option<OsString> {
-    if let Some(value) = process_value
+fn session_home_from(env_value: Option<OsString>, home_dir: Option<PathBuf>) -> Option<PathBuf> {
+    env_value
         .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
-    {
-        return Some(value);
-    }
-    shell_env
-        .iter()
-        .rev()
-        .find(|(key, value)| {
-            !value.is_empty()
-                && value.to_str().is_none_or(|s| !s.trim().is_empty())
-                && {
-                    #[cfg(windows)]
-                    {
-                        key.to_string_lossy().eq_ignore_ascii_case(name)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        key == name
-                    }
-                }
-        })
-        .map(|(_, value)| value.clone())
-}
-
-fn session_home_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    home_dir: Option<PathBuf>,
-) -> Option<PathBuf> {
-    env_var_from(process_value, shell_env, "KIMI_CODE_HOME")
         .map(PathBuf::from)
         .or_else(|| home_dir.map(|home| home.join(".kimi-code")))
 }
 
 /// Kimi's data directory, matching the CLI's own `KIMI_CODE_HOME` override.
 pub fn session_home() -> Option<PathBuf> {
-    session_home_from(
-        std::env::var_os("KIMI_CODE_HOME"),
-        &crate::command_env::shell_environment(),
-        dirs::home_dir(),
-    )
+    session_home_from(crate::command_env::env_var_os("KIMI_CODE_HOME"), dirs::home_dir())
 }
 
 fn provider_timestamp(value: Option<&Value>) -> u64 {
@@ -442,32 +405,25 @@ mod tests {
     }
 
     #[test]
-    fn session_home_filters_empty_env_and_falls_back_to_shell_environment() {
+    fn session_home_filters_empty_env_and_falls_back_to_home_dir() {
         let home = PathBuf::from("/fake/home");
-        let shell_env = vec![(
-            OsString::from("KIMI_CODE_HOME"),
-            OsString::from("/shell/kimi-home"),
-        )];
 
         assert_eq!(
-            session_home_from(Some(OsString::from("")), &shell_env, Some(home.clone())),
-            Some(PathBuf::from("/shell/kimi-home"))
+            session_home_from(Some(OsString::from("")), Some(home.clone())),
+            Some(home.join(".kimi-code"))
         );
         assert_eq!(
-            session_home_from(Some(OsString::from("   ")), &shell_env, Some(home.clone())),
-            Some(PathBuf::from("/shell/kimi-home"))
+            session_home_from(Some(OsString::from("   ")), Some(home.clone())),
+            Some(home.join(".kimi-code"))
         );
         assert_eq!(
-            session_home_from(
-                Some(OsString::from("/proc/kimi")),
-                &shell_env,
-                Some(home.clone())
-            ),
+            session_home_from(Some(OsString::from("/proc/kimi")), Some(home.clone())),
             Some(PathBuf::from("/proc/kimi"))
         );
         assert_eq!(
-            session_home_from(None, &[], Some(home.clone())),
+            session_home_from(None, Some(home.clone())),
             Some(home.join(".kimi-code"))
         );
+        assert_eq!(session_home_from(None, None), None);
     }
 }

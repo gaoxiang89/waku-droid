@@ -35,8 +35,6 @@
 //! threads are.
 
 use std::collections::HashMap;
-#[cfg(not(windows))]
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -122,44 +120,19 @@ pub(crate) fn registration_path() -> PathBuf {
 }
 
 fn state_directory() -> PathBuf {
-    let shell_env = crate::command_env::shell_environment();
     state_directory_from(
-        std::env::var_os("XDG_STATE_HOME"),
-        &shell_env,
+        crate::command_env::env_var_os("XDG_STATE_HOME"),
         dirs::home_dir(),
     )
 }
 
-fn state_directory_from(
-    process_xdg: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    home: Option<PathBuf>,
-) -> PathBuf {
-    process_xdg
-        .filter(|value| !value.is_empty())
-        .or_else(|| shell_env_var(shell_env, "XDG_STATE_HOME"))
+fn state_directory_from(xdg_state_home: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    xdg_state_home
+        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
         .map(PathBuf::from)
         .or_else(|| home.map(|home| home.join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from(".local").join("state"))
         .join("opencode")
-}
-
-fn shell_env_var(shell_env: &[(OsString, OsString)], name: &str) -> Option<OsString> {
-    shell_env
-        .iter()
-        .find(|(key, value)| {
-            !value.is_empty() && {
-                #[cfg(windows)]
-                {
-                    key.to_string_lossy().eq_ignore_ascii_case(name)
-                }
-                #[cfg(not(windows))]
-                {
-                    key.as_os_str() == OsStr::new(name)
-                }
-            }
-        })
-        .map(|(_, value)| value.clone())
 }
 
 /// Reads the descriptor of whatever service is registered, if any.
@@ -1580,27 +1553,29 @@ mod tests {
     }
 
     #[test]
-    fn state_directory_falls_back_to_shell_environment_xdg_state_home() {
-        let shell_env = vec![(
-            OsString::from("XDG_STATE_HOME"),
-            OsString::from("/from-shell/state"),
-        )];
+    fn state_directory_prefers_xdg_state_home_and_filters_empty_values() {
         let home = Some(PathBuf::from("/home/user"));
 
         assert_eq!(
-            state_directory_from(Some(OsString::from("/from-env/state")), &shell_env, home.clone()),
+            state_directory_from(Some(OsString::from("/from-env/state")), home.clone()),
             PathBuf::from("/from-env/state").join("opencode")
         );
         assert_eq!(
-            state_directory_from(None, &shell_env, home.clone()),
-            PathBuf::from("/from-shell/state").join("opencode")
+            state_directory_from(Some(OsString::new()), home.clone()),
+            PathBuf::from("/home/user")
+                .join(".local")
+                .join("state")
+                .join("opencode")
         );
         assert_eq!(
-            state_directory_from(Some(OsString::new()), &shell_env, home.clone()),
-            PathBuf::from("/from-shell/state").join("opencode")
+            state_directory_from(Some(OsString::from("   ")), home.clone()),
+            PathBuf::from("/home/user")
+                .join(".local")
+                .join("state")
+                .join("opencode")
         );
         assert_eq!(
-            state_directory_from(None, &[], home),
+            state_directory_from(None, home),
             PathBuf::from("/home/user")
                 .join(".local")
                 .join("state")

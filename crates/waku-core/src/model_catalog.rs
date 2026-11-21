@@ -33,107 +33,7 @@ const CURSOR_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 const ANTIGRAVITY_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
 
-pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
-    match provider {
-        ProviderKind::Amp => [
-            ProviderModel::new("low", tr!("model_option.low")),
-            ProviderModel::new("medium", tr!("model_option.medium")).default(),
-            ProviderModel::new("high", tr!("model_option.high")),
-            ProviderModel::new("ultra", tr!("model_option.ultra")),
-        ]
-        .into_iter()
-        .map(|model| {
-            model.service_tiers(
-                [ProviderModelOption::new("fast", tr!("model_option.fast"))
-                    .description(tr!("model_option.amp_fast_description"))],
-                "default",
-            )
-        })
-        .collect(),
-        ProviderKind::Codex => [
-            ProviderModel::new("gpt-5.6-sol", "GPT-5.6-Sol").default(),
-            ProviderModel::new("gpt-5.6-terra", "GPT-5.6-Terra"),
-            ProviderModel::new("gpt-5.6-luna", "GPT-5.6-Luna"),
-            ProviderModel::new("gpt-5.5", "GPT-5.5"),
-            ProviderModel::new("gpt-5.4", "GPT-5.4"),
-        ]
-        .into_iter()
-        .map(|model| {
-            model
-                .reasoning(
-                    reasoning_options(["low", "medium", "high", "xhigh"]),
-                    "medium",
-                )
-                .service_tiers(
-                    [ProviderModelOption::new("fast", tr!("model_option.fast"))
-                        .description(tr!("model_option.fast_description"))],
-                    "default",
-                )
-        })
-        .collect(),
-        ProviderKind::Claude => vec![
-            claude_long_context(claude_ultracode_model("claude-fable-5", "Claude Fable 5")),
-            claude_long_context(claude_ultracode_model("claude-opus-5", "Claude Opus 5")),
-            claude_long_context(claude_ultracode_model("claude-opus-4-8", "Claude Opus 4.8")),
-            claude_long_context(claude_ultracode_model("claude-opus-4-7", "Claude Opus 4.7")),
-            claude_long_context(claude_reasoning_model("claude-opus-4-6", "Claude Opus 4.6")),
-            claude_reasoning_model("claude-opus-4-5", "Claude Opus 4.5"),
-            claude_long_context(claude_ultracode_model("claude-sonnet-5", "Claude Sonnet 5"))
-                .default(),
-            claude_long_context(claude_reasoning_model(
-                "claude-sonnet-4-6",
-                "Claude Sonnet 4.6",
-            )),
-            ProviderModel::new("claude-haiku-4-5", "Claude Haiku 4.5"),
-        ],
-        // Cursor's full catalog is account-specific and comes from ACP
-        // `cursor/list_available_models`. Auto remains the provider-owned
-        // default and keeps older CLIs selectable if discovery is unavailable.
-        ProviderKind::Cursor => {
-            vec![ProviderModel::new("auto", tr!("model_option.auto")).default()]
-        }
-        // Antigravity reports its account's model families on `session/new`,
-        // and availability changes with the signed-in plan.
-        ProviderKind::Antigravity => Vec::new(),
-        // Harness reports its account/configuration-specific catalog from its
-        // Host. An invented fallback would make unavailable routes selectable.
-        ProviderKind::DeepSeek => Vec::new(),
-        // Fx resolves its catalog through the user's active Gateway or
-        // subscription login. An invented fallback could expose an unusable
-        // route, so discovery is authoritative.
-        ProviderKind::Fx => Vec::new(),
-        // Discovery through the adopted background service is authoritative;
-        // a fabricated catalog would offer models the server rejects.
-        ProviderKind::OpenCode => Vec::new(),
-        // Grok's catalog comes from `grok models`, which includes any custom
-        // model the user configured. An invented fallback would offer a model
-        // the CLI rejects, so discovery is authoritative.
-        ProviderKind::Grok => Vec::new(),
-        // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
-        // configured LLM providers. A fabricated fallback would make
-        // unavailable models look selectable.
-        ProviderKind::Droid | ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => {
-            Vec::new()
-        }
-    }
-}
-
-pub fn fallback_agent_presets(provider: ProviderKind) -> Vec<ProviderAgentPreset> {
-    if provider != ProviderKind::DeepSeek {
-        return Vec::new();
-    }
-    vec![
-        ProviderAgentPreset::new("standard", tr!("agent_preset.standard"))
-            .description(tr!("agent_preset.standard_description"))
-            .default(),
-        ProviderAgentPreset::new("code", tr!("agent_preset.code"))
-            .description(tr!("agent_preset.code_description")),
-        ProviderAgentPreset::new("minimal", tr!("agent_preset.minimal"))
-            .description(tr!("agent_preset.minimal_description")),
-        ProviderAgentPreset::new("cordis", tr!("agent_preset.creator"))
-            .description(tr!("agent_preset.creator_description")),
-    ]
-}
+pub use waku_protocol::model_catalog::{fallback_agent_presets, fallback_models};
 
 /// Discovers both ordinary models and provider-owned agent compositions in
 /// one provider process. Harness serves both catalogs from the same resident
@@ -1910,6 +1810,7 @@ pub(crate) fn with_variant_efforts<'a>(
     }
 }
 
+#[cfg(test)]
 fn reasoning_options<const N: usize>(efforts: [&str; N]) -> Vec<ProviderModelOption> {
     efforts
         .into_iter()
@@ -1931,38 +1832,6 @@ fn grok_reasoning_model(model: ProviderModel) -> ProviderModel {
         ),
         None => model,
     }
-}
-
-fn claude_reasoning_model(id: &str, name: &str) -> ProviderModel {
-    ProviderModel::new(id, name).reasoning(
-        reasoning_options(["low", "medium", "high", "xhigh", "max"]),
-        "high",
-    )
-}
-
-/// `ultracode` is an effort value Claude Code accepts alongside the ordinary
-/// ladder: it resolves to xhigh and turns on standing dynamic-workflow
-/// orchestration for that session. It therefore needs an xhigh-capable model —
-/// older ones clamp xhigh back to high, which would leave the entry inert.
-fn claude_ultracode_model(id: &str, name: &str) -> ProviderModel {
-    ProviderModel::new(id, name).reasoning(
-        reasoning_options(["low", "medium", "high", "xhigh", "max", "ultracode"]),
-        "high",
-    )
-}
-
-/// Claude Code serves a 200K window by default and reaches the 1M one through
-/// a `[1m]` model-id suffix, so the window is a per-session trait rather than a
-/// separate model. The CLI refuses the suffix on Claude 3, Opus 4.0/4.1/4.5,
-/// and Haiku 4.5, so only the models that honor it carry the choice.
-fn claude_long_context(model: ProviderModel) -> ProviderModel {
-    model.context_windows(
-        [
-            ProviderModelOption::new("200k", tr!("model_option.context_200k")),
-            ProviderModelOption::new("1m", tr!("model_option.context_1m")),
-        ],
-        "200k",
-    )
 }
 
 fn recv_rpc_response(rx: &Receiver<Value>, id: u64, timeout: Duration) -> Option<Value> {

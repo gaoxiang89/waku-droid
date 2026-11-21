@@ -122,58 +122,29 @@ fn build_acp_mcp_computer_use_config(
 
 const MAX_GROK_MIRROR_DEPTH: usize = 16;
 
-fn env_var_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    name: &str,
-) -> Option<OsString> {
-    if let Some(value) = process_value
+fn non_empty_env_path(value: Option<OsString>) -> Option<PathBuf> {
+    value
         .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
-    {
-        return Some(value);
-    }
-    shell_env
-        .iter()
-        .rev()
-        .find(|(key, value)| {
-            !value.is_empty()
-                && value.to_str().is_none_or(|s| !s.trim().is_empty())
-                && {
-                    #[cfg(windows)]
-                    {
-                        key.to_string_lossy().eq_ignore_ascii_case(name)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        key == name
-                    }
-                }
-        })
-        .map(|(_, value)| value.clone())
+        .map(PathBuf::from)
 }
 
 fn resolve_grok_source_home_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
+    grok_home_env: Option<OsString>,
     home_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    env_var_from(process_value, shell_env, "GROK_HOME")
-        .map(PathBuf::from)
+    non_empty_env_path(grok_home_env)
         .or_else(|| home_dir.map(|home| home.join(".grok")))
         .ok_or_else(|| anyhow!("home directory is unavailable"))
 }
 
 fn resolve_grok_auth_path_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
+    grok_auth_path_env: Option<OsString>,
     source_home: &Path,
 ) -> Option<PathBuf> {
-    env_var_from(process_value, shell_env, "GROK_AUTH_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let path = source_home.join("auth.json");
-            path.is_file().then_some(path)
-        })
+    non_empty_env_path(grok_auth_path_env).or_else(|| {
+        let path = source_home.join("auth.json");
+        path.is_file().then_some(path)
+    })
 }
 
 fn copy_dir_recursive(source: &Path, dest: &Path, depth: usize) -> io::Result<()> {
@@ -235,15 +206,12 @@ fn mirror_grok_resource_with(
 fn build_grok_computer_use_config(
     base: computer_use_runtime::ComputerUseConfig,
 ) -> anyhow::Result<HeadlessComputerUseConfig> {
-    let shell_env = crate::command_env::shell_environment();
     let source_home = resolve_grok_source_home_from(
-        std::env::var_os("GROK_HOME"),
-        &shell_env,
+        crate::command_env::env_var_os("GROK_HOME"),
         dirs::home_dir(),
     )?;
     let auth_path = resolve_grok_auth_path_from(
-        std::env::var_os("GROK_AUTH_PATH"),
-        &shell_env,
+        crate::command_env::env_var_os("GROK_AUTH_PATH"),
         &source_home,
     );
     build_grok_computer_use_config_in(base, &source_home, auth_path, fs_ext::symlink)
@@ -740,36 +708,32 @@ mod tests {
     }
 
     #[test]
-    fn grok_env_lookup_filters_empty_values_and_falls_back_to_shell_env() {
+    fn grok_env_lookup_filters_empty_values_and_falls_back_to_defaults() {
         let home = PathBuf::from("/fake/home");
-        let shell_env = vec![
-            (OsString::from("GROK_HOME"), OsString::from("/shell/grok")),
-            (
-                OsString::from("GROK_AUTH_PATH"),
-                OsString::from("/shell/grok-auth.json"),
-            ),
-        ];
 
         assert_eq!(
-            resolve_grok_source_home_from(Some(OsString::from("")), &shell_env, Some(home.clone()))
+            resolve_grok_source_home_from(Some(OsString::from("")), Some(home.clone())).unwrap(),
+            home.join(".grok")
+        );
+        assert_eq!(
+            resolve_grok_source_home_from(Some(OsString::from("   ")), Some(home.clone())).unwrap(),
+            home.join(".grok")
+        );
+        assert_eq!(
+            resolve_grok_source_home_from(Some(OsString::from("/shell/grok")), Some(home.clone()))
                 .unwrap(),
             PathBuf::from("/shell/grok")
         );
         assert_eq!(
-            resolve_grok_source_home_from(Some(OsString::from("")), &[], Some(home.clone()))
-                .unwrap(),
-            home.join(".grok")
+            resolve_grok_auth_path_from(Some(OsString::from("")), &home),
+            None
         );
         assert_eq!(
-            resolve_grok_auth_path_from(Some(OsString::from("")), &shell_env, &home),
-            Some(PathBuf::from("/shell/grok-auth.json"))
+            resolve_grok_auth_path_from(Some(OsString::from("   ")), &home),
+            None
         );
         assert_eq!(
-            resolve_grok_auth_path_from(
-                Some(OsString::from("/proc/auth.json")),
-                &shell_env,
-                &home
-            ),
+            resolve_grok_auth_path_from(Some(OsString::from("/proc/auth.json")), &home),
             Some(PathBuf::from("/proc/auth.json"))
         );
     }
@@ -802,7 +766,7 @@ mod tests {
             skill_path,
             process_directory: process_dir.clone(),
         };
-        let auth_path = resolve_grok_auth_path_from(None, &[], &source_home);
+        let auth_path = resolve_grok_auth_path_from(None, &source_home);
         let config = build_grok_computer_use_config_in(
             base,
             &source_home,

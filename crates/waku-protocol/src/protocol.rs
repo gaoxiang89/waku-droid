@@ -713,4 +713,368 @@ mod tests {
         assert_eq!(prompt, "<handoff>\nhello");
         assert_eq!(transcript_message.as_deref(), Some("hello"));
     }
+
+    #[test]
+    fn probe_provider_and_fetch_plan_usage_round_trip_with_optional_config_dir() {
+        let probe = Command::ProbeProvider {
+            provider: ProviderKind::Claude,
+            binary_override: Some("/usr/local/bin/claude".into()),
+            config_dir: Some("~/.claude-work".into()),
+            discover_models: true,
+            probe_version: true,
+        };
+        let json = serde_json::to_value(&probe).unwrap();
+        assert_eq!(json["type"], "probeProvider");
+        assert_eq!(json["provider"], "claude");
+        assert_eq!(json["binaryOverride"], "/usr/local/bin/claude");
+        assert_eq!(json["configDir"], "~/.claude-work");
+        assert_eq!(json["discoverModels"], true);
+        assert_eq!(json["probeVersion"], true);
+        let Command::ProbeProvider {
+            provider,
+            binary_override,
+            config_dir,
+            discover_models,
+            probe_version,
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(provider, ProviderKind::Claude);
+        assert_eq!(binary_override.as_deref(), Some("/usr/local/bin/claude"));
+        assert_eq!(config_dir.as_deref(), Some("~/.claude-work"));
+        assert!(discover_models);
+        assert!(probe_version);
+
+        let probe_default = serde_json::to_value(Command::ProbeProvider {
+            provider: ProviderKind::Codex,
+            binary_override: None,
+            config_dir: None,
+            discover_models: false,
+            probe_version: true,
+        })
+        .unwrap();
+        assert!(probe_default.get("configDir").is_none());
+        let Command::ProbeProvider { config_dir, .. } =
+            serde_json::from_value(probe_default).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(config_dir, None);
+
+        let usage = Command::FetchPlanUsage {
+            provider: ProviderKind::Codex,
+            binary_override: Some("/opt/codex".into()),
+            config_dir: Some("~/.codex-work".into()),
+            cli_version: Some("0.98.0".into()),
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["type"], "fetchPlanUsage");
+        assert_eq!(json["provider"], "codex");
+        assert_eq!(json["binaryOverride"], "/opt/codex");
+        assert_eq!(json["configDir"], "~/.codex-work");
+        assert_eq!(json["cliVersion"], "0.98.0");
+        let Command::FetchPlanUsage {
+            provider,
+            binary_override,
+            config_dir,
+            cli_version,
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(provider, ProviderKind::Codex);
+        assert_eq!(binary_override.as_deref(), Some("/opt/codex"));
+        assert_eq!(config_dir.as_deref(), Some("~/.codex-work"));
+        assert_eq!(cli_version.as_deref(), Some("0.98.0"));
+
+        let usage_default = serde_json::to_value(Command::FetchPlanUsage {
+            provider: ProviderKind::Claude,
+            binary_override: None,
+            config_dir: None,
+            cli_version: None,
+        })
+        .unwrap();
+        assert!(usage_default.get("configDir").is_none());
+        let Command::FetchPlanUsage { config_dir, .. } =
+            serde_json::from_value(usage_default).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(config_dir, None);
+    }
+
+    #[test]
+    fn update_settings_round_trips_provider_accounts() {
+        let mut settings = DaemonSettings::default();
+        settings.computer_use_enabled = true;
+        settings.disabled_providers = vec![ProviderKind::Amp];
+        settings
+            .provider_binary_overrides
+            .insert(ProviderKind::Claude, "/usr/local/bin/claude".into());
+        settings.provider_accounts = vec![
+            crate::settings::ProviderAccount {
+                id: "work".into(),
+                provider: ProviderKind::Claude,
+                label: "Work".into(),
+                config_dir: "~/.claude-work".into(),
+                binary_override: Some("/opt/claude-work".into()),
+            },
+            crate::settings::ProviderAccount {
+                id: "personal".into(),
+                provider: ProviderKind::Codex,
+                label: "Personal".into(),
+                config_dir: "~/.codex-personal".into(),
+                binary_override: None,
+            },
+        ];
+
+        let json = serde_json::to_value(Command::UpdateSettings {
+            settings: settings.clone(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "updateSettings");
+        assert_eq!(
+            json["settings"]["provider_accounts"][0]["configDir"],
+            "~/.claude-work"
+        );
+        assert_eq!(
+            json["settings"]["provider_accounts"][0]["binaryOverride"],
+            "/opt/claude-work"
+        );
+        assert!(
+            json["settings"]["provider_accounts"][1]
+                .get("binaryOverride")
+                .is_none()
+        );
+
+        let Command::UpdateSettings { settings: decoded } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn wire_driver_start_options_round_trip_with_and_without_config_dir() {
+        let options = WireDriverStartOptions {
+            provider: "claude".into(),
+            binary: PathBuf::from("/usr/local/bin/claude"),
+            config_dir: Some("~/.claude-work".into()),
+            cwd: PathBuf::from("/tmp/repo"),
+            mode: "fullAccess".into(),
+            model: Some("claude-sonnet-5".into()),
+            reasoning_effort: Some("high".into()),
+            service_tier: Some("fast".into()),
+            context_window: Some("1m".into()),
+            agent_preset: Some("code".into()),
+            computer_use_enabled: true,
+            provider_cursor: Some(serde_json::json!({
+                "provider": "claude",
+                "sessionId": "sess-42"
+            })),
+        };
+        let json = serde_json::to_value(Command::Start {
+            options: options.clone(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "start");
+        assert_eq!(json["options"]["configDir"], "~/.claude-work");
+        assert_eq!(json["options"]["reasoningEffort"], "high");
+        assert_eq!(json["options"]["serviceTier"], "fast");
+        assert_eq!(json["options"]["contextWindow"], "1m");
+        assert_eq!(json["options"]["agentPreset"], "code");
+        assert_eq!(json["options"]["computerUseEnabled"], true);
+
+        let Command::Start { options: decoded } = serde_json::from_value(json).unwrap() else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(decoded.provider, options.provider);
+        assert_eq!(decoded.binary, options.binary);
+        assert_eq!(decoded.config_dir, options.config_dir);
+        assert_eq!(decoded.cwd, options.cwd);
+        assert_eq!(decoded.mode, options.mode);
+        assert_eq!(decoded.model, options.model);
+        assert_eq!(decoded.reasoning_effort, options.reasoning_effort);
+        assert_eq!(decoded.service_tier, options.service_tier);
+        assert_eq!(decoded.context_window, options.context_window);
+        assert_eq!(decoded.agent_preset, options.agent_preset);
+        assert_eq!(decoded.computer_use_enabled, options.computer_use_enabled);
+        assert_eq!(decoded.provider_cursor, options.provider_cursor);
+
+        let without_config_dir = WireDriverStartOptions {
+            config_dir: None,
+            ..options
+        };
+        let json = serde_json::to_value(&without_config_dir).unwrap();
+        assert!(json.get("configDir").is_none());
+        let decoded: WireDriverStartOptions = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.config_dir, None);
+    }
+
+    #[test]
+    fn provider_session_fork_request_round_trips_all_five_variants() {
+        let source_session = AgentSession::new(Uuid::from_u128(55), ProviderKind::Cursor);
+
+        let claude_with_dir = Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::Claude {
+                session_id: "claude-sess-1".into(),
+                resume_at: Some("msg-3".into()),
+                turn_count: 2,
+                title: "Forked Claude".into(),
+                config_dir: Some(PathBuf::from("/home/user/.claude-work")),
+            },
+        };
+        let json = serde_json::to_value(&claude_with_dir).unwrap();
+        assert_eq!(json["type"], "forkProviderSession");
+        assert_eq!(json["request"]["provider"], "claude");
+        assert_eq!(json["request"]["config_dir"], "/home/user/.claude-work");
+        let Command::ForkProviderSession {
+            request:
+                ProviderSessionForkRequest::Claude {
+                    session_id,
+                    resume_at,
+                    turn_count,
+                    title,
+                    config_dir,
+                },
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(session_id, "claude-sess-1");
+        assert_eq!(resume_at.as_deref(), Some("msg-3"));
+        assert_eq!(turn_count, 2);
+        assert_eq!(title, "Forked Claude");
+        assert_eq!(config_dir, Some(PathBuf::from("/home/user/.claude-work")));
+
+        let claude_no_dir = serde_json::to_value(ProviderSessionForkRequest::Claude {
+            session_id: "claude-sess-2".into(),
+            resume_at: None,
+            turn_count: 1,
+            title: "Default".into(),
+            config_dir: None,
+        })
+        .unwrap();
+        assert!(claude_no_dir.get("config_dir").is_none());
+        let ProviderSessionForkRequest::Claude { config_dir, .. } =
+            serde_json::from_value(claude_no_dir).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(config_dir, None);
+
+        let amp = Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::Amp {
+                binary: PathBuf::from("/usr/local/bin/amp"),
+                cwd: PathBuf::from("/tmp/repo"),
+                thread_id: "amp-thread-1".into(),
+                fork_context: Some("prior summary".into()),
+                turn_count: 3,
+            },
+        };
+        let json = serde_json::to_value(&amp).unwrap();
+        assert_eq!(json["request"]["provider"], "amp");
+        let Command::ForkProviderSession {
+            request:
+                ProviderSessionForkRequest::Amp {
+                    binary,
+                    cwd,
+                    thread_id,
+                    fork_context,
+                    turn_count,
+                },
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(binary, PathBuf::from("/usr/local/bin/amp"));
+        assert_eq!(cwd, PathBuf::from("/tmp/repo"));
+        assert_eq!(thread_id, "amp-thread-1");
+        assert_eq!(fork_context.as_deref(), Some("prior summary"));
+        assert_eq!(turn_count, 3);
+
+        let cursor = Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::Cursor {
+                source: source_session.clone(),
+                turn_count: 4,
+            },
+        };
+        let json = serde_json::to_value(&cursor).unwrap();
+        assert_eq!(json["request"]["provider"], "cursor");
+        let Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::Cursor { source, turn_count },
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(source.id, source_session.id);
+        assert_eq!(source.provider, ProviderKind::Cursor);
+        assert_eq!(turn_count, 4);
+
+        let opencode = Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::OpenCode {
+                binary: PathBuf::from("/usr/local/bin/opencode"),
+                session_id: "oc-sess-1".into(),
+                turn_count: 5,
+            },
+        };
+        let json = serde_json::to_value(&opencode).unwrap();
+        assert_eq!(json["request"]["provider"], "openCode");
+        let Command::ForkProviderSession {
+            request:
+                ProviderSessionForkRequest::OpenCode {
+                    binary,
+                    session_id,
+                    turn_count,
+                },
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(binary, PathBuf::from("/usr/local/bin/opencode"));
+        assert_eq!(session_id, "oc-sess-1");
+        assert_eq!(turn_count, 5);
+
+        // Legacy openCode2 tag remains accepted as an alias.
+        let legacy_opencode: ProviderSessionForkRequest = serde_json::from_value(serde_json::json!({
+            "provider": "openCode2",
+            "binary": "/usr/local/bin/opencode",
+            "session_id": "oc-legacy",
+            "turn_count": 2
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy_opencode,
+            ProviderSessionForkRequest::OpenCode { session_id, turn_count: 2, .. }
+                if session_id == "oc-legacy"
+        ));
+
+        let grok = Command::ForkProviderSession {
+            request: ProviderSessionForkRequest::Grok {
+                binary: PathBuf::from("/usr/local/bin/grok"),
+                cwd: PathBuf::from("/tmp/grok-repo"),
+                session_id: "grok-sess-1".into(),
+                turn_count: 6,
+            },
+        };
+        let json = serde_json::to_value(&grok).unwrap();
+        assert_eq!(json["request"]["provider"], "grok");
+        let Command::ForkProviderSession {
+            request:
+                ProviderSessionForkRequest::Grok {
+                    binary,
+                    cwd,
+                    session_id,
+                    turn_count,
+                },
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected fork request variant");
+        };
+        assert_eq!(binary, PathBuf::from("/usr/local/bin/grok"));
+        assert_eq!(cwd, PathBuf::from("/tmp/grok-repo"));
+        assert_eq!(session_id, "grok-sess-1");
+        assert_eq!(turn_count, 6);
+    }
 }

@@ -200,53 +200,19 @@ fn find_session_directory(session_id: &str) -> anyhow::Result<PathBuf> {
     find_session_directory_in(&grok_home_directory()?, session_id)
 }
 
-fn env_var_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    name: &str,
-) -> Option<OsString> {
-    if let Some(value) = process_value
-        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
-    {
-        return Some(value);
-    }
-    shell_env
-        .iter()
-        .rev()
-        .find(|(key, value)| {
-            !value.is_empty()
-                && value.to_str().is_none_or(|s| !s.trim().is_empty())
-                && {
-                    #[cfg(windows)]
-                    {
-                        key.to_string_lossy().eq_ignore_ascii_case(name)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        key == name
-                    }
-                }
-        })
-        .map(|(_, value)| value.clone())
-}
-
 fn grok_home_directory_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
+    env_value: Option<OsString>,
     home_dir: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
-    env_var_from(process_value, shell_env, "GROK_HOME")
+    env_value
+        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
         .map(PathBuf::from)
         .or_else(|| home_dir.map(|home| home.join(".grok")))
         .ok_or_else(|| anyhow!("Grok's home directory could not be located"))
 }
 
 fn grok_home_directory() -> anyhow::Result<PathBuf> {
-    grok_home_directory_from(
-        std::env::var_os("GROK_HOME"),
-        &crate::command_env::shell_environment(),
-        dirs::home_dir(),
-    )
+    grok_home_directory_from(crate::command_env::env_var_os("GROK_HOME"), dirs::home_dir())
 }
 
 fn find_session_directory_in(grok_home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
@@ -658,32 +624,26 @@ mod tests {
     }
 
     #[test]
-    fn grok_home_filters_empty_env_and_falls_back_to_shell_environment() {
+    fn grok_home_filters_empty_env_and_falls_back_to_home_dir() {
         let home = PathBuf::from("/fake/home");
-        let shell_env = vec![(OsString::from("GROK_HOME"), OsString::from("/shell/grok"))];
 
         assert_eq!(
-            grok_home_directory_from(Some(OsString::from("")), &shell_env, Some(home.clone()))
-                .unwrap(),
-            PathBuf::from("/shell/grok")
+            grok_home_directory_from(Some(OsString::from("")), Some(home.clone())).unwrap(),
+            home.join(".grok")
         );
         assert_eq!(
-            grok_home_directory_from(Some(OsString::from("   ")), &shell_env, Some(home.clone()))
-                .unwrap(),
-            PathBuf::from("/shell/grok")
+            grok_home_directory_from(Some(OsString::from("   ")), Some(home.clone())).unwrap(),
+            home.join(".grok")
         );
         assert_eq!(
-            grok_home_directory_from(
-                Some(OsString::from("/proc/grok")),
-                &shell_env,
-                Some(home.clone())
-            )
-            .unwrap(),
+            grok_home_directory_from(Some(OsString::from("/proc/grok")), Some(home.clone()))
+                .unwrap(),
             PathBuf::from("/proc/grok")
         );
         assert_eq!(
-            grok_home_directory_from(None, &[], Some(home.clone())).unwrap(),
+            grok_home_directory_from(None, Some(home.clone())).unwrap(),
             home.join(".grok")
         );
+        assert!(grok_home_directory_from(None, None).is_err());
     }
 }

@@ -289,42 +289,15 @@ fn summary_from_session(
     })
 }
 
-fn env_var_from(
-    process_value: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
-    name: &str,
-) -> Option<OsString> {
-    if let Some(value) = process_value
-        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
-    {
-        return Some(value);
-    }
-    shell_env
-        .iter()
-        .rev()
-        .find(|(key, value)| {
-            !value.is_empty()
-                && value.to_str().is_none_or(|s| !s.trim().is_empty())
-                && {
-                    #[cfg(windows)]
-                    {
-                        key.to_string_lossy().eq_ignore_ascii_case(name)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        key == name
-                    }
-                }
-        })
-        .map(|(_, value)| value.clone())
+fn non_empty_env_var(value: Option<OsString>) -> Option<OsString> {
+    value.filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
 }
 
 fn session_roots_with(
     provider: ProviderKind,
     home: &Path,
-    process_agent_dir: Option<OsString>,
-    process_session_dir: Option<OsString>,
-    shell_env: &[(OsString, OsString)],
+    agent_dir_env: Option<OsString>,
+    session_dir_env: Option<OsString>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let expand_home = |path: PathBuf| {
         if path == Path::new("~") {
@@ -335,16 +308,12 @@ fn session_roots_with(
             .map(|suffix| home.join(suffix))
             .unwrap_or(path)
     };
-    let configured_agent = env_var_from(process_agent_dir, shell_env, "PI_CODING_AGENT_DIR")
+    let configured_agent = non_empty_env_var(agent_dir_env)
         .map(PathBuf::from)
         .map(&expand_home);
     match provider {
         ProviderKind::Pi => {
-            if let Some(path) = env_var_from(
-                process_session_dir,
-                shell_env,
-                "PI_CODING_AGENT_SESSION_DIR",
-            ) {
+            if let Some(path) = non_empty_env_var(session_dir_env) {
                 return Ok(vec![expand_home(PathBuf::from(path))]);
             }
             let agent = configured_agent.unwrap_or_else(|| home.join(".pi/agent"));
@@ -380,13 +349,11 @@ fn session_roots_with(
 
 fn session_roots(provider: ProviderKind) -> anyhow::Result<Vec<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory could not be located"))?;
-    let shell_env = crate::command_env::shell_environment();
     session_roots_with(
         provider,
         &home,
-        std::env::var_os("PI_CODING_AGENT_DIR"),
-        std::env::var_os("PI_CODING_AGENT_SESSION_DIR"),
-        &shell_env,
+        crate::command_env::env_var_os("PI_CODING_AGENT_DIR"),
+        crate::command_env::env_var_os("PI_CODING_AGENT_SESSION_DIR"),
     )
 }
 
@@ -771,26 +738,15 @@ mod tests {
     }
 
     #[test]
-    fn session_roots_falls_back_to_shell_environment() {
+    fn session_roots_expands_env_and_filters_empty_values() {
         let home = PathBuf::from("/fake/home");
-        let shell_env = vec![
-            (
-                OsString::from("PI_CODING_AGENT_DIR"),
-                OsString::from("~/custom-agent"),
-            ),
-            (
-                OsString::from("PI_CODING_AGENT_SESSION_DIR"),
-                OsString::from("~/custom-sessions"),
-            ),
-        ];
 
         assert_eq!(
             session_roots_with(
                 ProviderKind::Pi,
                 &home,
                 Some(OsString::from("")),
-                Some(OsString::from("")),
-                &shell_env,
+                Some(OsString::from("~/custom-sessions")),
             )
             .unwrap(),
             vec![home.join("custom-sessions")]
@@ -799,9 +755,8 @@ mod tests {
             session_roots_with(
                 ProviderKind::OhMyPi,
                 &home,
-                Some(OsString::from("")),
+                Some(OsString::from("~/custom-agent")),
                 None,
-                &shell_env,
             )
             .unwrap(),
             vec![home.join("custom-agent").join("sessions")]
@@ -810,9 +765,18 @@ mod tests {
             session_roots_with(
                 ProviderKind::Pi,
                 &home,
+                Some(OsString::from("   ")),
+                Some(OsString::from("")),
+            )
+            .unwrap(),
+            vec![home.join(".pi/agent").join("sessions")]
+        );
+        assert_eq!(
+            session_roots_with(
+                ProviderKind::Pi,
+                &home,
                 None,
                 Some(OsString::from("/proc/sessions")),
-                &shell_env,
             )
             .unwrap(),
             vec![PathBuf::from("/proc/sessions")]

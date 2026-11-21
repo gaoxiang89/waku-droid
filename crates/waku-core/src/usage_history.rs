@@ -835,6 +835,28 @@ fn account_transcript_root(provider: UsageProvider, config_dir: &Path) -> PathBu
     }
 }
 
+fn collect_scan_roots(
+    default_roots: impl IntoIterator<Item = (UsageProvider, PathBuf)>,
+    account_dirs: &[(UsageProvider, PathBuf)],
+) -> Vec<(UsageProvider, PathBuf)> {
+    let mut roots_to_scan = Vec::new();
+    let mut seen_roots = HashSet::new();
+    for (provider, root) in default_roots {
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if seen_roots.insert((provider, canonical)) {
+            roots_to_scan.push((provider, root));
+        }
+    }
+    for (provider, config_dir) in account_dirs {
+        let root = account_transcript_root(*provider, config_dir);
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if seen_roots.insert((*provider, canonical)) {
+            roots_to_scan.push((*provider, root));
+        }
+    }
+    roots_to_scan
+}
+
 /// Scan every provider's transcripts for `window` ending today and derive
 /// the page snapshot. `project_roots` are the app's known project paths, used
 /// to attribute working directories to projects. Blocking; run on the
@@ -873,23 +895,10 @@ pub fn scan_with_account_dirs(
     let mut skipped_files = 0;
     let mut errors = Vec::new();
 
-    let mut roots_to_scan: Vec<(UsageProvider, PathBuf)> = Vec::new();
-    let mut seen_roots: HashSet<(UsageProvider, PathBuf)> = HashSet::new();
-    for provider in UsageProvider::ALL {
-        if let Some(root) = provider_root(provider) {
-            let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-            if seen_roots.insert((provider, canonical)) {
-                roots_to_scan.push((provider, root));
-            }
-        }
-    }
-    for (provider, config_dir) in account_dirs {
-        let root = account_transcript_root(*provider, config_dir);
-        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        if seen_roots.insert((*provider, canonical)) {
-            roots_to_scan.push((*provider, root));
-        }
-    }
+    let default_roots = UsageProvider::ALL
+        .into_iter()
+        .filter_map(|provider| provider_root(provider).map(|root| (provider, root)));
+    let roots_to_scan = collect_scan_roots(default_roots, account_dirs);
 
     for (provider, root) in roots_to_scan {
         if !root.is_dir() {
@@ -1703,5 +1712,254 @@ mod tests {
         assert_eq!(days[0], since);
         assert_eq!(days[2], until);
         assert_eq!(enumerate_days(until, since), Vec::<NaiveDate>::new());
+    }
+
+    fn claude_usage_line(
+        timestamp: &str,
+        session_id: &str,
+        cwd: &Path,
+        model: &str,
+        msg_id: &str,
+        req_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": timestamp,
+            "requestId": req_id,
+            "sessionId": session_id,
+            "cwd": cwd.display().to_string(),
+            "message": {
+                "id": msg_id,
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": output_tokens
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn collect_scan_roots_deduplicates_canonical_account_and_default_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "waku-usage-roots-dedup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let claude_default = base.join("claude-default");
+        let claude_work = base.join("claude-work");
+        let codex_work = base.join("codex-work");
+        std::fs::create_dir_all(claude_default.join("projects")).unwrap();
+        std::fs::create_dir_all(claude_work.join("projects").join("nested")).unwrap();
+        std::fs::create_dir_all(codex_work.join("sessions").join("nested")).unwrap();
+
+        let default_roots = vec![(UsageProvider::Claude, claude_default.join("projects"))];
+        let mut account_dirs = vec![
+            // Same canonical root as default Claude root via a non-canonical spelling.
+            (UsageProvider::Claude, claude_default.join(".")),
+            // Distinct Claude account dir plus a non-canonical duplicate.
+            (UsageProvider::Claude, claude_work.clone()),
+            (
+                UsageProvider::Claude,
+                claude_work.join("projects").join(".."),
+            ),
+            // Distinct Codex account dir plus a non-canonical duplicate.
+            (UsageProvider::Codex, codex_work.clone()),
+            (UsageProvider::Codex, codex_work.join("sessions").join("..")),
+        ];
+        let symlink_alias = base.join("claude-work-link");
+        if crate::fs_ext::symlink(&claude_work, &symlink_alias).is_ok() {
+            account_dirs.push((UsageProvider::Claude, symlink_alias));
+        }
+
+        let roots = collect_scan_roots(default_roots, &account_dirs);
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[0], (UsageProvider::Claude, claude_default.join("projects")));
+        assert_eq!(roots[1], (UsageProvider::Claude, claude_work.join("projects")));
+        assert_eq!(roots[2], (UsageProvider::Codex, codex_work.join("sessions")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_with_account_dirs_scans_multiple_dirs_and_deduplicates_canonical_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "waku-usage-multi-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project_root = base.join("repo");
+        let project_sub = project_root.join("crates/core");
+        let claude_dir_a = base.join("claude-a");
+        let claude_dir_b = base.join("claude-b");
+        let codex_dir = base.join("codex-work");
+        let missing_dir = base.join("nonexistent-account");
+
+        std::fs::create_dir_all(&project_sub).unwrap();
+        std::fs::create_dir_all(claude_dir_a.join("projects/p1")).unwrap();
+        std::fs::create_dir_all(claude_dir_b.join("projects/p2")).unwrap();
+        std::fs::create_dir_all(codex_dir.join("sessions/2026/08")).unwrap();
+        std::fs::create_dir_all(codex_dir.join("helper")).unwrap();
+
+        let now_rfc3339 = Utc::now().to_rfc3339();
+        let unique_id = uuid::Uuid::new_v4();
+        let claude_model_a = format!("waku-test-claude-a-{unique_id}");
+        let claude_model_b = format!("waku-test-claude-b-{unique_id}");
+        let codex_model = format!("waku-test-codex-{unique_id}");
+
+        std::fs::write(
+            claude_dir_a.join("projects/p1/session-a.jsonl"),
+            format!(
+                "{}\n",
+                claude_usage_line(
+                    &now_rfc3339,
+                    &format!("claude-sess-a-{unique_id}"),
+                    &project_sub,
+                    &claude_model_a,
+                    &format!("msg-a-{unique_id}"),
+                    &format!("req-a-{unique_id}"),
+                    1_000,
+                    250,
+                )
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            claude_dir_b.join("projects/p2/session-b.jsonl"),
+            format!(
+                "{}\n",
+                claude_usage_line(
+                    &now_rfc3339,
+                    &format!("claude-sess-b-{unique_id}"),
+                    &project_root,
+                    &claude_model_b,
+                    &format!("msg-b-{unique_id}"),
+                    &format!("req-b-{unique_id}"),
+                    2_000,
+                    500,
+                )
+            ),
+        )
+        .unwrap();
+        let codex_lines = [
+            codex_meta(
+                &now_rfc3339,
+                &format!("codex-sess-{unique_id}"),
+                &project_root.display().to_string(),
+                None,
+                None,
+            ),
+            serde_json::json!({
+                "timestamp": now_rfc3339,
+                "type": "turn_context",
+                "payload": {
+                    "model": codex_model,
+                    "cwd": project_root.display().to_string(),
+                },
+            })
+            .to_string(),
+            codex_count(&now_rfc3339, 3_000, 400),
+        ];
+        std::fs::write(
+            codex_dir.join("sessions/2026/08/rollout.jsonl"),
+            format!("{}\n", codex_lines.join("\n")),
+        )
+        .unwrap();
+
+        let rates = rate_table(&[
+            (&claude_model_a, FLAT_RATE),
+            (&claude_model_b, FLAT_RATE),
+            (&codex_model, FLAT_RATE),
+        ]);
+        let project_roots = [project_root.clone()];
+        let mut cache = ScanCache::new();
+
+        // Capture host-machine baseline (default roots only) so assertions stay
+        // exact even when the test host has real ~/.claude or ~/.codex files.
+        let baseline = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &[],
+        );
+
+        let mut account_dirs = vec![
+            (UsageProvider::Claude, claude_dir_a.clone()),
+            // Non-canonical duplicate of claude_dir_a must be deduplicated.
+            (UsageProvider::Claude, claude_dir_a.join(".")),
+            (UsageProvider::Claude, claude_dir_b.clone()),
+            (UsageProvider::Codex, codex_dir.clone()),
+            // Non-canonical duplicate of codex_dir must be deduplicated: Codex
+            // records carry no dedupe_key, so scanning twice would double tokens.
+            (UsageProvider::Codex, codex_dir.join("helper").join("..")),
+            // Missing account directory is skipped without error.
+            (UsageProvider::Claude, missing_dir),
+        ];
+        let codex_link = base.join("codex-work-link");
+        if crate::fs_ext::symlink(&codex_dir, &codex_link).is_ok() {
+            account_dirs.push((UsageProvider::Codex, codex_link));
+        }
+
+        let history = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &account_dirs,
+        );
+
+        assert_eq!(history.scanned_files, baseline.scanned_files + 3);
+        assert_eq!(history.errors, baseline.errors);
+
+        let model_tokens = |provider: UsageProvider, model: &str| {
+            history
+                .models
+                .iter()
+                .find(|slice| slice.provider == provider && slice.model == model)
+                .map(|slice| slice.total_tokens)
+        };
+        assert_eq!(model_tokens(UsageProvider::Claude, &claude_model_a), Some(1_250));
+        assert_eq!(model_tokens(UsageProvider::Claude, &claude_model_b), Some(2_500));
+        assert_eq!(model_tokens(UsageProvider::Codex, &codex_model), Some(3_400));
+
+        let project_key = project_root.display().to_string();
+        let project = history
+            .projects
+            .iter()
+            .find(|slice| slice.path == project_key)
+            .expect("all account dirs attributed to the synthetic project root");
+        assert_eq!(project.sessions, 3);
+        assert_eq!(project.total_tokens, 1_250 + 2_500 + 3_400);
+        assert_eq!(
+            project.by_provider[UsageProvider::Claude.index()].total_tokens,
+            1_250 + 2_500
+        );
+        assert_eq!(
+            project.by_provider[UsageProvider::Codex.index()].total_tokens,
+            3_400
+        );
+
+        // Warm rescan reuses cached entries and produces identical counts.
+        let rescanned = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &account_dirs,
+        );
+        assert_eq!(rescanned.scanned_files, history.scanned_files);
+        let rescanned_project = rescanned
+            .projects
+            .iter()
+            .find(|slice| slice.path == project_key)
+            .expect("warm rescan keeps synthetic project totals");
+        assert_eq!(rescanned_project.total_tokens, project.total_tokens);
+        assert_eq!(rescanned_project.sessions, project.sessions);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
