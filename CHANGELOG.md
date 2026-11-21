@@ -14,6 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.52]
+
+- Prevent sidebar pin, archive, or rename on unopened sessions from wiping saved conversation transcripts, and validate provider config paths and file permissions on the daemon
+- Enforce workspace boundaries and permission prompts for ACP file/terminal operations and `@path` mentions, align Claude and DeepSeek `AutoAcceptEdits` permissions with user approval for non-edit actions, and support mid-session `reasoning_effort` updates on Claude
+- Fix Windows cancellation and error/stop-reason turn completion on Amp, clean up Windows and Unix provider child process trees reliably across Claude, Codex, DeepSeek, OpenCode, Pi, and Computer Use, and harden usage polling behind HTTP proxies
+- Improve desktop responsiveness and keyboard accessibility: move periodic session saves and startup SSH connection/keychain checks off the UI thread, eliminate per-frame home-directory lookups on the Usage page, prevent stale provider probes from overwriting newer settings, and add keyboard navigation across Settings, Usage, Composer, and Command Palette
+
 ## [0.1.51]
 
 - Paste an image once: when the clipboard offers the same picture in more than one format, the composer stages a single attachment instead of the file plus its raw bytes
