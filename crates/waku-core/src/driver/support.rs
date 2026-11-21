@@ -3,7 +3,9 @@
 //! classification.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow};
@@ -118,15 +120,141 @@ fn build_acp_mcp_computer_use_config(
     Ok(HeadlessComputerUseConfig::AcpMcp { base, rules })
 }
 
+const MAX_GROK_MIRROR_DEPTH: usize = 16;
+
+fn env_var_from(
+    process_value: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    name: &str,
+) -> Option<OsString> {
+    if let Some(value) = process_value
+        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
+    {
+        return Some(value);
+    }
+    shell_env
+        .iter()
+        .rev()
+        .find(|(key, value)| {
+            !value.is_empty()
+                && value.to_str().is_none_or(|s| !s.trim().is_empty())
+                && {
+                    #[cfg(windows)]
+                    {
+                        key.to_string_lossy().eq_ignore_ascii_case(name)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        key == name
+                    }
+                }
+        })
+        .map(|(_, value)| value.clone())
+}
+
+fn resolve_grok_source_home_from(
+    process_value: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    home_dir: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    env_var_from(process_value, shell_env, "GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir.map(|home| home.join(".grok")))
+        .ok_or_else(|| anyhow!("home directory is unavailable"))
+}
+
+fn resolve_grok_auth_path_from(
+    process_value: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    source_home: &Path,
+) -> Option<PathBuf> {
+    env_var_from(process_value, shell_env, "GROK_AUTH_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = source_home.join("auth.json");
+            path.is_file().then_some(path)
+        })
+}
+
+fn copy_dir_recursive(source: &Path, dest: &Path, depth: usize) -> io::Result<()> {
+    if depth >= MAX_GROK_MIRROR_DEPTH {
+        return Ok(());
+    }
+    fs_ext::create_private_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // Skip nested symlinks during fallback copies so cycles or links
+            // outside the Grok home cannot be copied recursively.
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path, depth + 1)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn mirror_grok_resource_with(
+    source: &Path,
+    dest: &Path,
+    symlink: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match symlink(source, dest) {
+        Ok(()) => Ok(()),
+        Err(symlink_error) => {
+            // On Windows without Developer Mode, symlink creation fails with
+            // ERROR_PRIVILEGE_NOT_HELD. Fall back to copying files and
+            // directories so Grok Computer Use still initializes cleanly.
+            let metadata = match fs::symlink_metadata(source) {
+                Ok(metadata) => metadata,
+                Err(_) => return Err(symlink_error),
+            };
+            if metadata.file_type().is_symlink() {
+                match fs::metadata(source) {
+                    Ok(target) if target.is_file() => fs::copy(source, dest).map(|_| ()),
+                    Ok(target) if target.is_dir() => copy_dir_recursive(source, dest, 0),
+                    _ => Ok(()),
+                }
+            } else if metadata.is_dir() {
+                copy_dir_recursive(source, dest, 0)
+            } else if metadata.is_file() {
+                fs::copy(source, dest).map(|_| ())
+            } else {
+                Err(symlink_error)
+            }
+        }
+    }
+}
+
 fn build_grok_computer_use_config(
     base: computer_use_runtime::ComputerUseConfig,
 ) -> anyhow::Result<HeadlessComputerUseConfig> {
-    let source_home = match std::env::var_os("GROK_HOME") {
-        Some(home) => PathBuf::from(home),
-        None => dirs::home_dir()
-            .ok_or_else(|| anyhow!("home directory is unavailable"))?
-            .join(".grok"),
-    };
+    let shell_env = crate::command_env::shell_environment();
+    let source_home = resolve_grok_source_home_from(
+        std::env::var_os("GROK_HOME"),
+        &shell_env,
+        dirs::home_dir(),
+    )?;
+    let auth_path = resolve_grok_auth_path_from(
+        std::env::var_os("GROK_AUTH_PATH"),
+        &shell_env,
+        &source_home,
+    );
+    build_grok_computer_use_config_in(base, &source_home, auth_path, fs_ext::symlink)
+}
+
+fn build_grok_computer_use_config_in(
+    base: computer_use_runtime::ComputerUseConfig,
+    source_home: &Path,
+    auth_path: Option<PathBuf>,
+    mut symlink: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> anyhow::Result<HeadlessComputerUseConfig> {
     let grok_home = base.process_directory.join("grok-home");
     fs::create_dir(&grok_home).with_context(|| {
         format!(
@@ -141,7 +269,7 @@ fn build_grok_computer_use_config(
         )
     })?;
     if source_home.is_dir() {
-        for entry in fs::read_dir(&source_home)
+        for entry in fs::read_dir(source_home)
             .with_context(|| format!("could not read Grok home {}", source_home.display()))?
         {
             let entry = entry?;
@@ -152,7 +280,10 @@ fn build_grok_computer_use_config(
             ) {
                 continue;
             }
-            fs_ext::symlink(&entry.path(), &grok_home.join(name)).with_context(|| {
+            mirror_grok_resource_with(&entry.path(), &grok_home.join(name), |src, dst| {
+                symlink(src, dst)
+            })
+            .with_context(|| {
                 format!(
                     "could not mirror Grok runtime resource {}",
                     entry.path().display()
@@ -179,12 +310,6 @@ fn build_grok_computer_use_config(
             grok_home.join("config.toml").display()
         )
     })?;
-    let auth_path = std::env::var_os("GROK_AUTH_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let path = source_home.join("auth.json");
-            path.is_file().then_some(path)
-        });
     let rules = fs::read_to_string(&base.skill_path).with_context(|| {
         format!(
             "could not read Waku Computer Use skill {}",
@@ -612,5 +737,110 @@ mod tests {
         );
         assert!(!permissions.pending.contains_key("per_matching"));
         assert!(permissions.pending.contains_key("per_other"));
+    }
+
+    #[test]
+    fn grok_env_lookup_filters_empty_values_and_falls_back_to_shell_env() {
+        let home = PathBuf::from("/fake/home");
+        let shell_env = vec![
+            (OsString::from("GROK_HOME"), OsString::from("/shell/grok")),
+            (
+                OsString::from("GROK_AUTH_PATH"),
+                OsString::from("/shell/grok-auth.json"),
+            ),
+        ];
+
+        assert_eq!(
+            resolve_grok_source_home_from(Some(OsString::from("")), &shell_env, Some(home.clone()))
+                .unwrap(),
+            PathBuf::from("/shell/grok")
+        );
+        assert_eq!(
+            resolve_grok_source_home_from(Some(OsString::from("")), &[], Some(home.clone()))
+                .unwrap(),
+            home.join(".grok")
+        );
+        assert_eq!(
+            resolve_grok_auth_path_from(Some(OsString::from("")), &shell_env, &home),
+            Some(PathBuf::from("/shell/grok-auth.json"))
+        );
+        assert_eq!(
+            resolve_grok_auth_path_from(
+                Some(OsString::from("/proc/auth.json")),
+                &shell_env,
+                &home
+            ),
+            Some(PathBuf::from("/proc/auth.json"))
+        );
+    }
+
+    #[test]
+    fn grok_computer_use_falls_back_to_copy_when_symlink_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-grok-cu-copy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_home = root.join("source-grok");
+        let process_dir = root.join("process");
+        let skill_path = root.join("SKILL.md");
+        fs::create_dir_all(source_home.join("skills/demo")).unwrap();
+        fs::create_dir_all(&process_dir).unwrap();
+        fs::write(&skill_path, "# rules").unwrap();
+        fs::write(source_home.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(source_home.join("skills/demo/SKILL.md"), "demo skill").unwrap();
+        fs::write(source_home.join("auth.json"), r#"{"token":"secret"}"#).unwrap();
+        fs::write(source_home.join("auth.json.lock"), "lock").unwrap();
+        fs::write(
+            source_home.join("config.toml"),
+            "default_model = \"grok-4\"\n",
+        )
+        .unwrap();
+
+        let base = computer_use_runtime::ComputerUseConfig {
+            server_path: root.join("server"),
+            repl_path: root.join("waku_js_repl"),
+            skill_path,
+            process_directory: process_dir.clone(),
+        };
+        let auth_path = resolve_grok_auth_path_from(None, &[], &source_home);
+        let config = build_grok_computer_use_config_in(
+            base,
+            &source_home,
+            auth_path,
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated Windows without Developer Mode",
+                ))
+            },
+        )
+        .unwrap();
+
+        let HeadlessComputerUseConfig::Grok {
+            grok_home,
+            auth_path,
+            rules,
+            ..
+        } = config
+        else {
+            panic!("expected Grok Computer Use config");
+        };
+        assert_eq!(rules, "# rules");
+        assert_eq!(auth_path, Some(source_home.join("auth.json")));
+        assert_eq!(
+            fs::read_to_string(grok_home.join("settings.json")).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(grok_home.join("skills/demo/SKILL.md")).unwrap(),
+            "demo skill"
+        );
+        assert!(!grok_home.join("auth.json").exists());
+        assert!(!grok_home.join("auth.json.lock").exists());
+        let written_toml = fs::read_to_string(grok_home.join("config.toml")).unwrap();
+        assert!(written_toml.contains("default_model = \"grok-4\""));
+        assert!(written_toml.contains("waku_js_repl"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

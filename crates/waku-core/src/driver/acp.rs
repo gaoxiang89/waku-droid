@@ -5,9 +5,10 @@
 //! only adapts typed ACP messages to its provider-neutral [`DriverEvent`]s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -381,23 +382,42 @@ impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
     }
 }
 
-fn sdk_agent(
+fn child_search_path_for(program: &Path) -> Option<OsString> {
+    let base = crate::command_env::executable_search_path();
+    child_search_path_with_base(base.as_deref(), program)
+}
+
+fn child_search_path_with_base(base_path: Option<&OsStr>, program: &Path) -> Option<OsString> {
+    let mut directories: Vec<PathBuf> = base_path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    if let Some(parent) = program
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        directories.push(parent.to_path_buf());
+    }
+    if directories.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    #[cfg(windows)]
+    directories.retain(|dir| seen.insert(dir.as_os_str().to_string_lossy().to_lowercase()));
+    #[cfg(not(windows))]
+    directories.retain(|dir| seen.insert(dir.clone()));
+    std::env::join_paths(directories).ok()
+}
+
+fn sdk_agent_environment(
     binary: &Path,
-    cwd: &Path,
-    mut launch: AcpLaunch,
-    computer_use: Option<&super::support::HeadlessComputerUseConfig>,
-    stderr_lines: Arc<Mutex<Vec<String>>>,
-) -> anyhow::Result<ProviderAgent> {
-    let binary = binary
-        .to_str()
-        .ok_or_else(|| anyhow!("the ACP executable path is not valid UTF-8"))?;
-    let cwd = cwd
-        .to_str()
-        .ok_or_else(|| anyhow!("the ACP working directory is not valid UTF-8"))?;
-    let (computer_args, computer_env) =
-        super::support::grok_computer_use_launch_configuration(computer_use);
-    launch.args.extend(computer_args);
-    let mut environment = crate::command_env::shell_environment()
+    shell_env: Vec<(OsString, OsString)>,
+    base_search_path: Option<&OsStr>,
+    mut launch_env: Vec<(String, String)>,
+    computer_env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut environment = shell_env
         .into_iter()
         .map(|(name, value)| {
             (
@@ -406,8 +426,54 @@ fn sdk_agent(
             )
         })
         .collect::<Vec<_>>();
-    environment.append(&mut launch.env);
+    if let Some(search_path) = child_search_path_with_base(base_search_path, binary) {
+        // Remove any prior PATH entry (case-insensitively on Windows) so
+        // `AcpAgentConfig`'s BTreeMap cannot keep a stale `Path` entry that
+        // sorts after and overrides our merged `PATH`.
+        environment.retain(|(name, _)| {
+            #[cfg(windows)]
+            {
+                !name.eq_ignore_ascii_case("PATH")
+            }
+            #[cfg(not(windows))]
+            {
+                name != "PATH"
+            }
+        });
+        environment.push((
+            "PATH".to_owned(),
+            search_path.to_string_lossy().into_owned(),
+        ));
+    }
+    environment.append(&mut launch_env);
     environment.extend(computer_env);
+    environment
+}
+
+fn sdk_agent(
+    binary: &Path,
+    cwd: &Path,
+    mut launch: AcpLaunch,
+    computer_use: Option<&super::support::HeadlessComputerUseConfig>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
+) -> anyhow::Result<ProviderAgent> {
+    let binary_str = binary
+        .to_str()
+        .ok_or_else(|| anyhow!("the ACP executable path is not valid UTF-8"))?;
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| anyhow!("the ACP working directory is not valid UTF-8"))?;
+    let (computer_args, computer_env) =
+        super::support::grok_computer_use_launch_configuration(computer_use);
+    launch.args.extend(computer_args);
+    let base_search_path = crate::command_env::executable_search_path();
+    let environment = sdk_agent_environment(
+        binary,
+        crate::command_env::shell_environment(),
+        base_search_path.as_deref(),
+        launch.env,
+        computer_env,
+    );
 
     // `AcpAgentConfig` deliberately contains only argv and environment. macOS
     // `env -C` supplies the session cwd without a shell, preserving exact
@@ -417,9 +483,9 @@ fn sdk_agent(
     // session cwd reaches the agent through the ACP `session/new`, `resume`,
     // and `load` requests instead.
     let (program, args) = if cfg!(windows) {
-        (binary, launch.args)
+        (binary_str, launch.args)
     } else {
-        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
+        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary_str.to_owned()];
         args.extend(launch.args);
         ("/usr/bin/env", args)
     };
@@ -660,6 +726,7 @@ async fn run_sdk_connection(
             {
                 let events = events.clone();
                 let prompt_requests = prompt_requests.clone();
+                let stream_state = stream_state.clone();
                 let grok_title_home = grok_title_home.clone();
                 let title_refresh = title_refresh.clone();
                 async move |notification: UntypedMessage, _connection| {
@@ -667,6 +734,7 @@ async fn run_sdk_connection(
                         if let Some(session_id) = finish_xai_prompt_complete(
                             notification.params(),
                             &prompt_requests,
+                            &stream_state,
                             &events,
                         ) {
                             start_grok_title_refresh(
@@ -1062,6 +1130,7 @@ async fn run_sdk_connection(
                                     title_refresh.clone(),
                                     stream_state.clone(),
                                     None,
+                                    PromptKind::Turn,
                                 ) {
                                     let _ = events.send(DriverEvent::Error(error.to_string()));
                                     let _ = events.send(DriverEvent::TurnFinished {
@@ -1080,21 +1149,16 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Prompt(text) => {
-                        let text = fork_context
-                            .take()
-                            .map(|context| {
-                                crate::cursor_session::prompt_with_fork_context(&context, &text)
-                            })
-                            .unwrap_or(text);
-                        let text = computer_use_instructions
-                            .take()
-                            .map(|instructions| format!("{instructions}\n\n{text}"))
-                            .unwrap_or(text);
+                        let prompt_text = format_prompt_with_seed(
+                            fork_context.as_deref(),
+                            computer_use_instructions.as_deref(),
+                            text,
+                        );
                         let _ = events.send(DriverEvent::TurnStarted);
-                        if let Err(error) = send_prompt(
+                        match send_prompt(
                             &connection,
                             &session_id,
-                            text,
+                            prompt_text,
                             &cwd,
                             &prompt_capabilities,
                             &prompt_requests,
@@ -1105,12 +1169,19 @@ async fn run_sdk_connection(
                             title_refresh.clone(),
                             stream_state.clone(),
                             (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
+                            PromptKind::Turn,
                         ) {
-                            let _ = events.send(DriverEvent::Error(error.to_string()));
-                            let _ = events.send(DriverEvent::TurnFinished {
-                                success: false,
-                                summary: None,
-                            });
+                            Ok(()) => {
+                                fork_context = None;
+                                computer_use_instructions = None;
+                            }
+                            Err(error) => {
+                                let _ = events.send(DriverEvent::Error(error.to_string()));
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                            }
                         }
                     }
                     CommandMessage::Steer(text) => {
@@ -1138,6 +1209,7 @@ async fn run_sdk_connection(
                             title_refresh.clone(),
                             stream_state.clone(),
                             None,
+                            PromptKind::Steer,
                         ) {
                             Ok(()) => {
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
@@ -1357,6 +1429,66 @@ async fn run_sdk_connection(
     result
 }
 
+/// Whether a failed `session/resume` or `session/load` error indicates that the
+/// saved session genuinely does not exist (or the method is unsupported) rather
+/// than an authentication, transport, or transient server failure. Only in the
+/// former case is falling back to `session/new` safe; surfacing other errors
+/// preserves the task's `provider_cursor` so the user can retry without losing
+/// conversation history.
+fn can_fallback_from_resume_error(error: &agent_client_protocol::Error) -> bool {
+    if matches!(
+        error.code,
+        agent_client_protocol::ErrorCode::ResourceNotFound
+            | agent_client_protocol::ErrorCode::MethodNotFound
+    ) {
+        return true;
+    }
+    if matches!(
+        error.code,
+        agent_client_protocol::ErrorCode::AuthRequired
+            | agent_client_protocol::ErrorCode::RequestCancelled
+            | agent_client_protocol::ErrorCode::ParseError
+    ) {
+        return false;
+    }
+    let detail = error.to_string().to_ascii_lowercase();
+    is_session_not_found_message(&detail)
+}
+
+fn is_session_not_found_message(detail: &str) -> bool {
+    if detail.contains("auth")
+        || detail.contains("unauthorized")
+        || detail.contains("forbidden")
+        || detail.contains("credential")
+        || detail.contains("token")
+        || detail.contains("login")
+        || detail.contains("api key")
+        || detail.contains("api_key")
+        || detail.contains("permission denied")
+        || detail.contains("connection closed")
+        || detail.contains("broken pipe")
+        || detail.contains("eof")
+        || detail.contains("process exited")
+    {
+        return false;
+    }
+    if detail.contains("unknown session")
+        || detail.contains("no such session")
+        || detail.contains("session expired")
+    {
+        return true;
+    }
+    let names_missing = detail.contains("not found")
+        || detail.contains("not_found")
+        || detail.contains("does not exist");
+    let names_session = detail.contains("session")
+        || detail.contains("conversation")
+        || detail.contains("trajectory")
+        || detail.contains("thread")
+        || detail.contains("chat");
+    names_missing && names_session
+}
+
 async fn establish_session(
     connection: &ConnectionTo<Agent>,
     provider: ProviderKind,
@@ -1371,6 +1503,7 @@ async fn establish_session(
     Option<Vec<SessionConfigOption>>,
 )> {
     if let Some(existing) = resume_session_id {
+        let mut fatal_resume_error = None;
         // `agy acp` answers `session/resume` with the session's settings and no
         // conversation history; its next turn starts with an empty model
         // context. `session/load` replays the history and does restore it, so
@@ -1387,12 +1520,22 @@ async fn establish_session(
             if !mcp_servers.is_empty() {
                 request = request.mcp_servers(mcp_servers.to_vec());
             }
-            if let Ok(response) = connection.send_request(request).block_task().await {
-                return Ok((
-                    SessionId::new(existing.to_owned()),
-                    response.modes,
-                    response.config_options,
-                ));
+            match connection.send_request(request).block_task().await {
+                Ok(response) => {
+                    return Ok((
+                        SessionId::new(existing.to_owned()),
+                        response.modes,
+                        response.config_options,
+                    ));
+                }
+                Err(error) => {
+                    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+                        return Err(error);
+                    }
+                    if !can_fallback_from_resume_error(&error) {
+                        fatal_resume_error = Some(error);
+                    }
+                }
             }
         }
 
@@ -1404,13 +1547,24 @@ async fn establish_session(
             }
             let response = connection.send_request(request).block_task().await;
             suppress_session_updates.store(false, Ordering::Release);
-            if let Ok(response) = response {
-                return Ok((
-                    SessionId::new(existing.to_owned()),
-                    response.modes,
-                    response.config_options,
-                ));
+            match response {
+                Ok(response) => {
+                    return Ok((
+                        SessionId::new(existing.to_owned()),
+                        response.modes,
+                        response.config_options,
+                    ));
+                }
+                Err(error) => {
+                    if !can_fallback_from_resume_error(&error) {
+                        return Err(error);
+                    }
+                }
             }
+        }
+
+        if let Some(error) = fatal_resume_error {
+            return Err(error);
         }
     }
 
@@ -1701,7 +1855,7 @@ fn session_config_current_value(option: &SessionConfigOption) -> Option<&str> {
 async fn apply_cursor_variant_configs(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
-    mut options: Vec<SessionConfigOption>,
+    options: &mut Vec<SessionConfigOption>,
     selection: &CursorModelSelection,
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
@@ -1714,7 +1868,7 @@ async fn apply_cursor_variant_configs(
             "thinking" => options
                 .iter()
                 .find(|option| is_cursor_thinking_option(option)),
-            "effort" => find_cursor_effort_option(&options),
+            "effort" => find_cursor_effort_option(options),
             "context" => options
                 .iter()
                 .find(|option| is_cursor_context_option(option)),
@@ -1770,7 +1924,7 @@ async fn apply_cursor_variant_configs(
             }
             _ => continue,
         };
-        options = connection
+        *options = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
                 option.id,
@@ -1990,39 +2144,44 @@ async fn apply_droid_model(
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
 ) -> Option<Vec<SessionConfigOption>> {
-    let model = model?;
     let mut options = config_options.unwrap_or_default().to_vec();
-    let Some(option) = config_option_by_id(&options, "model").cloned() else {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = "Factory Droid did not advertise its model configuration"
-        )));
-        return None;
-    };
-    if !session_config_select_values(&option).contains(&model) {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = format!("Factory Droid did not advertise model {model}")
-        )));
-        return None;
-    }
-    if session_config_current_value(&option) != Some(model) {
-        match connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id.clone(),
-                model,
-            ))
-            .block_task()
-            .await
-        {
-            Ok(response) => options = response.config_options,
-            Err(error) => {
-                let _ = events.send(DriverEvent::Error(tr!(
-                    "errors.select_model",
-                    error = error
-                )));
-                return None;
+    let mut updated = false;
+    if let Some(model) = model {
+        let Some(option) = config_option_by_id(&options, "model").cloned() else {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = "Factory Droid did not advertise its model configuration"
+            )));
+            return None;
+        };
+        if !session_config_select_values(&option).contains(&model) {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = format!("Factory Droid did not advertise model {model}")
+            )));
+            return None;
+        }
+        if session_config_current_value(&option) != Some(model) {
+            match connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    option.id.clone(),
+                    model,
+                ))
+                .block_task()
+                .await
+            {
+                Ok(response) => {
+                    options = response.config_options;
+                    updated = true;
+                }
+                Err(error) => {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.select_model",
+                        error = error
+                    )));
+                    return None;
+                }
             }
         }
     }
@@ -2044,9 +2203,10 @@ async fn apply_droid_model(
             .await
         {
             options = response.config_options;
+            updated = true;
         }
     }
-    Some(options)
+    updated.then_some(options)
 }
 
 /// Resolves a stored Antigravity model against the advertised families. A
@@ -2094,40 +2254,47 @@ async fn apply_antigravity_model(
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
 ) -> Option<Vec<SessionConfigOption>> {
-    let model = model?;
     let mut options = config_options.unwrap_or_default().to_vec();
-    let Some(model_option) = config_option_by_id(&options, "model").cloned() else {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = "Antigravity did not advertise its model configuration"
-        )));
-        return None;
-    };
-    let advertised = session_config_select_values(&model_option);
-    let Some((selected, inferred_effort)) = antigravity_model_selection(&advertised, model) else {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = format!("Antigravity did not advertise model {model}")
-        )));
-        return None;
-    };
-    if session_config_current_value(&model_option) != Some(selected.as_str()) {
-        match connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                model_option.id.clone(),
-                selected.as_str(),
-            ))
-            .block_task()
-            .await
-        {
-            Ok(response) => options = response.config_options,
-            Err(error) => {
-                let _ = events.send(DriverEvent::Error(tr!(
-                    "errors.select_model",
-                    error = error
-                )));
-                return None;
+    let mut updated = false;
+    let mut inferred_effort = None;
+    if let Some(model) = model {
+        let Some(model_option) = config_option_by_id(&options, "model").cloned() else {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = "Antigravity did not advertise its model configuration"
+            )));
+            return None;
+        };
+        let advertised = session_config_select_values(&model_option);
+        let Some((selected, inferred)) = antigravity_model_selection(&advertised, model) else {
+            let _ = events.send(DriverEvent::Error(tr!(
+                "errors.select_model",
+                error = format!("Antigravity did not advertise model {model}")
+            )));
+            return None;
+        };
+        inferred_effort = inferred;
+        if session_config_current_value(&model_option) != Some(selected.as_str()) {
+            match connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    model_option.id.clone(),
+                    selected.as_str(),
+                ))
+                .block_task()
+                .await
+            {
+                Ok(response) => {
+                    options = response.config_options;
+                    updated = true;
+                }
+                Err(error) => {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.select_model",
+                        error = error
+                    )));
+                    return None;
+                }
             }
         }
     }
@@ -2152,9 +2319,10 @@ async fn apply_antigravity_model(
             .await
         {
             options = response.config_options;
+            updated = true;
         }
     }
-    Some(options)
+    updated.then_some(options)
 }
 
 /// [`sync_session_model`] against the shared cache. Only an answer from the
@@ -2237,7 +2405,7 @@ async fn sync_session_model(
         connection,
         provider,
         session_id,
-        config_options.as_deref(),
+        config_options,
         model,
         reasoning_effort,
         service_tier,
@@ -2262,67 +2430,104 @@ fn set_model_params(
     params
 }
 
+fn has_cursor_variant_options(options: &[SessionConfigOption]) -> bool {
+    find_config_option(options, SessionConfigOptionCategory::Model).is_some()
+        || options.iter().any(|option| {
+            is_cursor_thinking_option(option)
+                || is_cursor_effort_option(option)
+                || is_cursor_context_option(option)
+                || is_cursor_fast_option(option)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_model(
     connection: &ConnectionTo<Agent>,
     provider: ProviderKind,
     session_id: &SessionId,
-    config_options: Option<&[SessionConfigOption]>,
+    config_options: &mut Option<Vec<SessionConfigOption>>,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     context_window: Option<&str>,
     events: &DriverEventSender,
 ) {
-    let Some(model) = model else {
-        return;
-    };
-    let cursor_model_option = (provider == ProviderKind::Cursor)
-        .then_some(config_options)
-        .flatten()
-        .and_then(|options| find_config_option(options, SessionConfigOptionCategory::Model));
-    if let Some(option) = cursor_model_option
-        && let Some(selection) = cursor_model_selection(option, model)
+    if provider == ProviderKind::Cursor
+        && let Some(options) = config_options.as_mut()
+        && has_cursor_variant_options(options)
     {
-        match connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id.clone(),
-                selection.value.as_str(),
-            ))
-            .block_task()
-            .await
-        {
-            Ok(response) => {
-                if let Err(error) = apply_cursor_variant_configs(
-                    connection,
-                    session_id,
-                    response.config_options,
-                    &selection,
-                    reasoning_effort,
-                    service_tier,
-                    context_window,
-                )
-                .await
+        if let Some(model) = model {
+            if let Some(option) =
+                find_config_option(options, SessionConfigOptionCategory::Model).cloned()
+                && let Some(selection) = cursor_model_selection(&option, model)
+            {
+                match connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        option.id.clone(),
+                        selection.value.as_str(),
+                    ))
+                    .block_task()
+                    .await
                 {
-                    let _ = events.send(DriverEvent::Error(tr!(
-                        "errors.select_model",
-                        error = error
-                    )));
+                    Ok(response) => {
+                        *options = response.config_options;
+                        if let Err(error) = apply_cursor_variant_configs(
+                            connection,
+                            session_id,
+                            options,
+                            &selection,
+                            reasoning_effort,
+                            service_tier,
+                            context_window,
+                        )
+                        .await
+                        {
+                            let _ = events.send(DriverEvent::Error(tr!(
+                                "errors.select_model",
+                                error = error
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events.send(DriverEvent::Error(tr!(
+                            "errors.select_model",
+                            error = error
+                        )));
+                    }
                 }
+                return;
             }
-            Err(error) => {
+        } else {
+            let empty_selection = CursorModelSelection {
+                value: String::new(),
+                suffix: String::new(),
+            };
+            if let Err(error) = apply_cursor_variant_configs(
+                connection,
+                session_id,
+                options,
+                &empty_selection,
+                reasoning_effort,
+                service_tier,
+                context_window,
+            )
+            .await
+            {
                 let _ = events.send(DriverEvent::Error(tr!(
                     "errors.select_model",
                     error = error
                 )));
             }
+            return;
         }
-        return;
     }
 
     if provider == ProviderKind::Fx {
-        let mut options = config_options.unwrap_or_default().to_vec();
+        let Some(model) = model else {
+            return;
+        };
+        let mut options = config_options.as_deref().unwrap_or_default().to_vec();
         if let Some((provider_option, value)) = fx_model_provider_switch(&options, model) {
             let config_id = provider_option.id.clone();
             match connection
@@ -2334,7 +2539,10 @@ async fn apply_model(
                 .block_task()
                 .await
             {
-                Ok(response) => options = response.config_options,
+                Ok(response) => {
+                    options = response.config_options;
+                    *config_options = Some(options.clone());
+                }
                 Err(error) => {
                     let _ = events.send(DriverEvent::Error(tr!(
                         "errors.select_model",
@@ -2358,7 +2566,7 @@ async fn apply_model(
             )));
             return;
         }
-        if let Err(error) = connection
+        match connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
                 option.id.clone(),
@@ -2367,10 +2575,15 @@ async fn apply_model(
             .block_task()
             .await
         {
-            let _ = events.send(DriverEvent::Error(tr!(
-                "errors.select_model",
-                error = error
-            )));
+            Ok(response) => {
+                *config_options = Some(response.config_options);
+            }
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+            }
         }
         return;
     }
@@ -2378,39 +2591,95 @@ async fn apply_model(
     // Grok, Kimi, and Cursor agents that do not advertise a model config
     // option retain the legacy request unchanged. Fx intentionally
     // stays on session/set_config_option, its documented model API.
-    let request = match UntypedMessage::new(
-        "session/set_model",
-        set_model_params(session_id, model, reasoning_effort, provider),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
+    if let Some(model) = model {
+        let request = match UntypedMessage::new(
+            "session/set_model",
+            set_model_params(session_id, model, reasoning_effort, provider),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return;
+            }
+        };
+        if let Err(error) = connection.send_request(request).block_task().await {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.select_model",
                 error = error
             )));
             return;
         }
-    };
-    if let Err(error) = connection.send_request(request).block_task().await {
-        let _ = events.send(DriverEvent::Error(tr!(
-            "errors.select_model",
-            error = error
-        )));
-        return;
     }
     if provider != ProviderKind::Grok
-        && let Some(effort) = reasoning_effort
+        && let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty())
     {
         // Reasoning effort is an optional config extension and is deliberately
         // non-fatal when an agent does not expose it.
-        let _ = connection
+        if let Ok(response) = connection
             .send_request(SetSessionConfigOptionRequest::new(
                 session_id.clone(),
                 reasoning_effort_config_id(provider),
                 effort,
             ))
             .block_task()
-            .await;
+            .await
+        {
+            *config_options = Some(response.config_options);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PromptKind {
+    Turn,
+    Steer,
+}
+
+fn format_prompt_with_seed(
+    fork_context: Option<&str>,
+    computer_use_instructions: Option<&str>,
+    text: String,
+) -> String {
+    let text = fork_context
+        .map(|context| crate::cursor_session::prompt_with_fork_context(context, &text))
+        .unwrap_or(text);
+    computer_use_instructions
+        .map(|instructions| format!("{instructions}\n\n{text}"))
+        .unwrap_or(text)
+}
+
+async fn resolve_native_turn_failure(
+    kimi_offset: Option<u64>,
+    antigravity_offset: Option<i64>,
+    native_session_id: String,
+    produced_content: bool,
+    stop_reason: Option<StopReason>,
+) -> Option<String> {
+    if let Some(offset) = kimi_offset {
+        if produced_content {
+            return None;
+        }
+        smol::unblock(move || crate::kimi_session::turn_failure(&native_session_id, offset)).await
+    } else if let Some(offset) = antigravity_offset {
+        let (refusal, empty_end_turn) = match stop_reason {
+            Some(StopReason::Refusal) => (true, false),
+            Some(StopReason::EndTurn) => (false, !produced_content),
+            _ => (false, false),
+        };
+        smol::unblock(move || {
+            crate::antigravity_session::turn_failure(
+                &native_session_id,
+                offset,
+                refusal,
+                empty_end_turn,
+            )
+        })
+        .await
+    } else {
+        None
     }
 }
 
@@ -2429,8 +2698,13 @@ fn send_prompt(
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
     lost_session_recovery: Option<smol::channel::Sender<CommandMessage>>,
+    prompt_kind: PromptKind,
 ) -> agent_client_protocol::Result<()> {
-    stream_state.lock().produced_content = false;
+    if prompt_kind == PromptKind::Turn {
+        let mut state = stream_state.lock();
+        state.produced_content = false;
+        state.tools.clear();
+    }
     let retry_text = lost_session_recovery.as_ref().map(|_| text.clone());
     // Read before the turn runs, so the failure lookup cannot mistake an
     // earlier turn's record for this one's.
@@ -2461,6 +2735,11 @@ fn send_prompt(
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
+            let produced_content = {
+                let mut state = stream_state.lock();
+                state.tools.clear();
+                state.produced_content
+            };
             // The resumed session no longer exists on the provider's side, so
             // every prompt to it would fail the same way. Hand the prompt back
             // to the loop to start a fresh session instead of failing the turn.
@@ -2475,29 +2754,18 @@ fn send_prompt(
             }
             // Only an empty turn pays for Kimi's lookup. Antigravity always
             // checks its own step log once, because it reports upstream API
-            // failures as a chat message and a clean `end_turn`.
-            let native_failure = if let Some(offset) = kimi_offset {
-                (!stream_state.lock().produced_content)
-                    .then(|| crate::kimi_session::turn_failure(&native_session_id, offset))
-                    .flatten()
-            } else if let Some(offset) = antigravity_offset {
-                let (refusal, empty_end_turn) = match &result {
-                    Ok(response) => (
-                        matches!(response.stop_reason, StopReason::Refusal),
-                        matches!(response.stop_reason, StopReason::EndTurn)
-                            && !stream_state.lock().produced_content,
-                    ),
-                    Err(_) => (false, false),
-                };
-                crate::antigravity_session::turn_failure(
-                    &native_session_id,
-                    offset,
-                    refusal,
-                    empty_end_turn,
-                )
-            } else {
-                None
-            };
+            // failures as a chat message and a clean `end_turn`. Both lookups
+            // poll with blocking sleeps/I/O, so offload them via `smol::unblock`
+            // off the single-threaded `smol::block_on` executor.
+            let stop_reason = result.as_ref().ok().map(|response| response.stop_reason);
+            let native_failure = resolve_native_turn_failure(
+                kimi_offset,
+                antigravity_offset,
+                native_session_id.clone(),
+                produced_content,
+                stop_reason,
+            )
+            .await;
             let success = finish_prompt(result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
@@ -3103,6 +3371,7 @@ fn handle_create_terminal_request(
 }
 
 const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT: usize = 1_048_576;
+const MAX_COMPLETED_TERMINALS: usize = 64;
 
 struct AcpTerminalProcess {
     id: String,
@@ -3111,6 +3380,7 @@ struct AcpTerminalProcess {
     cwd_display: String,
     started_at_ms: u64,
     updated_at_ms: u64,
+    completed_seq: Option<u64>,
     output: String,
     output_truncated: bool,
     output_byte_limit: usize,
@@ -3245,7 +3515,45 @@ impl AcpTerminalProcess {
 
 #[derive(Default)]
 pub(crate) struct AcpTerminalRegistry {
-    terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>,
+    terminals: Arc<Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>>,
+    next_completed_seq: Arc<AtomicU64>,
+}
+
+fn evict_completed_terminals_in(
+    terminals: &Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>,
+    max_completed: usize,
+) {
+    let mut map = terminals.lock();
+    let mut completed = Vec::new();
+    for (id, entry) in map.iter() {
+        let proc = entry.lock();
+        if proc.exit_status.is_some() && proc.waiters.is_empty() {
+            completed.push((
+                proc.completed_seq.unwrap_or(0),
+                proc.updated_at_ms,
+                proc.started_at_ms,
+                id.clone(),
+            ));
+        }
+    }
+    if completed.len() <= max_completed {
+        return;
+    }
+    completed.sort();
+    let remove_count = completed.len() - max_completed;
+    for (_, _, _, id) in completed.into_iter().take(remove_count) {
+        map.remove(&id);
+    }
+}
+
+fn terminal_command_search_path(command: &str, work_dir: &Path) -> Option<OsString> {
+    let raw = Path::new(command);
+    let resolved = if raw.is_relative() && raw.components().count() > 1 {
+        work_dir.join(raw)
+    } else {
+        raw.to_path_buf()
+    };
+    child_search_path_for(&resolved)
 }
 
 impl AcpTerminalRegistry {
@@ -3254,12 +3562,16 @@ impl AcpTerminalRegistry {
         work_dir: &Path,
     ) -> std::io::Result<std::process::Child> {
         let env_vars = sanitized_terminal_env(&request.env);
+        let search_path = terminal_command_search_path(&request.command, work_dir);
         let configure = |cmd: &mut std::process::Command| {
             cmd.current_dir(work_dir)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .envs(crate::command_env::shell_environment());
+            if let Some(search_path) = search_path.as_deref() {
+                cmd.env("PATH", search_path);
+            }
             for (name, value) in &env_vars {
                 cmd.env(name, value);
             }
@@ -3364,6 +3676,7 @@ impl AcpTerminalRegistry {
             cwd_display: work_dir.display().to_string(),
             started_at_ms: now,
             updated_at_ms: now,
+            completed_seq: None,
             output: String::new(),
             output_truncated: false,
             output_byte_limit,
@@ -3375,6 +3688,7 @@ impl AcpTerminalRegistry {
             waiters: Vec::new(),
         }));
         self.terminals.lock().insert(id.clone(), entry.clone());
+        evict_completed_terminals_in(&self.terminals, MAX_COMPLETED_TERMINALS);
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
             entry.lock().to_background_work_item(),
         )));
@@ -3387,6 +3701,8 @@ impl AcpTerminalRegistry {
         });
         let wait_entry = entry;
         let wait_events = events.clone();
+        let wait_terminals = Arc::clone(&self.terminals);
+        let wait_completed_seq = Arc::clone(&self.next_completed_seq);
         let _ = thread::Builder::new()
             .name("waku-acp-term-wait".into())
             .spawn(move || {
@@ -3422,12 +3738,17 @@ impl AcpTerminalRegistry {
                     let mut proc = wait_entry.lock();
                     proc.updated_at_ms = unix_time_millis();
                     proc.exit_status = Some(status.clone());
+                    if proc.completed_seq.is_none() {
+                        proc.completed_seq =
+                            Some(wait_completed_seq.fetch_add(1, Ordering::Relaxed) + 1);
+                    }
                     let waiters = std::mem::take(&mut proc.waiters);
                     (proc.to_background_work_item(), waiters)
                 };
                 for waiter in waiters {
                     let _ = waiter.respond(WaitForTerminalExitResponse::new(status.clone()));
                 }
+                evict_completed_terminals_in(&wait_terminals, MAX_COMPLETED_TERMINALS);
                 let _ = wait_events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
                     item,
                 )));
@@ -3641,9 +3962,14 @@ impl AcpTerminalRegistry {
                 proc.kill_process_tree();
                 proc.exit_status = Some(TerminalExitStatus::new());
                 proc.updated_at_ms = unix_time_millis();
+                if proc.completed_seq.is_none() {
+                    proc.completed_seq =
+                        Some(self.next_completed_seq.fetch_add(1, Ordering::Relaxed) + 1);
+                }
             }
             proc.to_background_work_item()
         };
+        evict_completed_terminals_in(&self.terminals, MAX_COMPLETED_TERMINALS);
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
             item,
         )));
@@ -3679,6 +4005,7 @@ fn settle_prompt_request(prompt_requests: &Mutex<PendingPrompts>, request_id: &R
 fn finish_xai_prompt_complete(
     params: &Value,
     prompt_requests: &Mutex<PendingPrompts>,
+    stream_state: &Mutex<AcpStreamState>,
     events: &DriverEventSender,
 ) -> Option<String> {
     let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
@@ -3691,6 +4018,7 @@ fn finish_xai_prompt_complete(
     {
         return None;
     }
+    stream_state.lock().tools.clear();
 
     let stop_reason = match params.get("stopReason").and_then(Value::as_str) {
         Some("cancelled") => StopReason::Cancelled,
@@ -5952,6 +6280,18 @@ mod tests {
             Some("waku-prompt".into()),
             "grok-session".into(),
         );
+        let stream_state = Mutex::new(AcpStreamState::default());
+        stream_state.lock().tools.insert(
+            "unfinished-call".into(),
+            StoredToolCall {
+                kind: ActivityKind::Tool,
+                title: "unfinished".into(),
+                raw_input: None,
+                locations: None,
+                content: None,
+                tool_name: None,
+            },
+        );
         let (events, event_rx) = crate::driver::test_event_channel();
 
         assert_eq!(
@@ -5962,9 +6302,14 @@ mod tests {
                     "stopReason": "end_turn"
                 }),
                 &requests,
+                &stream_state,
                 &events,
             ),
             Some("grok-session".into())
+        );
+        assert!(
+            stream_state.lock().tools.is_empty(),
+            "unfinished tool calls must be cleared when a turn ends"
         );
         assert!(matches!(
             event_rx.try_recv().unwrap(),
@@ -6619,6 +6964,7 @@ mod tests {
             cwd_display: ".".to_owned(),
             started_at_ms: 100,
             updated_at_ms: 200,
+            completed_seq: Some(1),
             output: "ok\n".to_owned(),
             output_truncated: false,
             output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
@@ -6707,6 +7053,673 @@ mod tests {
         assert_eq!(commands[0].name, "review");
         assert_eq!(commands[0].description, "Code review");
         assert_eq!(commands[0].argument_hint.as_deref(), Some("[branch]"));
+    }
+
+    #[test]
+    fn sdk_agent_and_terminal_path_include_binary_parent_and_deduplicate_path() {
+        let base_dir = std::env::temp_dir().join("waku-path-base");
+        let bin_dir = std::env::temp_dir().join("waku-bun-bin");
+        let binary = bin_dir.join("cursor-agent.cmd");
+        let base_path = std::env::join_paths([&base_dir]).unwrap();
+
+        let merged = child_search_path_with_base(Some(base_path.as_os_str()), &binary).unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(dirs, vec![base_dir.clone(), bin_dir.clone()]);
+
+        // sdk_agent_environment strips stale PATH / Path entries and installs the merged PATH.
+        let env = sdk_agent_environment(
+            &binary,
+            vec![
+                (OsString::from("Path"), OsString::from("/stale/lower")),
+                (OsString::from("PATH"), OsString::from("/stale/upper")),
+                (OsString::from("CUSTOM"), OsString::from("keep")),
+            ],
+            Some(base_path.as_os_str()),
+            vec![("LAUNCH".into(), "1".into())],
+            vec![("CU".into(), "2".into())],
+        );
+        let path_entries: Vec<&str> = env
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        #[cfg(windows)]
+        assert_eq!(path_entries.len(), 1);
+        assert!(path_entries.iter().any(|value| {
+            std::env::split_paths(value).any(|dir| dir == bin_dir)
+                && std::env::split_paths(value).any(|dir| dir == base_dir)
+        }));
+        assert!(env.contains(&("CUSTOM".into(), "keep".into())));
+        assert!(env.contains(&("LAUNCH".into(), "1".into())));
+        assert!(env.contains(&("CU".into(), "2".into())));
+
+        // Terminal command search path includes binary parent for both absolute and relative paths.
+        let work_dir = std::env::temp_dir().join("waku-term-wd");
+        let term_path = terminal_command_search_path("./tools/run.cmd", &work_dir).unwrap();
+        let expected_parent = work_dir.join("./tools");
+        assert!(
+            std::env::split_paths(&term_path).any(|dir| dir == expected_parent),
+            "terminal PATH must include relative command's resolved parent dir"
+        );
+    }
+
+    #[test]
+    fn establish_session_surfaces_auth_and_transport_errors_instead_of_creating_blank_session() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
+            ResumeSessionRequest, SessionCapabilities, SessionResumeCapabilities,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let cwd = std::env::temp_dir();
+        let init = InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(
+            AgentCapabilities::new()
+                .load_session(true)
+                .session_capabilities(
+                    SessionCapabilities::new().resume(SessionResumeCapabilities::new()),
+                ),
+        );
+
+        // Case 1: AuthRequired surfaces immediately without calling session/new.
+        let new_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls_agent = Arc::clone(&new_calls);
+        let auth_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: ResumeSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::Error::auth_required())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: LoadSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::Error::auth_required())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    new_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(NewSessionResponse::new("blank-new"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let init_clone = init.clone();
+        let cwd_clone = cwd.clone();
+        let auth_outcome = smol::block_on(Client.builder().connect_with(
+            auth_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                let suppress = AtomicBool::new(false);
+                let result = establish_session(
+                    &connection,
+                    ProviderKind::Cursor,
+                    &init_clone,
+                    Some("existing-cursor"),
+                    &cwd_clone,
+                    &[],
+                    &suppress,
+                )
+                .await;
+                assert!(result.is_err());
+                assert_eq!(
+                    result.unwrap_err().code,
+                    agent_client_protocol::ErrorCode::AuthRequired
+                );
+                Ok(())
+            },
+        ));
+        auth_outcome.unwrap();
+        assert_eq!(new_calls.load(Ordering::Relaxed), 0);
+
+        // Case 2: Transport/server internal error on both resume and load surfaces cleanly.
+        let new_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls_agent = Arc::clone(&new_calls);
+        let transport_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: ResumeSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::util::internal_error(
+                        "connection closed unexpectedly",
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: LoadSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    new_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(NewSessionResponse::new("blank-new"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let init_clone = init.clone();
+        let cwd_clone = cwd.clone();
+        let transport_outcome = smol::block_on(Client.builder().connect_with(
+            transport_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                let suppress = AtomicBool::new(false);
+                let result = establish_session(
+                    &connection,
+                    ProviderKind::Cursor,
+                    &init_clone,
+                    Some("existing-cursor"),
+                    &cwd_clone,
+                    &[],
+                    &suppress,
+                )
+                .await;
+                let err = result.unwrap_err();
+                assert!(err.to_string().contains("connection closed"));
+                Ok(())
+            },
+        ));
+        transport_outcome.unwrap();
+        assert_eq!(new_calls.load(Ordering::Relaxed), 0);
+
+        // Case 3: Genuine ResourceNotFound on both resume and load still falls back to session/new.
+        let new_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls_agent = Arc::clone(&new_calls);
+        let missing_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: ResumeSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::Error::resource_not_found(
+                        None,
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: LoadSessionRequest, responder, _cx| {
+                    responder.respond_with_error(agent_client_protocol::util::internal_error(
+                        "session not found",
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    new_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(NewSessionResponse::new("fresh-session"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let init_clone = init;
+        let cwd_clone = cwd;
+        let missing_outcome = smol::block_on(Client.builder().connect_with(
+            missing_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                let suppress = AtomicBool::new(false);
+                let (session_id, _, _) = establish_session(
+                    &connection,
+                    ProviderKind::Cursor,
+                    &init_clone,
+                    Some("deleted-session"),
+                    &cwd_clone,
+                    &[],
+                    &suppress,
+                )
+                .await?;
+                assert_eq!(session_id.to_string(), "fresh-session");
+                Ok(())
+            },
+        ));
+        missing_outcome.unwrap();
+        assert_eq!(new_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn apply_model_updates_shared_config_options_for_cursor_fx_and_none_model() {
+        use agent_client_protocol::schema::v1::SetSessionConfigOptionResponse;
+
+        // Cursor: model == None still applies effort/fast/context and refreshes SharedConfigOptions.
+        let initial_cursor = vec![
+            select_config_option(
+                "model",
+                SessionConfigOptionCategory::Model,
+                "claude-sonnet-4-6",
+                &["claude-sonnet-4-6"],
+            ),
+            select_config_option(
+                "effort",
+                SessionConfigOptionCategory::ThoughtLevel,
+                "medium",
+                &["low", "medium", "high"],
+            ),
+            select_config_option(
+                "context",
+                SessionConfigOptionCategory::ModelConfig,
+                "200k",
+                &["200k", "1m"],
+            ),
+            select_config_option(
+                "fast",
+                SessionConfigOptionCategory::ModelConfig,
+                "false",
+                &["false", "true"],
+            ),
+        ];
+        let state = Arc::new(Mutex::new(initial_cursor.clone()));
+        let state_agent = Arc::clone(&state);
+        let sent_updates = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let sent_updates_agent = Arc::clone(&sent_updates);
+
+        let cursor_agent = Agent.builder().on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                let value_str = match &req.value {
+                    SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                    SessionConfigOptionValue::Boolean { value } => value.to_string(),
+                    _ => String::new(),
+                };
+                sent_updates_agent
+                    .lock()
+                    .push((req.config_id.to_string(), value_str.clone()));
+                let mut opts = state_agent.lock();
+                for opt in opts.iter_mut() {
+                    if opt.id == req.config_id
+                        && let SessionConfigKind::Select(select) = &mut opt.kind
+                    {
+                        select.current_value = value_str.clone().into();
+                    }
+                }
+                responder.respond(SetSessionConfigOptionResponse::new(opts.clone()))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let cache: SharedConfigOptions = Arc::new(Mutex::new(Some(initial_cursor)));
+        let cache_clone = Arc::clone(&cache);
+        let (events, _rx) = crate::driver::test_event_channel();
+        smol::block_on(Client.builder().connect_with(
+            cursor_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                sync_cached_session_model(
+                    &connection,
+                    ProviderKind::Cursor,
+                    &SessionId::new("s-cursor"),
+                    &cache_clone,
+                    None,
+                    Some("high"),
+                    Some("fast"),
+                    Some("1m"),
+                    &events,
+                )
+                .await;
+                Ok(())
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *sent_updates.lock(),
+            vec![
+                ("effort".to_owned(), "high".to_owned()),
+                ("context".to_owned(), "1m".to_owned()),
+                ("fast".to_owned(), "true".to_owned()),
+            ]
+        );
+        let updated = cache.lock().clone().unwrap();
+        assert_eq!(
+            session_config_current_value(config_option_by_id(&updated, "effort").unwrap()),
+            Some("high")
+        );
+        assert_eq!(
+            session_config_current_value(config_option_by_id(&updated, "context").unwrap()),
+            Some("1m")
+        );
+        assert_eq!(
+            session_config_current_value(config_option_by_id(&updated, "fast").unwrap()),
+            Some("true")
+        );
+
+        // Fx: provider switch + model selection updates SharedConfigOptions.
+        let initial_fx = vec![
+            select_config_option(
+                "provider",
+                SessionConfigOptionCategory::Model,
+                "codex",
+                &["gateway", "codex"],
+            ),
+            select_config_option(
+                "model",
+                SessionConfigOptionCategory::Model,
+                "gpt-5",
+                &["gpt-5"],
+            ),
+        ];
+        let fx_agent = Agent.builder().on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                let response = if req.config_id.to_string() == "provider" {
+                    vec![
+                        select_config_option(
+                            "provider",
+                            SessionConfigOptionCategory::Model,
+                            "gateway",
+                            &["gateway", "codex"],
+                        ),
+                        select_config_option(
+                            "model",
+                            SessionConfigOptionCategory::Model,
+                            "openai/gpt-5",
+                            &["openai/gpt-5", "anthropic/claude-sonnet-5"],
+                        ),
+                    ]
+                } else {
+                    vec![
+                        select_config_option(
+                            "provider",
+                            SessionConfigOptionCategory::Model,
+                            "gateway",
+                            &["gateway", "codex"],
+                        ),
+                        select_config_option(
+                            "model",
+                            SessionConfigOptionCategory::Model,
+                            "anthropic/claude-sonnet-5",
+                            &["openai/gpt-5", "anthropic/claude-sonnet-5"],
+                        ),
+                    ]
+                };
+                responder.respond(SetSessionConfigOptionResponse::new(response))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let fx_cache: SharedConfigOptions = Arc::new(Mutex::new(Some(initial_fx)));
+        let fx_cache_clone = Arc::clone(&fx_cache);
+        let (events, _rx) = crate::driver::test_event_channel();
+        smol::block_on(Client.builder().connect_with(
+            fx_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                sync_cached_session_model(
+                    &connection,
+                    ProviderKind::Fx,
+                    &SessionId::new("s-fx"),
+                    &fx_cache_clone,
+                    Some("anthropic/claude-sonnet-5"),
+                    None,
+                    None,
+                    None,
+                    &events,
+                )
+                .await;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        let fx_updated = fx_cache.lock().clone().unwrap();
+        assert_eq!(
+            session_config_current_value(config_option_by_id(&fx_updated, "provider").unwrap()),
+            Some("gateway")
+        );
+        assert_eq!(
+            session_config_current_value(config_option_by_id(&fx_updated, "model").unwrap()),
+            Some("anthropic/claude-sonnet-5")
+        );
+
+        // Kimi: model == None still applies reasoning_effort (`thinking`) and refreshes cache.
+        let kimi_sent = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let kimi_sent_agent = Arc::clone(&kimi_sent);
+        let kimi_agent = Agent.builder().on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                let val = match &req.value {
+                    SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                    _ => String::new(),
+                };
+                kimi_sent_agent
+                    .lock()
+                    .push((req.config_id.to_string(), val.clone()));
+                responder.respond(SetSessionConfigOptionResponse::new(vec![
+                    select_config_option(
+                        "thinking",
+                        SessionConfigOptionCategory::ThoughtLevel,
+                        &val,
+                        &["off", "high"],
+                    ),
+                ]))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let kimi_cache: SharedConfigOptions = Arc::new(Mutex::new(None));
+        let kimi_cache_clone = Arc::clone(&kimi_cache);
+        let (events, _rx) = crate::driver::test_event_channel();
+        smol::block_on(Client.builder().connect_with(
+            kimi_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                sync_cached_session_model(
+                    &connection,
+                    ProviderKind::Kimi,
+                    &SessionId::new("s-kimi"),
+                    &kimi_cache_clone,
+                    None,
+                    Some("high"),
+                    None,
+                    None,
+                    &events,
+                )
+                .await;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            *kimi_sent.lock(),
+            vec![("thinking".to_owned(), "high".to_owned())]
+        );
+        assert_eq!(
+            session_config_current_value(
+                config_option_by_id(kimi_cache.lock().as_deref().unwrap(), "thinking").unwrap()
+            ),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn send_prompt_steer_preserves_produced_content_and_turn_end_clears_unfinished_tools() {
+        let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prompt_count_agent = Arc::clone(&prompt_count);
+        let mock_agent = Agent.builder().on_receive_request(
+            async move |_req: PromptRequest, responder, _cx| {
+                prompt_count_agent.fetch_add(1, Ordering::Relaxed);
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let stream_state = Arc::new(Mutex::new(AcpStreamState::default()));
+        stream_state.lock().produced_content = true;
+        stream_state.lock().tools.insert(
+            "dangling-tool".into(),
+            StoredToolCall {
+                kind: ActivityKind::Tool,
+                title: "hanging".into(),
+                raw_input: None,
+                locations: None,
+                content: None,
+                tool_name: None,
+            },
+        );
+        let stream_state_clone = Arc::clone(&stream_state);
+        let (events, event_rx) = crate::driver::test_event_channel();
+
+        smol::block_on(Client.builder().connect_with(
+            mock_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
+                // Simulate an active turn already registered before the steer arrives.
+                prompt_requests.lock().insert(
+                    RequestId::Str("active-turn".into()),
+                    None,
+                    "sess-1".into(),
+                );
+                let title_refresh = super::super::title_refresh::NativeTitleRefresh::default();
+                let cwd = std::env::temp_dir();
+                send_prompt(
+                    &connection,
+                    &SessionId::new("sess-1"),
+                    "steer message".into(),
+                    &cwd,
+                    &PromptCapabilities::new(),
+                    &prompt_requests,
+                    &events,
+                    ProviderKind::Cursor,
+                    "sess-1",
+                    None,
+                    title_refresh.clone(),
+                    stream_state_clone.clone(),
+                    None,
+                    PromptKind::Steer,
+                )?;
+                assert!(
+                    stream_state_clone.lock().produced_content,
+                    "Steer must not reset produced_content to false"
+                );
+                // Now settle the original turn request and send a normal prompt that settles.
+                prompt_requests
+                    .lock()
+                    .settle_request(&RequestId::Str("active-turn".into()));
+                // Wait briefly for the steer response to clear its request id.
+                for _ in 0..50 {
+                    if prompt_requests.lock().is_empty() {
+                        break;
+                    }
+                    smol::Timer::after(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    stream_state_clone.lock().tools.is_empty(),
+                    "unfinished tools must be cleared when turn settles"
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(prompt_count.load(Ordering::Relaxed), 1);
+        let events_seen: Vec<_> = event_rx.try_iter().collect();
+        assert!(events_seen.iter().any(|e| matches!(
+            e,
+            DriverEvent::TurnFinished {
+                success: true,
+                summary: None
+            }
+        )));
+    }
+
+    #[test]
+    fn format_prompt_with_seed_keeps_seed_reusable_until_prompt_succeeds() {
+        let mut fork_context = Some("[{\"role\":\"user\",\"content\":\"hi\"}]".to_owned());
+        let mut cu_instructions = Some("CU RULES".to_owned());
+
+        let first = format_prompt_with_seed(
+            fork_context.as_deref(),
+            cu_instructions.as_deref(),
+            "first try".to_owned(),
+        );
+        assert!(first.starts_with("CU RULES\n\nWAKU_CURSOR_BRANCH_CONTEXT_V1 "));
+        assert!(first.ends_with("first try"));
+        // Simulating a failed send_prompt: seed state is NOT cleared yet, so retry gets it.
+        assert!(fork_context.is_some());
+        assert!(cu_instructions.is_some());
+
+        let retry = format_prompt_with_seed(
+            fork_context.as_deref(),
+            cu_instructions.as_deref(),
+            "second try".to_owned(),
+        );
+        assert!(retry.starts_with("CU RULES\n\nWAKU_CURSOR_BRANCH_CONTEXT_V1 "));
+        assert!(retry.ends_with("second try"));
+
+        // After send_prompt succeeds, both are consumed.
+        fork_context = None;
+        cu_instructions = None;
+        let next = format_prompt_with_seed(
+            fork_context.as_deref(),
+            cu_instructions.as_deref(),
+            "later turn".to_owned(),
+        );
+        assert_eq!(next, "later turn");
+    }
+
+    #[test]
+    fn acp_terminal_registry_evicts_oldest_completed_entries_and_keeps_running() {
+        let registry = AcpTerminalRegistry::default();
+        let make_proc = |id: &str, completed_seq: Option<u64>, updated_at_ms: u64| {
+            Arc::new(Mutex::new(AcpTerminalProcess {
+                id: id.to_owned(),
+                title: id.to_owned(),
+                command_display: id.to_owned(),
+                cwd_display: ".".to_owned(),
+                started_at_ms: updated_at_ms,
+                updated_at_ms,
+                completed_seq,
+                output: String::new(),
+                output_truncated: false,
+                output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
+                exit_status: completed_seq.map(|_| TerminalExitStatus::new().exit_code(Some(0))),
+                killed: false,
+                child_pid: 0,
+                #[cfg(windows)]
+                job: None,
+                waiters: Vec::new(),
+            }))
+        };
+
+        {
+            let mut map = registry.terminals.lock();
+            map.insert("running-1".into(), make_proc("running-1", None, 10));
+            map.insert("done-1".into(), make_proc("done-1", Some(1), 100));
+            map.insert("done-2".into(), make_proc("done-2", Some(2), 200));
+            map.insert("done-3".into(), make_proc("done-3", Some(3), 300));
+            map.insert("done-4".into(), make_proc("done-4", Some(4), 400));
+        }
+
+        evict_completed_terminals_in(&registry.terminals, 2);
+
+        let map = registry.terminals.lock();
+        assert!(map.contains_key("running-1"), "running terminals must not be evicted");
+        assert!(!map.contains_key("done-1"), "oldest completed terminal should be evicted");
+        assert!(!map.contains_key("done-2"), "second oldest completed terminal should be evicted");
+        assert!(map.contains_key("done-3"), "newer completed terminal should be retained");
+        assert!(map.contains_key("done-4"), "newest completed terminal should be retained");
+    }
+
+    #[test]
+    fn native_turn_failure_offloads_blocking_poll_off_single_threaded_executor() {
+        // Kimi's turn_failure polls for ~1s when the wire log does not exist.
+        // Because `resolve_native_turn_failure` runs it on `smol::unblock`, a
+        // short timer racing on the same single-threaded `smol::block_on`
+        // executor must win promptly instead of being starved for 1s.
+        let started = std::time::Instant::now();
+        let winner = smol::block_on(smol::future::race(
+            async {
+                let _ = resolve_native_turn_failure(
+                    Some(0),
+                    None,
+                    format!("nonexistent-session-{}", uuid::Uuid::new_v4()),
+                    false,
+                    Some(StopReason::EndTurn),
+                )
+                .await;
+                "lookup"
+            },
+            async {
+                smol::Timer::after(Duration::from_millis(50)).await;
+                "timer"
+            },
+        ));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            winner, "timer",
+            "blocking failure lookup starved the single-threaded smol executor"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timer took {elapsed:?} instead of ~50ms"
+        );
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:

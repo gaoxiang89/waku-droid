@@ -1,14 +1,15 @@
 //! Grok native-session metadata and ACP helpers.
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
@@ -199,12 +200,53 @@ fn find_session_directory(session_id: &str) -> anyhow::Result<PathBuf> {
     find_session_directory_in(&grok_home_directory()?, session_id)
 }
 
-fn grok_home_directory() -> anyhow::Result<PathBuf> {
-    std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
+fn env_var_from(
+    process_value: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    name: &str,
+) -> Option<OsString> {
+    if let Some(value) = process_value
+        .filter(|value| !value.is_empty() && value.to_str().is_none_or(|s| !s.trim().is_empty()))
+    {
+        return Some(value);
+    }
+    shell_env
+        .iter()
+        .rev()
+        .find(|(key, value)| {
+            !value.is_empty()
+                && value.to_str().is_none_or(|s| !s.trim().is_empty())
+                && {
+                    #[cfg(windows)]
+                    {
+                        key.to_string_lossy().eq_ignore_ascii_case(name)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        key == name
+                    }
+                }
+        })
+        .map(|(_, value)| value.clone())
+}
+
+fn grok_home_directory_from(
+    process_value: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    home_dir: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    env_var_from(process_value, shell_env, "GROK_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
+        .or_else(|| home_dir.map(|home| home.join(".grok")))
         .ok_or_else(|| anyhow!("Grok's home directory could not be located"))
+}
+
+fn grok_home_directory() -> anyhow::Result<PathBuf> {
+    grok_home_directory_from(
+        std::env::var_os("GROK_HOME"),
+        &crate::command_env::shell_environment(),
+        dirs::home_dir(),
+    )
 }
 
 fn find_session_directory_in(grok_home: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
@@ -343,6 +385,8 @@ fn write_atomic(
 
 struct GrokRpc {
     child: Child,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
     stdin: ChildStdin,
     responses: Receiver<Value>,
 }
@@ -355,16 +399,40 @@ impl GrokRpc {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         let mut child =
             crate::command_env::spawn(command).context("failed to start Grok's ACP server")?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("Grok ACP stdin is unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("Grok ACP stdout is unavailable"))?;
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+        let cleanup_child = |child: &mut Child| {
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                if pid != 0 {
+                    unsafe {
+                        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let Some(stdin) = child.stdin.take() else {
+            #[cfg(windows)]
+            drop(job);
+            cleanup_child(&mut child);
+            bail!("Grok ACP stdin is unavailable");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            #[cfg(windows)]
+            drop(job);
+            cleanup_child(&mut child);
+            bail!("Grok ACP stdout is unavailable");
+        };
         let (tx, responses) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -375,6 +443,8 @@ impl GrokRpc {
         });
         Ok(Self {
             child,
+            #[cfg(windows)]
+            job,
             stdin,
             responses,
         })
@@ -387,24 +457,53 @@ impl GrokRpc {
         )?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
-        loop {
-            let response = self
-                .responses
-                .recv_timeout(RPC_TIMEOUT)
-                .with_context(|| format!("timed out waiting for Grok {method}"))?;
-            if response.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
+        recv_response_with_timeout(&self.responses, id, method, RPC_TIMEOUT)
+    }
+}
+
+fn recv_response_with_timeout(
+    responses: &Receiver<Value>,
+    id: u64,
+    method: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            bail!("timed out waiting for Grok {method}");
+        };
+        let response = match responses.recv_timeout(remaining) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                bail!("timed out waiting for Grok {method}");
             }
-            if let Some(error) = response.get("error") {
-                bail!("Grok {method} failed: {error}");
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("Grok ACP process closed while waiting for {method}");
             }
-            return Ok(response);
+        };
+        if response.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
         }
+        if let Some(error) = response.get("error") {
+            bail!("Grok {method} failed: {error}");
+        }
+        return Ok(response);
     }
 }
 
 impl Drop for GrokRpc {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        drop(self.job.take());
+        #[cfg(unix)]
+        {
+            let pid = self.child.id();
+            if pid != 0 {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -507,5 +606,84 @@ mod tests {
         ] {
             assert!(provider_summary(&value).is_none());
         }
+    }
+
+    #[test]
+    fn grok_rpc_deadline_does_not_reset_on_unrelated_notifications() {
+        let (tx, rx) = mpsc::channel();
+        let feeder = thread::spawn(move || {
+            for seq in 0..30 {
+                if tx
+                    .send(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"seq": seq}}))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let started = Instant::now();
+        let error =
+            recv_response_with_timeout(&rx, 7, "initialize", Duration::from_millis(120))
+                .unwrap_err();
+        let elapsed = started.elapsed();
+        drop(rx);
+        let _ = feeder.join();
+
+        assert!(
+            error.to_string().contains("timed out waiting for Grok initialize"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "unrelated notifications extended deadline to {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn grok_rpc_skips_unrelated_notifications_until_matching_response() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(json!({"jsonrpc": "2.0", "method": "session/update"}))
+            .unwrap();
+        tx.send(json!({"jsonrpc": "2.0", "id": 99, "result": {}}))
+            .unwrap();
+        tx.send(json!({"jsonrpc": "2.0", "id": 2, "result": {"newSessionId": "ok"}}))
+            .unwrap();
+
+        let response =
+            recv_response_with_timeout(&rx, 2, "_x.ai/session/fork", Duration::from_secs(1))
+                .unwrap();
+        assert_eq!(response.pointer("/result/newSessionId"), Some(&json!("ok")));
+    }
+
+    #[test]
+    fn grok_home_filters_empty_env_and_falls_back_to_shell_environment() {
+        let home = PathBuf::from("/fake/home");
+        let shell_env = vec![(OsString::from("GROK_HOME"), OsString::from("/shell/grok"))];
+
+        assert_eq!(
+            grok_home_directory_from(Some(OsString::from("")), &shell_env, Some(home.clone()))
+                .unwrap(),
+            PathBuf::from("/shell/grok")
+        );
+        assert_eq!(
+            grok_home_directory_from(Some(OsString::from("   ")), &shell_env, Some(home.clone()))
+                .unwrap(),
+            PathBuf::from("/shell/grok")
+        );
+        assert_eq!(
+            grok_home_directory_from(
+                Some(OsString::from("/proc/grok")),
+                &shell_env,
+                Some(home.clone())
+            )
+            .unwrap(),
+            PathBuf::from("/proc/grok")
+        );
+        assert_eq!(
+            grok_home_directory_from(None, &[], Some(home.clone())).unwrap(),
+            home.join(".grok")
+        );
     }
 }

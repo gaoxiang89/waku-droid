@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -174,9 +175,141 @@ enum PendingResponse {
 
 type PendingResponses = Arc<Mutex<HashMap<String, PendingResponse>>>;
 
+struct PiProcessState {
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+struct PiProcessHandle {
+    state: Mutex<PiProcessState>,
+    shutting_down: AtomicBool,
+}
+
+impl PiProcessHandle {
+    fn new(
+        pid: u32,
+        #[cfg(windows)] job: Option<crate::process_tree::KillOnCloseJob>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(PiProcessState {
+                pid,
+                #[cfg(windows)]
+                job,
+            }),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            state: Mutex::new(PiProcessState {
+                pid: 0,
+                #[cfg(windows)]
+                job: None,
+            }),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    fn terminate(&self) {
+        self.terminate_with_signal(false);
+    }
+
+    fn force_terminate(&self) {
+        self.terminate_with_signal(true);
+    }
+
+    fn terminate_with_signal(&self, force: bool) {
+        self.shutting_down.store(true, Ordering::Release);
+        let mut state = self.state.lock();
+        if state.pid == 0 {
+            return;
+        }
+        let pid = state.pid;
+        #[cfg(windows)]
+        {
+            let _ = force;
+            drop(state.job.take());
+            unsafe {
+                use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::{
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                };
+                let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !process.is_null() {
+                    let _ = TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+            unsafe {
+                let _ = libc::kill(-(pid as i32), signal);
+                let _ = libc::kill(pid as i32, signal);
+            }
+        }
+    }
+
+    fn mark_exited(&self) {
+        let mut state = self.state.lock();
+        state.pid = 0;
+        #[cfg(windows)]
+        drop(state.job.take());
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+}
+
+/// Guards a short-lived child process (such as `omp --fork`) with a Windows
+/// kill-on-close job and Unix process group cleanup on drop.
+struct ScopedChildProcess {
+    child: Child,
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+impl ScopedChildProcess {
+    fn adopt(child: Child) -> Self {
+        let pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(pid).ok();
+        Self {
+            child,
+            pid,
+            #[cfg(windows)]
+            job,
+        }
+    }
+}
+
+impl Drop for ScopedChildProcess {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        drop(self.job.take());
+        #[cfg(unix)]
+        if self.pid != 0 {
+            unsafe {
+                let _ = libc::kill(-(self.pid as i32), libc::SIGKILL);
+                let _ = libc::kill(self.pid as i32, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        self.pid = 0;
+        let _ = self.child.wait();
+    }
+}
+
 pub struct PiDriver {
     flavor: PiFlavor,
     commands: Sender<CommandMessage>,
+    process: Arc<PiProcessHandle>,
     computer_use: Option<computer_use_runtime::ComputerUseRuntime>,
 }
 
@@ -271,20 +404,39 @@ impl PiDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         let mut child = crate::command_env::spawn(command)
             .with_context(|| format!("failed to start `{} --mode rpc`", binary.display()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("{} stdin unavailable", flavor.display_name()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("{} stdout unavailable", flavor.display_name()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("{} stderr unavailable", flavor.display_name()))?;
+        let child_pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child_pid).ok();
+        let process = Arc::new(PiProcessHandle::new(
+            child_pid,
+            #[cfg(windows)]
+            job,
+        ));
+        let Some(stdin) = child.stdin.take() else {
+            process.force_terminate();
+            let _ = child.wait();
+            process.mark_exited();
+            return Err(anyhow!("{} stdin unavailable", flavor.display_name()));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            process.force_terminate();
+            let _ = child.wait();
+            process.mark_exited();
+            return Err(anyhow!("{} stdout unavailable", flavor.display_name()));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            process.force_terminate();
+            let _ = child.wait();
+            process.mark_exited();
+            return Err(anyhow!("{} stderr unavailable", flavor.display_name()));
+        };
 
         let (commands, command_rx) = unbounded();
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -357,6 +509,7 @@ impl PiDriver {
 
         let writer_pending = pending;
         let writer_events = events.clone();
+        let writer_process = process.clone();
         thread::Builder::new()
             .name("waku-pi-writer".into())
             .spawn(move || {
@@ -451,6 +604,7 @@ impl PiDriver {
                                 provider = flavor.display_name()
                             )),
                         });
+                        writer_process.terminate();
                         return;
                     }
                 };
@@ -466,6 +620,7 @@ impl PiDriver {
                             provider = flavor.display_name()
                         )),
                     });
+                    writer_process.terminate();
                     return;
                 };
                 let initial_usage = send_request(
@@ -571,71 +726,24 @@ impl PiDriver {
                                     provider = flavor.display_name(),
                                     error = error
                                 )));
+                                // If the RPC channel cannot honor abort (e.g. a
+                                // wedged tool subprocess), tear down the whole
+                                // process tree rather than leaving it hung.
+                                writer_process.force_terminate();
+                                break;
                             }
                         }
                         CommandMessage::Options(options) => {
-                            if options.model != current_model {
-                                match options.model.as_deref().map(parse_model_slug).transpose() {
-                                    Ok(Some((provider, model_id))) => {
-                                        match send_request(
-                                            &mut stdin,
-                                            &writer_pending,
-                                            &mut next_request_id,
-                                            json!({
-                                                "type": "set_model",
-                                                "provider": provider,
-                                                "modelId": model_id
-                                            }),
-                                        ) {
-                                            Ok(response) => {
-                                                if let Some(window) = response
-                                                    .pointer("/data/contextWindow")
-                                                    .and_then(Value::as_u64)
-                                                    .filter(|window| *window > 0)
-                                                {
-                                                    let _ = writer_events.send(
-                                                        DriverEvent::UsageUpdated {
-                                                            context_tokens: None,
-                                                            context_window: Some(window),
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                            Err(error) => {
-                                                let _ =
-                                                    writer_events.send(DriverEvent::Error(tr!(
-                                                        "errors.switch_provider_model",
-                                                        provider = flavor.display_name(),
-                                                        error = error
-                                                    )));
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        let _ = writer_events
-                                            .send(DriverEvent::Error(error.to_string()));
-                                    }
-                                }
-                                current_model = options.model;
-                            }
-                            if options.reasoning_effort != current_effort {
-                                if let Some(level) = options.reasoning_effort.as_deref()
-                                    && let Err(error) = send_request(
-                                        &mut stdin,
-                                        &writer_pending,
-                                        &mut next_request_id,
-                                        json!({"type": "set_thinking_level", "level": level}),
-                                    )
-                                {
-                                    let _ = writer_events.send(DriverEvent::Error(tr!(
-                                        "errors.change_provider_thinking",
-                                        provider = flavor.display_name(),
-                                        error = error
-                                    )));
-                                }
-                                current_effort = options.reasoning_effort;
-                            }
+                            apply_live_options(
+                                flavor,
+                                &mut stdin,
+                                &writer_pending,
+                                &mut next_request_id,
+                                options,
+                                &mut current_model,
+                                &mut current_effort,
+                                &writer_events,
+                            );
                         }
                         CommandMessage::CancelExtensionRequest(id) => {
                             if write_json_line(
@@ -652,7 +760,7 @@ impl PiDriver {
                             }
                         }
                         CommandMessage::Rollback { turns, response } => {
-                            let result = fork_pi_session(
+                            match fork_pi_session(
                                 flavor,
                                 &mut stdin,
                                 &writer_pending,
@@ -662,17 +770,27 @@ impl PiDriver {
                                 &cursor,
                                 turns,
                                 false,
-                            );
-                            if let Ok(next_cursor) = &result {
-                                cursor = next_cursor.clone();
+                            ) {
+                                Ok(next_cursor) => {
+                                    cursor = next_cursor.clone();
+                                    let _ = response.send(Ok(next_cursor));
+                                }
+                                Err(ForkError::Recoverable(error)) => {
+                                    let _ = response.send(Err(error));
+                                }
+                                Err(ForkError::SessionDesynced(error)) => {
+                                    let _ = response.send(Err(error.clone()));
+                                    let _ = writer_events.send(DriverEvent::Error(error));
+                                    writer_process.terminate();
+                                    break;
+                                }
                             }
-                            let _ = response.send(result);
                         }
                         CommandMessage::Fork {
                             turns_to_remove,
                             response,
                         } => {
-                            let result = fork_pi_session(
+                            match fork_pi_session(
                                 flavor,
                                 &mut stdin,
                                 &writer_pending,
@@ -682,8 +800,24 @@ impl PiDriver {
                                 &cursor,
                                 turns_to_remove,
                                 true,
-                            );
-                            let _ = response.send(result);
+                            ) {
+                                Ok(fork_cursor) => {
+                                    let _ = response.send(Ok(fork_cursor));
+                                }
+                                Err(ForkError::Recoverable(error)) => {
+                                    let _ = response.send(Err(error));
+                                }
+                                Err(ForkError::SessionDesynced(error)) => {
+                                    // The live process already switched to the
+                                    // forked session and could not return to
+                                    // the source session; shut it down so no
+                                    // subsequent prompt mutates the fork.
+                                    let _ = response.send(Err(error.clone()));
+                                    let _ = writer_events.send(DriverEvent::Error(error));
+                                    writer_process.terminate();
+                                    break;
+                                }
+                            }
                         }
                         CommandMessage::Shutdown => break,
                     }
@@ -698,32 +832,40 @@ impl PiDriver {
                 .name("waku-pi-stderr".into())
                 .spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        if line.to_ascii_lowercase().contains("error") {
-                            let error = format!("{}: {}", flavor.display_name(), line.trim());
+                        if let Some(diagnostic) = pi_stderr_error_line(&line) {
+                            let error = format!("{}: {diagnostic}", flavor.display_name());
                             *stderr_last_error.lock() = Some(error.clone());
                             let _ = stderr_events.send(DriverEvent::Error(error));
                         }
                     }
                 })?;
 
-        // Nothing signals or kills the agent process: it exits when the writer
-        // thread drops its stdin. Something still has to reap it, or every
-        // session that ever ran leaves a zombie behind for the life of the app.
+        // Reap the process, release its Windows job / PID guard before dropping
+        // `child` to prevent PID-reuse kills, and suppress expected shutdown
+        // exit codes.
+        let process_handle = process.clone();
         thread::Builder::new()
             .name("waku-pi-process".into())
             .spawn(move || {
                 let status = child.wait();
+                process_handle.mark_exited();
+                drop(child);
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
+                let shutting_down = process_handle.is_shutting_down();
                 match status {
-                    Ok(status) if !status.success() && last_visible_stderr.lock().is_none() => {
+                    Ok(status)
+                        if !shutting_down
+                            && !status.success()
+                            && last_visible_stderr.lock().is_none() =>
+                    {
                         let _ = events.send(DriverEvent::Error(tr!(
                             "errors.provider_rpc_exited",
                             provider = flavor.display_name(),
                             status = status
                         )));
                     }
-                    Err(error) => {
+                    Err(error) if !shutting_down => {
                         let _ = events.send(DriverEvent::Error(tr!(
                             "errors.read_provider_exit_status",
                             provider = format!("{} RPC", flavor.display_name()),
@@ -738,6 +880,7 @@ impl PiDriver {
         Ok(Self {
             flavor,
             commands,
+            process,
             computer_use,
         })
     }
@@ -836,7 +979,230 @@ impl Drop for PiDriver {
     fn drop(&mut self) {
         self.cancel_computer_use();
         let _ = self.commands.send(CommandMessage::Shutdown);
+        self.process.terminate();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_live_options(
+    flavor: PiFlavor,
+    stdin: &mut impl Write,
+    pending: &PendingResponses,
+    next_request_id: &mut u64,
+    options: SessionOptions,
+    current_model: &mut Option<String>,
+    current_effort: &mut Option<String>,
+    events: &impl DriverEventSink,
+) {
+    if options.model != *current_model {
+        match options.model.as_deref().map(parse_model_slug).transpose() {
+            Ok(Some((provider, model_id))) => {
+                match send_request(
+                    stdin,
+                    pending,
+                    next_request_id,
+                    json!({
+                        "type": "set_model",
+                        "provider": provider,
+                        "modelId": model_id
+                    }),
+                ) {
+                    Ok(response) => {
+                        if let Some(window) = response
+                            .pointer("/data/contextWindow")
+                            .and_then(Value::as_u64)
+                            .filter(|window| *window > 0)
+                        {
+                            let _ = events.send(DriverEvent::UsageUpdated {
+                                context_tokens: None,
+                                context_window: Some(window),
+                            });
+                        }
+                        *current_model = options.model;
+                    }
+                    Err(error) => {
+                        let _ = events.send(DriverEvent::Error(tr!(
+                            "errors.switch_provider_model",
+                            provider = flavor.display_name(),
+                            error = error
+                        )));
+                    }
+                }
+            }
+            Ok(None) => {
+                *current_model = None;
+            }
+            Err(error) => {
+                let _ = events.send(DriverEvent::Error(error.to_string()));
+            }
+        }
+    }
+    if options.reasoning_effort != *current_effort {
+        match options.reasoning_effort.as_deref() {
+            Some(level) => match send_request(
+                stdin,
+                pending,
+                next_request_id,
+                json!({"type": "set_thinking_level", "level": level}),
+            ) {
+                Ok(_) => {
+                    *current_effort = options.reasoning_effort;
+                }
+                Err(error) => {
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.change_provider_thinking",
+                        provider = flavor.display_name(),
+                        error = error
+                    )));
+                }
+            },
+            None => {
+                *current_effort = None;
+            }
+        }
+    }
+}
+
+fn strip_ansi_sequences(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn is_named_error_token(token: &str) -> bool {
+    let base = token.strip_suffix(':').unwrap_or(token);
+    let Some(prefix) = base.strip_suffix("error") else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Filters stderr lines from Pi / Oh My Pi so genuine runtime/CLI errors still
+/// surface to the user while benign diagnostics mentioning `"error"` (such as
+/// extension filenames, warnings, info/debug logs, or stack frames) do not spam
+/// false `DriverEvent::Error` banners.
+fn pi_stderr_error_line(raw: &str) -> Option<String> {
+    const MAX_STDERR_ERROR_CHARS: usize = 400;
+
+    let cleaned = strip_ansi_sequences(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed.starts_with("at ") {
+        return None;
+    }
+
+    if trimmed.starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && value.is_object()
+    {
+        let is_error_level = value.get("level").is_some_and(|level| {
+            level
+                .as_str()
+                .is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "error" | "fatal"))
+                || level.as_u64().is_some_and(|n| n >= 50)
+        });
+        if !is_error_level {
+            return None;
+        }
+        let message = value
+            .get("msg")
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("error"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|msg| !msg.is_empty())
+            .unwrap_or(trimmed);
+        return Some(truncate_stderr_message(message, MAX_STDERR_ERROR_CHARS));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("warning:")
+        || lower.starts_with("warn:")
+        || lower.starts_with("[warn]")
+        || lower.starts_with("[warning]")
+        || lower.starts_with("info:")
+        || lower.starts_with("[info]")
+        || lower.starts_with("debug:")
+        || lower.starts_with("[debug]")
+        || lower.starts_with("trace:")
+        || lower.starts_with("[trace]")
+        || lower.starts_with("note:")
+        || lower.starts_with("[note]")
+        || lower.starts_with("hint:")
+        || lower.starts_with("deprecationwarning:")
+        || lower.starts_with("experimentalwarning:")
+        || ((lower.starts_with("(node:") || lower.starts_with("(bun:")) && lower.contains("warning"))
+    {
+        return None;
+    }
+
+    let after_prefix = strip_diagnostic_prefix(trimmed);
+    let after_lower = after_prefix.to_ascii_lowercase();
+    let is_structured_error = after_lower.starts_with("error:")
+        || after_lower.starts_with("error [")
+        || after_lower.starts_with("fatal:")
+        || after_lower.starts_with("panic:")
+        || after_lower.starts_with("panic(")
+        || after_lower.starts_with("[error]")
+        || after_lower.starts_with("[fatal]")
+        || after_lower.starts_with("uncaught ")
+        || after_lower.starts_with("unhandledpromiserejection")
+        || after_lower.starts_with("unhandled rejection")
+        || after_lower.starts_with("unhandled error")
+        || after_prefix.starts_with("ERROR ")
+        || after_prefix.starts_with("FATAL ")
+        || after_lower.split_whitespace().next().is_some_and(|first| {
+            first.ends_with("error:") && is_named_error_token(first)
+                || (is_named_error_token(first)
+                    && after_lower[first.len()..].trim_start().starts_with('['))
+        });
+
+    is_structured_error.then(|| truncate_stderr_message(trimmed, MAX_STDERR_ERROR_CHARS))
+}
+
+fn strip_diagnostic_prefix(line: &str) -> &str {
+    let mut rest = line;
+    // Strip one leading bracketed component tag (e.g. `[pi] `) or ISO timestamp
+    // (e.g. `2026-01-01T00:00:00Z `), without stripping `[ERROR]` / `[FATAL]`.
+    if rest.starts_with('[')
+        && !rest.to_ascii_lowercase().starts_with("[error]")
+        && !rest.to_ascii_lowercase().starts_with("[fatal]")
+        && let Some(end) = rest.find(']')
+    {
+        rest = rest[end + 1..].trim_start();
+    } else if let Some((first, tail)) = rest.split_once(char::is_whitespace)
+        && first.len() >= 10
+        && first.as_bytes()[0..4].iter().all(u8::is_ascii_digit)
+        && first.as_bytes()[4] == b'-'
+    {
+        rest = tail.trim_start();
+    }
+    rest
+}
+
+fn truncate_stderr_message(message: &str, max_chars: usize) -> String {
+    if message.chars().count() <= max_chars {
+        return message.to_owned();
+    }
+    let mut truncated = message.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn send_request(
@@ -1076,6 +1442,17 @@ fn pi_message_context_tokens(message: &Value) -> Option<u64> {
         })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ForkError {
+    /// Failure occurred before the live session switched away from its original
+    /// session (or during an out-of-process clone).
+    Recoverable(String),
+    /// The live session already switched to a forked/rolled-back session and
+    /// could not be reconciled back to a known cursor; the live driver must
+    /// shut down rather than continue serving prompts on the wrong session.
+    SessionDesynced(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fork_pi_session(
     flavor: PiFlavor,
@@ -1087,18 +1464,21 @@ fn fork_pi_session(
     original_cursor: &ProviderResumeCursor,
     turns_to_remove: usize,
     restore_original: bool,
-) -> Result<ProviderResumeCursor, String> {
+) -> Result<ProviderResumeCursor, ForkError> {
     let name = flavor.display_name();
     let messages = send_request(
         stdin,
         pending,
         next_request_id,
         json!({"type": flavor.branch_messages_command()}),
-    )?;
+    )
+    .map_err(ForkError::Recoverable)?;
     let messages = messages
         .pointer("/data/messages")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("{name} returned an invalid fork-message list"))?;
+        .ok_or_else(|| {
+            ForkError::Recoverable(format!("{name} returned an invalid fork-message list"))
+        })?;
 
     // Keeping every turn is a whole-session copy, which Pi does in place and
     // Oh My Pi only does at launch. The out-of-process copy leaves this
@@ -1106,28 +1486,40 @@ fn fork_pi_session(
     if turns_to_remove == 0 && flavor == PiFlavor::OhMyPi {
         let session_file = flavor
             .session_file_from_cursor(original_cursor)
-            .ok_or_else(|| format!("{name}'s original session file is unavailable"))?;
-        return clone_ohmypi_session(binary, cwd, session_file);
+            .ok_or_else(|| {
+                ForkError::Recoverable(format!("{name}'s original session file is unavailable"))
+            })?;
+        return clone_ohmypi_session(binary, cwd, session_file).map_err(ForkError::Recoverable);
     }
 
-    let request = pi_fork_request(flavor, messages, turns_to_remove)?;
-    let fork = send_request(stdin, pending, next_request_id, request)?;
+    let request = pi_fork_request(flavor, messages, turns_to_remove)
+        .map_err(ForkError::Recoverable)?;
+    let fork = send_request(stdin, pending, next_request_id, request)
+        .map_err(ForkError::Recoverable)?;
     if fork.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
-        return Err(format!("{name} session fork was cancelled"));
+        return Err(ForkError::Recoverable(format!(
+            "{name} session fork was cancelled"
+        )));
     }
     let fork_state = send_request(
         stdin,
         pending,
         next_request_id,
         json!({"type": "get_state"}),
-    )?;
-    let fork_cursor = cursor_from_state(flavor, &fork_state)
-        .ok_or_else(|| format!("{name} did not report the forked session cursor"))?;
+    )
+    .map_err(ForkError::SessionDesynced)?;
+    let fork_cursor = cursor_from_state(flavor, &fork_state).ok_or_else(|| {
+        ForkError::SessionDesynced(format!("{name} did not report the forked session cursor"))
+    })?;
 
     if restore_original {
         let session_file = flavor
             .session_file_from_cursor(original_cursor)
-            .ok_or_else(|| format!("{name}'s original session file is unavailable"))?;
+            .ok_or_else(|| {
+                ForkError::SessionDesynced(format!(
+                    "{name}'s original session file is unavailable"
+                ))
+            })?;
         let switched = send_request(
             stdin,
             pending,
@@ -1136,24 +1528,27 @@ fn fork_pi_session(
                 "type": "switch_session",
                 "sessionPath": session_file
             }),
-        )?;
+        )
+        .map_err(ForkError::SessionDesynced)?;
         if switched.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
-            return Err(format!(
+            return Err(ForkError::SessionDesynced(format!(
                 "{name} could not return to the source session after forking"
-            ));
+            )));
         }
         let restored_state = send_request(
             stdin,
             pending,
             next_request_id,
             json!({"type": "get_state"}),
-        )?;
-        let restored_cursor = cursor_from_state(flavor, &restored_state)
-            .ok_or_else(|| format!("{name} did not report the restored source session"))?;
+        )
+        .map_err(ForkError::SessionDesynced)?;
+        let restored_cursor = cursor_from_state(flavor, &restored_state).ok_or_else(|| {
+            ForkError::SessionDesynced(format!("{name} did not report the restored source session"))
+        })?;
         if restored_cursor.native_id() != original_cursor.native_id() {
-            return Err(format!(
+            return Err(ForkError::SessionDesynced(format!(
                 "{name} returned to the wrong source session after forking"
-            ));
+            )));
         }
     }
 
@@ -1204,57 +1599,60 @@ fn clone_ohmypi_session(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = crate::command_env::spawn(command)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let child = crate::command_env::spawn(command)
         .map_err(|error| format!("could not start Oh My Pi to copy the session: {error}"))?;
-    let result = (|| {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Oh My Pi stdin unavailable".to_owned())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Oh My Pi stdout unavailable".to_owned())?;
-        let (tx, rx) = bounded(1);
-        thread::Builder::new()
-            .name("waku-ohmypi-clone".into())
-            .spawn(move || {
-                let mut chunks = ChunkAssembly::default();
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    let Ok(Some(value)) = chunks.accept(value) else {
-                        continue;
-                    };
-                    if value.get("id").and_then(Value::as_str) == Some("waku-clone") {
-                        let _ = tx.send(value);
-                        break;
-                    }
+    let mut scoped = ScopedChildProcess::adopt(child);
+    let mut stdin = scoped
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| "Oh My Pi stdin unavailable".to_owned())?;
+    let stdout = scoped
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| "Oh My Pi stdout unavailable".to_owned())?;
+    let (tx, rx) = bounded(1);
+    thread::Builder::new()
+        .name("waku-ohmypi-clone".into())
+        .spawn(move || {
+            let mut chunks = ChunkAssembly::default();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Ok(Some(value)) = chunks.accept(value) else {
+                    continue;
+                };
+                if value.get("id").and_then(Value::as_str) == Some("waku-clone") {
+                    let _ = tx.send(value);
+                    break;
                 }
-            })
-            .map_err(|error| format!("could not read the Oh My Pi session copy: {error}"))?;
-        write_json_line(
-            &mut stdin,
-            &json!({"id": "waku-clone", "type": "get_state"}),
-        )
-        .map_err(|error| format!("could not ask Oh My Pi for the copied session: {error}"))?;
-        let state = rx
-            .recv_timeout(CLONE_TIMEOUT)
-            .map_err(|_| "timed out waiting for Oh My Pi to copy the session".to_owned())?;
-        if state.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(state
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("Oh My Pi could not copy the session")
-                .to_owned());
-        }
-        cursor_from_state(PiFlavor::OhMyPi, &state)
-            .ok_or_else(|| "Oh My Pi did not report the copied session cursor".to_owned())
-    })();
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+            }
+        })
+        .map_err(|error| format!("could not read the Oh My Pi session copy: {error}"))?;
+    write_json_line(
+        &mut stdin,
+        &json!({"id": "waku-clone", "type": "get_state"}),
+    )
+    .map_err(|error| format!("could not ask Oh My Pi for the copied session: {error}"))?;
+    let state = rx
+        .recv_timeout(CLONE_TIMEOUT)
+        .map_err(|_| "timed out waiting for Oh My Pi to copy the session".to_owned())?;
+    if state.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(state
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Oh My Pi could not copy the session")
+            .to_owned());
+    }
+    cursor_from_state(PiFlavor::OhMyPi, &state)
+        .ok_or_else(|| "Oh My Pi did not report the copied session cursor".to_owned())
 }
 
 #[derive(Default)]
@@ -1816,6 +2214,7 @@ mod tests {
         let driver = PiDriver {
             flavor: PiFlavor::Pi,
             commands,
+            process: Arc::new(PiProcessHandle::detached()),
             computer_use: None,
         };
         let options = |mode| SessionOptions {
@@ -2413,5 +2812,327 @@ mod tests {
             event_rx.recv().unwrap(),
             DriverEvent::TurnFinished { success: true, .. }
         ));
+    }
+
+    /// Minimal writer that dispatches scripted RPC replies into `pending` as
+    /// soon as each JSON-RPC line is flushed, enabling deterministic sync tests
+    /// for `apply_live_options` and `fork_pi_session`.
+    struct ScriptedRpcWriter {
+        pending: PendingResponses,
+        replies: std::collections::VecDeque<Result<Value, String>>,
+        sent: Vec<Value>,
+        buffer: Vec<u8>,
+    }
+
+    impl ScriptedRpcWriter {
+        fn new(pending: PendingResponses, replies: Vec<Result<Value, String>>) -> Self {
+            Self {
+                pending,
+                replies: replies.into(),
+                sent: Vec::new(),
+                buffer: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ScriptedRpcWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer.extend_from_slice(buf);
+            while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=pos).collect();
+                let value: Value = serde_json::from_slice(&line)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+                let id = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.sent.push(value);
+                if let Some(PendingResponse::Request(tx)) = self.pending.lock().remove(&id) {
+                    let reply = self
+                        .replies
+                        .pop_front()
+                        .unwrap_or_else(|| Err("no scripted reply".to_owned()));
+                    let _ = tx.send(reply);
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn apply_live_options_preserves_model_and_effort_when_rpc_fails() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, event_rx) = unbounded();
+        let mut next_id = 0;
+        let mut current_model = Some("anthropic/claude-sonnet-4".to_owned());
+        let mut current_effort = Some("low".to_owned());
+
+        // Both set_model and set_thinking_level fail.
+        let mut writer = ScriptedRpcWriter::new(
+            pending.clone(),
+            vec![
+                Err("model unavailable".to_owned()),
+                Err("thinking unsupported".to_owned()),
+            ],
+        );
+        apply_live_options(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut next_id,
+            SessionOptions {
+                mode: RuntimeMode::FullAccess,
+                model: Some("anthropic/claude-opus-5".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+                service_tier: None,
+                context_window: None,
+            },
+            &mut current_model,
+            &mut current_effort,
+            &events,
+        );
+        assert_eq!(
+            current_model.as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "failed set_model must not overwrite current_model"
+        );
+        assert_eq!(
+            current_effort.as_deref(),
+            Some("low"),
+            "failed set_thinking_level must not overwrite current_effort"
+        );
+        assert_eq!(writer.sent.len(), 2);
+        assert!(matches!(event_rx.try_recv(), Ok(DriverEvent::Error(_))));
+        assert!(matches!(event_rx.try_recv(), Ok(DriverEvent::Error(_))));
+
+        // Invalid model slug must also not overwrite current_model.
+        apply_live_options(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut next_id,
+            SessionOptions {
+                mode: RuntimeMode::FullAccess,
+                model: Some("invalid-no-slash".to_owned()),
+                reasoning_effort: Some("low".to_owned()),
+                service_tier: None,
+                context_window: None,
+            },
+            &mut current_model,
+            &mut current_effort,
+            &events,
+        );
+        assert_eq!(current_model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert!(matches!(event_rx.try_recv(), Ok(DriverEvent::Error(_))));
+
+        // Retrying the same target model/effort now succeeds and updates state.
+        let mut writer = ScriptedRpcWriter::new(
+            pending.clone(),
+            vec![
+                Ok(json!({"success": true, "data": {"contextWindow": 200_000}})),
+                Ok(json!({"success": true})),
+            ],
+        );
+        apply_live_options(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut next_id,
+            SessionOptions {
+                mode: RuntimeMode::FullAccess,
+                model: Some("anthropic/claude-opus-5".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+                service_tier: None,
+                context_window: None,
+            },
+            &mut current_model,
+            &mut current_effort,
+            &events,
+        );
+        assert_eq!(current_model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert_eq!(current_effort.as_deref(), Some("high"));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(DriverEvent::UsageUpdated {
+                context_tokens: None,
+                context_window: Some(200_000),
+            })
+        ));
+    }
+
+    #[test]
+    fn fork_pi_session_flags_desynced_session_when_switching_back_fails() {
+        let original_cursor = ProviderResumeCursor::Pi {
+            session_id: "orig-session".to_owned(),
+            session_file: Some(PathBuf::from("/tmp/orig.jsonl")),
+        };
+
+        // Failure before mutating session (cancelled fork) is Recoverable.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut writer = ScriptedRpcWriter::new(
+            pending.clone(),
+            vec![
+                Ok(json!({"success": true, "data": {"messages": [{"entryId": "e1"}]}})),
+                Ok(json!({"success": true, "data": {"cancelled": true}})),
+            ],
+        );
+        let err = fork_pi_session(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut 0,
+            Path::new("pi"),
+            Path::new("/tmp"),
+            &original_cursor,
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ForkError::Recoverable(_)));
+
+        // Failure during switch_session back to original after fork succeeded is SessionDesynced.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut writer = ScriptedRpcWriter::new(
+            pending.clone(),
+            vec![
+                Ok(json!({"success": true, "data": {"messages": [{"entryId": "e1"}]}})),
+                Ok(json!({"success": true, "data": {"cancelled": false}})),
+                Ok(json!({"success": true, "data": {"sessionId": "fork-1", "sessionFile": "/tmp/fork.jsonl"}})),
+                Err("switch_session failed".to_owned()),
+            ],
+        );
+        let err = fork_pi_session(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut 0,
+            Path::new("pi"),
+            Path::new("/tmp"),
+            &original_cursor,
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ForkError::SessionDesynced(_)));
+
+        // Restoring to a mismatched session ID is also SessionDesynced.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut writer = ScriptedRpcWriter::new(
+            pending.clone(),
+            vec![
+                Ok(json!({"success": true, "data": {"messages": [{"entryId": "e1"}]}})),
+                Ok(json!({"success": true, "data": {"cancelled": false}})),
+                Ok(json!({"success": true, "data": {"sessionId": "fork-2", "sessionFile": "/tmp/fork2.jsonl"}})),
+                Ok(json!({"success": true, "data": {"cancelled": false}})),
+                Ok(json!({"success": true, "data": {"sessionId": "wrong-id", "sessionFile": "/tmp/wrong.jsonl"}})),
+            ],
+        );
+        let err = fork_pi_session(
+            PiFlavor::Pi,
+            &mut writer,
+            &pending,
+            &mut 0,
+            Path::new("pi"),
+            Path::new("/tmp"),
+            &original_cursor,
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ForkError::SessionDesynced(_)));
+    }
+
+    #[test]
+    fn pi_stderr_filter_ignores_benign_diagnostics_and_keeps_real_errors() {
+        for benign in [
+            "",
+            "   ",
+            "Loaded extension: error-handler.ts",
+            "Loading skill ~/.pi/skills/error-recovery/SKILL.md",
+            "warning: ignored error in optional plugin",
+            "WARN: transient error will be retried",
+            "INFO: completed with 0 errors",
+            "DEBUG: error state reset",
+            "(node:12345) [DEP0040] DeprecationWarning: error formatting changed",
+            "    at formatError (file:///usr/lib/pi/error.js:12:5)",
+            r#"{"level":"debug","msg":"checked errors","error":null}"#,
+            r#"{"level":30,"msg":"0 errors reported"}"#,
+        ] {
+            assert_eq!(
+                pi_stderr_error_line(benign),
+                None,
+                "benign stderr line should not trigger DriverEvent::Error: {benign:?}"
+            );
+        }
+
+        for real_error in [
+            "error: Cannot find module 'foo'",
+            "\x1b[31mError:\x1b[0m API key missing",
+            "TypeError: Cannot read properties of undefined",
+            "AssertionError [ERR_ASSERTION]: invalid rpc state",
+            "[ERROR] failed to open session file",
+            "[omp] error: corrupted config.json",
+            "2026-11-21T12:00:00Z ERROR sqlite busy",
+            "panic(main thread): Segmentation fault",
+            "UnhandledPromiseRejection: ECONNREFUSED",
+            r#"{"level":"error","msg":"authentication rejected"}"#,
+        ] {
+            assert!(
+                pi_stderr_error_line(real_error).is_some(),
+                "real stderr error should be surfaced: {real_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_process_handle_guards_pid_reuse_and_scoped_child_cleans_up_on_drop() {
+        let handle = PiProcessHandle::new(
+            u32::MAX,
+            #[cfg(windows)]
+            None,
+        );
+        handle.mark_exited();
+        // After mark_exited, terminate must be a no-op (not signaling sentinel PID).
+        handle.terminate();
+        assert!(handle.is_shutting_down());
+        assert_eq!(handle.state.lock().pid, 0);
+
+        #[cfg(windows)]
+        let child = {
+            let mut cmd = std::process::Command::new("cmd.exe");
+            cmd.args(["/d", "/c", "ping -n 30 127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            crate::command_env::spawn(&mut cmd).unwrap()
+        };
+        #[cfg(unix)]
+        let child = {
+            use std::os::unix::process::CommandExt as _;
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0);
+            crate::command_env::spawn(&mut cmd).unwrap()
+        };
+        let mut scoped = ScopedChildProcess::adopt(child);
+        let mut stdout = scoped.child.stdout.take().unwrap();
+        let (done_tx, done_rx) = bounded(1);
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+            let _ = done_tx.send(());
+        });
+        drop(scoped);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropping ScopedChildProcess must terminate the child process tree");
     }
 }

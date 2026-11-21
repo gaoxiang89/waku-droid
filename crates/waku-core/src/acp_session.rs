@@ -6,7 +6,6 @@
 //! reasoning and provider-only tool records by construction.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +15,7 @@ use agent_client_protocol::schema::v1::{
     ClientCapabilities, Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
     SessionNotification,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context as _, anyhow};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -43,9 +42,15 @@ pub(crate) fn catalog_working_directory() -> anyhow::Result<PathBuf> {
         "waku-provider-session-catalog-{}",
         std::process::id()
     ));
-    fs::create_dir_all(&directory).with_context(|| {
+    crate::fs_ext::create_private_dir_all(&directory).with_context(|| {
         format!(
             "could not create provider-session catalog directory {}",
+            directory.display()
+        )
+    })?;
+    crate::fs_ext::restrict_to_owner(&directory).with_context(|| {
+        format!(
+            "could not secure provider-session catalog directory {}",
             directory.display()
         )
     })?;
@@ -73,7 +78,13 @@ pub(crate) fn session_title(
     title
         .map(str::trim)
         .filter(|title| !title.is_empty())
-        .map(str::to_owned)
+        .and_then(|title| {
+            if provider == ProviderKind::Cursor {
+                crate::cursor_session::strip_title_envelope(title)
+            } else {
+                Some(title.to_owned())
+            }
+        })
         .unwrap_or_else(|| {
             let short_id = session_id.chars().take(8).collect::<String>();
             format!("{} session {short_id}", provider.short_name())
@@ -93,6 +104,21 @@ pub fn list_provider_sessions(
         return Ok(Vec::new());
     }
     let agent = crate::driver::catalog_agent(provider, binary, &catalog_working_directory()?)?;
+    list_provider_sessions_with_agent(provider, agent, cwd_filters, limit)
+}
+
+fn list_provider_sessions_with_agent<C>(
+    provider: ProviderKind,
+    agent: C,
+    cwd_filters: &[PathBuf],
+    limit: usize,
+) -> anyhow::Result<Vec<ProviderSessionSummary>>
+where
+    C: ConnectTo<Client> + 'static,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let filters = if cwd_filters.is_empty() {
         vec![None]
     } else {
@@ -151,9 +177,6 @@ pub fn list_provider_sessions(
                             updated_at,
                         });
                     }
-                    if found.len() >= limit {
-                        break;
-                    }
                     let Some(next) = response.next_cursor.filter(|next| !next.is_empty()) else {
                         break;
                     };
@@ -161,9 +184,6 @@ pub fn list_provider_sessions(
                         break;
                     }
                     cursor = Some(next);
-                }
-                if found.len() >= limit {
-                    break;
                 }
             }
             found.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -500,6 +520,9 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
             activity.complete = true;
         }
     }
+    if provider == ProviderKind::Cursor {
+        crate::cursor_session::expand_imported_history(&mut history);
+    }
     history
 }
 
@@ -654,5 +677,119 @@ mod tests {
         assert_eq!(history.messages[1].content, "answer 2");
         assert_eq!(history.transcript_blocks.len(), 1);
         assert_eq!(history.transcript_blocks[0].after_message, 1);
+    }
+
+    #[test]
+    fn catalog_directory_restricts_permissions_on_unix() {
+        let directory = catalog_working_directory().unwrap();
+        assert!(directory.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn list_provider_sessions_fetches_all_pages_before_sorting_and_truncating() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, ListSessionsResponse, SessionCapabilities,
+            SessionInfo, SessionListCapabilities,
+        };
+
+        let cwd = std::env::temp_dir();
+        let cwd_for_agent = cwd.clone();
+        let pages_requested = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let pages_seen = Arc::clone(&pages_requested);
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().list(SessionListCapabilities::new()),
+                    );
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    pages_seen.lock().push(req.cursor.clone());
+                    let response = match req.cursor.as_deref() {
+                        None => ListSessionsResponse::new(vec![
+                            SessionInfo::new("old-1", cwd_for_agent.clone())
+                                .title("Oldest")
+                                .updated_at("2026-01-01T00:00:01Z"),
+                            SessionInfo::new("mid-2", cwd_for_agent.clone())
+                                .title("Middle")
+                                .updated_at("2026-01-02T00:00:01Z"),
+                        ])
+                        .next_cursor("page-2".to_owned()),
+                        Some("page-2") => ListSessionsResponse::new(vec![
+                            SessionInfo::new("newest-3", cwd_for_agent.clone())
+                                .title("Newest")
+                                .updated_at("2026-01-03T00:00:01Z"),
+                        ]),
+                        Some(_) => ListSessionsResponse::new(Vec::new()),
+                    };
+                    responder.respond(response)
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let sessions =
+            list_provider_sessions_with_agent(ProviderKind::Cursor, mock_agent, &[], 2).unwrap();
+        assert_eq!(
+            *pages_requested.lock(),
+            vec![None, Some("page-2".to_owned())],
+            "pagination must not stop at `limit` before fetching later pages"
+        );
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].cursor.native_id(), "newest-3");
+        assert_eq!(sessions[1].cursor.native_id(), "mid-2");
+    }
+
+    #[test]
+    fn cursor_replay_strips_branch_envelope_and_keeps_block_alignment() {
+        let context = serde_json::to_string(&vec![
+            json!({"role": "user", "content": "prior prompt"}),
+            json!({"role": "assistant", "content": "prior answer"}),
+        ])
+        .unwrap();
+        let seeded = crate::cursor_session::prompt_with_fork_context(&context, "branch follow-up");
+        let (first_half, second_half) = seeded.split_at(seeded.len() / 2);
+
+        let history = history_from_updates(
+            ProviderKind::Cursor,
+            &[
+                json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":first_half}}),
+                json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":second_half}}),
+                json!({"sessionUpdate":"tool_call","toolCallId":"c1","title":"read_file","rawInput":{"path":"lib.rs"}}),
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"branch reply"}}),
+            ],
+        );
+
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(history.messages.len(), 4);
+        assert_eq!(history.messages[0].content, "prior prompt");
+        assert_eq!(history.messages[1].content, "prior answer");
+        assert_eq!(history.messages[2].content, "branch follow-up");
+        assert_eq!(history.messages[3].content, "branch reply");
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("WAKU_CURSOR_BRANCH_CONTEXT_V1"))
+        );
+        assert_eq!(history.transcript_blocks.len(), 1);
+        assert_eq!(history.transcript_blocks[0].after_message, 3);
+        assert_eq!(
+            session_title(ProviderKind::Cursor, Some(&seeded), "cursor-12345678"),
+            "branch follow-up"
+        );
     }
 }
