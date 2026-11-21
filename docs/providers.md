@@ -524,8 +524,10 @@ as newline-delimited user messages on stdin.
 **Approvals** — `control_request` / `subtype: "can_use_tool"` carries the tool
 name, input, `tool_use_id`, the `blocked_path` that tripped the check, and
 `permission_suggestions`. Waku answers with a `control_response` whose result is
-`{"behavior":"allow"}` or `{"behavior":"deny","message":…}`. Outside Supervised it
-answers allow itself.
+`{"behavior":"allow"}` or `{"behavior":"deny","message":…}`. Claude Code
+enforces `--permission-mode` (`default`, `acceptEdits`, `auto`,
+`bypassPermissions`) natively, so only Full access auto-approves `can_use_tool`
+requests itself; every other mode surfaces them to the user.
 
 **Cancel** — a `control_request` with `subtype: "interrupt"`.
 
