@@ -14,6 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.51]
+
+- Paste an image once: when the clipboard offers the same picture in more than one format, the composer stages a single attachment instead of the file plus its raw bytes
+- Keep sessions alive across daemon upgrades: a daemon left running from before a protocol change is now asked to shut down over its own protocol and replaced instead of failing the handshake, and the Windows installer launches only after the local daemon has stopped so the update can no longer race the daemon teardown
+- Only act on a recorded daemon pid after confirming the process is still `waku-daemon`, so a recycled pid is never signaled, and report a failed local daemon start in a dialog on Windows instead of dying silently
+- Show Droid's actual logo wherever the provider is listed, and keep the model chip from resizing when a busy session locks the model picker
+
 ## [0.1.50]
 
 - Drag and drop or upload files and folders into the Files sidebar across local and remote (SSH/WSL) workspaces: hover highlights the target folder or workspace root, prompts before replacing existing entries, streams chunks over the daemon RPC with a live progress and cancel card, and supports keyboard upload via the toolbar button, context menu, and paste (`Ctrl+V` / `Cmd+V`)
