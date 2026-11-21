@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::ActivationExt as _;
 
 use anyhow::Context as _;
 use base64::Engine as _;
@@ -1474,7 +1475,9 @@ impl Waku {
                     let select_weak = weak.clone();
                     let select_popover = popover.clone();
                     let favorite_model_id = model.id.clone();
+                    let key_favorite_model_id = model.id.clone();
                     let favorite_weak = weak.clone();
+                    let key_favorite_weak = weak.clone();
                     let show_account_in_subtitle =
                         searching || selected_tab == ModelPickerTab::Favorites;
                     let subtitle = model_picker_entry_subtitle(
@@ -1553,6 +1556,10 @@ impl Waku {
                                         row_suffix,
                                         model.id
                                     )))
+                                    .tab_index(0)
+                                    .focus_visible(|style| {
+                                        style.border_1().border_color(theme.accent)
+                                    })
                                     .w(px(28.0))
                                     .h(px(28.0))
                                     .rounded(px(6.0))
@@ -1582,6 +1589,23 @@ impl Waku {
                                                 cx,
                                             );
                                         });
+                                    })
+                                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                        if !event.keystroke.modifiers.modified()
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            cx.stop_propagation();
+                                            let _ = key_favorite_weak.update(cx, |this, cx| {
+                                                this.toggle_favorite_model(
+                                                    kind,
+                                                    key_favorite_model_id.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        }
                                     }),
                             )
                             .on_click(move |_, window, cx| {
@@ -1601,11 +1625,13 @@ impl Waku {
                 let next_models = available_models.clone();
                 let previous_models = available_models.clone();
                 let confirm_models = available_models.clone();
+                let favorite_models = available_models.clone();
                 let next_weak = weak.clone();
                 let previous_weak = weak.clone();
                 let next_tab_weak = weak.clone();
                 let previous_tab_weak = weak.clone();
                 let confirm_weak = weak.clone();
+                let favorite_shortcut_weak = weak.clone();
                 let confirm_popover = popover.clone();
                 div()
                     .w(px(460.0))
@@ -1648,6 +1674,23 @@ impl Waku {
                         });
                         confirm_popover.close(window, cx);
                         window.refresh();
+                    })
+                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                        let primary_only = event.keystroke.modifiers.secondary()
+                            && !event.keystroke.modifiers.alt
+                            && !event.keystroke.modifiers.shift
+                            && !event.keystroke.modifiers.function
+                            && if cfg!(target_os = "macos") {
+                                !event.keystroke.modifiers.control
+                            } else {
+                                !event.keystroke.modifiers.platform
+                            };
+                        if primary_only && event.keystroke.key.eq_ignore_ascii_case("d") {
+                            let _ = favorite_shortcut_weak.update(cx, |this, cx| {
+                                this.toggle_highlighted_model_favorite(&favorite_models, cx);
+                            });
+                            cx.stop_propagation();
+                        }
                     })
                     .child(sidebar)
                     .child(
@@ -1781,6 +1824,18 @@ impl Waku {
             entry.model.id.clone(),
         );
         self.choose_agent_model(kind, account_id, model_id, cx);
+    }
+
+    fn toggle_highlighted_model_favorite(
+        &mut self,
+        models: &[PickerModelEntry],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = models.get(self.model_picker_highlight.unwrap_or(0)) else {
+            return;
+        };
+        let (kind, model_id) = (entry.provider, entry.model.id.clone());
+        self.toggle_favorite_model(kind, model_id, cx);
     }
 
     pub(super) fn render_model_traits_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2242,10 +2297,11 @@ impl Waku {
         .map_or(0, |observed| observed.elapsed().as_secs() as i64);
         let label = super::goal_dialog::goal_chip_label(goal, live_elapsed_seconds);
         let objective = goal.objective.clone();
-        let weak = cx.entity().downgrade();
         Some(
             div()
                 .id("composer-goal")
+                .tab_index(0)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
                 .h(px(24.0))
                 .px(px(7.0))
                 .rounded(px(6.0))
@@ -2260,10 +2316,8 @@ impl Waku {
                 .child(div().max_w(px(220.0)).truncate().child(label))
                 .hover(|element| element.bg(theme.overlay))
                 .tooltip(Tooltip::text(objective))
-                .on_click(move |_, _, cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.request_goal_dialog(session_id, None, false, cx);
-                    });
+                .on_activation(cx, move |this, _, cx| {
+                    this.request_goal_dialog(session_id, None, false, cx);
                 })
                 .into_any_element(),
         )
@@ -3205,6 +3259,10 @@ impl Waku {
                                 .child(
                                     div()
                                         .id("send-or-stop")
+                                        .tab_index(0)
+                                        .focus_visible(|style| {
+                                            style.border_1().border_color(theme.accent)
+                                        })
                                         .w(px(26.0))
                                         .h(px(26.0))
                                         .rounded_full()
@@ -3227,14 +3285,18 @@ impl Waku {
                                         .when(!escape_stop_armed, |element| {
                                             element.child(icon("icons/stop.svg", 18.0, theme.text))
                                         })
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_activation(cx, |this, _, cx| {
                                             this.cancel_turn(cx);
-                                        })),
+                                        }),
                                 )
                                 .when(can_send, |element| {
                                     element.child(
                                         div()
                                             .id("queue-follow-up")
+                                            .tab_index(0)
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(theme.accent)
+                                            })
                                             .w(px(26.0))
                                             .h(px(26.0))
                                             .rounded_full()
@@ -3251,7 +3313,7 @@ impl Waku {
                                                 theme.on_inverse,
                                             ))
                                             .tooltip(Tooltip::text(tr!("composer.queue_followup")))
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                            .on_activation(cx, |this, _, cx| {
                                                 let prompt =
                                                     this.composer.read(cx).content(cx).to_owned();
                                                 if let Some(submission) =
@@ -3261,7 +3323,7 @@ impl Waku {
                                                         .update(cx, |input, cx| input.clear(cx));
                                                     this.submit_composer_submission(submission, cx);
                                                 }
-                                            })),
+                                            }),
                                     )
                                 }),
                             ComposerSubmitAction::Send => div()
@@ -3277,11 +3339,26 @@ impl Waku {
                                 } else {
                                     theme.overlay_strong
                                 })
+                                .focus_visible(|style| {
+                                    style.border_1().border_color(theme.accent)
+                                })
                                 .when(can_send, |element| {
                                     element
+                                        .tab_index(0)
                                         .cursor_default()
                                         .hover(|element| element.opacity(0.9))
                                         .active(|element| element.opacity(0.8))
+                                        .on_activation(cx, |this, _, cx| {
+                                            let prompt =
+                                                this.composer.read(cx).content(cx).to_owned();
+                                            if let Some(submission) =
+                                                this.submission_with_attachments(&prompt, cx)
+                                            {
+                                                this.composer
+                                                    .update(cx, |input, cx| input.clear(cx));
+                                                this.submit_composer_submission(submission, cx);
+                                            }
+                                        })
                                 })
                                 .child(icon(
                                     "icons/arrow-up.svg",
@@ -3296,16 +3373,7 @@ impl Waku {
                                 // the draft is ready and the machine is not.
                                 .when(no_providers, |element| {
                                     element.tooltip(Tooltip::text(tr!("composer.no_providers")))
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let prompt = this.composer.read(cx).content(cx).to_owned();
-                                    if let Some(submission) =
-                                        this.submission_with_attachments(&prompt, cx)
-                                    {
-                                        this.composer.update(cx, |input, cx| input.clear(cx));
-                                        this.submit_composer_submission(submission, cx);
-                                    }
-                                })),
+                                }),
                         }),
                 ),
         )

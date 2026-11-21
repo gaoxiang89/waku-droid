@@ -11,6 +11,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use gpui::{PathBuilder, relative};
 
 use super::*;
+use crate::ui::ActivationExt as _;
 use crate::usage_history::{
     self, MONTHLY_WINDOW, MonthSlice, PricingStatus, ProjectSlice, ProviderDay, UsageHistory,
     UsageProvider, UsageWindow, WINDOW_CHOICES,
@@ -317,6 +318,11 @@ impl Waku {
             .border_color(theme.border_strong)
             .flex()
             .overflow_hidden();
+        const VIEW_OPTIONS: [UsageViewMode; 3] = [
+            UsageViewMode::Daily,
+            UsageViewMode::Monthly,
+            UsageViewMode::Projects,
+        ];
         for (view, label) in [
             (UsageViewMode::Daily, tr!("usage.daily")),
             (UsageViewMode::Monthly, tr!("usage.monthly")),
@@ -349,6 +355,22 @@ impl Waku {
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_usage_view(view, cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        let key = event.keystroke.key.as_str();
+                        if matches!(key, "enter" | "space") {
+                            this.set_usage_view(view, cx);
+                            cx.stop_propagation();
+                        } else if let Some(next) =
+                            next_segmented_option(&VIEW_OPTIONS, this.usage_view, key)
+                        {
+                            this.set_usage_view(next, cx);
+                            cx.stop_propagation();
+                        }
                     })),
             );
         }
@@ -417,9 +439,9 @@ impl Waku {
                 tr!("usage.rescan")
             }))
             .child(refresh_glyph)
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_activation(cx, |this, _, cx| {
                 this.ensure_usage_history(true, cx);
-            }));
+            });
 
         let range_label = if monthly {
             tr!(
@@ -615,6 +637,7 @@ impl Waku {
             .border_color(theme.border_strong)
             .flex()
             .overflow_hidden();
+        const METRIC_OPTIONS: [UsageMetric; 2] = [UsageMetric::Cost, UsageMetric::Tokens];
         for (option, label) in [
             (UsageMetric::Cost, tr!("usage.cost_upper")),
             (UsageMetric::Tokens, tr!("usage.tokens_upper")),
@@ -645,6 +668,25 @@ impl Waku {
                         if this.usage_metric != option {
                             this.usage_metric = option;
                             cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        let key = event.keystroke.key.as_str();
+                        let next = if matches!(key, "enter" | "space") {
+                            Some(option)
+                        } else {
+                            next_segmented_option(&METRIC_OPTIONS, this.usage_metric, key)
+                        };
+                        if let Some(next) = next {
+                            if this.usage_metric != next {
+                                this.usage_metric = next;
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
                         }
                     })),
             );
@@ -1015,6 +1057,7 @@ impl Waku {
             .border_color(theme.border_strong)
             .flex()
             .overflow_hidden();
+        const BREAKDOWN_OPTIONS: [UsageBreakdown; 2] = [UsageBreakdown::Model, UsageBreakdown::Day];
         for (option, label) in [
             (UsageBreakdown::Model, tr!("usage.model_upper")),
             (UsageBreakdown::Day, tr!("usage.day_upper")),
@@ -1045,6 +1088,25 @@ impl Waku {
                         if this.usage_breakdown != option {
                             this.usage_breakdown = option;
                             cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        let key = event.keystroke.key.as_str();
+                        let next = if matches!(key, "enter" | "space") {
+                            Some(option)
+                        } else {
+                            next_segmented_option(&BREAKDOWN_OPTIONS, this.usage_breakdown, key)
+                        };
+                        if let Some(next) = next {
+                            if this.usage_breakdown != next {
+                                this.usage_breakdown = next;
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
                         }
                     })),
             );
@@ -1464,27 +1526,65 @@ impl Waku {
 
     /// Display name and path caption for a project row: a known Waku
     /// project's name when the path is one, else the directory's own name
-    /// alongside its complete path, shortening only the home prefix.
+    /// alongside its complete path, shortening only the local home prefix.
     fn usage_project_identity(&self, project: &ProjectSlice) -> (String, Option<String>) {
-        if project.path.is_empty() {
-            return (tr!("usage.other_sessions"), None);
-        }
-        let path = Path::new(&project.path);
-        let name = self
-            .state
-            .projects
-            .iter()
-            .find(|known| known.path.as_path() == path)
-            .map(|known| known.name.clone())
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| project.path.clone());
-        let home = crate::projectless::home_directory();
-        (name, Some(usage_project_path(path, home.as_deref())))
+        let host = self
+            .usage_history_host
+            .clone()
+            .unwrap_or_else(|| self.effective_usage_host());
+        usage_project_identity_for_host(
+            project,
+            &self.state.projects,
+            self.home_directory.as_deref(),
+            &host,
+        )
     }
+}
+
+fn usage_project_identity_for_host(
+    project: &ProjectSlice,
+    known_projects: &[Project],
+    local_home: Option<&Path>,
+    host: &waku_client::hosts::HostKey,
+) -> (String, Option<String>) {
+    if project.path.is_empty() {
+        return (tr!("usage.other_sessions"), None);
+    }
+    let path = Path::new(&project.path);
+    let name = known_projects
+        .iter()
+        .find(|known| known.path.as_path() == path)
+        .map(|known| known.name.clone())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| project.path.clone());
+    let home = (*host == waku_client::hosts::HostKey::Local)
+        .then_some(local_home)
+        .flatten();
+    (name, Some(usage_project_path(path, home)))
+}
+
+fn next_segmented_option<T: Copy + PartialEq>(
+    options: &[T],
+    current: T,
+    key: &str,
+) -> Option<T> {
+    if options.is_empty() {
+        return None;
+    }
+    let index = options.iter().position(|option| *option == current).unwrap_or(0);
+    let last = options.len() - 1;
+    let next = match key {
+        "left" => index.saturating_sub(1),
+        "right" => (index + 1).min(last),
+        "home" => 0,
+        "end" => last,
+        _ => return None,
+    };
+    Some(options[next])
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3010,5 +3110,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn project_identity_abbreviates_home_only_for_local_host() {
+        let home = Path::new("/Users/developer");
+        let mut known = Project::from_path(PathBuf::from("/Users/developer/dev/waku"));
+        known.name = "Waku App".to_owned();
+        let slice = ProjectSlice {
+            path: "/Users/developer/dev/waku".to_owned(),
+            cost_usd: 1.0,
+            total_tokens: 100,
+            by_provider: [
+                ProviderDay {
+                    cost_usd: 1.0,
+                    total_tokens: 100,
+                },
+                ProviderDay {
+                    cost_usd: 0.0,
+                    total_tokens: 0,
+                },
+            ],
+            sessions: 1,
+            cost_share: 1.0,
+            last_day: None,
+            top_models: Vec::new(),
+        };
+
+        let (local_name, local_path) = usage_project_identity_for_host(
+            &slice,
+            std::slice::from_ref(&known),
+            Some(home),
+            &waku_client::hosts::HostKey::Local,
+        );
+        assert_eq!(local_name, "Waku App");
+        assert_eq!(local_path.as_deref(), Some("~/dev/waku"));
+
+        let remote_host = waku_client::hosts::HostKey::Connection("ssh-prod".to_owned());
+        let (remote_name, remote_path) = usage_project_identity_for_host(
+            &slice,
+            &[],
+            Some(home),
+            &remote_host,
+        );
+        assert_eq!(remote_name, "waku");
+        assert_eq!(remote_path.as_deref(), Some("/Users/developer/dev/waku"));
+    }
+
+    #[test]
+    fn segmented_option_navigation_handles_arrows_and_bounds() {
+        let options = [
+            UsageViewMode::Daily,
+            UsageViewMode::Monthly,
+            UsageViewMode::Projects,
+        ];
+        assert_eq!(
+            next_segmented_option(&options, UsageViewMode::Daily, "left"),
+            Some(UsageViewMode::Daily)
+        );
+        assert_eq!(
+            next_segmented_option(&options, UsageViewMode::Daily, "right"),
+            Some(UsageViewMode::Monthly)
+        );
+        assert_eq!(
+            next_segmented_option(&options, UsageViewMode::Monthly, "end"),
+            Some(UsageViewMode::Projects)
+        );
+        assert_eq!(
+            next_segmented_option(&options, UsageViewMode::Projects, "home"),
+            Some(UsageViewMode::Daily)
+        );
+        assert_eq!(
+            next_segmented_option(&options, UsageViewMode::Daily, "up"),
+            None
+        );
+    }
+
+    #[test]
+    fn usage_page_render_never_queries_home_directory_per_frame() {
+        let source = include_str!("./usage_page.rs");
+        let end = source
+            .find("\n#[cfg(test)]")
+            .expect("test module marker must exist");
+        assert!(
+            !source[..end].contains("projectless::home_directory("),
+            "usage_page must read cached Waku.home_directory instead of querying home_directory per frame"
+        );
     }
 }

@@ -11,6 +11,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
 use super::*;
+use crate::ui::ActivationExt as _;
 
 actions!(
     waku_command_palette,
@@ -1553,10 +1554,8 @@ impl Waku {
             );
             return (session.provider, account_id);
         }
-        let provider = ProviderKind::ALL
-            .into_iter()
-            .find(|provider| !self.disabled_providers_for(&host).contains(provider))
-            .unwrap_or_default();
+        let disabled = self.disabled_providers_for(&host);
+        let provider = default_resume_provider(self.state.last_provider, disabled);
         let account_id = if provider == self.state.last_provider {
             self.validated_account_id_for_host(
                 &host,
@@ -2117,12 +2116,14 @@ impl Waku {
                         empty.child(
                             div()
                                 .id("command-palette-resume-provider")
+                                .tab_index(0)
                                 .mt(px(12.0))
                                 .h(px(28.0))
                                 .px(px(9.0))
                                 .rounded(px(8.0))
                                 .border_1()
                                 .border_color(theme.border)
+                                .focus_visible(|style| style.border_color(theme.accent))
                                 .flex()
                                 .items_center()
                                 .gap(px(7.0))
@@ -2141,10 +2142,9 @@ impl Waku {
                                         .child(resume_agent_label),
                                 )
                                 .child(icon("icons/chevron-down.svg", 11.0, theme.text_tertiary))
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_activation(cx, |this, _, cx| {
                                     this.open_command_palette_resume_provider_view(cx);
-                                    cx.stop_propagation();
-                                })),
+                                }),
                         )
                     }),
             );
@@ -2408,9 +2408,45 @@ impl Waku {
     }
 }
 
+fn default_resume_provider(
+    last_provider: ProviderKind,
+    disabled: &[ProviderKind],
+) -> ProviderKind {
+    if !disabled.contains(&last_provider) {
+        return last_provider;
+    }
+    ProviderKind::ALL
+        .into_iter()
+        .find(|provider| !disabled.contains(provider))
+        .unwrap_or(last_provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_resume_provider_honors_last_provider_when_enabled() {
+        assert_eq!(
+            default_resume_provider(ProviderKind::Claude, &[]),
+            ProviderKind::Claude
+        );
+        assert_eq!(
+            default_resume_provider(ProviderKind::DeepSeek, &[ProviderKind::Codex]),
+            ProviderKind::DeepSeek
+        );
+        assert_eq!(
+            default_resume_provider(ProviderKind::Claude, &[ProviderKind::Claude]),
+            ProviderKind::ALL
+                .into_iter()
+                .find(|provider| *provider != ProviderKind::Claude)
+                .unwrap()
+        );
+        assert_eq!(
+            default_resume_provider(ProviderKind::Claude, &ProviderKind::ALL),
+            ProviderKind::Claude
+        );
+    }
 
     fn score(query: &str, candidate: &str) -> Option<u32> {
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);

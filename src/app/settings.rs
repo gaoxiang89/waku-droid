@@ -1,5 +1,6 @@
 use super::composer::next_picker_highlight;
 use super::*;
+use crate::ui::ActivationExt as _;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum AccountFormMode {
@@ -209,6 +210,8 @@ impl Waku {
                 div().px(px(12.0)).child(
                     div()
                         .id("settings-back")
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
                         .h(px(34.0))
                         .px(px(9.0))
                         .rounded(px(8.0))
@@ -222,12 +225,12 @@ impl Waku {
                         .active(|element| element.bg(theme.overlay_strong))
                         .child(icon("icons/arrow-left.svg", 15.0, theme.text_tertiary))
                         .child(tr!("settings.back"))
-                        .on_click(cx.listener(|this, _, window, cx| {
+                        .on_activation(cx, |this, window, cx| {
                             this.settings_page = None;
                             let focus_handle = this.composer_focus(cx);
                             window.focus(&focus_handle, cx);
                             cx.notify();
-                        })),
+                        }),
                 ),
             )
             .child(
@@ -579,6 +582,8 @@ impl Waku {
                 {
                     div()
                         .id("install-update-settings-button")
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
                         .px(px(12.0))
                         .py(px(6.0))
                         .rounded(px(6.0))
@@ -589,9 +594,9 @@ impl Waku {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(0xFFFFFF))
                         .child(tr!("updater.update"))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_activation(cx, |this, _, cx| {
                             this.start_available_update(cx);
-                        }))
+                        })
                 } else if self.updater_status == crate::updater::UpdateStatus::Updating {
                     div()
                         .id("updating-settings-indicator")
@@ -604,6 +609,8 @@ impl Waku {
                 } else {
                     div()
                         .id("check-for-updates-settings-button")
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(theme.accent))
                         .px(px(12.0))
                         .py(px(6.0))
                         .rounded(px(6.0))
@@ -615,7 +622,7 @@ impl Waku {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .child(tr!("settings.check_for_updates"))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_activation(cx, |this, _, cx| {
                             this.show_toast_with_tone(tr!("updater.checking"), ToastTone::Success);
                             if let Some(updater) = cx
                                 .try_global::<crate::updater::UpdaterState>()
@@ -623,7 +630,7 @@ impl Waku {
                             {
                                 updater.check_for_updates();
                             }
-                        }))
+                        })
                 };
                 column
                     .child(
@@ -820,7 +827,6 @@ impl Waku {
         let apply_disabled = pending || !fields_dirty;
         let apply_button = div()
             .id("apply-daemon-settings")
-            .tab_index(0)
             .h(px(29.0))
             .px(px(11.0))
             .rounded(px(7.0))
@@ -836,18 +842,11 @@ impl Waku {
             .focus_visible(|style| style.border_color(theme.accent))
             .when(!apply_disabled, |element| {
                 element
+                    .tab_index(0)
                     .hover(|element| element.bg(theme.overlay))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_activation(cx, |this, _, cx| {
                         this.apply_daemon_exposure_fields(cx);
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if !event.keystroke.modifiers.modified()
-                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        {
-                            this.apply_daemon_exposure_fields(cx);
-                            cx.stop_propagation();
-                        }
-                    }))
+                    })
             })
             .child(if pending {
                 tr!("daemon.restarting")
@@ -995,7 +994,6 @@ impl Waku {
 
         let regenerate_button = div()
             .id("regenerate-daemon-token")
-            .tab_index(0)
             .h(px(27.0))
             .px(px(9.0))
             .rounded(px(6.0))
@@ -1010,18 +1008,11 @@ impl Waku {
             .focus_visible(|style| style.border_color(theme.accent))
             .when(!pending, |element| {
                 element
+                    .tab_index(0)
                     .hover(|element| element.bg(theme.overlay))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_activation(cx, |this, _, cx| {
                         this.regenerate_daemon_token(cx);
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if !event.keystroke.modifiers.modified()
-                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                        {
-                            this.regenerate_daemon_token(cx);
-                            cx.stop_propagation();
-                        }
-                    }))
+                    })
             })
             .child(tr!("daemon.regenerate_token"));
 
@@ -1775,8 +1766,15 @@ impl Waku {
                 .border_color(theme.border_strong)
                 .flex()
                 .overflow_hidden();
+            let selected_index = self
+                .hosts
+                .hosts
+                .iter()
+                .position(|host| &host.key == selected_host)
+                .unwrap_or(0);
             for (index, host) in self.hosts.hosts.iter().enumerate() {
                 let key = host.key.clone();
+                let key_for_keydown = key.clone();
                 let label: SharedString = if key == waku_client::hosts::HostKey::Local {
                     tr!("connections.local").into()
                 } else {
@@ -1806,6 +1804,23 @@ impl Waku {
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             on_select(this, key.clone(), cx);
+                            cx.stop_propagation();
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if event.keystroke.modifiers.modified() {
+                                return;
+                            }
+                            let pressed = event.keystroke.key.as_str();
+                            if matches!(pressed, "enter" | "space") {
+                                on_select(this, key_for_keydown.clone(), cx);
+                                cx.stop_propagation();
+                            } else if let Some(next_index) =
+                                next_host_tab_index(selected_index, this.hosts.hosts.len(), pressed)
+                                && let Some(next_host) = this.hosts.hosts.get(next_index)
+                            {
+                                on_select(this, next_host.key.clone(), cx);
+                                cx.stop_propagation();
+                            }
                         })),
                 );
             }
@@ -1976,9 +1991,9 @@ impl Waku {
             )
             .tab_index(0)
             .focus_visible(|style| style.border_1().border_color(theme.accent))
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .on_activation(cx, move |this, window, cx| {
                 this.toggle_provider_expanded(kind, window, cx);
-            }));
+            });
 
             let header = div()
                 .flex()
@@ -3833,16 +3848,51 @@ fn default_provider_config_dir(kind: ProviderKind, home: Option<&Path>) -> Optio
     }
 }
 
+fn next_host_tab_index(current: usize, count: usize, key: &str) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let last = count - 1;
+    let current = current.min(last);
+    match key {
+        "left" => Some(current.saturating_sub(1)),
+        "right" => Some((current + 1).min(last)),
+        "home" => Some(0),
+        "end" => Some(last),
+        _ => None,
+    }
+}
+
+fn quote_posix_shell_arg(value: &str) -> String {
+    // Preserve leading `~/` tilde expansion for remote POSIX paths while
+    // single-quoting the remainder so spaces and shell metacharacters
+    // (`'`, `"`, `$`, `;`, etc.) stay strictly literal.
+    if value == "~" {
+        return "~".to_owned();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if rest.is_empty() {
+            return "~/".to_owned();
+        }
+        return format!("~/'{}'", rest.replace('\'', "'\\''"));
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn quote_powershell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn format_account_login_command(
     kind: ProviderKind,
     config_dir: &str,
     windows_shell: bool,
 ) -> String {
     let trimmed = config_dir.trim();
-    let quoted = if trimmed.contains(' ') {
-        format!("\"{trimmed}\"")
+    let quoted = if windows_shell {
+        quote_powershell_arg(trimmed)
     } else {
-        trimmed.to_owned()
+        quote_posix_shell_arg(trimmed)
     };
     match (kind, windows_shell) {
         (ProviderKind::Claude, true) => {
@@ -3985,7 +4035,7 @@ fn permission_status_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderKind, abbreviate_home_path, format_account_login_command,
+        ProviderKind, abbreviate_home_path, format_account_login_command, next_host_tab_index,
         normalized_config_dir_key,
     };
     use std::path::Path;
@@ -4024,19 +4074,66 @@ mod tests {
                 r"C:\Users\My Name\.claude-alt",
                 true
             ),
-            r#"$env:CLAUDE_CONFIG_DIR="C:\Users\My Name\.claude-alt"; claude auth login"#
+            r"$env:CLAUDE_CONFIG_DIR='C:\Users\My Name\.claude-alt'; claude auth login"
         );
         assert_eq!(
             format_account_login_command(ProviderKind::Codex, "~/.codex-work", true),
-            "$env:CODEX_HOME=~/.codex-work; codex login"
+            "$env:CODEX_HOME='~/.codex-work'; codex login"
         );
         assert_eq!(
             format_account_login_command(ProviderKind::Claude, "/home/alice/.claude work", false),
-            "CLAUDE_CONFIG_DIR=\"/home/alice/.claude work\" claude auth login"
+            "CLAUDE_CONFIG_DIR='/home/alice/.claude work' claude auth login"
         );
         assert_eq!(
             format_account_login_command(ProviderKind::Codex, "~/.codex-work", false),
-            "CODEX_HOME=~/.codex-work codex login"
+            "CODEX_HOME=~/'.codex-work' codex login"
         );
+    }
+
+    #[test]
+    fn account_login_commands_escape_shell_metacharacters() {
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Claude,
+                r#"/home/o'brien/"$USER";id dir"#,
+                false
+            ),
+            r#"CLAUDE_CONFIG_DIR='/home/o'\''brien/"$USER";id dir' claude auth login"#
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Codex,
+                r#"~/o'brien/"$HOME";rm -rf /"#,
+                false
+            ),
+            r#"CODEX_HOME=~/'o'\''brien/"$HOME";rm -rf /' codex login"#
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Claude,
+                r#"C:\Users\O'Brien\"$env:PATH";calc"#,
+                true
+            ),
+            r#"$env:CLAUDE_CONFIG_DIR='C:\Users\O''Brien\"$env:PATH";calc'; claude auth login"#
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Codex,
+                r#"C:\Users\My 'Work'\$dir;echo hi"#,
+                true
+            ),
+            r#"$env:CODEX_HOME='C:\Users\My ''Work''\$dir;echo hi'; codex login"#
+        );
+    }
+
+    #[test]
+    fn host_tab_navigation_clamps_on_arrows_and_jumps_on_home_end() {
+        assert_eq!(next_host_tab_index(0, 3, "left"), Some(0));
+        assert_eq!(next_host_tab_index(0, 3, "right"), Some(1));
+        assert_eq!(next_host_tab_index(2, 3, "right"), Some(2));
+        assert_eq!(next_host_tab_index(2, 3, "home"), Some(0));
+        assert_eq!(next_host_tab_index(0, 3, "end"), Some(2));
+        assert_eq!(next_host_tab_index(0, 3, "up"), None);
+        assert_eq!(next_host_tab_index(0, 0, "right"), None);
     }
 }

@@ -619,17 +619,7 @@ impl Waku {
         }
         let weak = cx.entity().downgrade();
         let handle = self.menu_handle("skills-source-filter", cx);
-        let sources = [
-            SkillSource::Shared,
-            SkillSource::Provider(ProviderKind::Claude),
-            SkillSource::Provider(ProviderKind::Codex),
-            SkillSource::Provider(ProviderKind::Cursor),
-            SkillSource::Provider(ProviderKind::Fx),
-            SkillSource::Provider(ProviderKind::OpenCode),
-            SkillSource::Provider(ProviderKind::Pi),
-            SkillSource::Provider(ProviderKind::OhMyPi),
-            SkillSource::Provider(ProviderKind::Amp),
-        ];
+        let sources = SKILL_FILTER_SOURCES;
         dropdown_menu(
             MenuChip::new("skills-source-filter")
                 .icon(
@@ -1520,14 +1510,40 @@ fn updated_label(elapsed_seconds: u64) -> String {
     }
 }
 
+/// Provider sources exposed in the Skills page filter menu, matching the
+/// locations scanned by `waku_core::skills`.
+const SKILL_FILTER_SOURCES: [SkillSource; 11] = [
+    SkillSource::Shared,
+    SkillSource::Provider(ProviderKind::Claude),
+    SkillSource::Provider(ProviderKind::Codex),
+    SkillSource::Provider(ProviderKind::Cursor),
+    SkillSource::Provider(ProviderKind::Fx),
+    SkillSource::Provider(ProviderKind::OpenCode),
+    SkillSource::Provider(ProviderKind::Pi),
+    SkillSource::Provider(ProviderKind::OhMyPi),
+    SkillSource::Provider(ProviderKind::Amp),
+    SkillSource::Provider(ProviderKind::Droid),
+    SkillSource::Provider(ProviderKind::Antigravity),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn bytes_format_compactly() {
         assert_eq!(format_bytes(412), "412 B");
         assert_eq!(format_bytes(3_300), "3.2 KB");
         assert_eq!(format_bytes(1_200_000), "1.1 MB");
+    }
+
+    #[test]
+    fn skills_source_filter_includes_droid_and_antigravity_without_duplicates() {
+        let unique: HashSet<SkillSource> = SKILL_FILTER_SOURCES.into_iter().collect();
+        assert_eq!(unique.len(), SKILL_FILTER_SOURCES.len());
+        assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Shared));
+        assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Provider(ProviderKind::Droid)));
+        assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Provider(ProviderKind::Antigravity)));
     }
 }

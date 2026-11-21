@@ -541,10 +541,24 @@ fn usage_panel(
         panel = panel.child(match usage_url {
             Some(url) => header_row
                 .id("plan-usage-link")
+                .tab_index(0)
+                .rounded(px(4.0))
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
                 .cursor_default()
                 .hover(|element| element.opacity(0.8))
                 .tooltip(Tooltip::text(tr!("usage.open_account_settings")))
-                .on_click(move |_, _, cx| cx.open_url(url))
+                .on_click(move |_, _, cx| {
+                    cx.open_url(url);
+                    cx.stop_propagation();
+                })
+                .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        cx.open_url(url);
+                        cx.stop_propagation();
+                    }
+                })
                 .child(icon("icons/arrow-right.svg", 10.0, theme.text_tertiary))
                 .into_any_element(),
             None => header_row.into_any_element(),
