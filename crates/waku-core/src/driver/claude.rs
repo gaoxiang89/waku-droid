@@ -13,7 +13,7 @@
 //! invocation, not guessed. `--permission-prompt-tool` in particular is absent
 //! from `claude --help`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
@@ -49,6 +49,10 @@ enum CommandMessage {
     Respond {
         request_id: String,
         option_id: String,
+    },
+    DenyControlRequest {
+        request_id: String,
+        message: String,
     },
     RespondUserInput {
         request_id: String,
@@ -87,6 +91,8 @@ pub struct ClaudeDriver {
     commands: Sender<CommandMessage>,
     pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
     mode: RuntimeMode,
+    reasoning_effort: Option<String>,
+    current_model: Mutex<Option<String>>,
 }
 
 /// The permission posture Claude is launched with.
@@ -97,6 +103,15 @@ fn permission_mode(mode: RuntimeMode) -> &'static str {
         RuntimeMode::Auto => "auto",
         RuntimeMode::FullAccess => "bypassPermissions",
     }
+}
+
+/// Claude Code enforces `default`, `acceptEdits`, `auto`, and
+/// `bypassPermissions` natively. Any `can_use_tool` prompt that still reaches
+/// stdio outside `FullAccess` is an action that mode intentionally delegated
+/// to the user (non-edit tools under `acceptEdits`, risky actions under `auto`,
+/// everything under `default`). Only `FullAccess` auto-approves.
+fn auto_approves_permissions(mode: RuntimeMode) -> bool {
+    mode == RuntimeMode::FullAccess
 }
 
 /// The model id to hand the CLI for a session's context-window choice.
@@ -254,7 +269,6 @@ impl ClaudeDriver {
         });
 
         let (commands, command_rx) = unbounded();
-        let auto_approve = mode != RuntimeMode::Ask;
         let turn_active = Arc::new(Mutex::new(false));
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
         let pending_user_inputs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
@@ -288,27 +302,30 @@ impl ClaudeDriver {
                         &reader_events,
                         &reader_commands,
                         &reader_turn,
-                        auto_approve,
+                        mode,
                         &mut state,
                     );
                 }
             })?;
 
         let writer_events = events.clone();
-        let writer_turn = turn_active;
+        let writer_turn = turn_active.clone();
         let writer_pending_task_stops = pending_task_stops;
+        let writer_pending_user_inputs = pending_user_inputs.clone();
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
         let title_session_id = session_id;
         let title_config_dir = config_dir;
+        let writer_launch_model = launch_model.clone();
         thread::Builder::new()
             .name("waku-claude-writer".into())
             .spawn(move || {
                 let mut stdin = stdin;
                 let mut next_request_id = 0_u64;
-                let mut current_model = launch_model;
+                let mut current_model = writer_launch_model;
                 while let Ok(message) = command_rx.recv() {
                     let written = match message {
                         CommandMessage::Prompt(text) => {
+                            writer_pending_user_inputs.lock().clear();
                             *writer_turn.lock() = true;
                             start_claude_title_refresh(
                                 &writer_title_refresh,
@@ -361,6 +378,7 @@ impl ClaudeDriver {
                             written
                         }
                         CommandMessage::Cancel => {
+                            writer_pending_user_inputs.lock().clear();
                             next_request_id += 1;
                             write_line(
                                 &mut stdin,
@@ -395,6 +413,23 @@ impl ClaudeDriver {
                                 }),
                             )
                         }
+                        CommandMessage::DenyControlRequest {
+                            request_id,
+                            message,
+                        } => write_line(
+                            &mut stdin,
+                            &json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": {
+                                        "behavior": "deny",
+                                        "message": message
+                                    }
+                                }
+                            }),
+                        ),
                         CommandMessage::RespondUserInput {
                             request_id,
                             input,
@@ -452,10 +487,10 @@ impl ClaudeDriver {
                             if next_model == current_model {
                                 continue;
                             }
-                            current_model = next_model;
-                            let Some(model) = current_model.as_deref() else {
+                            let Some(model) = next_model.as_deref() else {
                                 continue;
                             };
+                            current_model = next_model.clone();
                             next_request_id += 1;
                             write_line(
                                 &mut stdin,
@@ -477,6 +512,7 @@ impl ClaudeDriver {
                         CommandMessage::Shutdown => break,
                     };
                     if let Err(error) = written {
+                        writer_pending_user_inputs.lock().clear();
                         let _ = writer_events.send(DriverEvent::Error(tr!(
                             "errors.provider_transport_write",
                             provider = "Claude",
@@ -503,11 +539,7 @@ impl ClaudeDriver {
         let stderr_thread = thread::Builder::new()
             .name("waku-claude-stderr".into())
             .spawn(move || {
-                let lines = BufReader::new(stderr)
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|line| !line.trim().is_empty())
-                    .collect::<Vec<_>>();
+                let lines = collect_bounded_stderr(BufReader::new(stderr));
                 if let Some(message) = super::support::provider_stderr_error(lines) {
                     let error = format!("Claude Code: {message}");
                     *stderr_last_error.lock() = Some(error.clone());
@@ -515,29 +547,30 @@ impl ClaudeDriver {
                 }
             })?;
 
+        let process_turn = turn_active;
+        let process_pending_user_inputs = pending_user_inputs.clone();
         thread::Builder::new()
             .name("waku-claude-process".into())
             .spawn(move || {
                 let status = child.wait();
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                if let Ok(status) = status
-                    && !status.success()
-                    && last_visible_stderr.lock().is_none()
-                {
-                    let _ = events.send(DriverEvent::Error(tr!(
-                        "errors.provider_exited",
-                        provider = "Claude Code",
-                        status = status
-                    )));
-                }
-                let _ = events.send(DriverEvent::ProcessExited);
+                let last_error = last_visible_stderr.lock().clone();
+                finalize_process_exit(
+                    status,
+                    last_error,
+                    &process_turn,
+                    &process_pending_user_inputs,
+                    &events,
+                );
             })?;
 
         Ok(Self {
             commands,
             pending_user_inputs,
             mode,
+            reasoning_effort,
+            current_model: Mutex::new(launch_model),
         })
     }
 }
@@ -584,12 +617,29 @@ impl DriverControl for ClaudeDriver {
     }
 
     fn apply_options(&self, options: SessionOptions) -> bool {
-        // The model has a setter; the permission posture is a launch flag, and
-        // changing what a running agent may touch deserves a fresh session.
-        if options.mode != self.mode {
+        // Permission posture and reasoning effort are launch flags with no
+        // live control setter, so changing either deserves a fresh process
+        // resuming the same session.
+        if options.mode != self.mode || options.reasoning_effort != self.reasoning_effort {
             return false;
         }
-        self.commands.send(CommandMessage::Options(options)).is_ok()
+        let next_model = wire_model(options.model.as_deref(), options.context_window.as_deref());
+        let mut current_model = self.current_model.lock();
+        if next_model == *current_model {
+            return true;
+        }
+        // Reverting an explicit model back to the provider default (`None`)
+        // has no verified `set_model` reset payload, so restart without
+        // `--model` and resume the session cleanly.
+        if next_model.is_none() {
+            return false;
+        }
+        if self.commands.send(CommandMessage::Options(options)).is_ok() {
+            *current_model = next_model;
+            true
+        } else {
+            false
+        }
     }
 
     fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
@@ -609,6 +659,124 @@ fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+const MAX_STDERR_LINES: usize = 256;
+const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
+const MAX_STDERR_TOTAL_BYTES: usize = 64 * 1024;
+const MAX_STDERR_ERROR_CONTEXT_LINES: usize = 6;
+
+fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut saw_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        saw_any = true;
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if bytes.len() < max_bytes {
+                let remaining = max_bytes - bytes.len();
+                bytes.extend_from_slice(&available[..newline.min(remaining)]);
+            }
+            reader.consume(newline + 1);
+            break;
+        }
+        if bytes.len() < max_bytes {
+            let remaining = max_bytes - bytes.len();
+            bytes.extend_from_slice(&available[..available.len().min(remaining)]);
+        }
+        let len = available.len();
+        reader.consume(len);
+    }
+    if !saw_any {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn collect_bounded_stderr(mut reader: impl BufRead) -> Vec<String> {
+    let mut lines = VecDeque::new();
+    let mut total_bytes = 0_usize;
+    let mut error_lines_remaining: Option<usize> = None;
+    while let Ok(Some(line)) = read_bounded_line(&mut reader, MAX_STDERR_LINE_BYTES) {
+        if error_lines_remaining == Some(0) {
+            // Keep draining stderr until EOF so the child never stalls on a
+            // full pipe, without retaining unbounded memory.
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(remaining) = error_lines_remaining.as_mut() {
+            if total_bytes.saturating_add(line.len()) <= MAX_STDERR_TOTAL_BYTES {
+                total_bytes = total_bytes.saturating_add(line.len());
+                lines.push_back(line);
+            }
+            *remaining = remaining.saturating_sub(1);
+            continue;
+        }
+        if line.to_ascii_lowercase().contains("error") {
+            lines.clear();
+            total_bytes = line.len();
+            lines.push_back(line);
+            error_lines_remaining = Some(MAX_STDERR_ERROR_CONTEXT_LINES.saturating_sub(1));
+            continue;
+        }
+        while !lines.is_empty()
+            && (lines.len() >= MAX_STDERR_LINES
+                || total_bytes.saturating_add(line.len()) > MAX_STDERR_TOTAL_BYTES)
+        {
+            if let Some(evicted) = lines.pop_front() {
+                total_bytes = total_bytes.saturating_sub(evicted.len());
+            }
+        }
+        total_bytes = total_bytes.saturating_add(line.len());
+        lines.push_back(line);
+    }
+    lines.into_iter().collect()
+}
+
+fn finalize_process_exit(
+    status: std::io::Result<std::process::ExitStatus>,
+    last_visible_stderr: Option<String>,
+    turn_active: &Mutex<bool>,
+    pending_user_inputs: &Mutex<HashMap<String, Value>>,
+    events: &impl DriverEventSink,
+) {
+    let exit_error = match status {
+        Ok(status) if !status.success() && last_visible_stderr.is_none() => {
+            let message = tr!(
+                "errors.provider_exited",
+                provider = "Claude Code",
+                status = status
+            );
+            let _ = events.send(DriverEvent::Error(message.clone()));
+            Some(message)
+        }
+        Err(error) if last_visible_stderr.is_none() => {
+            let message = tr!(
+                "errors.read_provider_exit_status",
+                provider = "Claude Code",
+                error = error
+            );
+            let _ = events.send(DriverEvent::Error(message.clone()));
+            Some(message)
+        }
+        _ => last_visible_stderr,
+    };
+    pending_user_inputs.lock().clear();
+    if std::mem::take(&mut *turn_active.lock()) {
+        let _ = events.send(DriverEvent::TurnFinished {
+            success: false,
+            summary: exit_error,
+        });
+    }
+    let _ = events.send(DriverEvent::ProcessExited);
 }
 
 #[derive(Default)]
@@ -1322,7 +1490,7 @@ fn handle_message(
     events: &DriverEventSender,
     commands: &Sender<CommandMessage>,
     turn_active: &Mutex<bool>,
-    auto_approve: bool,
+    mode: RuntimeMode,
     state: &mut ClaudeStreamState,
 ) {
     match value.get("type").and_then(Value::as_str) {
@@ -1350,8 +1518,8 @@ fn handle_message(
         Some("control_request") => {
             if value.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool") {
                 begin_unprompted_turn(turn_active, state, events);
-                if !request_user_input(value, events, state) {
-                    request_permission(value, events, commands, auto_approve);
+                if !request_user_input(value, events, commands, state) {
+                    request_permission(value, events, commands, mode);
                 }
             }
         }
@@ -1592,6 +1760,7 @@ fn handle_message(
             }
         }
         Some("result") => {
+            state.pending_user_inputs.lock().clear();
             let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
             if failed && let Some(result) = value.get("result").and_then(Value::as_str) {
                 let _ = events.send(DriverEvent::Error(result.to_owned()));
@@ -1654,6 +1823,7 @@ fn handle_message(
 fn request_user_input(
     value: &Value,
     events: &impl DriverEventSink,
+    commands: &Sender<CommandMessage>,
     state: &ClaudeStreamState,
 ) -> bool {
     let request = value.get("request").unwrap_or(&Value::Null);
@@ -1718,6 +1888,10 @@ fn request_user_input(
         })
         .collect::<Vec<_>>();
     if questions.is_empty() {
+        let _ = commands.send(CommandMessage::DenyControlRequest {
+            request_id: request_id.to_owned(),
+            message: "AskUserQuestion contained no valid questions.".into(),
+        });
         return true;
     }
     state
@@ -1735,12 +1909,12 @@ fn request_permission(
     value: &Value,
     events: &impl DriverEventSink,
     commands: &Sender<CommandMessage>,
-    auto_approve: bool,
+    mode: RuntimeMode,
 ) {
     let Some(request_id) = value.get("request_id").and_then(Value::as_str) else {
         return;
     };
-    if auto_approve {
+    if auto_approves_permissions(mode) {
         let _ = commands.send(CommandMessage::Respond {
             request_id: request_id.to_owned(),
             option_id: "allow".into(),
@@ -1836,7 +2010,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         handle_message(
@@ -1845,7 +2019,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
 
@@ -2101,6 +2275,8 @@ mod tests {
             commands,
             pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
             mode: RuntimeMode::FullAccess,
+            reasoning_effort: None,
+            current_model: Mutex::new(None),
         };
 
         assert!(driver.supports_steer());
@@ -2112,6 +2288,84 @@ mod tests {
             Ok(_) => panic!("expected a steer command"),
             Err(_) => panic!("no command was sent"),
         }
+    }
+
+    #[test]
+    fn apply_options_restarts_on_effort_mode_or_model_reset_and_switches_models_live() {
+        let (commands, command_rx) = unbounded();
+        let driver = ClaudeDriver {
+            commands,
+            pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
+            mode: RuntimeMode::AutoAcceptEdits,
+            reasoning_effort: Some("high".into()),
+            current_model: Mutex::new(Some("claude-sonnet-4-6".into())),
+        };
+        let opts = |mode, model: Option<&str>, effort: Option<&str>, window: Option<&str>| {
+            SessionOptions {
+                mode,
+                model: model.map(str::to_owned),
+                reasoning_effort: effort.map(str::to_owned),
+                service_tier: None,
+                context_window: window.map(str::to_owned),
+            }
+        };
+
+        // Unchanged options are a live no-op.
+        assert!(driver.apply_options(opts(
+            RuntimeMode::AutoAcceptEdits,
+            Some("claude-sonnet-4-6"),
+            Some("high"),
+            None,
+        )));
+        assert!(command_rx.try_recv().is_err());
+
+        // Mode changes require a restart.
+        assert!(!driver.apply_options(opts(
+            RuntimeMode::Ask,
+            Some("claude-sonnet-4-6"),
+            Some("high"),
+            None,
+        )));
+        assert!(command_rx.try_recv().is_err());
+
+        // Reasoning effort is a launch flag and requires a restart.
+        assert!(!driver.apply_options(opts(
+            RuntimeMode::AutoAcceptEdits,
+            Some("claude-sonnet-4-6"),
+            Some("low"),
+            None,
+        )));
+        assert!(!driver.apply_options(opts(
+            RuntimeMode::AutoAcceptEdits,
+            Some("claude-sonnet-4-6"),
+            None,
+            None,
+        )));
+        assert!(command_rx.try_recv().is_err());
+
+        // Model and context-window switches travel live via `set_model`.
+        assert!(driver.apply_options(opts(
+            RuntimeMode::AutoAcceptEdits,
+            Some("claude-opus-4-6"),
+            Some("high"),
+            Some("1m"),
+        )));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(CommandMessage::Options(sent))
+                if sent.model.as_deref() == Some("claude-opus-4-6")
+                    && sent.context_window.as_deref() == Some("1m")
+        ));
+
+        // Reverting back to default (`None`) asks for a restart instead of
+        // silently desynchronizing `current_model`.
+        assert!(!driver.apply_options(opts(
+            RuntimeMode::AutoAcceptEdits,
+            None,
+            Some("high"),
+            None,
+        )));
+        assert!(command_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2147,7 +2401,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         assert!(matches!(
@@ -2179,7 +2433,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         assert!(matches!(
@@ -2201,7 +2455,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(started)) =
@@ -2228,7 +2482,15 @@ mod tests {
                 "input": {"description": "Inspect the parser"}
             }]}
         });
-        handle_message(&tool, "s", &events, &commands, &turn, true, &mut state);
+        handle_message(
+            &tool,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
         let _ = event_rx.try_recv().unwrap();
 
         handle_message(
@@ -2245,7 +2507,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(started)) =
@@ -2269,7 +2531,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(completed)) =
@@ -2303,7 +2565,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(started)) =
@@ -2333,7 +2595,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(progress)) =
@@ -2365,7 +2627,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(settled)) =
@@ -2405,7 +2667,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let _ = event_rx.try_recv().unwrap();
@@ -2424,7 +2686,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         handle_message(
@@ -2435,7 +2697,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let mut seen = Vec::new();
@@ -2469,7 +2731,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(settled)) =
@@ -2492,7 +2754,15 @@ mod tests {
             json!({"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}),
         ];
         for message in wire {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         let deltas = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter_map(|event| match event {
@@ -2521,7 +2791,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         let DriverEvent::RichActivity(item) = event_rx.try_recv().unwrap() else {
@@ -2534,6 +2804,7 @@ mod tests {
     fn access_modes_map_to_claude_permission_modes() {
         assert_eq!(permission_mode(RuntimeMode::Ask), "default");
         assert_eq!(permission_mode(RuntimeMode::AutoAcceptEdits), "acceptEdits");
+        assert_eq!(permission_mode(RuntimeMode::Auto), "auto");
         assert_eq!(
             permission_mode(RuntimeMode::FullAccess),
             "bypassPermissions"
@@ -2561,7 +2832,15 @@ mod tests {
             json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}),
         ];
         for message in wire {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
 
         let mut seen = Vec::new();
@@ -2579,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn supervised_mode_asks_the_user_and_auto_modes_answer_themselves() {
+    fn only_full_access_auto_approves_delegated_claude_permission_prompts() {
         let (events, event_rx, commands, command_rx, turn, mut state) = harness();
         // Shape observed from a live `--permission-prompt-tool stdio` session.
         let request = json!({
@@ -2596,27 +2875,44 @@ mod tests {
             }
         });
 
-        handle_message(&request, "s", &events, &commands, &turn, false, &mut state);
-        let DriverEvent::Permission {
-            request_id,
-            detail,
-            options,
-            ..
-        } = event_rx.try_recv().unwrap()
-        else {
-            panic!("Supervised mode must surface the request to the user");
-        };
-        assert_eq!(request_id, "fa01120e");
-        assert_eq!(detail, "Write probe file");
-        assert_eq!(
-            options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
-            ["allow", "deny"]
-        );
-        assert!(command_rx.try_recv().is_err());
+        for mode in [
+            RuntimeMode::Ask,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+        ] {
+            handle_message(&request, "s", &events, &commands, &turn, mode, &mut state);
+            let DriverEvent::Permission {
+                request_id,
+                detail,
+                options,
+                ..
+            } = event_rx.try_recv().unwrap()
+            else {
+                panic!("{mode:?} must surface delegated can_use_tool prompts to the user");
+            };
+            assert_eq!(request_id, "fa01120e");
+            assert_eq!(detail, "Write probe file");
+            assert_eq!(
+                options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+                ["allow", "deny"]
+            );
+            assert!(
+                command_rx.try_recv().is_err(),
+                "{mode:?} must not auto-answer delegated prompts"
+            );
+        }
 
-        handle_message(&request, "s", &events, &commands, &turn, true, &mut state);
+        handle_message(
+            &request,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
         let Ok(CommandMessage::Respond { option_id, .. }) = command_rx.try_recv() else {
-            panic!("auto modes must answer without the user");
+            panic!("FullAccess must answer without the user");
         };
         assert_eq!(option_id, "allow");
         assert!(event_rx.try_recv().is_err());
@@ -2646,7 +2942,15 @@ mod tests {
         });
 
         // Even Full Access cannot invent an answer to a content question.
-        handle_message(&request, "s", &events, &commands, &turn, true, &mut state);
+        handle_message(
+            &request,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
         let DriverEvent::UserInputRequested {
             request_id,
             questions,
@@ -2659,6 +2963,120 @@ mod tests {
         assert_eq!(questions[0].options[0].label, "Preview");
         assert!(command_rx.try_recv().is_err());
         assert!(state.pending_user_inputs.lock().contains_key("ask-1"));
+
+        // Settling the turn prunes any unanswered question state.
+        handle_message(
+            &json!({"type": "result", "is_error": false, "stop_reason": "end_turn"}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        assert!(state.pending_user_inputs.lock().is_empty());
+    }
+
+    #[test]
+    fn empty_ask_user_question_replies_with_deny_to_avoid_cli_deadlock() {
+        let (events, event_rx, commands, command_rx, turn, mut state) = harness();
+        let request = json!({
+            "type": "control_request",
+            "request_id": "ask-empty",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": {"questions": [{"question": "   "}]}
+            }
+        });
+
+        handle_message(
+            &request,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::Ask,
+            &mut state,
+        );
+        assert!(event_rx.try_recv().is_err());
+        assert!(state.pending_user_inputs.lock().is_empty());
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(CommandMessage::DenyControlRequest { request_id, .. }) if request_id == "ask-empty"
+        ));
+    }
+
+    #[test]
+    fn unexpected_process_exit_mid_turn_settles_turn_as_failed_and_clears_pending_inputs() {
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let turn_active = Mutex::new(true);
+        let pending_user_inputs = Mutex::new(HashMap::from([("ask-1".to_owned(), json!({}))]));
+
+        finalize_process_exit(
+            Err(std::io::Error::other("simulated wait error")),
+            None,
+            &turn_active,
+            &pending_user_inputs,
+            &events,
+        );
+
+        let seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(matches!(&seen[0], DriverEvent::Error(_)));
+        assert!(matches!(
+            &seen[1],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(_),
+            }
+        ));
+        assert!(matches!(&seen[2], DriverEvent::ProcessExited));
+        assert_eq!(seen.len(), 3);
+        assert!(!*turn_active.lock());
+        assert!(pending_user_inputs.lock().is_empty());
+
+        // When no turn is active, exit emits only ProcessExited.
+        finalize_process_exit(
+            Err(std::io::Error::other("already reported")),
+            Some("Claude Code: prior error".into()),
+            &turn_active,
+            &pending_user_inputs,
+            &events,
+        );
+        let after: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(after.len(), 1);
+        assert!(matches!(&after[0], DriverEvent::ProcessExited));
+    }
+
+    #[test]
+    fn bounded_stderr_caps_memory_while_preserving_first_error_context() {
+        let mut raw = String::new();
+        for index in 0..1000 {
+            raw.push_str(&format!("debug line {index}\n"));
+        }
+        raw.push_str(&"x".repeat(16 * 1024));
+        raw.push('\n');
+        raw.push_str("Error: authentication expired\n");
+        raw.push_str("detail line 1\n");
+        for index in 0..1000 {
+            raw.push_str(&format!("trailing noise {index}\n"));
+        }
+
+        let lines = collect_bounded_stderr(std::io::Cursor::new(raw));
+        assert!(lines.len() <= MAX_STDERR_ERROR_CONTEXT_LINES);
+        assert_eq!(
+            super::super::support::provider_stderr_error(lines).as_deref(),
+            Some("Error: authentication expired")
+        );
+
+        // Without any error line, total retained lines and bytes stay bounded.
+        let noise = (0..1000)
+            .map(|index| format!("warning {index}: {}", "a".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let retained = collect_bounded_stderr(std::io::Cursor::new(noise));
+        assert!(retained.len() <= MAX_STDERR_LINES);
+        assert!(retained.iter().map(String::len).sum::<usize>() <= MAX_STDERR_TOTAL_BYTES);
     }
 
     #[test]
@@ -2666,7 +3084,15 @@ mod tests {
         let (events, event_rx, commands, _command_rx, turn, mut state) = harness();
         let result = json!({"type":"result","is_error":false,"stop_reason":"end_turn"});
 
-        handle_message(&result, "s", &events, &commands, &turn, true, &mut state);
+        handle_message(
+            &result,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
         // The checkpoint read is best-effort; the turn must settle regardless.
         let settled = std::iter::from_fn(|| event_rx.try_recv().ok())
             .filter(|event| matches!(event, DriverEvent::TurnFinished { .. }))
@@ -2674,7 +3100,15 @@ mod tests {
         assert_eq!(settled, 1);
         assert!(!*turn.lock());
 
-        handle_message(&result, "s", &events, &commands, &turn, true, &mut state);
+        handle_message(
+            &result,
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
         assert!(
             !std::iter::from_fn(|| event_rx.try_recv().ok())
                 .any(|event| matches!(event, DriverEvent::TurnFinished { .. })),
@@ -2698,7 +3132,15 @@ mod tests {
             json!({"type":"result","is_error":false,"stop_reason":"end_turn","num_turns":2}),
         ];
         for message in reply {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         let seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert!(
@@ -2722,7 +3164,15 @@ mod tests {
             json!({"type":"system","subtype":"status","status":"requesting"}),
         ];
         for message in prelude {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         // `init` and `status` also open a resume handshake that never runs
         // the model; only model output reports the wake.
@@ -2742,7 +3192,15 @@ mod tests {
             json!({"type":"result","is_error":false,"stop_reason":"end_turn","num_turns":1}),
         ];
         for message in wake {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         let seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert!(
@@ -2774,7 +3232,7 @@ mod tests {
             &events,
             &commands,
             &turn,
-            true,
+            RuntimeMode::FullAccess,
             &mut state,
         );
         while event_rx.try_recv().is_ok() {}
@@ -2787,7 +3245,15 @@ mod tests {
                 "message":{"content":[{"type":"text","text":"still going"}]}}),
         ];
         for message in wire {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         assert!(!*turn.lock());
         assert!(
@@ -2812,7 +3278,15 @@ mod tests {
                 "status":"completed","output_file":"","summary":"","ambient":true}),
         ];
         for message in wire {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
         let seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert_eq!(seen.len(), 1, "only the level signal carries user work");
@@ -2855,7 +3329,15 @@ mod tests {
             }}),
         ];
         for message in wire {
-            handle_message(&message, "s", &events, &commands, &turn, true, &mut state);
+            handle_message(
+                &message,
+                "s",
+                &events,
+                &commands,
+                &turn,
+                RuntimeMode::FullAccess,
+                &mut state,
+            );
         }
 
         let usage: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())

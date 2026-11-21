@@ -7,6 +7,7 @@
 //! avoids reverse-engineering the human CLI output.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
@@ -26,6 +27,35 @@ use crate::model::{
     BackgroundWorkStatus, DriverEvent, PermissionOption, ProviderResumeCursor, ReportedCommand,
     RuntimeMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
+
+trait DeepSeekRpcClient {
+    fn rpc(&self, method: &str, payload: Value) -> anyhow::Result<Value>;
+    fn respond(&self, rpc_id: &str, value: Value) -> anyhow::Result<()>;
+    fn reject_response(&self, rpc_id: &str, message: &str) -> anyhow::Result<()>;
+}
+
+impl DeepSeekRpcClient for PooledDeepSeekServer {
+    fn rpc(&self, method: &str, payload: Value) -> anyhow::Result<Value> {
+        (&**self).rpc(method, payload)
+    }
+
+    fn respond(&self, rpc_id: &str, value: Value) -> anyhow::Result<()> {
+        (&**self).respond(rpc_id, value)
+    }
+
+    fn reject_response(&self, rpc_id: &str, message: &str) -> anyhow::Result<()> {
+        (&**self).reject_response(rpc_id, message)
+    }
+}
+
+/// DeepSeek Harness runs every non-FullAccess mode under
+/// `/permission workspace-write`, which already permits in-workspace edits
+/// natively and has no AI reviewer for `Auto`. Any `approval/requested` that
+/// still reaches Waku outside `FullAccess` is an action beyond
+/// `workspace-write` and must be decided by the user.
+fn auto_approves_approval(mode: RuntimeMode) -> bool {
+    mode == RuntimeMode::FullAccess
+}
 
 enum CommandMessage {
     Prompt(String),
@@ -311,32 +341,56 @@ impl DriverControl for DeepSeekDriver {
     fn fork(&self, turns_to_remove: usize) -> anyhow::Result<ProviderResumeCursor> {
         let server = self
             .server
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| anyhow!("DeepSeek Harness driver is shutting down"))?;
-        let turns = self.completed_turn_seqs.lock();
+        fork_session_with_client(
+            server,
+            &self.session_id,
+            &self.cwd,
+            self.agent_preset.as_deref(),
+            &self.completed_turn_seqs,
+            turns_to_remove,
+        )
+    }
+}
+
+fn fork_session_with_client(
+    server: &impl DeepSeekRpcClient,
+    session_id: &str,
+    cwd: &Path,
+    agent_preset: Option<&str>,
+    completed_turn_seqs: &Mutex<Vec<u64>>,
+    turns_to_remove: usize,
+) -> anyhow::Result<ProviderResumeCursor> {
+    let fork_at_seq = {
+        let turns = completed_turn_seqs.lock();
         let retained = turns.len().checked_sub(turns_to_remove).ok_or_else(|| {
             anyhow!(
                 "cannot remove {turns_to_remove} turns from a {}-turn DeepSeek Harness session",
                 turns.len()
             )
         })?;
-        let session_id = if retained == 0 {
-            let session_id = Uuid::new_v4().to_string();
+        retained.checked_sub(1).map(|index| turns[index])
+    };
+    let forked_session_id = match fork_at_seq {
+        None => {
+            let new_session_id = Uuid::new_v4().to_string();
             let created = server.rpc(
                 "session.create",
-                session_create_payload(&self.cwd, &session_id, self.agent_preset.as_deref()),
+                session_create_payload(cwd, &new_session_id, agent_preset),
             )?;
             created
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| anyhow!("DeepSeek Harness returned no fork session ID"))?
-        } else {
+        }
+        Some(at_seq) => {
             let forked = server.rpc(
                 "session.fork",
                 json!({
-                    "sessionId": self.session_id,
-                    "atSeq": turns[retained - 1],
+                    "sessionId": session_id,
+                    "atSeq": at_seq,
                 }),
             )?;
             forked
@@ -344,9 +398,11 @@ impl DriverControl for DeepSeekDriver {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| anyhow!("DeepSeek Harness returned no fork session ID"))?
-        };
-        Ok(ProviderResumeCursor::DeepSeek { session_id })
-    }
+        }
+    };
+    Ok(ProviderResumeCursor::DeepSeek {
+        session_id: forked_session_id,
+    })
 }
 
 impl Drop for DeepSeekDriver {
@@ -373,7 +429,7 @@ fn session_create_payload(
 
 fn handle_command(
     message: CommandMessage,
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     events: &impl DriverEventSink,
     mode: &Mutex<RuntimeMode>,
@@ -547,7 +603,7 @@ fn deepseek_question_answers(
 
 fn handle_envelope(
     envelope: &Value,
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     events: &impl DriverEventSink,
     mode: &Mutex<RuntimeMode>,
@@ -646,7 +702,15 @@ fn handle_envelope(
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("DeepSeek Harness exited");
+            state.pending.clear();
             let _ = events.send(DriverEvent::Error(message.to_owned()));
+            if state.turn_active {
+                state.turn_active = false;
+                let _ = events.send(DriverEvent::TurnFinished {
+                    success: false,
+                    summary: Some(message.to_owned()),
+                });
+            }
             let _ = events.send(DriverEvent::ProcessExited);
             return false;
         }
@@ -898,10 +962,113 @@ fn presented_activity_kind(view: &Value) -> Option<ActivityKind> {
     }
 }
 
+const MAX_APPROVAL_SUMMARY_CHARS: usize = 400;
+
+fn truncate_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_APPROVAL_SUMMARY_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut short = trimmed
+        .chars()
+        .take(MAX_APPROVAL_SUMMARY_CHARS)
+        .collect::<String>();
+    short.push('…');
+    short
+}
+
+fn parsed_approval_arguments(payload: &Value, state: &StreamState) -> Option<Value> {
+    if let Some(raw) = payload
+        .get("arguments")
+        .or_else(|| payload.get("args"))
+        .or_else(|| payload.get("input"))
+        .filter(|value| !value.is_null())
+    {
+        return Some(
+            raw.as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or_else(|| raw.clone()),
+        );
+    }
+    payload
+        .get("callId")
+        .or_else(|| payload.get("toolCallId"))
+        .and_then(Value::as_str)
+        .and_then(|call_id| state.tools.get(call_id))
+        .map(|tool| tool.arguments.clone())
+        .filter(|value| !value.is_null())
+}
+
+fn approval_arguments_summary(payload: &Value, state: &StreamState) -> Option<String> {
+    for key in ["command", "cmd", "filePath", "file_path", "path"] {
+        if let Some(text) = payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(truncate_summary(text));
+        }
+    }
+    let arguments = parsed_approval_arguments(payload, state)?;
+    if let Some(text) = arguments.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(truncate_summary(text));
+    }
+    if let Some(title) = activity::input_title(Some(&arguments)) {
+        return Some(truncate_summary(&title));
+    }
+    for key in [
+        "command",
+        "cmd",
+        "file_path",
+        "filePath",
+        "path",
+        "url",
+        "query",
+        "pattern",
+        "description",
+    ] {
+        if let Some(text) = arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return Some(truncate_summary(text));
+        }
+    }
+    let is_empty_collection = arguments.as_object().is_some_and(|map| map.is_empty())
+        || arguments.as_array().is_some_and(|items| items.is_empty());
+    if is_empty_collection {
+        return None;
+    }
+    serde_json::to_string(&arguments)
+        .ok()
+        .filter(|serialized| !serialized.is_empty())
+        .map(|serialized| truncate_summary(&serialized))
+}
+
+fn approval_detail(payload: &Value, state: &StreamState) -> String {
+    let reason = payload
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let summary = approval_arguments_summary(payload, state);
+    match (reason, summary) {
+        (Some(reason), Some(summary)) if !reason.contains(&summary) => {
+            format!("{reason}\n{summary}")
+        }
+        (Some(reason), _) => reason.to_owned(),
+        (None, Some(summary)) => summary,
+        (None, None) => "DeepSeek Harness is asking for permission to continue".to_owned(),
+    }
+}
+
 fn handle_approval_request(
     envelope: &Value,
     payload: &Value,
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     events: &impl DriverEventSink,
     mode: &Mutex<RuntimeMode>,
@@ -913,7 +1080,7 @@ fn handle_approval_request(
     let Some(approval_id) = payload.get("approvalId").and_then(Value::as_str) else {
         return;
     };
-    if *mode.lock() != RuntimeMode::Ask {
+    if auto_approves_approval(*mode.lock()) {
         if let Err(error) = server.respond(
             rpc_id,
             json!({
@@ -940,14 +1107,11 @@ fn handle_approval_request(
         .get("toolName")
         .and_then(Value::as_str)
         .unwrap_or("tool");
-    let reason = payload
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("DeepSeek Harness is asking for permission to continue");
+    let detail = approval_detail(payload, state);
     let _ = events.send(DriverEvent::Permission {
         request_id: rpc_id.to_owned(),
         title: format!("Allow {tool_name}?"),
-        detail: reason.to_owned(),
+        detail,
         options: vec![
             PermissionOption {
                 id: "allow".into(),
@@ -966,7 +1130,7 @@ fn handle_approval_request(
 fn handle_question_request(
     envelope: &Value,
     payload: &Value,
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     events: &impl DriverEventSink,
     state: &mut StreamState,
@@ -1193,7 +1357,7 @@ fn turn_end_summary(data: &Value, reason: Option<&str>) -> Option<String> {
 }
 
 fn prompt(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     text: &str,
     mode: &str,
@@ -1222,7 +1386,7 @@ fn harness_command_name(line: &str) -> Option<&str> {
 }
 
 fn fetch_commands(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
 ) -> anyhow::Result<Vec<ReportedCommand>> {
     let commands = server.rpc("commands/list", json!({"args": {"agentId": session_id}}))?;
@@ -1245,7 +1409,7 @@ fn fetch_commands(
 }
 
 fn execute_harness_command(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     line: &str,
 ) -> anyhow::Result<HarnessCommandExecution> {
@@ -1299,20 +1463,42 @@ fn execute_harness_command(
 }
 
 fn apply_session_options(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     options: &SessionOptions,
     projections: Option<&Value>,
 ) -> anyhow::Result<()> {
-    if let Some(model) = options.model.as_deref() {
-        let (provider, model) = match model.split_once('/') {
-            Some((provider, model)) => (provider.to_owned(), model),
+    if options.model.is_some() || options.reasoning_effort.is_some() {
+        let (provider, model) = match options.model.as_deref() {
+            Some(model) => match model.split_once('/') {
+                Some((provider, model)) => (provider.to_owned(), model.to_owned()),
+                None => {
+                    let catalog = server.rpc("session.models", json!({"sessionId": session_id}))?;
+                    let provider = catalog
+                        .pointer("/current/provider")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| {
+                            anyhow!("DeepSeek Harness returned no current model provider")
+                        })?
+                        .to_owned();
+                    (provider, model.to_owned())
+                }
+            },
             None => {
                 let catalog = server.rpc("session.models", json!({"sessionId": session_id}))?;
                 let provider = catalog
                     .pointer("/current/provider")
                     .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| anyhow!("DeepSeek Harness returned no current model provider"))?
+                    .to_owned();
+                let model = catalog
+                    .pointer("/current/model")
+                    .or_else(|| catalog.pointer("/current/id"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("DeepSeek Harness returned no current model"))?
                     .to_owned();
                 (provider, model)
             }
@@ -1353,7 +1539,7 @@ fn apply_session_options(
 /// it once while attaching; ordinary option changes no longer know about or
 /// manipulate that state.
 fn normalize_legacy_read_only_mode(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
     projections: Option<&Value>,
 ) -> anyhow::Result<()> {
@@ -1384,12 +1570,13 @@ fn legacy_read_only_mode_active(projections: Option<&Value>) -> bool {
 }
 
 fn fetch_history(
-    server: &PooledDeepSeekServer,
+    server: &impl DeepSeekRpcClient,
     session_id: &str,
 ) -> anyhow::Result<HistorySnapshot> {
     let mut entries = Vec::new();
     let mut projection_values = None;
     let mut before_seq = None;
+    let mut seen = HashSet::new();
     loop {
         let mut payload = json!({"sessionId": session_id, "maxMessages": 200});
         if let Some(before_seq) = before_seq {
@@ -1406,7 +1593,12 @@ fn fetch_history(
             .unwrap_or_default();
         let oldest = page_entries
             .iter()
-            .filter_map(|entry| entry.pointer("/event/seq").and_then(Value::as_u64))
+            .filter_map(|entry| {
+                entry
+                    .pointer("/event/seq")
+                    .or_else(|| entry.get("seq"))
+                    .and_then(Value::as_u64)
+            })
             .min();
         entries.extend(page_entries);
         if !page
@@ -1419,6 +1611,9 @@ fn fetch_history(
         let Some(oldest) = oldest.filter(|oldest| *oldest > 0) else {
             break;
         };
+        if !seen.insert(oldest) || before_seq.is_some_and(|previous| oldest >= previous) {
+            break;
+        }
         before_seq = Some(oldest);
     }
     entries.sort_by_key(|entry| {
@@ -1653,5 +1848,318 @@ mod tests {
                 context_window: Some(8192)
             }
         ));
+    }
+
+    struct MockDeepSeekClient<F> {
+        rpc_handler: F,
+        rpc_calls: Mutex<Vec<(String, Value)>>,
+        responses: Mutex<Vec<(String, Value)>>,
+        rejections: Mutex<Vec<(String, String)>>,
+    }
+
+    impl<F> MockDeepSeekClient<F>
+    where
+        F: Fn(&str, &Value) -> anyhow::Result<Value>,
+    {
+        fn new(rpc_handler: F) -> Self {
+            Self {
+                rpc_handler,
+                rpc_calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(Vec::new()),
+                rejections: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl<F> DeepSeekRpcClient for MockDeepSeekClient<F>
+    where
+        F: Fn(&str, &Value) -> anyhow::Result<Value>,
+    {
+        fn rpc(&self, method: &str, payload: Value) -> anyhow::Result<Value> {
+            self.rpc_calls.lock().push((method.to_owned(), payload.clone()));
+            (self.rpc_handler)(method, &payload)
+        }
+
+        fn respond(&self, rpc_id: &str, value: Value) -> anyhow::Result<()> {
+            self.responses.lock().push((rpc_id.to_owned(), value));
+            Ok(())
+        }
+
+        fn reject_response(&self, rpc_id: &str, message: &str) -> anyhow::Result<()> {
+            self.rejections
+                .lock()
+                .push((rpc_id.to_owned(), message.to_owned()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_full_access_auto_approves_deepseek_requests() {
+        let envelope = json!({
+            "rpcId": "rpc-1",
+            "payload": {
+                "type": "approval/requested",
+                "sessionId": "session-1",
+                "approvalId": "appr-1",
+                "toolName": "bash",
+                "reason": "Run shell command",
+                "arguments": "{\"command\":\"rm -rf /tmp/test\"}"
+            }
+        });
+        let payload = envelope.get("payload").unwrap();
+
+        for mode in [
+            RuntimeMode::Ask,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::Auto,
+        ] {
+            let (events, event_rx, mut state) = harness();
+            let client = MockDeepSeekClient::new(|_, _| Ok(Value::Null));
+            let mode_lock = Mutex::new(mode);
+            handle_approval_request(
+                &envelope,
+                payload,
+                &client,
+                "session-1",
+                &events,
+                &mode_lock,
+                &mut state,
+            );
+            assert!(
+                client.responses.lock().is_empty(),
+                "{mode:?} must not auto-approve escalated workspace-write approvals"
+            );
+            let DriverEvent::Permission {
+                request_id,
+                title,
+                detail,
+                ..
+            } = event_rx.try_recv().unwrap()
+            else {
+                panic!("{mode:?} must surface a Permission prompt");
+            };
+            assert_eq!(request_id, "rpc-1");
+            assert_eq!(title, "Allow bash?");
+            assert_eq!(detail, "Run shell command\nrm -rf /tmp/test");
+            assert!(state.pending.contains_key("rpc-1"));
+        }
+
+        let (events, event_rx, mut state) = harness();
+        let client = MockDeepSeekClient::new(|_, _| Ok(Value::Null));
+        let full_access = Mutex::new(RuntimeMode::FullAccess);
+        handle_approval_request(
+            &envelope,
+            payload,
+            &client,
+            "session-1",
+            &events,
+            &full_access,
+            &mut state,
+        );
+        assert!(event_rx.try_recv().is_err());
+        assert!(state.pending.is_empty());
+        let responses = client.responses.lock();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0, "rpc-1");
+        assert_eq!(responses[0].1["outcome"], "allowed-once");
+    }
+
+    #[test]
+    fn approval_detail_surfaces_command_or_tool_arguments_without_duplication() {
+        let (_, _, mut state) = harness();
+        state.tools.insert(
+            "call-9".into(),
+            ToolCallState {
+                name: "bash".into(),
+                title: "git push --force".into(),
+                kind: ActivityKind::Command,
+                arguments: json!({"command": "git push --force"}),
+            },
+        );
+
+        // Falls back to stored tool-call arguments via `callId`.
+        assert_eq!(
+            approval_detail(
+                &json!({"toolName": "bash", "callId": "call-9", "reason": "Requires approval"}),
+                &state,
+            ),
+            "Requires approval\ngit push --force"
+        );
+        // Avoids duplicating the command when `reason` already contains it.
+        assert_eq!(
+            approval_detail(
+                &json!({
+                    "toolName": "bash",
+                    "command": "git status",
+                    "reason": "Execute git status outside sandbox"
+                }),
+                &state,
+            ),
+            "Execute git status outside sandbox"
+        );
+        // Surfaces compact JSON when no reason or known key is present.
+        let serialized = approval_detail(
+            &json!({"toolName": "custom", "arguments": {"target": "prod", "force": true}}),
+            &state,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialized).unwrap(),
+            json!({"target": "prod", "force": true})
+        );
+    }
+
+    #[test]
+    fn fork_releases_completed_turn_seqs_lock_before_rpc() {
+        let completed_turn_seqs = Arc::new(Mutex::new(vec![10, 25]));
+        let lock_for_rpc = Arc::clone(&completed_turn_seqs);
+        let client = MockDeepSeekClient::new(move |method, payload| {
+            assert!(
+                lock_for_rpc.try_lock().is_some(),
+                "completed_turn_seqs lock must not be held across {method} RPC"
+            );
+            assert_eq!(method, "session.fork");
+            assert_eq!(payload["atSeq"], 10);
+            Ok(json!({"sessionId": "forked-1"}))
+        });
+
+        let cursor = fork_session_with_client(
+            &client,
+            "session-1",
+            Path::new("/tmp/project"),
+            Some("code"),
+            &completed_turn_seqs,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            cursor,
+            ProviderResumeCursor::DeepSeek {
+                session_id: "forked-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn fetch_history_stops_on_repeated_pagination_cursors() {
+        let calls = Mutex::new(0_usize);
+        let client = MockDeepSeekClient::new(|method, payload| {
+            assert_eq!(method, "session.history");
+            let mut count = calls.lock();
+            *count += 1;
+            assert!(*count <= 3, "pagination failed to break out of cycle");
+            if payload.get("beforeSeq").is_none() {
+                Ok(json!({
+                    "hasMore": true,
+                    "events": [{"event": {"type": "turn/end", "seq": 10}}]
+                }))
+            } else {
+                // Server keeps returning the same oldest seq with hasMore=true.
+                Ok(json!({
+                    "hasMore": true,
+                    "events": [{"event": {"type": "turn/start", "seq": 10}}]
+                }))
+            }
+        });
+
+        let snapshot = fetch_history(&client, "session-1").unwrap();
+        assert_eq!(*calls.lock(), 2);
+        assert_eq!(snapshot.last_seq, 10);
+    }
+
+    #[test]
+    fn apply_session_options_applies_reasoning_effort_when_model_is_none() {
+        let client = MockDeepSeekClient::new(|method, _payload| match method {
+            "session.models" => Ok(json!({
+                "current": {"provider": "deepseek", "model": "deepseek-reasoner"}
+            })),
+            "session.selectModel" => Ok(json!({})),
+            other => bail!("unexpected RPC {other}"),
+        });
+        let options = SessionOptions {
+            mode: RuntimeMode::AutoAcceptEdits,
+            model: None,
+            reasoning_effort: Some("high".into()),
+            service_tier: None,
+            context_window: None,
+        };
+        let projections = json!({"permissions": {"currentValue": "workspace-write"}});
+
+        apply_session_options(&client, "session-1", &options, Some(&projections)).unwrap();
+
+        let calls = client.rpc_calls.lock();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "session.models");
+        assert_eq!(calls[1].0, "session.selectModel");
+        assert_eq!(
+            calls[1].1,
+            json!({
+                "sessionId": "session-1",
+                "provider": "deepseek",
+                "model": "deepseek-reasoner",
+                "reasoningEffort": "high",
+            })
+        );
+    }
+
+    #[test]
+    fn process_exit_mid_turn_emits_failed_turn_finished_and_clears_pending() {
+        let (events, event_rx, mut state) = harness();
+        state.turn_active = true;
+        state.pending.insert(
+            "rpc-1".into(),
+            PendingInteraction::Approval {
+                rpc_id: "rpc-1".into(),
+                approval_id: "appr-1".into(),
+            },
+        );
+        let client = MockDeepSeekClient::new(|_, _| Ok(Value::Null));
+        let mode = Mutex::new(RuntimeMode::Ask);
+        let envelope = json!({
+            "payload": {
+                "type": "waku/process-exited",
+                "message": "DeepSeek Harness exited (signal 9)"
+            }
+        });
+
+        assert!(!handle_envelope(
+            &envelope,
+            &client,
+            "session-1",
+            &events,
+            &mode,
+            &mut state,
+        ));
+        assert!(!state.turn_active);
+        assert!(state.pending.is_empty());
+
+        let seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(matches!(
+            &seen[0],
+            DriverEvent::Error(message) if message == "DeepSeek Harness exited (signal 9)"
+        ));
+        assert!(matches!(
+            &seen[1],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(message),
+            } if message == "DeepSeek Harness exited (signal 9)"
+        ));
+        assert!(matches!(&seen[2], DriverEvent::ProcessExited));
+        assert_eq!(seen.len(), 3);
+
+        // When no turn is active, ProcessExited is emitted without TurnFinished.
+        let (events, event_rx, mut idle_state) = harness();
+        assert!(!handle_envelope(
+            &envelope,
+            &client,
+            "session-1",
+            &events,
+            &mode,
+            &mut idle_state,
+        ));
+        let idle_seen: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(idle_seen.len(), 2);
+        assert!(matches!(&idle_seen[0], DriverEvent::Error(_)));
+        assert!(matches!(&idle_seen[1], DriverEvent::ProcessExited));
     }
 }
