@@ -5,7 +5,7 @@
 //! only adapts typed ACP messages to its provider-neutral [`DriverEvent`]s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -452,7 +452,42 @@ pub(crate) fn catalog_agent(
 }
 
 type PermissionResponder = Responder<RequestPermissionResponse>;
-type PendingPermissions = Arc<Mutex<HashMap<String, PermissionResponder>>>;
+
+const CLIENT_PERMISSION_ALLOW_ONCE: &str = "allow_once";
+const CLIENT_PERMISSION_DENY: &str = "deny";
+
+enum PendingPermission {
+    Protocol(PermissionResponder),
+    WriteFile {
+        request: WriteTextFileRequest,
+        cwd: PathBuf,
+        responder: Responder<WriteTextFileResponse>,
+    },
+    CreateTerminal {
+        request: CreateTerminalRequest,
+        cwd: PathBuf,
+        registry: Arc<AcpTerminalRegistry>,
+        events: DriverEventSender,
+        responder: Responder<CreateTerminalResponse>,
+    },
+}
+
+type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
+
+fn client_permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption {
+            id: CLIENT_PERMISSION_ALLOW_ONCE.to_owned(),
+            label: tr!("permission.allow_once"),
+            allow: true,
+        },
+        PermissionOption {
+            id: CLIENT_PERMISSION_DENY.to_owned(),
+            label: tr!("common.deny"),
+            allow: false,
+        },
+    ]
+}
 
 #[derive(Clone, Copy)]
 enum AcpUserInputKind {
@@ -681,26 +716,36 @@ async fn run_sdk_connection(
         )
         .on_receive_request(
             {
+                let access_mode = access_mode.clone();
+                let pending_permissions = pending_permissions.clone();
+                let events = events.clone();
                 async move |request: WriteTextFileRequest, responder, _connection| {
-                    match handle_write_text_file(request, &fs_write_cwd) {
-                        Ok(response) => responder.respond(response),
-                        Err(error) => responder.respond_with_error(error),
-                    }
+                    handle_write_text_file_request(
+                        request,
+                        &fs_write_cwd,
+                        *access_mode.lock(),
+                        &pending_permissions,
+                        &events,
+                        responder,
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             {
+                let access_mode = access_mode.clone();
+                let pending_permissions = pending_permissions.clone();
                 async move |request: CreateTerminalRequest, responder, _connection| {
-                    match terminal_create_registry.create_terminal(
+                    handle_create_terminal_request(
                         request,
                         &terminal_cwd,
+                        *access_mode.lock(),
+                        &terminal_create_registry,
+                        &pending_permissions,
                         &terminal_create_events,
-                    ) {
-                        Ok(response) => responder.respond(response),
-                        Err(error) => responder.respond_with_error(error),
-                    }
+                        responder,
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1126,12 +1171,56 @@ async fn run_sdk_connection(
                         request_id,
                         option_id,
                     } => {
-                        if let Some(responder) = pending_permissions.lock().remove(&request_id) {
-                            let _ = responder.respond(RequestPermissionResponse::new(
-                                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                                    option_id,
-                                )),
-                            ));
+                        if let Some(pending) = pending_permissions.lock().remove(&request_id) {
+                            match pending {
+                                PendingPermission::Protocol(responder) => {
+                                    let _ = responder.respond(RequestPermissionResponse::new(
+                                        RequestPermissionOutcome::Selected(
+                                            SelectedPermissionOutcome::new(option_id),
+                                        ),
+                                    ));
+                                }
+                                PendingPermission::WriteFile {
+                                    request,
+                                    cwd,
+                                    responder,
+                                } => {
+                                    if option_id == CLIENT_PERMISSION_ALLOW_ONCE {
+                                        let _ = match handle_write_text_file(request, &cwd) {
+                                            Ok(response) => responder.respond(response),
+                                            Err(error) => responder.respond_with_error(error),
+                                        };
+                                    } else {
+                                        let _ = responder.respond_with_error(
+                                            agent_client_protocol::util::internal_error(
+                                                "File write denied by user",
+                                            ),
+                                        );
+                                    }
+                                }
+                                PendingPermission::CreateTerminal {
+                                    request,
+                                    cwd,
+                                    registry,
+                                    events,
+                                    responder,
+                                } => {
+                                    if option_id == CLIENT_PERMISSION_ALLOW_ONCE {
+                                        let _ = match registry
+                                            .create_terminal_authorized(request, &cwd, &events)
+                                        {
+                                            Ok(response) => responder.respond(response),
+                                            Err(error) => responder.respond_with_error(error),
+                                        };
+                                    } else {
+                                        let _ = responder.respond_with_error(
+                                            agent_client_protocol::util::internal_error(
+                                                "Terminal execution denied by user",
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     CommandMessage::RespondUserInput {
@@ -2438,6 +2527,326 @@ fn is_lost_native_session(error: &str) -> bool {
 const MAX_PROMPT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_PROMPT_TEXT_RESOURCE_BYTES: u64 = 256 * 1024;
 
+fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+fn validate_requested_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("Path cannot be empty".to_owned());
+    }
+    if path.to_string_lossy().contains('\0') {
+        return Err("Path contains an invalid NUL character".to_owned());
+    }
+    let has_prefix_or_root = path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir));
+    if has_prefix_or_root && !path.is_absolute() {
+        return Err(format!(
+            "Path `{}` uses an unsupported drive-relative or root-relative form",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        for component in path.components() {
+            if let Component::Normal(part) = component
+                && part.to_string_lossy().contains(':')
+            {
+                return Err(format!(
+                    "Path `{}` contains an invalid colon in a filename component",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `path` component-by-component, canonicalizing every existing
+/// segment (including symlinks and Windows junctions) and allowing a missing
+/// tail of pure `Normal` segments. Fails closed on dangling symlinks and on
+/// `..` segments following a non-existent segment.
+fn canonicalize_allowing_missing(path: &Path) -> Result<PathBuf, String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("Failed to resolve current directory: {error}"))?
+            .join(path)
+    };
+    let mut current = PathBuf::new();
+    let mut missing = false;
+    for component in abs.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => {
+                current.push(Component::RootDir.as_os_str());
+                if let Ok(canonical) = std::fs::canonicalize(&current) {
+                    current = canonical;
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing || !current.pop() {
+                    return Err(format!(
+                        "Path `{}` traverses above a non-existent or root directory",
+                        path.display()
+                    ));
+                }
+            }
+            Component::Normal(part) => {
+                current.push(part);
+                if !missing {
+                    match std::fs::symlink_metadata(&current) {
+                        Ok(_) => {
+                            current = std::fs::canonicalize(&current).map_err(|error| {
+                                format!("Failed to resolve `{}`: {error}", current.display())
+                            })?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            missing = true;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "Failed to inspect `{}`: {error}",
+                                current.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn resolve_confined_path(
+    workspace_cwd: &Path,
+    requested: &Path,
+    allow_missing_workspace: bool,
+    allow_workspace_root: bool,
+) -> agent_client_protocol::Result<PathBuf> {
+    validate_requested_path(requested).map_err(agent_client_protocol::util::internal_error)?;
+
+    let (workspace_root, workspace_exists) = if allow_missing_workspace {
+        let root = canonicalize_allowing_missing(workspace_cwd)
+            .map_err(agent_client_protocol::util::internal_error)?;
+        let exists = match std::fs::symlink_metadata(&root) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(agent_client_protocol::util::internal_error(format!(
+                    "Failed to inspect workspace `{}`: {error}",
+                    workspace_cwd.display()
+                )));
+            }
+        };
+        (root, exists)
+    } else {
+        let root = std::fs::canonicalize(workspace_cwd).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to resolve workspace `{}`: {error}",
+                workspace_cwd.display()
+            ))
+        })?;
+        (root, true)
+    };
+
+    let resolved = if requested.is_absolute() {
+        canonicalize_allowing_missing(requested)
+            .map_err(agent_client_protocol::util::internal_error)?
+    } else {
+        let mut current = workspace_root.clone();
+        let mut missing = !workspace_exists;
+        for component in requested.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    return Err(agent_client_protocol::util::internal_error(format!(
+                        "Path `{}` is outside the session workspace",
+                        requested.display()
+                    )));
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if missing || !current.pop() {
+                        return Err(agent_client_protocol::util::internal_error(format!(
+                            "Path `{}` escapes the session workspace",
+                            requested.display()
+                        )));
+                    }
+                }
+                Component::Normal(part) => {
+                    current.push(part);
+                    if !missing {
+                        match std::fs::symlink_metadata(&current) {
+                            Ok(_) => {
+                                current = std::fs::canonicalize(&current).map_err(|error| {
+                                    agent_client_protocol::util::internal_error(format!(
+                                        "Failed to resolve `{}`: {error}",
+                                        requested.display()
+                                    ))
+                                })?;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                missing = true;
+                            }
+                            Err(error) => {
+                                return Err(agent_client_protocol::util::internal_error(format!(
+                                    "Failed to inspect `{}`: {error}",
+                                    requested.display()
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        current
+    };
+
+    if !resolved.starts_with(&workspace_root)
+        || (!allow_workspace_root && resolved == workspace_root)
+    {
+        return Err(agent_client_protocol::util::internal_error(format!(
+            "Path `{}` is outside the session workspace",
+            requested.display()
+        )));
+    }
+
+    Ok(strip_windows_verbatim(resolved))
+}
+
+fn resolve_workspace_read_path(
+    workspace_cwd: &Path,
+    requested: &Path,
+) -> agent_client_protocol::Result<PathBuf> {
+    resolve_confined_path(workspace_cwd, requested, false, false)
+}
+
+fn resolve_workspace_write_path(
+    workspace_cwd: &Path,
+    requested: &Path,
+) -> agent_client_protocol::Result<PathBuf> {
+    resolve_confined_path(workspace_cwd, requested, true, false)
+}
+
+fn resolve_workspace_dir(
+    workspace_cwd: &Path,
+    requested: Option<&Path>,
+) -> agent_client_protocol::Result<PathBuf> {
+    let resolved = match requested {
+        Some(path) => resolve_confined_path(workspace_cwd, path, false, true)?,
+        None => strip_windows_verbatim(std::fs::canonicalize(workspace_cwd).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to resolve workspace `{}`: {error}",
+                workspace_cwd.display()
+            ))
+        })?),
+    };
+    let metadata = std::fs::metadata(&resolved).map_err(|error| {
+        agent_client_protocol::util::internal_error(format!(
+            "Terminal working directory `{}` is unavailable: {error}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(agent_client_protocol::util::internal_error(format!(
+            "Terminal working directory `{}` is not a directory",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn auto_allows_client_write(mode: RuntimeMode) -> bool {
+    !matches!(mode, RuntimeMode::Ask)
+}
+
+fn auto_allows_client_terminal(mode: RuntimeMode) -> bool {
+    matches!(mode, RuntimeMode::Auto | RuntimeMode::FullAccess)
+}
+
+fn is_blocked_terminal_env_var(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains(['=', '\0']) {
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("LD_") || upper.starts_with("DYLD_") || upper.starts_with("BASH_FUNC_") {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "PATHEXT"
+            | "COMSPEC"
+            | "SYSTEMROOT"
+            | "WINDIR"
+            | "APPINIT_DLLS"
+            | "BASH_ENV"
+            | "ENV"
+            | "CDPATH"
+            | "GLOBIGNORE"
+            | "PROMPT_COMMAND"
+            | "IFS"
+            | "ZDOTDIR"
+            | "SHELLOPTS"
+            | "BASHOPTS"
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "HOSTALIASES"
+            | "RESOLV_HOST_CONF"
+            | "RES_OPTIONS"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "PYTHONSTARTUP"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "PERLLIB"
+            | "JAVA_TOOL_OPTIONS"
+            | "_JAVA_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "DOTNET_STARTUP_HOOKS"
+            | "CORECLR_PROFILER"
+            | "CORECLR_PROFILER_PATH"
+            | "COR_PROFILER"
+            | "COR_PROFILER_PATH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_SSH"
+            | "GIT_EXEC_PATH"
+            | "GIT_TEMPLATE_DIR"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+            | "EDITOR"
+            | "VISUAL"
+    )
+}
+
+fn sanitized_terminal_env(
+    env: &[agent_client_protocol::schema::v1::EnvVariable],
+) -> Vec<(&str, &str)> {
+    env.iter()
+        .filter(|var| !is_blocked_terminal_env_var(&var.name))
+        .map(|var| (var.name.as_str(), var.value.as_str()))
+        .collect()
+}
+
 pub(crate) fn build_prompt_content_blocks(
     text: &str,
     cwd: &Path,
@@ -2458,10 +2867,8 @@ pub(crate) fn build_prompt_content_blocks(
             continue;
         }
         let candidate = Path::new(mention);
-        let resolved = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            cwd.join(candidate)
+        let Ok(resolved) = resolve_workspace_read_path(cwd, candidate) else {
+            continue;
         };
         let Ok(metadata) = std::fs::metadata(&resolved) else {
             continue;
@@ -2529,11 +2936,7 @@ pub(crate) fn handle_read_text_file(
     request: ReadTextFileRequest,
     default_cwd: &Path,
 ) -> agent_client_protocol::Result<ReadTextFileResponse> {
-    let path = if request.path.is_absolute() {
-        request.path
-    } else {
-        default_cwd.join(request.path)
-    };
+    let path = resolve_workspace_read_path(default_cwd, &request.path)?;
     let raw = std::fs::read_to_string(&path).map_err(|error| {
         agent_client_protocol::util::internal_error(format!(
             "Failed to read {}: {error}",
@@ -2554,15 +2957,10 @@ pub(crate) fn handle_read_text_file(
     Ok(ReadTextFileResponse::new(content))
 }
 
-pub(crate) fn handle_write_text_file(
-    request: WriteTextFileRequest,
-    default_cwd: &Path,
+fn write_text_file_at(
+    path: &Path,
+    content: &str,
 ) -> agent_client_protocol::Result<WriteTextFileResponse> {
-    let path = if request.path.is_absolute() {
-        request.path
-    } else {
-        default_cwd.join(request.path)
-    };
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2574,13 +2972,134 @@ pub(crate) fn handle_write_text_file(
             ))
         })?;
     }
-    std::fs::write(&path, &request.content).map_err(|error| {
+    std::fs::write(path, content).map_err(|error| {
         agent_client_protocol::util::internal_error(format!(
             "Failed to write {}: {error}",
             path.display()
         ))
     })?;
     Ok(WriteTextFileResponse::new())
+}
+
+pub(crate) fn handle_write_text_file(
+    request: WriteTextFileRequest,
+    default_cwd: &Path,
+) -> agent_client_protocol::Result<WriteTextFileResponse> {
+    let path = resolve_workspace_write_path(default_cwd, &request.path)?;
+    write_text_file_at(&path, &request.content)
+}
+
+fn handle_write_text_file_request(
+    request: WriteTextFileRequest,
+    default_cwd: &Path,
+    access_mode: RuntimeMode,
+    pending: &PendingPermissions,
+    events: &impl DriverEventSink,
+    responder: Responder<WriteTextFileResponse>,
+) -> agent_client_protocol::Result<()> {
+    let resolved = match resolve_workspace_write_path(default_cwd, &request.path) {
+        Ok(path) => path,
+        Err(error) => return responder.respond_with_error(error),
+    };
+    if auto_allows_client_write(access_mode) {
+        return match write_text_file_at(&resolved, &request.content) {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        };
+    }
+
+    let request_id = responder.id().to_string();
+    let display_path = resolved
+        .strip_prefix(default_cwd)
+        .unwrap_or(&resolved)
+        .display()
+        .to_string();
+    pending.lock().insert(
+        request_id.clone(),
+        PendingPermission::WriteFile {
+            request,
+            cwd: default_cwd.to_path_buf(),
+            responder,
+        },
+    );
+    if events
+        .send(DriverEvent::Permission {
+            request_id: request_id.clone(),
+            title: tr!("permission.run_tool", tool = "fs/write_text_file"),
+            detail: tr!(
+                "permission.agent_wants_to",
+                action = format!("write {display_path}")
+            ),
+            options: client_permission_options(),
+        })
+        .is_err()
+        && let Some(PendingPermission::WriteFile { responder, .. }) =
+            pending.lock().remove(&request_id)
+    {
+        let _ = responder.respond_with_error(agent_client_protocol::util::internal_error(
+            "File write cancelled",
+        ));
+    }
+    Ok(())
+}
+
+fn handle_create_terminal_request(
+    request: CreateTerminalRequest,
+    default_cwd: &Path,
+    access_mode: RuntimeMode,
+    registry: &Arc<AcpTerminalRegistry>,
+    pending: &PendingPermissions,
+    events: &DriverEventSender,
+    responder: Responder<CreateTerminalResponse>,
+) -> agent_client_protocol::Result<()> {
+    if let Err(error) = resolve_workspace_dir(default_cwd, request.cwd.as_deref()) {
+        return responder.respond_with_error(error);
+    }
+    if auto_allows_client_terminal(access_mode) {
+        return match registry.create_terminal(request, default_cwd, access_mode, events) {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        };
+    }
+
+    let request_id = responder.id().to_string();
+    let command_display = if request.args.is_empty() {
+        request.command.clone()
+    } else {
+        format!("{} {}", request.command, request.args.join(" "))
+    };
+    pending.lock().insert(
+        request_id.clone(),
+        PendingPermission::CreateTerminal {
+            request,
+            cwd: default_cwd.to_path_buf(),
+            registry: registry.clone(),
+            events: events.clone(),
+            responder,
+        },
+    );
+    if events
+        .send(DriverEvent::Permission {
+            request_id: request_id.clone(),
+            title: tr!(
+                "permission.run_tool",
+                tool = truncate(&command_display, 80)
+            ),
+            detail: tr!(
+                "permission.agent_wants_to_run",
+                tool = truncate(&command_display, 200)
+            ),
+            options: client_permission_options(),
+        })
+        .is_err()
+        && let Some(PendingPermission::CreateTerminal { responder, .. }) =
+            pending.lock().remove(&request_id)
+    {
+        let _ = responder.respond_with_error(agent_client_protocol::util::internal_error(
+            "Terminal execution cancelled",
+        ));
+    }
+    Ok(())
 }
 
 const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT: usize = 1_048_576;
@@ -2694,26 +3213,31 @@ impl AcpTerminalProcess {
 
     fn kill_process_tree(&mut self) {
         self.killed = true;
+        let pid = self.child_pid;
         #[cfg(windows)]
         {
             drop(self.job.take());
-            unsafe {
-                use windows_sys::Win32::Foundation::CloseHandle;
-                use windows_sys::Win32::System::Threading::{
-                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-                };
-                let process = OpenProcess(PROCESS_TERMINATE, 0, self.child_pid);
-                if !process.is_null() {
-                    let _ = TerminateProcess(process, 1);
-                    CloseHandle(process);
+            if pid != 0 {
+                unsafe {
+                    use windows_sys::Win32::Foundation::CloseHandle;
+                    use windows_sys::Win32::System::Threading::{
+                        OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                    };
+                    let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !process.is_null() {
+                        let _ = TerminateProcess(process, 1);
+                        CloseHandle(process);
+                    }
                 }
             }
         }
         #[cfg(unix)]
         {
-            unsafe {
-                let _ = libc::kill(-(self.child_pid as i32), libc::SIGKILL);
-                let _ = libc::kill(self.child_pid as i32, libc::SIGKILL);
+            if pid != 0 {
+                unsafe {
+                    let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+                    let _ = libc::kill(pid as i32, libc::SIGKILL);
+                }
             }
         }
     }
@@ -2729,14 +3253,15 @@ impl AcpTerminalRegistry {
         request: &CreateTerminalRequest,
         work_dir: &Path,
     ) -> std::io::Result<std::process::Child> {
+        let env_vars = sanitized_terminal_env(&request.env);
         let configure = |cmd: &mut std::process::Command| {
             cmd.current_dir(work_dir)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .envs(crate::command_env::shell_environment());
-            for env_var in &request.env {
-                cmd.env(&env_var.name, &env_var.value);
+            for (name, value) in &env_vars {
+                cmd.env(name, value);
             }
             #[cfg(unix)]
             {
@@ -2782,13 +3307,34 @@ impl AcpTerminalRegistry {
         &self,
         request: CreateTerminalRequest,
         default_cwd: &Path,
+        access_mode: RuntimeMode,
         events: &DriverEventSender,
     ) -> agent_client_protocol::Result<CreateTerminalResponse> {
-        let work_dir = match request.cwd.as_deref() {
-            Some(path) if path.is_absolute() => path.to_path_buf(),
-            Some(path) => default_cwd.join(path),
-            None => default_cwd.to_path_buf(),
-        };
+        let work_dir = resolve_workspace_dir(default_cwd, request.cwd.as_deref())?;
+        if !auto_allows_client_terminal(access_mode) {
+            return Err(agent_client_protocol::util::internal_error(
+                "Terminal execution requires user approval in the current access mode",
+            ));
+        }
+        self.create_terminal_in_dir(request, work_dir, events)
+    }
+
+    fn create_terminal_authorized(
+        &self,
+        request: CreateTerminalRequest,
+        default_cwd: &Path,
+        events: &DriverEventSender,
+    ) -> agent_client_protocol::Result<CreateTerminalResponse> {
+        let work_dir = resolve_workspace_dir(default_cwd, request.cwd.as_deref())?;
+        self.create_terminal_in_dir(request, work_dir, events)
+    }
+
+    fn create_terminal_in_dir(
+        &self,
+        request: CreateTerminalRequest,
+        work_dir: PathBuf,
+        events: &DriverEventSender,
+    ) -> agent_client_protocol::Result<CreateTerminalResponse> {
         let mut child = Self::spawn_command(&request, &work_dir).map_err(|error| {
             agent_client_protocol::util::internal_error(format!(
                 "Failed to spawn terminal command `{}`: {error}",
@@ -2845,6 +3391,13 @@ impl AcpTerminalRegistry {
             .name("waku-acp-term-wait".into())
             .spawn(move || {
                 let wait_result = child.wait();
+                {
+                    let mut proc = wait_entry.lock();
+                    proc.child_pid = 0;
+                    #[cfg(windows)]
+                    drop(proc.job.take());
+                }
+                drop(child);
                 if let Some(handle) = stdout_handle {
                     let _ = handle.join();
                 }
@@ -3013,8 +3566,10 @@ impl AcpTerminalRegistry {
             })?;
         let item = {
             let mut proc = entry.lock();
-            proc.kill_process_tree();
-            proc.updated_at_ms = unix_time_millis();
+            if proc.exit_status.is_none() {
+                proc.kill_process_tree();
+                proc.updated_at_ms = unix_time_millis();
+            }
             proc.to_background_work_item()
         };
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
@@ -3082,11 +3637,11 @@ impl AcpTerminalRegistry {
         };
         let item = {
             let mut proc = entry.lock();
-            proc.kill_process_tree();
             if proc.exit_status.is_none() {
+                proc.kill_process_tree();
                 proc.exit_status = Some(TerminalExitStatus::new());
+                proc.updated_at_ms = unix_time_millis();
             }
-            proc.updated_at_ms = unix_time_millis();
             proc.to_background_work_item()
         };
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
@@ -3224,10 +3779,24 @@ fn finish_prompt(
 }
 
 fn cancel_pending_permissions(pending: &PendingPermissions) {
-    for (_, responder) in pending.lock().drain() {
-        let _ = responder.respond(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ));
+    for (_, entry) in pending.lock().drain() {
+        match entry {
+            PendingPermission::Protocol(responder) => {
+                let _ = responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            }
+            PendingPermission::WriteFile { responder, .. } => {
+                let _ = responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    "File write cancelled by user",
+                ));
+            }
+            PendingPermission::CreateTerminal { responder, .. } => {
+                let _ = responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    "Terminal execution cancelled by user",
+                ));
+            }
+        }
     }
 }
 
@@ -4025,7 +4594,9 @@ fn handle_permission_request(
     } else {
         detail
     };
-    pending.lock().insert(request_id.clone(), responder);
+    pending
+        .lock()
+        .insert(request_id.clone(), PendingPermission::Protocol(responder));
     if events
         .send(DriverEvent::Permission {
             request_id: request_id.clone(),
@@ -4034,7 +4605,7 @@ fn handle_permission_request(
             options,
         })
         .is_err()
-        && let Some(responder) = pending.lock().remove(&request_id)
+        && let Some(PendingPermission::Protocol(responder)) = pending.lock().remove(&request_id)
     {
         let _ = responder.respond(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
@@ -5740,6 +6311,365 @@ mod tests {
         assert!(matches!(&blocks[2], ContentBlock::Resource(_)));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn create_test_dir_link(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return true;
+            }
+            // Directory junctions work without elevated privileges on Windows
+            // and test the exact same reparse-point escape class.
+            std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
+    fn create_test_file_link(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn acp_fs_handlers_reject_workspace_escapes_and_symlinks() {
+        let outer_dir =
+            std::env::temp_dir().join(format!("waku-acp-fs-sec-{}", uuid::Uuid::new_v4()));
+        let workspace_dir = outer_dir.join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("sub")).unwrap();
+        let outside_file = outer_dir.join("secret.txt");
+        std::fs::write(&outside_file, "top-secret").unwrap();
+        let inside_file = workspace_dir.join("sub/ok.txt");
+        std::fs::write(&inside_file, "inside-ok").unwrap();
+
+        // In-workspace relative and absolute reads/writes succeed.
+        let read_rel =
+            handle_read_text_file(ReadTextFileRequest::new("s", "sub/ok.txt"), &workspace_dir)
+                .unwrap();
+        assert_eq!(read_rel.content, "inside-ok");
+        let read_abs = handle_read_text_file(
+            ReadTextFileRequest::new("s", inside_file.clone()),
+            &workspace_dir,
+        )
+        .unwrap();
+        assert_eq!(read_abs.content, "inside-ok");
+
+        assert!(
+            handle_write_text_file(
+                WriteTextFileRequest::new("s", "new_dir/written.txt", "safe"),
+                &workspace_dir
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_dir.join("new_dir/written.txt")).unwrap(),
+            "safe"
+        );
+
+        // Relative traversal and out-of-workspace absolute paths are rejected.
+        for escape in [
+            std::path::PathBuf::from("../secret.txt"),
+            std::path::PathBuf::from("sub/../../secret.txt"),
+            outside_file.clone(),
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from(""),
+        ] {
+            assert!(
+                handle_read_text_file(ReadTextFileRequest::new("s", escape.clone()), &workspace_dir)
+                    .is_err(),
+                "read should reject `{}`",
+                escape.display()
+            );
+        }
+
+        let escaped_write_target = outer_dir.join("pwned.txt");
+        for escape in [
+            std::path::PathBuf::from("../pwned.txt"),
+            std::path::PathBuf::from("nonexistent/../../pwned.txt"),
+            escaped_write_target.clone(),
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from(""),
+        ] {
+            assert!(
+                handle_write_text_file(
+                    WriteTextFileRequest::new("s", escape.clone(), "bad"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "write should reject `{}`",
+                escape.display()
+            );
+        }
+        assert!(!escaped_write_target.exists());
+
+        // Symlink / Windows directory junction escapes are rejected for both reads and writes.
+        let dir_link = workspace_dir.join("escape_dir");
+        if create_test_dir_link(&dir_link, &outer_dir) {
+            assert!(
+                handle_read_text_file(
+                    ReadTextFileRequest::new("s", "escape_dir/secret.txt"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "read should reject directory symlink/junction escape"
+            );
+            assert!(
+                handle_write_text_file(
+                    WriteTextFileRequest::new("s", "escape_dir/via_link.txt", "bad"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "write should reject directory symlink/junction escape"
+            );
+            assert!(!outer_dir.join("via_link.txt").exists());
+            let _ = std::fs::remove_dir(&dir_link);
+        }
+
+        let file_link = workspace_dir.join("escape_file.txt");
+        if create_test_file_link(&file_link, &outside_file) {
+            assert!(
+                handle_read_text_file(
+                    ReadTextFileRequest::new("s", "escape_file.txt"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "read should reject file symlink escape"
+            );
+            assert!(
+                handle_write_text_file(
+                    WriteTextFileRequest::new("s", "escape_file.txt", "bad"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "write should reject file symlink escape"
+            );
+            assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "top-secret");
+        }
+
+        let dangling_target = outer_dir.join("dangling_out.txt");
+        let dangling_link = workspace_dir.join("dangling_link.txt");
+        if create_test_file_link(&dangling_link, &dangling_target) {
+            assert!(
+                handle_write_text_file(
+                    WriteTextFileRequest::new("s", "dangling_link.txt", "bad"),
+                    &workspace_dir
+                )
+                .is_err(),
+                "write should reject dangling symlink escape"
+            );
+            assert!(!dangling_target.exists());
+        }
+
+        let _ = std::fs::remove_dir_all(&outer_dir);
+    }
+
+    #[test]
+    fn acp_prompt_content_blocks_rejects_out_of_workspace_mentions() {
+        let outer_dir =
+            std::env::temp_dir().join(format!("waku-acp-prompt-sec-{}", uuid::Uuid::new_v4()));
+        let workspace_dir = outer_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let outside_file = outer_dir.join("secret.txt");
+        std::fs::write(&outside_file, "secret-data").unwrap();
+        let inside_file = workspace_dir.join("inside.txt");
+        std::fs::write(&inside_file, "inside-data").unwrap();
+
+        let dir_link = workspace_dir.join("link_out");
+        let has_dir_link = create_test_dir_link(&dir_link, &outer_dir);
+
+        let prompt = format!(
+            "Check @inside.txt @../secret.txt @{} @link_out/secret.txt",
+            outside_file.display()
+        );
+        let capabilities = PromptCapabilities::new().image(true).embedded_context(true);
+        let blocks = build_prompt_content_blocks(&prompt, &workspace_dir, &capabilities);
+
+        assert_eq!(
+            blocks.len(),
+            2,
+            "only the text block and in-workspace @inside.txt should be attached (has_dir_link={has_dir_link})"
+        );
+        assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+        let ContentBlock::Resource(embedded) = &blocks[1] else {
+            panic!("expected embedded resource for inside.txt");
+        };
+        let EmbeddedResourceResource::TextResourceContents(contents) = &embedded.resource else {
+            panic!("expected text resource contents");
+        };
+        assert_eq!(contents.text, "inside-data");
+
+        if has_dir_link {
+            let _ = std::fs::remove_dir(&dir_link);
+        }
+        let _ = std::fs::remove_dir_all(&outer_dir);
+    }
+
+    #[test]
+    fn acp_terminal_confines_cwd_checks_access_mode_and_sanitizes_env() {
+        use agent_client_protocol::schema::v1::EnvVariable;
+
+        let outer_dir =
+            std::env::temp_dir().join(format!("waku-acp-term-sec-{}", uuid::Uuid::new_v4()));
+        let workspace_dir = outer_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let dir_link = workspace_dir.join("escape_cwd");
+        let has_dir_link = create_test_dir_link(&dir_link, &outer_dir);
+
+        let registry = AcpTerminalRegistry::default();
+        let (events, _event_rx) = crate::driver::test_event_channel();
+
+        // Out-of-workspace cwd rejected even in FullAccess.
+        for bad_cwd in [
+            std::path::PathBuf::from(".."),
+            outer_dir.clone(),
+        ] {
+            let req = CreateTerminalRequest::new("s", "echo").cwd(bad_cwd.clone());
+            assert!(
+                registry
+                    .create_terminal(req, &workspace_dir, RuntimeMode::FullAccess, &events)
+                    .is_err(),
+                "create_terminal should reject out-of-workspace cwd `{}`",
+                bad_cwd.display()
+            );
+        }
+        if has_dir_link {
+            let req = CreateTerminalRequest::new("s", "echo").cwd("escape_cwd");
+            assert!(
+                registry
+                    .create_terminal(req, &workspace_dir, RuntimeMode::FullAccess, &events)
+                    .is_err(),
+                "create_terminal should reject symlink/junction cwd escape"
+            );
+            let _ = std::fs::remove_dir(&dir_link);
+        }
+
+        // Access mode enforcement on write and terminal policy helpers and create_terminal.
+        assert!(!auto_allows_client_write(RuntimeMode::Ask));
+        assert!(auto_allows_client_write(RuntimeMode::AutoAcceptEdits));
+        assert!(auto_allows_client_write(RuntimeMode::Auto));
+        assert!(auto_allows_client_write(RuntimeMode::FullAccess));
+
+        assert!(!auto_allows_client_terminal(RuntimeMode::Ask));
+        assert!(!auto_allows_client_terminal(RuntimeMode::AutoAcceptEdits));
+        assert!(auto_allows_client_terminal(RuntimeMode::Auto));
+        assert!(auto_allows_client_terminal(RuntimeMode::FullAccess));
+
+        for gated_mode in [RuntimeMode::Ask, RuntimeMode::AutoAcceptEdits] {
+            let req = CreateTerminalRequest::new("s", "echo");
+            assert!(
+                registry
+                    .create_terminal(req, &workspace_dir, gated_mode, &events)
+                    .is_err(),
+                "create_terminal should require approval in {gated_mode:?}"
+            );
+        }
+
+        // Env sanitization strips loader/shell/interpreter injection vectors while keeping benign vars.
+        let raw_env = vec![
+            EnvVariable::new("LD_PRELOAD", "/tmp/evil.so"),
+            EnvVariable::new("LD_LIBRARY_PATH", "/tmp/evil"),
+            EnvVariable::new("dyld_insert_libraries", "/tmp/evil.dylib"),
+            EnvVariable::new("DYLD_LIBRARY_PATH", "/tmp/evil"),
+            EnvVariable::new("PATH", "/tmp/evil-bin"),
+            EnvVariable::new("BASH_ENV", "/tmp/evil.sh"),
+            EnvVariable::new("BASH_FUNC_ls%%", "() { evil; }"),
+            EnvVariable::new("NODE_OPTIONS", "--require=/tmp/evil.js"),
+            EnvVariable::new("PYTHONSTARTUP", "/tmp/evil.py"),
+            EnvVariable::new("GIT_SSH_COMMAND", "sh -c evil"),
+            EnvVariable::new("CI", "1"),
+            EnvVariable::new("NO_COLOR", "1"),
+            EnvVariable::new("RUST_LOG", "debug"),
+        ];
+        let filtered = sanitized_terminal_env(&raw_env);
+        assert_eq!(
+            filtered,
+            vec![("CI", "1"), ("NO_COLOR", "1"), ("RUST_LOG", "debug")]
+        );
+
+        let _ = std::fs::remove_dir_all(&outer_dir);
+    }
+
+    #[test]
+    fn acp_terminal_kill_and_stop_skip_already_exited_process() {
+        let registry = AcpTerminalRegistry::default();
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let id = "term-already-exited".to_owned();
+        let entry = Arc::new(Mutex::new(AcpTerminalProcess {
+            id: id.clone(),
+            title: "echo ok".to_owned(),
+            command_display: "echo ok".to_owned(),
+            cwd_display: ".".to_owned(),
+            started_at_ms: 100,
+            updated_at_ms: 200,
+            output: "ok\n".to_owned(),
+            output_truncated: false,
+            output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
+            exit_status: Some(TerminalExitStatus::new().exit_code(Some(0))),
+            killed: false,
+            // Sentinel non-zero PID: if kill_process_tree were wrongly called,
+            // it would flip `killed` and try to signal this PID.
+            child_pid: u32::MAX,
+            #[cfg(windows)]
+            job: None,
+            waiters: Vec::new(),
+        }));
+        registry.terminals.lock().insert(id.clone(), entry.clone());
+
+        registry
+            .kill_terminal(KillTerminalRequest::new("s", id.clone()), &events)
+            .unwrap();
+        assert!(
+            !entry.lock().killed,
+            "kill_terminal must not kill an already-exited child"
+        );
+        assert_eq!(
+            entry.lock().background_work_status(),
+            BackgroundWorkStatus::Completed
+        );
+
+        let key = BackgroundWorkKey::new(BackgroundWorkKind::Process, id.clone());
+        registry.stop_by_id(&id, &key, &events);
+        assert!(
+            !entry.lock().killed,
+            "stop_by_id must not kill an already-exited child"
+        );
+        assert_eq!(
+            entry.lock().background_work_status(),
+            BackgroundWorkStatus::Completed
+        );
+
+        // Drain events and confirm upserts kept Completed status.
+        let mut upserts = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(item)) = event {
+                upserts.push(item.status);
+            }
+        }
+        assert_eq!(
+            upserts,
+            vec![
+                BackgroundWorkStatus::Completed,
+                BackgroundWorkStatus::Completed
+            ]
+        );
     }
 
     #[test]

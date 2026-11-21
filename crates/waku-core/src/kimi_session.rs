@@ -190,15 +190,34 @@ fn turn_failure_in(
     }
 }
 
+/// Validates that a Kimi session ID is a single safe path segment on every
+/// platform, rejecting path separators, traversal sequences, NUL bytes, and
+/// drive or root prefixes.
+fn is_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty()
+        || session_id.contains(['/', '\\', '\0', ':'])
+        || session_id.contains("..")
+        || matches!(session_id, "." | "..")
+    {
+        return false;
+    }
+    let mut components = Path::new(session_id).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 /// Sessions are filed under a per-workspace directory whose name carries a
 /// hash Waku cannot reproduce, so the session id is matched by scanning.
 fn wire_log(home: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty() || session_id.contains(std::path::MAIN_SEPARATOR) {
+    if !is_safe_session_id(session_id) {
         return None;
     }
     std::fs::read_dir(home.join("sessions"))
         .ok()?
         .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .find_map(|entry| {
             let candidate = entry
                 .path()
@@ -333,6 +352,49 @@ mod tests {
         assert_eq!(sessions[0].created_at, 1_700_000_000);
         assert_eq!(sessions[0].updated_at, 1_700_000_100);
         assert_eq!(sessions[0].cwd, recorded_cwd);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wire_log_rejects_cross_platform_traversal_and_unsafe_session_ids() {
+        let root = std::env::temp_dir().join(format!("waku-kimi-wire-sec-{}", uuid::Uuid::new_v4()));
+        let valid_wire = root.join("sessions/ws-hash/valid-session_1/agents/main/wire.jsonl");
+        let escaped_wire = root.join("sessions/agents/main/wire.jsonl");
+        let sibling_wire = root.join("sessions/other/agents/main/wire.jsonl");
+        fs::create_dir_all(valid_wire.parent().unwrap()).unwrap();
+        fs::create_dir_all(escaped_wire.parent().unwrap()).unwrap();
+        fs::create_dir_all(sibling_wire.parent().unwrap()).unwrap();
+        fs::write(&valid_wire, "{}\n").unwrap();
+        fs::write(&escaped_wire, "{}\n").unwrap();
+        fs::write(&sibling_wire, "{}\n").unwrap();
+
+        assert_eq!(wire_log(&root, "valid-session_1"), Some(valid_wire));
+
+        for malicious in [
+            "",
+            ".",
+            "..",
+            "../other",
+            "..\\other",
+            "a/b",
+            "a\\b",
+            "foo..bar",
+            "/etc/passwd",
+            "\\Windows\\System32",
+            "C:\\Windows\\System32",
+            "C:relative",
+            "valid\0bad",
+        ] {
+            assert!(
+                !is_safe_session_id(malicious),
+                "expected `{malicious:?}` to be rejected as unsafe session id"
+            );
+            assert!(
+                wire_log(&root, malicious).is_none(),
+                "expected wire_log to reject `{malicious:?}`"
+            );
+        }
 
         let _ = fs::remove_dir_all(root);
     }

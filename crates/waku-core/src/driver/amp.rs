@@ -18,11 +18,11 @@
 //! against the real CLI; the attribute is in the manual's Streaming JSON
 //! section.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -37,15 +37,89 @@ use crate::driver::{
 };
 use crate::model::{ActivityKind, DriverEvent, ProviderResumeCursor, RuntimeMode};
 
+const MAX_STDERR_LINES: usize = 128;
+const MAX_STDERR_LINE_BYTES: usize = 4096;
+
 enum CommandMessage {
     Prompt(String),
     Steer(String),
     Shutdown,
 }
 
+struct AmpProcessState {
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+struct AmpProcessHandle {
+    state: Mutex<AmpProcessState>,
+    cancelled: AtomicBool,
+    turn_active: Arc<Mutex<bool>>,
+}
+
+impl AmpProcessHandle {
+    fn new(
+        pid: u32,
+        #[cfg(windows)] job: Option<crate::process_tree::KillOnCloseJob>,
+        turn_active: Arc<Mutex<bool>>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(AmpProcessState {
+                pid,
+                #[cfg(windows)]
+                job,
+            }),
+            cancelled: AtomicBool::new(false),
+            turn_active,
+        }
+    }
+
+    fn terminate(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut state = self.state.lock();
+        if state.pid == 0 {
+            return;
+        }
+        let pid = state.pid;
+        #[cfg(windows)]
+        {
+            drop(state.job.take());
+            unsafe {
+                use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::{
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                };
+                let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !process.is_null() {
+                    let _ = TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            unsafe {
+                let _ = libc::kill(pid as i32, libc::SIGINT);
+            }
+        }
+    }
+
+    fn mark_exited(&self) {
+        let mut state = self.state.lock();
+        state.pid = 0;
+        #[cfg(windows)]
+        drop(state.job.take());
+    }
+
+    fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 pub struct AmpDriver {
     commands: Sender<CommandMessage>,
-    active_pid: Arc<AtomicU32>,
+    process: Arc<AmpProcessHandle>,
 }
 
 /// Amp's thread arguments. The prompt never rides here — it goes in on stdin.
@@ -142,7 +216,9 @@ impl AmpDriver {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("Amp stderr unavailable"))?;
-        let active_pid = Arc::new(AtomicU32::new(child.id()));
+        let child_pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child_pid).ok();
 
         if let Some(thread_id) = thread_id.clone() {
             let _ = events.send(DriverEvent::Connected {
@@ -155,6 +231,12 @@ impl AmpDriver {
 
         let (commands, command_rx) = unbounded();
         let turn_active = Arc::new(Mutex::new(false));
+        let process = Arc::new(AmpProcessHandle::new(
+            child_pid,
+            #[cfg(windows)]
+            job,
+            turn_active.clone(),
+        ));
 
         let reader_events = events.clone();
         let reader_turn = turn_active.clone();
@@ -189,7 +271,7 @@ impl AmpDriver {
             })?;
 
         let writer_events = events.clone();
-        let writer_turn = turn_active;
+        let writer_turn = turn_active.clone();
         thread::Builder::new()
             .name("waku-amp-writer".into())
             .spawn(move || {
@@ -200,24 +282,9 @@ impl AmpDriver {
                 while let Ok(message) = command_rx.recv() {
                     match message {
                         CommandMessage::Prompt(text) => {
-                            let text = fork_context
-                                .take()
-                                .map(|context| {
-                                    crate::amp_session::prompt_with_fork_context(&context, &text)
-                                })
-                                .unwrap_or(text);
                             *writer_turn.lock() = true;
                             let _ = writer_events.send(DriverEvent::TurnStarted);
-                            let written = write_line(
-                                &mut stdin,
-                                &json!({
-                                    "type": "user",
-                                    "message": {
-                                        "role": "user",
-                                        "content": [{"type": "text", "text": text}]
-                                    }
-                                }),
-                            );
+                            let written = send_prompt_line(&mut stdin, &mut fork_context, text);
                             if let Err(error) = written {
                                 let _ = writer_events.send(DriverEvent::Error(tr!(
                                     "errors.provider_transport_write",
@@ -305,11 +372,7 @@ impl AmpDriver {
         let stderr_thread = thread::Builder::new()
             .name("waku-amp-stderr".into())
             .spawn(move || {
-                let lines = BufReader::new(stderr)
-                    .lines()
-                    .map_while(Result::ok)
-                    .filter(|line| !line.trim().is_empty())
-                    .collect::<Vec<_>>();
+                let lines = collect_bounded_stderr_lines(stderr);
                 if let Some(message) = super::support::provider_stderr_error(lines) {
                     let error = format!("Amp: {message}");
                     *stderr_last_error.lock() = Some(error.clone());
@@ -317,32 +380,54 @@ impl AmpDriver {
                 }
             })?;
 
-        let process_pid = active_pid.clone();
+        let process_handle = process.clone();
+        let process_turn = turn_active;
         thread::Builder::new()
             .name("waku-amp-process".into())
             .spawn(move || {
                 let status = child.wait();
-                process_pid.store(0, Ordering::Relaxed);
+                // Clear the tracked PID before dropping `child` so Windows
+                // cannot recycle the PID while `terminate()` still holds it.
+                process_handle.mark_exited();
+                drop(child);
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                if let Ok(status) = status
-                    && !status.success()
-                    && last_visible_stderr.lock().is_none()
-                {
-                    let _ = events.send(DriverEvent::Error(tr!(
-                        "errors.provider_exited",
-                        provider = "Amp",
-                        status = status
-                    )));
-                }
-                let _ = events.send(DriverEvent::ProcessExited);
+                let cancelled = process_handle.was_cancelled();
+                let last_stderr = last_visible_stderr.lock().clone();
+                finalize_process_exit(status, cancelled, last_stderr, &process_turn, &events);
             })?;
 
-        Ok(Self {
-            commands,
-            active_pid,
-        })
+        Ok(Self { commands, process })
     }
+}
+
+fn finalize_process_exit(
+    status: std::io::Result<std::process::ExitStatus>,
+    cancelled: bool,
+    last_visible_stderr: Option<String>,
+    turn_active: &Mutex<bool>,
+    events: &impl DriverEventSink,
+) {
+    let exit_error = if cancelled {
+        None
+    } else if let Some(stderr_error) = last_visible_stderr {
+        Some(stderr_error)
+    } else if let Ok(status) = status
+        && !status.success()
+    {
+        let message = tr!("errors.provider_exited", provider = "Amp", status = status);
+        let _ = events.send(DriverEvent::Error(message.clone()));
+        Some(message)
+    } else {
+        None
+    };
+    if std::mem::take(&mut *turn_active.lock()) {
+        let _ = events.send(DriverEvent::TurnFinished {
+            success: false,
+            summary: exit_error,
+        });
+    }
+    let _ = events.send(DriverEvent::ProcessExited);
 }
 
 impl DriverControl for AmpDriver {
@@ -363,15 +448,8 @@ impl DriverControl for AmpDriver {
         // process. The thread survives on Amp's side, and the next prompt
         // resumes it with `threads continue` — which is why Amp's runtime is
         // not retained after a cancel.
-        let pid = self.active_pid.load(Ordering::Relaxed);
-        if pid != 0 {
-            #[cfg(unix)]
-            {
-                let _ = Command::new("/bin/kill")
-                    .args(["-INT", &pid.to_string()])
-                    .status();
-            }
-        }
+        let _ = self.commands.send(CommandMessage::Shutdown);
+        self.process.terminate();
     }
 
     fn respond(&self, _request_id: String, _option_id: String) {}
@@ -391,7 +469,76 @@ impl DriverControl for AmpDriver {
 impl Drop for AmpDriver {
     fn drop(&mut self) {
         let _ = self.commands.send(CommandMessage::Shutdown);
+        if *self.process.turn_active.lock() || self.process.was_cancelled() {
+            self.process.terminate();
+        }
     }
+}
+
+fn send_prompt_line(
+    stdin: &mut impl Write,
+    fork_context: &mut Option<String>,
+    text: String,
+) -> std::io::Result<()> {
+    let payload_text = fork_context
+        .as_deref()
+        .map(|context| crate::amp_session::prompt_with_fork_context(context, &text))
+        .unwrap_or(text);
+    write_line(
+        stdin,
+        &json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": payload_text}]
+            }
+        }),
+    )?;
+    *fork_context = None;
+    Ok(())
+}
+
+fn collect_bounded_stderr_lines(reader: impl Read) -> Vec<String> {
+    let mut ring = VecDeque::with_capacity(MAX_STDERR_LINES);
+    let mut reader = BufReader::new(reader);
+    let mut current = Vec::new();
+    let push_line = |ring: &mut VecDeque<String>, raw: &mut Vec<u8>| {
+        if raw.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(raw);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            if ring.len() == MAX_STDERR_LINES {
+                ring.pop_front();
+            }
+            ring.push_back(trimmed.to_owned());
+        }
+        raw.clear();
+    };
+    loop {
+        let available = match reader.fill_buf() {
+            Ok([]) | Err(_) => break,
+            Ok(chunk) => chunk,
+        };
+        let mut consumed = 0;
+        while consumed < available.len() {
+            let rest = &available[consumed..];
+            if let Some(newline) = rest.iter().position(|&byte| byte == b'\n') {
+                let take = (MAX_STDERR_LINE_BYTES.saturating_sub(current.len())).min(newline);
+                current.extend_from_slice(&rest[..take]);
+                push_line(&mut ring, &mut current);
+                consumed += newline + 1;
+            } else {
+                let take = (MAX_STDERR_LINE_BYTES.saturating_sub(current.len())).min(rest.len());
+                current.extend_from_slice(&rest[..take]);
+                consumed += rest.len();
+            }
+        }
+        reader.consume(consumed);
+    }
+    push_line(&mut ring, &mut current);
+    ring.into_iter().collect()
 }
 
 fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
@@ -488,19 +635,26 @@ fn handle_message(
                     }
                 }
             }
-            // Amp emits no `result`: the turn is over when the assistant stops
-            // for its own reasons rather than to call a tool.
-            if value
+            // Amp emits no `result` on ordinary completion: the turn settles
+            // when the assistant stops for any terminal reason (anything other
+            // than `tool_use`).
+            if let Some(stop_reason) = value
                 .pointer("/message/stop_reason")
                 .and_then(Value::as_str)
-                == Some("end_turn")
+                && stop_reason != "tool_use"
                 && std::mem::take(&mut *turn_active.lock())
             {
-                let _ = events.send(DriverEvent::TurnFinished {
-                    success: true,
-                    summary: None,
-                });
-                turn_finished = true;
+                let (success, summary) = match stop_reason {
+                    "end_turn" => (true, None),
+                    "max_tokens" => (false, Some(tr!("session.agent_ran_out_of_context"))),
+                    "refusal" => (false, Some(tr!("session.agent_declined_turn"))),
+                    other => (
+                        false,
+                        Some(tr!("session.agent_stopped_reason", reason = other)),
+                    ),
+                };
+                let _ = events.send(DriverEvent::TurnFinished { success, summary });
+                turn_finished = success;
             }
         }
         Some("user") => {
@@ -532,12 +686,29 @@ fn handle_message(
                 )));
             }
         }
-        Some("result") if value.get("is_error").and_then(Value::as_bool) == Some(true) => {
-            let message = value
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("Amp reported an error");
-            let _ = events.send(DriverEvent::Error(message.to_owned()));
+        Some("result") => {
+            if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+                let message = value
+                    .get("error")
+                    .or_else(|| value.get("result"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|msg| !msg.is_empty())
+                    .unwrap_or("Amp reported an error");
+                let _ = events.send(DriverEvent::Error(message.to_owned()));
+                if std::mem::take(&mut *turn_active.lock()) {
+                    let _ = events.send(DriverEvent::TurnFinished {
+                        success: false,
+                        summary: Some(message.to_owned()),
+                    });
+                }
+            } else if std::mem::take(&mut *turn_active.lock()) {
+                let _ = events.send(DriverEvent::TurnFinished {
+                    success: true,
+                    summary: None,
+                });
+                turn_finished = true;
+            }
         }
         Some("system") => {
             if let Some(message) = value.get("error").and_then(Value::as_str) {
@@ -780,5 +951,257 @@ mod tests {
             !std::iter::from_fn(|| event_rx.try_recv().ok())
                 .any(|event| matches!(event, DriverEvent::TurnFinished { .. }))
         );
+    }
+
+    #[test]
+    fn result_error_settles_active_turn_with_failure() {
+        let (events, event_rx) = unbounded();
+        let turn = Mutex::new(true);
+        let mut state = AmpStreamState::default();
+
+        let refresh_title = handle_message(
+            &json!({"type":"result","is_error":true,"error":"quota exceeded"}),
+            &events,
+            &turn,
+            &mut state,
+        );
+
+        assert!(!refresh_title);
+        assert!(!*turn.lock(), "error result must clear turn_active");
+        let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(matches!(&seen[0], DriverEvent::Error(msg) if msg == "quota exceeded"));
+        assert!(matches!(
+            &seen[1],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(summary)
+            } if summary == "quota exceeded"
+        ));
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn non_end_turn_stop_reasons_settle_turn_without_hanging() {
+        for (reason, expected_summary) in [
+            ("max_tokens", tr!("session.agent_ran_out_of_context")),
+            ("refusal", tr!("session.agent_declined_turn")),
+            (
+                "stop_sequence",
+                tr!("session.agent_stopped_reason", reason = "stop_sequence"),
+            ),
+        ] {
+            let (events, event_rx) = unbounded();
+            let turn = Mutex::new(true);
+            let mut state = AmpStreamState::default();
+
+            let refresh_title = handle_message(
+                &json!({"type":"assistant","message":{"content":[],"stop_reason":reason}}),
+                &events,
+                &turn,
+                &mut state,
+            );
+
+            assert!(!refresh_title, "failed stop reason `{reason}` should not trigger title refresh");
+            assert!(!*turn.lock(), "stop reason `{reason}` must clear turn_active");
+            let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(seen.len(), 1);
+            assert!(
+                matches!(
+                    &seen[0],
+                    DriverEvent::TurnFinished {
+                        success: false,
+                        summary: Some(summary)
+                    } if summary == &expected_summary
+                ),
+                "unexpected event for `{reason}`: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_prompt_line_preserves_fork_context_on_write_failure() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut fork_context = Some("prior branch history".to_owned());
+        let err = send_prompt_line(&mut FailingWriter, &mut fork_context, "hello".to_owned());
+        assert!(err.is_err());
+        assert_eq!(
+            fork_context.as_deref(),
+            Some("prior branch history"),
+            "fork_context must remain intact when write_line fails"
+        );
+
+        let mut buffer = Vec::new();
+        send_prompt_line(&mut buffer, &mut fork_context, "hello".to_owned()).unwrap();
+        assert!(
+            fork_context.is_none(),
+            "fork_context should be consumed once write_line succeeds"
+        );
+        let written = String::from_utf8(buffer).unwrap();
+        assert!(written.contains("prior branch history"));
+        assert!(written.contains("hello"));
+    }
+
+    #[test]
+    fn collect_bounded_stderr_lines_caps_count_and_line_size() {
+        let mut input = String::new();
+        for idx in 0..250 {
+            input.push_str(&format!("line-{idx}\n"));
+        }
+        input.push_str(&"x".repeat(MAX_STDERR_LINE_BYTES * 3));
+        input.push('\n');
+
+        let lines = collect_bounded_stderr_lines(input.as_bytes());
+        assert_eq!(lines.len(), MAX_STDERR_LINES);
+        assert_eq!(lines[0], "line-123");
+        assert_eq!(lines[MAX_STDERR_LINES - 2], "line-249");
+        assert_eq!(lines[MAX_STDERR_LINES - 1].len(), MAX_STDERR_LINE_BYTES);
+    }
+
+    #[test]
+    fn cancel_terminates_running_child_process() {
+        #[cfg(windows)]
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn windows child");
+        #[cfg(not(windows))]
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unix child");
+
+        let pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(pid).ok();
+        let turn_active = Arc::new(Mutex::new(true));
+        let handle = Arc::new(AmpProcessHandle::new(
+            pid,
+            #[cfg(windows)]
+            job,
+            turn_active,
+        ));
+        let (commands, command_rx) = unbounded();
+        let driver = AmpDriver {
+            commands,
+            process: handle.clone(),
+        };
+
+        driver.cancel();
+        assert!(handle.was_cancelled());
+        assert!(matches!(command_rx.try_recv(), Ok(CommandMessage::Shutdown)));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        handle.mark_exited();
+        assert!(exited, "AmpDriver::cancel should terminate the child promptly");
+        // Calling terminate after mark_exited must be a safe no-op.
+        handle.terminate();
+    }
+
+    fn test_exit_status(code: u32) -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(code)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw((code as i32) << 8)
+        }
+    }
+
+    #[test]
+    fn finalize_process_exit_preserves_error_summary_and_clears_cancel_summary() {
+        // Unexpected mid-turn exit with stderr diagnostic keeps that summary.
+        let (events, event_rx) = unbounded();
+        let turn = Mutex::new(true);
+        finalize_process_exit(
+            Ok(test_exit_status(1)),
+            false,
+            Some("Amp: unauthorized".to_owned()),
+            &turn,
+            &events,
+        );
+        assert!(!*turn.lock());
+        let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(
+            &seen[0],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(summary)
+            } if summary == "Amp: unauthorized"
+        ));
+        assert!(matches!(&seen[1], DriverEvent::ProcessExited));
+
+        // Unexpected mid-turn non-zero exit without stderr emits Error and reuses it as summary.
+        let (events, event_rx) = unbounded();
+        let turn = Mutex::new(true);
+        let status = test_exit_status(2);
+        let expected = tr!("errors.provider_exited", provider = "Amp", status = status);
+        finalize_process_exit(Ok(status), false, None, &turn, &events);
+        assert!(!*turn.lock());
+        let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(seen.len(), 3);
+        assert!(matches!(&seen[0], DriverEvent::Error(msg) if msg == &expected));
+        assert!(matches!(
+            &seen[1],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: Some(summary)
+            } if summary == &expected
+        ));
+        assert!(matches!(&seen[2], DriverEvent::ProcessExited));
+
+        // Cancelled mid-turn exit suppresses Error and emits TurnFinished with summary: None.
+        let (events, event_rx) = unbounded();
+        let turn = Mutex::new(true);
+        finalize_process_exit(
+            Ok(test_exit_status(1)),
+            true,
+            Some("Amp: interrupted".to_owned()),
+            &turn,
+            &events,
+        );
+        assert!(!*turn.lock());
+        let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(
+            &seen[0],
+            DriverEvent::TurnFinished {
+                success: false,
+                summary: None
+            }
+        ));
+        assert!(matches!(&seen[1], DriverEvent::ProcessExited));
     }
 }
