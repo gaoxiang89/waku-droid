@@ -28,8 +28,12 @@ use crate::model::{
 };
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HELP_PROBE_BYTES: usize = 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_RETRY_DELAY: Duration = Duration::from_millis(200);
+#[cfg(windows)]
+const STREAM_CANCEL_POLL: Duration = Duration::from_millis(200);
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 fn provider_timestamp(value: &Value) -> u64 {
@@ -62,7 +66,7 @@ fn parse_provider_summaries(value: &Value, limit: usize) -> Vec<ProviderSessionS
                 return None;
             }
             let cwd = std::path::PathBuf::from(item.get("cwd").and_then(Value::as_str)?);
-            if !cwd.is_absolute() {
+            if !cwd.is_absolute() || !cwd.is_dir() {
                 return None;
             }
             let updated_at = provider_timestamp(item.get("updatedAt").unwrap_or(&Value::Null));
@@ -318,6 +322,9 @@ struct EventHub {
 impl EventHub {
     fn subscribe(&self, session_id: &str) -> Receiver<Value> {
         let (sender, receiver) = unbounded();
+        if session_id.trim().is_empty() {
+            return receiver;
+        }
         self.subscribers
             .lock()
             .entry(session_id.to_owned())
@@ -327,17 +334,17 @@ impl EventHub {
     }
 
     fn publish(&self, envelope: Value) {
-        let session_id = envelope
-            .pointer("/payload/sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let raw_session_id = envelope.pointer("/payload/sessionId").and_then(Value::as_str);
         let mut subscribers = self.subscribers.lock();
-        match session_id {
+        match raw_session_id {
+            Some(session_id) if session_id.trim().is_empty() => {
+                subscribers.remove(session_id);
+            }
             Some(session_id) => {
-                if let Some(targets) = subscribers.get_mut(&session_id) {
+                if let Some(targets) = subscribers.get_mut(session_id) {
                     targets.retain(|target| target.send(envelope.clone()).is_ok());
                     if targets.is_empty() {
-                        subscribers.remove(&session_id);
+                        subscribers.remove(session_id);
                     }
                 }
             }
@@ -345,7 +352,9 @@ impl EventHub {
                 for targets in subscribers.values_mut() {
                     targets.retain(|target| target.send(envelope.clone()).is_ok());
                 }
-                subscribers.retain(|_, targets| !targets.is_empty());
+                subscribers.retain(|session_id, targets| {
+                    !session_id.trim().is_empty() && !targets.is_empty()
+                });
             }
         }
     }
@@ -360,11 +369,12 @@ struct StreamControl {
 impl StreamControl {
     fn attach(&self, name: &'static str, stream: &TcpStream) -> std::io::Result<bool> {
         let socket = stream.try_clone()?;
+        let mut sockets = self.sockets.lock();
         if self.cancelled.load(Ordering::Acquire) {
             let _ = socket.shutdown(Shutdown::Both);
             return Ok(false);
         }
-        self.sockets.lock().insert(name, socket);
+        sockets.insert(name, socket);
         Ok(true)
     }
 
@@ -384,8 +394,55 @@ impl StreamControl {
     }
 }
 
+struct ManagedChild {
+    child: Child,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+impl ManagedChild {
+    fn new(child: Child) -> Self {
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+        Self {
+            child,
+            #[cfg(windows)]
+            job,
+        }
+    }
+}
+
+struct StartupGuard {
+    child: Arc<Mutex<ManagedChild>>,
+    streams: Arc<StreamControl>,
+    armed: bool,
+}
+
+impl StartupGuard {
+    fn new(child: Arc<Mutex<ManagedChild>>, streams: Arc<StreamControl>) -> Self {
+        Self {
+            child,
+            streams,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.streams.cancel();
+            terminate_managed_child(&mut self.child.lock(), Duration::from_secs(2));
+        }
+    }
+}
+
 pub(crate) struct DeepSeekServer {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<ManagedChild>>,
     pub(crate) port: u16,
     events: Arc<EventHub>,
     streams: Arc<StreamControl>,
@@ -431,16 +488,26 @@ impl DeepSeekServer {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = crate::command_env::spawn(&mut command)
+        let child = crate::command_env::spawn(&mut command)
             .context("failed to start `dsh web --host 127.0.0.1 --port 0`")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("DeepSeek Harness provided no startup output"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("DeepSeek Harness provided no diagnostic output"))?;
+        let child = Arc::new(Mutex::new(ManagedChild::new(child)));
+        let streams = Arc::new(StreamControl::default());
+        let mut startup_guard = StartupGuard::new(Arc::clone(&child), Arc::clone(&streams));
+
+        let (stdout, stderr) = {
+            let mut managed = child.lock();
+            let stdout = managed
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("DeepSeek Harness provided no startup output"))?;
+            let stderr = managed
+                .child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("DeepSeek Harness provided no diagnostic output"))?;
+            (stdout, stderr)
+        };
         let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
         let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
         thread::Builder::new()
@@ -474,7 +541,7 @@ impl DeepSeekServer {
                     diagnostics.push(line);
                 }
             }
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = child.lock().child.try_wait()? {
                 let detail = diagnostics.join("\n");
                 bail!(
                     "DeepSeek Harness exited during startup ({status}){}",
@@ -486,7 +553,6 @@ impl DeepSeekServer {
                 );
             }
             if started_at.elapsed() >= SERVER_START_TIMEOUT {
-                terminate_child(&mut child, Duration::from_secs(2));
                 let detail = diagnostics.join("\n");
                 bail!(
                     "timed out starting DeepSeek Harness{}",
@@ -500,9 +566,7 @@ impl DeepSeekServer {
             thread::sleep(Duration::from_millis(20));
         };
 
-        let child = Arc::new(Mutex::new(child));
         let events = Arc::new(EventHub::default());
-        let streams = Arc::new(StreamControl::default());
         for (name, path) in [("mux", "/api/events.mux"), ("host", "/api/events.host")] {
             let events = Arc::clone(&events);
             let streams = Arc::clone(&streams);
@@ -521,7 +585,15 @@ impl DeepSeekServer {
                     if monitor_streams.is_cancelled() {
                         return;
                     }
-                    let status = monitor_child.lock().try_wait();
+                    let status = {
+                        let mut managed = monitor_child.lock();
+                        let status = managed.child.try_wait();
+                        #[cfg(windows)]
+                        if matches!(status, Ok(Some(_))) {
+                            drop(managed.job.take());
+                        }
+                        status
+                    };
                     match status {
                         Ok(Some(status)) => {
                             monitor_events.publish(json!({
@@ -538,20 +610,21 @@ impl DeepSeekServer {
                         Ok(None) => thread::sleep(Duration::from_millis(100)),
                         Err(error) => {
                             monitor_events.publish(json!({
-                            "type": "server-request",
-                            "rpcId": format!("waku-process-{}", Uuid::new_v4()),
-                            "method": "waku/process-exited",
-                            "payload": {
-                                "type": "waku/process-exited",
-                                "message": format!("could not observe DeepSeek Harness: {error}")
-                            }
-                        }));
+                                "type": "server-request",
+                                "rpcId": format!("waku-process-{}", Uuid::new_v4()),
+                                "method": "waku/process-exited",
+                                "payload": {
+                                    "type": "waku/process-exited",
+                                    "message": format!("could not observe DeepSeek Harness: {error}")
+                                }
+                            }));
                             return;
                         }
                     }
                 }
             })?;
 
+        startup_guard.disarm();
         Ok(Self {
             child,
             port,
@@ -639,13 +712,14 @@ impl DeepSeekServer {
     pub(crate) fn is_alive(&self) -> bool {
         self.child
             .lock()
+            .child
             .try_wait()
             .is_ok_and(|status| status.is_none())
     }
 
     pub(crate) fn shutdown(&self, timeout: Duration) {
         self.streams.cancel();
-        terminate_child(&mut self.child.lock(), timeout);
+        terminate_managed_child(&mut self.child.lock(), timeout);
     }
 }
 
@@ -683,6 +757,14 @@ fn parse_ready_port(line: &str) -> Option<u16> {
 }
 
 fn web_supports_no_open(binary: &Path, dsh_home: Option<&Path>) -> bool {
+    web_supports_no_open_with_timeout(binary, dsh_home, HELP_PROBE_TIMEOUT)
+}
+
+fn web_supports_no_open_with_timeout(
+    binary: &Path,
+    dsh_home: Option<&Path>,
+    timeout: Duration,
+) -> bool {
     let mut command = crate::command_env::command(binary);
     command.args(["web", "--help"]);
     if let Ok(cwd) = crate::acp_session::catalog_working_directory() {
@@ -691,15 +773,87 @@ fn web_supports_no_open(binary: &Path, dsh_home: Option<&Path>) -> bool {
     if let Some(dsh_home) = dsh_home {
         command.env("DSH_HOME", dsh_home);
     }
-    crate::command_env::output(&mut command)
-        .ok()
-        .is_some_and(|output| web_help_supports_no_open(&output.stdout))
+    capture_stdout_with_timeout(&mut command, timeout)
+        .is_some_and(|output| web_help_supports_no_open(&output))
+}
+
+fn capture_stdout_with_timeout(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = crate::command_env::spawn(command).ok()?;
+    let mut managed = ManagedChild::new(child);
+    let Some(stdout) = managed.child.stdout.take() else {
+        terminate_managed_child(&mut managed, Duration::from_secs(1));
+        return None;
+    };
+    let Ok(reader) = thread::Builder::new()
+        .name("waku-deepseek-help-probe".into())
+        .spawn(move || drain_bounded(stdout, MAX_HELP_PROBE_BYTES))
+    else {
+        terminate_managed_child(&mut managed, Duration::from_secs(1));
+        return None;
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match managed.child.try_wait() {
+            Ok(Some(_)) => {
+                #[cfg(windows)]
+                drop(managed.job.take());
+                return reader.join().ok();
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => {
+                terminate_managed_child(&mut managed, Duration::from_secs(1));
+                let _ = reader.join();
+                return None;
+            }
+        }
+    }
+}
+
+fn drain_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while let Ok(read) = reader.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    }
+    output
 }
 
 fn web_help_supports_no_open(output: &[u8]) -> bool {
     String::from_utf8_lossy(output)
         .lines()
         .any(|line| line.contains("--no-open"))
+}
+
+fn terminate_managed_child(managed: &mut ManagedChild, timeout: Duration) {
+    #[cfg(windows)]
+    let job = managed.job.take();
+    let already_exited = managed
+        .child
+        .try_wait()
+        .is_ok_and(|status| status.is_some());
+    #[cfg(windows)]
+    drop(job);
+    if already_exited {
+        return;
+    }
+    terminate_child(&mut managed.child, timeout);
 }
 
 fn terminate_child(child: &mut Child, timeout: Duration) {
@@ -745,7 +899,7 @@ fn run_downlink(
                     return;
                 }
                 while !control.is_cancelled() {
-                    match reader.read_text_message() {
+                    match reader.read_text_message(control) {
                         Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
                             Ok(envelope) => events.publish(envelope),
                             Err(error) => events.publish(stream_error(format!(
@@ -819,17 +973,35 @@ impl WebSocketReader {
         if !status.starts_with("HTTP/1.1 101 ") && status != "HTTP/1.1 101" {
             bail!("DeepSeek Harness refused WebSocket upgrade: {status}");
         }
-        let has_upgrade = lines.any(|line| {
-            line.split_once(':').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("upgrade")
+        let expected_accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let mut has_upgrade = false;
+        let mut has_valid_accept = false;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("upgrade")
                     && value.trim().eq_ignore_ascii_case("websocket")
-            })
-        });
+                {
+                    has_upgrade = true;
+                } else if name.eq_ignore_ascii_case("sec-websocket-accept")
+                    && value.trim() == expected_accept
+                {
+                    has_valid_accept = true;
+                }
+            }
+        }
         if !has_upgrade {
             bail!("DeepSeek Harness returned no WebSocket upgrade header");
         }
+        if !has_valid_accept {
+            bail!("DeepSeek Harness returned an invalid Sec-WebSocket-Accept header");
+        }
+        // Closing a cloned socket does not reliably unblock a blocking read on
+        // Windows, so poll with a bounded timeout and re-check cancellation.
+        #[cfg(windows)]
+        stream.set_read_timeout(Some(STREAM_CANCEL_POLL))?;
+        #[cfg(not(windows))]
         stream.set_read_timeout(None)?;
-        stream.set_write_timeout(None)?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self {
             stream,
             fragmented: Vec::new(),
@@ -837,9 +1009,9 @@ impl WebSocketReader {
         })
     }
 
-    fn read_text_message(&mut self) -> anyhow::Result<Option<String>> {
+    fn read_text_message(&mut self, control: &StreamControl) -> anyhow::Result<Option<String>> {
         loop {
-            let Some((fin, opcode, payload)) = self.read_frame()? else {
+            let Some((fin, opcode, payload)) = self.read_frame(control)? else {
                 return Ok(None);
             };
             match opcode {
@@ -847,10 +1019,12 @@ impl WebSocketReader {
                     if self.fragmented_opcode.is_none() {
                         bail!("unexpected DeepSeek Harness WebSocket continuation frame");
                     }
-                    self.fragmented.extend_from_slice(&payload);
-                    if self.fragmented.len() > MAX_WEBSOCKET_MESSAGE_BYTES {
+                    if self.fragmented.len().saturating_add(payload.len())
+                        > MAX_WEBSOCKET_MESSAGE_BYTES
+                    {
                         bail!("DeepSeek Harness WebSocket message is too large");
                     }
+                    self.fragmented.extend_from_slice(&payload);
                     if fin {
                         let opcode = self.fragmented_opcode.take().unwrap_or_default();
                         let payload = std::mem::take(&mut self.fragmented);
@@ -862,6 +1036,11 @@ impl WebSocketReader {
                     }
                 }
                 0x1 | 0x2 => {
+                    if self.fragmented_opcode.is_some() {
+                        bail!(
+                            "unexpected DeepSeek Harness WebSocket data frame during fragmented message"
+                        );
+                    }
                     if fin {
                         if opcode == 0x1 {
                             return String::from_utf8(payload)
@@ -873,29 +1052,90 @@ impl WebSocketReader {
                         self.fragmented = payload;
                     }
                 }
-                0x8 => return Ok(None),
-                0x9 => self.write_control_frame(0xA, &payload)?,
-                0xA => {}
+                0x8 => {
+                    if !fin || payload.len() > 125 {
+                        bail!("DeepSeek Harness sent an invalid WebSocket close frame");
+                    }
+                    return Ok(None);
+                }
+                0x9 => {
+                    if !fin || payload.len() > 125 {
+                        bail!("DeepSeek Harness sent an invalid WebSocket ping frame");
+                    }
+                    self.write_control_frame(0xA, &payload)?;
+                }
+                0xA => {
+                    if !fin || payload.len() > 125 {
+                        bail!("DeepSeek Harness sent an invalid WebSocket pong frame");
+                    }
+                }
                 _ => bail!("DeepSeek Harness sent unsupported WebSocket opcode {opcode}"),
             }
         }
     }
 
-    fn read_frame(&mut self) -> anyhow::Result<Option<(bool, u8, Vec<u8>)>> {
-        let mut header = [0_u8; 2];
-        match self.stream.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
-                return Ok(None);
+    fn read_exact_cancellable(
+        &mut self,
+        mut buf: &mut [u8],
+        control: &StreamControl,
+        allow_clean_eof: bool,
+    ) -> std::io::Result<bool> {
+        let mut read_so_far = 0_usize;
+        while !buf.is_empty() {
+            if control.is_cancelled() {
+                return Ok(false);
             }
-            Err(error) => return Err(error.into()),
+            match self.stream.read(buf) {
+                Ok(0) => {
+                    if allow_clean_eof && read_so_far == 0 {
+                        return Ok(false);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole WebSocket frame",
+                    ));
+                }
+                Ok(count) => {
+                    read_so_far += count;
+                    buf = &mut buf[count..];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if control.is_cancelled() {
+                        return Ok(false);
+                    }
+                }
+                Err(error)
+                    if allow_clean_eof
+                        && read_so_far == 0
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => {
+                    if control.is_cancelled() {
+                        return Ok(false);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn read_frame(&mut self, control: &StreamControl) -> anyhow::Result<Option<(bool, u8, Vec<u8>)>> {
+        let mut header = [0_u8; 2];
+        if !self.read_exact_cancellable(&mut header, control, true)? {
+            return Ok(None);
         }
         if header[0] & 0x70 != 0 {
             bail!("DeepSeek Harness used unsupported WebSocket extensions");
@@ -906,11 +1146,15 @@ impl WebSocketReader {
         let mut length = u64::from(header[1] & 0x7f);
         if length == 126 {
             let mut bytes = [0_u8; 2];
-            self.stream.read_exact(&mut bytes)?;
+            if !self.read_exact_cancellable(&mut bytes, control, false)? {
+                return Ok(None);
+            }
             length = u64::from(u16::from_be_bytes(bytes));
         } else if length == 127 {
             let mut bytes = [0_u8; 8];
-            self.stream.read_exact(&mut bytes)?;
+            if !self.read_exact_cancellable(&mut bytes, control, false)? {
+                return Ok(None);
+            }
             length = u64::from_be_bytes(bytes);
         }
         let length =
@@ -920,13 +1164,17 @@ impl WebSocketReader {
         }
         let mask = if masked {
             let mut mask = [0_u8; 4];
-            self.stream.read_exact(&mut mask)?;
+            if !self.read_exact_cancellable(&mut mask, control, false)? {
+                return Ok(None);
+            }
             Some(mask)
         } else {
             None
         };
         let mut payload = vec![0_u8; length];
-        self.stream.read_exact(&mut payload)?;
+        if !self.read_exact_cancellable(&mut payload, control, false)? {
+            return Ok(None);
+        }
         if let Some(mask) = mask {
             for (index, byte) in payload.iter_mut().enumerate() {
                 *byte ^= mask[index % 4];
@@ -995,7 +1243,13 @@ mod tests {
 
     #[test]
     fn maps_deepseek_catalog_and_visible_history() {
-        let cwd = std::env::temp_dir().join("project");
+        let root = std::env::temp_dir().join(format!("waku-dsh-summary-{}", Uuid::new_v4()));
+        let cwd = root.join("project");
+        let missing = root.join("missing");
+        let file = root.join("not-a-dir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(&file, b"file").unwrap();
+
         let summaries = parse_provider_summaries(
             &json!({"items":[
                 {
@@ -1005,11 +1259,14 @@ mod tests {
                     "blank":false,
                     "projections":{"values":{"title":"Resume DeepSeek"}}
                 },
+                {"sessionId":"missing-cwd","cwd":missing,"blank":false,"updatedAt":4},
+                {"sessionId":"file-cwd","cwd":file,"blank":false,"updatedAt":5},
                 {"sessionId":"blank","cwd":std::env::temp_dir(),"blank":true,"updatedAt":2},
                 {"sessionId":"child","cwd":std::env::temp_dir(),"parentSessionId":"parent","updatedAt":3}
             ]}),
             10,
         );
+        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "Resume DeepSeek");
         assert_eq!(summaries[0].updated_at, 1_700_000_000);
@@ -1024,6 +1281,235 @@ mod tests {
         assert_eq!(history.turns[0].status, TurnStatus::Completed);
         assert_eq!(history.messages.len(), 2);
         assert_eq!(history.messages[1].content, "answer");
+    }
+
+    #[test]
+    fn event_hub_prunes_empty_session_keys_and_ignores_blank_subscriptions() {
+        let hub = EventHub::default();
+        let blank = hub.subscribe("   ");
+        assert!(hub.subscribers.lock().is_empty());
+        drop(blank);
+
+        let sub = hub.subscribe("ses_dead");
+        assert!(hub.subscribers.lock().contains_key("ses_dead"));
+        drop(sub);
+
+        hub.publish(json!({"payload": {"sessionId": "ses_dead"}}));
+        assert!(
+            !hub.subscribers.lock().contains_key("ses_dead"),
+            "dropped subscriber key should be pruned on publish"
+        );
+
+        let sub2 = hub.subscribe("ses_broadcast_dead");
+        drop(sub2);
+        hub.publish(stream_error("oops".into()));
+        assert!(hub.subscribers.lock().is_empty());
+    }
+
+    fn ws_handshake_key(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut key = None;
+        loop {
+            let mut line = String::new();
+            let count = reader.read_line(&mut line).unwrap();
+            assert!(count > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("sec-websocket-key")
+            {
+                key = Some(value.trim().to_owned());
+            }
+        }
+        key.expect("client must send Sec-WebSocket-Key")
+    }
+
+    fn write_ws_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
+        assert!(payload.len() < 126);
+        let first = if fin { 0x80 | opcode } else { opcode };
+        stream.write_all(&[first, payload.len() as u8]).unwrap();
+        stream.write_all(payload).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[test]
+    fn websocket_connect_validates_sec_websocket_accept() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            // 1) Wrong Sec-WebSocket-Accept -> must fail
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = ws_handshake_key(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong==\r\n\r\n",
+                )
+                .unwrap();
+
+            // 2) Missing Sec-WebSocket-Accept -> must fail
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = ws_handshake_key(&mut socket);
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .unwrap();
+
+            // 3) Valid Sec-WebSocket-Accept -> must succeed
+            let (mut socket, _) = listener.accept().unwrap();
+            let key = ws_handshake_key(&mut socket);
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            write!(
+                socket,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        assert!(WebSocketReader::connect(port, "/api/events.mux").is_err());
+        assert!(WebSocketReader::connect(port, "/api/events.mux").is_err());
+        assert!(WebSocketReader::connect(port, "/api/events.mux").is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn websocket_rejects_interleaved_data_frames_and_allows_interleaved_ping() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            // Connection 1: valid fragmented text with an interleaved ping
+            let (mut socket, _) = listener.accept().unwrap();
+            let key = ws_handshake_key(&mut socket);
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            write!(
+                socket,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .unwrap();
+            write_ws_frame(&mut socket, false, 0x1, b"hel");
+            write_ws_frame(&mut socket, true, 0x9, b"hi");
+            write_ws_frame(&mut socket, true, 0x0, b"lo");
+
+            // Connection 2: invalid data frame interleaved mid-fragment
+            let (mut socket, _) = listener.accept().unwrap();
+            let key = ws_handshake_key(&mut socket);
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            write!(
+                socket,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .unwrap();
+            write_ws_frame(&mut socket, false, 0x1, b"part1");
+            write_ws_frame(&mut socket, true, 0x1, b"interleaved");
+        });
+
+        let control = StreamControl::default();
+        let mut ok_reader = WebSocketReader::connect(port, "/api/events.mux").unwrap();
+        assert_eq!(
+            ok_reader.read_text_message(&control).unwrap().as_deref(),
+            Some("hello")
+        );
+
+        let mut bad_reader = WebSocketReader::connect(port, "/api/events.mux").unwrap();
+        assert!(bad_reader.read_text_message(&control).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_stream_control_unblocks_idle_websocket_read() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let key = ws_handshake_key(&mut socket);
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            write!(
+                socket,
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .unwrap();
+            accepted_tx.send(socket).unwrap();
+        });
+
+        let control = Arc::new(StreamControl::default());
+        let mut reader = WebSocketReader::connect(port, "/api/events.mux").unwrap();
+        // Keep a short timeout on all OSes to exercise the timeout-poll cancel path too.
+        reader
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(control.attach("mux", &reader.stream).unwrap());
+        let _keep_peer_open = accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let reader_control = Arc::clone(&control);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = thread::spawn(move || {
+            let res = reader.read_text_message(&reader_control);
+            let _ = done_tx.send(res.ok().flatten());
+        });
+
+        thread::sleep(Duration::from_millis(40));
+        control.cancel();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("StreamControl::cancel should unblock read_text_message promptly");
+        assert!(result.is_none());
+        join.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn help_probe_timeout_aborts_hung_process() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = crate::command_env::plain_command("cmd.exe");
+            command.args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = crate::command_env::plain_command("/bin/sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+
+        let started = Instant::now();
+        let output = capture_stdout_with_timeout(&mut command, Duration::from_millis(150));
+        assert!(output.is_none(), "hung probe should time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hung probe took too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminate_managed_child_kills_windows_cmd_grandchildren() {
+        let mut command = crate::command_env::plain_command("cmd.exe");
+        command
+            .args(["/d", "/c", "ping -n 60 127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = crate::command_env::spawn(&mut command).unwrap();
+        let mut managed = ManagedChild::new(child);
+        let mut stdout = managed.child.stdout.take().unwrap();
+        thread::sleep(Duration::from_millis(500));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            let _ = done_tx.send(());
+        });
+
+        terminate_managed_child(&mut managed, Duration::from_secs(2));
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("closing KillOnCloseJob must terminate cmd.exe grandchildren");
     }
 
     #[test]
@@ -1055,7 +1541,7 @@ mod tests {
         {
             // Simulate an abruptly terminated Waku process: the OS closes its
             // pipe without giving DeepSeekServer a chance to run Drop.
-            drop(server.child.lock().stdin.take());
+            drop(server.child.lock().child.stdin.take());
             let deadline = Instant::now() + Duration::from_secs(5);
             while server.is_alive() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));

@@ -29,6 +29,7 @@
 //!   without an error, because the service itself `chdir`s to `$HOME`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -974,13 +975,57 @@ pub(crate) fn list_mcp(endpoint: &Endpoint, directory: &str) -> Result<Vec<Value
     catalogue(endpoint, "/api/mcp", Some(directory), "MCP servers")
 }
 
+/// Strips Windows extended-length verbatim path prefixes (`\\?\C:\...` and
+/// `\\?\UNC\server\share\...`) emitted by `std::fs::canonicalize` so stored
+/// `location.directory` strings match OpenCode CLI/TUI exact-equality queries.
+pub(crate) fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| path.strip_prefix(r"\\?\unc\"))
+    {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\")
+        && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        rest.to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Canonicalizes `path` into the exact `location.directory` format OpenCode
+/// CLI/TUI expects, without Windows `\\?\` verbatim prefixes.
+pub(crate) fn canonical_directory(path: &Path) -> std::io::Result<String> {
+    let canonical = std::fs::canonicalize(path)?;
+    let raw = canonical.to_string_lossy();
+    #[cfg(windows)]
+    {
+        Ok(strip_windows_verbatim_prefix(&raw))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(raw.into_owned())
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn remove_mcp(endpoint: &Endpoint, directory: &str, server: &str) -> Result<()> {
+    remove_mcp_with_timeout(endpoint, directory, server, REQUEST_TIMEOUT)
+}
+
+pub(crate) fn remove_mcp_with_timeout(
+    endpoint: &Endpoint,
+    directory: &str,
+    server: &str,
+    timeout: Duration,
+) -> Result<()> {
     let path = format!(
         "/api/experimental/mcp/{}{}",
         encode_path_segment(server),
         location_query(Some(directory))
     );
-    request(endpoint, "DELETE", &path, None, REQUEST_TIMEOUT)?;
+    request(endpoint, "DELETE", &path, None, timeout)?;
     Ok(())
 }
 
@@ -2165,6 +2210,57 @@ mod tests {
         );
         let active = active_sessions(&endpoint).unwrap();
         assert_eq!(active, HashSet::from(["ses_a".to_owned()]));
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_handles_drive_unc_and_regular_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\Alice\repo"),
+            r"C:\Users\Alice\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\c:\work"),
+            r"c:\work"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"),
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/Users/alice/repo"),
+            "/Users/alice/repo"
+        );
+    }
+
+    #[test]
+    fn remove_mcp_with_timeout_honors_short_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let started = Instant::now();
+        let result = remove_mcp_with_timeout(
+            &Endpoint::local(port),
+            "/work",
+            "waku_js_repl_test",
+            Duration::from_millis(150),
+        );
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bounded DELETE took too long: {:?}",
+            started.elapsed()
+        );
+        let _ = done_tx.send(());
+        server.join().unwrap();
     }
 
     /// Reads the user's own running service. Kept out of the default run

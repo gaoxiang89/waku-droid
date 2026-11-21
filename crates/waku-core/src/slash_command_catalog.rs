@@ -154,12 +154,31 @@ fn discover_codex(
 
 fn discover_opencode(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
     // The registry is directory-scoped, not session-scoped. Seed the new-task
-    // composer too, without creating a disposable provider session.
-    let directory = std::fs::canonicalize(project_root).ok()?;
-    let directory = directory.to_string_lossy();
-    let service = crate::opencode_service::shared(binary).ok()?;
-    let endpoint = service.endpoint();
-    let commands = crate::opencode_api::list_commands(&endpoint, Some(&directory)).ok()?;
+    // composer only when an OpenCode service is already running, never
+    // starting the user's background daemon or creating a disposable session.
+    discover_opencode_with(
+        project_root,
+        || {
+            crate::opencode_service::attached(binary)
+                .ok()
+                .flatten()
+                .map(|service| service.endpoint())
+        },
+        |endpoint, directory| crate::opencode_api::list_commands(endpoint, Some(directory)).ok(),
+    )
+}
+
+fn discover_opencode_with(
+    project_root: &Path,
+    attach: impl FnOnce() -> Option<crate::http_wire::Endpoint>,
+    list_commands: impl FnOnce(
+        &crate::http_wire::Endpoint,
+        &str,
+    ) -> Option<Vec<crate::opencode_api::CommandInfo>>,
+) -> Option<Vec<SlashCommand>> {
+    let directory = crate::opencode_api::canonical_directory(project_root).ok()?;
+    let endpoint = attach()?;
+    let commands = list_commands(&endpoint, &directory)?;
     Some(opencode_commands(commands))
 }
 
@@ -691,6 +710,44 @@ mod tests {
                 .all(|command| command.scope == CommandScope::Builtin)
         );
         assert!(commands.iter().all(|command| command.template.is_none()));
+    }
+
+    #[test]
+    fn discover_opencode_returns_none_without_running_service_and_normalizes_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-slash-opencode-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let absent = discover_opencode_with(
+            &root,
+            || None,
+            |_, _| unreachable!("must not list commands when no service is attached"),
+        );
+        assert!(absent.is_none());
+
+        let mut captured_directory = String::new();
+        let present = discover_opencode_with(
+            &root,
+            || Some(crate::http_wire::Endpoint::local(1)),
+            |_, directory| {
+                captured_directory = directory.to_owned();
+                Some(vec![crate::opencode_api::CommandInfo {
+                    name: "review".to_owned(),
+                    description: Some("Review changes".to_owned()),
+                }])
+            },
+        )
+        .expect("attached service should return commands");
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].name, "review");
+        assert!(
+            !captured_directory.starts_with(r"\\?\"),
+            "Windows verbatim prefix must be stripped: {captured_directory}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

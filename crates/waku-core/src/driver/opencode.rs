@@ -139,6 +139,7 @@ enum DriverCommand {
         turns: usize,
         reply: Sender<anyhow::Result<ProviderResumeCursor>>,
     },
+    RefreshCommands,
     Shutdown,
 }
 
@@ -353,6 +354,9 @@ impl StreamState {
         self.permissions.pending.clear();
         self.permissions.responding.clear();
         self.parts.clear();
+        self.tools.clear();
+        self.tool_order.clear();
+        self.forms.clear();
         self.step = None;
         self.reconnecting = false;
         self.resume_deadline = None;
@@ -403,6 +407,7 @@ impl StreamState {
 struct Worker {
     service: Arc<OpenCodeService>,
     session_id: String,
+    directory: String,
     command_names: HashSet<String>,
     events: DriverEventSender,
     commands: Sender<DriverCommand>,
@@ -451,34 +456,32 @@ impl OpenCodeDriver {
             config_dir: _,
         } = options;
 
-        let resumed = match provider_cursor {
-            Some(ProviderResumeCursor::OpenCode { session_id, .. }) => {
-                (!session_id.is_empty()).then_some(session_id)
-            }
+        let (resumed, cursor_directory) = match provider_cursor {
+            Some(ProviderResumeCursor::OpenCode {
+                session_id,
+                directory,
+            }) => ((!session_id.is_empty()).then_some(session_id), directory),
             Some(cursor) => {
                 return Err(anyhow!(
                     "cannot resume OpenCode from a {} cursor",
                     cursor.provider().display_name()
                 ));
             }
-            None => None,
+            None => (None, None),
         };
 
-        // One canonical string with no trailing slash, reused for BOTH
-        // `location.directory` on create and `?directory=` on list. The server
-        // canonicalizes neither and filters by exact string equality, so a
-        // trailing slash or a subdirectory silently yields zero sessions — and
-        // a directory the service cannot resolve answers HTTP 500 with an
-        // empty body rather than a readable error.
-        let directory = std::fs::canonicalize(&cwd)
-            .with_context(|| {
-                format!(
-                    "OpenCode needs a resolvable workspace directory, but {} could not be canonicalized",
-                    cwd.display()
-                )
-            })?
-            .to_string_lossy()
-            .into_owned();
+        // One canonical string with no trailing slash (and no Windows `\\?\`
+        // verbatim prefix), reused for BOTH `location.directory` on create and
+        // `?directory=` on list. The server canonicalizes neither and filters
+        // by exact string equality, so a trailing slash, verbatim prefix, or
+        // mismatched symlink silently yields zero sessions — and a directory
+        // the service cannot resolve answers HTTP 500 with an empty body.
+        let directory = resolve_session_directory(
+            &cwd,
+            resumed
+                .as_ref()
+                .and(cursor_directory.as_deref()),
+        )?;
 
         let service = opencode_service::shared(&binary)?;
         let endpoint = service.endpoint();
@@ -598,9 +601,10 @@ impl OpenCodeDriver {
         }
 
         let (commands, command_rx) = unbounded();
-        let worker = Worker {
+        let mut worker = Worker {
             service: Arc::clone(&service),
             session_id: session_id.clone(),
+            directory,
             command_names,
             events,
             commands: commands.clone(),
@@ -624,7 +628,7 @@ impl OpenCodeDriver {
                     crossbeam_channel::select! {
                         recv(command_rx) -> message => {
                             let Ok(message) = message else { return };
-                            if !handle_command(&worker, message, &mut state) {
+                            if !handle_command(&mut worker, message, &mut state) {
                                 return;
                             }
                         }
@@ -762,6 +766,24 @@ impl Drop for OpenCodeDriver {
         drop(self.computer_use.take());
         let _ = self.commands.send(DriverCommand::Shutdown);
     }
+}
+
+fn resolve_session_directory(
+    cwd: &std::path::Path,
+    cursor_directory: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(directory) = cursor_directory.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let candidate = std::path::Path::new(directory);
+        if candidate.is_absolute() && candidate.is_dir() {
+            return Ok(opencode_api::strip_windows_verbatim_prefix(directory));
+        }
+    }
+    opencode_api::canonical_directory(cwd).with_context(|| {
+        format!(
+            "OpenCode needs a resolvable workspace directory, but {} could not be canonicalized",
+            cwd.display()
+        )
+    })
 }
 
 fn model_key(model: &ModelRef) -> String {
@@ -962,11 +984,11 @@ fn submit_prompt(
     }
 }
 
-fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamState) -> bool {
+fn handle_command(worker: &mut Worker, message: DriverCommand, state: &mut StreamState) -> bool {
     let endpoint = worker.service.endpoint();
-    let events = &worker.events;
     match message {
         DriverCommand::Prompt(text) => {
+            let events = &worker.events;
             // The user moved on; a run they stopped earlier is theirs again.
             state.stop_pending = false;
             state.begin_turn(events);
@@ -1002,6 +1024,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             }
         }
         DriverCommand::Steer(text) => {
+            let events = &worker.events;
             if matches!(state.turn, TurnState::Idle) {
                 let _ = events.send(DriverEvent::SteerRejected {
                     message: text,
@@ -1047,7 +1070,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
         }
         DriverCommand::Cancel => {
             let interrupted = opencode_api::interrupt(&endpoint, &worker.session_id);
-            stop_turn(state, interrupted, events);
+            stop_turn(state, interrupted, &worker.events);
         }
         DriverCommand::Respond {
             request_id,
@@ -1067,7 +1090,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
                     &request_id,
                     reply,
                 ) {
-                    let _ = events.send(DriverEvent::Error(tr!(
+                    let _ = worker.events.send(DriverEvent::Error(tr!(
                         "errors.answer_provider_permission",
                         provider = "OpenCode",
                         error = error
@@ -1086,7 +1109,7 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
             if let Err(error) =
                 opencode_api::reply_form(&endpoint, &worker.session_id, &request_id, &answer)
             {
-                let _ = events.send(DriverEvent::Error(tr!(
+                let _ = worker.events.send(DriverEvent::Error(tr!(
                     "errors.answer_provider_question",
                     provider = "OpenCode",
                     error = error
@@ -1100,9 +1123,26 @@ fn handle_command(worker: &Worker, message: DriverCommand, state: &mut StreamSta
         DriverCommand::Fork { turns, reply } => {
             let _ = reply.send(fork_session(&endpoint, worker, turns));
         }
+        DriverCommand::RefreshCommands => {
+            refresh_commands(worker, &endpoint);
+        }
         DriverCommand::Shutdown => return false,
     }
     true
+}
+
+fn refresh_commands(worker: &mut Worker, endpoint: &Endpoint) {
+    let Ok(native_commands) = opencode_api::list_commands(endpoint, Some(&worker.directory)) else {
+        return;
+    };
+    let next_names: HashSet<String> = native_commands
+        .iter()
+        .filter(|command| !command.name.is_empty())
+        .map(|command| command.name.clone())
+        .collect();
+    let reported = reported_commands(native_commands);
+    worker.command_names = next_names;
+    let _ = worker.events.send(DriverEvent::AvailableCommands(reported));
 }
 
 fn apply_options(
@@ -1255,6 +1295,9 @@ fn reconcile(worker: &Worker, state: &mut StreamState, generation: u64) {
             .as_ref()
             .and_then(|session| session.outcome)
             .is_some_and(|outcome| outcome == SessionOutcome::Failed);
+        if matches!(state.turn, TurnState::Running { .. }) {
+            state.drop_turn_scratch();
+        }
         state.settle(
             events,
             Some(TurnOutcome {
@@ -1824,6 +1867,10 @@ fn handle_event(
             let _ = events.send(DriverEvent::ProcessExited);
         }
 
+        "command.updated" | "skill.updated" => {
+            let _ = commands.send(DriverCommand::RefreshCommands);
+        }
+
         _ if is_ignored(kind) => {}
         // Tolerant by requirement: three weeks of upstream churn renamed a
         // whole event family, and an unknown type must never be fatal.
@@ -1855,15 +1902,13 @@ fn is_ignored(kind: &str) -> bool {
         "project.",
         "lsp.",
     ];
-    const EXACT: [&str; 14] = [
+    const EXACT: [&str; 12] = [
         "server.connected",
         "filesystem.changed",
         "location.shutdown",
         "model.updated",
         "provider.updated",
         "agent.updated",
-        "command.updated",
-        "skill.updated",
         "config.updated",
         "models-dev.refreshed",
         "session.created",
@@ -3540,6 +3585,161 @@ mod tests {
         );
         assert!(native_command_invocation("/reviewer", &commands).is_none());
         assert!(native_command_invocation("Discuss /review", &commands).is_none());
+    }
+
+    #[test]
+    fn resolve_session_directory_strips_verbatim_prefix_and_preserves_valid_cursor_directory() {
+        let root = std::env::temp_dir().join(format!("waku-opencode-dir-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let cursor_dir = root.join("cursor-dir");
+        let file = root.join("not-a-dir");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+
+        let resolved = resolve_session_directory(&workspace, None).unwrap();
+        assert!(
+            !resolved.starts_with(r"\\?\"),
+            "canonical directory must not carry Windows verbatim prefix: {resolved}"
+        );
+
+        let cursor_str = opencode_api::canonical_directory(&cursor_dir).unwrap();
+        assert_eq!(
+            resolve_session_directory(&workspace, Some(&cursor_str)).unwrap(),
+            cursor_str
+        );
+
+        // A cursor directory with a legacy Windows verbatim prefix is normalized too.
+        #[cfg(windows)]
+        {
+            let verbatim = format!(r"\\?\{cursor_str}");
+            assert_eq!(
+                resolve_session_directory(&workspace, Some(&verbatim)).unwrap(),
+                cursor_str
+            );
+        }
+
+        // Invalid cursor directories (missing, relative, empty, file) fall back to canonical cwd.
+        let missing = root.join("missing");
+        for invalid in [
+            "",
+            "   ",
+            "relative/path",
+            &missing.to_string_lossy(),
+            &file.to_string_lossy(),
+        ] {
+            assert_eq!(
+                resolve_session_directory(&workspace, Some(invalid)).unwrap(),
+                resolved,
+                "invalid cursor directory {invalid:?} should fall back to canonical cwd"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_turn_scratch_clears_tool_order_incomplete_tools_and_forms() {
+        let mut harness = Harness::new(RuntimeMode::Ask);
+        harness.feed(json!({"type": "session.execution.started", "data": {"sessionID": "ses_1"}}));
+        harness.feed(step_started("msg_1"));
+        harness.feed(json!({
+            "type": "session.tool.input.started",
+            "data": {"sessionID": "ses_1", "assistantMessageID": "msg_1", "id": "call_open", "name": "bash"}
+        }));
+        harness.feed(json!({
+            "type": "form.created",
+            "data": {
+                "form": {
+                    "id": "frm_open",
+                    "sessionID": "ses_1",
+                    "title": "Pick one",
+                    "fields": [{"type": "boolean", "key": "ok", "title": "OK"}]
+                }
+            }
+        }));
+        assert_eq!(harness.state.tools.len(), 1);
+        assert_eq!(harness.state.tool_order.len(), 1);
+        assert_eq!(harness.state.forms.len(), 1);
+
+        harness.feed(json!({"type": "session.execution.interrupted", "data": {"sessionID": "ses_1", "reason": "user"}}));
+        assert!(harness.state.tools.is_empty());
+        assert!(harness.state.tool_order.is_empty());
+        assert!(harness.state.forms.is_empty());
+        assert!(harness.state.parts.is_empty());
+    }
+
+    #[test]
+    fn command_and_skill_updates_refresh_worker_command_names() {
+        let mut harness = Harness::new(RuntimeMode::FullAccess);
+        harness.feed(json!({"type": "command.updated", "data": {}}));
+        harness.feed(json!({"type": "skill.updated", "data": {}}));
+        assert!(matches!(
+            harness.issued.try_recv(),
+            Ok(DriverCommand::RefreshCommands)
+        ));
+        assert!(matches!(
+            harness.issued.try_recv(),
+            Ok(DriverCommand::RefreshCommands)
+        ));
+        assert!(
+            harness.state.unknown.is_empty(),
+            "command.updated and skill.updated must not be counted as unknown"
+        );
+
+        let (endpoint, server) = canned_service(vec![
+            (
+                200,
+                json!({"data": [
+                    {"id": "opencode.command", "state": {"status": "active"}},
+                    {"id": "opencode.config.command", "state": {"status": "active"}},
+                    {"id": "opencode.config.skill", "state": {"status": "active"}}
+                ]}),
+            ),
+            (
+                200,
+                json!({"data": [
+                    {"name": "init", "description": "Setup"},
+                    {"name": "deploy", "description": "Deploy service"}
+                ]}),
+            ),
+        ]);
+        let service = OpenCodeService::for_test(endpoint);
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (commands, _command_rx) = unbounded();
+        let mut worker = Worker {
+            service,
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            command_names: HashSet::from(["stale-cmd".to_owned()]),
+            events,
+            commands,
+            computer_use: None,
+        };
+        let mut state = StreamState::new("ses_1".into(), RuntimeMode::FullAccess, None, 0);
+
+        assert!(handle_command(
+            &mut worker,
+            DriverCommand::RefreshCommands,
+            &mut state
+        ));
+        assert_eq!(server.join().unwrap(), 2);
+        assert!(worker.command_names.contains("deploy"));
+        assert!(!worker.command_names.contains("stale-cmd"));
+        assert_eq!(
+            native_command_invocation("/deploy prod", &worker.command_names),
+            Some(("deploy", "prod"))
+        );
+
+        let received: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            received.iter().any(|event| matches!(
+                event,
+                DriverEvent::AvailableCommands(commands)
+                    if commands.iter().any(|command| command.name == "deploy")
+            )),
+            "expected AvailableCommands update with deploy: {received:?}"
+        );
     }
 
     #[test]

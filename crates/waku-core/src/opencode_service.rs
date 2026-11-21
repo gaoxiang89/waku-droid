@@ -35,13 +35,21 @@
 //! threads are.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+#[cfg(not(windows))]
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{
+    Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak,
+};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
 use anyhow::{Context as _, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -63,6 +71,7 @@ const MODEL_ROUTE: &str = "/api/model";
 /// `--version` only prints a constant, so anything slower is a broken binary
 /// rather than a busy one.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VERSION_OUTPUT_BYTES: usize = 256 * 1024;
 const MODEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The service heartbeats `: heartbeat` exactly 15.000s apart (measured over a
 /// live idle stream), so 20s would tear down a healthy connection that merely
@@ -107,17 +116,50 @@ impl std::fmt::Debug for ServiceRegistration {
 }
 
 /// `${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json`.
+#[allow(dead_code)]
 pub(crate) fn registration_path() -> PathBuf {
     state_directory().join(REGISTRATION_FILE)
 }
 
 fn state_directory() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
+    let shell_env = crate::command_env::shell_environment();
+    state_directory_from(
+        std::env::var_os("XDG_STATE_HOME"),
+        &shell_env,
+        dirs::home_dir(),
+    )
+}
+
+fn state_directory_from(
+    process_xdg: Option<OsString>,
+    shell_env: &[(OsString, OsString)],
+    home: Option<PathBuf>,
+) -> PathBuf {
+    process_xdg
+        .filter(|value| !value.is_empty())
+        .or_else(|| shell_env_var(shell_env, "XDG_STATE_HOME"))
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))
+        .or_else(|| home.map(|home| home.join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from(".local").join("state"))
         .join("opencode")
+}
+
+fn shell_env_var(shell_env: &[(OsString, OsString)], name: &str) -> Option<OsString> {
+    shell_env
+        .iter()
+        .find(|(key, value)| {
+            !value.is_empty() && {
+                #[cfg(windows)]
+                {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                }
+                #[cfg(not(windows))]
+                {
+                    key.as_os_str() == OsStr::new(name)
+                }
+            }
+        })
+        .map(|(_, value)| value.clone())
 }
 
 /// Reads the descriptor of whatever service is registered, if any.
@@ -125,33 +167,92 @@ fn state_directory() -> PathBuf {
 /// Read-only by contract; see the module doc. Absence is an ordinary answer —
 /// the user simply has no service running — so this returns `None` rather than
 /// an error.
+#[allow(dead_code)]
 pub(crate) fn read_registration() -> Option<ServiceRegistration> {
-    read_registration_file(&registration_path()).or_else(channel_registration)
-}
-
-/// A non-mainstream channel registers as `service-<channel>.json`. The
-/// mainstream name is probed first so a stale channel descriptor can never
-/// shadow the service the user is actually running.
-fn channel_registration() -> Option<ServiceRegistration> {
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(state_directory())
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("service-") && name.ends_with(".json"))
-        })
-        .collect();
-    candidates.sort();
+    let candidates = read_registration_candidates_in(&state_directory());
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
     candidates
         .iter()
-        .find_map(|path| read_registration_file(path))
+        .find(|registration| probe(registration).is_ok())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// Lists every parseable registration descriptor in priority order: mainstream
+/// `service.json` first, then non-mainstream `service-<channel>.json` files.
+/// Returning all parseable candidates lets discovery probe past stale files
+/// left behind by crashed daemons instead of stopping at the first stale one.
+fn read_registration_candidates_in(dir: &Path) -> Vec<ServiceRegistration> {
+    let mut registrations = Vec::new();
+    if let Some(mainstream) = read_registration_file(&dir.join(REGISTRATION_FILE)) {
+        registrations.push(mainstream);
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("service-") && name.ends_with(".json"))
+            })
+            .collect();
+        candidates.sort();
+        for path in candidates {
+            if let Some(registration) = read_registration_file(&path) {
+                registrations.push(registration);
+            }
+        }
+    }
+    registrations
+}
+
+fn discover_live_service() -> Option<(ServiceRegistration, Endpoint)> {
+    discover_live_service_in(&state_directory())
+}
+
+fn discover_live_service_in(dir: &Path) -> Option<(ServiceRegistration, Endpoint)> {
+    read_registration_candidates_in(dir)
+        .into_iter()
+        .find_map(|registration| {
+            probe(&registration)
+                .ok()
+                .map(|endpoint| (registration, endpoint))
+        })
 }
 
 fn read_registration_file(path: &Path) -> Option<ServiceRegistration> {
     let contents = std::fs::read(path).ok()?;
     serde_json::from_slice(&contents).ok()
+}
+
+/// Validates that a registration URL targets local loopback over plain HTTP
+/// before Basic auth credentials can ever leave the machine.
+fn validated_loopback_endpoint(url: &str, user: &str, password: &str) -> anyhow::Result<Endpoint> {
+    let parsed =
+        url::Url::parse(url).with_context(|| format!("invalid OpenCode service URL {url}"))?;
+    if parsed.scheme() != "http" {
+        bail!("refusing to probe non-http OpenCode service URL {url}");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("refusing to probe OpenCode service URL with embedded credentials {url}");
+    }
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        bail!("refusing to probe OpenCode service URL with unexpected path or query {url}");
+    }
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if !is_loopback {
+        bail!("refusing to probe non-loopback OpenCode service URL {url}");
+    }
+    Endpoint::basic(url, user, password)
 }
 
 /// Confirms a descriptor still names a live, ready service, and returns the
@@ -161,7 +262,8 @@ fn read_registration_file(path: &Path) -> Option<ServiceRegistration> {
 /// starting or stopping, 500 when it failed — so a service that is still
 /// coming up fails here and is simply polled again.
 pub(crate) fn probe(registration: &ServiceRegistration) -> anyhow::Result<Endpoint> {
-    let endpoint = Endpoint::basic(&registration.url, SERVICE_USER, &registration.password)?;
+    let endpoint =
+        validated_loopback_endpoint(&registration.url, SERVICE_USER, &registration.password)?;
     let info = opencode_api::server_info(&endpoint)
         .context("the OpenCode service did not answer its info route")?;
     accept_info(registration, &info)?;
@@ -392,7 +494,7 @@ pub(crate) struct OpenCodeService {
     /// arrives while the previous reader is winding down can neither leave the
     /// hub without a reader nor put two readers on one `StreamControl`.
     reader_active: Mutex<bool>,
-    binary: PathBuf,
+    binary: RwLock<PathBuf>,
 }
 
 impl OpenCodeService {
@@ -411,8 +513,32 @@ impl OpenCodeService {
             model_windows: RwLock::new(HashMap::new()),
             models_refreshing: AtomicBool::new(false),
             reader_active: Mutex::new(false),
-            binary: binary.to_path_buf(),
+            binary: RwLock::new(binary.to_path_buf()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: Endpoint) -> Arc<Self> {
+        let registration = ServiceRegistration {
+            id: "test-service".to_owned(),
+            version: Some("2.0.0".to_owned()),
+            url: format!("http://{}", endpoint.address()),
+            pid: 1,
+            password: String::new(),
+        };
+        Self::adopt(Path::new("opencode"), registration, endpoint)
+    }
+
+    fn set_binary(&self, binary: &Path) {
+        let mut current = self.binary.write();
+        if current.as_path() != binary {
+            *current = binary.to_path_buf();
+        }
+    }
+
+    #[cfg(test)]
+    fn binary(&self) -> PathBuf {
+        self.binary.read().clone()
     }
 
     pub(crate) fn endpoint(&self) -> Endpoint {
@@ -522,15 +648,126 @@ enum SlotState {
     Running(Arc<OpenCodeService>),
 }
 
+fn lock_std<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct ServiceSlot {
+    state: StdMutex<SlotState>,
+    changed: Condvar,
+}
+
+impl Default for ServiceSlot {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(SlotState::Vacant),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+struct SlotStartingGuard<'a> {
+    slot: &'a ServiceSlot,
+    armed: bool,
+}
+
+impl<'a> SlotStartingGuard<'a> {
+    fn new(slot: &'a ServiceSlot) -> Self {
+        Self { slot, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SlotStartingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut slot = lock_std(&self.slot.state);
+            *slot = SlotState::Vacant;
+            self.slot.changed.notify_all();
+        }
+    }
+}
+
+impl ServiceSlot {
+    fn acquire_with<D, S>(
+        &self,
+        binary: &Path,
+        may_spawn: bool,
+        discover: D,
+        spawn: S,
+    ) -> anyhow::Result<Option<Arc<OpenCodeService>>>
+    where
+        D: Fn() -> Option<(ServiceRegistration, Endpoint)>,
+        S: Fn(&Path) -> anyhow::Result<(ServiceRegistration, Endpoint)>,
+    {
+        loop {
+            let mut slot = lock_std(&self.state);
+            match &*slot {
+                SlotState::Running(service) => {
+                    let service = Arc::clone(service);
+                    // Revalidation blocks on HTTP, so it happens outside the slot
+                    // lock: an acquire must never wait behind another acquire's
+                    // network round trip.
+                    drop(slot);
+                    return match revalidate_with(&service, binary, may_spawn, discover, spawn) {
+                        Ok(true) => Ok(Some(service)),
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    };
+                }
+                SlotState::Vacant => {
+                    *slot = SlotState::Starting;
+                    break;
+                }
+                SlotState::Starting => {
+                    let _unused = self
+                        .changed
+                        .wait(slot)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+        }
+        let mut guard = SlotStartingGuard::new(self);
+
+        let connected = connect_with(binary, may_spawn, discover, spawn);
+        let mut slot = lock_std(&self.state);
+        match connected {
+            Ok(Some(service)) => {
+                *slot = SlotState::Running(Arc::clone(&service));
+                guard.disarm();
+                self.changed.notify_all();
+                Ok(Some(service))
+            }
+            // A failed or declined start resets to `Vacant` so the next session
+            // simply retries.
+            Ok(None) => {
+                *slot = SlotState::Vacant;
+                guard.disarm();
+                self.changed.notify_all();
+                Ok(None)
+            }
+            Err(error) => {
+                *slot = SlotState::Vacant;
+                guard.disarm();
+                self.changed.notify_all();
+                Err(error)
+            }
+        }
+    }
+}
+
 /// There is exactly one service, so the slot is keyed on nothing. `Running`
 /// holds a STRONG handle: the service object is permanent, which is what keeps
 /// the two hazards this repo has already hit — a drop-before-start bouncing
 /// the shared connection, and a shutdown running under the slot mutex —
 /// structurally impossible here. The `Starting` + condvar discipline exists
 /// only so N concurrent driver starts do not each run the 20s spawn poll.
-fn slot() -> &'static (StdMutex<SlotState>, Condvar) {
-    static SERVICE: OnceLock<(StdMutex<SlotState>, Condvar)> = OnceLock::new();
-    SERVICE.get_or_init(|| (StdMutex::new(SlotState::Vacant), Condvar::new()))
+fn slot() -> &'static ServiceSlot {
+    static SERVICE: OnceLock<ServiceSlot> = OnceLock::new();
+    SERVICE.get_or_init(ServiceSlot::default)
 }
 
 /// Returns the shared service, starting one if none is registered.
@@ -549,65 +786,26 @@ pub(crate) fn attached(binary: &Path) -> anyhow::Result<Option<Arc<OpenCodeServi
 }
 
 fn acquire(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<OpenCodeService>>> {
-    let (state, changed) = slot();
-    loop {
-        let mut slot = state.lock().unwrap();
-        match &*slot {
-            SlotState::Running(service) => {
-                let service = Arc::clone(service);
-                // Revalidation blocks on HTTP, so it happens outside the slot
-                // lock: an acquire must never wait behind another acquire's
-                // network round trip.
-                drop(slot);
-                return match revalidate(&service, may_spawn) {
-                    Ok(true) => Ok(Some(service)),
-                    Ok(false) => Ok(None),
-                    Err(error) => Err(error),
-                };
-            }
-            SlotState::Vacant => {
-                *slot = SlotState::Starting;
-                break;
-            }
-            SlotState::Starting => {
-                let _unused = changed.wait(slot).unwrap();
-            }
-        }
-    }
-
-    let connected = connect(binary, may_spawn);
-    let mut slot = state.lock().unwrap();
-    match connected {
-        Ok(Some(service)) => {
-            *slot = SlotState::Running(Arc::clone(&service));
-            changed.notify_all();
-            Ok(Some(service))
-        }
-        // A failed or declined start resets to `Vacant` so the next session
-        // simply retries.
-        Ok(None) => {
-            *slot = SlotState::Vacant;
-            changed.notify_all();
-            Ok(None)
-        }
-        Err(error) => {
-            *slot = SlotState::Vacant;
-            changed.notify_all();
-            Err(error)
-        }
-    }
+    slot().acquire_with(binary, may_spawn, discover_live_service, spawn_service)
 }
 
-fn connect(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<OpenCodeService>>> {
-    if let Some(registration) = read_registration() {
-        if let Ok(endpoint) = probe(&registration) {
-            return Ok(Some(OpenCodeService::adopt(binary, registration, endpoint)));
-        }
+fn connect_with<D, S>(
+    binary: &Path,
+    may_spawn: bool,
+    discover: D,
+    spawn: S,
+) -> anyhow::Result<Option<Arc<OpenCodeService>>>
+where
+    D: Fn() -> Option<(ServiceRegistration, Endpoint)>,
+    S: Fn(&Path) -> anyhow::Result<(ServiceRegistration, Endpoint)>,
+{
+    if let Some((registration, endpoint)) = discover() {
+        return Ok(Some(OpenCodeService::adopt(binary, registration, endpoint)));
     }
     if !may_spawn {
         return Ok(None);
     }
-    let (registration, endpoint) = spawn_service(binary)?;
+    let (registration, endpoint) = spawn(binary)?;
     Ok(Some(OpenCodeService::adopt(binary, registration, endpoint)))
 }
 
@@ -617,18 +815,27 @@ fn connect(binary: &Path, may_spawn: bool) -> anyhow::Result<Option<Arc<OpenCode
 /// password, and the user can stop it outright between two Waku tasks. Both
 /// are absorbed by refreshing the endpoint IN PLACE — minting a second service
 /// object would put a second reader on the same process and orphan every live
-/// subscription.
-fn revalidate(service: &Arc<OpenCodeService>, may_spawn: bool) -> anyhow::Result<bool> {
-    if let Some(registration) = read_registration() {
-        if let Ok(endpoint) = probe(&registration) {
-            service.adopt_registration(registration, endpoint);
-            return Ok(true);
-        }
+/// subscription. Updated binary overrides from Settings are adopted here too.
+fn revalidate_with<D, S>(
+    service: &Arc<OpenCodeService>,
+    binary: &Path,
+    may_spawn: bool,
+    discover: D,
+    spawn: S,
+) -> anyhow::Result<bool>
+where
+    D: Fn() -> Option<(ServiceRegistration, Endpoint)>,
+    S: Fn(&Path) -> anyhow::Result<(ServiceRegistration, Endpoint)>,
+{
+    service.set_binary(binary);
+    if let Some((registration, endpoint)) = discover() {
+        service.adopt_registration(registration, endpoint);
+        return Ok(true);
     }
     if !may_spawn {
         return Ok(false);
     }
-    let (registration, endpoint) = spawn_service(&service.binary)?;
+    let (registration, endpoint) = spawn(binary)?;
     service.adopt_registration(registration, endpoint);
     Ok(true)
 }
@@ -655,14 +862,12 @@ fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint
     let deadline = Instant::now() + SERVICE_START_BUDGET;
     let mut exit = None;
     loop {
-        if let Some(registration) = read_registration() {
-            if let Ok(endpoint) = probe(&registration) {
-                // Reap the launcher if it has already detached. The service
-                // itself is never signalled, and dropping a `Child` does not
-                // kill it, so an attached service simply outlives this handle.
-                let _unused = child.try_wait();
-                return Ok((registration, endpoint));
-            }
+        if let Some((registration, endpoint)) = discover_live_service() {
+            // Reap the launcher if it has already detached. The service
+            // itself is never signalled, and dropping a `Child` does not
+            // kill it, so an attached service simply outlives this handle.
+            let _unused = child.try_wait();
+            return Ok((registration, endpoint));
         }
         if exit.is_none() {
             exit = child.try_wait().ok().flatten();
@@ -705,28 +910,107 @@ fn ensure_service_cli(binary: &Path) -> anyhow::Result<()> {
 }
 
 fn version_output(binary: &Path) -> Option<String> {
+    version_output_with_timeout(binary, VERSION_TIMEOUT)
+}
+
+fn version_output_with_timeout(binary: &Path, timeout: Duration) -> Option<String> {
     let mut command = crate::command_env::command(binary);
     command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
     let mut child = crate::command_env::spawn(&mut command).ok()?;
-    let deadline = Instant::now() + VERSION_TIMEOUT;
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+    #[cfg(windows)]
+    let mut job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+
+    let Some(stdout) = child.stdout.take() else {
+        terminate_probe_child(&mut child);
+        #[cfg(windows)]
+        drop(job.take());
+        return None;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_probe_child(&mut child);
+        #[cfg(windows)]
+        drop(job.take());
+        return None;
+    };
+
+    // Drain stdout and stderr concurrently while waiting so a verbose binary
+    // cannot block on a full OS pipe buffer and trip `VERSION_TIMEOUT`.
+    let Ok(stdout_reader) = thread::Builder::new()
+        .name("waku-opencode-version-stdout".into())
+        .spawn(move || drain_bounded_stream(stdout, MAX_VERSION_OUTPUT_BYTES))
+    else {
+        terminate_probe_child(&mut child);
+        #[cfg(windows)]
+        drop(job.take());
+        return None;
+    };
+    let Ok(stderr_reader) = thread::Builder::new()
+        .name("waku-opencode-version-stderr".into())
+        .spawn(move || drain_bounded_stream(stderr, MAX_VERSION_OUTPUT_BYTES))
+    else {
+        terminate_probe_child(&mut child);
+        #[cfg(windows)]
+        drop(job.take());
+        let _ = stdout_reader.join();
+        return None;
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                #[cfg(windows)]
+                drop(job.take());
+                let stdout_bytes = stdout_reader.join().ok()?;
+                let stderr_bytes = stderr_reader.join().ok()?;
+                return Some(format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&stdout_bytes),
+                    String::from_utf8_lossy(&stderr_bytes)
+                ));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => {
+                #[cfg(windows)]
+                drop(job.take());
+                terminate_probe_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return None;
+            }
         }
-        thread::sleep(Duration::from_millis(20));
     }
-    let output = child.wait_with_output().ok()?;
-    Some(format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    ))
+}
+
+fn drain_bounded_stream(mut reader: impl std::io::Read, limit: usize) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while let Ok(read) = reader.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    }
+    output
+}
+
+fn terminate_probe_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// OpenCode 1 prints its version bare (`1.18.32`), including its `0.0.0-…`
@@ -756,17 +1040,17 @@ struct ReaderWake {
 
 impl ReaderWake {
     fn wake(&self) {
-        *self.woken.lock().unwrap() = true;
+        *lock_std(&self.woken) = true;
         self.changed.notify_all();
     }
 
     /// Sleeps for `duration`, or until woken.
     fn sleep(&self, duration: Duration) {
-        let woken = self.woken.lock().unwrap();
+        let woken = lock_std(&self.woken);
         let (mut woken, _) = self
             .changed
             .wait_timeout_while(woken, duration, |woken| !*woken)
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *woken = false;
     }
 }
@@ -788,14 +1072,34 @@ fn run_reader(
     hub: Arc<EventHub>,
     stream: Arc<StreamControl>,
     wake: Arc<ReaderWake>,
+    endpoint: Endpoint,
+    service: Weak<OpenCodeService>,
+) {
+    run_reader_with_rediscover(hub, stream, wake, endpoint, service, rediscover);
+}
+
+fn run_reader_with_rediscover(
+    hub: Arc<EventHub>,
+    stream: Arc<StreamControl>,
+    wake: Arc<ReaderWake>,
     mut endpoint: Endpoint,
     service: Weak<OpenCodeService>,
+    rediscover_fn: impl Fn(&Weak<OpenCodeService>, &mut Endpoint),
 ) {
     let mut backoff = RECONNECT_MIN_BACKOFF;
     let mut pending_resync = None;
     loop {
         if stream.is_cancelled() {
             break;
+        }
+        // Re-read the service's current endpoint before dialing so an
+        // `adopt_registration` update landed before or during backoff takes
+        // effect immediately without dialing the superseded endpoint.
+        if let Some(current) = service.upgrade().map(|service| service.endpoint())
+            && current != endpoint
+        {
+            endpoint = current;
+            backoff = RECONNECT_MIN_BACKOFF;
         }
         match open_event_stream(&endpoint, EVENT_ROUTE, &stream) {
             Ok(Some(socket)) => {
@@ -821,8 +1125,15 @@ fn run_reader(
         };
         pending_resync = Some(generation);
         // A found service is adopted, which wakes this sleep at once.
-        rediscover(&service, &mut endpoint);
+        rediscover_fn(&service, &mut endpoint);
         wake.sleep(backoff);
+        if let Some(current) = service.upgrade().map(|service| service.endpoint())
+            && current != endpoint
+        {
+            endpoint = current;
+            backoff = RECONNECT_MIN_BACKOFF;
+            continue;
+        }
         backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
     }
 
@@ -885,10 +1196,7 @@ fn pump(
 /// Re-reads the descriptor and re-probes after a break, swapping the endpoint
 /// when a CLI upgrade has replaced the service. Never spawns.
 fn rediscover(service: &Weak<OpenCodeService>, endpoint: &mut Endpoint) {
-    let Some(registration) = read_registration() else {
-        return;
-    };
-    let Ok(next) = probe(&registration) else {
+    let Some((registration, next)) = discover_live_service() else {
         return;
     };
     // Brief upgrade only: see the module doc.
@@ -1233,6 +1541,335 @@ mod tests {
         assert_eq!(hub.session_count(), 1);
         hub.publish(json!({"type": "message.updated", "data": {"sessionID": "ses_a"}}));
         assert!(mine.try_recv().is_err());
+    }
+
+    #[test]
+    fn probe_rejects_non_http_and_non_loopback_urls_before_sending_auth() {
+        for rejected in [
+            "https://127.0.0.1:49374",
+            "https://localhost:49374",
+            "http://example.com:49374",
+            "http://192.168.1.50:49374",
+            "http://0.0.0.0:49374",
+            "http://127.0.0.1.evil.test:49374",
+            "http://127.0.0.1@evil.test:49374",
+            "http://[::ffff:192.0.2.1]:49374",
+            "http://127.0.0.1:49374/evil",
+            "file:///etc/passwd",
+        ] {
+            let mut reg = registration(1234);
+            reg.url = rejected.to_owned();
+            assert!(
+                validated_loopback_endpoint(&reg.url, SERVICE_USER, &reg.password).is_err(),
+                "{rejected} must be rejected before Basic auth is sent"
+            );
+            assert!(probe(&reg).is_err(), "{rejected} must be rejected by probe");
+        }
+
+        for accepted in [
+            "http://127.0.0.1:49374",
+            "http://[::1]:49374",
+            "http://localhost:49374",
+            "http://LOCALHOST:49374",
+        ] {
+            assert!(
+                validated_loopback_endpoint(accepted, SERVICE_USER, "secret").is_ok(),
+                "{accepted} should be allowed as a local loopback service URL"
+            );
+        }
+    }
+
+    #[test]
+    fn state_directory_falls_back_to_shell_environment_xdg_state_home() {
+        let shell_env = vec![(
+            OsString::from("XDG_STATE_HOME"),
+            OsString::from("/from-shell/state"),
+        )];
+        let home = Some(PathBuf::from("/home/user"));
+
+        assert_eq!(
+            state_directory_from(Some(OsString::from("/from-env/state")), &shell_env, home.clone()),
+            PathBuf::from("/from-env/state").join("opencode")
+        );
+        assert_eq!(
+            state_directory_from(None, &shell_env, home.clone()),
+            PathBuf::from("/from-shell/state").join("opencode")
+        );
+        assert_eq!(
+            state_directory_from(Some(OsString::new()), &shell_env, home.clone()),
+            PathBuf::from("/from-shell/state").join("opencode")
+        );
+        assert_eq!(
+            state_directory_from(None, &[], home),
+            PathBuf::from("/home/user")
+                .join(".local")
+                .join("state")
+                .join("opencode")
+        );
+    }
+
+    #[test]
+    fn discovery_probes_past_stale_channel_and_mainstream_registrations() {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = r#"{"version":"2.0.99","pid":4242}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        // Closed port for stale registrations.
+        let dead_port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "waku-opencode-discovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stale mainstream `service.json` and stale earlier channel `service-alpha.json`
+        std::fs::write(
+            dir.join("service.json"),
+            json!({
+                "id": "stale-main",
+                "version": "2.0.1",
+                "url": format!("http://127.0.0.1:{dead_port}"),
+                "pid": 1111,
+                "password": "old"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("service-alpha.json"),
+            json!({
+                "id": "stale-alpha",
+                "version": "2.0.2",
+                "url": format!("http://127.0.0.1:{dead_port}"),
+                "pid": 2222,
+                "password": "old"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("service-beta.json"),
+            json!({
+                "id": "live-beta",
+                "version": "2.0.99",
+                "url": format!("http://127.0.0.1:{live_port}"),
+                "pid": 4242,
+                "password": "good"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (found, endpoint) =
+            discover_live_service_in(&dir).expect("should skip stale files and find live beta");
+        assert_eq!(found.id, "live-beta");
+        assert_eq!(endpoint.port, live_port);
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn acquire_and_revalidate_respect_updated_binary_override() {
+        let slot = ServiceSlot::default();
+        let spawned_binaries = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let alive = Arc::new(AtomicBool::new(false));
+
+        let bin_a = PathBuf::from("/override/opencode-a");
+        let bin_b = PathBuf::from("/override/opencode-b");
+
+        let discover = {
+            let alive = Arc::clone(&alive);
+            move || {
+                alive.load(Ordering::Acquire).then(|| {
+                    (
+                        registration(100),
+                        Endpoint::basic("http://127.0.0.1:40100", SERVICE_USER, "secret").unwrap(),
+                    )
+                })
+            }
+        };
+        let spawn = {
+            let spawned = Arc::clone(&spawned_binaries);
+            move |binary: &Path| {
+                spawned.lock().push(binary.to_path_buf());
+                Ok((
+                    registration(200),
+                    Endpoint::basic("http://127.0.0.1:40200", SERVICE_USER, "secret").unwrap(),
+                ))
+            }
+        };
+
+        // Attach-only (`may_spawn = false`) never spawns when absent.
+        assert!(
+            slot.acquire_with(&bin_a, false, &discover, &spawn)
+                .unwrap()
+                .is_none()
+        );
+        assert!(spawned_binaries.lock().is_empty());
+
+        // First spawn uses `bin_a`.
+        let service = slot
+            .acquire_with(&bin_a, true, &discover, &spawn)
+            .unwrap()
+            .expect("first acquire should spawn");
+        assert_eq!(service.binary(), bin_a);
+        assert_eq!(*spawned_binaries.lock(), vec![bin_a.clone()]);
+
+        // Service is absent again; second acquire with updated `bin_b` must
+        // revalidate and spawn with `bin_b`, NOT stay pinned to `bin_a`.
+        let reused = slot
+            .acquire_with(&bin_b, true, &discover, &spawn)
+            .unwrap()
+            .expect("revalidate should spawn with updated binary");
+        assert!(Arc::ptr_eq(&service, &reused));
+        assert_eq!(reused.binary(), bin_b);
+        assert_eq!(*spawned_binaries.lock(), vec![bin_a, bin_b]);
+    }
+
+    #[test]
+    fn run_reader_re_reads_adopted_endpoint_after_wake_without_redundant_disconnect() {
+        use std::io::{BufRead as _, Write as _};
+
+        // Start with a dead port so the reader enters reconnect backoff.
+        let dead_port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let service = OpenCodeService::for_test(Endpoint::local(dead_port));
+        let (_rx_id, rx) = service.hub.subscribe("ses_wake");
+        service.subscribers.store(1, Ordering::Release);
+        *service.reader_active.lock() = true;
+
+        let hub = Arc::clone(&service.hub);
+        let stream = Arc::clone(&service.stream);
+        let wake = Arc::clone(&service.wake);
+        let initial_endpoint = service.endpoint();
+        let weak = Arc::downgrade(&service);
+        let reader = thread::spawn(move || {
+            run_reader_with_rediscover(hub, stream, wake, initial_endpoint, weak, |_, _| {});
+        });
+
+        // Wait for the initial Disconnected frame from the dead port.
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected initial Disconnected");
+        assert!(matches!(first, HubFrame::Disconnected));
+        assert_eq!(service.generation(), 1);
+
+        // Now stand up a live SSE server and adopt its endpoint while the
+        // reader is in backoff sleep.
+        let live_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let live_port = live_listener.local_addr().unwrap().port();
+        let (sse_done_tx, sse_done_rx) = std::sync::mpsc::channel();
+        let sse_server = thread::spawn(move || {
+            let (mut socket, _) = live_listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let _ = socket.write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                    "data: {\"id\":\"evt_1\",\"type\":\"session.updated\",\"data\":{\"sessionID\":\"ses_wake\"}}\n\n",
+                )
+                .as_bytes(),
+            );
+            let _ = socket.flush();
+            let _ = sse_done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let mut next_reg = registration(9001);
+        next_reg.url = format!("http://127.0.0.1:{live_port}");
+        service.adopt_registration(next_reg, Endpoint::local(live_port));
+
+        // The reader must wake and dial the new endpoint directly: next frame
+        // must be Resync { generation: 1 } (NO second Disconnected, NO gen 2).
+        let second = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected Resync on adopted endpoint");
+        assert!(
+            matches!(second, HubFrame::Resync { generation: 1 }),
+            "expected Resync {{ generation: 1 }}, got {second:?}"
+        );
+        let third = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected live event from adopted endpoint");
+        assert!(matches!(third, HubFrame::Event(_)), "got {third:?}");
+        assert_eq!(service.generation(), 1);
+
+        // Shut down reader cleanly.
+        service.subscribers.store(0, Ordering::Release);
+        service.stream.cancel();
+        service.wake.wake();
+        let _ = sse_done_tx.send(());
+        reader.join().unwrap();
+        sse_server.join().unwrap();
+    }
+
+    #[test]
+    fn version_output_drains_large_stdout_and_stderr_without_pipe_deadlock() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-opencode-version-pipe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(windows)]
+        let binary = {
+            let script = dir.join("fake-opencode.cmd");
+            // Emit >128 KiB to both stdout and stderr (well above Windows 4 KiB
+            // pipe buffer) before exiting cleanly.
+            std::fs::write(
+                &script,
+                "@echo off\r\npowershell -NoProfile -Command \"Write-Output 'opencode v2.0.50'; [Console]::Out.WriteLine(('A' * 131072)); [Console]::Error.WriteLine(('E' * 131072))\"\r\n",
+            )
+            .unwrap();
+            script
+        };
+        #[cfg(unix)]
+        let binary = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let script = dir.join("fake-opencode");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\necho 'opencode v2.0.50'\nhead -c 131072 /dev/zero | tr '\\0' 'A'\nhead -c 131072 /dev/zero | tr '\\0' 'E' >&2\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        };
+
+        let output = version_output_with_timeout(&binary, Duration::from_secs(10))
+            .expect("concurrent draining must prevent pipe deadlock");
+        assert!(output.contains("opencode v2.0.50"), "{output}");
+        assert!(opencode_one_version(&output).is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
