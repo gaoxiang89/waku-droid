@@ -45,11 +45,28 @@ const DIR_WALK_MAX_FILES: usize = 500;
 /// filesystem access — so this is safe to call while building a frame.
 pub fn user_skill_locations() -> Vec<SkillLocation> {
     let home = dirs::home_dir();
-    let claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
+    let claude_config_dir_env = crate::command_env::env_var_os("CLAUDE_CONFIG_DIR");
+    let codex_home_env = crate::command_env::env_var_os("CODEX_HOME");
+    user_skill_locations_with(
+        home.as_deref(),
+        claude_config_dir_env.as_deref(),
+        codex_home_env.as_deref(),
+    )
+}
+
+fn user_skill_locations_with(
+    home: Option<&Path>,
+    claude_config_dir_env: Option<&std::ffi::OsStr>,
+    codex_home_env: Option<&std::ffi::OsStr>,
+) -> Vec<SkillLocation> {
+    let claude_config_dir = claude_config_dir_env
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .or_else(|| home.as_deref().map(|home| home.join(".claude")));
+        .or_else(|| home.map(|home| home.join(".claude")));
+    let codex_config_dir = codex_home_env
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".codex")));
     let mut locations = Vec::new();
     let mut push = |source: SkillSource, root: Option<PathBuf>| {
         if let Some(root) = root {
@@ -61,7 +78,7 @@ pub fn user_skill_locations() -> Vec<SkillLocation> {
             });
         }
     };
-    let home_join = |suffix: &str| home.as_deref().map(|home| home.join(suffix));
+    let home_join = |suffix: &str| home.map(|home| home.join(suffix));
     push(SkillSource::Shared, home_join(".agents/skills"));
     push(
         SkillSource::Provider(ProviderKind::Claude),
@@ -69,7 +86,7 @@ pub fn user_skill_locations() -> Vec<SkillLocation> {
     );
     push(
         SkillSource::Provider(ProviderKind::Codex),
-        home_join(".codex/skills"),
+        codex_config_dir.map(|dir| dir.join("skills")),
     );
     push(
         SkillSource::Provider(ProviderKind::OpenCode),
@@ -662,5 +679,57 @@ mod tests {
         // User scope leads the scan, so grouped entries prefer user copies.
         assert!(locations[0].scope == SkillScope::User);
         assert_eq!(locations[0].source, SkillSource::Shared);
+    }
+
+    #[test]
+    fn user_skill_locations_honor_absolute_claude_and_codex_env_overrides() {
+        #[cfg(windows)]
+        let (home, custom_claude, custom_codex) = (
+            PathBuf::from(r"C:\Users\example"),
+            PathBuf::from(r"C:\custom\claude-home"),
+            PathBuf::from(r"C:\custom\codex-home"),
+        );
+        #[cfg(not(windows))]
+        let (home, custom_claude, custom_codex) = (
+            PathBuf::from("/Users/example"),
+            PathBuf::from("/opt/custom/claude-home"),
+            PathBuf::from("/opt/custom/codex-home"),
+        );
+
+        let overridden = user_skill_locations_with(
+            Some(&home),
+            Some(custom_claude.as_os_str()),
+            Some(custom_codex.as_os_str()),
+        );
+        let root_for = |locations: &[SkillLocation], provider: ProviderKind| {
+            locations
+                .iter()
+                .find(|location| location.source == SkillSource::Provider(provider))
+                .map(|location| location.root.clone())
+        };
+        assert_eq!(
+            root_for(&overridden, ProviderKind::Claude),
+            Some(custom_claude.join("skills"))
+        );
+        assert_eq!(
+            root_for(&overridden, ProviderKind::Codex),
+            Some(custom_codex.join("skills"))
+        );
+
+        // Relative or empty env values fall back to `~/.claude/skills` and
+        // `~/.codex/skills`, matching `composer_complete.rs`.
+        let fallback = user_skill_locations_with(
+            Some(&home),
+            Some(std::ffi::OsStr::new("relative/claude")),
+            Some(std::ffi::OsStr::new("relative/codex")),
+        );
+        assert_eq!(
+            root_for(&fallback, ProviderKind::Claude),
+            Some(home.join(".claude").join("skills"))
+        );
+        assert_eq!(
+            root_for(&fallback, ProviderKind::Codex),
+            Some(home.join(".codex").join("skills"))
+        );
     }
 }

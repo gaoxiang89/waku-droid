@@ -43,8 +43,25 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
     state.trim_idle_transcripts(pinned, RESIDENT_TRANSCRIPT_WINDOW);
 }
 
+struct LiveSessionRuntime {
+    runtime_id: Uuid,
+    provider: ProviderKind,
+    account_id: Option<String>,
+    driver: DriverHandle,
+}
+
+struct ValidatedClientConfigDir {
+    account_id: String,
+    raw: String,
+    resolved: PathBuf,
+}
+
+fn normalized_account_id(account_id: Option<&str>) -> Option<&str> {
+    account_id.map(str::trim).filter(|id| !id.is_empty())
+}
+
 pub struct WakuBackend {
-    sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    sessions: Mutex<HashMap<Uuid, LiveSessionRuntime>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, PathBuf, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
@@ -180,6 +197,26 @@ impl WakuBackend {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_test_session(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        provider: ProviderKind,
+        account_id: Option<String>,
+        driver: DriverHandle,
+    ) {
+        self.sessions.lock().insert(
+            session_id,
+            LiveSessionRuntime {
+                runtime_id,
+                provider,
+                account_id,
+                driver,
+            },
+        );
+    }
+
     fn open_terminal(
         &self,
         cwd: &Path,
@@ -307,15 +344,15 @@ impl Backend for WakuBackend {
         match request.command {
             Command::AttachSession => {
                 let sessions = self.sessions.lock();
-                let Some((runtime_id, driver)) = sessions.get(&session_id) else {
+                let Some(live) = sessions.get(&session_id) else {
                     return Ok(ResponsePayload::SessionRuntime {
                         runtime_id: None,
                         supports_steer: false,
                     });
                 };
                 Ok(ResponsePayload::SessionRuntime {
-                    runtime_id: Some(*runtime_id),
-                    supports_steer: driver.supports_steer(),
+                    runtime_id: Some(live.runtime_id),
+                    supports_steer: live.driver.supports_steer(),
                 })
             }
             Command::GetSettings => Ok(ResponsePayload::Settings {
@@ -334,7 +371,7 @@ impl Backend for WakuBackend {
             } => {
                 let resolved_config_dir = self
                     .validate_client_config_dir(provider, config_dir.as_deref())?
-                    .map(|(_, path)| path);
+                    .map(|validated| validated.resolved);
                 ensure_shell_environment();
                 let mut probe = match binary_override.as_deref() {
                     override_value if discover_models || probe_version => {
@@ -366,7 +403,7 @@ impl Backend for WakuBackend {
             } => {
                 let resolved_config_dir = self
                     .validate_client_config_dir(provider, config_dir.as_deref())?
-                    .map(|(_, path)| path);
+                    .map(|validated| validated.resolved);
                 let usage = match provider {
                     crate::model::ProviderKind::Claude => {
                         Some(crate::usage::fetch_claude_plan_usage(
@@ -378,6 +415,7 @@ impl Backend for WakuBackend {
                         crate::usage::fetch_codex_plan_usage(resolved_config_dir.as_deref())?,
                     ),
                     crate::model::ProviderKind::OpenCode => {
+                        ensure_shell_environment();
                         crate::usage::fetch_opencode_go_plan_usage()?
                     }
                     crate::model::ProviderKind::Grok => {
@@ -403,6 +441,7 @@ impl Backend for WakuBackend {
                 window,
                 project_roots,
             } => {
+                ensure_shell_environment();
                 let rates = crate::usage_history::load_rate_table(&self.usage_rates_dir);
                 let account_dirs = self
                     .settings
@@ -429,6 +468,7 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::UsageHistory { history })
             }
             Command::LoadSkills { projects } => {
+                ensure_shell_environment();
                 let locations = crate::skills::skill_locations(&projects);
                 Ok(ResponsePayload::SkillsCatalog {
                     catalog: crate::skills::scan_skills(&locations),
@@ -920,9 +960,12 @@ impl Backend for WakuBackend {
                 );
                 let provider = decode_enum(&options.provider)?;
                 let mode = decode_enum(&options.mode)?;
-                let config_dir = self
-                    .validate_client_config_dir(provider, options.config_dir.as_deref())?
-                    .map(|(_, path)| path);
+                let validated_account =
+                    self.validate_client_config_dir(provider, options.config_dir.as_deref())?;
+                let account_id = validated_account
+                    .as_ref()
+                    .map(|validated| validated.account_id.clone());
+                let config_dir = validated_account.map(|validated| validated.resolved);
                 let provider_cursor = options
                     .provider_cursor
                     .map(serde_json::from_value)
@@ -970,7 +1013,15 @@ impl Backend for WakuBackend {
                     !self.removed_session_ids.lock().contains(&session_id),
                     "the task has been deleted"
                 );
-                sessions.insert(session_id, (runtime_id, handle));
+                sessions.insert(
+                    session_id,
+                    LiveSessionRuntime {
+                        runtime_id,
+                        provider,
+                        account_id,
+                        driver: handle,
+                    },
+                );
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
@@ -978,7 +1029,7 @@ impl Backend for WakuBackend {
                     let mut sessions = self.sessions.lock();
                     sessions
                         .get(&session_id)
-                        .is_some_and(|(active_runtime_id, _)| *active_runtime_id == runtime_id)
+                        .is_some_and(|live| live.runtime_id == runtime_id)
                         .then(|| sessions.remove(&session_id))
                         .flatten()
                 };
@@ -988,15 +1039,16 @@ impl Backend for WakuBackend {
             command => {
                 let driver = {
                     let sessions = self.sessions.lock();
-                    let (active_runtime_id, driver) = sessions
+                    let live = sessions
                         .get(&session_id)
                         .ok_or_else(|| anyhow!("daemon session {session_id} is not running"))?;
-                    if *active_runtime_id != runtime_id {
+                    if live.runtime_id != runtime_id {
                         bail!(
-                            "daemon session {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                            "daemon session {session_id} belongs to runtime {}, not {runtime_id}",
+                            live.runtime_id
                         );
                     }
-                    driver.clone()
+                    live.driver.clone()
                 };
                 if let Some(event) = prompt_submission_wire_event(&command)? {
                     // Publish the submission into the runtime's event stream
@@ -1020,6 +1072,18 @@ impl Backend for WakuBackend {
                 .lock()
                 .values()
                 .any(|(_, _, terminal)| !terminal.exited())
+    }
+
+    fn is_runtime_live(&self, session_id: Uuid, runtime_id: Uuid) -> bool {
+        self.sessions
+            .lock()
+            .get(&session_id)
+            .is_some_and(|live| live.runtime_id == runtime_id)
+            || self
+                .terminals
+                .lock()
+                .get(&session_id)
+                .is_some_and(|(active_runtime_id, _, _)| *active_runtime_id == runtime_id)
     }
 
     fn shutdown(&self) {
@@ -1498,18 +1562,22 @@ impl WakuBackend {
         }
     }
 
+    fn matching_live_driver(&self, source: &AgentSession) -> Option<DriverHandle> {
+        let sessions = self.sessions.lock();
+        let live = sessions.get(&source.id)?;
+        let matches = live.provider == source.provider
+            && normalized_account_id(live.account_id.as_deref())
+                == normalized_account_id(source.account_id.as_deref());
+        matches.then(|| live.driver.clone())
+    }
+
     fn fork_response_with_driver(
         &self,
         source: &AgentSession,
         cwd: &Path,
         turns_to_remove: usize,
     ) -> anyhow::Result<ProviderResumeCursor> {
-        if let Some(driver) = self
-            .sessions
-            .lock()
-            .get(&source.id)
-            .map(|(_, driver)| driver.clone())
-        {
+        if let Some(driver) = self.matching_live_driver(source) {
             return driver.fork(turns_to_remove);
         }
 
@@ -1620,12 +1688,7 @@ impl WakuBackend {
                 Ok((Some(fork.cursor), fork.message_ids, false))
             }
             ProviderKind::OpenCode => {
-                let cursor = if let Some(driver) = self
-                    .sessions
-                    .lock()
-                    .get(&source.id)
-                    .map(|(_, driver)| driver.clone())
-                {
+                let cursor = if let Some(driver) = self.matching_live_driver(source) {
                     driver
                         .rollback(rollback_turns)?
                         .ok_or_else(|| anyhow!("OpenCode returned no rewound-session cursor"))?
@@ -1714,12 +1777,7 @@ impl WakuBackend {
         binary: &Path,
         rollback_turns: usize,
     ) -> anyhow::Result<Option<ProviderResumeCursor>> {
-        if let Some(driver) = self
-            .sessions
-            .lock()
-            .get(&source.id)
-            .map(|(_, driver)| driver.clone())
-        {
+        if let Some(driver) = self.matching_live_driver(source) {
             return driver.rollback(rollback_turns);
         }
 
@@ -1778,7 +1836,7 @@ impl WakuBackend {
             .sessions
             .lock()
             .iter()
-            .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
+            .map(|(session_id, live)| (*session_id, live.runtime_id))
             .collect::<HashMap<_, _>>();
         let mut state = self.task_state.lock();
         let removed_project_ids = self.removed_project_ids.lock();
@@ -1871,7 +1929,7 @@ impl WakuBackend {
         &self,
         provider: ProviderKind,
         config_dir: Option<&str>,
-    ) -> anyhow::Result<Option<(String, PathBuf)>> {
+    ) -> anyhow::Result<Option<ValidatedClientConfigDir>> {
         let Some(raw) = config_dir.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
         };
@@ -1901,14 +1959,14 @@ impl WakuBackend {
         };
         Ok(self
             .validate_client_config_dir_resolved(provider, &resolved)?
-            .map(|(_, path)| path))
+            .map(|validated| validated.resolved))
     }
 
     fn validate_client_config_dir_resolved(
         &self,
         provider: ProviderKind,
         requested: &Path,
-    ) -> anyhow::Result<Option<(String, PathBuf)>> {
+    ) -> anyhow::Result<Option<ValidatedClientConfigDir>> {
         let Some(requested_key) = normalize_config_dir_for_comparison(requested) else {
             bail!(
                 "config_dir is not a valid path for {}",
@@ -1929,7 +1987,11 @@ impl WakuBackend {
                 continue;
             };
             if requested_key == registered_key {
-                return Ok(Some((trimmed.to_owned(), registered_resolved)));
+                return Ok(Some(ValidatedClientConfigDir {
+                    account_id: account.id.clone(),
+                    raw: trimmed.to_owned(),
+                    resolved: registered_resolved,
+                }));
             }
         }
         bail!(
@@ -1961,7 +2023,7 @@ impl WakuBackend {
             } => {
                 *config_dir = self
                     .validate_client_config_dir(*provider, config_dir.as_deref())?
-                    .map(|(raw, _)| raw);
+                    .map(|validated| validated.raw);
             }
             WorkspaceOperation::GenerateCommitMessage { invocation, .. } => {
                 invocation.config_dir = self
@@ -1969,7 +2031,7 @@ impl WakuBackend {
                         invocation.provider,
                         invocation.config_dir.as_deref(),
                     )?
-                    .map(|(raw, _)| raw);
+                    .map(|validated| validated.raw);
             }
             _ => {}
         }
@@ -3208,21 +3270,23 @@ mod tests {
 
         // Registered existing path (including trailing slash) succeeds.
         let with_slash = format!("{}/", existing_account.to_string_lossy());
-        let (_, validated_existing) = backend
+        let validated_existing = backend
             .validate_client_config_dir(ProviderKind::Claude, Some(&with_slash))
             .unwrap()
             .expect("registered existing account accepted");
-        assert_eq!(validated_existing, existing_account);
+        assert_eq!(validated_existing.account_id, "claude-1");
+        assert_eq!(validated_existing.resolved, existing_account);
 
         // Registered not-yet-created path succeeds.
-        let (_, validated_pending) = backend
+        let validated_pending = backend
             .validate_client_config_dir(
                 ProviderKind::Codex,
                 Some(&pending_account.to_string_lossy()),
             )
             .unwrap()
             .expect("registered pending account accepted");
-        assert_eq!(validated_pending, pending_account);
+        assert_eq!(validated_pending.account_id, "codex-1");
+        assert_eq!(validated_pending.resolved, pending_account);
 
         // Unregistered host paths are rejected.
         assert!(
@@ -3315,6 +3379,120 @@ mod tests {
                 })
                 .is_ok()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RecordingDriverControl {
+        fork_calls: Arc<std::sync::atomic::AtomicUsize>,
+        rollback_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::driver::DriverControl for RecordingDriverControl {
+        fn prompt(&self, _prompt: String) {}
+        fn cancel(&self) {}
+        fn respond(&self, _request_id: String, _option_id: String) {}
+        fn rollback(&self, _turns: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
+            self.rollback_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(Some(ProviderResumeCursor::Codex {
+                thread_id: "rolled-back".into(),
+            }))
+        }
+        fn fork(&self, _turns_to_remove: usize) -> anyhow::Result<ProviderResumeCursor> {
+            self.fork_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ProviderResumeCursor::Codex {
+                thread_id: "forked".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn live_driver_is_reused_for_fork_and_rollback_only_when_provider_and_account_match() {
+        let dir =
+            std::env::temp_dir().join(format!("waku-daemon-live-driver-match-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+
+        let fork_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rollback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let driver = DriverHandle::from_control(Arc::new(RecordingDriverControl {
+            fork_calls: fork_calls.clone(),
+            rollback_calls: rollback_calls.clone(),
+        }));
+
+        let mut source = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        source.account_id = Some("codex-work".into());
+        backend.insert_test_session(
+            source.id,
+            Uuid::new_v4(),
+            ProviderKind::Codex,
+            Some("codex-work".into()),
+            driver,
+        );
+
+        // Matching (provider, account_id) reuses the live driver.
+        assert!(backend.matching_live_driver(&source).is_some());
+        let forked = backend
+            .fork_response_with_driver(&source, &dir, 1)
+            .expect("matching live driver handles fork");
+        assert_eq!(forked.native_id(), "forked");
+        assert_eq!(fork_calls.load(Ordering::Acquire), 1);
+
+        let rewound = backend
+            .rollback_response_with_driver(&source, &dir, Path::new("missing-binary"), 1)
+            .expect("matching live driver handles rollback");
+        assert_eq!(rewound.as_ref().map(|c| c.native_id()), Some("rolled-back"));
+        assert_eq!(rollback_calls.load(Ordering::Acquire), 1);
+
+        // Different account_id must NOT reuse the live driver.
+        let mut other_account = source.clone();
+        other_account.account_id = None;
+        assert!(backend.matching_live_driver(&other_account).is_none());
+        assert!(
+            backend
+                .fork_response_with_driver(&other_account, &dir, 1)
+                .is_err()
+        );
+        assert!(
+            backend
+                .rollback_response_with_driver(
+                    &other_account,
+                    &dir,
+                    &dir.join("missing-codex"),
+                    1
+                )
+                .is_err()
+        );
+        assert_eq!(fork_calls.load(Ordering::Acquire), 1);
+        assert_eq!(rollback_calls.load(Ordering::Acquire), 1);
+
+        // Different provider must NOT reuse the live driver.
+        let mut other_provider = source.clone();
+        other_provider.provider = ProviderKind::DeepSeek;
+        other_provider.account_id = Some("codex-work".into());
+        assert!(backend.matching_live_driver(&other_provider).is_none());
+        assert!(
+            backend
+                .fork_response_with_driver(&other_provider, &dir, 1)
+                .is_err()
+        );
+        assert!(
+            backend
+                .rollback_response_with_driver(
+                    &other_provider,
+                    &dir,
+                    &dir.join("missing-dsh"),
+                    1
+                )
+                .is_err()
+        );
+        assert_eq!(fork_calls.load(Ordering::Acquire), 1);
+        assert_eq!(rollback_calls.load(Ordering::Acquire), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

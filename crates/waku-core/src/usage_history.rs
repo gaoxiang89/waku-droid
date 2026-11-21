@@ -561,11 +561,11 @@ pub type ScanCache = HashMap<PathBuf, FileCacheEntry>;
 /// The transcript root scanned for one provider.
 fn provider_root(provider: UsageProvider) -> Option<PathBuf> {
     match provider {
-        UsageProvider::Claude => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        UsageProvider::Claude => match crate::command_env::env_var_os("CLAUDE_CONFIG_DIR") {
             Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("projects")),
             _ => dirs::home_dir().map(|home| home.join(".claude/projects")),
         },
-        UsageProvider::Codex => match std::env::var_os("CODEX_HOME") {
+        UsageProvider::Codex => match crate::command_env::env_var_os("CODEX_HOME") {
             Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("sessions")),
             _ => dirs::home_dir().map(|home| home.join(".codex/sessions")),
         },

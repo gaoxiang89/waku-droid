@@ -284,8 +284,8 @@ fn usage_error_detail(body: &str) -> Option<String> {
 /// the file — and `auth.json` only answers for a machine that has not started
 /// OpenCode since upgrading.
 fn opencode_go_api_key() -> Option<String> {
-    let stored = match std::env::var("OPENCODE_AUTH_CONTENT")
-        .ok()
+    let stored = match crate::command_env::env_var_os("OPENCODE_AUTH_CONTENT")
+        .and_then(|payload| payload.into_string().ok())
         .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
     {
         Some(auth) => opencode_go_api_key_from_auth(Some(&auth)),
@@ -298,8 +298,8 @@ fn opencode_go_api_key() -> Option<String> {
         }),
     };
     stored.or_else(|| {
-        std::env::var("OPENCODE_API_KEY")
-            .ok()
+        crate::command_env::env_var_os("OPENCODE_API_KEY")
+            .and_then(|key| key.into_string().ok())
             .map(|key| key.trim().to_owned())
             .filter(|key| !key.is_empty())
     })
@@ -307,7 +307,7 @@ fn opencode_go_api_key() -> Option<String> {
 
 /// `${XDG_DATA_HOME:-~/.local/share}/opencode`, on every platform.
 fn opencode_data_directory() -> Option<PathBuf> {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
+    let data_home = crate::command_env::env_var_os("XDG_DATA_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))?;
@@ -317,7 +317,7 @@ fn opencode_data_directory() -> Option<PathBuf> {
 /// OpenCode's database, which `OPENCODE_DB` can move. A relative override is
 /// resolved against the data directory, as OpenCode itself resolves it.
 fn opencode_database_path(data: &Path) -> PathBuf {
-    match std::env::var_os("OPENCODE_DB").filter(|path| !path.is_empty()) {
+    match crate::command_env::env_var_os("OPENCODE_DB").filter(|path| !path.is_empty()) {
         Some(path) => data.join(path),
         None => data.join("opencode.db"),
     }

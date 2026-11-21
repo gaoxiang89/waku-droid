@@ -2,8 +2,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 pub use waku_protocol::model::*;
+
+/// Upper bound on `<cli> --version` probes so a hung CLI binary cannot stall
+/// provider detection indefinitely.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// dk's launcher for clients that cannot call its `droid` shell alias or
 /// PowerShell function: it injects the current dk key and runs the real CLI.
@@ -98,9 +103,13 @@ pub fn discover_provider_models_in(
 /// token. Provider CLIs decorate this output differently, so clients receive a
 /// normalized value rather than subprocess output.
 pub fn probe_provider_version(binary: &Path) -> Option<String> {
+    probe_provider_version_with_timeout(binary, VERSION_PROBE_TIMEOUT)
+}
+
+fn probe_provider_version_with_timeout(binary: &Path, timeout: Duration) -> Option<String> {
     let mut command = crate::command_env::command(binary);
-    let command = command.arg("--version").stdin(std::process::Stdio::null());
-    let output = crate::command_env::output(command).ok()?;
+    let command = command.arg("--version");
+    let output = crate::command_env::output_with_timeout(command, timeout).ok()?;
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -129,5 +138,54 @@ mod tests {
 
         assert_eq!(probe.models.len(), 1);
         assert_eq!(probe.models[0].id, "cached-model");
+    }
+
+    #[test]
+    fn probe_provider_version_reads_output_and_bounds_hanging_binaries() {
+        let dir = std::env::temp_dir().join(format!("waku-version-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(windows)]
+        let (ok_bin, ok_script, hang_bin, hang_script) = (
+            dir.join("ok-cli.cmd"),
+            "@echo off\r\necho faux-cli 2.4.1\r\n",
+            dir.join("hang-cli.cmd"),
+            "@echo off\r\nping -n 30 127.0.0.1 >nul\r\n",
+        );
+        #[cfg(not(windows))]
+        let (ok_bin, ok_script, hang_bin, hang_script) = (
+            dir.join("ok-cli"),
+            "#!/bin/sh\nprintf 'faux-cli 2.4.1\\n'\n",
+            dir.join("hang-cli"),
+            "#!/bin/sh\nsleep 30\n",
+        );
+
+        std::fs::write(&ok_bin, ok_script).unwrap();
+        std::fs::write(&hang_bin, hang_script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [&ok_bin, &hang_bin] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        assert_eq!(
+            probe_provider_version_with_timeout(&ok_bin, Duration::from_secs(10)).as_deref(),
+            Some("2.4.1")
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            probe_provider_version_with_timeout(&hang_bin, Duration::from_millis(250)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "hanging version probe did not time out promptly: {:?}",
+            started.elapsed()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

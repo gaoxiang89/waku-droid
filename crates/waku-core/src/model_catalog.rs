@@ -1,11 +1,16 @@
 //! Provider model and agent-preset discovery.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -19,6 +24,7 @@ use crate::model::{ProviderAgentPreset, ProviderKind, ProviderModel, ProviderMod
 use waku_protocol::model_catalog::normalize_cursor_reasoning_effort;
 
 const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The probe answers only after the agent has finished loading its extensions,
 /// resources and model catalog, which can outlast a live request's budget.
@@ -236,15 +242,56 @@ fn write_cached_models(provider: ProviderKind, models: &[ProviderModel]) {
     let _ = write_models_file(&model_cache_path(provider), models);
 }
 
+static MODEL_CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_cache_path_with(path: &Path, next_seq: &AtomicU64) -> PathBuf {
+    let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
+}
+
+fn create_unique_temp_cache_file_with(
+    path: &Path,
+    next_seq: &AtomicU64,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for _ in 0..64 {
+        let temporary = unique_temp_cache_path_with(path, next_seq);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary model cache file",
+    ))
+}
+
 fn write_models_file(path: &Path, models: &[ProviderModel]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Write-then-rename so a crash mid-write can't leave a torn file for the
-    // next launch to trip over.
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec(models)?)?;
-    std::fs::rename(temporary, path)
+    let payload = serde_json::to_vec(models)?;
+    // Write-then-rename with a unique temporary file so concurrent writers
+    // never collide and a crash mid-write can't leave a torn file for the next
+    // launch to trip over.
+    let (temporary, mut file) = create_unique_temp_cache_file_with(path, &MODEL_CACHE_TMP_SEQ)?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(&payload)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Claude Code's sessionless SDK initialization response carries the exact
@@ -364,7 +411,7 @@ fn discover_cursor_models(binary: &Path) -> Vec<ProviderModel> {
     }
     let mut command = crate::command_env::command(binary);
     let command = command.arg("models");
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT) else {
         return Vec::new();
     };
     let combined = format!(
@@ -854,7 +901,7 @@ fn parse_deepseek_model_catalog(catalog: &Value) -> Vec<ProviderModel> {
 fn discover_fx_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["models", "--json"]);
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT) else {
         return Vec::new();
     };
     let Ok(catalog) = serde_json::from_slice::<Value>(&output.stdout) else {
@@ -866,7 +913,7 @@ fn discover_fx_models(binary: &Path) -> Vec<ProviderModel> {
 fn discover_fx_default_model(binary: &Path) -> Option<String> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["status", "--json"]);
-    let output = crate::command_env::output(command).ok()?;
+    let output = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT).ok()?;
     let status = serde_json::from_slice::<Value>(&output.stdout).ok()?;
     status
         .get("model")
@@ -902,7 +949,7 @@ fn parse_fx_models(catalog: &Value, default_model: Option<&str>) -> Vec<Provider
 fn discover_grok_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.arg("models");
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT) else {
         return Vec::new();
     };
     let combined = format!(
@@ -956,6 +1003,13 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
 /// reasoning levels. Unlike ACP `session/new`, it does not persist a probe
 /// session or sync a "New Session" in our temporary directory to Factory web.
 fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
+    discover_droid_models_with_timeout(binary, CLI_DISCOVERY_TIMEOUT)
+}
+
+fn discover_droid_models_with_timeout(
+    binary: &Path,
+    timeout: Duration,
+) -> Result<Vec<ProviderModel>, String> {
     let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
     let mut command = crate::command_env::command(binary);
     command
@@ -963,7 +1017,8 @@ fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
         .current_dir(cwd)
         .env("DROID_DISABLE_AUTO_UPDATE", "true")
         .env("FACTORY_DROID_AUTO_UPDATE_ENABLED", "false");
-    let output = crate::command_env::output(&mut command).map_err(|error| error.to_string())?;
+    let output = crate::command_env::output_with_timeout(&mut command, timeout)
+        .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(format!(
             "Droid model discovery exited with {}",
@@ -1291,7 +1346,7 @@ fn acp_select_choices(option: &SessionConfigOption) -> Vec<(String, String)> {
 fn discover_kimi_models(binary: &Path) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["provider", "list", "--json"]);
-    let Ok(output) = crate::command_env::output(command) else {
+    let Ok(output) = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT) else {
         return Vec::new();
     };
     let Ok(catalog) = serde_json::from_slice::<Value>(&output.stdout) else {
@@ -1303,7 +1358,7 @@ fn discover_kimi_models(binary: &Path) -> Vec<ProviderModel> {
 fn discover_kimi_default_model(binary: &Path) -> Option<String> {
     let mut command = crate::command_env::command(binary);
     let command = command.args(["provider", "list"]);
-    let output = crate::command_env::output(command).ok()?;
+    let output = crate::command_env::output_with_timeout(command, CLI_DISCOVERY_TIMEOUT).ok()?;
     parse_kimi_default_model(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -1415,36 +1470,80 @@ impl PiDialect {
     }
 }
 
+/// Ensures a short-lived RPC probe child (and its process group / Windows job)
+/// is always terminated and reaped on every exit path, including early errors.
+struct ProbeChildGuard {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+impl ProbeChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+        Self {
+            child,
+            #[cfg(windows)]
+            job,
+        }
+    }
+}
+
+impl Drop for ProbeChildGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id())
+            && pid > 0
+        {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        #[cfg(windows)]
+        let _ = self.job.take();
+        let _ = self.child.wait();
+    }
+}
+
 fn discover_pi_models(binary: &Path, dialect: PiDialect) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     if dialect == PiDialect::Pi {
         // Oh My Pi has no such opt-out; it gates its update check on a setting.
         command.env("PI_SKIP_VERSION_CHECK", "1");
     }
+    #[cfg(unix)]
+    command.process_group(0);
     let command = command
         .args(dialect.probe_args())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = crate::command_env::spawn(command) else {
+    let Ok(child) = crate::command_env::spawn(command) else {
         return Vec::new();
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
+    let mut child_guard = ProbeChildGuard::new(child);
+    let Some(mut stdin) = child_guard.child.stdin.take() else {
         return Vec::new();
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+    let Some(stdout) = child_guard.child.stdout.take() else {
         return Vec::new();
     };
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                let _ = tx.send(value);
+    if std::thread::Builder::new()
+        .name("waku-pi-model-discovery".into())
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    let _ = tx.send(value);
+                }
             }
-        }
-    });
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
 
     let models_request = json!({"id": "waku-models", "type": "get_available_models"});
     let result = if write_json_line(&mut stdin, &models_request).is_ok()
@@ -1463,8 +1562,8 @@ fn discover_pi_models(binary: &Path, dialect: PiDialect) -> Vec<ProviderModel> {
     } else {
         Vec::new()
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(stdin);
+    drop(child_guard);
     result
 }
 
@@ -1578,30 +1677,37 @@ fn pi_reasoning_options(dialect: PiDialect, model: &Value) -> Vec<ProviderModelO
 fn discover_codex_models(binary: &Path, config_dir: Option<&Path>) -> Vec<ProviderModel> {
     let mut command = crate::command_env::command(binary);
     crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
+    #[cfg(unix)]
+    command.process_group(0);
     let command = command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = crate::command_env::spawn(command) else {
+    let Ok(child) = crate::command_env::spawn(command) else {
         return Vec::new();
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
+    let mut child_guard = ProbeChildGuard::new(child);
+    let Some(mut stdin) = child_guard.child.stdin.take() else {
         return Vec::new();
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+    let Some(stdout) = child_guard.child.stdout.take() else {
         return Vec::new();
     };
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                let _ = tx.send(value);
+    if std::thread::Builder::new()
+        .name("waku-codex-model-discovery".into())
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    let _ = tx.send(value);
+                }
             }
-        }
-    });
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
 
     let initialize = json!({
         "method": "initialize",
@@ -1621,7 +1727,6 @@ fn discover_codex_models(binary: &Path, config_dir: Option<&Path>) -> Vec<Provid
         || recv_rpc_response(&rx, 0, CODEX_RPC_TIMEOUT).is_none()
         || write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}})).is_err()
     {
-        let _ = child.kill();
         return Vec::new();
     }
 
@@ -1651,8 +1756,8 @@ fn discover_codex_models(binary: &Path, config_dir: Option<&Path>) -> Vec<Provid
             break;
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(stdin);
+    drop(child_guard);
     models
 }
 
@@ -2334,6 +2439,124 @@ Authentication:
         assert_eq!(read_models_file(&path), None);
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn model_cache_writes_use_unique_temp_files_and_clean_up_on_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "waku-model-cache-atomic-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Two sequential paths have distinct `.tmp.{pid}.{seq}` names, and
+        // `create_new(true)` skips any pre-existing colliding file untouched.
+        let path = directory.join("codex.json");
+        let seq = AtomicU64::new(0);
+        let colliding = directory.join(format!("codex.json.tmp.{}.0", std::process::id()));
+        std::fs::write(&colliding, b"pre-existing").unwrap();
+        let (created_path, created_file) = create_unique_temp_cache_file_with(&path, &seq).unwrap();
+        drop(created_file);
+        assert_eq!(
+            created_path,
+            directory.join(format!("codex.json.tmp.{}.1", std::process::id()))
+        );
+        assert_eq!(std::fs::read(&colliding).unwrap(), b"pre-existing");
+        std::fs::remove_file(&created_path).unwrap();
+        std::fs::remove_file(&colliding).unwrap();
+
+        let first_tmp = unique_temp_cache_path_with(&path, &seq);
+        let second_tmp = unique_temp_cache_path_with(&path, &seq);
+        assert_ne!(first_tmp, second_tmp);
+
+        // If a destination cannot be replaced (it is a directory), the newly
+        // created temp file must be cleaned up instead of leaked.
+        let dir_target = directory.join("cannot-replace.json");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        let sample = vec![ProviderModel::new("m1", "Model 1")];
+        assert!(write_models_file(&dir_target, &sample).is_err());
+        let leftover_temps: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            })
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "failed cache write leaked temporary files: {leftover_temps:?}"
+        );
+
+        // Concurrent writers must never leave torn JSON or leftover `.tmp.*`
+        // files behind.
+        let target = directory.join("concurrent.json");
+        let workers: Vec<_> = (0..8)
+            .map(|idx| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let models = vec![ProviderModel::new(
+                        format!("model-{idx}"),
+                        format!("Model {idx}"),
+                    )];
+                    for _ in 0..5 {
+                        let _ = write_models_file(&target, &models);
+                        if let Some(read_back) = read_models_file(&target) {
+                            assert_eq!(read_back.len(), 1);
+                            assert!(read_back[0].id.starts_with("model-"));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // Final deterministic write verifies valid readable output and zero
+        // leaked temp files across all concurrent writers.
+        write_models_file(&target, &sample).unwrap();
+        assert_eq!(read_models_file(&target), Some(sample));
+        let leftover_temps: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "concurrent cache writes leaked temporary files: {leftover_temps:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn droid_discovery_times_out_hanging_binaries() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-droid-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(windows)]
+        let (name, script) = ("droid.cmd", "@echo off\r\nping -n 30 127.0.0.1 >nul\r\n");
+        #[cfg(not(windows))]
+        let (name, script) = ("droid", "#!/bin/sh\nsleep 30\n");
+        let binary = directory.join(name);
+        std::fs::write(&binary, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = Instant::now();
+        let error = discover_droid_models_with_timeout(&binary, Duration::from_millis(250))
+            .expect_err("hanging droid binary must time out");
+        assert!(
+            !error.is_empty() && started.elapsed() < Duration::from_secs(5),
+            "timeout took {:?} with error {error:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

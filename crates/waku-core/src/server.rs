@@ -91,6 +91,16 @@ pub trait Backend: Send + Sync + 'static {
     fn has_live_work(&self) -> bool {
         false
     }
+
+    /// Whether `session_id` still owns a live runtime matching `runtime_id`.
+    ///
+    /// After a failed `Start` or `OpenTerminal`, the hub consults this before
+    /// restoring a displaced runtime so a failure after the backend already
+    /// dropped the previous driver cannot leave the hub pointing at a dead
+    /// runtime and its stale replay journal.
+    fn is_runtime_live(&self, _session_id: Uuid, _runtime_id: Uuid) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -962,6 +972,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::StopBackgroundWork { .. }
             | Command::Respond { .. }
             | Command::RespondUserInput { .. }
+            | Command::Goal { .. }
             | Command::RunComputerTool { .. }
             | Command::RejectComputerTool { .. }
             | Command::ApplyOptions { .. }
@@ -1019,6 +1030,10 @@ fn run_runtime_mailbox(
             if starts_runtime {
                 if matches!(&handled.outcome, ResponseOutcome::Ok { .. }) {
                     active_runtime_id = Some(runtime_id);
+                } else if let Some(existing) = active_runtime_id
+                    && !backend.is_runtime_live(session_id, existing)
+                {
+                    active_runtime_id = None;
                 }
             } else if let ResponseOutcome::Ok {
                 payload:
@@ -1142,9 +1157,18 @@ fn handle_request(
             match start_arm {
                 Some(StartArm::Fresh) => hub.end_runtime(session_id, Some(runtime_id)),
                 Some(StartArm::Displaced(displaced)) => {
-                    hub.restore_displaced_runtime(session_id, displaced);
+                    if backend.is_runtime_live(session_id, displaced.runtime_id) {
+                        hub.restore_displaced_runtime(session_id, displaced);
+                    } else {
+                        hub.end_runtime(session_id, Some(runtime_id));
+                    }
                 }
-                _ => {}
+                Some(StartArm::AlreadyActive) => {
+                    if !backend.is_runtime_live(session_id, runtime_id) {
+                        hub.end_runtime(session_id, Some(runtime_id));
+                    }
+                }
+                None => {}
             }
         }
         (outcome, true)
@@ -1530,6 +1554,10 @@ mod tests {
                 }
                 _ => Ok(ResponsePayload::Ack),
             }
+        }
+
+        fn is_runtime_live(&self, session_id: Uuid, runtime_id: Uuid) -> bool {
+            self.runtimes.lock().get(&session_id) == Some(&runtime_id)
         }
     }
 
@@ -3478,6 +3506,7 @@ mod tests {
                     });
                 }
                 Command::Prompt { .. } => "prompt",
+                Command::Goal { .. } => "goal",
                 Command::CloseSession => "close",
                 _ => "other",
             };
@@ -3639,5 +3668,365 @@ mod tests {
             provider_cursor: None,
             config_dir: None,
         }
+    }
+
+    #[test]
+    fn goal_commands_serialize_through_the_runtime_mailbox() {
+        assert!(command_targets_runtime(&Command::Goal {
+            operation: crate::model::GoalOperation::Refresh,
+        }));
+
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let (handled, handled_rx) = unbounded();
+        let (release_start, release_start_rx) = bounded(1);
+        let dispatcher = RequestDispatcher::new(
+            Arc::new(RuntimeOrderingBackend {
+                blocked_session_id: session_id,
+                handled,
+                release_start: release_start_rx,
+            }),
+            Arc::new(Hub::default()),
+        );
+        let (start_tx, start_rx) = unbounded();
+        let (goal_tx, goal_rx) = unbounded();
+
+        let start_id = Uuid::new_v4();
+        dispatcher.dispatch(
+            Request {
+                request_id: start_id,
+                session_id,
+                runtime_id,
+                command: Command::Start {
+                    options: test_start_options(),
+                },
+            },
+            start_tx,
+            0,
+        );
+        assert_eq!(
+            handled_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (session_id, "start")
+        );
+
+        let goal_id = Uuid::new_v4();
+        dispatcher.dispatch(
+            Request {
+                request_id: goal_id,
+                session_id,
+                runtime_id,
+                command: Command::Goal {
+                    operation: crate::model::GoalOperation::Refresh,
+                },
+            },
+            goal_tx,
+            0,
+        );
+        // Goal must wait in the session mailbox rather than racing Start.
+        assert!(handled_rx.recv_timeout(Duration::from_millis(80)).is_err());
+
+        release_start.send(()).unwrap();
+        assert!(matches!(
+            start_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Response { request_id, .. } if request_id == start_id
+        ));
+        assert_eq!(
+            handled_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (session_id, "goal")
+        );
+        assert!(matches!(
+            goal_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::Response { request_id, .. } if request_id == goal_id
+        ));
+
+        let (close_tx, close_rx) = unbounded();
+        dispatcher.dispatch(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id,
+                command: Command::CloseSession,
+            },
+            close_tx,
+            0,
+        );
+        let _ = close_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    struct StubDriverControl;
+
+    impl crate::driver::DriverControl for StubDriverControl {
+        fn prompt(&self, _prompt: String) {}
+        fn cancel(&self) {}
+        fn respond(&self, _request_id: String, _option_id: String) {}
+        fn rollback(
+            &self,
+            _turns: usize,
+        ) -> anyhow::Result<Option<crate::model::ProviderResumeCursor>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn failed_start_after_dropping_previous_runtime_clears_hub_state_instead_of_restoring_dead_runtime()
+    {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+
+        let root = std::env::temp_dir().join(format!("waku-failed-start-hub-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let live_runtime_id = Uuid::new_v4();
+        let replacement_runtime_id = Uuid::new_v4();
+
+        backend.insert_test_session(
+            session_id,
+            live_runtime_id,
+            ProviderKind::Codex,
+            None,
+            crate::driver::DriverHandle::from_control(Arc::new(StubDriverControl)),
+        );
+        hub.begin_runtime(session_id, live_runtime_id);
+        hub.event_sink(session_id, live_runtime_id)
+            .send(WireDriverEvent::new("old-live", serde_json::Value::Null))
+            .unwrap();
+
+        // First: a Start that fails validation BEFORE dropping the live driver
+        // must keep the live runtime and its journal intact.
+        let mut invalid_provider = test_start_options();
+        invalid_provider.provider = "nonexistent-provider".into();
+        let (outgoing, _responses) = unbounded();
+        let outcome = handle_request(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: replacement_runtime_id,
+                command: Command::Start {
+                    options: invalid_provider,
+                },
+            },
+            outgoing,
+            0,
+            backend.clone(),
+            hub.clone(),
+        )
+        .outcome;
+        assert!(matches!(outcome, ResponseOutcome::Error { .. }));
+        assert!(backend.is_runtime_live(session_id, live_runtime_id));
+        {
+            let (sub_tx, sub_rx) = unbounded();
+            hub.subscribe(&[], Subscriber::new(sub_tx).0);
+            let ServerMessage::Event(replayed) =
+                sub_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("live runtime journal should remain intact after pre-drop failure");
+            };
+            assert_eq!(replayed.runtime_id, live_runtime_id);
+            assert_eq!(replayed.event.kind, "old-live");
+        }
+
+        // Second: a Start that drops the live driver and then fails inside
+        // `driver::start_local` (missing binary) must NOT restore the dead
+        // runtime or leave Hub pointing at either runtime.
+        let mut failing_start = test_start_options();
+        failing_start.binary = root.join("definitely-missing-codex-binary");
+        failing_start.cwd = root.clone();
+        let (outgoing, _responses) = unbounded();
+        let outcome = handle_request(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: replacement_runtime_id,
+                command: Command::Start {
+                    options: failing_start,
+                },
+            },
+            outgoing,
+            0,
+            backend.clone(),
+            hub.clone(),
+        )
+        .outcome;
+        assert!(matches!(outcome, ResponseOutcome::Error { .. }));
+        assert!(!backend.is_runtime_live(session_id, live_runtime_id));
+        assert!(!backend.is_runtime_live(session_id, replacement_runtime_id));
+
+        let (sub_tx, sub_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(sub_tx).0);
+        // No stale replay from either the dropped runtime or the failed start.
+        assert!(sub_rx.try_recv().is_err());
+        hub.event_sink(session_id, live_runtime_id)
+            .send(WireDriverEvent::new("ghost-old", serde_json::Value::Null))
+            .unwrap();
+        hub.event_sink(session_id, replacement_runtime_id)
+            .send(WireDriverEvent::new("ghost-new", serde_json::Value::Null))
+            .unwrap();
+        assert!(sub_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_start_with_same_runtime_id_after_dropping_driver_disarms_hub() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+
+        let root = std::env::temp_dir().join(format!("waku-failed-same-id-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+
+        backend.insert_test_session(
+            session_id,
+            runtime_id,
+            ProviderKind::Codex,
+            None,
+            crate::driver::DriverHandle::from_control(Arc::new(StubDriverControl)),
+        );
+        hub.begin_runtime(session_id, runtime_id);
+        hub.event_sink(session_id, runtime_id)
+            .send(WireDriverEvent::new("before-drop", serde_json::Value::Null))
+            .unwrap();
+
+        let mut failing_start = test_start_options();
+        failing_start.binary = root.join("missing-codex-binary");
+        failing_start.cwd = root.clone();
+        let (outgoing, _responses) = unbounded();
+        let outcome = handle_request(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id,
+                command: Command::Start {
+                    options: failing_start,
+                },
+            },
+            outgoing,
+            0,
+            backend.clone(),
+            hub.clone(),
+        )
+        .outcome;
+        assert!(matches!(outcome, ResponseOutcome::Error { .. }));
+        assert!(!backend.is_runtime_live(session_id, runtime_id));
+
+        let (sub_tx, sub_rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(sub_tx).0);
+        assert!(sub_rx.try_recv().is_err());
+        hub.event_sink(session_id, runtime_id)
+            .send(WireDriverEvent::new("ghost", serde_json::Value::Null))
+            .unwrap();
+        assert!(sub_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_mailbox_retires_when_failed_start_drops_active_runtime() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+
+        let root = std::env::temp_dir().join(format!("waku-mailbox-retire-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = Arc::new(
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+        );
+        let hub = Arc::new(Hub::default());
+        let dispatcher = RequestDispatcher::new(backend.clone(), hub.clone());
+        let session_id = Uuid::new_v4();
+        let live_runtime_id = Uuid::new_v4();
+        let replacement_runtime_id = Uuid::new_v4();
+
+        backend.insert_test_session(
+            session_id,
+            live_runtime_id,
+            ProviderKind::Codex,
+            None,
+            crate::driver::DriverHandle::from_control(Arc::new(StubDriverControl)),
+        );
+        // Prime the mailbox so its local `active_runtime_id` becomes `Some(live_runtime_id)`.
+        let (tx, rx) = unbounded();
+        dispatcher.dispatch(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: Uuid::nil(),
+                command: Command::AttachSession,
+            },
+            tx.clone(),
+            0,
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ServerMessage::Response {
+                outcome: ResponseOutcome::Ok {
+                    payload: ResponsePayload::SessionRuntime {
+                        runtime_id: Some(attached),
+                        ..
+                    }
+                },
+                ..
+            } if attached == live_runtime_id
+        ));
+        assert!(dispatcher.runtime_mailboxes.lock().contains_key(&session_id));
+
+        // Now fail a replacement Start after dropping the previous driver; the
+        // mailbox must clear its active runtime id and retire cleanly.
+        let mut failing_start = test_start_options();
+        failing_start.binary = root.join("missing-codex-binary");
+        failing_start.cwd = root.clone();
+        dispatcher.dispatch(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id: replacement_runtime_id,
+                command: Command::Start {
+                    options: failing_start,
+                },
+            },
+            tx,
+            0,
+        );
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ServerMessage::Response {
+                outcome: ResponseOutcome::Error { .. },
+                ..
+            }
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dispatcher.runtime_mailboxes.lock().contains_key(&session_id) {
+            assert!(
+                Instant::now() < deadline,
+                "runtime mailbox did not retire after failed Start dropped the active runtime"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

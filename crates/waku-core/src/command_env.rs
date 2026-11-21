@@ -128,6 +128,96 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     spawn(command)?.wait_with_output()
 }
 
+/// Spawn `command` through [`spawn`] and collect its output, terminating and
+/// reaping the child (and its process group / Windows job) if it does not exit
+/// within `timeout`.
+///
+/// Stdout and stderr are drained concurrently on reader threads so a verbose
+/// child cannot deadlock on full pipe buffers while waiting for exit.
+pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = spawn(command)?;
+    let mut job = ChildJobGuard::adopt(&child);
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = match std::thread::Builder::new()
+        .name("waku-cmd-stdout".into())
+        .spawn(move || read_pipe_to_end(stdout_pipe))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            terminate_child_with_job(&mut child, &mut job);
+            return Err(error);
+        }
+    };
+    let stderr_reader = match std::thread::Builder::new()
+        .name("waku-cmd-stderr".into())
+        .spawn(move || read_pipe_to_end(stderr_pipe))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            terminate_child_with_job(&mut child, &mut job);
+            let _ = stdout_reader.join();
+            return Err(error);
+        }
+    };
+
+    let status = wait_for_child_with_job(&mut child, timeout, &mut job)?;
+    // Tear down any stray descendants in the Windows job after the direct
+    // child has exited so pipe readers cannot hang indefinitely.
+    job.terminate();
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_pipe_to_end<R: io::Read>(pipe: Option<R>) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = io::Read::read_to_end(&mut pipe, &mut buffer);
+    }
+    buffer
+}
+
+struct ChildJobGuard {
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+impl ChildJobGuard {
+    fn adopt(child: &Child) -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                job: crate::process_tree::KillOnCloseJob::adopt(child.id()).ok(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Self {}
+        }
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(windows)]
+        {
+            let _ = self.job.take();
+        }
+    }
+}
+
 /// Normalize a Waku-owned provider thread before a dependency spawns the child
 /// internally. The ACP SDK owns its `async_process::Command`, so its dedicated
 /// connection thread uses this once at startup instead of [`spawn`].
@@ -514,14 +604,51 @@ pub(crate) fn shell_environment() -> ShellEnvironment {
         .unwrap_or_default()
 }
 
+/// Look up an environment variable, preferring the current process environment
+/// (so tests and explicit launch overrides win) and falling back to the cached
+/// login-shell environment when it has already been populated.
+///
+/// Never spawns a shell: if [`refresh_from_default_shell`] has not run yet,
+/// only `std::env::var_os` is consulted.
+pub fn env_var_os(key: &str) -> Option<OsString> {
+    if let Some(value) = std::env::var_os(key) {
+        return Some(value);
+    }
+    cached_login_shell_variable(OsStr::new(key))
+}
+
+fn env_var_name_matches(candidate: &OsStr, target: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        candidate
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(target.as_encoded_bytes())
+    }
+    #[cfg(not(windows))]
+    {
+        candidate == target
+    }
+}
+
+fn lookup_env_var_os(
+    key: &OsStr,
+    process_value: Option<OsString>,
+    shell_env: Option<&[(OsString, OsString)]>,
+) -> Option<OsString> {
+    process_value.or_else(|| {
+        shell_env?
+            .iter()
+            .find(|(candidate, _)| env_var_name_matches(candidate, key))
+            .map(|(_, value)| value.clone())
+    })
+}
+
 fn cached_login_shell_variable(name: &OsStr) -> Option<OsString> {
-    login_shell_environment()
+    let lock = LOGIN_SHELL_ENVIRONMENT.get()?;
+    let guard = lock
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()?
-        .iter()
-        .find(|(candidate, _)| candidate == name)
-        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    lookup_env_var_os(name, None, guard.as_deref())
 }
 
 fn search_paths_from(
@@ -818,9 +945,29 @@ fn parse_shell_environment(bytes: &[u8]) -> Option<ShellEnvironment> {
     (!environment.is_empty()).then_some(environment)
 }
 
+fn is_waku_env_variable(name: &OsStr) -> bool {
+    name.as_encoded_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"WAKU_"))
+}
+
 fn is_shell_capture_variable(name: &OsStr) -> bool {
+    if is_waku_env_variable(name) {
+        // The Windows PowerShell capture script emits these two internal
+        // sentinels for `merge_windows_environment` to consume and remove.
+        #[cfg(windows)]
+        if name
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b"WAKU_USER_PATH")
+            || name
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(b"WAKU_MACHINE_PATH")
+        {
+            return false;
+        }
+        return true;
+    }
     [
-        "WAKU_SHELL_ENV_CAPTURE_FILE",
         "DISABLE_AUTO_UPDATE",
         "ZSH_TMUX_AUTOSTARTED",
         "ZSH_TMUX_AUTOSTART",
@@ -848,6 +995,15 @@ fn os_string_from_bytes(bytes: &[u8]) -> Option<OsString> {
 }
 
 fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+    let mut job = ChildJobGuard::adopt(child);
+    wait_for_child_with_job(child, timeout, &mut job)
+}
+
+fn wait_for_child_with_job(
+    child: &mut Child,
+    timeout: Duration,
+    job: &mut ChildJobGuard,
+) -> io::Result<ExitStatus> {
     let started_at = Instant::now();
     loop {
         match child.try_wait() {
@@ -856,26 +1012,31 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                terminate_shell_capture(child);
+                terminate_child_with_job(child, job);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("child process did not exit within {timeout:?}"),
                 ));
             }
             Err(error) => {
-                terminate_shell_capture(child);
+                terminate_child_with_job(child, job);
                 return Err(error);
             }
         }
     }
 }
 
-fn terminate_shell_capture(child: &mut Child) {
+fn terminate_child_with_job(child: &mut Child, job: &mut ChildJobGuard) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    if let Ok(pid) = i32::try_from(child.id())
+        && pid > 0
+    {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
     }
     let _ = child.kill();
+    job.terminate();
     let _ = child.wait();
 }
 
@@ -1349,7 +1510,7 @@ mod tests {
         let shell = directory.join("fake-shell");
         fs::write(
             &shell,
-            "#!/bin/sh\n/usr/bin/printf 'PATH=/Users/example/.fnm/current/bin:/usr/bin\\000WAKU_TEST_TOKEN=from-shell\\000' > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"\n",
+            "#!/bin/sh\n/usr/bin/printf 'PATH=/Users/example/.fnm/current/bin:/usr/bin\\000TEST_SHELL_TOKEN=from-shell\\000WAKU_DAEMON_TOKEN=secret\\000WAKU_TEST_TOKEN=stripped\\000' > \"$WAKU_SHELL_ENV_CAPTURE_FILE\"\n",
         )
         .expect("write shell fixture");
         let mut permissions = fs::metadata(&shell)
@@ -1370,13 +1531,160 @@ mod tests {
                     OsString::from("/Users/example/.fnm/current/bin:/usr/bin"),
                 ),
                 (
-                    OsString::from("WAKU_TEST_TOKEN"),
+                    OsString::from("TEST_SHELL_TOKEN"),
                     OsString::from("from-shell"),
                 ),
             ]
         );
         let _ = fs::remove_file(shell);
         let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn shell_capture_strips_waku_prefixed_variables() {
+        let parsed = parse_shell_environment(
+            b"PATH=/usr/bin\0OPENCODE_API_KEY=from-shell\0WAKU_DAEMON_TOKEN=secret\0WAKU_DAEMON_ADDRESS=127.0.0.1:9\0WAKU_DATA_DIR=/tmp/waku\0waku_lowercase=1\0WAKU_SHELL_ENV_CAPTURE_FILE=/tmp/cap\0DISABLE_AUTO_UPDATE=true\0",
+        )
+        .expect("parse filtered environment");
+
+        assert_eq!(
+            parsed,
+            vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+                (
+                    OsString::from("OPENCODE_API_KEY"),
+                    OsString::from("from-shell"),
+                ),
+            ]
+        );
+        assert!(is_shell_capture_variable(OsStr::new("WAKU_DAEMON_TOKEN")));
+        assert!(is_shell_capture_variable(OsStr::new("waku_custom")));
+        assert!(!is_shell_capture_variable(OsStr::new("OPENCODE_API_KEY")));
+        #[cfg(unix)]
+        {
+            assert!(is_shell_capture_variable(OsStr::new("WAKU_USER_PATH")));
+            assert!(is_shell_capture_variable(OsStr::new("WAKU_MACHINE_PATH")));
+        }
+        #[cfg(windows)]
+        {
+            assert!(!is_shell_capture_variable(OsStr::new("WAKU_USER_PATH")));
+            assert!(!is_shell_capture_variable(OsStr::new("WAKU_MACHINE_PATH")));
+        }
+    }
+
+    #[test]
+    fn env_var_os_prefers_process_environment_over_cached_shell_environment() {
+        let shell_env = vec![
+            (
+                OsString::from("OPENCODE_API_KEY"),
+                OsString::from("from-shell"),
+            ),
+            (
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                OsString::from("/shell/claude"),
+            ),
+        ];
+
+        assert_eq!(
+            lookup_env_var_os(
+                OsStr::new("OPENCODE_API_KEY"),
+                Some(OsString::from("from-process")),
+                Some(&shell_env),
+            ),
+            Some(OsString::from("from-process"))
+        );
+        // An explicit empty process value still shadows the shell cache.
+        assert_eq!(
+            lookup_env_var_os(
+                OsStr::new("OPENCODE_API_KEY"),
+                Some(OsString::new()),
+                Some(&shell_env),
+            ),
+            Some(OsString::new())
+        );
+        // When absent from the process environment, fall back to cached shell env.
+        assert_eq!(
+            lookup_env_var_os(OsStr::new("OPENCODE_API_KEY"), None, Some(&shell_env)),
+            Some(OsString::from("from-shell"))
+        );
+        assert_eq!(
+            lookup_env_var_os(OsStr::new("MISSING_KEY"), None, Some(&shell_env)),
+            None
+        );
+        assert_eq!(
+            lookup_env_var_os(OsStr::new("OPENCODE_API_KEY"), None, None),
+            None
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            lookup_env_var_os(OsStr::new("opencode_api_key"), None, Some(&shell_env)),
+            Some(OsString::from("from-shell"))
+        );
+
+        // `env_var_os` returns the inherited process env directly and returns
+        // None for an absent variable without spawning a login shell.
+        assert_eq!(env_var_os("PATH"), std::env::var_os("PATH"));
+        assert_eq!(env_var_os("WAKU_DEFINITELY_ABSENT_ENV_VAR_9F3C"), None);
+    }
+
+    #[test]
+    fn output_with_timeout_captures_streams_and_reaps_hanging_children() {
+        const CHILD_MODE: &str = "WAKU_OUTPUT_TIMEOUT_TEST_MODE";
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            match mode.to_str().expect("child mode") {
+                "emit" => {
+                    use std::io::Write as _;
+                    // Exceed typical 64 KiB OS pipe buffers on both streams to
+                    // verify concurrent draining does not deadlock.
+                    let payload = vec![b'x'; 96 * 1024];
+                    let _ = io::stdout().write_all(b"hello-out:");
+                    let _ = io::stdout().write_all(&payload);
+                    let _ = io::stderr().write_all(b"hello-err:");
+                    let _ = io::stderr().write_all(&payload);
+                    std::process::exit(0);
+                }
+                "hang" => loop {
+                    std::thread::park();
+                },
+                _ => panic!("unknown child mode"),
+            }
+        }
+
+        let test_bin = std::env::current_exe().expect("test executable");
+        let mut emit_cmd = plain_command(&test_bin);
+        emit_cmd
+            .args([
+                "--exact",
+                "command_env::tests::output_with_timeout_captures_streams_and_reaps_hanging_children",
+                "--nocapture",
+            ])
+            .env(CHILD_MODE, "emit");
+        let output =
+            output_with_timeout(&mut emit_cmd, Duration::from_secs(30)).expect("emit child");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("hello-out:"), "stdout missing marker");
+        assert!(stdout.len() >= 96 * 1024);
+        assert!(stderr.contains("hello-err:"), "stderr missing marker");
+        assert!(stderr.len() >= 96 * 1024);
+
+        let mut hang_cmd = plain_command(&test_bin);
+        hang_cmd
+            .args([
+                "--exact",
+                "command_env::tests::output_with_timeout_captures_streams_and_reaps_hanging_children",
+            ])
+            .env(CHILD_MODE, "hang");
+        let started = Instant::now();
+        let error =
+            output_with_timeout(&mut hang_cmd, Duration::from_millis(200)).expect_err("timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout exceeded expected bound: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
