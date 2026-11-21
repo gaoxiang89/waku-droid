@@ -31,12 +31,48 @@ const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 /// User-Agent when the CLI's probed version is not known yet.
 const FALLBACK_CLI_VERSION: &str = "2.1.0";
 
-/// The absolute path keeps a shadowed `curl` on `PATH` out of the credential
-/// exchange. Windows 10 build 17063 and later ship the same tool in System32.
-#[cfg(not(windows))]
-const CURL_PATH: &str = "/usr/bin/curl";
-#[cfg(windows)]
-const CURL_PATH: &str = r"C:\Windows\System32\curl.exe";
+/// Prefer the OS-bundled `curl` so a shadowed binary on `PATH` stays out of
+/// the credential exchange, while falling back to `PATH` (for NixOS, Guix,
+/// non-FHS Linux, or non-standard Windows installs).
+fn resolve_curl_path() -> PathBuf {
+    #[cfg(windows)]
+    let system_candidates = {
+        let mut candidates = Vec::new();
+        for env_key in ["SystemRoot", "WINDIR"] {
+            if let Some(root) = std::env::var_os(env_key).filter(|value| !value.is_empty()) {
+                let candidate = PathBuf::from(root).join("System32").join("curl.exe");
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates
+    };
+    #[cfg(not(windows))]
+    let system_candidates = vec![PathBuf::from("/usr/bin/curl")];
+
+    resolve_curl_path_with(&system_candidates, crate::command_env::find_executable)
+}
+
+fn resolve_curl_path_with(
+    system_candidates: &[PathBuf],
+    find_in_path: impl FnOnce(&str) -> Option<PathBuf>,
+) -> PathBuf {
+    if let Some(existing) = system_candidates.iter().find(|path| path.is_file()) {
+        return existing.clone();
+    }
+    if let Some(found) = find_in_path("curl") {
+        return found;
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from("curl.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("curl")
+    }
+}
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
@@ -813,21 +849,25 @@ fn parse_credentials(payload: &str) -> anyhow::Result<OauthCredentials> {
 /// on stdin, never on argv, so bearer tokens cannot show up in the process
 /// table. Shared with the usage-history rate-table fetch.
 pub fn http_get(url: &str, headers: &[String]) -> anyhow::Result<(u16, String)> {
-    let mut child = crate::command_env::plain_command(CURL_PATH)
-        .args(["-sS", "--max-time", "15", "-D", "-", "-K", "-", url])
+    validate_http_url(url)?;
+    let config = format_curl_config(headers)?;
+    let curl = resolve_curl_path();
+    let mut command = crate::command_env::plain_command(&curl);
+    command
+        .args(["-sS", "--max-time", "15", "-D", "-", "-K", "-", "--", url])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context(tr!("usage_error.run_curl"))?;
+        .stderr(Stdio::piped());
+    let mut child =
+        crate::command_env::spawn(&mut command).context(tr!("usage_error.run_curl"))?;
     {
         let stdin = child
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow!(tr!("usage_error.curl_stdin_unavailable")))?;
-        for header in headers {
-            writeln!(stdin, "header = \"{header}\"").context(tr!("usage_error.configure_curl"))?;
-        }
+        stdin
+            .write_all(config.as_bytes())
+            .context(tr!("usage_error.configure_curl"))?;
     }
     let output = child
         .wait_with_output()
@@ -846,21 +886,116 @@ pub fn http_get(url: &str, headers: &[String]) -> anyhow::Result<(u16, String)> 
     split_status_and_body(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// `-D -` prefixes the body with the response headers; the status code is on
-/// the first line and the body follows the blank separator line.
+fn validate_http_url(url: &str) -> anyhow::Result<()> {
+    if url.is_empty() || contains_control_chars(url) {
+        return Err(anyhow!("HTTP request URL contains disallowed characters"));
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(anyhow!("HTTP request URL must use http or https"));
+    }
+    Ok(())
+}
+
+/// Format HTTP headers for curl `-K -`, rejecting control characters that could
+/// inject curl directives or smuggle headers, and escaping `\` and `"` per
+/// curl's quoted config syntax.
+fn format_curl_config(headers: &[String]) -> anyhow::Result<String> {
+    let mut config = String::new();
+    for header in headers {
+        if contains_control_chars(header) {
+            return Err(anyhow!(
+                "HTTP header contains disallowed control characters"
+            ));
+        }
+        config.push_str("header = \"");
+        for ch in header.chars() {
+            match ch {
+                '\\' => config.push_str("\\\\"),
+                '"' => config.push_str("\\\""),
+                _ => config.push(ch),
+            }
+        }
+        config.push_str("\"\n");
+    }
+    Ok(config)
+}
+
+fn contains_control_chars(value: &str) -> bool {
+    value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+}
+
+/// `-D -` prefixes the body with response headers. When curl traverses an HTTP
+/// CONNECT proxy (`HTTP/1.1 200 Connection established`) or receives `1xx`
+/// informational responses (`100 Continue`), multiple header blocks precede the
+/// final response; scan forward to the final block.
 fn split_status_and_body(raw: &str) -> anyhow::Result<(u16, String)> {
-    let status = raw
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!(tr!("usage_error.curl_no_status")))?;
-    let body = raw
-        .split_once("\r\n\r\n")
-        .or_else(|| raw.split_once("\n\n"))
-        .map(|(_, body)| body)
-        .unwrap_or_default();
-    Ok((status, body.to_owned()))
+    let mut rest = raw;
+    loop {
+        let status = parse_http_status_line(rest)
+            .ok_or_else(|| anyhow!(tr!("usage_error.curl_no_status")))?;
+        let (headers, body) = split_header_block(rest);
+        let Some(remainder) = body else {
+            return Ok((status, String::new()));
+        };
+        let can_continue = (100..200).contains(&status)
+            || (status == 200 && !has_non_empty_body_header(headers));
+        if can_continue
+            && parse_http_status_line(remainder).is_some()
+            && split_header_block(remainder).1.is_some()
+        {
+            rest = remainder;
+            continue;
+        }
+        return Ok((status, remainder.to_owned()));
+    }
+}
+
+fn parse_http_status_line(text: &str) -> Option<u16> {
+    let first_line = text.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    code.parse::<u16>().ok()
+}
+
+fn split_header_block(raw: &str) -> (&str, Option<&str>) {
+    let crlf = raw.find("\r\n\r\n").map(|index| (index, 4));
+    let lf = raw.find("\n\n").map(|index| (index, 2));
+    match (crlf, lf) {
+        (Some((a, a_len)), Some((b, b_len))) => {
+            if a <= b {
+                (&raw[..a], Some(&raw[a + a_len..]))
+            } else {
+                (&raw[..b], Some(&raw[b + b_len..]))
+            }
+        }
+        (Some((index, len)), None) | (None, Some((index, len))) => {
+            (&raw[..index], Some(&raw[index + len..]))
+        }
+        (None, None) => (raw, None),
+    }
+}
+
+fn has_non_empty_body_header(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return true;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<u64>().is_ok_and(|length| length > 0);
+        }
+        false
+    })
 }
 
 fn parse_plan_usage(body: &Value, credentials: &OauthCredentials) -> PlanUsage {
@@ -1122,6 +1257,127 @@ mod tests {
                 .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "{\"a\":1}");
+    }
+
+    #[test]
+    fn split_status_and_body_handles_proxy_connect_and_100_continue() {
+        let proxy_ok = concat!(
+            "HTTP/1.1 200 Connection established\r\n",
+            "Proxy-Agent: Squid/5.7\r\n",
+            "\r\n",
+            "HTTP/2 200 \r\n",
+            "content-type: application/json\r\n",
+            "\r\n",
+            "{\"usage\":true}"
+        );
+        let (status, body) = split_status_and_body(proxy_ok).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"usage\":true}");
+
+        let proxy_401 = concat!(
+            "HTTP/1.1 200 Connection established\r\n",
+            "\r\n",
+            "HTTP/1.1 401 Unauthorized\r\n",
+            "Content-Type: application/json\r\n",
+            "\r\n",
+            "{\"error\":\"expired\"}"
+        );
+        let (status, body) = split_status_and_body(proxy_401).unwrap();
+        assert_eq!(status, 401);
+        assert_eq!(body, "{\"error\":\"expired\"}");
+
+        let continue_then_ok = concat!(
+            "HTTP/1.1 100 Continue\r\n",
+            "\r\n",
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "\r\n",
+            "{\"ok\":1}"
+        );
+        let (status, body) = split_status_and_body(continue_then_ok).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "{\"ok\":1}");
+
+        let chained = concat!(
+            "HTTP/1.1 200 Connection established\r\n",
+            "\r\n",
+            "HTTP/1.1 100 Continue\r\n",
+            "\r\n",
+            "HTTP/2 429\r\n",
+            "\r\n",
+            "rate limited"
+        );
+        let (status, body) = split_status_and_body(chained).unwrap();
+        assert_eq!(status, 429);
+        assert_eq!(body, "rate limited");
+
+        // A real response with a non-zero Content-Length whose body starts with
+        // an HTTP-like line must not be misinterpreted as a second header block.
+        let body_looks_like_http = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Length: 31\r\n",
+            "\r\n",
+            "HTTP/1.1 500 Fake\r\n\r\nfake body!"
+        );
+        let (status, body) = split_status_and_body(body_looks_like_http).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, "HTTP/1.1 500 Fake\r\n\r\nfake body!");
+
+        assert!(split_status_and_body("not an http response").is_err());
+    }
+
+    #[test]
+    fn curl_config_escapes_quotes_and_backslashes_and_rejects_control_chars() {
+        let formatted = format_curl_config(&[
+            "Authorization: Bearer tok\"en\\val".to_owned(),
+            "Accept: application/json".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            formatted,
+            "header = \"Authorization: Bearer tok\\\"en\\\\val\"\nheader = \"Accept: application/json\"\n"
+        );
+
+        // Control characters that could inject new curl config lines or HTTP headers.
+        assert!(format_curl_config(&["Authorization: Bearer a\noutput = /tmp/x".to_owned()]).is_err());
+        assert!(format_curl_config(&["Authorization: Bearer a\r\nX-Injected: 1".to_owned()]).is_err());
+        assert!(format_curl_config(&["Authorization: Bearer a\0b".to_owned()]).is_err());
+        assert!(format_curl_config(&["X-Tab: a\tb".to_owned()]).is_err());
+        assert!(format_curl_config(&["X-Del: a\x7fb".to_owned()]).is_err());
+
+        assert!(validate_http_url("https://api.anthropic.com/api/oauth/usage").is_ok());
+        assert!(validate_http_url("https://example.com/\nfoo").is_err());
+        assert!(validate_http_url("file:///etc/passwd").is_err());
+        assert!(validate_http_url("--config").is_err());
+    }
+
+    #[test]
+    fn curl_path_resolution_prefers_existing_system_binary_and_falls_back_to_path() {
+        let dir = std::env::temp_dir().join(format!("waku-curl-res-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system_curl = dir.join("system-curl");
+        std::fs::write(&system_curl, b"").unwrap();
+        let path_curl = dir.join("path-curl");
+
+        let resolved = resolve_curl_path_with(
+            &[dir.join("missing"), system_curl.clone()],
+            |_| Some(path_curl.clone()),
+        );
+        assert_eq!(resolved, system_curl);
+
+        let fallback = resolve_curl_path_with(
+            &[dir.join("missing")],
+            |_| Some(path_curl.clone()),
+        );
+        assert_eq!(fallback, path_curl);
+
+        let bare = resolve_curl_path_with(&[dir.join("missing")], |_| None);
+        #[cfg(windows)]
+        assert_eq!(bare, PathBuf::from("curl.exe"));
+        #[cfg(not(windows))]
+        assert_eq!(bare, PathBuf::from("curl"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1180,15 +1180,23 @@ pub struct AgentSession {
     /// Startup loads only the columns the session list needs, so a session
     /// begins as a skeleton with empty `messages`, `transcript_blocks` and
     /// `turns`. Those are empty because nothing fetched them, not because the
-    /// session is empty — never persist a skeleton, and never conclude from one
-    /// that a session has no history.
-    #[serde(skip, default = "detail_loaded_default")]
+    /// session is empty — never overwrite persisted detail with a skeleton, and
+    /// never conclude from one that a session has no history.
+    ///
+    /// Serialized only when `false` so hydrated `session_details` JSON stays
+    /// unchanged and older payloads omitting the field still default to `true`,
+    /// while skeletons retain their unloaded marker across the daemon wire.
+    #[serde(default = "detail_loaded_default", skip_serializing_if = "is_detail_loaded")]
     pub detail_loaded: bool,
 }
 
 /// Anything deserialized from a `data` blob carries its full detail.
 fn detail_loaded_default() -> bool {
     true
+}
+
+fn is_detail_loaded(detail_loaded: &bool) -> bool {
+    *detail_loaded
 }
 
 impl AgentSession {
@@ -1346,7 +1354,7 @@ impl AgentSession {
             return false;
         }
         self.title = title.to_owned();
-        self.updated_at = unix_time();
+        self.updated_at = unix_time().max(self.updated_at.saturating_add(1));
         true
     }
 
@@ -5838,5 +5846,26 @@ mod tests {
             Project::from_path(PathBuf::from(r"/home/user/foo\bar")).name,
             r"foo\bar"
         );
+    }
+
+    #[test]
+    fn skeleton_detail_loaded_marker_survives_wire_roundtrip_and_defaults_true_when_omitted() {
+        let mut hydrated = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        hydrated.begin_turn("Hello");
+        let hydrated_json = serde_json::to_value(&hydrated).unwrap();
+        assert!(
+            hydrated_json.get("detail_loaded").is_none(),
+            "hydrated sessions omit detail_loaded for backward-compatible storage"
+        );
+        let restored_hydrated: AgentSession = serde_json::from_value(hydrated_json).unwrap();
+        assert!(restored_hydrated.detail_loaded);
+
+        let skeleton = hydrated.list_projection();
+        assert!(!skeleton.detail_loaded);
+        let skeleton_json = serde_json::to_value(&skeleton).unwrap();
+        assert_eq!(skeleton_json.get("detail_loaded"), Some(&serde_json::json!(false)));
+        let restored_skeleton: AgentSession = serde_json::from_value(skeleton_json).unwrap();
+        assert!(!restored_skeleton.detail_loaded);
+        assert!(restored_skeleton.has_started());
     }
 }

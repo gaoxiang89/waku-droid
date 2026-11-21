@@ -1326,18 +1326,33 @@ pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_vec_pretty(value).map_err(to_io_error)?;
-    let temporary = path.with_extension("json.tmp");
+    let temporary = unique_temp_path(path);
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&data)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let result = (|| -> io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
 }
 
 fn restore_task_state_skeletons(sessions: &mut [AgentSession]) {
@@ -1617,12 +1632,97 @@ mod tests {
         };
 
         assert!(
-            !sessions[0].has_started(),
-            "serde cannot carry the process-local skeleton marker"
+            !sessions[0].detail_loaded,
+            "the skeleton marker now survives wire serialization"
         );
+        assert!(sessions[0].has_started());
+        // Still force skeleton mode for compatibility with older daemons that
+        // omitted `detail_loaded`.
+        sessions[0].detail_loaded = true;
         restore_task_state_skeletons(&mut sessions);
         assert!(!sessions[0].detail_loaded);
         assert!(sessions[0].has_started());
+    }
+
+    #[test]
+    fn task_state_save_command_preserves_skeleton_marker_on_pin_archive_rename() {
+        let mut state = PersistedState::fresh(PathBuf::from("/local"));
+        let project_id = state.projects[0].id;
+        let session_id = state.sessions[0].id;
+        state.sessions[0].detail_loaded = false;
+
+        {
+            let skeleton = state.session_mut(session_id).unwrap();
+            assert!(skeleton.set_pinned(true));
+            assert!(skeleton.set_archived(true));
+            assert!(skeleton.set_title("Renamed skeleton"));
+        }
+
+        let (command, _) = task_state_save_command(
+            &state,
+            &HashSet::from([project_id]),
+            &HashSet::from([session_id]),
+            true,
+        )
+        .unwrap();
+        let wire = serde_json::to_vec(&command).unwrap();
+        let Command::SaveTaskState { sessions, .. } = serde_json::from_slice(&wire).unwrap() else {
+            panic!("expected SaveTaskState command");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].detail_loaded);
+        assert_eq!(sessions[0].title, "Renamed skeleton");
+        assert!(sessions[0].pinned);
+        assert!(sessions[0].archived);
+    }
+
+    #[test]
+    fn write_json_atomically_handles_concurrent_writes_without_temp_collisions() {
+        let dir = std::env::temp_dir().join(format!("waku-atomic-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("app.json");
+
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let path = target.clone();
+            handles.push(std::thread::spawn(move || {
+                for iter in 0..10 {
+                    let payload = serde_json::json!({ "worker": worker, "iter": iter });
+                    // On Windows, concurrent rename onto the same live destination
+                    // can transiently return PermissionDenied while another thread
+                    // swaps it; what must never happen is a shared `.json.tmp`
+                    // collision or a corrupt file left behind.
+                    for attempt in 0..10 {
+                        match write_json_atomically(&path, &payload) {
+                            Ok(()) => break,
+                            Err(error)
+                                if cfg!(windows)
+                                    && error.kind() == io::ErrorKind::PermissionDenied
+                                    && attempt < 9 =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("atomic write failed: {error}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        assert!(final_value.get("worker").is_some());
+        assert!(final_value.get("iter").is_some());
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

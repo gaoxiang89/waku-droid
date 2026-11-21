@@ -332,6 +332,9 @@ impl Backend for WakuBackend {
                 discover_models,
                 probe_version,
             } => {
+                let resolved_config_dir = self
+                    .validate_client_config_dir(provider, config_dir.as_deref())?
+                    .map(|(_, path)| path);
                 ensure_shell_environment();
                 let mut probe = match binary_override.as_deref() {
                     override_value if discover_models || probe_version => {
@@ -348,9 +351,6 @@ impl Backend for WakuBackend {
                     })
                     .flatten();
                 if discover_models {
-                    let resolved_config_dir = config_dir
-                        .as_deref()
-                        .and_then(crate::command_env::resolve_config_dir);
                     probe = crate::model::discover_provider_models_in(
                         probe,
                         resolved_config_dir.as_deref(),
@@ -364,9 +364,9 @@ impl Backend for WakuBackend {
                 config_dir,
                 cli_version,
             } => {
-                let resolved_config_dir = config_dir
-                    .as_deref()
-                    .and_then(crate::command_env::resolve_config_dir);
+                let resolved_config_dir = self
+                    .validate_client_config_dir(provider, config_dir.as_deref())?
+                    .map(|(_, path)| path);
                 let usage = match provider {
                     crate::model::ProviderKind::Claude => {
                         Some(crate::usage::fetch_claude_plan_usage(
@@ -463,90 +463,9 @@ impl Backend for WakuBackend {
                 projects,
                 live_session_ids: _,
                 sessions,
-            } => {
-                let active_runtimes = self
-                    .sessions
-                    .lock()
-                    .iter()
-                    .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
-                    .collect::<HashMap<_, _>>();
-                let mut state = self.task_state.lock();
-                let removed_project_ids = self.removed_project_ids.lock();
-                let removed_session_ids = self.removed_session_ids.lock();
-                for project in projects
-                    .into_iter()
-                    .filter(|project| !removed_project_ids.contains(&project.id))
-                {
-                    if let Some(existing) = state
-                        .projects
-                        .iter_mut()
-                        .find(|existing| existing.id == project.id)
-                    {
-                        *existing = project;
-                    } else {
-                        state.projects.push(project);
-                    }
-                }
-                let sessions = sessions
-                    .into_iter()
-                    .filter(|session| {
-                        !removed_session_ids.contains(&session.id)
-                            && !removed_project_ids.contains(&session.project_id)
-                    })
-                    .collect::<Vec<_>>();
-                drop(removed_session_ids);
-                let saved_ids = sessions
-                    .iter()
-                    .map(|session| session.id)
-                    .collect::<Vec<_>>();
-                for mut session in sessions {
-                    if let Some(existing) = state
-                        .sessions
-                        .iter_mut()
-                        .find(|existing| existing.id == session.id)
-                    {
-                        if session_projection_precedes(
-                            existing,
-                            &session,
-                            active_runtimes.get(&session.id).copied(),
-                        ) {
-                            merge_stale_session_metadata(existing, session);
-                        } else {
-                            preserve_daemon_checkpoints(existing, &mut session);
-                            *existing = session;
-                        }
-                    } else {
-                        state.sessions.push(session);
-                    }
-                }
-                let used_project_ids = state
-                    .sessions
-                    .iter()
-                    .map(|session| session.project_id)
-                    .collect::<std::collections::HashSet<_>>();
-                state.projects.retain(|project| {
-                    !project.is_projectless() || used_project_ids.contains(&project.id)
-                });
-                for session_id in &saved_ids {
-                    state.mark_session_dirty(*session_id);
-                }
-                self.task_store.save(&mut state)?;
-                let sessions = saved_ids
-                    .into_iter()
-                    .filter_map(|session_id| {
-                        state
-                            .sessions
-                            .iter()
-                            .find(|session| session.id == session_id)
-                            .cloned()
-                    })
-                    .collect();
-                // The save above can adopt full transcripts for every session
-                // the client touched. Keep only the recent window resident;
-                // the echoed clones above still carry the saved detail.
-                trim_resident_transcripts(&mut state, &active_runtimes.keys().copied().collect());
-                Ok(ResponsePayload::TaskStateSaved { sessions })
-            }
+            } => Ok(ResponsePayload::TaskStateSaved {
+                sessions: self.save_task_state(projects, sessions)?,
+            }),
             Command::RemoveSession => {
                 {
                     let mut state = self.task_state.lock();
@@ -867,6 +786,7 @@ impl Backend for WakuBackend {
                 })
             }
             Command::ForkProviderSession { request } => {
+                let request = self.validate_fork_provider_session_request(request)?;
                 Ok(ResponsePayload::ProviderSessionForked {
                     result: fork_provider_session(request)?,
                 })
@@ -883,9 +803,12 @@ impl Backend for WakuBackend {
                     checkpoint: self.capture_turn_checkpoint(cwd, session_id, turn_count)?,
                 },
             }),
-            Command::Workspace { operation } => Ok(ResponsePayload::Workspace {
-                result: crate::workspace::execute(operation)?,
-            }),
+            Command::Workspace { operation } => {
+                let operation = self.validate_workspace_operation(operation)?;
+                Ok(ResponsePayload::Workspace {
+                    result: crate::workspace::execute(operation)?,
+                })
+            }
             Command::OpenTerminal { cwd, cols, rows } => {
                 anyhow::ensure!(
                     (2..=4000).contains(&cols) && (1..=2000).contains(&rows),
@@ -995,28 +918,30 @@ impl Backend for WakuBackend {
                     !self.removed_session_ids.lock().contains(&session_id),
                     "the task has been deleted"
                 );
+                let provider = decode_enum(&options.provider)?;
+                let mode = decode_enum(&options.mode)?;
+                let config_dir = self
+                    .validate_client_config_dir(provider, options.config_dir.as_deref())?
+                    .map(|(_, path)| path);
+                let provider_cursor = options
+                    .provider_cursor
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .context("daemon received an invalid provider cursor")?;
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
-                let provider = decode_enum(&options.provider)?;
                 let options = DriverStartOptions {
                     binary: options.binary,
-                    config_dir: options
-                        .config_dir
-                        .as_deref()
-                        .and_then(crate::command_env::resolve_config_dir),
+                    config_dir,
                     cwd: options.cwd,
-                    mode: decode_enum(&options.mode)?,
+                    mode,
                     model: options.model,
                     reasoning_effort: options.reasoning_effort,
                     service_tier: options.service_tier,
                     context_window: options.context_window,
                     agent_preset: options.agent_preset,
                     computer_use_enabled: options.computer_use_enabled,
-                    provider_cursor: options
-                        .provider_cursor
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .context("daemon received an invalid provider cursor")?,
+                    provider_cursor,
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
                 let (event_sender, event_receiver) = driver::event_channel(wake);
@@ -1149,6 +1074,27 @@ fn session_projection_precedes(
         }
         (Some(_), None) if existing.status.is_busy() => true,
         _ => incoming.updated_at < existing.updated_at,
+    }
+}
+
+/// Merge list-level metadata from an unhydrated client skeleton (`detail_loaded == false`).
+///
+/// A skeleton's `messages`, `turns`, `transcript_blocks`, `workspace`,
+/// `provider_cursor`, `account_id`, and model options are empty placeholders,
+/// never authoritative transcript state. Only sidebar-level metadata may be
+/// updated so pinning, archiving, or renaming an unopened session cannot erase
+/// persisted `session_details` or `messages`.
+fn merge_skeleton_session_metadata(existing: &mut AgentSession, incoming: AgentSession) {
+    if incoming.updated_at >= existing.updated_at {
+        existing.title = incoming.title;
+        if incoming.auto_title.is_some() {
+            existing.auto_title = incoming.auto_title;
+        }
+        existing.pinned = incoming.pinned;
+        existing.archived = incoming.archived;
+        existing.project_id = incoming.project_id;
+        existing.updated_at = incoming.updated_at;
+        existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
 }
 
@@ -1821,6 +1767,278 @@ impl WakuBackend {
         settings
             .effective_config_dir(provider, account_id)
             .and_then(crate::command_env::resolve_config_dir)
+    }
+
+    fn save_task_state(
+        &self,
+        projects: Vec<Project>,
+        sessions: Vec<AgentSession>,
+    ) -> anyhow::Result<Vec<AgentSession>> {
+        let active_runtimes = self
+            .sessions
+            .lock()
+            .iter()
+            .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
+            .collect::<HashMap<_, _>>();
+        let mut state = self.task_state.lock();
+        let removed_project_ids = self.removed_project_ids.lock();
+        let removed_session_ids = self.removed_session_ids.lock();
+        for project in projects
+            .into_iter()
+            .filter(|project| !removed_project_ids.contains(&project.id))
+        {
+            if let Some(existing) = state
+                .projects
+                .iter_mut()
+                .find(|existing| existing.id == project.id)
+            {
+                *existing = project;
+            } else {
+                state.projects.push(project);
+            }
+        }
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| {
+                !removed_session_ids.contains(&session.id)
+                    && !removed_project_ids.contains(&session.project_id)
+            })
+            .collect::<Vec<_>>();
+        drop(removed_session_ids);
+        let mut saved_ids = Vec::with_capacity(sessions.len());
+        for mut session in sessions {
+            if let Some(existing) = state
+                .sessions
+                .iter_mut()
+                .find(|existing| existing.id == session.id)
+            {
+                if !session.detail_loaded {
+                    merge_skeleton_session_metadata(existing, session);
+                } else if session_projection_precedes(
+                    existing,
+                    &session,
+                    active_runtimes.get(&session.id).copied(),
+                ) {
+                    merge_stale_session_metadata(existing, session);
+                } else {
+                    preserve_daemon_checkpoints(existing, &mut session);
+                    *existing = session;
+                }
+                saved_ids.push(existing.id);
+            } else if session.detail_loaded {
+                saved_ids.push(session.id);
+                state.sessions.push(session);
+            }
+        }
+        let used_project_ids = state
+            .sessions
+            .iter()
+            .map(|session| session.project_id)
+            .collect::<std::collections::HashSet<_>>();
+        state.projects.retain(|project| {
+            !project.is_projectless() || used_project_ids.contains(&project.id)
+        });
+        for session_id in &saved_ids {
+            state.mark_session_dirty(*session_id);
+        }
+        self.task_store.save(&mut state)?;
+        let sessions = saved_ids
+            .into_iter()
+            .filter_map(|session_id| {
+                state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .cloned()
+            })
+            .collect();
+        // The save above can adopt full transcripts for every session
+        // the client touched. Keep only the recent window resident;
+        // the echoed clones above still carry the saved detail.
+        trim_resident_transcripts(&mut state, &active_runtimes.keys().copied().collect());
+        Ok(sessions)
+    }
+
+    /// Validate a client-supplied `config_dir` string against the daemon's
+    /// registered `provider_accounts` for `provider`.
+    ///
+    /// Allows `None` (or empty/whitespace, meaning the provider's default
+    /// account) and paths that match a registered account for the same
+    /// provider, returning the registered account's own raw spec and resolved
+    /// path so raw WS clients cannot steer host reads/processes to arbitrary
+    /// directories.
+    fn validate_client_config_dir(
+        &self,
+        provider: ProviderKind,
+        config_dir: Option<&str>,
+    ) -> anyhow::Result<Option<(String, PathBuf)>> {
+        let Some(raw) = config_dir.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let requested = crate::command_env::resolve_config_dir(raw)
+            .ok_or_else(|| anyhow!("invalid config_dir for {}", provider.display_name()))?;
+        self.validate_client_config_dir_resolved(provider, &requested)
+    }
+
+    fn validate_client_config_dir_path(
+        &self,
+        provider: ProviderKind,
+        config_dir: Option<&Path>,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let Some(path) = config_dir.filter(|path| !path.as_os_str().is_empty()) else {
+            return Ok(None);
+        };
+        let resolved = match path.to_str() {
+            Some(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                crate::command_env::resolve_config_dir(trimmed)
+                    .ok_or_else(|| anyhow!("invalid config_dir for {}", provider.display_name()))?
+            }
+            None => path.to_path_buf(),
+        };
+        Ok(self
+            .validate_client_config_dir_resolved(provider, &resolved)?
+            .map(|(_, path)| path))
+    }
+
+    fn validate_client_config_dir_resolved(
+        &self,
+        provider: ProviderKind,
+        requested: &Path,
+    ) -> anyhow::Result<Option<(String, PathBuf)>> {
+        let Some(requested_key) = normalize_config_dir_for_comparison(requested) else {
+            bail!(
+                "config_dir is not a valid path for {}",
+                provider.display_name()
+            );
+        };
+        let settings = self.settings.get();
+        for account in settings.accounts_for(provider) {
+            let trimmed = account.config_dir.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(registered_resolved) = crate::command_env::resolve_config_dir(trimmed) else {
+                continue;
+            };
+            let Some(registered_key) = normalize_config_dir_for_comparison(&registered_resolved)
+            else {
+                continue;
+            };
+            if requested_key == registered_key {
+                return Ok(Some((trimmed.to_owned(), registered_resolved)));
+            }
+        }
+        bail!(
+            "config_dir is not registered for {} in daemon settings",
+            provider.display_name()
+        )
+    }
+
+    fn validate_fork_provider_session_request(
+        &self,
+        mut request: ProviderSessionForkRequest,
+    ) -> anyhow::Result<ProviderSessionForkRequest> {
+        if let ProviderSessionForkRequest::Claude { config_dir, .. } = &mut request {
+            *config_dir =
+                self.validate_client_config_dir_path(ProviderKind::Claude, config_dir.as_deref())?;
+        }
+        Ok(request)
+    }
+
+    fn validate_workspace_operation(
+        &self,
+        mut operation: WorkspaceOperation,
+    ) -> anyhow::Result<WorkspaceOperation> {
+        match &mut operation {
+            WorkspaceOperation::DiscoverSlashCommands {
+                provider,
+                config_dir,
+                ..
+            } => {
+                *config_dir = self
+                    .validate_client_config_dir(*provider, config_dir.as_deref())?
+                    .map(|(raw, _)| raw);
+            }
+            WorkspaceOperation::GenerateCommitMessage { invocation, .. } => {
+                invocation.config_dir = self
+                    .validate_client_config_dir(
+                        invocation.provider,
+                        invocation.config_dir.as_deref(),
+                    )?
+                    .map(|(raw, _)| raw);
+            }
+            _ => {}
+        }
+        Ok(operation)
+    }
+}
+
+/// Normalize an absolute host path for security comparison without requiring
+/// the leaf directory to exist yet.
+///
+/// Existing paths use `fs::canonicalize` directly so symlinks and `..`
+/// components resolve against the real filesystem. Non-existent paths reject
+/// `..` components and canonicalize the deepest existing ancestor before
+/// appending the remaining normal segments.
+fn normalize_config_dir_for_comparison(path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path.as_os_str().to_string_lossy().contains('\0')
+    {
+        return None;
+    }
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(comparable_path(canonical));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut tail = Vec::new();
+    let mut cursor = path;
+    let base = loop {
+        match std::fs::canonicalize(cursor) {
+            Ok(canonical) => break canonical,
+            Err(_) => {
+                let name = cursor.file_name()?;
+                tail.push(name.to_os_string());
+                let parent = cursor.parent()?;
+                if parent == cursor {
+                    return None;
+                }
+                cursor = parent;
+            }
+        }
+    };
+    let mut normalized = base;
+    for part in tail.into_iter().rev() {
+        normalized.push(part);
+    }
+    Some(comparable_path(normalized))
+}
+
+fn comparable_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        let stripped = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            rest.to_owned()
+        } else {
+            text.into_owned()
+        };
+        PathBuf::from(stripped.to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path
     }
 }
 
@@ -2795,6 +3013,308 @@ mod tests {
         assert!(cursor.is_none());
         assert!(message_ids.is_empty());
         assert!(reset_native_session);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_task_state_skeleton_pin_archive_rename_preserves_messages_and_details() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-skeleton-{}", Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let db_path = dir.join("state.db");
+        let settings_path = dir.join("daemon-settings.json");
+        let store = StateStore::daemon(db_path.clone());
+        let mut state = PersistedState::fresh(workspace.clone());
+        let project = state.projects[0].clone();
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.provider = ProviderKind::Claude;
+            session.account_id = Some("claude-work".into());
+            session.reasoning_effort = Some("high".into());
+            session.workspace = crate::model::SessionWorkspace::Worktree {
+                path: dir.join("worktree"),
+                branch: "feat/keep".into(),
+            };
+            session.begin_turn("Important user prompt");
+            session.mark_active_turn_provider_started();
+            session.push_message(crate::model::MessageRole::Assistant, "Important answer");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(ProviderResumeCursor::Claude {
+                session_id: "claude-native-1".into(),
+                resume_at: Some("msg-1".into()),
+            });
+        }
+        store.save(&mut state).unwrap();
+
+        // Case 1: Daemon restarted (holds skeleton in memory) and receives a
+        // wire-serialized mutated skeleton (pin + archive + rename).
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(settings_path.clone()).unwrap(),
+            StateStore::daemon(db_path.clone()),
+        )
+        .unwrap();
+        let mut skeleton = {
+            let loaded = backend.task_state.lock();
+            assert!(!loaded.sessions[0].detail_loaded);
+            loaded.sessions[0].list_projection()
+        };
+        assert!(skeleton.set_pinned(true));
+        assert!(skeleton.set_archived(true));
+        assert!(skeleton.set_title("Renamed via skeleton"));
+
+        // Round-trip through JSON to verify the wire preserves `detail_loaded = false`.
+        let wire = serde_json::to_vec(&Command::SaveTaskState {
+            projects: vec![project.clone()],
+            live_session_ids: vec![session_id],
+            sessions: vec![skeleton],
+        })
+        .unwrap();
+        let Command::SaveTaskState {
+            projects, sessions, ..
+        } = serde_json::from_slice(&wire).unwrap()
+        else {
+            panic!("expected SaveTaskState");
+        };
+        assert!(!sessions[0].detail_loaded);
+
+        let saved = backend.save_task_state(projects, sessions).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].title, "Renamed via skeleton");
+        assert!(saved[0].pinned);
+        assert!(saved[0].archived);
+
+        // Hydrate from SQLite and verify every detail and message survived.
+        {
+            let mut task_state = backend.task_state.lock();
+            backend.task_store.hydrate(&mut task_state.sessions[0]).unwrap();
+            let hydrated = &task_state.sessions[0];
+            assert!(hydrated.detail_loaded);
+            assert_eq!(hydrated.title, "Renamed via skeleton");
+            assert!(hydrated.pinned);
+            assert!(hydrated.archived);
+            assert_eq!(hydrated.messages.len(), 2);
+            assert_eq!(hydrated.messages[0].content, "Important user prompt");
+            assert_eq!(hydrated.messages[1].content, "Important answer");
+            assert_eq!(hydrated.turns.len(), 1);
+            assert_eq!(hydrated.account_id.as_deref(), Some("claude-work"));
+            assert_eq!(hydrated.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(
+                hydrated.workspace,
+                crate::model::SessionWorkspace::Worktree {
+                    path: dir.join("worktree"),
+                    branch: "feat/keep".into(),
+                }
+            );
+            assert_eq!(
+                hydrated.provider_cursor,
+                Some(ProviderResumeCursor::Claude {
+                    session_id: "claude-native-1".into(),
+                    resume_at: Some("msg-1".into()),
+                })
+            );
+        }
+
+        // Case 2: Daemon holds the hydrated session in memory while another
+        // client sends an unhydrated skeleton mutation (unpin + rename).
+        let mut second_skeleton = {
+            let loaded = backend.task_state.lock();
+            assert!(loaded.sessions[0].detail_loaded);
+            loaded.sessions[0].list_projection()
+        };
+        assert!(second_skeleton.set_pinned(false));
+        assert!(second_skeleton.set_title("Renamed while daemon hydrated"));
+        let wire = serde_json::to_vec(&second_skeleton).unwrap();
+        let decoded_skeleton: AgentSession = serde_json::from_slice(&wire).unwrap();
+        assert!(!decoded_skeleton.detail_loaded);
+
+        backend
+            .save_task_state(vec![project], vec![decoded_skeleton])
+            .unwrap();
+
+        // Reload fresh from SQLite and verify nothing was lost.
+        let fresh_store = StateStore::daemon(db_path);
+        let mut fresh_state = fresh_store.load().unwrap();
+        assert_eq!(fresh_state.sessions.len(), 1);
+        assert_eq!(fresh_state.sessions[0].title, "Renamed while daemon hydrated");
+        assert!(!fresh_state.sessions[0].pinned);
+        assert!(fresh_state.sessions[0].archived);
+        fresh_store.hydrate(&mut fresh_state.sessions[0]).unwrap();
+        let reloaded = &fresh_state.sessions[0];
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[0].content, "Important user prompt");
+        assert_eq!(reloaded.messages[1].content, "Important answer");
+        assert_eq!(reloaded.turns.len(), 1);
+        assert_eq!(reloaded.account_id.as_deref(), Some("claude-work"));
+        assert_eq!(reloaded.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            reloaded.workspace,
+            crate::model::SessionWorkspace::Worktree {
+                path: dir.join("worktree"),
+                branch: "feat/keep".into(),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_config_dir_validation_allows_none_and_registered_accounts_only() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-cfgdir-{}", Uuid::new_v4()));
+        let existing_account = dir.join("claude-work");
+        let pending_account = dir.join("codex-pending");
+        let outside_dir = dir.join("outside-secret");
+        std::fs::create_dir_all(&existing_account).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let settings_store = DaemonSettingsStore::open(dir.join("settings.json")).unwrap();
+        let mut settings = settings_store.get();
+        settings.provider_accounts = vec![
+            waku_protocol::ProviderAccount {
+                id: "claude-1".into(),
+                provider: ProviderKind::Claude,
+                label: "Work".into(),
+                config_dir: existing_account.to_string_lossy().into_owned(),
+                binary_override: None,
+            },
+            waku_protocol::ProviderAccount {
+                id: "codex-1".into(),
+                provider: ProviderKind::Codex,
+                label: "Pending".into(),
+                config_dir: pending_account.to_string_lossy().into_owned(),
+                binary_override: None,
+            },
+        ];
+        settings_store.replace(settings).unwrap();
+
+        let backend =
+            WakuBackend::new(settings_store, StateStore::daemon(dir.join("state.db"))).unwrap();
+
+        // None and whitespace-only map to default account (Ok(None)).
+        assert!(
+            backend
+                .validate_client_config_dir(ProviderKind::Claude, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .validate_client_config_dir(ProviderKind::Claude, Some("   "))
+                .unwrap()
+                .is_none()
+        );
+
+        // Registered existing path (including trailing slash) succeeds.
+        let with_slash = format!("{}/", existing_account.to_string_lossy());
+        let (_, validated_existing) = backend
+            .validate_client_config_dir(ProviderKind::Claude, Some(&with_slash))
+            .unwrap()
+            .expect("registered existing account accepted");
+        assert_eq!(validated_existing, existing_account);
+
+        // Registered not-yet-created path succeeds.
+        let (_, validated_pending) = backend
+            .validate_client_config_dir(
+                ProviderKind::Codex,
+                Some(&pending_account.to_string_lossy()),
+            )
+            .unwrap()
+            .expect("registered pending account accepted");
+        assert_eq!(validated_pending, pending_account);
+
+        // Unregistered host paths are rejected.
+        assert!(
+            backend
+                .validate_client_config_dir(
+                    ProviderKind::Claude,
+                    Some(&outside_dir.to_string_lossy()),
+                )
+                .is_err()
+        );
+
+        // Cross-provider account paths are rejected.
+        assert!(
+            backend
+                .validate_client_config_dir(
+                    ProviderKind::Codex,
+                    Some(&existing_account.to_string_lossy()),
+                )
+                .is_err()
+        );
+
+        // Relative and `..` traversal paths are rejected.
+        assert!(
+            backend
+                .validate_client_config_dir(ProviderKind::Claude, Some("../outside-secret"))
+                .is_err()
+        );
+        let traversal = format!("{}/../outside-secret", pending_account.to_string_lossy());
+        assert!(
+            backend
+                .validate_client_config_dir(ProviderKind::Codex, Some(&traversal))
+                .is_err()
+        );
+
+        // Workspace and fork request validators enforce the same policy.
+        assert!(
+            backend
+                .validate_fork_provider_session_request(ProviderSessionForkRequest::Claude {
+                    session_id: "s1".into(),
+                    resume_at: None,
+                    turn_count: 1,
+                    title: "fork".into(),
+                    config_dir: Some(outside_dir.clone()),
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .validate_fork_provider_session_request(ProviderSessionForkRequest::Claude {
+                    session_id: "s1".into(),
+                    resume_at: None,
+                    turn_count: 1,
+                    title: "fork".into(),
+                    config_dir: Some(existing_account.clone()),
+                })
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_workspace_operation(WorkspaceOperation::DiscoverSlashCommands {
+                    provider: ProviderKind::Claude,
+                    project_root: dir.clone(),
+                    binary_override: None,
+                    config_dir: Some(outside_dir.to_string_lossy().into_owned()),
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .validate_workspace_operation(WorkspaceOperation::GenerateCommitMessage {
+                    cwd: dir.clone(),
+                    include_unstaged: false,
+                    invocation: waku_protocol::git::AgentInvocation {
+                        provider: ProviderKind::Claude,
+                        binary: PathBuf::from("claude"),
+                        model: None,
+                        reasoning_effort: None,
+                        config_dir: Some(outside_dir.to_string_lossy().into_owned()),
+                    },
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .validate_workspace_operation(WorkspaceOperation::DiscoverSlashCommands {
+                    provider: ProviderKind::Claude,
+                    project_root: dir.clone(),
+                    binary_override: None,
+                    config_dir: Some(existing_account.to_string_lossy().into_owned()),
+                })
+                .is_ok()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

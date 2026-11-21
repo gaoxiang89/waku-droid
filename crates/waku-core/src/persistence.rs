@@ -14,11 +14,15 @@
 //! applied by [`apply_migrations`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -145,12 +149,7 @@ impl ComposerDraftStore {
         if generation < *latest_write {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, data)?;
-        fs::rename(temporary, &self.path)?;
+        write_bytes_atomically(&self.path, &data)?;
         *latest_write = generation;
         Ok(())
     }
@@ -176,15 +175,43 @@ impl ComposerDraftStore {
             return Ok(());
         }
         let data = serde_json::to_vec_pretty(&drafts).map_err(to_io_error)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, data)?;
-        fs::rename(temporary, &self.path)?;
+        write_bytes_atomically(&self.path, &data)?;
         *latest_write = latest_write.saturating_add(1);
         Ok(())
     }
+}
+
+fn write_bytes_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = unique_temp_path(path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| -> io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
 }
 
 /// Desktop-owned, user-editable configuration.
@@ -1144,23 +1171,13 @@ impl StateStore {
     }
 
     fn write_app_settings(&self, settings: &AppSettings) -> io::Result<()> {
-        if let Some(parent) = self.app_settings_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_vec_pretty(settings).map_err(to_io_error)?;
-        let temporary = self.app_settings_path.with_extension("json.tmp");
-        fs::write(&temporary, data)?;
-        fs::rename(temporary, &self.app_settings_path)
+        write_bytes_atomically(&self.app_settings_path, &data)
     }
 
     fn write_app_state(&self, app_state: &AppState) -> io::Result<()> {
-        if let Some(parent) = self.app_state_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_vec_pretty(app_state).map_err(to_io_error)?;
-        let temporary = self.app_state_path.with_extension("json.tmp");
-        fs::write(&temporary, data)?;
-        fs::rename(temporary, &self.app_state_path)
+        write_bytes_atomically(&self.app_state_path, &data)
     }
 
     pub fn load(&self) -> io::Result<PersistedState> {
@@ -4022,6 +4039,77 @@ mod tests {
             vec![crate::model::ProviderResumeCursor::Codex {
                 thread_id: "codex-thread-1".into(),
             }]
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn saving_dirty_skeleton_metadata_preserves_messages_and_session_details() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session_id = state.sessions[0].id;
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.workspace = SessionWorkspace::Worktree {
+                path: PathBuf::from("/tmp/project-worktree"),
+                branch: "feature/keep-me".into(),
+            };
+            session.account_id = Some("codex-work".into());
+            session.reasoning_effort = Some("high".into());
+            session.begin_turn("User question");
+            session.push_message(MessageRole::Assistant, "Full persisted answer");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(ProviderResumeCursor::Codex {
+                thread_id: "thread-keep".into(),
+            });
+        }
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut skeleton_state = reopened.load().unwrap();
+        assert!(!skeleton_state.sessions[0].detail_loaded);
+        assert!(skeleton_state.sessions[0].messages.is_empty());
+
+        {
+            let skeleton = skeleton_state.session_mut(session_id).unwrap();
+            assert!(skeleton.set_pinned(true));
+            assert!(skeleton.set_archived(true));
+            assert!(skeleton.set_title("Renamed unopened session"));
+        }
+        reopened.save(&mut skeleton_state).unwrap();
+
+        let verify = store_in(&directory);
+        let mut restored = verify.load().unwrap();
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].title, "Renamed unopened session");
+        assert!(restored.sessions[0].pinned);
+        assert!(restored.sessions[0].archived);
+
+        verify.hydrate(&mut restored.sessions[0]).unwrap();
+        let hydrated = &restored.sessions[0];
+        assert!(hydrated.detail_loaded);
+        assert_eq!(hydrated.title, "Renamed unopened session");
+        assert!(hydrated.pinned);
+        assert!(hydrated.archived);
+        assert_eq!(hydrated.messages.len(), 2);
+        assert_eq!(hydrated.messages[0].content, "User question");
+        assert_eq!(hydrated.messages[1].content, "Full persisted answer");
+        assert_eq!(hydrated.turns.len(), 1);
+        assert_eq!(hydrated.account_id.as_deref(), Some("codex-work"));
+        assert_eq!(hydrated.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            hydrated.workspace,
+            SessionWorkspace::Worktree {
+                path: PathBuf::from("/tmp/project-worktree"),
+                branch: "feature/keep-me".into(),
+            }
+        );
+        assert_eq!(
+            hydrated.provider_cursor,
+            Some(ProviderResumeCursor::Codex {
+                thread_id: "thread-keep".into(),
+            })
         );
         fs::remove_dir_all(directory).ok();
     }

@@ -1,8 +1,12 @@
 //! Daemon-owned, user-editable configuration.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -89,14 +93,43 @@ fn quarantine_corrupt_settings(path: &Path) -> io::Result<PathBuf> {
     Ok(backup)
 }
 
+/// Atomically replace `path` with owner-only permissions (`0600` on Unix).
+///
+/// On Windows, `~/.waku/settings.json` lives inside the user's profile
+/// directory, whose inherited NTFS ACL already restricts access to the owner
+/// and administrators (matching [`crate::fs_ext::create_private_dir_all`]).
 fn write_atomic(path: &Path, settings: &DaemonSettings) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::fs_ext::create_private_dir_all(parent)?;
     }
     let data = serde_json::to_vec_pretty(settings).map_err(to_io_error)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, data)?;
-    fs::rename(temporary, path)
+    let temporary = unique_temp_path(path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| -> io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut os = path.as_os_str().to_os_string();
+    os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(os)
 }
 
 fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -172,6 +205,35 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("settings.json.corrupt-")
         }));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn settings_writes_clean_up_temp_files_and_restrict_permissions() {
+        let directory = std::env::temp_dir().join(format!("waku-settings-{}", Uuid::new_v4()));
+        let path = directory.join("settings.json");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, "{}").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        let mut updated = store.get();
+        updated.computer_use_enabled = true;
+        store.replace(updated).unwrap();
+
+        assert!(store.get().computer_use_enabled);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        );
         fs::remove_dir_all(directory).ok();
     }
 }

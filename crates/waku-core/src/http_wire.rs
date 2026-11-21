@@ -31,11 +31,22 @@ use serde_json::Value;
 /// service demands HTTP Basic with the password from its registration file.
 /// Precompute the header once so it is never rebuilt per request — and never
 /// log it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct Endpoint {
     pub host: String,
     pub port: u16,
     pub auth: Option<String>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Endpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Endpoint {
@@ -628,5 +639,23 @@ mod tests {
         let endpoint = Endpoint::local(1234);
         assert_eq!(endpoint.address(), "127.0.0.1:1234");
         assert!(endpoint.auth.is_none());
+    }
+
+    #[test]
+    fn endpoint_debug_redacts_auth_credential() {
+        let basic = Endpoint::basic("http://127.0.0.1:49374", "opencode", "super-secret").unwrap();
+        let rendered = format!("{basic:?}");
+        assert!(rendered.contains("127.0.0.1"), "{rendered}");
+        assert!(rendered.contains("49374"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(
+            !rendered.contains(basic.auth.as_deref().unwrap()),
+            "{rendered}"
+        );
+
+        let local = Endpoint::local(1234);
+        let local_rendered = format!("{local:?}");
+        assert!(local_rendered.contains("auth: None"), "{local_rendered}");
     }
 }
