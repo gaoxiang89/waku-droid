@@ -408,17 +408,14 @@ impl TitleChildGuard {
     fn terminate(&mut self) {
         if let Some(mut child) = self.child.take() {
             #[cfg(unix)]
-            if let Ok(pid) = i32::try_from(child.id())
-                && pid > 0
+            crate::command_env::terminate_process_group_child(&mut child);
+            #[cfg(not(unix))]
             {
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
+                #[cfg(windows)]
+                drop(self.job.take());
+                let _ = child.kill();
+                let _ = child.wait();
             }
-            #[cfg(windows)]
-            drop(self.job.take());
-            let _ = child.kill();
-            let _ = child.wait();
         } else {
             #[cfg(windows)]
             drop(self.job.take());
@@ -1769,7 +1766,13 @@ fn generate_codex_title(
 
     drop(stdin);
     process.terminate();
-    let _ = reader.join();
+    let reader_deadline = Instant::now() + Duration::from_millis(200);
+    while !reader.is_finished() && Instant::now() < reader_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+    }
     result
 }
 

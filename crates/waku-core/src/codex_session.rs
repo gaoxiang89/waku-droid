@@ -71,17 +71,14 @@ impl AppServerChild {
             return;
         }
         #[cfg(unix)]
-        if let Ok(pid) = i32::try_from(self.child.id())
-            && pid > 0
+        crate::command_env::terminate_process_group_child(&mut self.child);
+        #[cfg(not(unix))]
         {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            #[cfg(windows)]
+            drop(self.job.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        #[cfg(windows)]
-        drop(self.job.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         self.reaped = true;
     }
 }

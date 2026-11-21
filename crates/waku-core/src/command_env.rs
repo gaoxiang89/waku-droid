@@ -1026,18 +1026,67 @@ fn wait_for_child_with_job(
     }
 }
 
-fn terminate_child_with_job(child: &mut Child, job: &mut ChildJobGuard) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(child.id())
-        && pid > 0
-    {
+/// Terminate a child spawned as the leader of its own Unix process group
+/// (`CommandExt::process_group(0)`), sweeping any grandchild forked mid-signal
+/// before reaping the child.
+///
+/// On Unix (notably macOS XNU), a single `kill(-pid, SIGKILL)` can race with a
+/// shell child that is mid-`fork`/`posix_spawn`, leaving the newly created
+/// grandchild alive and holding inherited pipes open. Waiting for the direct
+/// child with `waitid(..., WEXITED | WNOWAIT)` guarantees it can no longer fork
+/// while keeping its PID un-reaped (so it cannot be recycled yet), allowing a
+/// second `kill(-pid, SIGKILL)` to sweep the group safely before `child.wait()`
+/// reaps it.
+#[cfg(unix)]
+pub(crate) fn terminate_process_group_child(child: &mut Child) {
+    let pgid = i32::try_from(child.id()).ok().filter(|&pid| pid > 0);
+    if let Some(pid) = pgid {
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
     let _ = child.kill();
-    job.terminate();
+    if let Some(pid) = pgid {
+        let mut waited_unreaped = false;
+        let mut siginfo = MaybeUninit::<libc::siginfo_t>::zeroed();
+        loop {
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    siginfo.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if status == 0 {
+                waited_unreaped = true;
+                break;
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+        if waited_unreaped {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
     let _ = child.wait();
+}
+
+fn terminate_child_with_job(child: &mut Child, job: &mut ChildJobGuard) {
+    #[cfg(unix)]
+    {
+        job.terminate();
+        terminate_process_group_child(child);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        job.terminate();
+        let _ = child.wait();
+    }
 }
 
 struct ShellEnvironmentCapture(PathBuf);
