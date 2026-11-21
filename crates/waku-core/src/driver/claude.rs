@@ -20,9 +20,9 @@ use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar};
 use std::thread;
 use std::time::Duration;
 
@@ -87,9 +87,209 @@ fn stop_task_request(request_id: u64, task_id: &str) -> Value {
     })
 }
 
+const SHUTDOWN_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct ClaudeTurnState {
+    active: bool,
+    /// The prompted turn's reply ended while `live_tasks` was non-empty: the
+    /// turn is held open for the wake instead of being reported finished.
+    parked: bool,
+}
+
+impl ClaudeTurnState {
+    fn can_steer(&self) -> bool {
+        self.active && !self.parked
+    }
+}
+
+struct ProcessState {
+    exited: bool,
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+struct ProcessLifecycle {
+    state: std::sync::Mutex<ProcessState>,
+    exited_cv: Condvar,
+    terminated: AtomicBool,
+}
+
+impl ProcessLifecycle {
+    fn adopt(child: &Child) -> Self {
+        let pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(pid).ok();
+        Self {
+            state: std::sync::Mutex::new(ProcessState {
+                exited: false,
+                pid,
+                #[cfg(windows)]
+                job,
+            }),
+            exited_cv: Condvar::new(),
+            terminated: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_exited(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.exited = true;
+        state.pid = 0;
+        #[cfg(windows)]
+        drop(state.job.take());
+        self.exited_cv.notify_all();
+    }
+
+    fn was_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    fn terminate_locked(state: &mut ProcessState, terminated: &AtomicBool) {
+        if state.exited || state.pid == 0 {
+            #[cfg(windows)]
+            drop(state.job.take());
+            return;
+        }
+        terminated.store(true, Ordering::Release);
+        let pid = state.pid;
+        state.pid = 0;
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(pid)
+            && pid > 0
+        {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            drop(state.job.take());
+            unsafe {
+                use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::{
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                };
+                let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !process.is_null() {
+                    let _ = TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
+        }
+    }
+
+    fn terminate_now(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::terminate_locked(&mut state, &self.terminated);
+    }
+
+    /// Give the child a bounded grace window to exit cooperatively after stdin
+    /// closes (see `docs/providers.md`), then terminate the process tree if it
+    /// is still wedged. Runs on a short-lived watchdog thread so `Drop` never
+    /// blocks the caller.
+    fn request_shutdown_after_grace(self: &Arc<Self>, grace: Duration) {
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.exited {
+                return;
+            }
+        }
+        let process = self.clone();
+        let wait_and_terminate = move || {
+            let state = process
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut state, _) = process
+                .exited_cv
+                .wait_timeout_while(state, grace, |state| !state.exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.exited {
+                Self::terminate_locked(&mut state, &process.terminated);
+            }
+        };
+        if thread::Builder::new()
+            .name("waku-claude-shutdown".into())
+            .spawn(wait_and_terminate)
+            .is_err()
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut state, _) = self
+                .exited_cv
+                .wait_timeout_while(state, grace, |state| !state.exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.exited {
+                Self::terminate_locked(&mut state, &self.terminated);
+            }
+        }
+    }
+}
+
+struct StartupChildGuard {
+    child: Option<Child>,
+    process: Arc<ProcessLifecycle>,
+}
+
+impl StartupChildGuard {
+    fn new(child: Child, process: Arc<ProcessLifecycle>) -> Self {
+        Self {
+            child: Some(child),
+            process,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("startup child guard still owns child")
+    }
+
+    fn take_child(&mut self) -> Child {
+        self.child
+            .take()
+            .expect("startup child guard still owns child")
+    }
+}
+
+impl Drop for StartupChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.process.terminate_now();
+            let _ = child.kill();
+            let _ = child.wait();
+            self.process.mark_exited();
+        }
+    }
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 pub struct ClaudeDriver {
     commands: Sender<CommandMessage>,
     pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
+    process: Option<Arc<ProcessLifecycle>>,
     mode: RuntimeMode,
     reasoning_effort: Option<String>,
     current_model: Mutex<Option<String>>,
@@ -244,17 +444,23 @@ impl ClaudeDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = crate::command_env::spawn(command)
+        isolate_process_group(command);
+        let child = crate::command_env::spawn(command)
             .context("failed to start `claude` in streaming-input mode")?;
-        let stdin = child
+        let process = Arc::new(ProcessLifecycle::adopt(&child));
+        let mut child_guard = StartupChildGuard::new(child, process.clone());
+        let stdin = child_guard
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| anyhow!("Claude stdin unavailable"))?;
-        let stdout = child
+        let stdout = child_guard
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Claude stdout unavailable"))?;
-        let stderr = child
+        let stderr = child_guard
+            .child_mut()
             .stderr
             .take()
             .ok_or_else(|| anyhow!("Claude stderr unavailable"))?;
@@ -269,13 +475,13 @@ impl ClaudeDriver {
         });
 
         let (commands, command_rx) = unbounded();
-        let turn_active = Arc::new(Mutex::new(false));
+        let turn_state = Arc::new(Mutex::new(ClaudeTurnState::default()));
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
         let pending_user_inputs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
         let reader_events = events.clone();
         let reader_commands = commands.clone();
-        let reader_turn = turn_active.clone();
+        let reader_turn = turn_state.clone();
         let reader_session = session_id.clone();
         let reader_config_dir = config_dir.clone();
         let reader_pending_task_stops = pending_task_stops.clone();
@@ -309,7 +515,7 @@ impl ClaudeDriver {
             })?;
 
         let writer_events = events.clone();
-        let writer_turn = turn_active.clone();
+        let writer_turn = turn_state.clone();
         let writer_pending_task_stops = pending_task_stops;
         let writer_pending_user_inputs = pending_user_inputs.clone();
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
@@ -326,7 +532,11 @@ impl ClaudeDriver {
                     let written = match message {
                         CommandMessage::Prompt(text) => {
                             writer_pending_user_inputs.lock().clear();
-                            *writer_turn.lock() = true;
+                            {
+                                let mut turn = writer_turn.lock();
+                                turn.active = true;
+                                turn.parked = false;
+                            }
                             start_claude_title_refresh(
                                 &writer_title_refresh,
                                 &title_session_id,
@@ -337,41 +547,11 @@ impl ClaudeDriver {
                             write_line(&mut stdin, &user_message_payload(&text))
                         }
                         CommandMessage::Steer(text) => {
-                            // A mid-turn user message is held by the CLI and
-                            // folded into the running turn at the next model
-                            // call — one `result` settles everything, and the
-                            // isReplay echo marks the moment it is absorbed.
-                            // Verified against the real CLI (2.1.223). Unlike
-                            // Amp, no marker is needed: folding is the default.
-                            if !*writer_turn.lock() {
-                                let _ = writer_events.send(DriverEvent::SteerRejected {
-                                    message: text,
-                                    reason: tr!(
-                                        "errors.provider_no_active_turn",
-                                        provider = "Claude"
-                                    ),
-                                });
+                            let Some(written) =
+                                write_steer_message(&mut stdin, text, &writer_turn, &writer_events)
+                            else {
                                 continue;
-                            }
-                            // No TurnStarted and no turn re-arm: the turn the
-                            // message joins is already running.
-                            let written = write_line(&mut stdin, &user_message_payload(&text));
-                            match &written {
-                                Ok(()) => {
-                                    let _ = writer_events
-                                        .send(DriverEvent::SteerAccepted { message: text });
-                                }
-                                Err(error) => {
-                                    let _ = writer_events.send(DriverEvent::SteerRejected {
-                                        message: text,
-                                        reason: tr!(
-                                            "errors.provider_transport_write",
-                                            provider = "Claude",
-                                            error = error
-                                        ),
-                                    });
-                                }
-                            }
+                            };
                             // A failed write still falls through to the shared
                             // transport-failure path: the running turn cannot
                             // settle once stdin is gone.
@@ -519,7 +699,14 @@ impl ClaudeDriver {
                             error = error
                         )));
                         // Nothing will settle a turn whose prompt never landed.
-                        if std::mem::take(&mut *writer_turn.lock()) {
+                        let was_active = {
+                            let mut turn = writer_turn.lock();
+                            let active = turn.active;
+                            turn.active = false;
+                            turn.parked = false;
+                            active
+                        };
+                        if was_active {
                             let _ = writer_events.send(DriverEvent::TurnFinished {
                                 success: false,
                                 summary: Some(tr!(
@@ -547,18 +734,23 @@ impl ClaudeDriver {
                 }
             })?;
 
-        let process_turn = turn_active;
+        let process_turn = turn_state;
         let process_pending_user_inputs = pending_user_inputs.clone();
+        let process_lifecycle = process.clone();
         thread::Builder::new()
             .name("waku-claude-process".into())
             .spawn(move || {
+                let mut child = child_guard.take_child();
                 let status = child.wait();
+                process_lifecycle.mark_exited();
+                drop(child);
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
                 let last_error = last_visible_stderr.lock().clone();
                 finalize_process_exit(
                     status,
                     last_error,
+                    process_lifecycle.was_terminated(),
                     &process_turn,
                     &process_pending_user_inputs,
                     &events,
@@ -568,6 +760,7 @@ impl ClaudeDriver {
         Ok(Self {
             commands,
             pending_user_inputs,
+            process: Some(process),
             mode,
             reasoning_effort,
             current_model: Mutex::new(launch_model),
@@ -652,7 +845,49 @@ impl DriverControl for ClaudeDriver {
 impl Drop for ClaudeDriver {
     fn drop(&mut self) {
         let _ = self.commands.send(CommandMessage::Shutdown);
+        if let Some(process) = &self.process {
+            process.request_shutdown_after_grace(SHUTDOWN_EXIT_GRACE);
+        }
     }
+}
+
+fn write_steer_message(
+    stdin: &mut impl Write,
+    text: String,
+    turn_state: &Mutex<ClaudeTurnState>,
+    events: &impl DriverEventSink,
+) -> Option<std::io::Result<()>> {
+    // A mid-turn user message is held by the CLI and folded into the running
+    // turn at the next model call — one `result` settles everything, and the
+    // isReplay echo marks the moment it is absorbed. Verified against the real
+    // CLI (2.1.223). Unlike Amp, no marker is needed: folding is the default.
+    // A parked turn is waiting on detached background work with no running
+    // model call, so reject steering until the wake begins again.
+    if !turn_state.lock().can_steer() {
+        let _ = events.send(DriverEvent::SteerRejected {
+            message: text,
+            reason: tr!("errors.provider_no_active_turn", provider = "Claude"),
+        });
+        return None;
+    }
+    // No TurnStarted and no turn re-arm: the turn the message joins is already running.
+    let written = write_line(stdin, &user_message_payload(&text));
+    match &written {
+        Ok(()) => {
+            let _ = events.send(DriverEvent::SteerAccepted { message: text });
+        }
+        Err(error) => {
+            let _ = events.send(DriverEvent::SteerRejected {
+                message: text,
+                reason: tr!(
+                    "errors.provider_transport_write",
+                    provider = "Claude",
+                    error = error
+                ),
+            });
+        }
+    }
+    Some(written)
 }
 
 fn write_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
@@ -744,33 +979,45 @@ fn collect_bounded_stderr(mut reader: impl BufRead) -> Vec<String> {
 fn finalize_process_exit(
     status: std::io::Result<std::process::ExitStatus>,
     last_visible_stderr: Option<String>,
-    turn_active: &Mutex<bool>,
+    terminated_by_shutdown: bool,
+    turn_state: &Mutex<ClaudeTurnState>,
     pending_user_inputs: &Mutex<HashMap<String, Value>>,
     events: &impl DriverEventSink,
 ) {
-    let exit_error = match status {
-        Ok(status) if !status.success() && last_visible_stderr.is_none() => {
-            let message = tr!(
-                "errors.provider_exited",
-                provider = "Claude Code",
-                status = status
-            );
-            let _ = events.send(DriverEvent::Error(message.clone()));
-            Some(message)
+    let exit_error = if terminated_by_shutdown {
+        last_visible_stderr
+    } else {
+        match status {
+            Ok(status) if !status.success() && last_visible_stderr.is_none() => {
+                let message = tr!(
+                    "errors.provider_exited",
+                    provider = "Claude Code",
+                    status = status
+                );
+                let _ = events.send(DriverEvent::Error(message.clone()));
+                Some(message)
+            }
+            Err(error) if last_visible_stderr.is_none() => {
+                let message = tr!(
+                    "errors.read_provider_exit_status",
+                    provider = "Claude Code",
+                    error = error
+                );
+                let _ = events.send(DriverEvent::Error(message.clone()));
+                Some(message)
+            }
+            _ => last_visible_stderr,
         }
-        Err(error) if last_visible_stderr.is_none() => {
-            let message = tr!(
-                "errors.read_provider_exit_status",
-                provider = "Claude Code",
-                error = error
-            );
-            let _ = events.send(DriverEvent::Error(message.clone()));
-            Some(message)
-        }
-        _ => last_visible_stderr,
     };
     pending_user_inputs.lock().clear();
-    if std::mem::take(&mut *turn_active.lock()) {
+    let was_active = {
+        let mut turn = turn_state.lock();
+        let active = turn.active;
+        turn.active = false;
+        turn.parked = false;
+        active
+    };
+    if was_active {
         let _ = events.send(DriverEvent::TurnFinished {
             success: false,
             summary: exit_error,
@@ -793,9 +1040,6 @@ struct ClaudeStreamState {
     /// they settle. Replaced wholesale by each `background_tasks_changed`
     /// level signal and kept current by the task bookends between them.
     live_tasks: HashSet<String>,
-    /// The prompted turn's reply ended while `live_tasks` was non-empty: the
-    /// turn is held open for the wake instead of being reported finished.
-    parked: bool,
     /// Task tool-use id → task id, so a subagent's own messages — they arrive
     /// on the main channel with `parent_tool_use_id` set — can be routed into
     /// that task's output pane instead of this session's transcript.
@@ -821,6 +1065,25 @@ struct ClaudeStreamState {
 
 #[derive(Default)]
 struct ClaudeTaskOutputTails(HashMap<String, Arc<AtomicBool>>);
+
+impl ClaudeTaskOutputTails {
+    fn stop(&mut self, task_id: &str) {
+        if let Some(stop) = self.0.remove(task_id) {
+            stop.store(true, Ordering::Release);
+        }
+    }
+
+    fn retain_only(&mut self, keep: &HashSet<String>) {
+        self.0.retain(|task_id, stop| {
+            if keep.contains(task_id) {
+                true
+            } else {
+                stop.store(true, Ordering::Release);
+                false
+            }
+        });
+    }
+}
 
 impl Drop for ClaudeTaskOutputTails {
     fn drop(&mut self) {
@@ -1274,8 +1537,9 @@ fn handle_claude_system(
             .cloned()
             .unwrap_or_default();
         // The level signal is authoritative for what can still wake the
-        // session; ambient housekeeping never parks a turn.
-        state.live_tasks = tasks
+        // session; ambient housekeeping never parks a turn. Stop any output
+        // tail for detached tasks that vanished without a `task_notification`.
+        let next_live_tasks: HashSet<String> = tasks
             .iter()
             .filter(|entry| !claude_task_is_ambient(entry))
             .filter_map(|entry| {
@@ -1285,6 +1549,10 @@ fn handle_claude_system(
                     .or_else(|| claude_task_id(entry).map(str::to_owned))
             })
             .collect();
+        for removed in state.live_tasks.difference(&next_live_tasks) {
+            state.task_output_tails.stop(removed);
+        }
+        state.live_tasks = next_live_tasks;
         let items = tasks
             .iter()
             .filter_map(|entry| {
@@ -1353,7 +1621,8 @@ fn handle_claude_system(
             state.live_tasks.insert(task_id.clone());
         }
         let output_tail_item = (subtype == "task_started"
-            && item.key.kind == BackgroundWorkKind::Process)
+            && item.key.kind == BackgroundWorkKind::Process
+            && item.status.is_live())
             .then(|| item.clone());
         let stop_output_tail = !item.status.is_live();
         // Remember what the task is called: `task_started` names it, and a
@@ -1378,8 +1647,8 @@ fn handle_claude_system(
         // first delta; an output-before-start race would otherwise discard it.
         if let Some(item) = output_tail_item {
             start_claude_task_output_tail(session_id, &item, events, state);
-        } else if stop_output_tail && let Some(stop) = state.task_output_tails.0.remove(&task_id) {
-            stop.store(true, Ordering::Release);
+        } else if stop_output_tail {
+            state.task_output_tails.stop(&task_id);
         }
     }
 }
@@ -1469,17 +1738,13 @@ fn forward_subagent_transcript(
 /// host learns the model is running again through `TurnStarted`, on the turn
 /// it already holds open. A wake that finds no turn at all — the host settled
 /// the parked one itself — opens a fresh one the same way.
-fn begin_unprompted_turn(
-    turn_active: &Mutex<bool>,
-    state: &mut ClaudeStreamState,
-    events: &DriverEventSender,
-) {
-    let mut active = turn_active.lock();
-    if *active && !state.parked {
+fn begin_unprompted_turn(turn_state: &Mutex<ClaudeTurnState>, events: &DriverEventSender) {
+    let mut turn = turn_state.lock();
+    if turn.active && !turn.parked {
         return;
     }
-    *active = true;
-    state.parked = false;
+    turn.active = true;
+    turn.parked = false;
     let _ = events.send(DriverEvent::TurnStarted);
 }
 
@@ -1489,7 +1754,7 @@ fn handle_message(
     session_id: &str,
     events: &DriverEventSender,
     commands: &Sender<CommandMessage>,
-    turn_active: &Mutex<bool>,
+    turn_state: &Mutex<ClaudeTurnState>,
     mode: RuntimeMode,
     state: &mut ClaudeStreamState,
 ) {
@@ -1517,7 +1782,7 @@ fn handle_message(
         }
         Some("control_request") => {
             if value.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool") {
-                begin_unprompted_turn(turn_active, state, events);
+                begin_unprompted_turn(turn_state, events);
                 if !request_user_input(value, events, commands, state) {
                     request_permission(value, events, commands, mode);
                 }
@@ -1552,6 +1817,8 @@ fn handle_message(
                     BackgroundWorkEvent::StopFailed { key, message },
                 ));
             } else {
+                state.live_tasks.remove(&key.provider_id);
+                state.task_output_tails.stop(&key.provider_id);
                 let mut item = BackgroundWorkItem::new(
                     key.kind,
                     key.provider_id.clone(),
@@ -1575,7 +1842,7 @@ fn handle_message(
             {
                 return;
             }
-            begin_unprompted_turn(turn_active, state, events);
+            begin_unprompted_turn(turn_state, events);
             let event = value.get("event").unwrap_or(&Value::Null);
             // Each assistant message re-arms the delta fallback.
             if event.get("type").and_then(Value::as_str) == Some("message_start") {
@@ -1615,7 +1882,7 @@ fn handle_message(
                 forward_subagent_transcript(parent, value, events, state);
                 return;
             }
-            begin_unprompted_turn(turn_active, state, events);
+            begin_unprompted_turn(turn_state, events);
             if let Some(usage) = value.pointer("/message/usage") {
                 if let Some(model) = value.pointer("/message/model").and_then(Value::as_str) {
                     state.last_assistant_model = Some(model.to_owned());
@@ -1774,9 +2041,13 @@ fn handle_message(
                     context_window: Some(window),
                 });
             }
-            if !*turn_active.lock() {
+            if !turn_state.lock().active {
                 return;
             }
+            // Any foreground process task that ended without a task_notification
+            // cannot outlive the turn's result; keep only tails for detached
+            // tasks still tracked in `live_tasks`.
+            state.task_output_tails.retain_only(&state.live_tasks);
             // Claude writes its generated title and rewind checkpoint to the
             // same native transcript as the turn settles. Read it once, ahead
             // of TurnFinished, so that event's forced save includes both.
@@ -1803,12 +2074,15 @@ fn handle_message(
             // so the turn is parked and its wake continues it. Only a reply
             // with nothing left to wait for settles it.
             if !failed && !state.live_tasks.is_empty() {
-                state.parked = true;
+                turn_state.lock().parked = true;
                 let _ = events.send(DriverEvent::TurnParked);
                 return;
             }
-            state.parked = false;
-            *turn_active.lock() = false;
+            {
+                let mut turn = turn_state.lock();
+                turn.active = false;
+                turn.parked = false;
+            }
             let _ = events.send(DriverEvent::TurnFinished {
                 success: !failed,
                 summary: None,
@@ -1986,7 +2260,7 @@ mod tests {
         crossbeam_channel::Receiver<DriverEvent>,
         Sender<CommandMessage>,
         crossbeam_channel::Receiver<CommandMessage>,
-        Mutex<bool>,
+        Mutex<ClaudeTurnState>,
         ClaudeStreamState,
     ) {
         let (events, event_rx) = crate::driver::test_event_channel();
@@ -1996,7 +2270,10 @@ mod tests {
             event_rx,
             commands,
             command_rx,
-            Mutex::new(true),
+            Mutex::new(ClaudeTurnState {
+                active: true,
+                parked: false,
+            }),
             ClaudeStreamState::default(),
         )
     }
@@ -2274,6 +2551,7 @@ mod tests {
         let driver = ClaudeDriver {
             commands,
             pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
+            process: None,
             mode: RuntimeMode::FullAccess,
             reasoning_effort: None,
             current_model: Mutex::new(None),
@@ -2296,6 +2574,7 @@ mod tests {
         let driver = ClaudeDriver {
             commands,
             pending_user_inputs: Arc::new(Mutex::new(HashMap::new())),
+            process: None,
             mode: RuntimeMode::AutoAcceptEdits,
             reasoning_effort: Some("high".into()),
             current_model: Mutex::new(Some("claude-sonnet-4-6".into())),
@@ -3010,13 +3289,17 @@ mod tests {
     #[test]
     fn unexpected_process_exit_mid_turn_settles_turn_as_failed_and_clears_pending_inputs() {
         let (events, event_rx) = crate::driver::test_event_channel();
-        let turn_active = Mutex::new(true);
+        let turn_state = Mutex::new(ClaudeTurnState {
+            active: true,
+            parked: false,
+        });
         let pending_user_inputs = Mutex::new(HashMap::from([("ask-1".to_owned(), json!({}))]));
 
         finalize_process_exit(
             Err(std::io::Error::other("simulated wait error")),
             None,
-            &turn_active,
+            false,
+            &turn_state,
             &pending_user_inputs,
             &events,
         );
@@ -3032,14 +3315,16 @@ mod tests {
         ));
         assert!(matches!(&seen[2], DriverEvent::ProcessExited));
         assert_eq!(seen.len(), 3);
-        assert!(!*turn_active.lock());
+        assert!(!turn_state.lock().active);
+        assert!(!turn_state.lock().parked);
         assert!(pending_user_inputs.lock().is_empty());
 
         // When no turn is active, exit emits only ProcessExited.
         finalize_process_exit(
             Err(std::io::Error::other("already reported")),
             Some("Claude Code: prior error".into()),
-            &turn_active,
+            false,
+            &turn_state,
             &pending_user_inputs,
             &events,
         );
@@ -3098,7 +3383,7 @@ mod tests {
             .filter(|event| matches!(event, DriverEvent::TurnFinished { .. }))
             .count();
         assert_eq!(settled, 1);
-        assert!(!*turn.lock());
+        assert!(!turn.lock().active);
 
         handle_message(
             &result,
@@ -3154,7 +3439,8 @@ mod tests {
                 .any(|event| matches!(event, DriverEvent::TurnFinished { .. })),
             "a parked turn is not finished"
         );
-        assert!(*turn.lock(), "the turn stays open for the wake");
+        assert!(turn.lock().active, "the turn stays open for the wake");
+        assert!(turn.lock().parked, "the turn is marked parked");
 
         let prelude = [
             json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
@@ -3219,8 +3505,8 @@ mod tests {
             1,
             "one wake is reported once"
         );
-        assert!(!*turn.lock());
-        assert!(!state.parked);
+        assert!(!turn.lock().active);
+        assert!(!turn.lock().parked);
     }
 
     #[test]
@@ -3255,7 +3541,7 @@ mod tests {
                 &mut state,
             );
         }
-        assert!(!*turn.lock());
+        assert!(!turn.lock().active);
         assert!(
             !std::iter::from_fn(|| event_rx.try_recv().ok())
                 .any(|event| matches!(event, DriverEvent::TurnStarted)),
@@ -3352,5 +3638,160 @@ mod tests {
         // 2+100+10+8 from the last iteration, then the main model's window —
         // not the subagent's tokens, not the smaller subagent window.
         assert_eq!(usage, [(Some(120), None), (None, Some(1_000_000))]);
+    }
+
+    #[test]
+    fn steer_is_rejected_while_turn_is_parked_and_accepted_after_wake() {
+        let (events, event_rx, commands, _command_rx, turn, mut state) = harness();
+
+        // Park the turn with a live background task.
+        handle_message(
+            &json!({
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "tasks": [{"task_id": "bg-1", "task_type": "local_bash"}]
+            }),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        handle_message(
+            &json!({"type": "result", "is_error": false, "stop_reason": "end_turn"}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        while event_rx.try_recv().is_ok() {}
+        assert!(turn.lock().active && turn.lock().parked);
+
+        let mut sink = Vec::new();
+        assert!(
+            write_steer_message(&mut sink, "while parked".into(), &turn, &events).is_none(),
+            "steering while parked must not write to stdin"
+        );
+        assert!(sink.is_empty());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(DriverEvent::SteerRejected { message, .. }) if message == "while parked"
+        ));
+
+        // Model wakes: parked clears and steering writes again.
+        handle_message(
+            &json!({"type":"stream_event","parent_tool_use_id":null,
+                "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"awake"}}}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        while event_rx.try_recv().is_ok() {}
+        assert!(
+            write_steer_message(&mut sink, "after wake".into(), &turn, &events)
+                .transpose()
+                .unwrap()
+                .is_some()
+        );
+        assert!(!sink.is_empty());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(DriverEvent::SteerAccepted { message }) if message == "after wake"
+        ));
+    }
+
+    #[test]
+    fn task_output_tails_stop_when_tasks_vanish_without_task_notification() {
+        let (events, _event_rx, commands, _command_rx, turn, mut state) = harness();
+        let bg_stop = Arc::new(AtomicBool::new(false));
+        let fg_stop = Arc::new(AtomicBool::new(false));
+        state.live_tasks.insert("bg-1".into());
+        state.task_output_tails.0.insert("bg-1".into(), bg_stop.clone());
+        state.task_output_tails.0.insert("fg-1".into(), fg_stop.clone());
+
+        // `background_tasks_changed` drops `bg-1` without a `task_notification`,
+        // while foreground `fg-1` stays untouched until the turn settles.
+        handle_message(
+            &json!({"type": "system", "subtype": "background_tasks_changed", "tasks": []}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        assert!(bg_stop.load(Ordering::Acquire));
+        assert!(!state.task_output_tails.0.contains_key("bg-1"));
+        assert!(!fg_stop.load(Ordering::Acquire));
+
+        // When the turn settles via `result`, any unnotified foreground tail stops too.
+        handle_message(
+            &json!({"type": "result", "is_error": false, "stop_reason": "end_turn"}),
+            "s",
+            &events,
+            &commands,
+            &turn,
+            RuntimeMode::FullAccess,
+            &mut state,
+        );
+        assert!(fg_stop.load(Ordering::Acquire));
+        assert!(state.task_output_tails.0.is_empty());
+    }
+
+    #[test]
+    fn shutdown_grace_terminates_wedged_process_tree() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("cmd.exe");
+            cmd.args(["/d", "/c", "ping -n 60 127.0.0.1"]);
+            cmd
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("/bin/sh");
+            cmd.args(["-c", "sleep 60"]);
+            cmd
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+
+        let mut child = crate::command_env::spawn(&mut command).unwrap();
+        let lifecycle = Arc::new(ProcessLifecycle::adopt(&child));
+        let mut stdout = child.stdout.take().expect("stdout pipe");
+        thread::sleep(Duration::from_millis(400));
+
+        let reaper_lifecycle = lifecycle.clone();
+        let reaper = thread::spawn(move || {
+            let _ = child.wait();
+            reaper_lifecycle.mark_exited();
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut drained = Vec::new();
+            let _ = stdout.read_to_end(&mut drained);
+            let _ = done_tx.send(());
+        });
+
+        lifecycle.request_shutdown_after_grace(Duration::from_millis(80));
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wedged child and grandchild must terminate after shutdown grace");
+        reader.join().unwrap();
+        reaper.join().unwrap();
+        assert!(lifecycle.was_terminated());
     }
 }

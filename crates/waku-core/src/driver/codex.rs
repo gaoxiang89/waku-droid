@@ -4,13 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
-use crossbeam_channel::{Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select, unbounded};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 #[cfg(test)]
@@ -130,12 +131,352 @@ impl BackgroundRpcState {
     }
 }
 
+const SHUTDOWN_EXIT_GRACE: Duration = Duration::from_secs(2);
+const CODEX_INIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ThreadIdStatus {
+    Pending,
+    Ready(String),
+    Failed,
+}
+
+struct ThreadIdState {
+    status: std::sync::Mutex<ThreadIdStatus>,
+    changed: Condvar,
+}
+
+impl Default for ThreadIdState {
+    fn default() -> Self {
+        Self {
+            status: std::sync::Mutex::new(ThreadIdStatus::Pending),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl ThreadIdState {
+    #[cfg(test)]
+    fn ready(thread_id: impl Into<String>) -> Self {
+        Self {
+            status: std::sync::Mutex::new(ThreadIdStatus::Ready(thread_id.into())),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn current(&self) -> Option<String> {
+        match &*self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            ThreadIdStatus::Ready(id) => Some(id.clone()),
+            ThreadIdStatus::Pending | ThreadIdStatus::Failed => None,
+        }
+    }
+
+    fn set_ready(&self, thread_id: String) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *status = ThreadIdStatus::Ready(thread_id);
+        self.changed.notify_all();
+    }
+
+    fn mark_failed(&self) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*status, ThreadIdStatus::Pending) {
+            *status = ThreadIdStatus::Failed;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> Option<String> {
+        let guard = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (guard, _) = self
+            .changed
+            .wait_timeout_while(guard, timeout, |status| {
+                matches!(status, ThreadIdStatus::Pending)
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ThreadIdStatus::Ready(id) => Some(id.clone()),
+            ThreadIdStatus::Pending | ThreadIdStatus::Failed => None,
+        }
+    }
+}
+
+struct ProcessState {
+    exited: bool,
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+struct ProcessLifecycle {
+    state: std::sync::Mutex<ProcessState>,
+    exited_cv: Condvar,
+    terminated: AtomicBool,
+}
+
+impl ProcessLifecycle {
+    fn adopt(child: &Child) -> Self {
+        let pid = child.id();
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(pid).ok();
+        Self {
+            state: std::sync::Mutex::new(ProcessState {
+                exited: false,
+                pid,
+                #[cfg(windows)]
+                job,
+            }),
+            exited_cv: Condvar::new(),
+            terminated: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_exited(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.exited = true;
+        state.pid = 0;
+        #[cfg(windows)]
+        drop(state.job.take());
+        self.exited_cv.notify_all();
+    }
+
+    fn was_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    fn terminate_locked(state: &mut ProcessState, terminated: &AtomicBool) {
+        if state.exited || state.pid == 0 {
+            #[cfg(windows)]
+            drop(state.job.take());
+            return;
+        }
+        terminated.store(true, Ordering::Release);
+        let pid = state.pid;
+        state.pid = 0;
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(pid)
+            && pid > 0
+        {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            drop(state.job.take());
+            unsafe {
+                use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::{
+                    OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+                };
+                let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !process.is_null() {
+                    let _ = TerminateProcess(process, 1);
+                    CloseHandle(process);
+                }
+            }
+        }
+    }
+
+    fn terminate_now(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::terminate_locked(&mut state, &self.terminated);
+    }
+
+    fn request_shutdown_after_grace(self: &Arc<Self>, grace: Duration) {
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.exited {
+                return;
+            }
+        }
+        let process = self.clone();
+        let wait_and_terminate = move || {
+            let state = process
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut state, _) = process
+                .exited_cv
+                .wait_timeout_while(state, grace, |state| !state.exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.exited {
+                Self::terminate_locked(&mut state, &process.terminated);
+            }
+        };
+        if thread::Builder::new()
+            .name("waku-codex-shutdown".into())
+            .spawn(wait_and_terminate)
+            .is_err()
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut state, _) = self
+                .exited_cv
+                .wait_timeout_while(state, grace, |state| !state.exited)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.exited {
+                Self::terminate_locked(&mut state, &self.terminated);
+            }
+        }
+    }
+}
+
+struct StartupChildGuard {
+    child: Option<Child>,
+    process: Arc<ProcessLifecycle>,
+}
+
+impl StartupChildGuard {
+    fn new(child: Child, process: Arc<ProcessLifecycle>) -> Self {
+        Self {
+            child: Some(child),
+            process,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("startup child guard still owns child")
+    }
+
+    fn take_child(&mut self) -> Child {
+        self.child
+            .take()
+            .expect("startup child guard still owns child")
+    }
+}
+
+impl Drop for StartupChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.process.terminate_now();
+            let _ = child.kill();
+            let _ = child.wait();
+            self.process.mark_exited();
+        }
+    }
+}
+
+struct TitleChildGuard {
+    child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+}
+
+impl TitleChildGuard {
+    fn new(child: Child) -> Self {
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+        Self {
+            child: Some(child),
+            #[cfg(windows)]
+            job,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("title child guard still owns child")
+    }
+
+    fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            if let Ok(pid) = i32::try_from(child.id())
+                && pid > 0
+            {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            #[cfg(windows)]
+            drop(self.job.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        } else {
+            #[cfg(windows)]
+            drop(self.job.take());
+        }
+    }
+}
+
+impl Drop for TitleChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+struct ComputerUseStartupGuard {
+    process_directory: Option<PathBuf>,
+    server_path: Option<PathBuf>,
+    preview_monitor: Option<computer_use_runtime::ComputerUsePreviewMonitor>,
+}
+
+impl Drop for ComputerUseStartupGuard {
+    fn drop(&mut self) {
+        if let (Some(directory), Some(server_path)) = (
+            self.process_directory.as_deref(),
+            self.server_path.as_deref(),
+        ) {
+            computer_use_runtime::shutdown_process_directory(
+                directory,
+                server_path,
+                &mut self.preview_monitor,
+            );
+        } else {
+            drop(self.preview_monitor.take());
+            if let Some(directory) = self.process_directory.as_deref() {
+                let _ = fs::remove_dir_all(directory);
+            }
+        }
+    }
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 pub struct CodexDriver {
     commands: Sender<CommandMessage>,
     binary: PathBuf,
     cwd: PathBuf,
     config_dir: Option<PathBuf>,
     mode: RuntimeMode,
+    thread_id: Arc<ThreadIdState>,
+    shutdown: Option<Sender<()>>,
+    process: Option<Arc<ProcessLifecycle>>,
     computer_use_process_directory: Option<PathBuf>,
     computer_use_server_path: Option<PathBuf>,
     computer_use_preview_monitor: Option<computer_use_runtime::ComputerUsePreviewMonitor>,
@@ -241,12 +582,15 @@ impl CodexDriver {
         let computer_use_skill_root = computer_use
             .as_ref()
             .map(|config| config.skill_root.clone());
-        let computer_use_process_directory = computer_use
-            .as_ref()
-            .map(|config| config.process_directory.clone());
-        let computer_use_server_path = computer_use
-            .as_ref()
-            .map(|config| config.server_path.clone());
+        let mut computer_use_guard = ComputerUseStartupGuard {
+            process_directory: computer_use
+                .as_ref()
+                .map(|config| config.process_directory.clone()),
+            server_path: computer_use
+                .as_ref()
+                .map(|config| config.server_path.clone()),
+            preview_monitor: None,
+        };
         let title_binary = binary.clone();
         let title_cwd = cwd.clone();
         let title_config_dir = config_dir.clone();
@@ -263,22 +607,29 @@ impl CodexDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child =
+        isolate_process_group(command);
+        let child =
             crate::command_env::spawn(command).context("failed to start `codex app-server`")?;
+        let process = Arc::new(ProcessLifecycle::adopt(&child));
+        let mut child_guard = StartupChildGuard::new(child, process.clone());
 
-        let stdin = child
+        let stdin = child_guard
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| anyhow!("Codex stdin unavailable"))?;
-        let stdout = child
+        let stdout = child_guard
+            .child_mut()
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Codex stdout unavailable"))?;
-        let stderr = child
+        let stderr = child_guard
+            .child_mut()
             .stderr
             .take()
             .ok_or_else(|| anyhow!("Codex stderr unavailable"))?;
-        let computer_use_preview_monitor = computer_use_process_directory
+        computer_use_guard.preview_monitor = computer_use_guard
+            .process_directory
             .as_ref()
             .map(|directory| {
                 computer_use_runtime::ComputerUsePreviewMonitor::start(
@@ -288,7 +639,9 @@ impl CodexDriver {
             })
             .transpose()?;
         let (commands, command_rx) = unbounded();
-        let thread_id = Arc::new(Mutex::new(None::<String>));
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
+        let (init_tx, init_rx) = bounded::<Result<(), String>>(1);
+        let thread_id = Arc::new(ThreadIdState::default());
         let turn_id = Arc::new(Mutex::new(None::<String>));
         let turn_ids = Arc::new(Mutex::new(Vec::<String>::new()));
         let pending_rollbacks = Arc::new(Mutex::new(HashMap::<
@@ -312,6 +665,7 @@ impl CodexDriver {
         let writer_background_rpcs = background_rpcs.clone();
         let writer_goal_rpcs = goal_rpcs.clone();
         let writer_title_generation = title_generation.clone();
+        let writer_shutdown_rx = shutdown_rx.clone();
         let writer_events = events.clone();
         let cwd_string = cwd.display().to_string();
         thread::Builder::new()
@@ -332,16 +686,40 @@ impl CodexDriver {
                         }
                     }
                 });
-                if write_json_line(&mut stdin, &initialize).is_err()
-                    || write_json_line(
-                        &mut stdin,
-                        &json!({
-                            "method": "initialized",
-                            "params": {}
-                        }),
-                    )
-                    .is_err()
+                if write_json_line(&mut stdin, &initialize).is_err() {
+                    writer_thread_id.mark_failed();
+                    let _ = writer_events.send(DriverEvent::Error(tr!(
+                        "errors.initialize_codex_app_server"
+                    )));
+                    return;
+                }
+                let init_result = select! {
+                    recv(writer_shutdown_rx) -> _ => {
+                        writer_thread_id.mark_failed();
+                        return;
+                    }
+                    recv(init_rx) -> result => match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(tr!("errors.initialize_codex_app_server")),
+                    },
+                    default(CODEX_INIT_TIMEOUT) => Err(tr!("errors.initialize_codex_app_server")),
+                };
+                if let Err(error) = init_result {
+                    writer_thread_id.mark_failed();
+                    let _ = writer_events.send(DriverEvent::Error(error));
+                    return;
+                }
+                if write_json_line(
+                    &mut stdin,
+                    &json!({
+                        "method": "initialized",
+                        "params": {}
+                    }),
+                )
+                .is_err()
                 {
+                    writer_thread_id.mark_failed();
                     let _ = writer_events.send(DriverEvent::Error(tr!(
                         "errors.initialize_codex_app_server"
                     )));
@@ -364,6 +742,7 @@ impl CodexDriver {
                     )
                     .is_err()
                     {
+                        writer_thread_id.mark_failed();
                         let _ = writer_events.send(DriverEvent::Error(tr!(
                             "errors.register_computer_use_skill"
                         )));
@@ -418,7 +797,15 @@ impl CodexDriver {
                         "params": params
                     })
                 };
-                let _ = write_json_line(&mut stdin, &open_thread);
+                if let Err(error) = write_json_line(&mut stdin, &open_thread) {
+                    writer_thread_id.mark_failed();
+                    let _ = writer_events.send(DriverEvent::Error(tr!(
+                        "errors.provider_transport_write",
+                        provider = "Codex",
+                        error = error
+                    )));
+                    return;
+                }
 
                 let mut next_request_id = 10_u64;
                 while let Ok(command) = command_rx.recv() {
@@ -463,7 +850,7 @@ impl CodexDriver {
                         }
                         CommandMessage::Steer(text) => {
                             let (thread_id, active_turn_id) = (
-                                writer_thread_id.lock().clone(),
+                                writer_thread_id.current(),
                                 writer_turn_id.lock().clone(),
                             );
                             let (Some(thread_id), Some(expected_turn_id)) =
@@ -508,7 +895,7 @@ impl CodexDriver {
                         }
                         CommandMessage::Cancel => {
                             let (Some(thread_id), Some(turn_id)) = (
-                                writer_thread_id.lock().clone(),
+                                writer_thread_id.current(),
                                 writer_turn_id.lock().clone(),
                             ) else {
                                 continue;
@@ -746,12 +1133,16 @@ impl CodexDriver {
         let reader_background_rpcs = background_rpcs.clone();
         let reader_goal_rpcs = goal_rpcs.clone();
         let reader_title_generation = title_generation;
+        let reader_shutdown_rx = shutdown_rx;
         let reader_commands = commands.clone();
         let reader_events = events.clone();
         let reader_thread = thread::Builder::new()
             .name("waku-codex-reader".into())
             .spawn(move || {
-                let mut stream_state = CodexStreamState::default();
+                let mut stream_state = CodexStreamState {
+                    init_response: Some(init_tx),
+                    ..CodexStreamState::default()
+                };
                 for line in BufReader::new(stdout).lines() {
                     match line {
                         Ok(line) if !line.trim().is_empty() => {
@@ -759,7 +1150,7 @@ impl CodexDriver {
                                 Ok(value) => {
                                     let main_turn_started = is_codex_turn_started(
                                         &value,
-                                        reader_thread_id.lock().as_deref(),
+                                        reader_thread_id.current().as_deref(),
                                     );
                                     handle_codex_message(
                                         value,
@@ -774,7 +1165,12 @@ impl CodexDriver {
                                         &reader_events,
                                         &mut stream_state,
                                     );
-                                    if main_turn_started {
+                                    if main_turn_started
+                                        && !matches!(
+                                            reader_shutdown_rx.try_recv(),
+                                            Ok(()) | Err(TryRecvError::Disconnected)
+                                        )
+                                    {
                                         let request = {
                                             let mut title = reader_title_generation.lock();
                                             if title.enabled && !title.launched {
@@ -790,6 +1186,7 @@ impl CodexDriver {
                                             let cwd = title_cwd.clone();
                                             let config_dir = title_config_dir.clone();
                                             let commands = reader_commands.clone();
+                                            let cancel_rx = reader_shutdown_rx.clone();
                                             let _ = thread::Builder::new()
                                                 .name("waku-codex-title".into())
                                                 .spawn(move || {
@@ -798,6 +1195,7 @@ impl CodexDriver {
                                                         &cwd,
                                                         config_dir.as_deref(),
                                                         &request.prompt,
+                                                        &cancel_rx,
                                                     ) {
                                                         let _ = commands.send(
                                                             CommandMessage::GeneratedTitle(title),
@@ -827,6 +1225,7 @@ impl CodexDriver {
                         }
                     }
                 }
+                reader_thread_id.mark_failed();
             })?;
 
         let last_visible_stderr = Arc::new(Mutex::new(None::<String>));
@@ -844,28 +1243,38 @@ impl CodexDriver {
                 }
             })?;
 
+        let process_lifecycle = process.clone();
+        let process_thread_id = thread_id.clone();
         thread::Builder::new()
             .name("waku-codex-process".into())
             .spawn(move || {
+                let mut child = child_guard.take_child();
                 let status = child.wait();
+                process_lifecycle.mark_exited();
+                drop(child);
                 let _ = reader_thread.join();
                 let _ = stderr_thread.join();
-                match status {
-                    Ok(status) if !status.success() && last_visible_stderr.lock().is_none() => {
-                        let _ = events.send(DriverEvent::Error(tr!(
-                            "errors.provider_exited",
-                            provider = "Codex app-server",
-                            status = status
-                        )));
+                process_thread_id.mark_failed();
+                if !process_lifecycle.was_terminated() {
+                    match status {
+                        Ok(status)
+                            if !status.success() && last_visible_stderr.lock().is_none() =>
+                        {
+                            let _ = events.send(DriverEvent::Error(tr!(
+                                "errors.provider_exited",
+                                provider = "Codex app-server",
+                                status = status
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = events.send(DriverEvent::Error(tr!(
+                                "errors.read_provider_exit_status",
+                                provider = "Codex app-server",
+                                error = error
+                            )));
+                        }
+                        _ => {}
                     }
-                    Err(error) => {
-                        let _ = events.send(DriverEvent::Error(tr!(
-                            "errors.read_provider_exit_status",
-                            provider = "Codex app-server",
-                            error = error
-                        )));
-                    }
-                    _ => {}
                 }
                 let _ = events.send(DriverEvent::ProcessExited);
             })?;
@@ -876,9 +1285,12 @@ impl CodexDriver {
             cwd,
             config_dir,
             mode,
-            computer_use_process_directory,
-            computer_use_server_path,
-            computer_use_preview_monitor,
+            thread_id,
+            shutdown: Some(shutdown_tx),
+            process: Some(process),
+            computer_use_process_directory: computer_use_guard.process_directory.take(),
+            computer_use_server_path: computer_use_guard.server_path.take(),
+            computer_use_preview_monitor: computer_use_guard.preview_monitor.take(),
         })
     }
 }
@@ -1108,12 +1520,27 @@ impl DriverControl for CodexDriver {
 
 impl Drop for CodexDriver {
     fn drop(&mut self) {
-        self.cancel_computer_use();
-        drop(self.computer_use_preview_monitor.take());
-        if let Some(directory) = self.computer_use_process_directory.as_deref() {
-            let _ = fs::remove_dir_all(directory);
+        self.shutdown.take();
+        self.thread_id.mark_failed();
+        if let (Some(directory), Some(server_path)) = (
+            self.computer_use_process_directory.as_deref(),
+            self.computer_use_server_path.as_deref(),
+        ) {
+            computer_use_runtime::shutdown_process_directory(
+                directory,
+                server_path,
+                &mut self.computer_use_preview_monitor,
+            );
+        } else {
+            drop(self.computer_use_preview_monitor.take());
+            if let Some(directory) = self.computer_use_process_directory.as_deref() {
+                let _ = fs::remove_dir_all(directory);
+            }
         }
         let _ = self.commands.send(CommandMessage::Shutdown);
+        if let Some(process) = &self.process {
+            process.request_shutdown_after_grace(SHUTDOWN_EXIT_GRACE);
+        }
     }
 }
 
@@ -1177,7 +1604,14 @@ fn generate_codex_title(
     cwd: &Path,
     config_dir: Option<&Path>,
     prompt: &str,
+    cancel_rx: &Receiver<()>,
 ) -> anyhow::Result<String> {
+    if matches!(
+        cancel_rx.try_recv(),
+        Ok(()) | Err(TryRecvError::Disconnected)
+    ) {
+        return Err(anyhow!("Codex title generation cancelled"));
+    }
     let mut command = crate::command_env::command(binary);
     crate::command_env::apply_provider_config_dir(
         &mut command,
@@ -1190,13 +1624,17 @@ fn generate_codex_title(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child =
+    isolate_process_group(command);
+    let child =
         crate::command_env::spawn(command).context("failed to start Codex title generation")?;
-    let mut stdin = child
+    let mut process = TitleChildGuard::new(child);
+    let mut stdin = process
+        .child_mut()
         .stdin
         .take()
         .ok_or_else(|| anyhow!("Codex title generation stdin is unavailable"))?;
-    let stdout = child
+    let stdout = process
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| anyhow!("Codex title generation stdout is unavailable"))?;
@@ -1212,6 +1650,18 @@ fn generate_codex_title(
         })?;
 
     let result = (|| -> anyhow::Result<String> {
+        let deadline = Instant::now() + CODEX_TITLE_TIMEOUT;
+        let recv_message = || -> anyhow::Result<Value> {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("Codex title generation timed out"))?;
+            select! {
+                recv(cancel_rx) -> _ => Err(anyhow!("Codex title generation cancelled")),
+                recv(message_rx) -> message => message.context("Codex title generation stopped before completion"),
+                default(remaining) => Err(anyhow!("Codex title generation timed out")),
+            }
+        };
+
         write_json_line(
             &mut stdin,
             &json!({
@@ -1227,8 +1677,20 @@ fn generate_codex_title(
                 }
             }),
         )?;
-        write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
 
+        loop {
+            let value = recv_message()?;
+            if value.get("id").and_then(Value::as_u64) == Some(0) && value.get("method").is_none() {
+                if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+                    return Err(anyhow!(
+                        "Codex title generation initialize failed: {error}"
+                    ));
+                }
+                break;
+            }
+        }
+
+        write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
         write_json_line(
             &mut stdin,
             &json!({
@@ -1238,16 +1700,10 @@ fn generate_codex_title(
             }),
         )?;
 
-        let deadline = Instant::now() + CODEX_TITLE_TIMEOUT;
         let mut title_thread_id = None::<String>;
         let mut generated = None::<String>;
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| anyhow!("Codex title generation timed out"))?;
-            let value = message_rx
-                .recv_timeout(remaining)
-                .context("Codex title generation stopped before completion")?;
+            let value = recv_message()?;
 
             if value.get("id").and_then(Value::as_u64) == Some(1) && value.get("method").is_none() {
                 if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
@@ -1267,6 +1723,13 @@ fn generate_codex_title(
                         "params": codex_title_turn_params(&thread_id, prompt)
                     }),
                 )?;
+                continue;
+            }
+
+            if value.get("id").and_then(Value::as_u64) == Some(2) && value.get("method").is_none() {
+                if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+                    return Err(anyhow!("Codex could not start a title turn: {error}"));
+                }
                 continue;
             }
 
@@ -1305,8 +1768,7 @@ fn generate_codex_title(
     })();
 
     drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
+    process.terminate();
     let _ = reader.join();
     result
 }
@@ -1347,14 +1809,8 @@ fn normalize_codex_title(raw: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn wait_for_thread_id(thread_id: &Mutex<Option<String>>) -> Option<String> {
-    for _ in 0..500 {
-        if let Some(thread_id) = thread_id.lock().clone() {
-            return Some(thread_id);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    None
+fn wait_for_thread_id(thread_id: &ThreadIdState) -> Option<String> {
+    thread_id.wait_timeout(Duration::from_secs(10))
 }
 
 fn fork_last_turn_id(turn_ids: &[String], turns_to_remove: usize) -> Result<String, String> {
@@ -1378,6 +1834,8 @@ struct CodexStreamState {
     next_citation_number: usize,
     /// Item id and part index of the reasoning chunk currently streaming.
     reasoning_part: Option<(String, u64)>,
+    /// One-shot handshake signal resolved by the `initialize` (`id: 0`) response.
+    init_response: Option<Sender<Result<(), String>>>,
 }
 
 impl CodexStreamState {
@@ -1455,7 +1913,11 @@ impl CodexStreamState {
 
         let mut links = Vec::new();
         for reference in parts.filter(|part| !part.is_empty()) {
-            let Some(url) = self.citations.get(reference).cloned() else {
+            let Some(destination) = self
+                .citations
+                .get(reference)
+                .and_then(|url| markdown_link_destination(url))
+            else {
                 continue;
             };
             let number = *self
@@ -1466,16 +1928,43 @@ impl CodexStreamState {
                     self.next_citation_number += 1;
                     number
                 });
-            links.push(format!("[{number}]({})", markdown_link_destination(&url)));
+            links.push(format!("[{number}]({destination})"));
         }
         links.join(" ")
     }
 }
 
-fn markdown_link_destination(url: &str) -> String {
-    url.replace('\\', "\\\\")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
+fn markdown_link_destination(url: &str) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let remainder = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    if remainder.is_empty() || url.chars().any(char::is_control) {
+        return None;
+    }
+    let mut sanitized = String::with_capacity(url.len());
+    for character in url.chars() {
+        match character {
+            '\\' => sanitized.push_str("\\\\"),
+            '(' => sanitized.push_str("\\("),
+            ')' => sanitized.push_str("\\)"),
+            '[' => sanitized.push_str("%5B"),
+            ']' => sanitized.push_str("%5D"),
+            '<' => sanitized.push_str("%3C"),
+            '>' => sanitized.push_str("%3E"),
+            c if c.is_whitespace() => {
+                let mut utf8 = [0_u8; 4];
+                for byte in c.encode_utf8(&mut utf8).as_bytes() {
+                    let _ = write!(sanitized, "%{byte:02X}");
+                }
+            }
+            _ => sanitized.push(character),
+        }
+    }
+    Some(sanitized)
 }
 
 fn json_id(value: Option<&Value>) -> Option<String> {
@@ -1641,11 +2130,24 @@ fn codex_subagent_work(item: &Value) -> Vec<BackgroundWorkItem> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+fn matches_current_thread(params: &Value, current_thread_id: Option<&str>) -> bool {
+    let Some(current) = current_thread_id else {
+        return true;
+    };
+    let Some(notification_thread_id) = params
+        .get("threadId")
+        .or_else(|| params.pointer("/turn/threadId"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    notification_thread_id == current
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_codex_message(
     value: Value,
-    thread_id: &Mutex<Option<String>>,
+    thread_id: &ThreadIdState,
     turn_id: &Mutex<Option<String>>,
     turn_ids: &Mutex<Vec<String>>,
     pending_rollbacks: &Mutex<HashMap<u64, (usize, Sender<Result<(), String>>)>>,
@@ -1660,6 +2162,18 @@ fn handle_codex_message(
     // the same numeric ID as one of Waku's earlier requests. Only messages
     // without a method are responses to Waku-originated requests.
     let is_response = value.get("method").is_none();
+    if is_response && value.get("id").and_then(Value::as_u64) == Some(0) {
+        if let Some(init_tx) = stream_state.init_response.take() {
+            let result = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map_or_else(|| Ok(()), |error| Err(error.to_owned()));
+            let _ = init_tx.send(result);
+        } else if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+            let _ = events.send(DriverEvent::Error(error.to_owned()));
+        }
+        return;
+    }
     let pending_goal = is_response
         .then(|| value.get("id").and_then(Value::as_u64))
         .flatten()
@@ -1765,7 +2279,11 @@ fn handle_codex_message(
     }
 
     if is_response && value.get("id").and_then(Value::as_u64) == Some(1) {
-        if let Some(id) = value.pointer("/result/thread/id").and_then(Value::as_str) {
+        if let Some(id) = value
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
             *turn_ids.lock() = value
                 .pointer("/result/thread/turns")
                 .and_then(Value::as_array)
@@ -1773,7 +2291,7 @@ fn handle_codex_message(
                 .flatten()
                 .filter_map(|turn| turn.get("id").and_then(Value::as_str).map(str::to_owned))
                 .collect();
-            *thread_id.lock() = Some(id.to_owned());
+            thread_id.set_ready(id.to_owned());
             if let Some(title) = value
                 .pointer("/result/thread/name")
                 .and_then(Value::as_str)
@@ -1789,8 +2307,11 @@ fn handle_codex_message(
             // A resumed thread may carry a goal set in an earlier run; probe
             // once so the client shows it without waiting for a notification.
             let _ = commands.send(CommandMessage::Goal(GoalOperation::Refresh));
-        } else if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
-            let _ = events.send(DriverEvent::Error(error.to_owned()));
+        } else {
+            thread_id.mark_failed();
+            if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+                let _ = events.send(DriverEvent::Error(error.to_owned()));
+            }
         }
         return;
     }
@@ -1802,6 +2323,15 @@ fn handle_codex_message(
         return;
     };
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let current_thread_id = thread_id.current();
+    if value.get("id").is_none()
+        && (method.starts_with("turn/")
+            || method.starts_with("item/")
+            || method == "thread/tokenUsage/updated")
+        && !matches_current_thread(&params, current_thread_id.as_deref())
+    {
+        return;
+    }
 
     match method {
         "turn/started" => {
@@ -1924,7 +2454,6 @@ fn handle_codex_message(
             });
         }
         "thread/name/updated" => {
-            let current_thread_id = thread_id.lock().clone();
             if params.get("threadId").and_then(Value::as_str) == current_thread_id.as_deref() {
                 let title = params
                     .get("threadName")
@@ -1958,14 +2487,14 @@ fn handle_codex_message(
             }
         }
         "thread/goal/updated" => {
-            if params.get("threadId").and_then(Value::as_str) == thread_id.lock().as_deref()
+            if params.get("threadId").and_then(Value::as_str) == current_thread_id.as_deref()
                 && let Some(goal) = params.get("goal").and_then(parse_thread_goal)
             {
                 let _ = events.send(DriverEvent::GoalUpdated(Some(goal)));
             }
         }
         "thread/goal/cleared" => {
-            if params.get("threadId").and_then(Value::as_str) == thread_id.lock().as_deref() {
+            if params.get("threadId").and_then(Value::as_str) == current_thread_id.as_deref() {
                 let _ = events.send(DriverEvent::GoalUpdated(None));
             }
         }
@@ -1983,10 +2512,18 @@ fn handle_codex_message(
             }
         }
         "item/tool/requestUserInput" if value.get("id").is_some() => {
+            let request_id = rpc_id_string(value.get("id").unwrap());
             let questions = codex_user_input_questions(&params);
-            if !questions.is_empty() {
+            if questions.is_empty() {
+                // Always answer JSON-RPC requests so the app-server never hangs
+                // waiting on an unacknowledged request ID.
+                let _ = commands.send(CommandMessage::RespondUserInput {
+                    request_id,
+                    answers: Vec::new(),
+                });
+            } else {
                 let _ = events.send(DriverEvent::UserInputRequested {
-                    request_id: rpc_id_string(value.get("id").unwrap()),
+                    request_id,
                     questions,
                 });
             }
@@ -2682,7 +3219,7 @@ mod tests {
     }
 
     struct GoalHarness {
-        thread_id: Mutex<Option<String>>,
+        thread_id: ThreadIdState,
         turn_id: Mutex<Option<String>>,
         turn_ids: Mutex<Vec<String>>,
         rollbacks: Mutex<HashMap<u64, (usize, Sender<Result<(), String>>)>>,
@@ -2700,7 +3237,7 @@ mod tests {
             let (events, received) = crate::driver::test_event_channel();
             let (commands, command_rx) = unbounded();
             Self {
-                thread_id: Mutex::new(Some("thread-1".to_owned())),
+                thread_id: ThreadIdState::ready("thread-1"),
                 turn_id: Mutex::new(None),
                 turn_ids: Mutex::new(Vec::new()),
                 rollbacks: Mutex::new(HashMap::new()),
@@ -2934,11 +3471,13 @@ mod tests {
     #[ignore = "requires an installed, authenticated codex"]
     fn codex_title_generation_against_the_real_cli() {
         let binary = crate::command_env::find_executable("codex").expect("codex is not installed");
+        let (_cancel_tx, cancel_rx) = bounded(0);
         let title = generate_codex_title(
             &binary,
             &std::env::temp_dir(),
             None,
             "Find why provider-generated task titles never replace the first prompt and fix it.",
+            &cancel_rx,
         )
         .expect("Codex should generate a task title");
         assert!(!title.is_empty());
@@ -2999,6 +3538,9 @@ mod tests {
             cwd: std::env::temp_dir(),
             config_dir: None,
             mode: RuntimeMode::FullAccess,
+            thread_id: Arc::new(ThreadIdState::default()),
+            shutdown: None,
+            process: None,
             computer_use_process_directory: None,
             computer_use_server_path: None,
             computer_use_preview_monitor: None,
@@ -3137,7 +3679,7 @@ mod tests {
 
     #[test]
     fn provider_thread_names_are_forwarded_only_for_the_current_thread() {
-        let thread_id = Mutex::new(None);
+        let thread_id = ThreadIdState::default();
         let turn_id = Mutex::new(None);
         let turn_ids = Mutex::new(Vec::new());
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3204,7 +3746,7 @@ mod tests {
 
     #[test]
     fn rollback_rpc_responses_are_routed_to_the_waiting_request() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(None);
         let turn_ids = Mutex::new(vec!["turn-1".to_owned(), "turn-2".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3239,7 +3781,7 @@ mod tests {
 
     #[test]
     fn rollback_rpc_errors_are_returned_without_becoming_stream_errors() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(None);
         let turn_ids = Mutex::new(vec!["turn-1".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3278,7 +3820,7 @@ mod tests {
     fn reasoning_parts_are_separated_from_each_other() {
         // Codex numbers reasoning parts but sends no separator with the deltas, so
         // appending them verbatim runs the headers together as `**one****two**`.
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(Some("turn-1".to_owned()));
         let turn_ids = Mutex::new(vec!["turn-1".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3335,7 +3877,7 @@ mod tests {
 
     #[test]
     fn steer_rpc_success_is_reported_as_an_accepted_steer() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(Some("turn-9".to_owned()));
         let turn_ids = Mutex::new(vec!["turn-9".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3375,7 +3917,7 @@ mod tests {
 
     #[test]
     fn steer_rpc_errors_fall_back_to_a_rejected_steer() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(Some("turn-9".to_owned()));
         let turn_ids = Mutex::new(vec!["turn-9".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3441,7 +3983,7 @@ mod tests {
 
     #[test]
     fn background_terminal_list_responses_reconcile_the_registry() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(None);
         let turn_ids = Mutex::new(Vec::new());
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3551,7 +4093,7 @@ mod tests {
 
     #[test]
     fn mcp_activity_keeps_native_server_and_tool_names() {
-        let thread_id = Mutex::new(Some("thread-1".to_owned()));
+        let thread_id = ThreadIdState::ready("thread-1");
         let turn_id = Mutex::new(Some("turn-9".to_owned()));
         let turn_ids = Mutex::new(vec!["turn-9".to_owned()]);
         let pending_rollbacks = Mutex::new(HashMap::new());
@@ -3844,5 +4386,283 @@ mod tests {
 
         assert!(codex_plan_usage(Some(&json!({"planType": "plus"}))).is_none());
         assert!(codex_plan_usage(None).is_none());
+    }
+
+    #[test]
+    fn subagent_notifications_for_other_threads_are_filtered_out() {
+        let harness = GoalHarness::new();
+        *harness.turn_id.lock() = Some("main-turn".to_owned());
+
+        let foreign = [
+            json!({"method": "turn/started", "params": {"threadId": "subagent-thread", "turn": {"id": "sub-turn"}}}),
+            json!({"method": "item/agentMessage/delta", "params": {"threadId": "subagent-thread", "delta": "subagent text"}}),
+            json!({"method": "item/reasoning/summaryTextDelta", "params": {"threadId": "subagent-thread", "itemId": "r1", "summaryIndex": 0, "delta": "subagent thought"}}),
+            json!({"method": "item/commandExecution/outputDelta", "params": {"threadId": "subagent-thread", "itemId": "c1", "delta": "subagent stdout"}}),
+            json!({"method": "item/started", "params": {"threadId": "subagent-thread", "item": {"id": "cmd-1", "type": "commandExecution", "command": "echo sub"}}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"threadId": "subagent-thread", "tokenUsage": {"last": {"totalTokens": 9999}, "modelContextWindow": 128000}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "subagent-thread", "turn": {"status": "completed"}}}),
+        ];
+        for message in foreign {
+            harness.handle(message);
+        }
+
+        assert!(
+            harness.received.try_recv().is_err(),
+            "notifications for another threadId must not leak into the main session"
+        );
+        assert_eq!(
+            harness.turn_id.lock().as_deref(),
+            Some("main-turn"),
+            "subagent turn/started and turn/completed must not overwrite or clear the main turn_id"
+        );
+
+        // Notifications for the current thread continue to flow normally.
+        harness.handle(json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": {"last": {"totalTokens": 420}, "modelContextWindow": 200000}
+            }
+        }));
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::UsageUpdated {
+                context_tokens: Some(420),
+                context_window: Some(200_000)
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_user_input_request_replies_instead_of_dropping_jsonrpc_id() {
+        let harness = GoalHarness::new();
+        harness.handle(json!({
+            "id": 77,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1",
+                "questions": [{"id": "q1", "question": "   "}]
+            }
+        }));
+
+        assert!(harness.received.try_recv().is_err());
+        assert!(matches!(
+            harness.command_rx.try_recv(),
+            Ok(CommandMessage::RespondUserInput { request_id, answers })
+                if request_id == "77" && answers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn wait_for_thread_id_aborts_immediately_when_thread_open_fails() {
+        let harness = GoalHarness {
+            thread_id: ThreadIdState::default(),
+            ..GoalHarness::new()
+        };
+        harness.handle(json!({
+            "id": 1,
+            "error": {"message": "thread resume failed"}
+        }));
+
+        assert!(matches!(
+            harness.received.try_recv(),
+            Ok(DriverEvent::Error(message)) if message == "thread resume failed"
+        ));
+        let started = Instant::now();
+        assert_eq!(wait_for_thread_id(&harness.thread_id), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "wait_for_thread_id must abort immediately after id: 1 fails"
+        );
+    }
+
+    #[test]
+    fn initialize_response_resolves_handshake_channel() {
+        let harness = GoalHarness {
+            thread_id: ThreadIdState::default(),
+            ..GoalHarness::new()
+        };
+        let (init_tx, init_rx) = bounded(1);
+        let mut stream_state = CodexStreamState {
+            init_response: Some(init_tx),
+            ..CodexStreamState::default()
+        };
+        handle_codex_message(
+            json!({"id": 0, "error": {"message": "unsupported protocol"}}),
+            &harness.thread_id,
+            &harness.turn_id,
+            &harness.turn_ids,
+            &harness.rollbacks,
+            &harness.steers,
+            &harness.background,
+            &harness.goals,
+            &harness.commands,
+            &harness.events,
+            &mut stream_state,
+        );
+        assert_eq!(
+            init_rx.try_recv().unwrap(),
+            Err("unsupported protocol".to_owned())
+        );
+    }
+
+    #[test]
+    fn citation_links_allow_only_http_https_and_escape_brackets_and_whitespace() {
+        assert_eq!(
+            markdown_link_destination("https://example.com/a [b] (c) d").as_deref(),
+            Some("https://example.com/a%20%5Bb%5D%20\\(c\\)%20d")
+        );
+        assert_eq!(
+            markdown_link_destination("HTTP://example.com/path").as_deref(),
+            Some("HTTP://example.com/path")
+        );
+        assert_eq!(markdown_link_destination("javascript:alert(1)"), None);
+        assert_eq!(markdown_link_destination("file:///etc/passwd"), None);
+        assert_eq!(markdown_link_destination("data:text/html,<h1>x</h1>"), None);
+        assert_eq!(markdown_link_destination("https://"), None);
+        assert_eq!(
+            markdown_link_destination("https://example.com/a\nb"),
+            None
+        );
+
+        let mut state = CodexStreamState::default();
+        state.begin_turn();
+        state.capture_citations(&json!({
+            "type": "webSearch",
+            "results": [
+                { "ref_id": "bad", "url": "javascript:alert(1)" },
+                { "ref_id": "good", "url": "https://example.com/doc [1]" }
+            ]
+        }));
+        assert_eq!(
+            state.rewrite_citation_delta("See\u{e200}cite\u{e202}bad\u{e202}good\u{e201}"),
+            "See [1](https://example.com/doc%20%5B1%5D)"
+        );
+    }
+
+    #[test]
+    fn generate_codex_title_fails_fast_on_initialize_error_and_cancels_on_drop() {
+        let dir = std::env::temp_dir().join(format!("waku-codex-title-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Script 1: rejects `initialize` (`id: 0`) immediately and stays open waiting for stdin.
+        #[cfg(windows)]
+        let (init_err_bin, hang_bin) = {
+            let err_bin = dir.join("init-err.cmd");
+            fs::write(
+                &err_bin,
+                "@echo off\r\n\
+                 set /p line=\r\n\
+                 echo {\"id\":0,\"error\":{\"message\":\"init rejected\"}}\r\n\
+                 ping -n 30 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+            let hang_bin = dir.join("hang.cmd");
+            fs::write(
+                &hang_bin,
+                "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n",
+            )
+            .unwrap();
+            (err_bin, hang_bin)
+        };
+        #[cfg(unix)]
+        let (init_err_bin, hang_bin) = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let err_bin = dir.join("init-err.sh");
+            fs::write(
+                &err_bin,
+                "#!/bin/sh\nIFS= read -r _\nprintf '{\"id\":0,\"error\":{\"message\":\"init rejected\"}}\\n'\nsleep 30\n",
+            )
+            .unwrap();
+            fs::set_permissions(&err_bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let hang_bin = dir.join("hang.sh");
+            fs::write(&hang_bin, "#!/bin/sh\nsleep 60\n").unwrap();
+            fs::set_permissions(&hang_bin, fs::Permissions::from_mode(0o755)).unwrap();
+            (err_bin, hang_bin)
+        };
+
+        let (_keep_alive, cancel_rx) = bounded(0);
+        let started = Instant::now();
+        let err = generate_codex_title(&init_err_bin, &dir, None, "test prompt", &cancel_rx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("init rejected"),
+            "expected initialize error, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "initialize error must fail immediately rather than waiting 60s"
+        );
+
+        let (cancel_tx, cancel_rx) = bounded(0);
+        let hang_dir = dir.clone();
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            generate_codex_title(&hang_bin, &hang_dir, None, "test prompt", &cancel_rx)
+        });
+        thread::sleep(Duration::from_millis(200));
+        drop(cancel_tx);
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected cancellation error, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "dropping cancel handle must terminate hung title helper promptly"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shutdown_grace_terminates_wedged_codex_process_tree() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("cmd.exe");
+            cmd.args(["/d", "/c", "ping -n 60 127.0.0.1"]);
+            cmd
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("/bin/sh");
+            cmd.args(["-c", "sleep 60"]);
+            cmd
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+
+        let mut child = crate::command_env::spawn(&mut command).unwrap();
+        let lifecycle = Arc::new(ProcessLifecycle::adopt(&child));
+        let mut stdout = child.stdout.take().expect("stdout pipe");
+        thread::sleep(Duration::from_millis(400));
+
+        let reaper_lifecycle = lifecycle.clone();
+        let reaper = thread::spawn(move || {
+            let _ = child.wait();
+            reaper_lifecycle.mark_exited();
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut drained = Vec::new();
+            let _ = stdout.read_to_end(&mut drained);
+            let _ = done_tx.send(());
+        });
+
+        lifecycle.request_shutdown_after_grace(Duration::from_millis(80));
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wedged child and grandchild must terminate after shutdown grace");
+        reader.join().unwrap();
+        reaper.join().unwrap();
+        assert!(lifecycle.was_terminated());
     }
 }

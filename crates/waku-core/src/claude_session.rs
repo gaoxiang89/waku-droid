@@ -1,6 +1,6 @@
 //! Claude native transcript and fork helpers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write};
 #[cfg(unix)]
@@ -86,14 +86,28 @@ pub fn provider_session_history(
     provider_session_history_in(&projects_directory_for(config_dir)?, session_id, turn_limit)
 }
 
+fn claude_config_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            crate::command_env::shell_environment()
+                .into_iter()
+                .find(|(name, value)| {
+                    #[cfg(windows)]
+                    let matches = name.to_string_lossy().eq_ignore_ascii_case("CLAUDE_CONFIG_DIR");
+                    #[cfg(not(windows))]
+                    let matches = name == "CLAUDE_CONFIG_DIR";
+                    matches && !value.is_empty()
+                })
+                .map(|(_, value)| value)
+        })
+        .map(PathBuf::from)
+}
+
 fn projects_directory_for(config_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     let config_directory = config_dir
         .map(Path::to_path_buf)
-        .or_else(|| {
-            std::env::var_os("CLAUDE_CONFIG_DIR")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
+        .or_else(claude_config_dir_from_env)
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
         .ok_or_else(|| anyhow!("Claude's configuration directory could not be located"))?;
     Ok(config_directory.join("projects"))
@@ -205,9 +219,10 @@ fn compact_import_entry(value: Value) -> Option<Value> {
 fn read_import_entries(path: &Path) -> anyhow::Result<Vec<Value>> {
     let file = fs::File::open(path)
         .with_context(|| format!("could not open Claude session {}", path.display()))?;
-    Ok(serde_json::Deserializer::from_reader(BufReader::new(file))
-        .into_iter::<Value>()
-        .filter_map(Result::ok)
+    Ok(BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
         .filter_map(compact_import_entry)
         .collect())
 }
@@ -472,38 +487,85 @@ fn list_provider_sessions_from_history(
             });
     }
 
-    let files = provider_session_files(projects_directory)?
-        .into_iter()
-        .filter_map(|(modified_at, path)| {
-            let session_id = path.file_stem()?.to_str()?.to_owned();
-            Some((session_id, (modified_at, path)))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut sessions = indexed
+    let mut files = HashMap::<String, (u64, PathBuf)>::new();
+    for (modified_at, path) in provider_session_files(projects_directory)? {
+        let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        files
+            .entry(session_id.to_owned())
+            .and_modify(|existing| {
+                if modified_at > existing.0 || (modified_at == existing.0 && path < existing.1) {
+                    *existing = (modified_at, path.clone());
+                }
+            })
+            .or_insert((modified_at, path));
+    }
+
+    // Sort and bound by known recency (history timestamp + file mtime) before
+    // paying up to 512 KiB of transcript I/O per candidate. Every candidate
+    // here has a valid fallback summary, so reading past the top window (plus
+    // any bounded ties at the cutoff) cannot rescue filtered-out entries.
+    let mut candidates = indexed
         .into_iter()
         .filter_map(|(session_id, indexed)| {
-            let (file_updated_at, path) = files.get(&session_id)?;
+            let (file_updated_at, path) = files.remove(&session_id)?;
             let fallback_title = title_from_prompt(&indexed.first_prompt)?;
-            let mut summary = session_summary_from_path(path).unwrap_or(ProviderSessionSummary {
-                cursor: ProviderResumeCursor::Claude {
-                    session_id: session_id.clone(),
-                    resume_at: None,
-                },
-                title: fallback_title,
-                cwd: indexed.cwd.clone(),
-                created_at: indexed.created_at,
-                updated_at: indexed.updated_at,
-            });
-            summary.cwd = indexed.cwd;
-            if indexed.created_at > 0 {
-                summary.created_at = summary.created_at.min(indexed.created_at);
-            }
-            summary.updated_at = summary
-                .updated_at
-                .max(indexed.updated_at)
-                .max(*file_updated_at);
-            Some(summary)
+            let estimated_updated_at = indexed.updated_at.max(file_updated_at);
+            Some((
+                estimated_updated_at,
+                session_id,
+                indexed,
+                file_updated_at,
+                path,
+                fallback_title,
+            ))
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.2.updated_at.cmp(&a.2.updated_at))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    if candidates.len() > limit {
+        let cutoff_recency = candidates[limit - 1].0;
+        let max_reads = limit.saturating_mul(2).max(limit.saturating_add(16));
+        let mut read_count = limit;
+        while read_count < candidates.len()
+            && read_count < max_reads
+            && candidates[read_count].0 == cutoff_recency
+        {
+            read_count += 1;
+        }
+        candidates.truncate(read_count);
+    }
+
+    let mut sessions = candidates
+        .into_iter()
+        .map(
+            |(_, session_id, indexed, file_updated_at, path, fallback_title)| {
+                let mut summary =
+                    session_summary_from_path(&path).unwrap_or(ProviderSessionSummary {
+                        cursor: ProviderResumeCursor::Claude {
+                            session_id: session_id.clone(),
+                            resume_at: None,
+                        },
+                        title: fallback_title,
+                        cwd: indexed.cwd.clone(),
+                        created_at: indexed.created_at,
+                        updated_at: indexed.updated_at,
+                    });
+                summary.cwd = indexed.cwd;
+                if indexed.created_at > 0 {
+                    summary.created_at = summary.created_at.min(indexed.created_at);
+                }
+                summary.updated_at = summary
+                    .updated_at
+                    .max(indexed.updated_at)
+                    .max(file_updated_at);
+                summary
+            },
+        )
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     sessions.truncate(limit);
@@ -656,7 +718,14 @@ fn active_chain(entries: &[Value]) -> Vec<&Map<String, Value>> {
         return Vec::new();
     };
     let mut chain = Vec::new();
+    let mut visited = HashSet::new();
     loop {
+        let Some(uuid) = current.get("uuid").and_then(Value::as_str) else {
+            break;
+        };
+        if !visited.insert(uuid) {
+            break;
+        }
         chain.push(current);
         let Some(parent) = current.get("parentUuid").and_then(Value::as_str) else {
             break;
@@ -774,7 +843,7 @@ fn fork_session_at_in(
         }
     }
 
-    let mut transcript = transcript_entries(&raw_entries);
+    let mut transcript = active_chain(&raw_entries);
     let cutoff = transcript
         .iter()
         .position(|entry| entry.get("uuid").and_then(Value::as_str) == Some(up_to_message_id))
@@ -835,7 +904,11 @@ fn fork_session_at_in(
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut new_parent = None;
+        let mut visited_parents = HashSet::from([old_uuid.to_owned()]);
         while let Some(parent) = parent_id {
+            if !visited_parents.insert(parent.clone()) {
+                break;
+            }
             let Some(parent_index) = by_uuid.get(&parent).copied() else {
                 break;
             };
@@ -1167,5 +1240,183 @@ mod tests {
 
         fs::remove_dir_all(root).ok();
         fs::remove_dir_all(empty_root).ok();
+    }
+
+    #[test]
+    fn active_chain_and_fork_terminate_on_cyclic_parent_uuids() {
+        let root =
+            std::env::temp_dir().join(format!("waku-claude-cycle-{}", Uuid::new_v4()));
+        let project = root.join("projects").join("-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        let source = project.join(format!("{SESSION}.jsonl"));
+
+        // Direct cycle between progress and user/assistant entries.
+        let entries = [
+            json!({"type":"progress","uuid":PROGRESS,"parentUuid":ASSISTANT_ONE,"sessionId":SESSION}),
+            json!({"type":"user","uuid":USER_ONE,"parentUuid":PROGRESS,"sessionId":SESSION,"message":{"role":"user","content":"first"}}),
+            json!({"type":"assistant","uuid":ASSISTANT_ONE,"parentUuid":USER_ONE,"sessionId":SESSION,"message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}),
+        ];
+        let mut file = fs::File::create(&source).unwrap();
+        for entry in &entries {
+            serde_json::to_writer(&mut file, entry).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let chain = active_chain(&entries);
+        assert_eq!(chain.len(), 3, "cycle must terminate after visiting each node once");
+
+        let fork = fork_session_at_in(&root.join("projects"), SESSION, ASSISTANT_ONE, "Cycle fork")
+            .expect("fork must not hang on cyclic progress parentUuid");
+        assert_eq!(fork.message_ids.len(), 3);
+        let fork_path = project.join(format!("{}.jsonl", fork.session_id));
+        let forked_entries = read_entries(&fork_path).unwrap();
+        let forked_transcript = transcript_entries(&forked_entries);
+        assert_eq!(forked_transcript.len(), 2);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn import_skips_corrupt_middle_jsonl_line_and_keeps_subsequent_turns() {
+        let (root, source) = fixture();
+        let projects = root.join("projects");
+        let original = fs::read_to_string(&source).unwrap();
+        let mut lines: Vec<&str> = original.lines().collect();
+        lines.insert(4, "{not valid json truncated mid-write");
+        fs::write(&source, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let history = provider_session_history_in(&projects, SESSION, 10).unwrap();
+        assert_eq!(history.turns.len(), 2);
+        assert!(
+            history
+                .messages
+                .iter()
+                .any(|message| message.content == "second"),
+            "turns after a corrupt JSONL line must still be imported"
+        );
+        assert!(
+            history
+                .messages
+                .iter()
+                .any(|message| message.content == "later"),
+            "assistant replies after a corrupt JSONL line must still be imported"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fork_truncates_active_chain_without_copying_abandoned_sibling_branches() {
+        let root =
+            std::env::temp_dir().join(format!("waku-claude-branch-fork-{}", Uuid::new_v4()));
+        let project = root.join("projects").join("-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        let source = project.join(format!("{SESSION}.jsonl"));
+
+        let abandoned_user = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let abandoned_assistant = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let entries = [
+            json!({"type":"user","uuid":USER_ONE,"parentUuid":null,"sessionId":SESSION,"message":{"role":"user","content":"root"}}),
+            json!({"type":"assistant","uuid":ASSISTANT_ONE,"parentUuid":USER_ONE,"sessionId":SESSION,"message":{"role":"assistant","content":[{"type":"text","text":"root reply"}]}}),
+            // Abandoned sibling branch off ASSISTANT_ONE
+            json!({"type":"user","uuid":abandoned_user,"parentUuid":ASSISTANT_ONE,"sessionId":SESSION,"message":{"role":"user","content":"abandoned prompt"}}),
+            json!({"type":"assistant","uuid":abandoned_assistant,"parentUuid":abandoned_user,"sessionId":SESSION,"message":{"role":"assistant","content":[{"type":"text","text":"abandoned reply"}]}}),
+            // Active branch continuing off ASSISTANT_ONE
+            json!({"type":"user","uuid":USER_TWO,"parentUuid":ASSISTANT_ONE,"sessionId":SESSION,"message":{"role":"user","content":"kept prompt"}}),
+            json!({"type":"assistant","uuid":ASSISTANT_TWO,"parentUuid":USER_TWO,"sessionId":SESSION,"message":{"role":"assistant","content":[{"type":"text","text":"kept reply"}]}}),
+            json!({"type":"assistant","uuid":ASSISTANT_THREE,"parentUuid":ASSISTANT_TWO,"sessionId":SESSION,"message":{"role":"assistant","content":[{"type":"text","text":"tail reply"}]}}),
+        ];
+        let mut file = fs::File::create(&source).unwrap();
+        for entry in entries {
+            serde_json::to_writer(&mut file, &entry).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+
+        let fork = fork_session_at_in(&root.join("projects"), SESSION, ASSISTANT_TWO, "Active branch")
+            .expect("fork succeeds");
+        let fork_path = project.join(format!("{}.jsonl", fork.session_id));
+        let forked_entries = read_entries(&fork_path).unwrap();
+        let forked_transcript = transcript_entries(&forked_entries);
+
+        let original_ids: Vec<&str> = forked_transcript
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("forkedFrom")
+                    .and_then(|forked_from| forked_from.get("messageUuid"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(
+            original_ids,
+            vec![USER_ONE, ASSISTANT_ONE, USER_TWO, ASSISTANT_TWO]
+        );
+        assert!(!fork.message_ids.contains_key(abandoned_user));
+        assert!(!fork.message_ids.contains_key(abandoned_assistant));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn history_listing_preserves_recency_ordering_and_limit() {
+        let root =
+            std::env::temp_dir().join(format!("waku-claude-history-order-{}", Uuid::new_v4()));
+        let project = root.join("projects").join("-tmp-project");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let mut history = fs::File::create(root.join("history.jsonl")).unwrap();
+        let mut expected_newest_ids = Vec::new();
+        for index in 0..6_u64 {
+            let id = format!("00000000-0000-4000-8000-{index:012}");
+            let timestamp_ms = (2_000_000_000 + index * 100) * 1_000;
+            serde_json::to_writer(
+                &mut history,
+                &json!({
+                    "display": format!("prompt {index}"),
+                    "project": workspace,
+                    "sessionId": id,
+                    "timestamp": timestamp_ms
+                }),
+            )
+            .unwrap();
+            history.write_all(b"\n").unwrap();
+
+            let mut file = fs::File::create(project.join(format!("{id}.jsonl"))).unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &json!({
+                    "type": "user",
+                    "uuid": format!("11111111-1111-4111-8111-{index:012}"),
+                    "parentUuid": null,
+                    "sessionId": id,
+                    "cwd": workspace,
+                    "message": {"role": "user", "content": format!("prompt {index}")}
+                }),
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            serde_json::to_writer(
+                &mut file,
+                &json!({
+                    "type": "custom-title",
+                    "customTitle": format!("Session {index}"),
+                    "sessionId": id
+                }),
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+            expected_newest_ids.push(id);
+        }
+
+        let listed = list_provider_sessions_in(&root.join("projects"), 2).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].cursor.native_id(), expected_newest_ids[5]);
+        assert_eq!(listed[0].title, "Session 5");
+        assert_eq!(listed[1].cursor.native_id(), expected_newest_ids[4]);
+        assert_eq!(listed[1].title, "Session 4");
+
+        fs::remove_dir_all(root).ok();
     }
 }

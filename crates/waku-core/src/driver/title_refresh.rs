@@ -1,7 +1,7 @@
 //! Provider title refresh helpers.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,12 +12,50 @@ const IDLE: u8 = 0;
 const RUNNING: u8 = 1;
 const RESOLVED: u8 = 2;
 
+#[derive(Default)]
+struct NativeTitleRefreshInner {
+    state: Arc<AtomicU8>,
+    cancel: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for NativeTitleRefreshInner {
+    fn drop(&mut self) {
+        let (lock, condvar) = &*self.cancel;
+        let mut cancelled = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cancelled = true;
+        condvar.notify_all();
+    }
+}
+
 /// Runs a provider metadata lookup away from the UI and provider reader
 /// threads. A missed lookup becomes eligible again on the next completed turn;
-/// a resolved title is final for this live driver.
+/// a resolved title is final for this live driver. Dropping the last handle
+/// cooperatively cancels any sleeping or in-flight lookup immediately.
 #[derive(Clone, Default)]
 pub(super) struct NativeTitleRefresh {
-    state: Arc<AtomicU8>,
+    inner: Arc<NativeTitleRefreshInner>,
+}
+
+fn is_cancelled(cancel: &(Mutex<bool>, Condvar)) -> bool {
+    *cancel
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_for_delay_or_cancel(cancel: &(Mutex<bool>, Condvar), delay: Duration) -> bool {
+    let (lock, condvar) = cancel;
+    let cancelled = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *cancelled {
+        return true;
+    }
+    if delay.is_zero() {
+        return false;
+    }
+    let (cancelled, _) = condvar
+        .wait_timeout_while(cancelled, delay, |cancelled| !*cancelled)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cancelled
 }
 
 impl NativeTitleRefresh {
@@ -29,6 +67,7 @@ impl NativeTitleRefresh {
         lookup: impl Fn() -> anyhow::Result<Option<String>> + Send + 'static,
     ) {
         if self
+            .inner
             .state
             .compare_exchange(IDLE, RUNNING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -36,19 +75,25 @@ impl NativeTitleRefresh {
             return;
         }
 
-        let state = self.state.clone();
+        let state = self.inner.state.clone();
+        let cancel = self.inner.cancel.clone();
         let result = thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
                 for delay in delays {
-                    if !delay.is_zero() {
-                        thread::sleep(delay);
+                    if wait_for_delay_or_cancel(&cancel, delay) {
+                        state.store(IDLE, Ordering::Release);
+                        return;
                     }
                     let title = lookup()
                         .ok()
                         .flatten()
                         .map(|title| title.trim().to_owned())
                         .filter(|title| !title.is_empty());
+                    if is_cancelled(&cancel) {
+                        state.store(IDLE, Ordering::Release);
+                        return;
+                    }
                     if let Some(title) = title {
                         let _ = events.send(DriverEvent::AutoTitleUpdated(Some(title)));
                         state.store(RESOLVED, Ordering::Release);
@@ -59,7 +104,7 @@ impl NativeTitleRefresh {
             });
 
         if result.is_err() {
-            self.state.store(IDLE, Ordering::Release);
+            self.inner.state.store(IDLE, Ordering::Release);
         }
     }
 }
@@ -69,6 +114,8 @@ mod tests {
     use super::*;
     use crate::model::DriverEvent;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Instant;
 
     /// Blank and failed lookups are misses, not answers, so the schedule keeps
     /// going and the driver is left free to try again on its next turn.
@@ -138,18 +185,119 @@ mod tests {
             // final while the thread is still RUNNING, and the next start
             // would silently no-op.
             for _ in 0..400 {
-                if refresh.state.load(Ordering::Acquire) == IDLE {
+                if refresh.inner.state.load(Ordering::Acquire) == IDLE {
                     break;
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(refresh.state.load(Ordering::Acquire), IDLE);
+            assert_eq!(refresh.inner.state.load(Ordering::Acquire), IDLE);
         }
 
         assert_eq!(attempts.load(Ordering::Acquire), 4);
         assert!(
             event_rx.try_recv().is_err(),
             "a dry schedule must not announce a title"
+        );
+    }
+
+    #[test]
+    fn dropping_refresh_interrupts_sleeping_worker_immediately() {
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let refresh = NativeTitleRefresh::default();
+        let state = refresh.inner.state.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let lookups = attempts.clone();
+
+        refresh.start(
+            "waku-title-cancel-test",
+            vec![Duration::from_secs(60)],
+            events,
+            move || {
+                lookups.fetch_add(1, Ordering::AcqRel);
+                Ok(Some("Should never run".into()))
+            },
+        );
+        assert_eq!(state.load(Ordering::Acquire), RUNNING);
+
+        let started = Instant::now();
+        drop(refresh);
+
+        for _ in 0..200 {
+            if state.load(Ordering::Acquire) == IDLE {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.load(Ordering::Acquire), IDLE);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "sleep must be interrupted immediately on drop"
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cloned_handle_keeps_schedule_alive_until_last_handle_drops() {
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let primary = NativeTitleRefresh::default();
+        let transient = primary.clone();
+
+        transient.start(
+            "waku-title-clone-test",
+            vec![Duration::from_millis(30)],
+            events,
+            || Ok(Some("Survived transient clone drop".into())),
+        );
+        // Dropping a per-prompt clone must not cancel the driver's schedule.
+        drop(transient);
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("primary handle must keep the title refresh alive");
+        assert!(matches!(
+            event,
+            DriverEvent::AutoTitleUpdated(Some(title)) if title == "Survived transient clone drop"
+        ));
+        drop(primary);
+    }
+
+    #[test]
+    fn dropping_during_in_flight_lookup_suppresses_late_title_event() {
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let refresh = NativeTitleRefresh::default();
+        let state = refresh.inner.state.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+
+        refresh.start(
+            "waku-title-inflight-test",
+            vec![Duration::ZERO],
+            events,
+            move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                Ok(Some("Stale title after drop".into()))
+            },
+        );
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lookup should start");
+        drop(refresh);
+        let _ = release_tx.send(());
+
+        for _ in 0..200 {
+            if state.load(Ordering::Acquire) == IDLE {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.load(Ordering::Acquire), IDLE);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a lookup finishing after drop must not emit a title"
         );
     }
 }

@@ -6,9 +6,10 @@
 //! are bounded, short-lived, and called only from the daemon's background RPC
 //! path — never from a render frame.
 
+use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -22,11 +23,234 @@ use crate::model::{
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_THREAD_LIST_PAGES: usize = 16;
+const MAX_THREAD_LIST_PAGE_SIZE: usize = 100;
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+struct AppServerChild {
+    child: Child,
+    #[cfg(windows)]
+    job: Option<crate::process_tree::KillOnCloseJob>,
+    reaped: bool,
+}
+
+impl AppServerChild {
+    fn spawn(command: &mut Command, binary: &Path) -> anyhow::Result<Self> {
+        isolate_process_group(command);
+        let child = crate::command_env::spawn(command)
+            .with_context(|| format!("could not start {} app-server", binary.display()))?;
+        #[cfg(windows)]
+        let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+            reaped: false,
+        })
+    }
+
+    fn terminate(&mut self) {
+        if self.reaped {
+            #[cfg(windows)]
+            drop(self.job.take());
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(pid) = i32::try_from(self.child.id())
+            && pid > 0
+        {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        drop(self.job.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+}
+
+impl Drop for AppServerChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+struct AppServerClient<'a> {
+    stdin: &'a mut std::process::ChildStdin,
+    rx: &'a mpsc::Receiver<Value>,
+    deadline: Instant,
+    next_id: u64,
+}
+
+impl AppServerClient<'_> {
+    fn receive_response(&self, id: u64) -> anyhow::Result<Value> {
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("Codex app-server session request timed out"))?;
+            let value = self
+                .rx
+                .recv_timeout(remaining)
+                .map_err(|_| anyhow!("Codex app-server session request timed out"))?;
+            if value.get("method").is_none() && value.get("id").and_then(Value::as_u64) == Some(id)
+            {
+                if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
+                    bail!("Codex rejected the session request: {error}");
+                }
+                return Ok(value);
+            }
+        }
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_json_line(
+            self.stdin,
+            &json!({
+                "method": method,
+                "id": id,
+                "params": params
+            }),
+        )?;
+        self.receive_response(id)
+    }
+
+    fn raw_request(&mut self, mut request: Value) -> anyhow::Result<Value> {
+        let id = request
+            .get("id")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                let id = self.next_id;
+                request["id"] = json!(id);
+                id
+            });
+        self.next_id = self.next_id.max(id + 1);
+        write_json_line(self.stdin, &request)?;
+        self.receive_response(id)
+    }
+}
+
+fn with_app_server_in<T>(
+    binary: &Path,
+    cwd: &Path,
+    config_dir: Option<&Path>,
+    operation: impl FnOnce(&mut AppServerClient<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
+    let command = command
+        .args(["app-server", "--stdio"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut process = AppServerChild::spawn(command, binary)?;
+    let mut stdin = process
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Codex app-server stdin is unavailable"))?;
+    let stdout = process
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Codex app-server stdout is unavailable"))?;
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::Builder::new()
+        .name("waku-codex-session".into())
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && tx.send(value).is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .context("could not start Codex app-server reader thread")?;
+
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let response = {
+        let mut client = AppServerClient {
+            stdin: &mut stdin,
+            rx: &rx,
+            deadline,
+            next_id: 1,
+        };
+        (|| -> anyhow::Result<T> {
+            write_json_line(
+                client.stdin,
+                &json!({
+                    "method": "initialize",
+                    "id": 0,
+                    "params": {
+                        "clientInfo": {
+                            "name": "waku",
+                            "title": "Waku",
+                            "version": env!("CARGO_PKG_VERSION")
+                        },
+                        "capabilities": { "experimentalApi": true }
+                    }
+                }),
+            )?;
+            client.receive_response(0)?;
+            write_json_line(client.stdin, &json!({"method": "initialized", "params": {}}))?;
+            operation(&mut client)
+        })()
+    };
+
+    // A fork response still leaves a live writer in this app-server. Let EOF
+    // flush and close it before handing the new thread to another process.
+    // Also wait for stdout to close: the configured CLI may wrap Codex in Node.
+    drop(stdin);
+    let shutdown_deadline = Instant::now() + RPC_TIMEOUT;
+    let shutdown = (|| -> anyhow::Result<()> {
+        loop {
+            if let Some(status) = process.child.try_wait()? {
+                process.reaped = true;
+                if !status.success() {
+                    bail!("Codex app-server exited with {status}");
+                }
+                if reader.is_finished() {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= shutdown_deadline {
+                bail!("Codex app-server did not finish closing its session");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if shutdown.is_err() {
+        process.terminate();
+    }
+    #[cfg(windows)]
+    drop(process.job.take());
+    if reader.is_finished() {
+        let _ = reader.join();
+    }
+    let response = response?;
+    shutdown?;
+    Ok(response)
 }
 
 fn app_server_request(
@@ -44,106 +268,7 @@ fn app_server_request_in(
     config_dir: Option<&Path>,
     request: Value,
 ) -> anyhow::Result<Value> {
-    let mut command = crate::command_env::command(binary);
-    crate::command_env::apply_provider_config_dir(&mut command, ProviderKind::Codex, config_dir);
-    let command = command
-        .args(["app-server", "--stdio"])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = crate::command_env::spawn(command)
-        .with_context(|| format!("could not start {} app-server", binary.display()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Codex app-server stdin is unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Codex app-server stdout is unavailable"))?;
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<Value>(&line)
-                && tx.send(value).is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + RPC_TIMEOUT;
-    let receive_response = |id| -> anyhow::Result<Value> {
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| anyhow!("Codex app-server session request timed out"))?;
-            let value = rx
-                .recv_timeout(remaining)
-                .map_err(|_| anyhow!("Codex app-server session request timed out"))?;
-            if value.get("method").is_none() && value.get("id").and_then(Value::as_u64) == Some(id)
-            {
-                if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
-                    bail!("Codex rejected the session request: {error}");
-                }
-                return Ok(value);
-            }
-        }
-    };
-    let response = (|| -> anyhow::Result<Value> {
-        write_json_line(
-            &mut stdin,
-            &json!({
-                "method": "initialize",
-                "id": 0,
-                "params": {
-                    "clientInfo": {
-                        "name": "waku",
-                        "title": "Waku",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "capabilities": { "experimentalApi": true }
-                }
-            }),
-        )?;
-        receive_response(0)?;
-        write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
-        write_json_line(&mut stdin, &request)?;
-        receive_response(1)
-    })();
-
-    // A fork response still leaves a live writer in this app-server. Let EOF
-    // flush and close it before handing the new thread to another process.
-    // Also wait for stdout to close: the configured CLI may wrap Codex in Node.
-    drop(stdin);
-    let shutdown_deadline = Instant::now() + RPC_TIMEOUT;
-    let shutdown = (|| -> anyhow::Result<()> {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("Codex app-server exited with {status}");
-                }
-                if reader.is_finished() {
-                    return Ok(());
-                }
-            }
-            if Instant::now() >= shutdown_deadline {
-                bail!("Codex app-server did not finish closing its session");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    })();
-    if shutdown.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    if reader.is_finished() {
-        let _ = reader.join();
-    }
-    let response = response?;
-    shutdown?;
-    Ok(response)
+    with_app_server_in(binary, cwd, config_dir, |client| client.raw_request(request))
 }
 
 /// Create the fork outside the source session's resident app-server. Returning
@@ -251,6 +376,52 @@ fn parse_session_summaries(response: &Value, limit: usize) -> Vec<ProviderSessio
         .collect()
 }
 
+fn thread_list_page_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(2)
+        .clamp(1, MAX_THREAD_LIST_PAGE_SIZE)
+}
+
+fn collect_paginated_session_summaries(
+    limit: usize,
+    mut fetch_page: impl FnMut(usize, Option<&str>) -> anyhow::Result<Value>,
+) -> anyhow::Result<Vec<ProviderSessionSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let page_limit = thread_list_page_limit(limit);
+    let mut sessions = Vec::with_capacity(limit.min(MAX_THREAD_LIST_PAGE_SIZE));
+    let mut seen_ids = HashSet::new();
+    let mut seen_cursors = HashSet::new();
+    let mut cursor: Option<String> = None;
+
+    for _ in 0..MAX_THREAD_LIST_PAGES {
+        let response = fetch_page(page_limit, cursor.as_deref())?;
+        for summary in parse_session_summaries(&response, usize::MAX) {
+            if seen_ids.insert(summary.cursor.native_id().to_owned()) {
+                sessions.push(summary);
+                if sessions.len() >= limit {
+                    return Ok(sessions);
+                }
+            }
+        }
+        let next_cursor = response
+            .pointer("/result/nextCursor")
+            .and_then(Value::as_str)
+            .filter(|next| !next.is_empty())
+            .map(str::to_owned);
+        let Some(next) = next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            break;
+        }
+        cursor = Some(next);
+    }
+
+    Ok(sessions)
+}
+
 /// Ask Codex for CLI-owned threads, excluding exec, editor, app-server and
 /// sub-agent rollouts. Waku-created app-server threads are filtered again by
 /// native cursor in the daemon catalog.
@@ -262,21 +433,21 @@ pub fn list_provider_sessions(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let response = app_server_request(
-        binary,
-        config_dir,
-        json!({
-            "method": "thread/list",
-            "id": 1,
-            "params": {
-                "limit": limit,
+    let cwd = crate::acp_session::catalog_working_directory()?;
+    with_app_server_in(binary, &cwd, config_dir, |client| {
+        collect_paginated_session_summaries(limit, |page_limit, cursor| {
+            let mut params = json!({
+                "limit": page_limit,
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
                 "sourceKinds": ["cli"]
+            });
+            if let Some(cursor) = cursor {
+                params["cursor"] = json!(cursor);
             }
-        }),
-    )?;
-    Ok(parse_session_summaries(&response, limit))
+            client.request("thread/list", params)
+        })
+    })
 }
 
 fn codex_user_text(item: &Value) -> Option<String> {
@@ -483,5 +654,188 @@ mod tests {
         assert_eq!(history.messages[1].content, "later");
         assert_eq!(history.messages[0].turn_id, Some(history.turns[1].id));
         assert_eq!(history.turns[1].turn_count, 2);
+    }
+
+    #[test]
+    fn paginated_listing_overfetches_and_follows_cursors_past_filtered_threads() {
+        let root = std::env::temp_dir();
+        let mut requested_limits = Vec::new();
+        let mut requested_cursors = Vec::new();
+
+        let sessions = collect_paginated_session_summaries(3, |page_limit, cursor| {
+            requested_limits.push(page_limit);
+            requested_cursors.push(cursor.map(str::to_owned));
+            match cursor {
+                None => Ok(json!({
+                    "result": {
+                        "data": [
+                            {
+                                "id": "ephemeral-1",
+                                "name": "Ephemeral",
+                                "cwd": root,
+                                "createdAt": 100,
+                                "updatedAt": 100,
+                                "ephemeral": true,
+                                "parentThreadId": null
+                            },
+                            {
+                                "id": "subagent-1",
+                                "name": "Subagent",
+                                "cwd": root,
+                                "createdAt": 99,
+                                "updatedAt": 99,
+                                "ephemeral": false,
+                                "parentThreadId": "valid-1"
+                            },
+                            {
+                                "id": "valid-1",
+                                "name": "First valid",
+                                "cwd": root,
+                                "createdAt": 98,
+                                "updatedAt": 98,
+                                "ephemeral": false,
+                                "parentThreadId": null
+                            }
+                        ],
+                        "nextCursor": "page-2"
+                    }
+                })),
+                Some("page-2") => Ok(json!({
+                    "result": {
+                        "data": [
+                            {
+                                "id": "valid-1",
+                                "name": "Duplicate across page",
+                                "cwd": root,
+                                "createdAt": 98,
+                                "updatedAt": 98,
+                                "ephemeral": false,
+                                "parentThreadId": null
+                            },
+                            {
+                                "id": "valid-2",
+                                "name": "Second valid",
+                                "cwd": root,
+                                "createdAt": 97,
+                                "updatedAt": 97,
+                                "ephemeral": false,
+                                "parentThreadId": null
+                            },
+                            {
+                                "id": "valid-3",
+                                "name": "Third valid",
+                                "cwd": root,
+                                "createdAt": 96,
+                                "updatedAt": 96,
+                                "ephemeral": false,
+                                "parentThreadId": null
+                            },
+                            {
+                                "id": "valid-4",
+                                "name": "Fourth valid",
+                                "cwd": root,
+                                "createdAt": 95,
+                                "updatedAt": 95,
+                                "ephemeral": false,
+                                "parentThreadId": null
+                            }
+                        ],
+                        "nextCursor": "page-3"
+                    }
+                })),
+                other => panic!("unexpected cursor {other:?}"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(requested_limits, vec![6, 6]);
+        assert_eq!(requested_cursors, vec![None, Some("page-2".to_owned())]);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.cursor.native_id()).collect();
+        assert_eq!(ids, vec!["valid-1", "valid-2", "valid-3"]);
+    }
+
+    #[test]
+    fn thread_list_page_limit_caps_large_limits_without_panicking() {
+        assert_eq!(thread_list_page_limit(0), 1);
+        assert_eq!(thread_list_page_limit(10), 20);
+        assert_eq!(thread_list_page_limit(50), 100);
+        assert_eq!(thread_list_page_limit(150), MAX_THREAD_LIST_PAGE_SIZE);
+        assert_eq!(thread_list_page_limit(usize::MAX), MAX_THREAD_LIST_PAGE_SIZE);
+
+        let mut observed_limit = None;
+        let sessions = collect_paginated_session_summaries(150, |page_limit, _| {
+            observed_limit = Some(page_limit);
+            Ok(json!({"result": {"data": []}}))
+        })
+        .unwrap();
+        assert_eq!(observed_limit, Some(MAX_THREAD_LIST_PAGE_SIZE));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn paginated_listing_breaks_on_repeating_cursor() {
+        let root = std::env::temp_dir();
+        let mut calls = 0;
+        let sessions = collect_paginated_session_summaries(5, |_, _| {
+            calls += 1;
+            Ok(json!({
+                "result": {
+                    "data": [{
+                        "id": "valid-1",
+                        "name": "Only one",
+                        "cwd": root,
+                        "createdAt": 10,
+                        "updatedAt": 10,
+                        "ephemeral": false,
+                        "parentThreadId": null
+                    }],
+                    "nextCursor": "stuck-cursor"
+                }
+            }))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn app_server_child_drop_terminates_descendants() {
+        use std::io::Read as _;
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("cmd.exe");
+            cmd.args(["/d", "/c", "ping -n 60 127.0.0.1"]);
+            cmd
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut cmd = crate::command_env::plain_command("/bin/sh");
+            cmd.args(["-c", "sleep 60"]);
+            cmd
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut process = AppServerChild::spawn(&mut command, Path::new("codex")).unwrap();
+        let mut stdout = process.child.stdout.take().expect("stdout pipe");
+        std::thread::sleep(Duration::from_millis(500));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut drained = Vec::new();
+            let _ = stdout.read_to_end(&mut drained);
+            let _ = done_tx.send(());
+        });
+
+        drop(process);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("grandchild kept stdout open after AppServerChild dropped");
+        reader.join().unwrap();
     }
 }
