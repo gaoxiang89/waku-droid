@@ -2451,3 +2451,262 @@ fn settled_turn_fold_label_includes_hidden_tool_work_summary() {
         "Worked for 12 seconds · 1 file edit · 1 command"
     );
 }
+
+#[test]
+fn provider_probe_state_rejects_stale_generations_and_preserves_targeted_refreshes() {
+    use super::runtime::ProviderProbeState;
+
+    let mut state = ProviderProbeState::default();
+    let full_gen = state.begin_detection(&ProviderKind::ALL);
+    assert_eq!(state.detection_pending_len(), ProviderKind::ALL.len());
+
+    // Start a discovery and version probe for Claude under the initial pass.
+    let old_discovery_gen = state.begin_discovery(ProviderKind::Claude);
+    let old_version_gen = state.begin_version(ProviderKind::Claude);
+    assert!(state.accept_discovery(old_discovery_gen, ProviderKind::Claude));
+    assert!(state.accept_version(old_version_gen, ProviderKind::Claude));
+
+    // While the full startup detection is still in flight, a targeted refresh
+    // for Claude (for example after editing its binary override) must NOT be
+    // dropped and must supersede older Claude detection/discovery/version work
+    // without disturbing sibling providers from the full pass.
+    let targeted_gen = state.begin_detection(&[ProviderKind::Claude]);
+    assert!(targeted_gen > full_gen);
+    assert_eq!(state.detection_pending_len(), ProviderKind::ALL.len());
+
+    // Stale Claude events from the earlier pass are rejected.
+    assert!(!state.accept_detection(full_gen, ProviderKind::Claude));
+    assert!(!state.accept_discovery(old_discovery_gen, ProviderKind::Claude));
+    assert!(!state.accept_version(old_version_gen, ProviderKind::Claude));
+    assert_eq!(state.detection_pending_len(), ProviderKind::ALL.len());
+
+    // Sibling providers from the full pass are still accepted.
+    assert!(state.accept_detection(full_gen, ProviderKind::Codex));
+    assert_eq!(state.detection_pending_len(), ProviderKind::ALL.len() - 1);
+
+    // The targeted Claude detection lands and opens a new discovery/version gen.
+    assert!(state.accept_detection(targeted_gen, ProviderKind::Claude));
+    assert_eq!(state.detection_pending_len(), ProviderKind::ALL.len() - 2);
+    let new_discovery_gen = state.begin_discovery(ProviderKind::Claude);
+    let new_version_gen = state.begin_version(ProviderKind::Claude);
+    assert!(state.accept_discovery(new_discovery_gen, ProviderKind::Claude));
+    assert!(state.accept_version(new_version_gen, ProviderKind::Claude));
+    assert!(!state.accept_discovery(old_discovery_gen, ProviderKind::Claude));
+    assert!(!state.accept_version(old_version_gen, ProviderKind::Claude));
+}
+
+#[test]
+fn remote_host_model_picker_does_not_report_no_providers_before_host_detection_settles() {
+    use super::composer::picker_has_no_providers;
+    use super::hosts::{HostCatalog, host_detection_settled};
+    use crate::model::ProviderProbe;
+    use waku_client::hosts::HostKey;
+
+    let remote_key = HostKey::Connection("ssh:build".into());
+    let local_checked = Some(Instant::now());
+    let empty_probes = ProviderKind::ALL
+        .into_iter()
+        .map(|provider| ProviderProbe {
+            provider,
+            installed: false,
+            path: None,
+            models: Vec::new(),
+            agent_presets: Vec::new(),
+            discovery_error: None,
+        })
+        .collect::<Vec<_>>();
+
+    // Local detection has settled, but the remote host has no catalog yet.
+    assert!(!host_detection_settled(&remote_key, local_checked, None));
+    assert!(!picker_has_no_providers(
+        &empty_probes,
+        &[],
+        host_detection_settled(&remote_key, local_checked, None),
+    ));
+
+    // Remote host catalog exists with probes still in flight.
+    let mut catalog = HostCatalog {
+        probes: empty_probes.clone(),
+        pending: HashSet::from([ProviderKind::Claude, ProviderKind::Codex]),
+        discovered: HashSet::new(),
+        checked_at: None,
+    };
+    assert!(!host_detection_settled(
+        &remote_key,
+        local_checked,
+        Some(&catalog),
+    ));
+    assert!(!picker_has_no_providers(
+        &catalog.probes,
+        &[],
+        host_detection_settled(&remote_key, local_checked, Some(&catalog)),
+    ));
+
+    // Once the remote host's probes all complete with none installed, it does
+    // legitimately report no providers.
+    catalog.pending.clear();
+    catalog.checked_at = Some(Instant::now());
+    assert!(host_detection_settled(
+        &remote_key,
+        local_checked,
+        Some(&catalog),
+    ));
+    assert!(picker_has_no_providers(
+        &catalog.probes,
+        &[],
+        host_detection_settled(&remote_key, local_checked, Some(&catalog)),
+    ));
+
+    // Local still gates on local_checked_at.
+    assert!(host_detection_settled(&HostKey::Local, local_checked, None));
+    assert!(!host_detection_settled(&HostKey::Local, None, Some(&catalog)));
+}
+
+#[test]
+fn provider_path_input_reloads_local_override_after_host_reset() {
+    use super::hosts::provider_path_input_value_for_host;
+
+    assert_eq!(
+        provider_path_input_value_for_host(Some(ProviderKind::Claude), Some("/usr/local/bin/claude")),
+        "/usr/local/bin/claude"
+    );
+    assert_eq!(
+        provider_path_input_value_for_host(Some(ProviderKind::Claude), None),
+        ""
+    );
+    assert_eq!(
+        provider_path_input_value_for_host(None, Some("/remote/bin/claude")),
+        ""
+    );
+}
+
+#[test]
+fn live_plan_usage_update_clears_error_unconfigured_stale_and_updates_checked_at() {
+    use super::streaming::record_live_plan_usage;
+    use std::collections::HashMap;
+    use waku_client::hosts::HostKey;
+
+    let key = (HostKey::Local, ProviderKind::Codex, Some("work".to_owned()));
+    let mut plan_usage = HashMap::new();
+    let mut plan_usage_error = HashMap::from([(key.clone(), "rate limit probe timed out".to_owned())]);
+    let mut plan_usage_unconfigured = HashSet::from([key.clone()]);
+    let mut plan_usage_stale = HashSet::from([key.clone()]);
+    let mut plan_usage_checked_at = HashMap::new();
+
+    let usage = crate::usage::PlanUsage {
+        plan_label: Some("Plus".into()),
+        windows: Vec::new(),
+    };
+    let now = Instant::now();
+    record_live_plan_usage(
+        &mut plan_usage,
+        &mut plan_usage_error,
+        &mut plan_usage_unconfigured,
+        &mut plan_usage_stale,
+        &mut plan_usage_checked_at,
+        key.clone(),
+        usage.clone(),
+        now,
+    );
+
+    assert_eq!(plan_usage.get(&key), Some(&usage));
+    assert!(!plan_usage_error.contains_key(&key));
+    assert!(!plan_usage_unconfigured.contains(&key));
+    assert!(!plan_usage_stale.contains(&key));
+    assert_eq!(plan_usage_checked_at.get(&key), Some(&now));
+}
+
+#[test]
+fn process_exited_fallback_message_uses_actual_provider_for_non_codex() {
+    use super::streaming::process_exited_fallback_message;
+
+    let codex_message = process_exited_fallback_message(ProviderKind::Codex);
+    assert!(codex_message.contains("Codex"));
+
+    let claude_message = process_exited_fallback_message(ProviderKind::Claude);
+    assert!(
+        !claude_message.contains("Codex"),
+        "non-Codex exit message must not mention Codex: {claude_message}"
+    );
+    assert!(
+        claude_message.contains(ProviderKind::Claude.display_name()),
+        "non-Codex exit message should identify the provider: {claude_message}"
+    );
+
+    let deepseek_message = process_exited_fallback_message(ProviderKind::DeepSeek);
+    assert!(!deepseek_message.contains("Codex"));
+    assert!(deepseek_message.contains(ProviderKind::DeepSeek.display_name()));
+}
+
+#[test]
+fn connections_startup_merge_rejects_stale_generation_and_preserves_local_edits() {
+    use super::connections_page::{ConnectionsLoadSnapshot, merge_loaded_connections};
+    use std::collections::HashMap;
+    use waku_client::remote::{Connection, ConnectionsFile, SshAuthMethod, SshTarget};
+
+    let disk_ssh = Connection::ssh(SshTarget::ConfigHost {
+        host: "prod".into(),
+        auth_method: SshAuthMethod::Password,
+    });
+    let disk_wsl = Connection::wsl("Ubuntu");
+    let local_added = Connection::wsl("Debian");
+
+    let mut file = ConnectionsFile::default();
+    file.upsert(local_added.clone());
+    let mut saved_passwords = HashSet::new();
+    let mut local_upserted_ids = HashSet::from([local_added.id.clone()]);
+    let mut local_removed_ids = HashSet::from([disk_wsl.id.clone()]);
+    let mut local_password_overrides = HashMap::from([(disk_ssh.id.clone(), false)]);
+    let mut startup_loaded = false;
+
+    let snapshot = ConnectionsLoadSnapshot {
+        file: ConnectionsFile {
+            connections: vec![disk_ssh.clone(), disk_wsl.clone()],
+            ..ConnectionsFile::default()
+        },
+        saved_passwords: HashSet::from([disk_ssh.id.clone()]),
+    };
+
+    // Stale generation is ignored completely.
+    assert!(!merge_loaded_connections(
+        2,
+        1,
+        &mut file,
+        &mut saved_passwords,
+        &mut local_upserted_ids,
+        &mut local_removed_ids,
+        &mut local_password_overrides,
+        &mut startup_loaded,
+        snapshot,
+    ));
+    assert!(!startup_loaded);
+    assert_eq!(file.connections.len(), 1);
+    assert_eq!(file.connections[0].id, local_added.id);
+
+    // Current generation merges disk entries while honoring in-flight local
+    // additions, removals, and keyring password overrides.
+    let snapshot = ConnectionsLoadSnapshot {
+        file: ConnectionsFile {
+            connections: vec![disk_ssh.clone(), disk_wsl.clone()],
+            ..ConnectionsFile::default()
+        },
+        saved_passwords: HashSet::from([disk_ssh.id.clone()]),
+    };
+    let had_local = merge_loaded_connections(
+        2,
+        2,
+        &mut file,
+        &mut saved_passwords,
+        &mut local_upserted_ids,
+        &mut local_removed_ids,
+        &mut local_password_overrides,
+        &mut startup_loaded,
+        snapshot,
+    );
+    assert!(had_local);
+    assert!(startup_loaded);
+    assert!(file.get(&disk_ssh.id).is_some());
+    assert!(file.get(&local_added.id).is_some());
+    assert!(file.get(&disk_wsl.id).is_none());
+    assert!(!saved_passwords.contains(&disk_ssh.id));
+}

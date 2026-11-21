@@ -656,7 +656,16 @@ impl Waku {
                         provider,
                         raw_account_id.as_deref(),
                     );
-                    self.plan_usage.insert((host, provider, account_id), usage);
+                    record_live_plan_usage(
+                        &mut self.plan_usage,
+                        &mut self.plan_usage_error,
+                        &mut self.plan_usage_unconfigured,
+                        &mut self.plan_usage_stale,
+                        &mut self.plan_usage_checked_at,
+                        (host, provider, account_id),
+                        usage,
+                        Instant::now(),
+                    );
                 }
             }
             DriverEvent::GoalUpdated(goal) => {
@@ -901,13 +910,13 @@ impl Waku {
                 runtime.driver.cancel_computer_use();
                 runtime.computer_use_previews.clear();
                 let needs_fallback = !self.turn_has_assistant_message(session_id);
-                let failure_message = runtime
-                    .last_driver_error
-                    .take()
-                    .unwrap_or_else(|| tr!("session.codex_exited_before_response"));
+                let last_driver_error = runtime.last_driver_error.take();
                 let should_finish_turn = if let Some(session) = self.state.session_mut(session_id)
                     && session.status.is_busy()
                 {
+                    let provider = session.provider;
+                    let failure_message = last_driver_error
+                        .unwrap_or_else(|| process_exited_fallback_message(provider));
                     session.status = SessionStatus::Failed;
                     session.updated_at = unix_time();
                     if needs_fallback {
@@ -1170,4 +1179,33 @@ pub(super) fn append_text_delta_to_session(
         session.messages.push(message);
     }
     session.updated_at = unix_time();
+}
+
+pub(super) fn record_live_plan_usage(
+    plan_usage: &mut HashMap<PlanUsageKey, crate::usage::PlanUsage>,
+    plan_usage_error: &mut HashMap<PlanUsageKey, String>,
+    plan_usage_unconfigured: &mut HashSet<PlanUsageKey>,
+    plan_usage_stale: &mut HashSet<PlanUsageKey>,
+    plan_usage_checked_at: &mut HashMap<PlanUsageKey, Instant>,
+    key: PlanUsageKey,
+    usage: crate::usage::PlanUsage,
+    now: Instant,
+) {
+    plan_usage.insert(key.clone(), usage);
+    plan_usage_error.remove(&key);
+    plan_usage_unconfigured.remove(&key);
+    plan_usage_stale.remove(&key);
+    plan_usage_checked_at.insert(key, now);
+}
+
+pub(super) fn process_exited_fallback_message(provider: ProviderKind) -> String {
+    if provider == ProviderKind::Codex {
+        tr!("session.codex_exited_before_response")
+    } else {
+        format!(
+            "{}: {}",
+            provider.display_name(),
+            tr!("session.stopped_before_response")
+        )
+    }
 }

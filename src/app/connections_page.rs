@@ -6,7 +6,7 @@
 //! they run on the background executor; frames read only the cached state.
 //! Saving a connection never contacts the host.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use waku_client::bridge::IncompatibleDaemon;
 use waku_client::remote::{
@@ -49,6 +49,81 @@ pub(super) struct DaemonReplaceConfirm {
     focus_pending: bool,
 }
 
+pub(super) struct ConnectionsLoadSnapshot {
+    pub(super) file: ConnectionsFile,
+    pub(super) saved_passwords: HashSet<String>,
+}
+
+/// Pure startup merge for saved connections and keyring flags. Guarded by a
+/// monotonic generation counter so a superseded background pass cannot
+/// overwrite newer state, while preserving any edits the user made before the
+/// initial background load landed.
+pub(super) fn merge_loaded_connections(
+    current_generation: u64,
+    snapshot_generation: u64,
+    file: &mut ConnectionsFile,
+    saved_passwords: &mut HashSet<String>,
+    local_upserted_ids: &mut HashSet<String>,
+    local_removed_ids: &mut HashSet<String>,
+    local_password_overrides: &mut HashMap<String, bool>,
+    startup_loaded: &mut bool,
+    snapshot: ConnectionsLoadSnapshot,
+) -> bool {
+    if snapshot_generation != current_generation {
+        return false;
+    }
+    let had_local_mutations = !local_upserted_ids.is_empty() || !local_removed_ids.is_empty();
+    let local_connections = std::mem::take(&mut file.connections);
+    let mut merged = Vec::new();
+    for connection in snapshot.file.connections {
+        if local_removed_ids.contains(&connection.id) || local_upserted_ids.contains(&connection.id)
+        {
+            continue;
+        }
+        merged.push(connection);
+    }
+    for connection in local_connections {
+        if !merged.iter().any(|existing| existing.id == connection.id) {
+            merged.push(connection);
+        }
+    }
+    file.connections = merged;
+
+    let mut merged_passwords = snapshot.saved_passwords;
+    for id in local_removed_ids.iter() {
+        merged_passwords.remove(id);
+    }
+    for (id, has_password) in local_password_overrides.drain() {
+        if has_password {
+            merged_passwords.insert(id);
+        } else {
+            merged_passwords.remove(&id);
+        }
+    }
+    *saved_passwords = merged_passwords;
+    local_upserted_ids.clear();
+    local_removed_ids.clear();
+    *startup_loaded = true;
+    had_local_mutations
+}
+
+fn load_saved_connections_snapshot() -> ConnectionsLoadSnapshot {
+    let file = ConnectionsFile::load()
+        .inspect_err(|error| eprintln!("could not read saved connections: {error}"))
+        .unwrap_or_default();
+    let saved_passwords = file
+        .connections
+        .iter()
+        .filter(|connection| matches!(connection.kind, ConnectionKind::Ssh { .. }))
+        .filter(|connection| waku_client::remote::credentials::has_ssh_password(&connection.id))
+        .map(|connection| connection.id.clone())
+        .collect();
+    ConnectionsLoadSnapshot {
+        file,
+        saved_passwords,
+    }
+}
+
 pub(super) struct ConnectionsUi {
     pub(super) file: ConnectionsFile,
     /// `None` until the first listing; `Err` carries a displayable reason.
@@ -62,9 +137,17 @@ pub(super) struct ConnectionsUi {
     proxy_jump_input: Entity<TextInput>,
     editing_id: Option<String>,
     /// Connection ids known to have a password or key passphrase in the
-    /// credential store. Populated once at startup and updated on
-    /// save/clear/remove so frames never query the keyring synchronously.
+    /// credential store. Populated off-thread at startup and updated on
+    /// save/clear/remove so neither startup nor frames query the keyring
+    /// synchronously on the UI thread.
     saved_passwords: HashSet<String>,
+    /// Monotonic counter guarding off-thread `ConnectionsFile::load` + keyring
+    /// probes so superseded passes cannot overwrite newer state.
+    load_generation: u64,
+    startup_loaded: bool,
+    local_upserted_ids: HashSet<String>,
+    local_removed_ids: HashSet<String>,
+    local_password_overrides: HashMap<String, bool>,
     replace_confirm: Option<DaemonReplaceConfirm>,
     replace_cancel_focus: FocusHandle,
     replace_confirm_focus: FocusHandle,
@@ -72,18 +155,8 @@ pub(super) struct ConnectionsUi {
 
 impl ConnectionsUi {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
-        let file = ConnectionsFile::load()
-            .inspect_err(|error| eprintln!("could not read saved connections: {error}"))
-            .unwrap_or_default();
-        let saved_passwords = file
-            .connections
-            .iter()
-            .filter(|connection| matches!(connection.kind, ConnectionKind::Ssh { .. }))
-            .filter(|connection| waku_client::remote::credentials::has_ssh_password(&connection.id))
-            .map(|connection| connection.id.clone())
-            .collect();
         Self {
-            file,
+            file: ConnectionsFile::default(),
             distributions: None,
             distributions_loading: false,
             pending: HashSet::new(),
@@ -103,7 +176,12 @@ impl ConnectionsUi {
                     .placeholder(tr!("connections.ssh_proxy_jump_placeholder"))
             }),
             editing_id: None,
-            saved_passwords,
+            saved_passwords: HashSet::new(),
+            load_generation: 0,
+            startup_loaded: false,
+            local_upserted_ids: HashSet::new(),
+            local_removed_ids: HashSet::new(),
+            local_password_overrides: HashMap::new(),
             replace_confirm: None,
             replace_cancel_focus: cx.focus_handle(),
             replace_confirm_focus: cx.focus_handle(),
@@ -247,6 +325,43 @@ fn format_ssh_target_host_field(target: &SshTarget) -> String {
 }
 
 impl Waku {
+    /// Load saved remote connections and probe OS keyring password presence
+    /// off the UI thread, guarded by a generation counter so superseded passes
+    /// cannot overwrite newer state. Reconnects saved hosts once loaded.
+    pub(super) fn start_connections_load(&mut self, cx: &mut Context<Self>) {
+        self.connections.load_generation = self.connections.load_generation.wrapping_add(1);
+        let generation = self.connections.load_generation;
+        let load = cx
+            .background_executor()
+            .spawn(async { load_saved_connections_snapshot() });
+        cx.spawn(async move |this, cx| {
+            let snapshot = load.await;
+            let _ = this.update(cx, |this, cx| {
+                let merged_with_local_edits = merge_loaded_connections(
+                    this.connections.load_generation,
+                    generation,
+                    &mut this.connections.file,
+                    &mut this.connections.saved_passwords,
+                    &mut this.connections.local_upserted_ids,
+                    &mut this.connections.local_removed_ids,
+                    &mut this.connections.local_password_overrides,
+                    &mut this.connections.startup_loaded,
+                    snapshot,
+                );
+                if generation != this.connections.load_generation {
+                    return;
+                }
+                if merged_with_local_edits {
+                    this.save_connections();
+                }
+                this.refresh_connections_localized_text(cx);
+                this.reconnect_saved_hosts(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Start listing WSL distributions the first time the page opens.
     pub(super) fn ensure_wsl_distributions(&mut self, force: bool, cx: &mut Context<Self>) {
         if !cfg!(windows) || self.connections.distributions_loading {
@@ -284,8 +399,18 @@ impl Waku {
             .get(&format!("wsl:{distro}"))
             .cloned()
             .unwrap_or_else(|| Connection::wsl(&distro));
+        if !self.connections.startup_loaded {
+            self.connections
+                .local_removed_ids
+                .remove(&connection.id);
+            self.connections
+                .local_upserted_ids
+                .insert(connection.id.clone());
+        }
         self.connections.file.upsert(connection.clone());
-        self.save_connections();
+        if self.connections.startup_loaded {
+            self.save_connections();
+        }
         self.open_connection(connection, cx);
     }
 
@@ -751,6 +876,11 @@ impl Waku {
             return;
         }
         self.connections.saved_passwords.remove(&id);
+        if !self.connections.startup_loaded {
+            self.connections
+                .local_password_overrides
+                .insert(id.clone(), false);
+        }
         self.connections
             .password_input
             .update(cx, |input, cx| input.set_content(String::new(), cx));
@@ -768,7 +898,11 @@ impl Waku {
                     if *auth_method == SshAuthMethod::Password =>
                 {
                     *auth_method = SshAuthMethod::Agent;
-                    self.save_connections();
+                    if !self.connections.startup_loaded {
+                        self.connections.local_upserted_ids.insert(id.clone());
+                    } else {
+                        self.save_connections();
+                    }
                 }
                 _ => {}
             }
@@ -850,6 +984,11 @@ impl Waku {
             self.connections
                 .saved_passwords
                 .insert(connection.id.clone());
+            if !self.connections.startup_loaded {
+                self.connections
+                    .local_password_overrides
+                    .insert(connection.id.clone(), true);
+            }
         } else if matches!(target.auth_method(), SshAuthMethod::Agent)
             && self.connections.saved_passwords.contains(&connection.id)
         {
@@ -865,10 +1004,23 @@ impl Waku {
                 return;
             }
             self.connections.saved_passwords.remove(&connection.id);
+            if !self.connections.startup_loaded {
+                self.connections
+                    .local_password_overrides
+                    .insert(connection.id.clone(), false);
+            }
         }
 
+        if !self.connections.startup_loaded {
+            self.connections.local_removed_ids.remove(&connection.id);
+            self.connections
+                .local_upserted_ids
+                .insert(connection.id.clone());
+        }
         self.connections.file.upsert(connection);
-        self.save_connections();
+        if self.connections.startup_loaded {
+            self.save_connections();
+        }
         self.clear_ssh_form(cx);
         cx.notify();
     }
@@ -878,6 +1030,10 @@ impl Waku {
         if self.connections.editing_id.as_deref() == Some(id) {
             self.clear_ssh_form(cx);
         }
+        if !self.connections.startup_loaded {
+            self.connections.local_upserted_ids.remove(id);
+            self.connections.local_removed_ids.insert(id.to_owned());
+        }
         if let Some(removed) = self.connections.file.remove(id) {
             if matches!(removed.kind, ConnectionKind::Ssh { .. }) {
                 if let Err(error) = waku_client::remote::credentials::delete_ssh_password(id) {
@@ -886,9 +1042,16 @@ impl Waku {
                     self.show_toast(message);
                 } else {
                     self.connections.saved_passwords.remove(id);
+                    if !self.connections.startup_loaded {
+                        self.connections
+                            .local_password_overrides
+                            .insert(id.to_owned(), false);
+                    }
                 }
             }
-            self.save_connections();
+            if self.connections.startup_loaded {
+                self.save_connections();
+            }
         }
         cx.notify();
     }

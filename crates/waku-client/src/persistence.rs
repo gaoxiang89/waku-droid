@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -937,6 +937,200 @@ impl TaskStateLoadGate {
     }
 }
 
+struct AppFileQueue {
+    pending_settings: Option<AppSettings>,
+    pending_state: Option<AppState>,
+    last_settings_bytes: Option<Vec<u8>>,
+    enqueued_seq: u64,
+    completed_seq: u64,
+    last_error: Option<String>,
+    shutdown: bool,
+    exited: bool,
+}
+
+struct AppFileWriterShared {
+    app_settings_path: PathBuf,
+    app_state_path: PathBuf,
+    queue: Mutex<AppFileQueue>,
+    wake: Condvar,
+    flushed: Condvar,
+}
+
+/// Coalesced single-writer background thread for local desktop JSON files
+/// (`app.json` and `state.json`). Enqueueing from the UI thread swaps the
+/// latest pending snapshot under a brief lock and never touches disk; rapid
+/// saves (such as 1 Hz streaming checkpoints) coalesce into one atomic write.
+struct AppFileWriter {
+    shared: Arc<AppFileWriterShared>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl AppFileWriter {
+    fn new(app_settings_path: PathBuf, app_state_path: PathBuf) -> Self {
+        Self {
+            shared: Arc::new(AppFileWriterShared {
+                app_settings_path,
+                app_state_path,
+                queue: Mutex::new(AppFileQueue {
+                    pending_settings: None,
+                    pending_state: None,
+                    last_settings_bytes: None,
+                    enqueued_seq: 0,
+                    completed_seq: 0,
+                    last_error: None,
+                    shutdown: false,
+                    exited: false,
+                }),
+                wake: Condvar::new(),
+                flushed: Condvar::new(),
+            }),
+            thread: Mutex::new(None),
+        }
+    }
+
+    fn seed_last_settings(&self, encoded: Option<Vec<u8>>) {
+        self.shared.queue.lock().last_settings_bytes = encoded;
+    }
+
+    fn ensure_started(&self) -> io::Result<()> {
+        let mut handle = self.thread.lock();
+        if handle.is_some() {
+            return Ok(());
+        }
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("waku-app-file-writer".into())
+            .spawn(move || run_app_file_writer(shared))?;
+        *handle = Some(spawned);
+        Ok(())
+    }
+
+    fn enqueue(&self, settings: AppSettings, state: AppState) -> io::Result<()> {
+        if self.ensure_started().is_err() {
+            // Extreme fallback if OS thread creation fails: persist inline so
+            // state is never silently dropped.
+            return self.write_inline(settings, state);
+        }
+        let previous_error = {
+            let mut queue = self.shared.queue.lock();
+            queue.pending_settings = Some(settings);
+            queue.pending_state = Some(state);
+            queue.enqueued_seq = queue.enqueued_seq.saturating_add(1);
+            self.shared.wake.notify_one();
+            queue.last_error.take()
+        };
+        previous_error.map_or(Ok(()), |message| Err(io::Error::other(message)))
+    }
+
+    fn write_inline(&self, settings: AppSettings, state: AppState) -> io::Result<()> {
+        let encoded = serde_json::to_vec(&settings).map_err(to_io_error)?;
+        let should_write_settings = self.shared.queue.lock().last_settings_bytes.as_deref()
+            != Some(encoded.as_slice());
+        if should_write_settings {
+            write_json_atomically(&self.shared.app_settings_path, &settings)?;
+            self.shared.queue.lock().last_settings_bytes = Some(encoded);
+        }
+        write_json_atomically(&self.shared.app_state_path, &state)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        flush_app_file_writer(&self.shared)
+    }
+
+    fn flusher(&self) -> impl FnOnce() -> io::Result<()> + Send + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || flush_app_file_writer(&shared)
+    }
+}
+
+impl Drop for AppFileWriter {
+    fn drop(&mut self) {
+        {
+            let mut queue = self.shared.queue.lock();
+            queue.shutdown = true;
+            self.shared.wake.notify_one();
+        }
+        if let Some(handle) = self.thread.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn flush_app_file_writer(shared: &AppFileWriterShared) -> io::Result<()> {
+    let mut queue = shared.queue.lock();
+    let target = queue.enqueued_seq;
+    while queue.completed_seq < target && !queue.exited {
+        shared.flushed.wait(&mut queue);
+    }
+    queue
+        .last_error
+        .take()
+        .map_or(Ok(()), |message| Err(io::Error::other(message)))
+}
+
+fn run_app_file_writer(shared: Arc<AppFileWriterShared>) {
+    loop {
+        let (settings, state, seq, prev_settings_bytes) = {
+            let mut queue = shared.queue.lock();
+            while queue.pending_settings.is_none()
+                && queue.pending_state.is_none()
+                && !queue.shutdown
+            {
+                shared.wake.wait(&mut queue);
+            }
+            if queue.pending_settings.is_none()
+                && queue.pending_state.is_none()
+                && queue.shutdown
+            {
+                queue.exited = true;
+                shared.flushed.notify_all();
+                return;
+            }
+            (
+                queue.pending_settings.take(),
+                queue.pending_state.take(),
+                queue.enqueued_seq,
+                queue.last_settings_bytes.clone(),
+            )
+        };
+
+        let mut updated_settings_bytes = None;
+        let mut write_error: Option<io::Error> = None;
+
+        if let Some(settings) = settings {
+            match serde_json::to_vec(&settings).map_err(to_io_error) {
+                Ok(encoded) => {
+                    if prev_settings_bytes.as_deref() != Some(encoded.as_slice()) {
+                        match write_json_atomically(&shared.app_settings_path, &settings) {
+                            Ok(()) => updated_settings_bytes = Some(encoded),
+                            Err(error) => write_error = Some(error),
+                        }
+                    }
+                }
+                Err(error) => write_error = Some(error),
+            }
+        }
+        if let Some(state) = state
+            && let Err(error) = write_json_atomically(&shared.app_state_path, &state)
+        {
+            write_error.get_or_insert(error);
+        }
+
+        let mut queue = shared.queue.lock();
+        if let Some(encoded) = updated_settings_bytes {
+            queue.last_settings_bytes = Some(encoded);
+        }
+        if let Some(error) = write_error {
+            eprintln!("could not persist local desktop state: {error}");
+            queue.last_error = Some(error.to_string());
+        }
+        if seq > queue.completed_seq {
+            queue.completed_seq = seq;
+        }
+        shared.flushed.notify_all();
+    }
+}
+
 /// Desktop state store: app files stay local, task data crosses RPC.
 pub struct StateStore {
     path: PathBuf,
@@ -950,10 +1144,10 @@ pub struct StateStore {
     /// after a transient RPC failure must never turn the next ordinary save
     /// into a destructive replacement of the daemon database.
     task_state_loaded: TaskStateLoadGate,
-    /// `app.json` as this store last read or wrote it. Several windows share
-    /// the file, so a save rewrites it only when this window changed a
-    /// setting; an idle window must not revert another window's change.
-    last_app_settings: Mutex<Option<Vec<u8>>>,
+    /// Off-thread coalesced writer for `app.json` and `state.json`. Several
+    /// windows share `app.json`, so it rewrites that file only when this window
+    /// changed a setting; an idle window must not revert another window's edit.
+    app_file_writer: AppFileWriter,
 }
 
 impl StateStore {
@@ -974,15 +1168,18 @@ impl StateStore {
     }
 
     pub fn remote(daemon: DaemonSupervisor) -> Self {
+        let app_state_path = default_app_state_path();
+        let app_settings_path = default_app_settings_path();
+        let app_file_writer = AppFileWriter::new(app_settings_path.clone(), app_state_path.clone());
         Self {
-            app_state_path: default_app_state_path(),
-            app_settings_path: default_app_settings_path(),
+            app_state_path,
+            app_settings_path,
             legacy_settings_paths: default_legacy_settings_paths(),
             path: Self::default_path(),
             daemon,
             remote_default_cwd: Mutex::new(None),
             task_state_loaded: TaskStateLoadGate::default(),
-            last_app_settings: Mutex::new(None),
+            app_file_writer,
         }
     }
 
@@ -1142,12 +1339,17 @@ impl StateStore {
         }
         state.migrate_loaded();
         if app_settings_missing {
-            let _ = self.write_app_settings(&state.app_settings());
+            let settings = state.app_settings();
+            if write_json_atomically(&self.app_settings_path, &settings).is_ok() {
+                self.app_file_writer
+                    .seed_last_settings(serde_json::to_vec(&settings).ok());
+            }
         } else {
-            *self.last_app_settings.lock() = serde_json::to_vec(&state.app_settings()).ok();
+            self.app_file_writer
+                .seed_last_settings(serde_json::to_vec(&state.app_settings()).ok());
         }
         if app_state_missing {
-            let _ = self.write_app_state(&state.app_state());
+            let _ = write_json_atomically(&self.app_state_path, &state.app_state());
         }
         Ok(state)
     }
@@ -1174,6 +1376,18 @@ impl StateStore {
         self.save_partition(state, &projects, &sessions, true)
     }
 
+    /// Blocks until every queued `app.json` / `state.json` write has landed on
+    /// disk. Intended for graceful shutdown and tests.
+    pub fn flush_app_files(&self) -> io::Result<()> {
+        self.app_file_writer.flush()
+    }
+
+    /// Returns a sendable closure that flushes queued app-file writes off the
+    /// UI thread (for example inside GPUI's `on_app_quit` background task).
+    pub fn app_file_flusher(&self) -> impl FnOnce() -> io::Result<()> + Send + 'static {
+        self.app_file_writer.flusher()
+    }
+
     pub fn task_state_loaded(&self) -> bool {
         self.task_state_loaded.loaded()
     }
@@ -1197,8 +1411,8 @@ impl StateStore {
         write_app_files: bool,
     ) -> io::Result<()> {
         if write_app_files {
-            self.write_app_settings(&state.app_settings())?;
-            self.write_app_state(&state.app_state())?;
+            self.app_file_writer
+                .enqueue(state.app_settings(), state.app_state())?;
         }
         let (command, dirty_ids) =
             task_state_save_command(state, project_ids, session_ids, self.task_state_loaded())?;
@@ -1236,21 +1450,6 @@ impl StateStore {
         source
             .map(|(bytes, _)| serde_json::from_slice(&bytes).map_err(to_io_error))
             .transpose()
-    }
-
-    fn write_app_settings(&self, settings: &AppSettings) -> io::Result<()> {
-        let encoded = serde_json::to_vec(settings).map_err(to_io_error)?;
-        let mut last = self.last_app_settings.lock();
-        if last.as_deref() == Some(encoded.as_slice()) {
-            return Ok(());
-        }
-        write_json_atomically(&self.app_settings_path, settings)?;
-        *last = Some(encoded);
-        Ok(())
-    }
-
-    fn write_app_state(&self, state: &AppState) -> io::Result<()> {
-        write_json_atomically(&self.app_state_path, state)
     }
 }
 
@@ -1722,6 +1921,107 @@ mod tests {
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_file_writer_coalesces_rapid_saves_and_flushes_latest_state() {
+        let dir = std::env::temp_dir().join(format!("waku-app-file-writer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("app.json");
+        let state_path = dir.join("state.json");
+        let writer = AppFileWriter::new(settings_path.clone(), state_path.clone());
+
+        let mut persisted = PersistedState::empty();
+        for width in 260..320 {
+            persisted.sidebar_width = width as f32;
+            persisted.render_math = width % 2 == 0;
+            writer
+                .enqueue(persisted.app_settings(), persisted.app_state())
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let saved_settings: AppSettings =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        let saved_state: AppState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved_state.sidebar_width, 319.0);
+        assert!(!saved_settings.render_math);
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        );
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_file_writer_preserves_other_windows_settings_when_unchanged() {
+        let dir = std::env::temp_dir().join(format!("waku-app-file-unchanged-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("app.json");
+        let state_path = dir.join("state.json");
+
+        let mut window_a = PersistedState::empty();
+        let writer = AppFileWriter::new(settings_path.clone(), state_path.clone());
+        writer.seed_last_settings(serde_json::to_vec(&window_a.app_settings()).ok());
+
+        // Simulate another window writing a different setting to `app.json`.
+        let mut window_b = PersistedState::empty();
+        window_b.render_math = false;
+        write_json_atomically(&settings_path, &window_b.app_settings()).unwrap();
+
+        // Window A saves a UI-layout change only; its unchanged settings must
+        // not overwrite window B's `app.json`.
+        window_a.sidebar_width = 333.0;
+        writer
+            .enqueue(window_a.app_settings(), window_a.app_state())
+            .unwrap();
+        writer.flush().unwrap();
+
+        let on_disk_settings: AppSettings =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert!(!on_disk_settings.render_math);
+        let on_disk_state: AppState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(on_disk_state.sidebar_width, 333.0);
+
+        // Once window A explicitly changes a setting, `app.json` is written.
+        window_a.theme = ThemePreference::Dark;
+        writer
+            .enqueue(window_a.app_settings(), window_a.app_state())
+            .unwrap();
+        writer.flush().unwrap();
+        let updated_settings: AppSettings =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(updated_settings.theme, ThemePreference::Dark);
+
+        drop(writer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_file_writer_flushes_pending_writes_on_drop() {
+        let dir = std::env::temp_dir().join(format!("waku-app-file-drop-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("app.json");
+        let state_path = dir.join("state.json");
+
+        {
+            let writer = AppFileWriter::new(settings_path.clone(), state_path.clone());
+            let mut persisted = PersistedState::empty();
+            persisted.files_panel_width = 412.0;
+            writer
+                .enqueue(persisted.app_settings(), persisted.app_state())
+                .unwrap();
+        }
+
+        let on_disk_state: AppState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(on_disk_state.files_panel_width, 412.0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

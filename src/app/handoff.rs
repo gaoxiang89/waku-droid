@@ -76,6 +76,16 @@ pub(super) fn plan_with_accounts(
     prompt: &str,
     accounts: &[waku_protocol::ProviderAccount],
 ) -> Option<HandoffPlan> {
+    let localized_default_account = tr!("providers.default_account");
+    plan_with_accounts_and_default_label(session, prompt, accounts, &localized_default_account)
+}
+
+fn plan_with_accounts_and_default_label(
+    session: &AgentSession,
+    prompt: &str,
+    accounts: &[waku_protocol::ProviderAccount],
+    localized_default_account: &str,
+) -> Option<HandoffPlan> {
     let target = session.provider;
     let target_account_id = session.account_id.as_deref();
     let same_target = |turn: &AgentTurn| {
@@ -134,23 +144,28 @@ pub(super) fn plan_with_accounts(
             providers_with_multiple_accounts.push(provider);
         }
     }
-    let format_agent = |provider: ProviderKind, account_id: Option<&str>| -> String {
-        if let Some(id) = account_id {
-            let label = accounts
-                .iter()
-                .find(|account| account.provider == provider && account.id == id)
-                .map(|account| account.label.as_str())
-                .unwrap_or(id);
-            format!("{} ({label})", provider.display_name())
-        } else if providers_with_multiple_accounts.contains(&provider) {
-            format!(
-                "{} ({})",
-                provider.display_name(),
-                tr!("providers.default_account")
-            )
-        } else {
-            provider.display_name().to_owned()
-        }
+    let format_agent =
+        |provider: ProviderKind, account_id: Option<&str>, default_label: &str| -> String {
+            if let Some(id) = account_id {
+                let label = accounts
+                    .iter()
+                    .find(|account| account.provider == provider && account.id == id)
+                    .map(|account| account.label.as_str())
+                    .unwrap_or(id);
+                format!("{} ({label})", provider.display_name())
+            } else if providers_with_multiple_accounts.contains(&provider) {
+                format!("{} ({default_label})", provider.display_name())
+            } else {
+                provider.display_name().to_owned()
+            }
+        };
+    // Provider-facing preamble stays English regardless of app locale; UI
+    // notices remain localized.
+    let format_preamble_agent = |provider: ProviderKind, account_id: Option<&str>| -> String {
+        format_agent(provider, account_id, "Default")
+    };
+    let format_notice_agent = |provider: ProviderKind, account_id: Option<&str>| -> String {
+        format_agent(provider, account_id, localized_default_account)
     };
 
     let mut messages_by_turn: HashMap<Uuid, Vec<&Message>> =
@@ -177,7 +192,8 @@ pub(super) fn plan_with_accounts(
     };
     let render = |pos: usize| {
         let turn = &session.turns[covered[pos]];
-        let speaker = format_agent(session.turn_provider(turn), session.turn_account_id(turn));
+        let speaker =
+            format_preamble_agent(session.turn_provider(turn), session.turn_account_id(turn));
         render_turn(
             session,
             covered[pos],
@@ -188,7 +204,8 @@ pub(super) fn plan_with_accounts(
     };
     let render_prompt = |pos: usize| {
         let turn = &session.turns[covered[pos]];
-        let speaker = format_agent(session.turn_provider(turn), session.turn_account_id(turn));
+        let speaker =
+            format_preamble_agent(session.turn_provider(turn), session.turn_account_id(turn));
         render_turn_prompt(session, covered[pos], &speaker, &messages_by_turn)
     };
     let mut selected: Vec<(usize, String)> = Vec::new();
@@ -231,21 +248,28 @@ pub(super) fn plan_with_accounts(
     selected.sort_unstable_by_key(|(pos, _)| *pos);
 
     let mut from_providers: Vec<ProviderKind> = Vec::new();
-    let mut from_agent_names: Vec<String> = Vec::new();
+    let mut notice_agent_names: Vec<String> = Vec::new();
+    let mut preamble_agent_names: Vec<String> = Vec::new();
     for (pos, _) in &selected {
         let turn = &session.turns[covered[*pos]];
         let provider = session.turn_provider(turn);
+        let account_id = session.turn_account_id(turn);
         if !from_providers.contains(&provider) {
             from_providers.push(provider);
         }
-        let agent_name = format_agent(provider, session.turn_account_id(turn));
-        if !from_agent_names.contains(&agent_name) {
-            from_agent_names.push(agent_name);
+        let notice_name = format_notice_agent(provider, account_id);
+        if !notice_agent_names.contains(&notice_name) {
+            notice_agent_names.push(notice_name);
+        }
+        let preamble_name = format_preamble_agent(provider, account_id);
+        if !preamble_agent_names.contains(&preamble_name) {
+            preamble_agent_names.push(preamble_name);
         }
     }
     let omitted_turns = covered.len() - selected.len();
-    let agents = from_agent_names.join(", ");
-    let target_name = format_agent(target, target_account_id);
+    let agents = notice_agent_names.join(", ");
+    let preamble_agents = preamble_agent_names.join(", ");
+    let target_name = format_notice_agent(target, target_account_id);
     let mut notice = if resumed {
         if selected.len() == 1 {
             tr!(
@@ -292,7 +316,7 @@ pub(super) fn plan_with_accounts(
     preamble.push_str(&format!(
         "\n\nCovered {} turn(s) of this task, written by {}.",
         selected.len(),
-        agents
+        preamble_agents
     ));
     if resumed {
         preamble.push(' ');
@@ -923,5 +947,57 @@ mod tests {
         );
         assert!(back_to_default.preamble.contains("work answer"));
         assert!(!back_to_default.preamble.contains("personal answer"));
+    }
+
+    #[test]
+    fn handoff_preamble_uses_english_default_account_label_under_non_english_locale() {
+        let work_account = waku_protocol::ProviderAccount {
+            id: "work".into(),
+            provider: ProviderKind::Claude,
+            label: "Work".into(),
+            config_dir: "/tmp/claude-work".into(),
+            binary_override: None,
+        };
+        let accounts = vec![work_account];
+
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Claude);
+        session.begin_turn("personal question");
+        session.push_message(MessageRole::Assistant, "personal answer");
+        if let Some(turn) = session.turns.last_mut() {
+            turn.provider_turn_started = true;
+            turn.status = TurnStatus::Completed;
+        }
+        session.switch_agent(ProviderKind::Claude, Some("work".into()));
+
+        let plan = plan_with_accounts_and_default_label(
+            &session,
+            "continue on work",
+            &accounts,
+            "默认",
+        )
+        .expect("switching accounts within Claude hands over prior turn");
+
+        assert!(
+            plan.preamble
+                .contains("### Turn 1 — Claude Code (Default)"),
+            "model preamble header must remain English: {}",
+            plan.preamble
+        );
+        assert!(
+            plan.preamble
+                .contains("Covered 1 turn(s) of this task, written by Claude Code (Default)."),
+            "model preamble summary must remain English: {}",
+            plan.preamble
+        );
+        assert!(
+            !plan.preamble.contains("默认"),
+            "localized default account label leaked into English preamble: {}",
+            plan.preamble
+        );
+        assert!(
+            plan.notice.contains("Claude Code (默认)"),
+            "UI notice should keep the localized default account label: {}",
+            plan.notice
+        );
     }
 }

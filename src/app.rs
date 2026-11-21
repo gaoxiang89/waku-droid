@@ -1355,23 +1355,26 @@ pub struct Waku {
         ProviderKind,
         Option<ProviderProbe>,
     )>,
-    provider_probe_tx: Sender<ProviderProbe>,
-    provider_probe_events: Receiver<ProviderProbe>,
+    provider_probe_tx: Sender<(u64, ProviderProbe)>,
+    provider_probe_events: Receiver<(u64, ProviderProbe)>,
     provider_model_discoveries: HashSet<ProviderKind>,
     provider_model_discoveries_pending: HashSet<ProviderKind>,
     /// CLI version per provider, probed off-thread. Missing key means the
     /// probe has not answered yet; `None` means it ran and found nothing.
     provider_versions: HashMap<ProviderKind, Option<String>>,
-    provider_version_tx: Sender<(ProviderKind, Option<String>)>,
-    provider_version_events: Receiver<(ProviderKind, Option<String>)>,
+    provider_version_tx: Sender<(u64, ProviderKind, Option<String>)>,
+    provider_version_events: Receiver<(u64, ProviderKind, Option<String>)>,
     /// Providers with a version probe in flight, so a re-detect cannot stack
     /// a second subprocess on one that has not answered.
     provider_version_probes_pending: HashSet<ProviderKind>,
     /// Fast provider detection results from the daemon, including its cached
     /// model catalog. Live discovery revalidates these probes afterward.
-    provider_detection_tx: Sender<ProviderProbe>,
-    provider_detection_events: Receiver<ProviderProbe>,
-    /// Providers the running re-detection has not answered for yet; empty
+    provider_detection_tx: Sender<(u64, ProviderProbe)>,
+    provider_detection_events: Receiver<(u64, ProviderProbe)>,
+    /// Monotonic per-provider generation counters for detection, model
+    /// discovery, and version probes so stale async responses are ignored.
+    provider_probe_state: runtime::ProviderProbeState,
+    /// Providers the running re-detection has not answered for yet; zero
     /// means no re-detection is in flight.
     provider_detection_remaining: usize,
     /// When provider detection last completed, for the page's "Checked" label.
@@ -3079,10 +3082,23 @@ impl Waku {
             .detach();
 
             // Window-frame changes are only mirrored in memory; the quit save
-            // is what lands the final position and size on disk.
-            cx.on_app_quit(|this, _| {
+            // is what lands the final position and size on disk, flushed on the
+            // background executor so shutdown waits for durability without
+            // blocking the UI thread.
+            cx.on_app_quit(|this, cx| {
                 this.save();
-                async {}
+                let flush = this
+                    .hosts
+                    .get(&waku_client::hosts::HostKey::Local)
+                    .map(|host| host.store.app_file_flusher());
+                let task = cx.background_executor().spawn(async move {
+                    if let Some(flush) = flush {
+                        let _ = flush();
+                    }
+                });
+                async move {
+                    let _ = task.await;
+                }
             })
             .detach();
 
@@ -3483,6 +3499,7 @@ impl Waku {
                 provider_version_probes_pending: HashSet::new(),
                 provider_detection_tx,
                 provider_detection_events,
+                provider_probe_state: runtime::ProviderProbeState::default(),
                 provider_detection_remaining: 0,
                 provider_detection_checked_at: None,
                 expanded_provider_settings: None,
@@ -3835,7 +3852,7 @@ impl Waku {
         entity.update(cx, |this, cx| {
             this.start_terminal_persistence(cx);
             this.restart_task_state_sync();
-            this.reconnect_saved_hosts(cx);
+            this.start_connections_load(cx);
             for session_id in startup_live_session_ids {
                 this.start_runtime_attachment(session_id, cx);
             }

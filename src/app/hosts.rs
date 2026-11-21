@@ -3,9 +3,32 @@ use super::*;
 use waku_client::hosts::HostKey;
 
 pub(super) struct HostCatalog {
-    probes: Vec<ProviderProbe>,
-    pending: HashSet<ProviderKind>,
-    discovered: HashSet<ProviderKind>,
+    pub(super) probes: Vec<ProviderProbe>,
+    pub(super) pending: HashSet<ProviderKind>,
+    pub(super) discovered: HashSet<ProviderKind>,
+    pub(super) checked_at: Option<Instant>,
+}
+
+pub(super) fn host_detection_settled(
+    key: &HostKey,
+    local_checked_at: Option<Instant>,
+    catalog: Option<&HostCatalog>,
+) -> bool {
+    if *key == HostKey::Local {
+        local_checked_at.is_some()
+    } else {
+        catalog.is_some_and(|catalog| catalog.checked_at.is_some() && catalog.pending.is_empty())
+    }
+}
+
+pub(super) fn provider_path_input_value_for_host(
+    expanded_provider: Option<ProviderKind>,
+    override_for_provider: Option<&str>,
+) -> String {
+    expanded_provider
+        .and(override_for_provider)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 impl Waku {
@@ -48,6 +71,28 @@ impl Waku {
             .is_some_and(|catalog| !catalog.pending.is_empty())
     }
 
+    /// Whether provider detection for `key` has settled at least once with no
+    /// in-flight probes remaining.
+    pub(super) fn provider_detection_checked_for_host(&self, key: &HostKey) -> bool {
+        host_detection_settled(
+            key,
+            self.provider_detection_checked_at,
+            self.host_catalogs.get(key),
+        )
+    }
+
+    pub(super) fn reload_provider_path_input_for_current_host(&self, cx: &mut Context<Self>) {
+        let override_value = provider_path_input_value_for_host(
+            self.expanded_provider_settings,
+            self.expanded_provider_settings.and_then(|provider| {
+                self.provider_override_for_host(&self.provider_settings_host, provider)
+                    .map(String::as_str)
+            }),
+        );
+        self.provider_path_input
+            .update(cx, |input, cx| input.set_content(override_value, cx));
+    }
+
     /// Switch the Providers page to another host. The pending binary override
     /// edit commits to the host being left before the move; if a row stays
     /// expanded, its input reloads the new host's override.
@@ -61,13 +106,8 @@ impl Waku {
         if key != HostKey::Local {
             self.sync_host_provider_settings(&key);
         }
-        if let Some(provider) = self.expanded_provider_settings {
-            let override_value = self
-                .provider_override_for_host(&key, provider)
-                .cloned()
-                .unwrap_or_default();
-            self.provider_path_input
-                .update(cx, |input, cx| input.set_content(override_value, cx));
+        if self.expanded_provider_settings.is_some() {
+            self.reload_provider_path_input_for_current_host(cx);
         }
         cx.notify();
     }
@@ -328,6 +368,7 @@ impl Waku {
                     .collect(),
                 pending: HashSet::new(),
                 discovered: HashSet::new(),
+                checked_at: None,
             });
         let providers = provider
             .map(|provider| vec![provider])
@@ -341,6 +382,9 @@ impl Waku {
             })
             .collect::<Vec<_>>();
         if providers.is_empty() {
+            if catalog.pending.is_empty() {
+                catalog.checked_at = Some(Instant::now());
+            }
             return;
         }
         catalog.pending.extend(providers.iter().copied());
@@ -400,6 +444,9 @@ impl Waku {
                 continue;
             };
             catalog.pending.remove(&provider);
+            if catalog.pending.is_empty() {
+                catalog.checked_at = Some(Instant::now());
+            }
             if let Some(probe) = probe {
                 catalog.discovered.insert(provider);
                 if let Some(existing) = catalog
@@ -787,6 +834,7 @@ impl Waku {
         if &self.provider_settings_host == key {
             self.cancel_provider_account_form(cx);
             self.provider_settings_host = HostKey::Local;
+            self.reload_provider_path_input_for_current_host(cx);
         }
         if &self.skills_settings_host == key {
             self.skills_settings_host = HostKey::Local;

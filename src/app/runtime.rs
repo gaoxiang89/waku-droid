@@ -1518,6 +1518,7 @@ impl Waku {
         };
         self.provider_model_discoveries.insert(provider);
         self.provider_model_discoveries_pending.insert(provider);
+        let generation = self.provider_probe_state.begin_discovery(provider);
         let provider_probe_tx = self.provider_probe_tx.clone();
         let event_wake = self.event_wake_tx.clone();
         let daemon = self.daemon.client();
@@ -1539,7 +1540,7 @@ impl Waku {
                     Ok(waku_client::ResponsePayload::ProviderProbe { probe, .. }) => probe,
                     _ => probe,
                 };
-                if provider_probe_tx.send(discovered).is_ok() {
+                if provider_probe_tx.send((generation, discovered)).is_ok() {
                     signal_event_pump(&event_wake);
                 }
             })
@@ -1587,6 +1588,7 @@ impl Waku {
             if !self.provider_version_probes_pending.insert(provider) {
                 continue;
             }
+            let generation = self.provider_probe_state.begin_version(provider);
             let provider_version_tx = self.provider_version_tx.clone();
             let event_wake = self.event_wake_tx.clone();
             let daemon = self.daemon.client();
@@ -1608,7 +1610,10 @@ impl Waku {
                         Ok(waku_client::ResponsePayload::ProviderProbe { version, .. }) => version,
                         _ => None,
                     };
-                    if provider_version_tx.send((provider, version)).is_ok() {
+                    if provider_version_tx
+                        .send((generation, provider, version))
+                        .is_ok()
+                    {
                         signal_event_pump(&event_wake);
                     }
                 })
@@ -1621,7 +1626,13 @@ impl Waku {
 
     pub(super) fn drain_provider_version_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((provider, version)) = self.provider_version_events.try_recv() {
+        while let Ok((generation, provider, version)) = self.provider_version_events.try_recv() {
+            if !self
+                .provider_probe_state
+                .accept_version(generation, provider)
+            {
+                continue;
+            }
             self.provider_version_probes_pending.remove(&provider);
             self.provider_versions.insert(provider, version);
             changed = true;
@@ -1633,24 +1644,44 @@ impl Waku {
     /// page's refresh, or one whose binary override just changed. Also re-runs
     /// model discovery and version probes for whatever the detection finds
     /// installed.
+    ///
+    /// Never silently drops targeted refreshes when another detection pass is
+    /// already running: each pass stamps its providers with a newer generation
+    /// so superseded responses are discarded on drain.
     pub(super) fn refresh_provider_detection(&mut self, scope: Option<ProviderKind>) {
-        if self.provider_detection_remaining > 0 {
-            return;
-        }
-        let disabled = &self.state.disabled_providers;
+        let disabled = self.state.disabled_providers.clone();
         let providers = match scope {
-            Some(provider) if disabled.contains(&provider) => Vec::new(),
+            Some(provider) if disabled.contains(&provider) => {
+                self.provider_probe_state.invalidate_provider(provider);
+                self.provider_model_discoveries.remove(&provider);
+                self.provider_model_discoveries_pending.remove(&provider);
+                self.provider_version_probes_pending.remove(&provider);
+                self.provider_detection_remaining =
+                    self.provider_probe_state.detection_pending_len();
+                Vec::new()
+            }
             Some(provider) => vec![provider],
-            None => ProviderKind::ALL
-                .into_iter()
-                .filter(|provider| !disabled.contains(provider))
-                .collect(),
+            None => {
+                for &provider in &disabled {
+                    self.provider_probe_state.invalidate_provider(provider);
+                    self.provider_model_discoveries_pending.remove(&provider);
+                    self.provider_version_probes_pending.remove(&provider);
+                }
+                ProviderKind::ALL
+                    .into_iter()
+                    .filter(|provider| !disabled.contains(provider))
+                    .collect()
+            }
         };
         if providers.is_empty() {
-            self.provider_detection_checked_at = Some(Instant::now());
+            self.provider_detection_remaining = self.provider_probe_state.detection_pending_len();
+            if self.provider_detection_remaining == 0 {
+                self.provider_detection_checked_at = Some(Instant::now());
+            }
             return;
         }
-        self.provider_detection_remaining = providers.len();
+        let generation = self.provider_probe_state.begin_detection(&providers);
+        self.provider_detection_remaining = self.provider_probe_state.detection_pending_len();
         let overrides = self.state.provider_binary_overrides.clone();
         let provider_detection_tx = self.provider_detection_tx.clone();
         let event_wake = self.event_wake_tx.clone();
@@ -1682,31 +1713,41 @@ impl Waku {
                             discovery_error: None,
                         },
                     };
-                    if provider_detection_tx.send(probe).is_ok() {
+                    if provider_detection_tx.send((generation, probe)).is_ok() {
                         signal_event_pump(&event_wake);
                     }
                 }
             })
             .is_err()
         {
-            self.provider_detection_remaining = 0;
+            self.provider_probe_state
+                .abort_detection(generation, &providers);
+            self.provider_detection_remaining = self.provider_probe_state.detection_pending_len();
             return;
         }
         // A refresh means "re-check everything about these providers":
-        // clearing the per-launch guard lets each one's catalog discovery run
-        // again as its detection lands below.
+        // clearing the per-launch guards lets each one's catalog discovery and
+        // version probe run again as its detection lands below.
         for provider in providers {
             self.provider_model_discoveries.remove(&provider);
+            self.provider_model_discoveries_pending.remove(&provider);
+            self.provider_version_probes_pending.remove(&provider);
         }
     }
 
     pub(super) fn drain_provider_detection_events(&mut self) -> bool {
         let mut changed = false;
         let mut installed_providers = Vec::new();
-        while let Ok(probe) = self.provider_detection_events.try_recv() {
+        while let Ok((generation, probe)) = self.provider_detection_events.try_recv() {
             let provider = probe.provider;
+            if !self
+                .provider_probe_state
+                .accept_detection(generation, provider)
+            {
+                continue;
+            }
             let installed = probe.installed;
-            self.provider_detection_remaining = self.provider_detection_remaining.saturating_sub(1);
+            self.provider_detection_remaining = self.provider_probe_state.detection_pending_len();
             if self.provider_detection_remaining == 0 {
                 self.provider_detection_checked_at = Some(Instant::now());
             }
@@ -1788,13 +1829,12 @@ impl Waku {
     /// composer's trigger, the picker panel, and the send button all swap to
     /// their unavailable state.
     pub(super) fn model_picker_has_no_providers(&self) -> bool {
-        let disabled = self
-            .disabled_providers_for(&self.selected_host_key())
-            .to_vec();
+        let host = self.selected_host_key();
+        let disabled = self.disabled_providers_for(&host).to_vec();
         super::composer::picker_has_no_providers(
-            self.provider_probes(),
+            self.provider_probes_for_host(&host),
             &disabled,
-            self.provider_detection_checked_at.is_some(),
+            self.provider_detection_checked_for_host(&host),
         )
     }
 
@@ -3678,6 +3718,9 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if !self.submission_preparations.contains(&session_id) {
+            if let Ok(prepared) = prepared {
+                close_prepared_driver(prepared.driver);
+            }
             return;
         }
         let selected = self.state.selected_session == Some(session_id);
@@ -3746,6 +3789,7 @@ impl Waku {
                     })
             });
         if !can_start {
+            close_prepared_driver(prepared_driver);
             self.submission_preparations.remove(&session_id);
             cx.notify();
             return;
@@ -3922,7 +3966,13 @@ impl Waku {
 
     pub(super) fn drain_provider_probe_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(probe) = self.provider_probe_events.try_recv() {
+        while let Ok((generation, probe)) = self.provider_probe_events.try_recv() {
+            if !self
+                .provider_probe_state
+                .accept_discovery(generation, probe.provider)
+            {
+                continue;
+            }
             self.provider_model_discoveries_pending
                 .remove(&probe.provider);
             if let Some(existing) = self
@@ -4058,6 +4108,91 @@ impl Waku {
             self.save();
         }
         changed || selected_changed
+    }
+}
+
+fn close_prepared_driver(driver: Option<anyhow::Result<PreparedDriver>>) {
+    if let Some(Ok(prepared)) = driver {
+        prepared.handle.close();
+    }
+}
+
+/// Monotonic per-provider generation counters guarding off-thread provider
+/// detection, model discovery, and CLI version probes so stale responses from
+/// superseded passes cannot overwrite newer overrides or catalogs.
+#[derive(Default)]
+pub(super) struct ProviderProbeState {
+    next_generation: u64,
+    detection_generations: HashMap<ProviderKind, u64>,
+    detection_pending: HashSet<ProviderKind>,
+    discovery_generations: HashMap<ProviderKind, u64>,
+    version_generations: HashMap<ProviderKind, u64>,
+}
+
+impl ProviderProbeState {
+    fn next_gen(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.next_generation
+    }
+
+    pub(super) fn invalidate_provider(&mut self, provider: ProviderKind) -> u64 {
+        let generation = self.next_gen();
+        self.detection_generations.insert(provider, generation);
+        self.discovery_generations.insert(provider, generation);
+        self.version_generations.insert(provider, generation);
+        self.detection_pending.remove(&provider);
+        generation
+    }
+
+    pub(super) fn begin_detection(&mut self, providers: &[ProviderKind]) -> u64 {
+        let generation = self.next_gen();
+        for &provider in providers {
+            self.detection_generations.insert(provider, generation);
+            self.discovery_generations.insert(provider, generation);
+            self.version_generations.insert(provider, generation);
+            self.detection_pending.insert(provider);
+        }
+        generation
+    }
+
+    pub(super) fn abort_detection(&mut self, generation: u64, providers: &[ProviderKind]) {
+        for &provider in providers {
+            if self.detection_generations.get(&provider) == Some(&generation) {
+                self.detection_pending.remove(&provider);
+            }
+        }
+    }
+
+    pub(super) fn accept_detection(&mut self, generation: u64, provider: ProviderKind) -> bool {
+        if self.detection_generations.get(&provider) != Some(&generation) {
+            return false;
+        }
+        self.detection_pending.remove(&provider);
+        true
+    }
+
+    pub(super) fn detection_pending_len(&self) -> usize {
+        self.detection_pending.len()
+    }
+
+    pub(super) fn begin_discovery(&mut self, provider: ProviderKind) -> u64 {
+        let generation = self.next_gen();
+        self.discovery_generations.insert(provider, generation);
+        generation
+    }
+
+    pub(super) fn accept_discovery(&self, generation: u64, provider: ProviderKind) -> bool {
+        self.discovery_generations.get(&provider) == Some(&generation)
+    }
+
+    pub(super) fn begin_version(&mut self, provider: ProviderKind) -> u64 {
+        let generation = self.next_gen();
+        self.version_generations.insert(provider, generation);
+        generation
+    }
+
+    pub(super) fn accept_version(&self, generation: u64, provider: ProviderKind) -> bool {
+        self.version_generations.get(&provider) == Some(&generation)
     }
 }
 
