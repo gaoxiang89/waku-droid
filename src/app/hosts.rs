@@ -656,7 +656,7 @@ impl Waku {
             .into_iter()
             .filter(|connection| !connection.is_local())
         {
-            self.open_connection(connection, cx);
+            self.open_connection_auto(connection, cx);
         }
         if self.connections.pending.is_empty() && self.pending_host_session.take().is_some() {
             self.state.selected_session = None;
@@ -808,7 +808,20 @@ impl Waku {
             .ownership
             .projects
             .retain(|_, owner| owner != key);
-        self.hosts.hosts.retain(|host| &host.key != key);
+        let mut removed_hosts = Vec::new();
+        let mut index = 0;
+        while index < self.hosts.hosts.len() {
+            if &self.hosts.hosts[index].key == key {
+                removed_hosts.push(self.hosts.hosts.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        if !removed_hosts.is_empty() {
+            cx.background_executor()
+                .spawn(async move { drop(removed_hosts) })
+                .detach();
+        }
         self.host_disconnected.remove(key);
         self.host_catalogs.remove(key);
         self.host_provider_overrides.remove(key);
@@ -883,6 +896,112 @@ impl Waku {
         }
         cx.notify();
     }
+    /// Replace a disconnected remote host entry when another connection path
+    /// reaches the same daemon, preserving local selection, unsaved offline
+    /// drafts, sidebar collapse state, settings host picks, and CLI opens.
+    pub(super) fn replace_disconnected_host(
+        &mut self,
+        existing_key: &HostKey,
+        host: waku_client::hosts::Host,
+        drafts: waku_client::persistence::ComposerDrafts,
+        snapshot: RemoteTaskStateSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let new_key = host.key.clone();
+        self.capture_and_save_current_composer_draft(cx);
+        self.hosts.ownership.register_new_sessions(&self.state);
+        let preserved_session_drafts = self
+            .composer_drafts
+            .sessions
+            .iter()
+            .filter(|(id, _)| self.hosts.ownership.session(**id) == *existing_key)
+            .map(|(id, draft)| (*id, draft.clone()))
+            .collect::<Vec<_>>();
+        let preserved_new_session_drafts = self
+            .composer_drafts
+            .new_sessions
+            .iter()
+            .filter(|(id, _)| self.hosts.ownership.project(**id) == *existing_key)
+            .map(|(id, draft)| (*id, draft.clone()))
+            .collect::<Vec<_>>();
+        let selected_session_on_old = self
+            .state
+            .selected_session
+            .filter(|id| self.hosts.ownership.session(*id) == *existing_key);
+        let selected_session_started = selected_session_on_old.is_some_and(|id| {
+            self.state
+                .sessions
+                .iter()
+                .any(|session| session.id == id && session.has_started())
+        });
+        let selected_project_on_old = self
+            .state
+            .selected_project
+            .filter(|id| self.hosts.ownership.project(*id) == *existing_key);
+        let was_collapsed = self.collapsed_hosts.contains(existing_key);
+        let was_provider_host = &self.provider_settings_host == existing_key;
+        let was_skills_host = &self.skills_settings_host == existing_key;
+        let was_usage_host = &self.usage_settings_host == existing_key;
+
+        self.retarget_pending_open_requests(existing_key, &new_key);
+        if selected_session_on_old.is_some() || selected_project_on_old.is_some() {
+            self.state.selected_session = None;
+            self.state.selected_project = None;
+        }
+        self.disconnect_host(existing_key, cx);
+
+        self.composer_drafts
+            .new_sessions
+            .extend(drafts.new_sessions);
+        self.composer_drafts.sessions.extend(drafts.sessions);
+        for (id, draft) in preserved_new_session_drafts {
+            self.composer_drafts.new_sessions.insert(id, draft);
+        }
+        for (id, draft) in preserved_session_drafts {
+            self.composer_drafts.sessions.insert(id, draft);
+        }
+
+        host.store.mark_task_state_loaded();
+        self.hosts.hosts.push(host);
+        if selected_session_started {
+            self.pending_host_session = selected_session_on_old;
+        }
+        self.sync_host_provider_settings(&new_key);
+        self.apply_remote_task_state(new_key.clone(), snapshot, cx);
+        if was_collapsed {
+            self.collapsed_hosts.insert(new_key.clone());
+            self.save_sidebar_collapsed_state();
+        }
+        if was_provider_host {
+            self.set_provider_settings_host(new_key.clone(), cx);
+        }
+        if was_skills_host {
+            if self.settings_page == Some(SettingsPage::Skills) {
+                self.set_skills_settings_host(new_key.clone(), cx);
+            } else {
+                self.skills_settings_host = new_key.clone();
+            }
+        }
+        if was_usage_host {
+            if self.settings_page == Some(SettingsPage::Usage) {
+                self.set_usage_settings_host(new_key.clone(), cx);
+            } else {
+                self.usage_settings_host = new_key.clone();
+            }
+        }
+        if !selected_session_started
+            && self.state.selected_session.is_none()
+            && self.state.selected_project.is_none()
+            && let Some(project_id) = selected_project_on_old
+                .filter(|id| self.state.projects.iter().any(|project| project.id == *id))
+        {
+            self.select_project(project_id, cx);
+        }
+        self.refresh_host_catalog(new_key.clone(), None, true);
+        self.start_host_task_state_sync(new_key);
+        self.process_pending_open_requests(cx);
+    }
+
     pub(super) fn selected_host_key(&self) -> HostKey {
         self.state
             .selected_session

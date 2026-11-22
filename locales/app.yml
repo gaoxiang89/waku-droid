@@ -2768,6 +2768,8 @@ connections.ssh_port_invalid:
   en: The SSH port is not a number between 1 and 65535
 connections.ssh_duplicate:
   en: This SSH host is already saved
+connections.already_connected_via:
+  en: "Already connected to this host via %{existing}"
 connections.save_failed:
   en: "Could not save connections: %{error}"
 connections.connect_failed:

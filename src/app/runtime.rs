@@ -142,6 +142,29 @@ pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
             .is_some_and(|turn| turn.status == TurnStatus::Running && turn.provider_turn_started)
 }
 
+/// Collapse any pre-existing duplicate session rows sharing one UUID,
+/// preserving whichever carries hydrated detail (or fresher state).
+fn deduplicate_sessions_in_place(sessions: &mut Vec<AgentSession>) {
+    let mut index_by_id: HashMap<Uuid, usize> = HashMap::with_capacity(sessions.len());
+    let mut deduped: Vec<AgentSession> = Vec::with_capacity(sessions.len());
+    for session in sessions.drain(..) {
+        if let Some(&existing_index) = index_by_id.get(&session.id) {
+            let existing = &deduped[existing_index];
+            let prefer_candidate = (session.detail_loaded && !existing.detail_loaded)
+                || (session.detail_loaded == existing.detail_loaded
+                    && (session.turns.len(), session.messages.len(), session.updated_at)
+                        > (existing.turns.len(), existing.messages.len(), existing.updated_at));
+            if prefer_candidate {
+                deduped[existing_index] = session;
+            }
+        } else {
+            index_by_id.insert(session.id, deduped.len());
+            deduped.push(session);
+        }
+    }
+    *sessions = deduped;
+}
+
 /// Merge the daemon's list-only session projection into the desktop catalog.
 ///
 /// Existing rows may already contain a hydrated transcript, so only list
@@ -153,6 +176,19 @@ pub(super) fn merge_remote_session_catalog(
     remote: Vec<AgentSession>,
     has_local_runtime: impl Fn(Uuid) -> bool,
 ) -> Vec<Uuid> {
+    deduplicate_sessions_in_place(local);
+    let mut unique_remote: Vec<AgentSession> = Vec::with_capacity(remote.len());
+    let mut remote_indices: HashMap<Uuid, usize> = HashMap::with_capacity(remote.len());
+    for session in remote {
+        if let Some(&index) = remote_indices.get(&session.id) {
+            unique_remote[index] = session;
+        } else {
+            remote_indices.insert(session.id, unique_remote.len());
+            unique_remote.push(session);
+        }
+    }
+    let remote = unique_remote;
+
     let remote_ids = remote
         .iter()
         .map(|session| session.id)
@@ -210,12 +246,30 @@ fn merge_host_task_state(
     snapshot
         .projects
         .retain(|project| !state.deleted_project_ids.contains(&project.id));
+    let mut unique_projects = Vec::with_capacity(snapshot.projects.len());
+    let mut project_indices = HashMap::with_capacity(snapshot.projects.len());
+    for project in snapshot.projects {
+        if let Some(&index) = project_indices.get(&project.id) {
+            unique_projects[index] = project;
+        } else {
+            project_indices.insert(project.id, unique_projects.len());
+            unique_projects.push(project);
+        }
+    }
+    snapshot.projects = unique_projects;
     snapshot
         .sessions
         .retain(|session| !state.deleted_project_ids.contains(&session.project_id));
+    let incoming_session_ids = snapshot
+        .sessions
+        .iter()
+        .map(|session| session.id)
+        .collect::<HashSet<_>>();
     let (mut sessions, other_sessions) = std::mem::take(&mut state.sessions)
         .into_iter()
-        .partition(|session| ownership.session(session.id) == *key);
+        .partition(|session| {
+            ownership.session(session.id) == *key || incoming_session_ids.contains(&session.id)
+        });
     state.sessions = other_sessions;
     let mut deleted = Vec::new();
     sessions.retain(|session| {
@@ -1136,12 +1190,53 @@ impl Waku {
         for (key, (ticket, result)) in latest {
             match result {
                 Ok(snapshot) => {
-                    if !self
-                        .hosts
-                        .get(&key)
-                        .is_some_and(|host| host.store.task_state_load_gate().complete(ticket))
-                    {
-                        continue;
+                    let duplicate = {
+                        let Some(host) = self.hosts.get(&key) else {
+                            continue;
+                        };
+                        if !host.store.task_state_load_gate().complete(ticket) {
+                            continue;
+                        }
+                        let identity = host.daemon.daemon_identity();
+                        self.hosts.find_duplicate_host(
+                            &key,
+                            identity.as_ref(),
+                            &snapshot.projects,
+                            &snapshot.sessions,
+                        )
+                    };
+                    if let Some(existing_key) = duplicate {
+                        let existing_disconnected =
+                            existing_key != waku_client::hosts::HostKey::Local
+                                && (self.host_disconnected.contains(&existing_key)
+                                    || self
+                                        .hosts
+                                        .get(&existing_key)
+                                        .is_some_and(|host| host.daemon.is_disconnected()));
+                        if key == waku_client::hosts::HostKey::Local || existing_disconnected {
+                            let selected_on_old = self
+                                .state
+                                .selected_session
+                                .filter(|id| self.hosts.ownership.session(*id) == existing_key);
+                            if let Some(selected_id) = selected_on_old
+                                && self
+                                    .state
+                                    .sessions
+                                    .iter()
+                                    .any(|session| session.id == selected_id && session.has_started())
+                            {
+                                self.pending_host_session = Some(selected_id);
+                                self.state.selected_session = None;
+                                self.state.selected_project = None;
+                            }
+                            self.retarget_pending_open_requests(&existing_key, &key);
+                            self.disconnect_host(&existing_key, cx);
+                        } else {
+                            self.retarget_pending_open_requests(&key, &existing_key);
+                            self.disconnect_host(&key, cx);
+                            changed = true;
+                            continue;
+                        }
                     }
                     self.apply_remote_task_state(key, snapshot, cx);
                     self.process_pending_open_requests(cx);
@@ -4058,6 +4153,21 @@ impl Waku {
         });
     }
 
+    pub(super) fn retarget_pending_open_requests(
+        &mut self,
+        from: &waku_client::hosts::HostKey,
+        to: &waku_client::hosts::HostKey,
+    ) -> bool {
+        let mut retargeted = false;
+        for req in &mut self.pending_open_requests {
+            if matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == from) {
+                req.target = OpenWorkspaceTarget::Host(to.clone());
+                retargeted = true;
+            }
+        }
+        retargeted
+    }
+
     fn drain_open_workspace_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut received = Vec::new();
         while let Ok((source_host, generation, request)) = self.open_workspace_events.try_recv() {
@@ -4688,6 +4798,80 @@ mod response_fork_title_tests {
             next_response_fork_title("Plan (2026)", ["Plan (2026)"]),
             "Plan (2026) (2)"
         );
+    }
+
+    #[test]
+    fn overlapping_host_merges_never_duplicate_projects_or_sessions() {
+        use waku_client::hosts::{HostKey, HostOwnership};
+
+        let host_a = HostKey::Connection("ssh:lan".into());
+        let host_b = HostKey::Connection("ssh:tailscale".into());
+        let project = Project::from_path("/remote/repo".into());
+        let mut hydrated = AgentSession::new(project.id, ProviderKind::Codex);
+        hydrated.begin_turn("Keep hydrated detail");
+        assert!(hydrated.detail_loaded);
+        let projection = hydrated.list_projection();
+
+        let mut owners = HostOwnership::default();
+        let mut state = PersistedState::empty();
+
+        // Host A loads initial state, then user hydrates the session locally.
+        merge_host_task_state(
+            &mut state,
+            &mut owners,
+            &host_a,
+            RemoteTaskStateSnapshot {
+                deleted_project_ids: vec![],
+                projects: vec![project.clone()],
+                sessions: vec![projection.clone()],
+            },
+            |_| false,
+        );
+        state.sessions[0] = hydrated.clone();
+
+        // Alternating sync snapshots from Host B and Host A sharing the same UUIDs
+        // must keep exactly one project and one session with hydrated detail intact.
+        for owner in [&host_b, &host_a, &host_b, &host_a] {
+            merge_host_task_state(
+                &mut state,
+                &mut owners,
+                owner,
+                RemoteTaskStateSnapshot {
+                    deleted_project_ids: vec![],
+                    projects: vec![project.clone()],
+                    sessions: vec![projection.clone()],
+                },
+                |_| false,
+            );
+            assert_eq!(state.projects.len(), 1);
+            assert_eq!(state.sessions.len(), 1);
+            assert_eq!(state.sessions[0].id, hydrated.id);
+            assert!(state.sessions[0].detail_loaded);
+            assert_eq!(state.sessions[0].turns.len(), 1);
+        }
+    }
+
+    #[test]
+    fn merge_remote_session_catalog_collapses_existing_duplicates_and_keeps_detail() {
+        let project = Project::from_path("/remote/repo".into());
+        let mut hydrated = AgentSession::new(project.id, ProviderKind::Codex);
+        hydrated.begin_turn("Hydrated prompt");
+        let skeleton = hydrated.list_projection();
+        let mut updated_remote = skeleton.clone();
+        assert!(updated_remote.set_title("Updated title"));
+
+        let mut local = vec![skeleton.clone(), hydrated.clone()];
+        let removed = merge_remote_session_catalog(
+            &mut local,
+            vec![skeleton, updated_remote],
+            |_| false,
+        );
+
+        assert!(removed.is_empty());
+        assert_eq!(local.len(), 1);
+        assert!(local[0].detail_loaded);
+        assert_eq!(local[0].turns.len(), 1);
+        assert_eq!(local[0].title, "Updated title");
     }
 }
 

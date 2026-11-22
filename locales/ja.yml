@@ -1409,6 +1409,7 @@ connections.ssh_proxy_jump_placeholder: 踏み台ホスト ProxyJump（任意）
 connections.ssh_host_required: SSH ホストを入力してください
 connections.ssh_port_invalid: SSH ポートは 1〜65535 の数値で指定してください
 connections.ssh_duplicate: この SSH ホストは既に保存されています
+connections.already_connected_via: "%{existing} 経由で既に同じホストに接続されています"
 connections.save_failed: "接続を保存できませんでした：%{error}"
 connections.connect_failed: "%{name} に接続できませんでした：%{error}"
 connections.test_succeeded: "%{name} に接続しました"

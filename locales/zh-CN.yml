@@ -1356,6 +1356,7 @@ connections.ssh_proxy_jump_placeholder: 跳板机 ProxyJump（可选）
 connections.ssh_host_required: 请输入 SSH 主机
 connections.ssh_port_invalid: SSH 端口必须是 1 到 65535 之间的数字
 connections.ssh_duplicate: 该 SSH 主机已保存
+connections.already_connected_via: "已通过 %{existing} 连接到同一主机"
 connections.save_failed: "无法保存连接：%{error}"
 connections.connect_failed: "无法连接到 %{name}：%{error}"
 connections.test_succeeded: "已连接到 %{name}"

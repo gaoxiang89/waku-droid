@@ -424,7 +424,13 @@ impl Waku {
     /// Connect a host in this window. The first connection to a host may
     /// install the daemon, so the button reports progress until it resolves.
     pub(super) fn open_connection(&mut self, connection: Connection, cx: &mut Context<Self>) {
-        self.open_connection_with(connection, false, cx);
+        self.open_connection_with(connection, false, false, cx);
+    }
+
+    /// Automatic startup reconnect variant: skips duplicate-host toast noise
+    /// when multiple saved SSH routes reach the same daemon.
+    pub(super) fn open_connection_auto(&mut self, connection: Connection, cx: &mut Context<Self>) {
+        self.open_connection_with(connection, false, true, cx);
     }
 
     /// `replace_incompatible` ends a host daemon that speaks another protocol
@@ -433,6 +439,7 @@ impl Waku {
         &mut self,
         connection: Connection,
         replace_incompatible: bool,
+        auto_reconnect: bool,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -474,16 +481,62 @@ impl Waku {
                 match result {
                     Ok((host, drafts, snapshot)) => {
                         let key = host.key.clone();
-                        this.composer_drafts
-                            .new_sessions
-                            .extend(drafts.new_sessions);
-                        this.composer_drafts.sessions.extend(drafts.sessions);
-                        host.store.mark_task_state_loaded();
-                        this.hosts.hosts.push(host);
-                        this.sync_host_provider_settings(&key);
-                        this.apply_remote_task_state(key.clone(), snapshot, cx);
-                        this.refresh_host_catalog(key.clone(), None, true);
-                        this.start_host_task_state_sync(key);
+                        let identity = host.daemon.daemon_identity();
+                        if let Some(existing_key) = this.hosts.find_duplicate_host(
+                            &key,
+                            identity.as_ref(),
+                            &snapshot.projects,
+                            &snapshot.sessions,
+                        ) {
+                            let existing_disconnected =
+                                existing_key != waku_client::hosts::HostKey::Local
+                                    && (this.host_disconnected.contains(&existing_key)
+                                        || this
+                                            .hosts
+                                            .get(&existing_key)
+                                            .is_some_and(|existing| existing.daemon.is_disconnected()));
+                            if existing_disconnected {
+                                this.replace_disconnected_host(
+                                    &existing_key,
+                                    host,
+                                    drafts,
+                                    snapshot,
+                                    cx,
+                                );
+                            } else {
+                                let existing_name =
+                                    if existing_key == waku_client::hosts::HostKey::Local {
+                                        tr!("connections.local")
+                                    } else {
+                                        this.hosts
+                                            .get(&existing_key)
+                                            .map(|existing| existing.name.clone())
+                                            .unwrap_or_default()
+                                    };
+                                cx.background_executor()
+                                    .spawn(async move { drop(host) })
+                                    .detach();
+                                if this.retarget_pending_open_requests(&key, &existing_key) {
+                                    this.process_pending_open_requests(cx);
+                                } else if !auto_reconnect {
+                                    this.show_toast(tr!(
+                                        "connections.already_connected_via",
+                                        existing = existing_name.as_str()
+                                    ));
+                                }
+                            }
+                        } else {
+                            this.composer_drafts
+                                .new_sessions
+                                .extend(drafts.new_sessions);
+                            this.composer_drafts.sessions.extend(drafts.sessions);
+                            host.store.mark_task_state_loaded();
+                            this.hosts.hosts.push(host);
+                            this.sync_host_provider_settings(&key);
+                            this.apply_remote_task_state(key.clone(), snapshot, cx);
+                            this.refresh_host_catalog(key.clone(), None, true);
+                            this.start_host_task_state_sync(key);
+                        }
                     }
                     Err(error) => {
                         let failed_host = waku_client::hosts::HostKey::Connection(id.clone());
@@ -542,7 +595,7 @@ impl Waku {
         let Some(dialog) = self.connections.replace_confirm.take() else {
             return;
         };
-        self.open_connection_with(dialog.connection, true, cx);
+        self.open_connection_with(dialog.connection, true, false, cx);
     }
 
     pub(super) fn render_daemon_replace_dialog(

@@ -3221,6 +3221,19 @@ impl Waku {
                                     .collect::<Vec<_>>();
                                 this.host_disconnected = down;
                                 for key in recovered {
+                                    if key != HostKey::Local
+                                        && let Some(identity) = this
+                                            .hosts
+                                            .get(&key)
+                                            .and_then(|host| host.daemon.daemon_identity())
+                                        && let Some(existing_key) =
+                                            this.hosts.find_same_daemon(&key, &identity)
+                                        && !this.host_disconnected.contains(&existing_key)
+                                    {
+                                        this.retarget_pending_open_requests(&key, &existing_key);
+                                        this.disconnect_host(&key, cx);
+                                        continue;
+                                    }
                                     this.refresh_host_catalog(key, None, true);
                                 }
                                 cx.notify();

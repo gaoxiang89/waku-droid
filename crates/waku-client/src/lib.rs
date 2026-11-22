@@ -21,8 +21,8 @@ pub use client::{
     OpenWorkspaceRequest, request_open_workspace,
 };
 pub use process::{
-    DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonProcess, DaemonSupervisor,
-    parse_allowed_origins, resident_daemon_state_path,
+    DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonIdentity, DaemonProcess,
+    DaemonSupervisor, parse_allowed_origins, resident_daemon_state_path,
 };
 pub use waku_protocol::*;
 pub use workspace_client::WorkspaceClient;

@@ -597,6 +597,27 @@ enum DisconnectedTarget {
     },
 }
 
+/// Identity of the daemon process a [`DaemonSupervisor`] is currently attached
+/// to. Remote hosts running a shared daemon return the same `token` and `pid`
+/// across different network routes (for example LAN vs Tailscale SSH).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonIdentity {
+    pub token: String,
+    pub pid: Option<u32>,
+}
+
+impl DaemonIdentity {
+    pub fn matches(&self, other: &Self) -> bool {
+        if self.token != other.token {
+            return false;
+        }
+        match (self.pid, other.pid) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+}
+
 /// Owns the current daemon and, in development, swaps it after a successful
 /// rebuild without requiring the desktop process to relaunch.
 pub struct DaemonSupervisor {
@@ -725,6 +746,33 @@ impl DaemonSupervisor {
     /// retries. Lock-free, so a frame may read it.
     pub fn is_disconnected(&self) -> bool {
         self.inner.transport_down.load(Ordering::Acquire)
+    }
+
+    /// Current daemon identity (bearer token and pid when known), or `None`
+    /// while a local daemon is mid-restart.
+    pub fn daemon_identity(&self) -> Option<DaemonIdentity> {
+        let target = self.inner.target.lock();
+        match &*target {
+            DaemonTarget::Local(process) => Some(DaemonIdentity {
+                token: process.reconnect_token().to_owned(),
+                pid: Some(process.pid),
+            }),
+            DaemonTarget::Remote {
+                endpoint: RemoteEndpoint::Bridged { session, .. },
+                ..
+            } => Some(DaemonIdentity {
+                token: session.token().to_owned(),
+                pid: Some(session.remote_pid()),
+            }),
+            DaemonTarget::Remote {
+                endpoint: RemoteEndpoint::Direct { token, .. },
+                ..
+            } => Some(DaemonIdentity {
+                token: token.clone(),
+                pid: None,
+            }),
+            DaemonTarget::Restarting(_) => None,
+        }
     }
 
     fn from_target(
@@ -1470,6 +1518,140 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(&state_file);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_identity_matching_and_supervisor_reporting() {
+        let a = DaemonIdentity {
+            token: "tok-1".into(),
+            pid: Some(42),
+        };
+        let b_same = DaemonIdentity {
+            token: "tok-1".into(),
+            pid: Some(42),
+        };
+        let c_diff_pid = DaemonIdentity {
+            token: "tok-1".into(),
+            pid: Some(99),
+        };
+        let d_no_pid = DaemonIdentity {
+            token: "tok-1".into(),
+            pid: None,
+        };
+        let e_diff_tok = DaemonIdentity {
+            token: "tok-2".into(),
+            pid: Some(42),
+        };
+        assert!(a.matches(&b_same));
+        assert!(!a.matches(&c_diff_pid));
+        assert!(a.matches(&d_no_pid));
+        assert!(d_no_pid.matches(&a));
+        assert!(!a.matches(&e_diff_tok));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let Ok(stream) = stream else { break };
+                handlers.push(std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut ws = tungstenite::accept(stream).unwrap();
+                    let _ = ws.read().unwrap();
+                    ws.send(tungstenite::Message::Text(
+                        serde_json::to_string(&waku_protocol::ServerMessage::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_version: "test".into(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .unwrap();
+                    while let Ok(msg) = ws.read() {
+                        match msg {
+                            tungstenite::Message::Text(text) => {
+                                if let Ok(waku_protocol::ClientMessage::Request(request)) =
+                                    serde_json::from_str(text.as_ref())
+                                {
+                                    ws.send(tungstenite::Message::Text(
+                                        serde_json::to_string(
+                                            &waku_protocol::ServerMessage::Response {
+                                                request_id: request.request_id,
+                                                outcome: waku_protocol::ResponseOutcome::Ok {
+                                                    payload:
+                                                        waku_protocol::ResponsePayload::Settings {
+                                                            settings: DaemonSettings::default(),
+                                                        },
+                                                },
+                                            },
+                                        )
+                                        .unwrap()
+                                        .into(),
+                                    ))
+                                    .unwrap();
+                                }
+                            }
+                            tungstenite::Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let direct = DaemonSupervisor::connect(&addr, "tok-direct".into()).unwrap();
+        assert_eq!(
+            direct.daemon_identity(),
+            Some(DaemonIdentity {
+                token: "tok-direct".into(),
+                pid: None,
+            })
+        );
+        let direct_client = direct.client();
+
+        let restarting = DaemonSupervisor::from_target(
+            DaemonTarget::Restarting(direct_client.clone()),
+            None,
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(restarting.daemon_identity(), None);
+
+        let local_client = DaemonClient::connect(&addr, "tok-local".into()).unwrap();
+        let local_process = DaemonProcess {
+            client: Mutex::new(local_client.clone()),
+            address: addr,
+            token: "tok-local".into(),
+            child: None,
+            state_file: std::env::temp_dir()
+                .join(format!("waku-identity-test-{}.json", Uuid::new_v4())),
+            pid: 12345,
+        };
+        let local = DaemonSupervisor::from_target(
+            DaemonTarget::Local(local_process),
+            None,
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            local.daemon_identity(),
+            Some(DaemonIdentity {
+                token: "tok-local".into(),
+                pid: Some(12345),
+            })
+        );
+
+        direct_client.disconnect();
+        local_client.disconnect();
+        drop(restarting);
+        drop(direct);
+        drop(local);
         server.join().unwrap();
     }
 }
