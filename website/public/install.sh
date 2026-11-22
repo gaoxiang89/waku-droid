@@ -149,17 +149,17 @@ main() {
         fi
     fi
 
-    # Waku is a desktop app and takes no arguments, so the launcher entry is
-    # the way in. The PATH link is a convenience for starting it from a
-    # terminal to watch its output.
+    # Linking bin/waku onto PATH lets users launch Waku or open a workspace
+    # directly from a terminal (e.g. `waku .`, `waku <path>`, `waku --host ...`).
     echo "Waku is installed."
     if [ -f "$desktop_file" ]; then
         echo "Open it from your applications menu."
     fi
     if [ "$(command -v waku || true)" = "$bin_link" ]; then
-        echo "From a terminal: waku"
+        echo "From a terminal: waku [path]"
     else
-        echo "From a terminal: $bin_link"
+        echo "From a terminal: $bin_link [path]"
+        echo "Add $(dirname "$bin_link") to PATH to run 'waku' directly."
     fi
 }
 

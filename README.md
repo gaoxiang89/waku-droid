@@ -59,6 +59,27 @@ there yet.
 To run agents where your code lives, open a WSL distribution or SSH host from
 Settings → Connections; see [docs/remote.md](docs/remote.md).
 
+### Command line
+
+Open a local or remote folder in Waku directly from a terminal:
+
+```sh
+waku .                                  # open the current directory
+waku /path/to/project                   # open a folder (or a file's parent folder)
+waku --host ssh:build /srv/app          # open a folder on an SSH host
+waku --host wsl:Ubuntu-24.04 ~/src/app  # open a folder in a WSL distribution
+```
+
+- **Windows:** the installer adds `<install-dir>\bin` (`waku.exe`) to your user
+  `PATH` by default; portable zips ship the CLI at `<dir>\bin\waku.exe`
+  ([docs/windows.md](docs/windows.md#command-line)).
+- **Linux:** `install.sh` symlinks `bin/waku` into `~/.local/bin/waku`
+  ([docs/linux.md](docs/linux.md#command-line)).
+- **macOS:** symlink the app binary onto your `PATH`:
+  `ln -sf /Applications/Waku.app/Contents/MacOS/Waku /usr/local/bin/waku`.
+- **WSL & SSH hosts:** `waku .` works automatically inside Waku's built-in
+  remote terminal ([docs/remote.md](docs/remote.md#opening-workspaces-from-the-command-line)).
+
 ## Supported agents
 
 Waku works with:
