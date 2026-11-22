@@ -18,6 +18,7 @@ the original feature bullet instead of adding separate entries for them.
 
 - Open workspaces from a terminal with the new `waku` command: `waku .`, `waku <path>`, and `waku --host ssh:<alias>` / `wsl:<distro> <path>` focus a running window (or launch Waku) and open the folder locally or on a remote host. The Windows installer adds `bin\` to the user `PATH` by default, Linux installs link `waku` onto `PATH`, and `waku-daemon bridge` stages a remote `waku` shim for connected SSH and WSL hosts
 - Reconnecting to a terminal now restores the screen it actually shows: colors, styles, wide characters, scrollback, cursor and terminal modes, the alternate screen with its working directory, and the window title. Detached terminals answer cursor, device-status, and kitty-keyboard queries, and output inside a synchronized update no longer stalls the recovery snapshot
+- Collapse duplicate connections when several saved SSH or WSL routes reach the same daemon: reuse the live connection (or replace a disconnected one) instead of opening a second host, retarget pending workspace opens, and keep automatic reconnect from reporting an "already connected" toast for every route
 - Replace the vt100 shadow parser that could panic when a wide character crossed a shrinking resize with an `alacritty_terminal`-backed emulator, isolating shadow updates and snapshots so terminal recovery cannot crash the daemon
 
 ## [0.1.52]
