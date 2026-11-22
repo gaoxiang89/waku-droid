@@ -610,6 +610,19 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Default macOS volumes are case-insensitive, so `Waku` and `waku` name
+    /// the same file there. Compare the directory and filename instead of the
+    /// exact path string, which the resolver may return with either case.
+    fn assert_resolves_to(cli: &Path, expected: &Path) {
+        let resolved = resolve_gui_executable_from(cli).expect("gui executable resolves");
+        assert!(resolved.is_file());
+        assert_eq!(resolved.parent(), expected.parent());
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .eq_ignore_ascii_case(expected.file_name().unwrap()));
+    }
+
     #[test]
     fn resolves_gui_executable_in_packaged_and_cargo_layouts() {
         let gui_name = if cfg!(target_os = "windows") {
@@ -631,10 +644,7 @@ mod tests {
         let packaged_cli = packaged.join("bin").join(gui_name);
         fs::write(&packaged_gui, b"gui").unwrap();
         fs::write(&packaged_cli, b"cli").unwrap();
-        assert_eq!(
-            resolve_gui_executable_from(&packaged_cli),
-            Some(packaged_gui.clone())
-        );
+        assert_resolves_to(&packaged_cli, &packaged_gui);
 
         // Self-exec guard: if `<app>/waku.exe` is missing, `<app>/bin/waku.exe`
         // must NOT resolve to itself.
@@ -650,10 +660,7 @@ mod tests {
         let cargo_cli = cargo_dir.join(cli_cargo_name);
         fs::write(&cargo_gui, b"gui").unwrap();
         fs::write(&cargo_cli, b"cli").unwrap();
-        assert_eq!(
-            resolve_gui_executable_from(&cargo_cli),
-            Some(cargo_gui.clone())
-        );
+        assert_resolves_to(&cargo_cli, &cargo_gui);
         fs::remove_dir_all(&cargo_dir).unwrap();
     }
 
