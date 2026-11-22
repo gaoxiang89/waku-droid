@@ -12,5 +12,52 @@ fn main() {
     if let Some(code) = waku_client::remote::ssh::handle_askpass() {
         std::process::exit(code);
     }
-    waku::run();
+
+    let action = match waku::cli::parse_args(std::env::args().skip(1), true) {
+        Ok(action) => action,
+        Err(error) => {
+            eprintln!("waku: {error}");
+            std::process::exit(1);
+        }
+    };
+    let request = match action {
+        waku::cli::CliAction::Help => {
+            println!("{}", waku::cli::help_text());
+            return;
+        }
+        waku::cli::CliAction::Version => {
+            println!("{}", waku::cli::version_text());
+            return;
+        }
+        waku::cli::CliAction::Open(request) => request,
+    };
+
+    let cwd = std::env::current_dir().ok();
+    let mut request = waku::cli::prepare_request(request, cwd.as_deref());
+
+    match waku::cli::try_deliver_to_running_desktop(&request) {
+        Ok(waku::cli::DeliveryResult::Delivered(_)) => return,
+        Ok(waku::cli::DeliveryResult::NotRunning) => {}
+        Err(error) => {
+            eprintln!("waku: {error}");
+            std::process::exit(1);
+        }
+    }
+
+    // Validate local startup paths before opening the GPUI window so invalid
+    // paths exit cleanly without blocking the UI thread on filesystem I/O.
+    if request.host.is_none()
+        && let Some(raw_path) = request.path.as_deref()
+    {
+        match waku::cli::validate_local_workspace_path(raw_path) {
+            Ok(resolved) => request.path = Some(resolved),
+            Err(error) => {
+                eprintln!("waku: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let startup_open = (request.path.is_some() || request.host.is_some()).then_some(request);
+    waku::run(startup_open);
 }

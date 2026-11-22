@@ -32,6 +32,7 @@ mod analytics;
 mod app;
 mod assets;
 mod browser;
+pub mod cli;
 mod computer_use;
 pub mod daemon;
 mod driver;
@@ -200,16 +201,19 @@ impl WakuApplicationExt for Application {
         self.on_reopen(|cx| {
             if let Some(window) = cx.windows().into_iter().next() {
                 window
-                    .update(cx, |_, window, _| window.activate_window())
+                    .update(cx, |_, window, cx| {
+                        crate::platform::activate_main_window(window, cx);
+                    })
                     .ok();
+            } else {
+                cx.activate(true);
             }
-            cx.activate(true);
         });
         self
     }
 }
 
-pub fn run() {
+pub fn run(startup_open: Option<crate::cli::StartupOpenRequest>) {
     let daemon = crate::daemon::start_process().unwrap_or_else(|error| {
         crate::platform::report_startup_error(&format!("Failed to start Waku daemon:\n\n{error:#}"))
     });
@@ -383,7 +387,8 @@ pub fn run() {
             })
             .detach();
 
-            let window = open_main_window(cx, daemon).expect("failed to open Waku window");
+            let window =
+                open_main_window(cx, daemon, startup_open).expect("failed to open Waku window");
 
             cx.on_system_notification_response({
                 let window = window;
@@ -395,8 +400,7 @@ pub fn run() {
                     window
                         .update(cx, |waku, window, cx| {
                             waku.open_task_from_notification(session_id, cx);
-                            window.activate_window();
-                            cx.activate(true);
+                            crate::platform::activate_main_window(window, cx);
                         })
                         .ok();
                     cx.dismiss_system_notification(&response.tag);
@@ -425,6 +429,7 @@ pub fn run() {
 pub(crate) fn open_main_window(
     cx: &mut App,
     daemon: waku_client::DaemonSupervisor,
+    startup_open: Option<crate::cli::StartupOpenRequest>,
 ) -> anyhow::Result<WindowHandle<Waku>> {
     let (window_bounds, display_id) = restored_window_placement(cx);
     let title = APP_NAME.to_owned();
@@ -463,7 +468,7 @@ pub(crate) fn open_main_window(
         },
         move |window, cx| {
             crate::platform::configure_main_window_close_behavior(window, cx);
-            let waku = Waku::new(window, cx, daemon);
+            let waku = Waku::new(window, cx, daemon, startup_open);
             let composer_focus = waku.read(cx).composer_focus(cx);
             window.focus(&composer_focus, cx);
             waku

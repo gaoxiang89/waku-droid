@@ -2062,13 +2062,16 @@ impl Waku {
         if self.hosts.get(&host).is_none() {
             return;
         }
-        if let Some(existing) = self
-            .state
-            .projects
-            .iter()
-            .find(|p| p.path == path && self.hosts.ownership.project(p.id) == host)
-        {
-            self.select_project(existing.id, cx);
+        let path = normalize_project_path(path);
+        if let Some(existing_id) = find_existing_project_on_host(
+            &self.state.projects,
+            &self.hosts.ownership,
+            &self.state.deleted_project_ids,
+            &self.project_deletions,
+            &host,
+            &path,
+        ) {
+            self.select_project(existing_id, cx);
             return;
         }
         let project = Project::from_path(path);
@@ -2078,6 +2081,67 @@ impl Waku {
         self.analytics.track(crate::analytics::Event::ProjectAdded);
         self.create_session_for(project_id, self.state.last_provider, cx);
     }
+}
+
+/// Normalize an absolute workspace path using host-aware lexical rules
+/// (stripping Windows `\\?\` / `\\?\UNC\` prefixes, resolving `.`/`..`,
+/// normalizing separators, and uppercasing Windows drive letters) without
+/// performing any filesystem I/O.
+pub(super) fn normalize_project_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let Some(parsed) = waku_protocol::lexical_path::parse(&raw) else {
+        return path;
+    };
+    let normalized = parsed.normalized();
+    let mut rendered = normalized.to_path_string();
+    if matches!(
+        normalized.root,
+        waku_protocol::lexical_path::Root::Drive(_)
+    ) && !rendered.is_empty()
+    {
+        // `Root::Drive` guarantees an ASCII alphabetic first byte.
+        rendered[..1].make_ascii_uppercase();
+    }
+    PathBuf::from(rendered)
+}
+
+fn project_paths_match(a: &Path, b: &Path) -> bool {
+    let a_raw = a.to_string_lossy();
+    let b_raw = b.to_string_lossy();
+    match (
+        waku_protocol::lexical_path::parse(&a_raw),
+        waku_protocol::lexical_path::parse(&b_raw),
+    ) {
+        (Some(a_parsed), Some(b_parsed)) => {
+            a_parsed.normalized().lexical_eq(&b_parsed.normalized())
+        }
+        _ => a == b,
+    }
+}
+
+/// Look up an existing, non-deleted project on `host` whose path matches
+/// `path` under host-correct lexical rules (case-insensitive for Windows
+/// Drive/UNC paths, exact for POSIX paths).
+pub(super) fn find_existing_project_on_host(
+    projects: &[Project],
+    ownership: &waku_client::hosts::HostOwnership,
+    deleted_project_ids: &HashSet<Uuid>,
+    project_deletions: &HashSet<Uuid>,
+    host: &waku_client::hosts::HostKey,
+    path: &Path,
+) -> Option<Uuid> {
+    projects
+        .iter()
+        .find(|project| {
+            !project_deletions.contains(&project.id)
+                && !deleted_project_ids.contains(&project.id)
+                && ownership.project(project.id) == *host
+                && project_paths_match(&project.path, path)
+        })
+        .map(|project| project.id)
+}
+
+impl Waku {
 
     pub(super) fn create_projectless_session(&mut self, cx: &mut Context<Self>) {
         self.create_projectless_session_on_host(self.selected_host_key(), cx);

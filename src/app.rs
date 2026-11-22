@@ -1620,6 +1620,17 @@ pub struct Waku {
         u64,
         Result<RemoteTaskStateSnapshot, String>,
     )>,
+    open_workspace_tx: Sender<(
+        waku_client::hosts::HostKey,
+        u64,
+        waku_client::OpenWorkspaceRequest,
+    )>,
+    open_workspace_events: Receiver<(
+        waku_client::hosts::HostKey,
+        u64,
+        waku_client::OpenWorkspaceRequest,
+    )>,
+    pending_open_requests: Vec<runtime::PendingOpenRequest>,
     runtimes: HashMap<Uuid, SessionRuntime>,
     runtime_attach_pending: HashSet<Uuid>,
     runtime_attach_misses: HashMap<Uuid, u8>,
@@ -2480,6 +2491,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut App,
         daemon: waku_client::DaemonSupervisor,
+        startup_open: Option<crate::cli::StartupOpenRequest>,
     ) -> Entity<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let store = StateStore::remote(daemon.clone());
@@ -2788,6 +2800,11 @@ impl Waku {
         let (plan_usage_tx, plan_usage_events) = unbounded();
         let (event_wake_tx, event_wake_events) = smol::channel::bounded(1);
         let (task_state_sync_tx, task_state_sync_events) = unbounded();
+        let (open_workspace_tx, open_workspace_events) = unbounded();
+        let pending_open_requests = startup_open
+            .map(runtime::PendingOpenRequest::from_startup)
+            .into_iter()
+            .collect();
         #[cfg(target_os = "macos")]
         if crate::computer_use::is_available() {
             let computer_permission_tx = computer_permission_tx.clone();
@@ -3618,6 +3635,9 @@ impl Waku {
                 event_wake_tx,
                 task_state_sync_tx,
                 task_state_sync_events,
+                open_workspace_tx,
+                open_workspace_events,
+                pending_open_requests,
                 runtimes: HashMap::new(),
                 runtime_attach_pending: HashSet::new(),
                 runtime_attach_misses: HashMap::new(),

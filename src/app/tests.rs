@@ -2710,3 +2710,218 @@ fn connections_startup_merge_rejects_stale_generation_and_preserves_local_edits(
     assert!(file.get(&disk_wsl.id).is_none());
     assert!(!saved_passwords.contains(&disk_ssh.id));
 }
+
+#[test]
+fn project_path_lookup_normalizes_and_deduplicates_across_windows_and_posix() {
+    use super::sessions::{find_existing_project_on_host, normalize_project_path};
+    use crate::model::Project;
+    use std::path::{Path, PathBuf};
+    use waku_client::hosts::{HostKey, HostOwnership};
+
+    assert_eq!(
+        normalize_project_path(PathBuf::from(r"\\?\c:\Users\Me\Git\.\Waku\")),
+        PathBuf::from(r"C:\Users\Me\Git\Waku")
+    );
+    assert_eq!(
+        normalize_project_path(PathBuf::from(r"\\?\UNC\server\share\repo\sub\..")),
+        PathBuf::from(r"\\server\share\repo")
+    );
+    assert_eq!(
+        normalize_project_path(PathBuf::from("c:/Users/Me/repo/")),
+        PathBuf::from(r"C:\Users\Me\repo")
+    );
+    assert_eq!(
+        normalize_project_path(PathBuf::from("/home/me/./repo/../work/")),
+        PathBuf::from("/home/me/work")
+    );
+    assert_eq!(
+        normalize_project_path(PathBuf::from(r"/home/odd\name/proj/")),
+        PathBuf::from(r"/home/odd\name/proj")
+    );
+
+    let win_project = Project::from_path(PathBuf::from(r"C:\Users\Me\Git\Waku"));
+    let win_deleted = Project::from_path(PathBuf::from(r"C:\Users\Me\Git\Deleted"));
+    let win_pending_delete = Project::from_path(PathBuf::from(r"C:\Users\Me\Git\Deleting"));
+    let posix_project = Project::from_path(PathBuf::from("/home/me/Repo"));
+    let remote_host = HostKey::Connection("ssh:devbox".into());
+
+    let mut ownership = HostOwnership::default();
+    ownership.register(
+        &HostKey::Local,
+        &[
+            win_project.clone(),
+            win_deleted.clone(),
+            win_pending_delete.clone(),
+        ],
+        &[],
+    );
+    ownership.register(&remote_host, &[posix_project.clone()], &[]);
+
+    let projects = vec![
+        win_project.clone(),
+        win_deleted.clone(),
+        win_pending_delete.clone(),
+        posix_project.clone(),
+    ];
+    let deleted_ids = HashSet::from([win_deleted.id]);
+    let in_flight_deletions = HashSet::from([win_pending_delete.id]);
+
+    // Windows lexical match ignores drive letter case, directory case, slashes,
+    // trailing separator, and `\\?\` verbatim prefixes.
+    for variant in [
+        r"c:\users\me\git\waku",
+        "c:/Users/Me/Git/Waku/",
+        r"\\?\C:\USERS\ME\GIT\WAKU\",
+        r"C:\Users\Me\Git\sub\..\Waku",
+    ] {
+        assert_eq!(
+            find_existing_project_on_host(
+                &projects,
+                &ownership,
+                &deleted_ids,
+                &in_flight_deletions,
+                &HostKey::Local,
+                Path::new(variant),
+            ),
+            Some(win_project.id),
+            "variant {variant:?} should match existing Windows project"
+        );
+    }
+
+    // Tombstoned and in-flight deleted projects must not be reused.
+    assert_eq!(
+        find_existing_project_on_host(
+            &projects,
+            &ownership,
+            &deleted_ids,
+            &in_flight_deletions,
+            &HostKey::Local,
+            Path::new(r"C:\Users\Me\Git\Deleted"),
+        ),
+        None
+    );
+    assert_eq!(
+        find_existing_project_on_host(
+            &projects,
+            &ownership,
+            &deleted_ids,
+            &in_flight_deletions,
+            &HostKey::Local,
+            Path::new(r"C:\Users\Me\Git\Deleting"),
+        ),
+        None
+    );
+
+    // POSIX paths stay case-sensitive and scoped to their owning host.
+    assert_eq!(
+        find_existing_project_on_host(
+            &projects,
+            &ownership,
+            &deleted_ids,
+            &in_flight_deletions,
+            &remote_host,
+            Path::new("/home/me/Repo/"),
+        ),
+        Some(posix_project.id)
+    );
+    assert_eq!(
+        find_existing_project_on_host(
+            &projects,
+            &ownership,
+            &deleted_ids,
+            &in_flight_deletions,
+            &remote_host,
+            Path::new("/home/me/repo"),
+        ),
+        None
+    );
+    assert_eq!(
+        find_existing_project_on_host(
+            &projects,
+            &ownership,
+            &deleted_ids,
+            &in_flight_deletions,
+            &HostKey::Local,
+            Path::new("/home/me/Repo"),
+        ),
+        None
+    );
+}
+
+#[test]
+fn resolve_connection_spec_matches_saved_ssh_aliases_before_synthesizing() {
+    use waku_client::remote::{Connection, ConnectionKind, SshAuthMethod, SshTarget};
+
+    let saved_config = Connection {
+        id: "ssh:1111222233334444".into(),
+        name: "SSH · devbox".into(),
+        kind: ConnectionKind::Ssh {
+            target: SshTarget::ConfigHost {
+                host: "devbox".into(),
+                auth_method: SshAuthMethod::Password,
+            },
+        },
+    };
+    let saved_direct = Connection {
+        id: "ssh:5555666677778888".into(),
+        name: "SSH · alice@prod.example.com:2222".into(),
+        kind: ConnectionKind::Ssh {
+            target: SshTarget::Direct {
+                hostname: "prod.example.com".into(),
+                port: Some(2222),
+                user: Some("alice".into()),
+                identity_file: Some("/keys/prod".into()),
+                auth_method: SshAuthMethod::Key,
+                proxy_jump: Some("bastion".into()),
+            },
+        },
+    };
+    let saved_wsl = Connection::wsl("Ubuntu-24.04");
+    let saved = vec![
+        saved_config.clone(),
+        saved_direct.clone(),
+        saved_wsl.clone(),
+    ];
+
+    // Exact saved ID still wins first.
+    assert_eq!(
+        crate::daemon::resolve_connection_spec("ssh:1111222233334444", &saved),
+        Some(saved_config.clone())
+    );
+    // `ssh:<alias>` resolves saved ConfigHost and keeps its UUID + Password auth.
+    assert_eq!(
+        crate::daemon::resolve_connection_spec("ssh:devbox", &saved),
+        Some(saved_config)
+    );
+    // `ssh:<display_host>` resolves saved Direct target and keeps key/ProxyJump.
+    assert_eq!(
+        crate::daemon::resolve_connection_spec("ssh:alice@prod.example.com:2222", &saved),
+        Some(saved_direct)
+    );
+    // Saved WSL connection resolves cleanly.
+    assert_eq!(
+        crate::daemon::resolve_connection_spec("wsl:Ubuntu-24.04", &saved),
+        Some(saved_wsl)
+    );
+    // Unsaved SSH alias falls back to synthesized Connection::from_spec.
+    let adhoc = crate::daemon::resolve_connection_spec("ssh:freshbox", &saved).unwrap();
+    assert_eq!(adhoc.id, "ssh:freshbox");
+    assert_eq!(
+        adhoc.kind,
+        ConnectionKind::Ssh {
+            target: SshTarget::ConfigHost {
+                host: "freshbox".into(),
+                auth_method: SshAuthMethod::Agent,
+            }
+        }
+    );
+    // Local & invalid specs.
+    assert!(
+        crate::daemon::resolve_connection_spec("local", &saved)
+            .unwrap()
+            .is_local()
+    );
+    assert!(crate::daemon::resolve_connection_spec("", &saved).is_none());
+    assert!(crate::daemon::resolve_connection_spec("ssh:", &saved).is_none());
+    assert!(crate::daemon::resolve_connection_spec("bogus", &saved).is_none());
+}

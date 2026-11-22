@@ -1,5 +1,6 @@
 [package]
 name = "waku"
+default-run = "waku"
 version.workspace = true
 edition = "2024"
 description = "A fast, native control plane for local coding agents"

@@ -646,7 +646,7 @@ impl Waku {
     }
     pub(super) fn reconnect_saved_hosts(&mut self, cx: &mut Context<Self>) {
         let mut connections = self.connections.file.connections.clone();
-        if let Some(connection) = crate::daemon::startup_connection()
+        if let Some(connection) = crate::daemon::startup_connection_from(&self.connections.file)
             && !connections.iter().any(|saved| saved.id == connection.id)
         {
             self.connections.file.upsert(connection.clone());
@@ -829,6 +829,7 @@ impl Waku {
             .retain(|(owner, _, _), _| owner != key);
         self.pending_queue_drains
             .retain(|id| !sessions.contains(id));
+        self.drop_pending_open_requests_for_host(key);
         self.collapsed_hosts.remove(key);
         self.clear_host_workspace_caches_for(key);
         if &self.provider_settings_host == key {

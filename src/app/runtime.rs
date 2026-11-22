@@ -997,6 +997,40 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
     })
 }
 
+#[derive(Clone, Debug)]
+enum OpenWorkspaceTarget {
+    Host(waku_client::hosts::HostKey),
+    Spec(String),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingOpenRequest {
+    target: OpenWorkspaceTarget,
+    path: Option<String>,
+    path_resolved: bool,
+}
+
+impl PendingOpenRequest {
+    pub(super) fn from_startup(request: crate::cli::StartupOpenRequest) -> Self {
+        let host = request
+            .host
+            .map(|spec| spec.trim().to_owned())
+            .filter(|spec| !spec.is_empty() && spec != waku_client::remote::LOCAL_CONNECTION_ID);
+        match host {
+            Some(spec) => Self {
+                target: OpenWorkspaceTarget::Spec(spec),
+                path: request.path,
+                path_resolved: false,
+            },
+            None => Self {
+                target: OpenWorkspaceTarget::Host(waku_client::hosts::HostKey::Local),
+                path: request.path,
+                path_resolved: true,
+            },
+        }
+    }
+}
+
 impl Waku {
     pub(super) fn restart_task_state_sync(&mut self) {
         let keys = self
@@ -1016,14 +1050,21 @@ impl Waku {
         };
         let clients = host.daemon.subscribe_clients();
         let load_gate = host.store.task_state_load_gate();
+        // Flip the gate synchronously on the UI thread before spawning so
+        // cold-start / newly connected open requests wait for this initial
+        // snapshot instead of racing ahead and getting overwritten.
+        let initial_ticket = load_gate.begin();
         let generation = host.generation;
         let results = self.task_state_sync_tx.clone();
+        let open_requests_tx = self.open_workspace_tx.clone();
         let event_wake = self.event_wake_tx.clone();
         let (stop_tx, stop) = crossbeam_channel::bounded::<()>(1);
         self.host_sync_stops.insert(key.clone(), stop_tx);
-        std::thread::Builder::new()
+        let thread_gate = load_gate.clone();
+        if std::thread::Builder::new()
             .name(format!("waku-task-state-{key:?}"))
             .spawn(move || {
+                let mut pending_ticket = Some(initial_ticket);
                 let mut client = crossbeam_channel::select! {
                     recv(stop) -> _ => return,
                     recv(clients) -> client => match client { Ok(client) => client, Err(_) => return },
@@ -1031,7 +1072,8 @@ impl Waku {
                 loop {
                     while let Ok(newer) = clients.try_recv() { client = newer; }
                     let revisions = client.subscribe_task_state();
-                    let ticket = load_gate.begin();
+                    let open_requests = client.subscribe_open_workspace();
+                    let ticket = pending_ticket.take().unwrap_or_else(|| thread_gate.begin());
                     let result = load_remote_task_state(&client).map_err(|error| error.to_string());
                     if results.send((key.clone(), generation, ticket, result)).is_err() { return; }
                     signal_event_pump(&event_wake);
@@ -1050,15 +1092,33 @@ impl Waku {
                                     };
                                 }
                                 while revisions.try_recv().is_ok() {}
-                                let ticket = load_gate.begin();
+                                let ticket = thread_gate.begin();
                                 let result = load_remote_task_state(&client).map_err(|error| error.to_string());
                                 if results.send((key.clone(), generation, ticket, result)).is_err() { return; }
                                 signal_event_pump(&event_wake);
                             }
+                            recv(open_requests) -> request => {
+                                match request {
+                                    Ok(request) => {
+                                        if open_requests_tx.send((key.clone(), generation, request)).is_err() { return; }
+                                        signal_event_pump(&event_wake);
+                                    }
+                                    Err(_) => {
+                                        break crossbeam_channel::select! {
+                                            recv(stop) -> _ => return,
+                                            recv(clients) -> replacement => match replacement { Ok(client) => client, Err(_) => return },
+                                        };
+                                    }
+                                }
+                            }
                         }
                     };
                 }
-            }).ok();
+            })
+            .is_err()
+        {
+            load_gate.complete(initial_ticket);
+        }
     }
 
     fn drain_task_state_sync_events(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1084,6 +1144,7 @@ impl Waku {
                         continue;
                     }
                     self.apply_remote_task_state(key, snapshot, cx);
+                    self.process_pending_open_requests(cx);
                     changed = true;
                 }
                 Err(error) => eprintln!("could not refresh {key:?} task state: {error}"),
@@ -3937,6 +3998,7 @@ impl Waku {
             | self.drain_computer_permission_events()
             | self.drain_plan_usage_events()
             | self.drain_task_state_sync_events(cx)
+            | self.drain_open_workspace_events(cx)
         {
             cx.notify();
         }
@@ -3962,6 +4024,252 @@ impl Waku {
         } else {
             EventPumpSchedule::Idle
         }
+    }
+
+    pub(super) fn activate_main_window(&self, cx: &mut Context<Self>) {
+        // Defer activation so we never synchronously re-borrow `Waku` through
+        // `window.update(cx, ...)` while already holding `&mut Waku`.
+        cx.defer(|cx| {
+            if let Some(window) = cx.windows().into_iter().next() {
+                let _ = window.update(cx, |_, window, cx| {
+                    crate::platform::activate_main_window(window, cx);
+                });
+            } else {
+                cx.activate(true);
+            }
+        });
+    }
+
+    pub(super) fn has_pending_open_requests_for_host(
+        &self,
+        host: &waku_client::hosts::HostKey,
+    ) -> bool {
+        self.pending_open_requests.iter().any(|req| {
+            matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host)
+        })
+    }
+
+    pub(super) fn drop_pending_open_requests_for_host(
+        &mut self,
+        host: &waku_client::hosts::HostKey,
+    ) {
+        self.pending_open_requests.retain(|req| {
+            !matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host)
+        });
+    }
+
+    fn drain_open_workspace_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut received = Vec::new();
+        while let Ok((source_host, generation, request)) = self.open_workspace_events.try_recv() {
+            if self
+                .hosts
+                .get(&source_host)
+                .is_some_and(|host| host.generation == generation)
+            {
+                received.push((source_host, request));
+            }
+        }
+        if received.is_empty() {
+            return false;
+        }
+        for (source_host, request) in received {
+            self.activate_main_window(cx);
+            let explicit_host = request
+                .host
+                .map(|spec| spec.trim().to_owned())
+                .filter(|spec| !spec.is_empty());
+            let pending = match explicit_host.as_deref() {
+                Some(spec) if spec == waku_client::remote::LOCAL_CONNECTION_ID => {
+                    PendingOpenRequest {
+                        target: OpenWorkspaceTarget::Host(waku_client::hosts::HostKey::Local),
+                        path: request.path,
+                        path_resolved: false,
+                    }
+                }
+                Some(spec) => PendingOpenRequest {
+                    target: OpenWorkspaceTarget::Spec(spec.to_owned()),
+                    path: request.path,
+                    path_resolved: false,
+                },
+                None => {
+                    if request.path.is_none()
+                        && source_host == waku_client::hosts::HostKey::Local
+                    {
+                        continue;
+                    }
+                    PendingOpenRequest {
+                        target: OpenWorkspaceTarget::Host(source_host),
+                        path: request.path,
+                        path_resolved: true,
+                    }
+                }
+            };
+            self.pending_open_requests.push(pending);
+        }
+        self.process_pending_open_requests(cx);
+        true
+    }
+
+    pub(super) fn process_pending_open_requests(&mut self, cx: &mut Context<Self>) {
+        if self.pending_open_requests.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.pending_open_requests);
+        let mut remaining = Vec::new();
+        let mut changed = false;
+
+        for mut req in queued {
+            // Race 1 & Race 2: resolve `--host <SPEC>` only after saved
+            // connections have finished loading off-thread, matching saved SSH
+            // aliases before falling back to `Connection::from_spec`.
+            if let OpenWorkspaceTarget::Spec(spec) = &req.target {
+                if !self.connections.startup_loaded {
+                    remaining.push(req);
+                    continue;
+                }
+                let Some(connection) = crate::daemon::resolve_connection_spec(
+                    spec,
+                    &self.connections.file.connections,
+                ) else {
+                    self.show_toast(format!("Unknown host: {spec}"));
+                    self.activate_main_window(cx);
+                    changed = true;
+                    continue;
+                };
+                if connection.is_local() {
+                    req.target = OpenWorkspaceTarget::Host(waku_client::hosts::HostKey::Local);
+                } else {
+                    let key = waku_client::hosts::HostKey::Connection(connection.id.clone());
+                    if self.hosts.get(&key).is_none()
+                        && !self.connections.pending.contains(&connection.id)
+                        && !self.connections.is_replace_confirm_for(&connection.id)
+                    {
+                        self.open_connection(connection, cx);
+                        changed = true;
+                    }
+                    req.target = OpenWorkspaceTarget::Host(key);
+                }
+            }
+
+            let OpenWorkspaceTarget::Host(host_key) = &req.target else {
+                unreachable!("Spec resolved or deferred above");
+            };
+            let Some(owner) = self.hosts.get(host_key) else {
+                let still_connecting = match host_key {
+                    waku_client::hosts::HostKey::Local => false,
+                    waku_client::hosts::HostKey::Connection(id) => {
+                        self.connections.pending.contains(id)
+                            || self.connections.is_replace_confirm_for(id)
+                    }
+                };
+                if still_connecting {
+                    remaining.push(req);
+                }
+                continue;
+            };
+            // Race 3: wait until the host's task-state load gate has settled so
+            // an in-flight `LoadTaskState` snapshot cannot overwrite the newly
+            // opened project and `save_partition` will accept the save.
+            if !owner.store.task_state_loaded() {
+                remaining.push(req);
+                continue;
+            }
+            let host_key = host_key.clone();
+            let generation = owner.generation;
+            match req.path {
+                None => {
+                    self.settings_page = None;
+                    self.set_sidebar_host_collapsed(host_key, false, cx);
+                    self.composer_focus_pending = true;
+                    self.activate_main_window(cx);
+                    changed = true;
+                }
+                Some(raw_path) if req.path_resolved => {
+                    self.open_resolved_workspace_on_host(PathBuf::from(raw_path), host_key, cx);
+                    changed = true;
+                }
+                Some(raw_path) => {
+                    let workspace = waku_client::WorkspaceClient::for_daemon(owner.daemon.clone());
+                    self.resolve_and_open_workspace_on_host(
+                        host_key,
+                        generation,
+                        workspace,
+                        raw_path,
+                        cx,
+                    );
+                    changed = true;
+                }
+            }
+        }
+
+        remaining.extend(std::mem::take(&mut self.pending_open_requests));
+        self.pending_open_requests = remaining;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn resolve_and_open_workspace_on_host(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        generation: u64,
+        workspace: waku_client::WorkspaceClient,
+        raw_path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx
+            .background_executor()
+            .spawn(async move { workspace.resolve_path(raw_path) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(owner) = this.hosts.get(&host) else {
+                    return;
+                };
+                if owner.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(resolved) => {
+                        if owner.store.task_state_loaded() {
+                            this.open_resolved_workspace_on_host(
+                                PathBuf::from(resolved),
+                                host,
+                                cx,
+                            );
+                        } else {
+                            this.pending_open_requests.push(PendingOpenRequest {
+                                target: OpenWorkspaceTarget::Host(host),
+                                path: Some(resolved),
+                                path_resolved: true,
+                            });
+                        }
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.show_toast(format!("{error:#}"));
+                        this.activate_main_window(cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_resolved_workspace_on_host(
+        &mut self,
+        path: PathBuf,
+        host: waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_host_session = None;
+        self.settings_page = None;
+        self.set_sidebar_host_collapsed(host.clone(), false, cx);
+        self.add_project_path_on_host(path, host, cx);
+        self.composer_focus_pending = true;
+        self.activate_main_window(cx);
+        cx.notify();
     }
 
     pub(super) fn drain_provider_probe_events(&mut self) -> bool {

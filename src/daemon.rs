@@ -36,15 +36,54 @@ pub fn start_process() -> anyhow::Result<waku_client::DaemonSupervisor> {
     )
 }
 
+/// Resolve a host spec (`ssh:<alias>`, `wsl:<distro>`, `local`, or a saved
+/// connection id) against `saved`, preferring saved SSH connections whose
+/// config alias or display host matches before synthesizing a new Agent-auth
+/// entry via [`waku_client::remote::Connection::from_spec`].
+pub(crate) fn resolve_connection_spec(
+    spec: &str,
+    saved: &[waku_client::remote::Connection],
+) -> Option<waku_client::remote::Connection> {
+    use waku_client::remote::{Connection, ConnectionKind, SshTarget};
+
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    if let Some(connection) = saved.iter().find(|connection| connection.id == spec) {
+        return Some(connection.clone());
+    }
+    if let Some(alias) = spec.strip_prefix("ssh:").filter(|value| !value.is_empty()) {
+        if let Some(connection) = saved.iter().find(|connection| {
+            matches!(
+                &connection.kind,
+                ConnectionKind::Ssh {
+                    target: SshTarget::ConfigHost { host, .. },
+                } if host == alias
+            )
+        }) {
+            return Some(connection.clone());
+        }
+        if let Some(connection) = saved.iter().find(|connection| {
+            matches!(
+                &connection.kind,
+                ConnectionKind::Ssh { target } if target.display_host() == alias
+            )
+        }) {
+            return Some(connection.clone());
+        }
+    }
+    Connection::from_spec(spec, saved)
+}
+
 /// The WSL or SSH connection to open at launch: `WAKU_CONNECTION` (a saved
 /// id, `wsl:<distro>`, or `ssh:<config host>`) wins over the saved choice.
-pub(crate) fn startup_connection() -> Option<waku_client::remote::Connection> {
-    let saved = waku_client::remote::ConnectionsFile::load()
-        .inspect_err(|error| eprintln!("could not read saved connections: {error}"))
-        .unwrap_or_default();
+pub(crate) fn startup_connection_from(
+    saved: &waku_client::remote::ConnectionsFile,
+) -> Option<waku_client::remote::Connection> {
     let connection = match std::env::var("WAKU_CONNECTION") {
         Ok(spec) if !spec.trim().is_empty() => {
-            let connection = waku_client::remote::Connection::from_spec(&spec, &saved.connections);
+            let connection = resolve_connection_spec(&spec, &saved.connections);
             if connection.is_none() {
                 eprintln!("WAKU_CONNECTION={spec:?} names no connection");
             }

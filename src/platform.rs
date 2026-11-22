@@ -466,6 +466,41 @@ pub fn hide_window(window: &mut Window) {
     window.remove_window();
 }
 
+/// Bring the main Waku window to the front and focus the application.
+///
+/// On macOS, GPUI's `activate_window` only invokes `makeKeyAndOrderFront:`,
+/// which leaves minimized windows in the Dock; deminiaturize first before
+/// ordering front.
+#[cfg(target_os = "macos")]
+pub fn activate_main_window(window: &mut Window, cx: &mut gpui::App) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
+        && let RawWindowHandle::AppKit(handle) = handle.as_raw()
+        && MainThreadMarker::new().is_some()
+    {
+        unsafe {
+            let view = handle.ns_view.cast::<NSView>().as_ref();
+            if let Some(native_window) = view.window() {
+                if native_window.isMiniaturized() {
+                    native_window.deminiaturize(None);
+                }
+                native_window.makeKeyAndOrderFront(None);
+            }
+        }
+    }
+    window.activate_window();
+    cx.activate(true);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_main_window(window: &mut Window, cx: &mut gpui::App) {
+    window.activate_window();
+    cx.activate(true);
+}
+
 #[cfg(target_os = "macos")]
 thread_local! {
     static SIDEBAR_TINT_VIEW: std::cell::RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSView>>> =

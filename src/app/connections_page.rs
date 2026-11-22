@@ -144,7 +144,7 @@ pub(super) struct ConnectionsUi {
     /// Monotonic counter guarding off-thread `ConnectionsFile::load` + keyring
     /// probes so superseded passes cannot overwrite newer state.
     load_generation: u64,
-    startup_loaded: bool,
+    pub(super) startup_loaded: bool,
     local_upserted_ids: HashSet<String>,
     local_removed_ids: HashSet<String>,
     local_password_overrides: HashMap<String, bool>,
@@ -154,6 +154,12 @@ pub(super) struct ConnectionsUi {
 }
 
 impl ConnectionsUi {
+    pub(super) fn is_replace_confirm_for(&self, connection_id: &str) -> bool {
+        self.replace_confirm
+            .as_ref()
+            .is_some_and(|dialog| dialog.connection.id == connection_id)
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             file: ConnectionsFile::default(),
@@ -356,6 +362,7 @@ impl Waku {
                 }
                 this.refresh_connections_localized_text(cx);
                 this.reconnect_saved_hosts(cx);
+                this.process_pending_open_requests(cx);
                 cx.notify();
             });
         })
@@ -479,6 +486,7 @@ impl Waku {
                         this.start_host_task_state_sync(key);
                     }
                     Err(error) => {
+                        let failed_host = waku_client::hosts::HostKey::Connection(id.clone());
                         if let Some(incompatible) = IncompatibleDaemonError::find(&error)
                             && !replace_incompatible
                         {
@@ -487,7 +495,11 @@ impl Waku {
                                 daemon: incompatible.0.clone(),
                                 focus_pending: true,
                             });
+                            if this.has_pending_open_requests_for_host(&failed_host) {
+                                this.activate_main_window(cx);
+                            }
                         } else {
+                            this.drop_pending_open_requests_for_host(&failed_host);
                             this.show_toast(tr!(
                                 "connections.connect_failed",
                                 name = name.as_str(),
@@ -518,7 +530,10 @@ impl Waku {
     }
 
     fn dismiss_daemon_replace(&mut self, cx: &mut Context<Self>) {
-        if self.connections.replace_confirm.take().is_some() {
+        if let Some(dialog) = self.connections.replace_confirm.take() {
+            self.drop_pending_open_requests_for_host(&waku_client::hosts::HostKey::Connection(
+                dialog.connection.id,
+            ));
             cx.notify();
         }
     }
