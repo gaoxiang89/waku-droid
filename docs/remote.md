@@ -164,6 +164,50 @@ Every provider CLI the remote tasks use — `claude`, `pi`, `codex`, and so on
 — must be installed and signed in **on the remote host**. The daemon resolves
 them from the remote login shell's `PATH`.
 
+### Opening workspaces from the command line
+
+You can open a remote folder from your local machine or from a shell running on
+the remote host itself.
+
+**From your local machine:** pass `--host` with a saved SSH alias
+(`ssh:<alias>`) or WSL distribution (`wsl:<distro>`):
+
+```sh
+waku --host ssh:build /srv/app
+waku --host ssh:build ~/projects/api
+waku --host wsl:Ubuntu-24.04 ~/src/app
+```
+
+If Waku is already running, it routes the request to that host (connecting it
+first if needed) and focuses the window; otherwise it launches Waku, connects
+the host, and opens the workspace once its snapshot loads.
+
+**From inside a connected SSH or WSL host:**
+
+- **Waku's built-in remote terminal** injects the remote CLI directory onto
+  `PATH` automatically, so `waku .` and `waku /path/to/project` work out of the
+  box.
+- **External SSH or WSL terminals** can use the CLI shim staged by
+  `waku-daemon bridge` at `~/.cache/waku/server/bin/waku` (Unix) or
+  `%USERPROFILE%\.cache\waku\server\bin\waku.cmd` alongside a POSIX `waku`
+  script for Git Bash (Windows SSH hosts). Development builds use `waku-dev`
+  instead of `waku`. On Linux, macOS, or WSL hosts, symlink it onto your `PATH`
+  to make `waku` available outside Waku's terminal:
+
+  ```sh
+  mkdir -p ~/.local/bin
+  ln -sf ~/.cache/waku/server/bin/waku ~/.local/bin/waku
+  ```
+
+  Make sure `~/.local/bin` is on your `PATH` (or add `~/.cache/waku/server/bin`
+  to `PATH` directly). On Windows WSL, using the Linux shim avoids invoking the
+  Windows `waku.exe` over WSL interop.
+
+- **Desktop connection required:** running `waku` on a remote host talks to
+  that host's daemon and forwards the open request to the connected desktop
+  app. The Waku desktop app must be currently connected to that host;
+  otherwise `waku` prints an error to stderr and exits non-zero.
+
 ### Markdown images
 
 Markdown images load from the host that owns the document, the way VS Code's
@@ -224,8 +268,8 @@ supervisor reconnects to the same daemon.
 
 Remote state lives in `~/.cache/waku[-dev]/server/` on Unix and
 `%USERPROFILE%\.cache\waku[-dev]\server\` on Windows: `waku-daemon` (or
-`waku-daemon.exe`), `daemon.json`, `daemon.lock`, and `daemon.log` (the
-daemon's stderr).
+`waku-daemon.exe`), `bin/waku` (or `bin/waku.cmd` and `bin/waku` on Windows),
+`daemon.json`, `daemon.lock`, and `daemon.log` (the daemon's stderr).
 
 ## Current limitations
 

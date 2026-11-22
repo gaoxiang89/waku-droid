@@ -7,7 +7,9 @@ Arm device) from [releases.waku.sh](https://releases.waku.sh) or the
 [GitHub release](https://github.com/egoist/waku/releases) and run it. It
 installs per-user into `%LOCALAPPDATA%\Programs\Waku`, so it never asks for
 administrator rights — which is also what lets Waku update itself later
-without a UAC prompt.
+without a UAC prompt. By default the installer also checks **Add Waku CLI
+(`waku`) to user PATH**, adding `<install-dir>\bin` to your user `PATH`
+(and remembering your choice across silent updates).
 
 `https://releases.waku.sh/latest-windows.txt` names the current version if you
 want to script the download.
@@ -15,7 +17,7 @@ want to script the download.
 ### Portable
 
 `waku-<version>-<target>.zip` is the same build without an installer. Unpack it
-anywhere and run `waku.exe`.
+anywhere and run `waku.exe` (or `<dir>\bin\waku.exe` from a terminal).
 
 **Keep the installation folder intact.** Waku launches its daemon and
 Computer Use helpers from this directory and loads the bundled SDK DLL and
@@ -40,6 +42,32 @@ rarely have the arm64 redistributable already.
 
 SmartScreen may warn about an unrecognized publisher on first launch when the
 release was not code-signed. Choose **More info → Run anyway**.
+
+## Command line
+
+The installer registers `<install-dir>\bin` on your user `PATH` by default
+(**Add Waku CLI (`waku`) to user PATH**). Open a new shell after installing so
+the updated `PATH` takes effect.
+
+The GUI app stays at `<install-dir>\waku.exe`, while the console CLI lives at
+`<install-dir>\bin\waku.exe`. Putting only `bin\` on `PATH` gives PowerShell,
+Command Prompt, and Git Bash a console `waku` command without colliding with
+the GUI executable or exposing helper binaries.
+
+```powershell
+waku                                    # launch or focus Waku
+waku .                                  # open the current directory
+waku C:\path\to\project                 # open a folder (or a file's parent folder)
+waku --host ssh:build /srv/app          # open a folder on an SSH host
+waku --host wsl:Ubuntu-24.04 ~/src/app  # open a folder in a WSL distribution
+```
+
+If Waku is already running, `waku` focuses the existing window and opens the
+workspace there; otherwise it launches Waku and opens the workspace.
+
+With the portable `.zip`, invoke `<dir>\bin\waku.exe` directly or add
+`<dir>\bin` to your user `PATH`. To open workspaces from inside a WSL or SSH
+shell, see [Remote hosts](remote.md#opening-workspaces-from-the-command-line).
 
 ## Updating
 

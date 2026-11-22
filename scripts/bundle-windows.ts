@@ -207,7 +207,7 @@ const installer = join(
   `Waku-${version}-${architecture}-Setup.exe`,
 );
 
-await $`cargo build --locked --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon --package waku-computer-use --bin waku_computer_use`;
+await $`cargo build --locked --release --package waku --bin waku --bin waku_cli --bin waku_js_repl --package waku-daemon --bin waku-daemon --package waku-computer-use --bin waku_computer_use`;
 
 const staging = await mkdtemp(join(tmpdir(), "waku-bundle-"));
 try {
@@ -223,6 +223,15 @@ try {
   for (const file of ["waku.exe", "waku-daemon.exe"]) {
     await copyFile(join(releaseDirectory, file), join(packageDirectory, file));
   }
+  // Keep the console-subsystem CLI in bin\waku.exe so adding `{app}\bin` to
+  // PATH gives PowerShell, CMD, Git Bash, and WSL a clean `waku` command
+  // without colliding with the GUI waku.exe or exposing helper binaries.
+  const binDirectory = join(packageDirectory, "bin");
+  await mkdir(binDirectory, { recursive: true });
+  await copyFile(
+    join(releaseDirectory, "waku_cli.exe"),
+    join(binDirectory, "waku.exe"),
+  );
   await copyFile(
     join(projectRoot, "LICENSE"),
     join(packageDirectory, "LICENSE"),
@@ -245,6 +254,7 @@ try {
     signtool = findSigntool();
     await sign(signtool, certificate, certificatePassword, [
       join(packageDirectory, "waku.exe"),
+      join(packageDirectory, "bin", "waku.exe"),
       join(packageDirectory, "waku-daemon.exe"),
       join(packageDirectory, "waku_js_repl.exe"),
       join(packageDirectory, "waku_computer_use.exe"),

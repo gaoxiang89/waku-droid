@@ -65,6 +65,24 @@ sed -i "s|^Icon=sh.waku$|Icon=$HOME/.local/waku.app/share/icons/hicolor/256x256/
   ~/.local/share/applications/sh.waku.desktop
 ```
 
+## Command line
+
+`install.sh` symlinks `~/.local/waku.app/bin/waku` to `~/.local/bin/waku`
+(for a manual install, symlink `bin/waku` into a directory on your `PATH`).
+On Linux, `bin/waku` handles CLI arguments directly:
+
+```sh
+waku                            # launch or focus Waku
+waku .                          # open the current directory
+waku /path/to/project           # open a folder (or a file's parent folder)
+waku --host ssh:build /srv/app  # open a folder on an SSH host
+```
+
+If Waku is already running, `waku` focuses the existing window and opens the
+workspace there; otherwise it launches Waku and opens the workspace. To open
+workspaces from inside a connected SSH host, see
+[Remote hosts](remote.md#opening-workspaces-from-the-command-line).
+
 ## Updating
 
 Tarball installs under the user's home directory update themselves. Waku
