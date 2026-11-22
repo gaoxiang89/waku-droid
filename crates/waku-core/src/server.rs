@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
 use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 use crate::protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
+    ClientKind, ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
     ResponsePayload, RpcError, SequencedEvent, ServerMessage, WireDriverEvent,
 };
 
@@ -71,6 +71,9 @@ pub struct ServerOptions {
     /// live work for this long. Bridge-managed daemons on WSL or SSH hosts
     /// use it so an abandoned host does not keep a daemon forever.
     pub idle_exit: Option<Duration>,
+    /// Optional directory containing the `waku` CLI shim, prepended to `PATH`
+    /// in daemon-owned PTYs for bridge-managed remote daemons.
+    pub cli_bin_dir: Option<std::path::PathBuf>,
 }
 
 struct ConnectionPermit(Arc<AtomicUsize>);
@@ -133,12 +136,31 @@ struct Subscriber {
     /// the hub. The connection polls it and closes, letting the client
     /// reconnect and resume from its last replayed cursor.
     kicked: Sender<()>,
+    client_kind: ClientKind,
+    client_pid: Option<u32>,
 }
 
 impl Subscriber {
+    #[cfg(test)]
     fn new(messages: Sender<ServerMessage>) -> (Self, Receiver<()>) {
+        Self::with_identity(messages, ClientKind::Other, None)
+    }
+
+    fn with_identity(
+        messages: Sender<ServerMessage>,
+        client_kind: ClientKind,
+        client_pid: Option<u32>,
+    ) -> (Self, Receiver<()>) {
         let (kicked, kicked_rx) = unbounded();
-        (Self { messages, kicked }, kicked_rx)
+        (
+            Self {
+                messages,
+                kicked,
+                client_kind,
+                client_pid,
+            },
+            kicked_rx,
+        )
     }
 }
 
@@ -515,6 +537,47 @@ impl Hub {
         Self::broadcast(state, &message, Some(source_subscriber_id));
     }
 
+    fn broadcast_open_workspace(
+        &self,
+        path: Option<String>,
+        host: Option<String>,
+    ) -> (bool, Option<u32>) {
+        let mut state = self.state.lock();
+        let message = ServerMessage::OpenWorkspace { path, host };
+        let mut desktop_ids: Vec<u64> = state
+            .subscribers
+            .iter()
+            .filter_map(|(&id, subscriber)| {
+                (subscriber.client_kind == ClientKind::Desktop).then_some(id)
+            })
+            .collect();
+        // Prefer the most recently connected desktop's PID deterministically.
+        desktop_ids.sort_unstable_by(|a, b| b.cmp(a));
+        let mut delivered = false;
+        let mut desktop_pid = None;
+        let mut overwhelmed = Vec::new();
+        for subscriber_id in desktop_ids {
+            let Some(subscriber) = state.subscribers.get(&subscriber_id) else {
+                continue;
+            };
+            if subscriber.messages.len() >= MAX_QUEUED_MESSAGES_PER_SUBSCRIBER
+                || subscriber.messages.try_send(message.clone()).is_err()
+            {
+                overwhelmed.push((subscriber_id, subscriber.kicked.clone()));
+            } else {
+                delivered = true;
+                if desktop_pid.is_none() {
+                    desktop_pid = subscriber.client_pid;
+                }
+            }
+        }
+        for (subscriber_id, kicked) in overwhelmed {
+            state.subscribers.remove(&subscriber_id);
+            let _ = kicked.send(());
+        }
+        (delivered, desktop_pid)
+    }
+
     fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
         self.state
             .lock()
@@ -765,14 +828,16 @@ fn handle_connection(
     )
     .context("WebSocket handshake failed")?;
     let hello = read_client_message(&mut socket)?;
-    let resume_from = match hello {
+    let (resume_from, client_kind, client_pid) = match hello {
         ClientMessage::Hello {
             protocol_version,
             token,
             resume_from,
+            client_kind,
+            client_pid,
             ..
         } if protocol_version == PROTOCOL_VERSION && token_matches(expected_token, &token) => {
-            resume_from
+            (resume_from, client_kind, client_pid)
         }
         ClientMessage::Hello {
             protocol_version, ..
@@ -819,7 +884,8 @@ fn handle_connection(
         .set_write_timeout(Some(SOCKET_WRITE_STALL_TIMEOUT))?;
 
     let (outgoing, outgoing_rx) = bounded(MAX_QUEUED_MESSAGES_PER_SUBSCRIBER);
-    let (subscriber, kicked) = Subscriber::new(outgoing.clone());
+    let (subscriber, kicked) =
+        Subscriber::with_identity(outgoing.clone(), client_kind, client_pid);
     let subscriber_id = hub.subscribe(&resume_from, subscriber);
 
     let mut last_inbound = Instant::now();
@@ -1144,7 +1210,11 @@ fn handle_request(
         (cached, false)
     } else {
         let start_arm = starts_runtime.then(|| hub.arm_starting_runtime(session_id, runtime_id));
-        let outcome = match backend.handle(request, hub.event_sink(session_id, runtime_id)) {
+        let handled_result = match request.command {
+            Command::OpenWorkspace { path, host } => handle_open_workspace(&hub, path, host),
+            _ => backend.handle(request, hub.event_sink(session_id, runtime_id)),
+        };
+        let outcome = match handled_result {
             Ok(payload) => ResponseOutcome::Ok { payload },
             Err(error) => ResponseOutcome::Error {
                 error: RpcError::from(error),
@@ -1208,6 +1278,29 @@ fn handle_request(
         });
     }
     HandledRequest { outcome, executed }
+}
+
+fn handle_open_workspace(
+    hub: &Hub,
+    path: Option<String>,
+    host: Option<String>,
+) -> anyhow::Result<ResponsePayload> {
+    let host = host.filter(|value| !value.trim().is_empty());
+    let resolved_path = match (&host, path) {
+        (None, Some(raw)) => Some(
+            crate::workspace::resolve_workspace_directory(&raw)?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (Some(_), path) => path,
+        (None, None) => None,
+    };
+    let (delivered, desktop_pid) = hub.broadcast_open_workspace(resolved_path.clone(), host);
+    Ok(ResponsePayload::WorkspaceOpened {
+        delivered,
+        desktop_pid,
+        resolved_path,
+    })
 }
 
 fn task_catalog_action(command: &Command) -> TaskCatalogAction {
@@ -1679,6 +1772,8 @@ mod tests {
                 token: "secret".into(),
                 client_id: Uuid::new_v4(),
                 resume_from: Vec::new(),
+                client_kind: ClientKind::Other,
+                client_pid: None,
             },
         )
         .unwrap();
@@ -4027,6 +4122,169 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_workspace_routes_to_desktop_only_resolves_local_and_forwards_remote() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let root = std::env::temp_dir().join(format!("waku-open-ws-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        let file = root.join("proj").join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let expected_proj = crate::workspace::resolve_workspace_directory(
+            &root.join("proj").to_string_lossy(),
+        )
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+        // With only a web client connected, delivery is false.
+        let web = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Web,
+            None,
+        )
+        .unwrap();
+        let web_open_rx = web.subscribe_open_workspace();
+        let cli = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Cli,
+            Some(9999),
+        )
+        .unwrap();
+
+        let undelivered = cli
+            .open_workspace(Some(root.join("proj").to_string_lossy().into_owned()), None)
+            .unwrap();
+        assert!(!undelivered.delivered);
+        assert_eq!(undelivered.desktop_pid, None);
+        assert_eq!(undelivered.resolved_path.as_deref(), Some(expected_proj.as_str()));
+        assert!(web_open_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        // Missing local path returns an RPC error and does not broadcast.
+        let err = cli
+            .open_workspace(
+                Some(root.join("missing").to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap_err();
+        assert!(err.downcast_ref::<waku_client::DaemonRpcError>().is_some());
+        assert!(err.to_string().contains("does not exist"));
+
+        // Connect a desktop subscriber with a PID and verify file->parent resolution.
+        let desktop = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Desktop,
+            Some(42424),
+        )
+        .unwrap();
+        let desktop_open_rx = desktop.subscribe_open_workspace();
+
+        let outcome = cli
+            .open_workspace(Some(file.to_string_lossy().into_owned()), None)
+            .unwrap();
+        assert!(outcome.delivered);
+        assert_eq!(outcome.desktop_pid, Some(42424));
+        assert_eq!(outcome.resolved_path.as_deref(), Some(expected_proj.as_str()));
+        assert_eq!(
+            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            waku_client::OpenWorkspaceRequest {
+                path: Some(expected_proj.clone()),
+                host: None,
+            }
+        );
+        assert!(web_open_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        // Remote host forwards path unmodified without checking local filesystem.
+        let remote_outcome = cli
+            .open_workspace(Some("~/remote-only-repo".into()), Some("ssh:devbox".into()))
+            .unwrap();
+        assert!(remote_outcome.delivered);
+        assert_eq!(remote_outcome.desktop_pid, Some(42424));
+        assert_eq!(
+            remote_outcome.resolved_path.as_deref(),
+            Some("~/remote-only-repo")
+        );
+        assert_eq!(
+            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            waku_client::OpenWorkspaceRequest {
+                path: Some("~/remote-only-repo".into()),
+                host: Some("ssh:devbox".into()),
+            }
+        );
+
+        // Focus-only (path: None, host: None) delivers cleanly.
+        let focus_outcome = cli.open_workspace(None, None).unwrap();
+        assert!(focus_outcome.delivered);
+        assert_eq!(focus_outcome.desktop_pid, Some(42424));
+        assert_eq!(focus_outcome.resolved_path, None);
+        assert_eq!(
+            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            waku_client::OpenWorkspaceRequest {
+                path: None,
+                host: None,
+            }
+        );
+
+        // request_open_workspace via a BridgeState JSON file works end-to-end.
+        let state_file = root.join("daemon.json");
+        std::fs::write(
+            &state_file,
+            serde_json::to_string(&waku_protocol::bridge::BridgeState {
+                address: address.to_string(),
+                token: "secret".into(),
+                pid: std::process::id(),
+                protocol_version: PROTOCOL_VERSION,
+                fingerprint: "test".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let via_state = waku_client::request_open_workspace(
+            &state_file,
+            Some(root.join("proj").to_string_lossy().into_owned()),
+            None,
+        )
+        .unwrap();
+        assert!(via_state.delivered);
+        assert_eq!(via_state.desktop_pid, Some(42424));
+        assert_eq!(via_state.resolved_path.as_deref(), Some(expected_proj.as_str()));
+        assert_eq!(
+            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            waku_client::OpenWorkspaceRequest {
+                path: Some(expected_proj),
+                host: None,
+            }
+        );
+
+        cli.shutdown();
+        desktop.disconnect();
+        web.disconnect();
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

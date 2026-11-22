@@ -19,6 +19,7 @@ use waku_protocol::bridge::{
 };
 
 pub const STATE_FILE: &str = "daemon.json";
+pub const CLI_BIN_DIR: &str = "bin";
 const LOCK_FILE: &str = "daemon.lock";
 const LOG_FILE: &str = "daemon.log";
 /// How long a bridge-managed daemon stays up with no client and no runtime.
@@ -75,6 +76,84 @@ pub fn write_state(path: &Path, state: &BridgeState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ensure `<state_dir>/bin` contains a `waku` CLI shim that opens workspaces
+/// against the daemon tracked in `<state_dir>/daemon.json`.
+pub fn ensure_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<PathBuf> {
+    let bin_dir = state_dir.join(CLI_BIN_DIR);
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("could not create {}", bin_dir.display()))?;
+    #[cfg(unix)]
+    {
+        let link_path = bin_dir.join("waku");
+        let canonical_state =
+            fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+        let daemon_name = if executable.parent() == Some(state_dir) {
+            executable
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("waku-daemon"))
+        } else {
+            OsStr::new("waku-daemon")
+        };
+        let target = canonical_state.join(daemon_name);
+        let already_matches = fs::read_link(&link_path)
+            .map(|existing| existing == target)
+            .unwrap_or(false);
+        if !already_matches {
+            let tmp = bin_dir.join(format!(".waku.tmp.{}", std::process::id()));
+            let _ = fs::remove_file(&tmp);
+            std::os::unix::fs::symlink(&target, &tmp)
+                .with_context(|| format!("could not create symlink {}", tmp.display()))?;
+            if let Err(error) = fs::rename(&tmp, &link_path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(error)
+                    .with_context(|| format!("could not install {}", link_path.display()));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let daemon_name = if executable.parent() == Some(state_dir) {
+            executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("waku-daemon.exe")
+        } else {
+            "waku-daemon.exe"
+        };
+        let cmd_contents = format!(
+            "@echo off\r\n\"%~dp0..\\{daemon_name}\" open --state-dir \"%~dp0..\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+        );
+        write_shim_if_changed(&bin_dir.join("waku.cmd"), cmd_contents.as_bytes())?;
+        let sh_contents = format!(
+            "#!/bin/sh\ndir=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && (pwd -W 2>/dev/null || pwd))\"\nexec \"$dir/{daemon_name}\" open --state-dir \"$dir\" \"$@\"\n"
+        );
+        write_shim_if_changed(&bin_dir.join("waku"), sh_contents.as_bytes())?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = executable;
+    Ok(bin_dir)
+}
+
+#[cfg(windows)]
+fn write_shim_if_changed(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if fs::read(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("waku"),
+        std::process::id()
+    ));
+    fs::write(&tmp, contents).with_context(|| format!("could not write {}", tmp.display()))?;
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("could not install {}", path.display()));
+    }
+    Ok(())
+}
+
 pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     let mut state_dir = None;
     let mut replace_incompatible = false;
@@ -102,6 +181,9 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     };
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("could not create {}", state_dir.display()))?;
+    if let Err(error) = ensure_cli_shim(&state_dir, &executable) {
+        eprintln!("waku-daemon bridge: could not prepare CLI shim: {error:#}");
+    }
     let fingerprint = file_fingerprint(&executable)
         .with_context(|| format!("could not fingerprint {}", executable.display()))?;
 
@@ -338,7 +420,16 @@ fn start_daemon(
     let mut diagnostic_log = log.try_clone().ok();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let idle_secs = IDLE_EXIT_SECONDS.to_string();
-    let args = [
+    let cli_bin_dir = match ensure_cli_shim(state_dir, executable) {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            if let Some(ref mut log) = diagnostic_log {
+                let _ = writeln!(log, "waku-daemon bridge: could not prepare CLI shim: {error:#}");
+            }
+            None
+        }
+    };
+    let mut args = vec![
         OsStr::new("--bind"),
         OsStr::new("127.0.0.1:0"),
         OsStr::new("--state-file"),
@@ -346,6 +437,10 @@ fn start_daemon(
         OsStr::new("--idle-exit-secs"),
         OsStr::new(&idle_secs),
     ];
+    if let Some(ref bin_dir) = cli_bin_dir {
+        args.push(OsStr::new("--cli-bin-dir"));
+        args.push(bin_dir.as_os_str());
+    }
     let mut owned_envs: Vec<(&OsStr, OsString)> = vec![(
         OsStr::new(waku_protocol::DAEMON_TOKEN_ENV),
         OsString::from(&token),
@@ -756,6 +851,46 @@ mod tests {
         assert!(!waku_client::pid::is_alive(child.id()));
         let logged = String::from_utf8_lossy(&fs::read(&log_path).unwrap()).into_owned();
         assert!(logged.contains("isolated_ok"), "unexpected log: {logged:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_cli_shim_installs_platform_cli_entrypoint() {
+        let dir = std::env::temp_dir().join(format!("waku-cli-shim-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_name = if cfg!(windows) {
+            "waku-daemon.exe"
+        } else {
+            "waku-daemon"
+        };
+        let exe = dir.join(exe_name);
+        fs::write(&exe, b"stub").unwrap();
+
+        let bin_dir = ensure_cli_shim(&dir, &exe).unwrap();
+        assert_eq!(bin_dir, dir.join(CLI_BIN_DIR));
+
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(bin_dir.join("waku")).unwrap();
+            let expected = fs::canonicalize(&dir).unwrap().join("waku-daemon");
+            assert_eq!(target, expected);
+            // Calling twice is idempotent.
+            ensure_cli_shim(&dir, &exe).unwrap();
+            assert_eq!(fs::read_link(bin_dir.join("waku")).unwrap(), expected);
+        }
+        #[cfg(windows)]
+        {
+            let cmd = fs::read_to_string(bin_dir.join("waku.cmd")).unwrap();
+            assert!(cmd.contains(r#""%~dp0..\waku-daemon.exe" open --state-dir "%~dp0.." %*"#));
+            let sh = fs::read_to_string(bin_dir.join("waku")).unwrap();
+            assert!(sh.starts_with("#!/bin/sh\n"));
+            assert!(!sh.contains('\r'));
+            assert!(sh.contains("waku-daemon.exe"));
+            assert!(sh.contains("open --state-dir"));
+            // Calling twice is idempotent.
+            ensure_cli_shim(&dir, &exe).unwrap();
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

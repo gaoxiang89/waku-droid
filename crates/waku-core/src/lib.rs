@@ -71,9 +71,9 @@ mod protocol;
 mod server;
 
 pub use protocol::{
-    APP_EXECUTABLE_ENV, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV, DaemonReady,
-    PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError,
-    SequencedEvent, ServerMessage, WireComputerToolRequest, WireDriverEvent,
+    APP_EXECUTABLE_ENV, ClientKind, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV,
+    DaemonReady, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome, ResponsePayload,
+    RpcError, SequencedEvent, ServerMessage, WireComputerToolRequest, WireDriverEvent,
     WireDriverStartOptions, WireSessionOptions,
 };
 pub use server::{Backend, EventSink, ServerOptions, serve};

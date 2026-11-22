@@ -13,7 +13,7 @@ import type { SlashCommand } from "./SlashCommand";
 import type { WorkingTreeEntry } from "./WorkingTreeEntry";
 import type { WorkspaceWatchState } from "./WorkspaceWatchState";
 
-export type WorkspaceResult = { "type": "changes", state: WorkspaceWatchState, } | { "type": "ack" } | { "type": "workingTree", entries: Array<WorkingTreeEntry>, } | { "type": "directory", path: string, parent: string | null, home: string, filesystem_root: string, entries: Array<WorkingTreeEntry>, } | { "type": "textFile", content: string, } | { "type": "fileChunk",
+export type WorkspaceResult = { "type": "changes", state: WorkspaceWatchState, } | { "type": "ack" } | { "type": "workingTree", entries: Array<WorkingTreeEntry>, } | { "type": "directory", path: string, parent: string | null, home: string, filesystem_root: string, entries: Array<WorkingTreeEntry>, } | { "type": "resolvedPath", path: string, } | { "type": "textFile", content: string, } | { "type": "fileChunk",
 /**
  * Base64-encoded file bytes at the requested offset, matching the
  * blob command framing.

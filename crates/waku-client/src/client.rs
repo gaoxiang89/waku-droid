@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,13 +16,14 @@ use uuid::Uuid;
 
 use waku_protocol::MAX_WIRE_MESSAGE_BYTES;
 use waku_protocol::{
-    ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
+    ClientKind, ClientMessage, Command, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
     ResponsePayload, RpcError, SequencedEvent, ServerMessage,
 };
 
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_BUFFERED_EVENTS_PER_RUNTIME: usize = 4096;
+const MAX_BUFFERED_OPEN_WORKSPACES: usize = 64;
 /// A write that makes no progress for this long means the daemon stopped
 /// reading. Without a deadline, a full TCP buffer would block the socket
 /// thread — which owns reads as well — and stall the whole client.
@@ -41,12 +43,55 @@ enum Outgoing {
     Disconnect,
 }
 
+/// An incoming `openWorkspace` push delivered by a daemon to a desktop client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenWorkspaceRequest {
+    pub path: Option<String>,
+    pub host: Option<String>,
+}
+
+/// Outcome returned by `Command::OpenWorkspace`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenWorkspaceOutcome {
+    pub delivered: bool,
+    pub desktop_pid: Option<u32>,
+    pub resolved_path: Option<String>,
+}
+
+/// Typed error returned when the daemon accepted the request and replied with
+/// an explicit [`RpcError`] (for example, a nonexistent workspace path).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonRpcError(pub String);
+
+impl std::fmt::Display for DaemonRpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DaemonRpcError {}
+
+/// Typed error returned by [`request_open_workspace`] when no compatible
+/// running daemon could be reached via the given state file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonUnavailableError(pub String);
+
+impl std::fmt::Display for DaemonUnavailableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DaemonUnavailableError {}
+
 struct ClientInner {
     outgoing: Sender<Outgoing>,
     pending: Mutex<HashMap<Uuid, Sender<Result<ResponsePayload, RpcError>>>>,
     sessions: Mutex<HashMap<(Uuid, Uuid), Sender<SequencedEvent>>>,
     pending_events: Mutex<HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>>,
     task_state_subscribers: Mutex<Vec<Sender<u64>>>,
+    open_workspace_subscribers: Mutex<Vec<Sender<OpenWorkspaceRequest>>>,
+    pending_open_workspaces: Mutex<VecDeque<OpenWorkspaceRequest>>,
     last_sequences: Mutex<HashMap<(Uuid, Uuid), LastSequence>>,
     disconnected: AtomicBool,
     /// Why the current or most recent connection ended, for diagnostics.
@@ -74,6 +119,16 @@ impl DaemonClient {
         address: &str,
         token: String,
         resume_from: Vec<ReplayCursor>,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_identity(address, token, resume_from, ClientKind::Other, None)
+    }
+
+    pub fn connect_with_identity(
+        address: &str,
+        token: String,
+        resume_from: Vec<ReplayCursor>,
+        client_kind: ClientKind,
+        client_pid: Option<u32>,
     ) -> anyhow::Result<Self> {
         let last_sequences = resume_from
             .iter()
@@ -106,6 +161,8 @@ impl DaemonClient {
                 token,
                 client_id: Uuid::new_v4(),
                 resume_from,
+                client_kind,
+                client_pid,
             },
         )?;
         let hello = read_server_message(&mut socket)?;
@@ -135,6 +192,8 @@ impl DaemonClient {
             sessions: Mutex::new(HashMap::new()),
             pending_events: Mutex::new(HashMap::new()),
             task_state_subscribers: Mutex::new(Vec::new()),
+            open_workspace_subscribers: Mutex::new(Vec::new()),
+            pending_open_workspaces: Mutex::new(VecDeque::new()),
             last_sequences: Mutex::new(last_sequences),
             disconnected: AtomicBool::new(false),
             disconnect_reason: Mutex::new(None),
@@ -198,6 +257,43 @@ impl DaemonClient {
         receiver
     }
 
+    /// Subscribe to `openWorkspace` requests pushed by the daemon to desktop
+    /// clients. Any requests that arrived after the WebSocket handshake but
+    /// before the first subscriber registered are drained immediately in order.
+    pub fn subscribe_open_workspace(&self) -> Receiver<OpenWorkspaceRequest> {
+        let (events, receiver) = unbounded();
+        let mut subscribers = self.inner.open_workspace_subscribers.lock();
+        subscribers.push(events.clone());
+        let mut pending = self.inner.pending_open_workspaces.lock();
+        while let Some(request) = pending.pop_front() {
+            let _ = events.send(request);
+        }
+        receiver
+    }
+
+    pub fn open_workspace(
+        &self,
+        path: Option<String>,
+        host: Option<String>,
+    ) -> anyhow::Result<OpenWorkspaceOutcome> {
+        match self.request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::OpenWorkspace { path, host },
+        )? {
+            ResponsePayload::WorkspaceOpened {
+                delivered,
+                desktop_pid,
+                resolved_path,
+            } => Ok(OpenWorkspaceOutcome {
+                delivered,
+                desktop_pid,
+                resolved_path,
+            }),
+            _ => bail!("Waku daemon returned an invalid openWorkspace response"),
+        }
+    }
+
     pub fn request(
         &self,
         session_id: Uuid,
@@ -227,7 +323,7 @@ impl DaemonClient {
         }
         match response_rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(Ok(payload)) => Ok(payload),
-            Ok(Err(error)) => Err(anyhow!(error.message)),
+            Ok(Err(error)) => Err(anyhow::Error::new(DaemonRpcError(error.message))),
             Err(error) => {
                 self.inner.pending.lock().remove(&request_id);
                 Err(anyhow!("timed out waiting for Waku daemon: {error}"))
@@ -280,6 +376,59 @@ impl DaemonClient {
     pub fn disconnect(&self) {
         let _ = self.inner.outgoing.send(Outgoing::Disconnect);
     }
+}
+
+/// Read a daemon `BridgeState` JSON file (`resident-daemon.json` or
+/// `daemon.json`), verify that its daemon PID is alive, connect as
+/// [`ClientKind::Cli`], and invoke [`Command::OpenWorkspace`].
+///
+/// Missing/stale state files, dead PIDs, protocol mismatches, and socket
+/// connect failures return a [`DaemonUnavailableError`]; daemon-side RPC
+/// rejections (such as a nonexistent workspace path) return a
+/// [`DaemonRpcError`].
+pub fn request_open_workspace(
+    state_file: &Path,
+    path: Option<String>,
+    host: Option<String>,
+) -> anyhow::Result<OpenWorkspaceOutcome> {
+    let bytes = std::fs::read(state_file).map_err(|error| {
+        anyhow::Error::new(DaemonUnavailableError(format!(
+            "could not read daemon state file {}: {error}",
+            state_file.display()
+        )))
+    })?;
+    let state: waku_protocol::bridge::BridgeState =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::Error::new(DaemonUnavailableError(format!(
+                "invalid daemon state file {}: {error}",
+                state_file.display()
+            )))
+        })?;
+    if !crate::pid::is_alive(state.pid) {
+        return Err(anyhow::Error::new(DaemonUnavailableError(format!(
+            "Waku daemon (pid {}) is not running",
+            state.pid
+        ))));
+    }
+    if state.protocol_version != PROTOCOL_VERSION {
+        return Err(anyhow::Error::new(DaemonUnavailableError(format!(
+            "running Waku daemon uses protocol {}, expected {PROTOCOL_VERSION}",
+            state.protocol_version
+        ))));
+    }
+    let address = crate::process::desktop_client_address(&state.address)
+        .unwrap_or_else(|_| state.address.clone());
+    let client = DaemonClient::connect_with_identity(
+        &address,
+        state.token,
+        Vec::new(),
+        ClientKind::Cli,
+        Some(std::process::id()),
+    )
+    .map_err(|error| anyhow::Error::new(DaemonUnavailableError(format!("{error:#}"))))?;
+    let outcome = client.open_workspace(path, host);
+    client.disconnect();
+    outcome
 }
 
 /// Result of asking a running daemon at `address` to shut down cleanly.
@@ -347,6 +496,8 @@ fn shutdown_with_protocol(
             token: token.to_owned(),
             client_id: Uuid::new_v4(),
             resume_from: Vec::new(),
+            client_kind: ClientKind::Other,
+            client_pid: None,
         },
     )?;
     match read_server_message(&mut socket)? {
@@ -522,6 +673,19 @@ fn run_client(
                                     .lock()
                                     .retain(|subscriber| subscriber.send(revision).is_ok());
                             }
+                            ServerMessage::OpenWorkspace { path, host } => {
+                                let request = OpenWorkspaceRequest { path, host };
+                                let mut subscribers = inner.open_workspace_subscribers.lock();
+                                subscribers
+                                    .retain(|subscriber| subscriber.send(request.clone()).is_ok());
+                                if subscribers.is_empty() {
+                                    let mut pending = inner.pending_open_workspaces.lock();
+                                    pending.push_back(request);
+                                    while pending.len() > MAX_BUFFERED_OPEN_WORKSPACES {
+                                        pending.pop_front();
+                                    }
+                                }
+                            }
                             ServerMessage::ShuttingDown => {
                                 close_reason = "the daemon is shutting down".into();
                                 break;
@@ -571,6 +735,7 @@ fn run_client(
     // `processExited` event emitted by the daemon.
     drop(std::mem::take(&mut *inner.sessions.lock()));
     inner.task_state_subscribers.lock().clear();
+    inner.open_workspace_subscribers.lock().clear();
 }
 
 fn set_client_timeouts(
@@ -733,5 +898,103 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("old-protocol daemon should receive shutdown");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_with_identity_and_open_workspace_buffering_work() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (identity_tx, identity_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let Message::Text(text) = ws.read().unwrap() else {
+                panic!("expected text hello");
+            };
+            let ClientMessage::Hello {
+                client_kind,
+                client_pid,
+                ..
+            } = serde_json::from_str(text.as_ref()).unwrap()
+            else {
+                panic!("expected hello");
+            };
+            identity_tx.send((client_kind, client_pid)).unwrap();
+            write_json(
+                &mut ws,
+                &ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                },
+            )
+            .unwrap();
+            // Push immediately after Hello, before the caller subscribes.
+            write_json(
+                &mut ws,
+                &ServerMessage::OpenWorkspace {
+                    path: Some("/early".into()),
+                    host: None,
+                },
+            )
+            .unwrap();
+            while let Ok(msg) = ws.read() {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let client = DaemonClient::connect_with_identity(
+            &addr,
+            "tok".into(),
+            Vec::new(),
+            ClientKind::Desktop,
+            Some(7777),
+        )
+        .unwrap();
+        assert_eq!(
+            identity_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (ClientKind::Desktop, Some(7777))
+        );
+        // Give the client reader thread a moment to receive the early push.
+        std::thread::sleep(Duration::from_millis(50));
+        let rx = client.subscribe_open_workspace();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            OpenWorkspaceRequest {
+                path: Some("/early".into()),
+                host: None,
+            }
+        );
+        client.disconnect();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn request_open_workspace_reports_unavailable_for_missing_or_dead_state() {
+        let dir = std::env::temp_dir().join(format!("waku-cli-open-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.json");
+        let err = request_open_workspace(&missing, None, None).unwrap_err();
+        assert!(err.downcast_ref::<DaemonUnavailableError>().is_some());
+
+        let dead_state = dir.join("dead.json");
+        std::fs::write(
+            &dead_state,
+            serde_json::to_string(&waku_protocol::bridge::BridgeState {
+                address: "127.0.0.1:1".into(),
+                token: "tok".into(),
+                pid: 0,
+                protocol_version: PROTOCOL_VERSION,
+                fingerprint: "fp".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = request_open_workspace(&dead_state, None, None).unwrap_err();
+        assert!(err.downcast_ref::<DaemonUnavailableError>().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

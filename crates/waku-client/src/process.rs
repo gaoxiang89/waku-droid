@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::DaemonClient;
 use crate::remote::{BridgeError, BridgeSession, BridgeStage, Connection};
 use waku_protocol::{
-    APP_EXECUTABLE_ENV, Command, DAEMON_TOKEN_ENV, DaemonReady, DaemonSettings, PROTOCOL_VERSION,
-    ReplayCursor, ResponsePayload,
+    APP_EXECUTABLE_ENV, ClientKind, Command, DAEMON_TOKEN_ENV, DaemonReady, DaemonSettings,
+    PROTOCOL_VERSION, ReplayCursor, ResponsePayload,
 };
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,6 +129,25 @@ pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
     Ok(origins)
 }
 
+/// Path to the resident local daemon's `BridgeState` record (`resident-daemon.json`).
+pub fn resident_daemon_state_path() -> PathBuf {
+    crate::persistence::StateStore::default_path().with_file_name("resident-daemon.json")
+}
+
+fn connect_desktop_client(
+    address: &str,
+    token: String,
+    resume_from: Vec<ReplayCursor>,
+) -> anyhow::Result<DaemonClient> {
+    DaemonClient::connect_with_identity(
+        address,
+        token,
+        resume_from,
+        ClientKind::Desktop,
+        Some(std::process::id()),
+    )
+}
+
 pub struct DaemonProcess {
     client: Mutex<DaemonClient>,
     /// Loopback address and bearer token for re-dialing this daemon after a
@@ -151,8 +170,7 @@ impl DaemonProcess {
     ) -> anyhow::Result<Self> {
         let settings = settings.validate()?;
         let token = settings.token.clone();
-        let state_file =
-            crate::persistence::StateStore::default_path().with_file_name("resident-daemon.json");
+        let state_file = resident_daemon_state_path();
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -203,7 +221,7 @@ impl DaemonProcess {
                     let _ = std::fs::remove_file(&state_file);
                 }
             } else if let Ok(address) = desktop_client_address(&record.address)
-                && let Ok(client) = DaemonClient::connect(&address, token.clone())
+                && let Ok(client) = connect_desktop_client(&address, token.clone(), Vec::new())
             {
                 return Ok(Self {
                     client: Mutex::new(client),
@@ -350,7 +368,7 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        let client = match DaemonClient::connect(&client_address, token.to_owned()) {
+        let client = match connect_desktop_client(&client_address, token.to_owned(), Vec::new()) {
             Ok(client) => client,
             Err(error) => {
                 let _ = child.kill();
@@ -436,7 +454,7 @@ impl Drop for DaemonProcess {
     }
 }
 
-fn desktop_client_address(address: &str) -> anyhow::Result<String> {
+pub(crate) fn desktop_client_address(address: &str) -> anyhow::Result<String> {
     let address = address
         .parse::<std::net::SocketAddr>()
         .with_context(|| format!("Waku daemon returned an invalid address {address:?}"))?;
@@ -512,8 +530,7 @@ impl RemoteEndpoint {
     fn reconnect(&self, resume_from: Vec<ReplayCursor>) -> anyhow::Result<(DaemonClient, Self)> {
         match self {
             Self::Direct { address, token } => {
-                let client =
-                    DaemonClient::connect_with_resume(address, token.clone(), resume_from)?;
+                let client = connect_desktop_client(address, token.clone(), resume_from)?;
                 Ok((
                     client,
                     Self::Direct {
@@ -527,7 +544,7 @@ impl RemoteEndpoint {
                 session,
             } => {
                 let session = Arc::new(BridgeSession::reconnect(connection, session.target())?);
-                let client = DaemonClient::connect_with_resume(
+                let client = connect_desktop_client(
                     session.address(),
                     session.token().to_owned(),
                     resume_from,
@@ -624,7 +641,7 @@ impl DaemonSupervisor {
     /// Connect to a daemon managed on another host (or by an external local
     /// service manager). Dropping the desktop never shuts this daemon down.
     pub fn connect(address: &str, token: String) -> anyhow::Result<Self> {
-        let client = DaemonClient::connect(address, token.clone())?;
+        let client = connect_desktop_client(address, token.clone(), Vec::new())?;
         let settings = read_settings(&client)?;
         Self::remote(
             client,
@@ -659,8 +676,12 @@ impl DaemonSupervisor {
                 detail => error.context(detail),
             },
         };
-        let client = DaemonClient::connect(session.address(), session.token().to_owned())
-            .map_err(bridge_error)?;
+        let client = connect_desktop_client(
+            session.address(),
+            session.token().to_owned(),
+            Vec::new(),
+        )
+        .map_err(bridge_error)?;
         let settings = read_settings(&client).map_err(bridge_error)?;
         Self::remote(
             client,
@@ -981,7 +1002,7 @@ fn monitor_daemon(
                             // The target lock is released here: dialing a
                             // wedged daemon can block for seconds, and
                             // UI-side `client()` calls must not wait.
-                            match DaemonClient::connect_with_resume(&address, token, resume_from) {
+                            match connect_desktop_client(&address, token, resume_from) {
                                 Ok(replacement) => {
                                     if !inner.running.load(Ordering::Acquire) {
                                         replacement.disconnect();

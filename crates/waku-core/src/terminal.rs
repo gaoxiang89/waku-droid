@@ -50,14 +50,25 @@ mod platform {
             rows: u16,
             events: EventSink,
         ) -> anyhow::Result<Self> {
+            Self::open_with_cli_bin_dir(cwd, cols, rows, events, None)
+        }
+
+        pub fn open_with_cli_bin_dir(
+            cwd: &std::path::Path,
+            cols: u16,
+            rows: u16,
+            events: EventSink,
+            cli_bin_dir: Option<&std::path::Path>,
+        ) -> anyhow::Result<Self> {
             let shell = crate::command_env::default_terminal_shell();
             let shell_args = crate::command_env::default_terminal_shell_args(&shell);
-            Self::open_with_shell(
+            Self::open_with_shell_and_cli_bin_dir(
                 cwd,
                 cols,
                 rows,
                 events,
                 Shell::new(shell.to_string_lossy().into_owned(), shell_args),
+                cli_bin_dir,
             )
         }
 
@@ -67,6 +78,17 @@ mod platform {
             rows: u16,
             events: EventSink,
             shell: Shell,
+        ) -> anyhow::Result<Self> {
+            Self::open_with_shell_and_cli_bin_dir(cwd, cols, rows, events, shell, None)
+        }
+
+        pub(crate) fn open_with_shell_and_cli_bin_dir(
+            cwd: &std::path::Path,
+            cols: u16,
+            rows: u16,
+            events: EventSink,
+            shell: Shell,
+            cli_bin_dir: Option<&std::path::Path>,
         ) -> anyhow::Result<Self> {
             let events = crate::terminal_state::TerminalEvents::new(events, cols, rows);
             if !cwd.is_dir() {
@@ -82,11 +104,27 @@ mod platform {
                 drain_on_exit: false,
                 ..Default::default()
             };
+            let mut env_path: Option<std::ffi::OsString> = None;
             for (name, value) in crate::command_env::shell_environment() {
+                if name == "PATH" {
+                    env_path = Some(value);
+                    continue;
+                }
                 options.env.insert(
                     name.to_string_lossy().into_owned(),
                     value.to_string_lossy().into_owned(),
                 );
+            }
+            if let Some(cli_bin_dir) = cli_bin_dir {
+                let existing = env_path.or_else(|| std::env::var_os("PATH"));
+                let merged = super::prepend_path_dir(existing.as_deref(), cli_bin_dir);
+                options
+                    .env
+                    .insert("PATH".into(), merged.to_string_lossy().into_owned());
+            } else if let Some(path) = env_path {
+                options
+                    .env
+                    .insert("PATH".into(), path.to_string_lossy().into_owned());
             }
             options.env.insert("TERM".into(), "xterm-256color".into());
             options.env.insert("COLORTERM".into(), "truecolor".into());
@@ -493,3 +531,64 @@ pub use platform::DaemonTerminal;
 mod windows;
 #[cfg(not(unix))]
 pub use windows::DaemonTerminal;
+
+pub(crate) fn prepend_path_dir(
+    existing: Option<&std::ffi::OsStr>,
+    dir: &std::path::Path,
+) -> std::ffi::OsString {
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = existing {
+        for entry in std::env::split_paths(existing) {
+            if entry.as_os_str().is_empty() {
+                continue;
+            }
+            #[cfg(windows)]
+            let same = entry
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&dir.to_string_lossy());
+            #[cfg(not(windows))]
+            let same = entry == dir;
+            if !same {
+                entries.push(entry);
+            }
+        }
+    }
+    std::env::join_paths(&entries).unwrap_or_else(|_| {
+        let mut fallback = dir.as_os_str().to_os_string();
+        if let Some(existing) = existing
+            && !existing.is_empty()
+        {
+            fallback.push(if cfg!(windows) { ";" } else { ":" });
+            fallback.push(existing);
+        }
+        fallback
+    })
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::prepend_path_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn prepend_path_dir_places_cli_bin_first_without_duplicating() {
+        let dir = if cfg!(windows) {
+            Path::new(r"C:\Users\me\.cache\waku\server\bin")
+        } else {
+            Path::new("/home/me/.cache/waku/server/bin")
+        };
+        let other = if cfg!(windows) {
+            Path::new(r"C:\Windows\System32")
+        } else {
+            Path::new("/usr/bin")
+        };
+        let existing = std::env::join_paths([other, dir]).unwrap();
+        let merged = prepend_path_dir(Some(existing.as_os_str()), dir);
+        let parts: Vec<PathBuf> = std::env::split_paths(&merged).collect();
+        assert_eq!(parts, vec![dir.to_path_buf(), other.to_path_buf()]);
+
+        let alone = prepend_path_dir(None, dir);
+        let alone_parts: Vec<PathBuf> = std::env::split_paths(&alone).collect();
+        assert_eq!(alone_parts, vec![dir.to_path_buf()]);
+    }
+}

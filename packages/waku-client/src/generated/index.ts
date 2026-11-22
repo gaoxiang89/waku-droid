@@ -14,6 +14,7 @@ export type { BranchSnapshot } from "./BranchSnapshot";
 export type { Checkpoint } from "./Checkpoint";
 export type { CheckpointFile } from "./CheckpointFile";
 export type { CheckpointStatus } from "./CheckpointStatus";
+export type { ClientKind } from "./ClientKind";
 export type { ClientMessage } from "./ClientMessage";
 export type { Command } from "./Command";
 export type { CommandScope } from "./CommandScope";

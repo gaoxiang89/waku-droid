@@ -19,11 +19,22 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "WAKU_APP_EXECUTABLE";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientKind {
+    #[default]
+    Other,
+    Desktop,
+    Web,
+    Mobile,
+    Cli,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +57,10 @@ pub enum ClientMessage {
         client_id: Uuid,
         #[serde(default)]
         resume_from: Vec<ReplayCursor>,
+        #[serde(default)]
+        client_kind: ClientKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_pid: Option<u32>,
     },
     Request(Request),
     Shutdown,
@@ -264,6 +279,14 @@ pub enum Command {
     Workspace {
         operation: WorkspaceOperation,
     },
+    /// Ask connected desktop apps to focus and optionally open a workspace path
+    /// on this host (or on `host` when forwarded through the local daemon).
+    OpenWorkspace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+    },
     OpenTerminal {
         #[ts(type = "string")]
         cwd: PathBuf,
@@ -379,6 +402,14 @@ pub enum ServerMessage {
     TaskStateChanged {
         revision: u64,
     },
+    /// A CLI or other client asked connected desktop apps to activate and
+    /// optionally open a workspace path.
+    OpenWorkspace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+    },
     ShuttingDown,
 }
 
@@ -491,6 +522,13 @@ pub enum ResponsePayload {
     Workspace {
         result: WorkspaceResult,
     },
+    WorkspaceOpened {
+        delivered: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_path: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -586,7 +624,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -595,7 +633,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -642,11 +680,15 @@ mod tests {
                 epoch: Uuid::from_u128(3),
                 sequence: 9,
             }],
+            client_kind: ClientKind::Desktop,
+            client_pid: Some(4242),
         };
         let json = serde_json::to_value(message).unwrap();
 
         assert_eq!(json["type"], "hello");
         assert_eq!(json["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(json["clientKind"], "desktop");
+        assert_eq!(json["clientPid"], 4242);
         assert_eq!(json["resumeFrom"][0]["sessionId"], session_id.to_string());
         assert_eq!(json["resumeFrom"][0]["runtimeId"], runtime_id.to_string());
         assert_eq!(
@@ -654,6 +696,102 @@ mod tests {
             Uuid::from_u128(3).to_string()
         );
         assert!(json.get("protocol_version").is_none());
+
+        let minimal: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "hello",
+            "protocolVersion": PROTOCOL_VERSION,
+            "token": "secret",
+            "clientId": Uuid::from_u128(2),
+        }))
+        .unwrap();
+        let ClientMessage::Hello {
+            client_kind,
+            client_pid,
+            resume_from,
+            ..
+        } = minimal
+        else {
+            panic!("expected hello");
+        };
+        assert_eq!(client_kind, ClientKind::Other);
+        assert_eq!(client_pid, None);
+        assert!(resume_from.is_empty());
+    }
+
+    #[test]
+    fn open_workspace_messages_use_stable_camel_case_fields() {
+        let command = Command::OpenWorkspace {
+            path: Some("/tmp/project".into()),
+            host: Some("ssh:devbox".into()),
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["type"], "openWorkspace");
+        assert_eq!(json["path"], "/tmp/project");
+        assert_eq!(json["host"], "ssh:devbox");
+        let Command::OpenWorkspace { path, host } = serde_json::from_value(json).unwrap() else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(path.as_deref(), Some("/tmp/project"));
+        assert_eq!(host.as_deref(), Some("ssh:devbox"));
+
+        let focus_only = serde_json::to_value(Command::OpenWorkspace {
+            path: None,
+            host: None,
+        })
+        .unwrap();
+        assert_eq!(focus_only["type"], "openWorkspace");
+        assert!(focus_only.get("path").is_none());
+        assert!(focus_only.get("host").is_none());
+
+        let response = ResponsePayload::WorkspaceOpened {
+            delivered: true,
+            desktop_pid: Some(9876),
+            resolved_path: Some("/tmp/project".into()),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["type"], "workspaceOpened");
+        assert_eq!(json["delivered"], true);
+        assert_eq!(json["desktopPid"], 9876);
+        assert_eq!(json["resolvedPath"], "/tmp/project");
+        let ResponsePayload::WorkspaceOpened {
+            delivered,
+            desktop_pid,
+            resolved_path,
+        } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected payload variant");
+        };
+        assert!(delivered);
+        assert_eq!(desktop_pid, Some(9876));
+        assert_eq!(resolved_path.as_deref(), Some("/tmp/project"));
+
+        let server_msg = ServerMessage::OpenWorkspace {
+            path: Some("/tmp/project".into()),
+            host: None,
+        };
+        let json = serde_json::to_value(&server_msg).unwrap();
+        assert_eq!(json["type"], "openWorkspace");
+        assert_eq!(json["path"], "/tmp/project");
+        assert!(json.get("host").is_none());
+        let ServerMessage::OpenWorkspace { path, host } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("unexpected server message variant");
+        };
+        assert_eq!(path.as_deref(), Some("/tmp/project"));
+        assert_eq!(host, None);
+
+        let resolve_op = serde_json::to_value(WorkspaceOperation::ResolvePath {
+            path: "~/repo".into(),
+        })
+        .unwrap();
+        assert_eq!(resolve_op["type"], "resolvePath");
+        assert_eq!(resolve_op["path"], "~/repo");
+        let resolve_res = serde_json::to_value(WorkspaceResult::ResolvedPath {
+            path: "/home/u/repo".into(),
+        })
+        .unwrap();
+        assert_eq!(resolve_res["type"], "resolvedPath");
+        assert_eq!(resolve_res["path"], "/home/u/repo");
     }
 
     #[test]

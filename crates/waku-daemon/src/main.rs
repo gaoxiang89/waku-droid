@@ -1,5 +1,6 @@
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,8 +10,17 @@ use waku_daemon::bridge;
 use waku_protocol::bridge::{BRIDGE_SUBCOMMAND, BridgeState, FINGERPRINT_FLAG};
 use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
+const OPEN_SUBCOMMAND: &str = "open";
+const NO_DESKTOP_CONNECTED_MESSAGE: &str =
+    "No Waku desktop app is currently connected to this host.";
+
 fn main() -> anyhow::Result<()> {
-    let mut raw_arguments = std::env::args().skip(1).peekable();
+    let mut all_arguments = std::env::args();
+    let argv0 = all_arguments.next();
+    let mut raw_arguments = all_arguments.peekable();
+    if invoked_as_waku_cli(argv0.as_deref()) {
+        return run_open_cli(raw_arguments);
+    }
     match raw_arguments.peek().map(String::as_str) {
         Some(FINGERPRINT_FLAG) => {
             println!("{}", bridge::own_fingerprint()?);
@@ -19,6 +29,10 @@ fn main() -> anyhow::Result<()> {
         Some(BRIDGE_SUBCOMMAND) => {
             raw_arguments.next();
             return bridge::run(raw_arguments);
+        }
+        Some(OPEN_SUBCOMMAND) => {
+            raw_arguments.next();
+            return run_open_cli(raw_arguments);
         }
         _ => {}
     }
@@ -76,17 +90,172 @@ fn main() -> anyhow::Result<()> {
     )
     .context("could not load daemon settings")?;
     let task_store = waku_core::persistence::StateStore::daemon(task_path);
+    let backend = waku_core::daemon::WakuBackend::new(settings, task_store)?
+        .with_cli_bin_dir(arguments.cli_bin_dir.clone());
     waku_core::serve(
         listener,
         token,
-        Arc::new(waku_core::daemon::WakuBackend::new(settings, task_store)?),
+        Arc::new(backend),
         shutdown,
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some() || arguments.allow_shutdown,
             idle_exit: arguments.idle_exit,
+            cli_bin_dir: arguments.cli_bin_dir,
         },
     )
+}
+
+fn invoked_as_waku_cli(argv0: Option<&str>) -> bool {
+    let Some(argv0) = argv0 else {
+        return false;
+    };
+    let name = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem == "waku"
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum OpenAction {
+    Help,
+    Version,
+    Open {
+        state_dir: Option<PathBuf>,
+        path: Option<String>,
+    },
+}
+
+fn parse_open_arguments(
+    arguments: impl IntoIterator<Item = String>,
+) -> anyhow::Result<OpenAction> {
+    let mut state_dir = None;
+    let mut path = None;
+    let mut literal_only = false;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if !literal_only {
+            match argument.as_str() {
+                "-h" | "--help" => return Ok(OpenAction::Help),
+                "-V" | "--version" => return Ok(OpenAction::Version),
+                "--" => {
+                    literal_only = true;
+                    continue;
+                }
+                "--state-dir" => {
+                    let dir = arguments
+                        .next()
+                        .ok_or_else(|| anyhow!("--state-dir requires a path"))?;
+                    state_dir = Some(PathBuf::from(dir));
+                    continue;
+                }
+                _ if argument.starts_with("--state-dir=") => {
+                    let dir = &argument["--state-dir=".len()..];
+                    if dir.is_empty() {
+                        bail!("--state-dir requires a path");
+                    }
+                    state_dir = Some(PathBuf::from(dir));
+                    continue;
+                }
+                _ if argument.starts_with('-') && argument != "-" => {
+                    bail!("unknown option {argument:?}");
+                }
+                _ => {}
+            }
+        }
+        if path.is_some() {
+            bail!("expected at most one path argument");
+        }
+        path = Some(argument);
+    }
+    Ok(OpenAction::Open { state_dir, path })
+}
+
+fn resolve_open_cli_path(raw: &str, cwd: Option<&Path>) -> String {
+    if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") || raw.trim().is_empty() {
+        return raw.to_owned();
+    }
+    #[cfg(windows)]
+    {
+        let bytes = raw.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return format!("{raw}\\");
+        }
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return raw.to_owned();
+    }
+    let Some(cwd) = cwd else {
+        return raw.to_owned();
+    };
+    if raw == "." {
+        return cwd.to_string_lossy().into_owned();
+    }
+    cwd.join(path).to_string_lossy().into_owned()
+}
+
+fn default_open_state_dir() -> anyhow::Result<PathBuf> {
+    let executable = std::env::current_exe().context("could not locate waku-daemon")?;
+    let canonical = std::fs::canonicalize(&executable).unwrap_or(executable);
+    canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("waku-daemon has no parent directory"))
+}
+
+fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
+    let action = match parse_open_arguments(arguments) {
+        Ok(action) => action,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    match action {
+        OpenAction::Help => {
+            println!(
+                "Usage: waku [PATH]\n\n\
+                 Open a directory or focus the connected Waku desktop window.\n\n\
+                 Options:\n  \
+                   --state-dir <DIR>  Override the daemon state directory\n  \
+                   -h, --help         Print help\n  \
+                   -V, --version      Print version"
+            );
+            Ok(())
+        }
+        OpenAction::Version => {
+            println!("waku {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        OpenAction::Open { state_dir, path } => {
+            let state_dir = match state_dir {
+                Some(dir) => dir,
+                None => default_open_state_dir()?,
+            };
+            let state_file = state_dir.join(bridge::STATE_FILE);
+            let cwd = std::env::current_dir().ok();
+            let resolved_path = path.map(|raw| resolve_open_cli_path(&raw, cwd.as_deref()));
+            match waku_client::request_open_workspace(&state_file, resolved_path, None) {
+                Ok(outcome) if outcome.delivered => Ok(()),
+                Ok(_) => {
+                    eprintln!("{NO_DESKTOP_CONNECTED_MESSAGE}");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    if error
+                        .downcast_ref::<waku_client::DaemonUnavailableError>()
+                        .is_some()
+                    {
+                        eprintln!("{NO_DESKTOP_CONNECTED_MESSAGE}");
+                    } else {
+                        eprintln!("{error}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow::Result<()> {
@@ -106,6 +275,7 @@ struct Arguments {
     allow_non_loopback: bool,
     state_file: Option<std::path::PathBuf>,
     idle_exit: Option<Duration>,
+    cli_bin_dir: Option<std::path::PathBuf>,
 }
 
 impl Arguments {
@@ -117,6 +287,7 @@ impl Arguments {
         let mut allow_non_loopback = false;
         let mut state_file = None;
         let mut idle_exit = None;
+        let mut cli_bin_dir = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -161,9 +332,17 @@ impl Arguments {
                         .context("--idle-exit-secs is not a valid number")?;
                     idle_exit = Some(Duration::from_secs(seconds));
                 }
+                "--cli-bin-dir" => {
+                    cli_bin_dir = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--cli-bin-dir requires a path"))?
+                            .into(),
+                    );
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {0} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--state-file PATH] [--idle-exit-secs N]\n       {0} bridge [--state-dir DIR]\n       {0} --fingerprint",
+                        "usage: {0} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]... [--state-file PATH] [--idle-exit-secs N] [--cli-bin-dir DIR]\n       {0} bridge [--state-dir DIR]\n       {0} open [--state-dir DIR] [PATH]\n       {0} --fingerprint",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -179,6 +358,7 @@ impl Arguments {
             allow_non_loopback,
             state_file,
             idle_exit,
+            cli_bin_dir,
         })
     }
 }
@@ -217,5 +397,84 @@ mod tests {
     fn parses_explicit_non_loopback_opt_in() {
         let arguments = Arguments::parse(["--allow-non-loopback".into()]).unwrap();
         assert!(arguments.allow_non_loopback);
+    }
+
+    #[test]
+    fn parses_cli_bin_dir_argument() {
+        let arguments =
+            Arguments::parse(["--cli-bin-dir".into(), "/tmp/waku/bin".into()]).unwrap();
+        assert_eq!(arguments.cli_bin_dir, Some(PathBuf::from("/tmp/waku/bin")));
+    }
+
+    #[test]
+    fn detects_waku_multicall_argv0() {
+        assert!(invoked_as_waku_cli(Some("waku")));
+        assert!(invoked_as_waku_cli(Some("WAKU.EXE")));
+        assert!(invoked_as_waku_cli(Some("/home/me/.cache/waku/server/bin/waku")));
+        assert!(invoked_as_waku_cli(Some(r"C:\Users\me\.cache\waku\server\bin\waku.exe")));
+        assert!(!invoked_as_waku_cli(Some("waku-daemon")));
+        assert!(!invoked_as_waku_cli(Some("waku-daemon.exe")));
+        assert!(!invoked_as_waku_cli(Some("waku-debug-daemon")));
+        assert!(!invoked_as_waku_cli(None));
+    }
+
+    #[test]
+    fn parses_open_subcommand_arguments_and_resolves_relative_paths() {
+        assert_eq!(
+            parse_open_arguments(["--help".into()]).unwrap(),
+            OpenAction::Help
+        );
+        assert_eq!(
+            parse_open_arguments(["-h".into()]).unwrap(),
+            OpenAction::Help
+        );
+        assert_eq!(
+            parse_open_arguments(["--version".into()]).unwrap(),
+            OpenAction::Version
+        );
+        assert_eq!(
+            parse_open_arguments(["-V".into()]).unwrap(),
+            OpenAction::Version
+        );
+        assert_eq!(
+            parse_open_arguments([
+                "--state-dir".into(),
+                "/tmp/state".into(),
+                ".".into(),
+            ])
+            .unwrap(),
+            OpenAction::Open {
+                state_dir: Some(PathBuf::from("/tmp/state")),
+                path: Some(".".into()),
+            }
+        );
+        assert_eq!(
+            parse_open_arguments(["--state-dir=/tmp/state".into()]).unwrap(),
+            OpenAction::Open {
+                state_dir: Some(PathBuf::from("/tmp/state")),
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse_open_arguments(["--".into(), "-weird-dir".into()]).unwrap(),
+            OpenAction::Open {
+                state_dir: None,
+                path: Some("-weird-dir".into()),
+            }
+        );
+        assert!(parse_open_arguments(["--bogus".into()]).is_err());
+        assert!(parse_open_arguments(["a".into(), "b".into()]).is_err());
+
+        let cwd = Path::new(if cfg!(windows) { r"C:\work" } else { "/work" });
+        assert_eq!(
+            resolve_open_cli_path(".", Some(cwd)),
+            cwd.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_open_cli_path("sub/dir", Some(cwd)),
+            cwd.join("sub/dir").to_string_lossy()
+        );
+        assert_eq!(resolve_open_cli_path("~", Some(cwd)), "~");
+        assert_eq!(resolve_open_cli_path("~/proj", Some(cwd)), "~/proj");
     }
 }

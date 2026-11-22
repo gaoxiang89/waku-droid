@@ -1,5 +1,6 @@
 import {
   PROTOCOL_VERSION,
+  type ClientKind,
   type ClientMessage,
   type Command,
   type ReplayCursor,
@@ -31,6 +32,7 @@ export interface WakuClientOptions {
   address: string;
   token: string;
   clientId?: string;
+  clientKind?: ClientKind;
   requestTimeoutMs?: number;
   /** How long a handshake may take before the attempt fails as `timeout`. */
   connectTimeoutMs?: number;
@@ -100,6 +102,7 @@ export class WakuClient {
 
   private readonly address: string;
   private readonly token: string;
+  private readonly clientKind: ClientKind;
   private readonly requestTimeoutMs: number;
   private readonly connectTimeoutMs: number;
   private readonly socketFactory: (url: string) => WebSocketLike;
@@ -121,6 +124,7 @@ export class WakuClient {
   constructor(options: WakuClientOptions) {
     this.address = options.address;
     this.token = options.token;
+    this.clientKind = options.clientKind ?? "other";
     this.requestTimeoutMs = options.requestTimeoutMs ?? 120_000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.socketFactory =
@@ -213,6 +217,7 @@ export class WakuClient {
           token: this.token,
           clientId: this.clientId,
           resumeFrom: this.replayCursors(),
+          clientKind: this.clientKind,
         };
         socket.send(JSON.stringify(hello));
       });
@@ -445,6 +450,10 @@ export class WakuClient {
     }
     if (message.type === "taskStateChanged") {
       for (const listener of this.taskStateListeners) listener(message.revision);
+      return;
+    }
+    if (message.type === "openWorkspace") {
+      // Only native desktop clients handle workspace-open pushes.
       return;
     }
     if (message.type === "shuttingDown") {

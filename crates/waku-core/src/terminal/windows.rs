@@ -37,6 +37,16 @@ impl DaemonTerminal {
         rows: u16,
         events: EventSink,
     ) -> anyhow::Result<Self> {
+        Self::open_with_cli_bin_dir(cwd, cols, rows, events, None)
+    }
+
+    pub fn open_with_cli_bin_dir(
+        cwd: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        events: EventSink,
+        cli_bin_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             cwd.is_dir(),
             "terminal working directory does not exist: {}",
@@ -49,8 +59,20 @@ impl DaemonTerminal {
         let mut command = CommandBuilder::new(&shell);
         command.args(crate::command_env::default_terminal_shell_args(&shell));
         command.cwd(cwd);
+        let mut env_path: Option<std::ffi::OsString> = None;
         for (name, value) in crate::command_env::shell_environment() {
+            if name.to_string_lossy().eq_ignore_ascii_case("PATH") {
+                env_path = Some(value);
+                continue;
+            }
             command.env(name, value);
+        }
+        if let Some(cli_bin_dir) = cli_bin_dir {
+            let existing = env_path.or_else(|| std::env::var_os("PATH"));
+            let merged = super::prepend_path_dir(existing.as_deref(), cli_bin_dir);
+            command.env("PATH", merged);
+        } else if let Some(path) = env_path {
+            command.env("PATH", path);
         }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");

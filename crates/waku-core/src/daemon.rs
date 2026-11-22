@@ -75,6 +75,7 @@ pub struct WakuBackend {
     checkpoint_capture_locks: Mutex<HashMap<(PathBuf, Uuid, usize), Arc<Mutex<()>>>>,
     usage_rates_dir: std::path::PathBuf,
     default_cwd: std::path::PathBuf,
+    cli_bin_dir: Option<PathBuf>,
 }
 
 impl WakuBackend {
@@ -187,7 +188,15 @@ impl WakuBackend {
             checkpoint_capture_locks: Mutex::new(HashMap::new()),
             usage_rates_dir,
             default_cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cli_bin_dir: None,
         })
+    }
+
+    /// Optional directory containing the `waku` CLI shim, prepended to `PATH`
+    /// in daemon-owned PTYs (for bridge-managed remote daemons).
+    pub fn with_cli_bin_dir(mut self, cli_bin_dir: Option<PathBuf>) -> Self {
+        self.cli_bin_dir = cli_bin_dir;
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -225,16 +234,23 @@ impl WakuBackend {
     ) -> anyhow::Result<crate::terminal::DaemonTerminal> {
         #[cfg(all(test, unix))]
         if let Some(shell) = &self.terminal_shell {
-            return crate::terminal::DaemonTerminal::open_with_shell(
+            return crate::terminal::DaemonTerminal::open_with_shell_and_cli_bin_dir(
                 cwd,
                 cols,
                 rows,
                 events,
                 shell.clone(),
+                self.cli_bin_dir.as_deref(),
             );
         }
         ensure_shell_environment();
-        crate::terminal::DaemonTerminal::open(cwd, cols, rows, events)
+        crate::terminal::DaemonTerminal::open_with_cli_bin_dir(
+            cwd,
+            cols,
+            rows,
+            events,
+            self.cli_bin_dir.as_deref(),
+        )
     }
 
     /// Capture and persist one ending checkpoint exactly once per daemon.
@@ -847,6 +863,9 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Workspace {
                     result: crate::workspace::execute(operation)?,
                 })
+            }
+            Command::OpenWorkspace { .. } => {
+                bail!("openWorkspace must be handled by the daemon server hub")
             }
             Command::OpenTerminal { cwd, cols, rows } => {
                 anyhow::ensure!(
@@ -2387,6 +2406,7 @@ fn handle_driver_command(
         | Command::RewindSessionToMessage { .. }
         | Command::ForkProviderSession { .. }
         | Command::Workspace { .. }
+        | Command::OpenWorkspace { .. }
         | Command::OpenTerminal { .. }
         | Command::WriteTerminal { .. }
         | Command::ResizeTerminal { .. }

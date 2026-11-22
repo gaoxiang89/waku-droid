@@ -216,6 +216,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       const next = new WakuClient({
         address: profile.address,
         token,
+        clientKind: "mobile",
         randomUUID: Crypto.randomUUID,
         webSocketFactory:
           Platform.OS === "web" ? undefined : createNativeDaemonSocket,

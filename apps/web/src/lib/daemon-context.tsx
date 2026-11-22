@@ -64,6 +64,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       const next = new WakuClient({
         address: normalized.address,
         token: normalized.token,
+        clientKind: 'web',
       })
       setClient(next)
       try {

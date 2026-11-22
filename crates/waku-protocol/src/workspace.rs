@@ -72,6 +72,12 @@ pub enum WorkspaceOperation {
         #[ts(type = "string | null")]
         path: Option<PathBuf>,
     },
+    /// Resolve a user-supplied workspace path on the daemon host (expanding
+    /// leading `~`, resolving a file to its parent directory, canonicalizing,
+    /// and stripping any Windows verbatim prefix).
+    ResolvePath {
+        path: String,
+    },
     ReadTextFile {
         #[ts(type = "string")]
         root: PathBuf,
@@ -335,6 +341,9 @@ pub enum WorkspaceResult {
         #[ts(type = "string")]
         filesystem_root: PathBuf,
         entries: Vec<WorkingTreeEntry>,
+    },
+    ResolvedPath {
+        path: String,
     },
     TextFile {
         content: String,

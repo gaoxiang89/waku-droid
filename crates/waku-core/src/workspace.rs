@@ -95,6 +95,11 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
                 filesystem_root,
             }
         }
+        WorkspaceOperation::ResolvePath { path } => WorkspaceResult::ResolvedPath {
+            path: resolve_workspace_directory(&path)?
+                .to_string_lossy()
+                .into_owned(),
+        },
         WorkspaceOperation::ReadTextFile {
             root,
             relative_path,
@@ -1822,6 +1827,68 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }
+
+    #[test]
+    fn resolve_path_handles_directories_files_tilde_and_missing_paths() {
+        let root = std::env::temp_dir().join(format!("waku-resolve-path-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let file = root.join("nested").join("readme.md");
+        fs::write(&file, "hello").unwrap();
+
+        let expected_nested = strip_windows_verbatim(fs::canonicalize(root.join("nested")).unwrap())
+            .to_string_lossy()
+            .into_owned();
+
+        let WorkspaceResult::ResolvedPath { path: dir_resolved } =
+            execute(WorkspaceOperation::ResolvePath {
+                path: root.join("nested").to_string_lossy().into_owned(),
+            })
+            .unwrap()
+        else {
+            panic!("expected ResolvedPath");
+        };
+        assert_eq!(dir_resolved, expected_nested);
+        assert!(!dir_resolved.starts_with(r"\\?\"));
+
+        let WorkspaceResult::ResolvedPath {
+            path: file_resolved,
+        } = execute(WorkspaceOperation::ResolvePath {
+            path: file.to_string_lossy().into_owned(),
+        })
+        .unwrap()
+        else {
+            panic!("expected ResolvedPath");
+        };
+        assert_eq!(file_resolved, expected_nested);
+
+        if let Some(home) = dirs::home_dir() {
+            let expected_home = strip_windows_verbatim(fs::canonicalize(&home).unwrap())
+                .to_string_lossy()
+                .into_owned();
+            let WorkspaceResult::ResolvedPath {
+                path: tilde_resolved,
+            } = execute(WorkspaceOperation::ResolvePath { path: "~".into() }).unwrap()
+            else {
+                panic!("expected ResolvedPath");
+            };
+            assert_eq!(tilde_resolved, expected_home);
+        }
+
+        let missing = root.join("does-not-exist");
+        let missing_err = execute(WorkspaceOperation::ResolvePath {
+            path: missing.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+        assert!(
+            missing_err.to_string().contains("does not exist"),
+            "unexpected error: {missing_err}"
+        );
+        assert!(
+            execute(WorkspaceOperation::ResolvePath { path: "   ".into() }).is_err()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -1852,4 +1919,61 @@ fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
     } else {
         path
     }
+}
+
+/// Resolve a user-supplied workspace path on this daemon host:
+/// - expands a leading `~` or `~/` (`~\` on Windows) to the host's home dir;
+/// - checks that the path exists;
+/// - if it names a regular file, resolves to its parent directory;
+/// - canonicalizes and strips any Windows `\\?\` verbatim prefix.
+pub fn resolve_workspace_directory(raw: &str) -> anyhow::Result<PathBuf> {
+    if raw.trim().is_empty() {
+        bail!("workspace path must not be empty");
+    }
+    let expanded = expand_leading_tilde(raw)?;
+    let metadata = fs::metadata(&expanded).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow!("workspace path does not exist: {}", expanded.display())
+        } else {
+            anyhow!(
+                "could not access workspace path {}: {error}",
+                expanded.display()
+            )
+        }
+    })?;
+    let target = if metadata.is_dir() {
+        expanded
+    } else if metadata.is_file() {
+        expanded
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else {
+        bail!(
+            "workspace path is not a directory or file: {}",
+            expanded.display()
+        );
+    };
+    let canonical = fs::canonicalize(&target)
+        .with_context(|| format!("could not resolve workspace path: {}", target.display()))?;
+    Ok(strip_windows_verbatim(canonical))
+}
+
+fn expand_leading_tilde(raw: &str) -> anyhow::Result<PathBuf> {
+    if raw == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("home directory is unavailable"));
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory is unavailable"))?;
+        return Ok(home.join(rest));
+    }
+    #[cfg(windows)]
+    {
+        let bytes = raw.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return Ok(PathBuf::from(format!("{raw}\\")));
+        }
+    }
+    Ok(PathBuf::from(raw))
 }

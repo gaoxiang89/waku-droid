@@ -16,10 +16,13 @@ mod process;
 pub mod remote;
 mod workspace_client;
 
-pub use client::DaemonClient;
+pub use client::{
+    DaemonClient, DaemonRpcError, DaemonUnavailableError, OpenWorkspaceOutcome,
+    OpenWorkspaceRequest, request_open_workspace,
+};
 pub use process::{
     DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonProcess, DaemonSupervisor,
-    parse_allowed_origins,
+    parse_allowed_origins, resident_daemon_state_path,
 };
 pub use waku_protocol::*;
 pub use workspace_client::WorkspaceClient;

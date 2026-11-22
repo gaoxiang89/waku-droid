@@ -111,6 +111,7 @@ describe("WakuClient", () => {
       token: "secret",
       clientId: "00000000-0000-4000-8000-000000000001",
       resumeFrom: [],
+      clientKind: "other",
     });
     socket.receive({ type: "hello", protocolVersion: PROTOCOL_VERSION, daemonVersion: "test" });
     await connected;
@@ -264,6 +265,26 @@ describe("WakuClient", () => {
 
     socket.receive({ type: "taskStateChanged", revision: 7 });
     expect(revisions).toEqual([7]);
+  });
+
+  test("sends configured clientKind and gracefully ignores openWorkspace pushes", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new WakuClient({
+      address: "127.0.0.1:4312",
+      token: "secret",
+      clientKind: "web",
+      randomUUID: () => "00000000-0000-4000-8000-000000000001",
+      webSocketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    const socket = await connect(client, sockets);
+    expect(JSON.parse(socket.sent[0]!).clientKind).toBe("web");
+
+    socket.receive({ type: "openWorkspace", path: "/tmp/proj", host: null });
+    expect(client.connected).toBe(true);
   });
 
   test("disconnected requests reject instead of throwing synchronously", async () => {

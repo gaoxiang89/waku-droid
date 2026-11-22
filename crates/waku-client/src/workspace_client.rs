@@ -62,4 +62,14 @@ impl WorkspaceClient {
             _ => anyhow::bail!("Waku daemon returned an invalid provider-fork response"),
         }
     }
+
+    /// Resolve a user-supplied workspace path on the daemon host (expanding
+    /// leading `~`, resolving a file to its parent directory, canonicalizing,
+    /// and stripping any Windows verbatim prefix).
+    pub fn resolve_path(&self, path: impl Into<String>) -> anyhow::Result<String> {
+        match self.request(WorkspaceOperation::ResolvePath { path: path.into() })? {
+            WorkspaceResult::ResolvedPath { path } => Ok(path),
+            _ => anyhow::bail!("Waku daemon returned an invalid path-resolution response"),
+        }
+    }
 }
