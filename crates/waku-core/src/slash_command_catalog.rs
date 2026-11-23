@@ -33,7 +33,7 @@ pub(crate) fn discover(
 ) -> Option<Vec<SlashCommand>> {
     match provider {
         ProviderKind::Amp => discover_amp(binary, project_root),
-        ProviderKind::Antigravity => discover_antigravity(binary, project_root),
+        ProviderKind::Antigravity => discover_antigravity(binary, project_root, config_dir),
         ProviderKind::Claude => discover_claude(binary, project_root, config_dir),
         ProviderKind::Codex => discover_codex(binary, project_root, config_dir),
         ProviderKind::OpenCode => discover_opencode(binary, project_root),
@@ -52,9 +52,14 @@ pub(crate) fn discover(
     }
 }
 
-fn discover_antigravity(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
-    let acp_commands = crate::model_catalog::discover_antigravity_acp_commands(binary);
-    let skills = discover_antigravity_skills(binary, project_root);
+fn discover_antigravity(
+    binary: &Path,
+    project_root: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
+    let acp_commands =
+        crate::model_catalog::discover_antigravity_acp_commands_in(binary, config_dir);
+    let skills = discover_antigravity_skills(binary, project_root, config_dir);
     let bridged = antigravity_bridged_cli_commands();
     let merged = merge_antigravity_catalog(
         acp_commands.unwrap_or_default(),
@@ -64,11 +69,17 @@ fn discover_antigravity(binary: &Path, project_root: &Path) -> Option<Vec<SlashC
     (!merged.is_empty()).then_some(merged)
 }
 
-fn discover_antigravity_skills(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
-    let value = capture_json(
+fn discover_antigravity_skills(
+    binary: &Path,
+    project_root: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
+    let value = capture_json_in(
         binary,
         &["-p", "/skills", "--output-format", "json"],
         project_root,
+        Some(ProviderKind::Antigravity),
+        config_dir,
     )?;
     Some(parse_antigravity_skills(&value))
 }
@@ -592,14 +603,43 @@ fn command(
     })
 }
 
-fn capture_json(binary: &Path, args: &[&str], cwd: &Path) -> Option<Value> {
+fn build_capture_command(
+    binary: &Path,
+    args: &[&str],
+    cwd: &Path,
+    provider: Option<ProviderKind>,
+    config_dir: Option<&Path>,
+) -> Command {
     let mut command = crate::command_env::command(binary);
+    if let Some(provider) = provider {
+        crate::command_env::apply_provider_config_dir(&mut command, provider, config_dir);
+        if provider == ProviderKind::Antigravity
+            && let Some(settings_path) = crate::command_env::antigravity_settings_arg(config_dir)
+        {
+            command.arg("--settings").arg(settings_path);
+        }
+    }
     command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    command
+}
+
+fn capture_json(binary: &Path, args: &[&str], cwd: &Path) -> Option<Value> {
+    capture_json_in(binary, args, cwd, None, None)
+}
+
+fn capture_json_in(
+    binary: &Path,
+    args: &[&str],
+    cwd: &Path,
+    provider: Option<ProviderKind>,
+    config_dir: Option<&Path>,
+) -> Option<Value> {
+    let mut command = build_capture_command(binary, args, cwd, provider, config_dir);
     isolate_process_group(&mut command);
     let mut child = crate::command_env::spawn(&mut command).ok()?;
     #[cfg(windows)]
@@ -1032,6 +1072,60 @@ mod tests {
                 && command.template.is_none()
                 && !command.description.is_empty()
         }));
+    }
+
+    #[test]
+    fn antigravity_capture_command_injects_settings_before_prompt_and_account_env() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-agy-skills-cmd-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+        std::fs::write(&settings_path, "{}").unwrap();
+        std::fs::write(dir.join(".env"), "GEMINI_API_KEY=test-key\n").unwrap();
+
+        let command = build_capture_command(
+            Path::new("agy"),
+            &["-p", "/skills", "--output-format", "json"],
+            &dir,
+            Some(ProviderKind::Antigravity),
+            Some(&dir),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--settings".to_owned(),
+                settings_path.to_string_lossy().into_owned(),
+                "-p".to_owned(),
+                "/skills".to_owned(),
+                "--output-format".to_owned(),
+                "json".to_owned(),
+            ]
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "GEMINI_API_KEY" && value.and_then(|v| v.to_str()) == Some("test-key")
+        }));
+
+        // Non-Antigravity callers without config_dir keep args unchanged.
+        let plain = build_capture_command(
+            Path::new("amp"),
+            &["skill", "list", "--json"],
+            &dir,
+            None,
+            None,
+        );
+        let plain_args: Vec<_> = plain
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(plain_args, vec!["skill", "list", "--json"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

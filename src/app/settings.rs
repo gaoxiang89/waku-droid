@@ -2865,8 +2865,9 @@ impl Waku {
 
         let default_hint = default_account_hint_path(kind, home, local);
         let matches_default = if local {
-            default_provider_config_dir(kind, home)
-                .is_some_and(|default_dir| account_config_dir_key(&default_dir, local) == candidate_key)
+            default_provider_config_dir(kind, home).is_some_and(|default_dir| {
+                account_config_dir_key(&default_dir, local) == candidate_key
+            })
         } else {
             account_config_dir_key(Path::new(&default_hint), local) == candidate_key
         };
@@ -2889,7 +2890,8 @@ impl Waku {
             .any(|existing| {
                 existing.provider == kind
                     && editing_id != Some(existing.id.as_str())
-                    && account_config_dir_key(Path::new(&existing.config_dir), local) == candidate_key
+                    && account_config_dir_key(Path::new(&existing.config_dir), local)
+                        == candidate_key
             });
         if duplicate {
             self.account_form_error = Some(tr!(
@@ -3312,14 +3314,19 @@ impl Waku {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.revoke_computer_app(&click_key, cx);
                                 }))
-                                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                                    if !event.keystroke.modifiers.modified()
-                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
-                                    {
-                                        this.revoke_computer_app(&key_key, cx);
-                                        cx.stop_propagation();
-                                    }
-                                })),
+                                .on_key_down(cx.listener(
+                                    move |this, event: &KeyDownEvent, _, cx| {
+                                        if !event.keystroke.modifiers.modified()
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            this.revoke_computer_app(&key_key, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                )),
                         ),
                 );
             }
@@ -3453,17 +3460,19 @@ impl Waku {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.request_computer_permissions(false, cx);
                                     }))
-                                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                        if !event.keystroke.modifiers.modified()
-                                            && matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            )
-                                        {
-                                            this.request_computer_permissions(false, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    })),
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, _, cx| {
+                                            if !event.keystroke.modifiers.modified()
+                                                && matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                )
+                                            {
+                                                this.request_computer_permissions(false, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    )),
                             ),
                         ),
                 )
@@ -3825,6 +3834,7 @@ fn abbreviate_home_path(path: &Path, home: Option<&Path>) -> String {
 
 fn default_account_example_dir(kind: ProviderKind) -> &'static str {
     match kind {
+        ProviderKind::Antigravity => "~/.gemini/antigravity-work",
         ProviderKind::Claude => "~/.claude-work",
         ProviderKind::Codex => "~/.codex-work",
         _ => "~/.config-work",
@@ -3833,6 +3843,7 @@ fn default_account_example_dir(kind: ProviderKind) -> &'static str {
 
 fn default_account_tilde_dir(kind: ProviderKind) -> &'static str {
     match kind {
+        ProviderKind::Antigravity => "~/.gemini/antigravity-cli",
         ProviderKind::Claude => "~/.claude",
         ProviderKind::Codex => "~/.codex",
         _ => "~",
@@ -3842,6 +3853,7 @@ fn default_account_tilde_dir(kind: ProviderKind) -> &'static str {
 fn default_provider_config_dir(kind: ProviderKind, home: Option<&Path>) -> Option<PathBuf> {
     let home = home?;
     match kind {
+        ProviderKind::Antigravity => Some(home.join(".gemini").join("antigravity-cli")),
         ProviderKind::Claude => Some(home.join(".claude")),
         ProviderKind::Codex => Some(home.join(".codex")),
         _ => None,
@@ -3895,6 +3907,9 @@ fn format_account_login_command(
         quote_posix_shell_arg(trimmed)
     };
     match (kind, windows_shell) {
+        (ProviderKind::Antigravity, _) => {
+            format!("agy acp --gemini-dir {quoted} --app-data-dir . --login")
+        }
         (ProviderKind::Claude, true) => {
             format!("$env:CLAUDE_CONFIG_DIR={quoted}; claude auth login")
         }
@@ -4035,7 +4050,8 @@ fn permission_status_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderKind, abbreviate_home_path, format_account_login_command, next_host_tab_index,
+        ProviderKind, abbreviate_home_path, default_account_example_dir, default_account_tilde_dir,
+        default_provider_config_dir, format_account_login_command, next_host_tab_index,
         normalized_config_dir_key,
     };
     use std::path::Path;
@@ -4123,6 +4139,60 @@ mod tests {
                 true
             ),
             r#"$env:CODEX_HOME='C:\Users\My ''Work''\$dir;echo hi'; codex login"#
+        );
+    }
+
+    #[test]
+    fn antigravity_account_defaults_and_login_commands_match_cli_layout() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            default_account_example_dir(ProviderKind::Antigravity),
+            "~/.gemini/antigravity-work"
+        );
+        assert_eq!(
+            default_account_tilde_dir(ProviderKind::Antigravity),
+            "~/.gemini/antigravity-cli"
+        );
+        assert_eq!(
+            default_provider_config_dir(ProviderKind::Antigravity, Some(home)),
+            Some(home.join(".gemini").join("antigravity-cli"))
+        );
+        assert_eq!(
+            default_provider_config_dir(ProviderKind::Antigravity, None),
+            None
+        );
+
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Antigravity,
+                "~/.gemini/antigravity-work",
+                false
+            ),
+            "agy acp --gemini-dir ~/'.gemini/antigravity-work' --app-data-dir . --login"
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Antigravity,
+                "/home/alice/.gemini/agy work",
+                false
+            ),
+            "agy acp --gemini-dir '/home/alice/.gemini/agy work' --app-data-dir . --login"
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Antigravity,
+                r"C:\Users\My Name\.gemini\agy-work",
+                true
+            ),
+            r"agy acp --gemini-dir 'C:\Users\My Name\.gemini\agy-work' --app-data-dir . --login"
+        );
+        assert_eq!(
+            format_account_login_command(
+                ProviderKind::Antigravity,
+                r#"C:\Users\O'Brien\.gemini\agy-work"#,
+                true
+            ),
+            r"agy acp --gemini-dir 'C:\Users\O''Brien\.gemini\agy-work' --app-data-dir . --login"
         );
     }
 

@@ -1,9 +1,9 @@
 //! Historical token and cost usage for the settings Usage page, scanned from
 //! the provider CLIs' own on-disk session transcripts (Claude Code's
-//! `~/.claude/projects` and Codex's `~/.codex/sessions`) the way T3 Code and
-//! `ccusage` do it, so usage covers turns driven outside Waku too. Costs are
-//! priced against LiteLLM's model rate table, fetched at most daily and cached
-//! beside the app database.
+//! `~/.claude/projects`, Codex's `~/.codex/sessions`, and Antigravity's
+//! `~/.gemini/antigravity*/brain`) the way T3 Code and `ccusage` do it, so usage
+//! covers turns driven outside Waku too. Costs are priced against LiteLLM's
+//! model rate table, fetched at most daily and cached beside the app database.
 //!
 //! Everything here blocks on the filesystem and (for the rate table) the
 //! network, and must run on the background executor. Render reads only the
@@ -61,6 +61,9 @@ fn might_carry_usage(line: &str, provider: UsageProvider) -> bool {
     match provider {
         UsageProvider::Claude => line.contains("\"usage\""),
         UsageProvider::Codex => line.contains("\"token_count\""),
+        UsageProvider::Antigravity => {
+            line.contains("\"input_tokens\"") || line.contains("\"output_tokens\"")
+        }
     }
 }
 
@@ -137,6 +140,65 @@ fn parse_claude_line(line: &str) -> Option<UsageRecord> {
             .get("costUSD")
             .and_then(Value::as_f64)
             .filter(|cost| cost.is_finite()),
+        dedupe_key,
+    })
+}
+
+/// Parses one line of an Antigravity `transcript.jsonl` log.
+///
+/// Only `PLANNER_RESPONSE` entries with non-zero token counts represent billed
+/// model turns. Unlike Codex, Antigravity reports `input_tokens` and
+/// `cache_read_tokens` as disjoint counts.
+fn parse_antigravity_line(line: &str, session_id: &str, project: &str) -> Option<UsageRecord> {
+    let record: Value = serde_json::from_str(line).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    let uncached_input = int(record.get("input_tokens"));
+    let cached_input = int(record.get("cache_read_tokens"));
+    let output = int(record.get("output_tokens"));
+    if uncached_input == 0 && cached_input == 0 && output == 0 {
+        return None;
+    }
+    let timestamp_ms = parse_timestamp_ms(record.get("created_at"))?;
+    let model = record
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("unknown");
+    let step_index = record.get("step_index").and_then(|value| {
+        value
+            .as_u64()
+            .map(|index| index.to_string())
+            .or_else(|| {
+                value
+                    .as_i64()
+                    .filter(|index| *index >= 0)
+                    .map(|index| index.to_string())
+            })
+            .or_else(|| {
+                value
+                    .as_str()
+                    .filter(|index| !index.is_empty())
+                    .map(str::to_owned)
+            })
+    });
+    let dedupe_key = step_index.map(|step| format!("{session_id}:{step}"));
+
+    Some(UsageRecord {
+        provider: UsageProvider::Antigravity,
+        timestamp_ms,
+        model: model.to_owned(),
+        session_id: session_id.to_owned(),
+        project: project.to_owned(),
+        totals: TokenTotals {
+            uncached_input,
+            cached_input,
+            cache_creation: 0,
+            output,
+            reasoning: 0,
+        },
+        reported_cost_usd: None,
         dedupe_key,
     })
 }
@@ -409,12 +471,30 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+/// Antigravity encodes reasoning effort on the model id (`gemini-3.8-flash-low`)
+/// while LiteLLM indexes the base model name. Longest suffixes come first so
+/// `-xhigh` is never misread as `-high`.
+const EFFORT_SUFFIXES: [&str; 5] = ["-xhigh", "-medium", "-high", "-low", "-max"];
+
 fn lookup_rate<'a>(table: &'a RateTable, model: &str) -> Option<&'a ModelRate> {
     let normalized = normalize_model_name(model);
     if normalized.is_empty() || UNPRICEABLE_MODELS.contains(&normalized.as_str()) {
         return None;
     }
-    table.rates.get(&normalized)
+    if let Some(rate) = table.rates.get(&normalized) {
+        return Some(rate);
+    }
+    for suffix in EFFORT_SUFFIXES {
+        if let Some(base) = normalized.strip_suffix(suffix) {
+            if !base.is_empty() && !UNPRICEABLE_MODELS.contains(&base) {
+                if let Some(rate) = table.rates.get(base) {
+                    return Some(rate);
+                }
+            }
+            break;
+        }
+    }
+    None
 }
 
 /// Projects the LiteLLM document into a rate table. Entries without both an
@@ -558,25 +638,84 @@ pub struct FileCacheEntry {
 
 pub type ScanCache = HashMap<PathBuf, FileCacheEntry>;
 
-/// The transcript root scanned for one provider.
-fn provider_root(provider: UsageProvider) -> Option<PathBuf> {
+const ANTIGRAVITY_DATA_ROOTS: [&str; 3] = [
+    ".gemini/antigravity-cli",
+    ".gemini/antigravity-acp",
+    ".gemini/antigravity",
+];
+
+fn antigravity_brain_roots_from(
+    exec_data_dir: Option<&std::ffi::OsStr>,
+    home_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_data_root = |data_root: PathBuf| {
+        let brain = data_root.join("brain");
+        if !roots.contains(&brain) {
+            roots.push(brain);
+        }
+    };
+    if let Some(exec_dir) = exec_data_dir.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(exec_dir);
+        let data_root = if path.file_name().and_then(|name| name.to_str()) == Some("sidecar_data") {
+            path.parent().map(Path::to_path_buf)
+        } else {
+            Some(path)
+        };
+        if let Some(root) = data_root {
+            push_data_root(root);
+        }
+    }
+    if let Some(home) = home_dir {
+        for relative in ANTIGRAVITY_DATA_ROOTS {
+            push_data_root(home.join(relative));
+        }
+    }
+    roots
+}
+
+/// Candidate transcript roots scanned for one provider, in priority order.
+fn provider_roots(provider: UsageProvider) -> Vec<PathBuf> {
     match provider {
         UsageProvider::Claude => match crate::command_env::env_var_os("CLAUDE_CONFIG_DIR") {
-            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("projects")),
-            _ => dirs::home_dir().map(|home| home.join(".claude/projects")),
+            Some(dir) if !dir.is_empty() => vec![PathBuf::from(dir).join("projects")],
+            _ => dirs::home_dir()
+                .into_iter()
+                .map(|home| home.join(".claude/projects"))
+                .collect(),
         },
         UsageProvider::Codex => match crate::command_env::env_var_os("CODEX_HOME") {
-            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("sessions")),
-            _ => dirs::home_dir().map(|home| home.join(".codex/sessions")),
+            Some(dir) if !dir.is_empty() => vec![PathBuf::from(dir).join("sessions")],
+            _ => dirs::home_dir()
+                .into_iter()
+                .map(|home| home.join(".codex/sessions"))
+                .collect(),
         },
+        UsageProvider::Antigravity => {
+            let exec_data_dir = crate::command_env::env_var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR");
+            let home = dirs::home_dir();
+            antigravity_brain_roots_from(exec_data_dir.as_deref(), home.as_deref())
+        }
     }
 }
 
-/// Lists `.jsonl` transcripts under `root` modified at or after `since_ms`.
+/// Lists transcripts under `root` modified at or after `since_ms`.
 /// Errors on individual entries are swallowed: session files rotate and get
 /// removed while the walk is in flight, and a partial listing beats failing
 /// the page. Returns the number of files skipped by the mtime prefilter.
 fn list_transcript_files(
+    root: &Path,
+    provider: UsageProvider,
+    since_ms: i64,
+    found: &mut Vec<(PathBuf, u64, i64)>,
+) -> usize {
+    if provider == UsageProvider::Antigravity {
+        return list_antigravity_transcript_files(root, since_ms, found);
+    }
+    list_recursive_jsonl_files(root, since_ms, found)
+}
+
+fn list_recursive_jsonl_files(
     root: &Path,
     since_ms: i64,
     found: &mut Vec<(PathBuf, u64, i64)>,
@@ -591,7 +730,7 @@ fn list_transcript_files(
             continue;
         };
         if file_type.is_dir() {
-            skipped += list_transcript_files(&path, since_ms, found);
+            skipped += list_recursive_jsonl_files(&path, since_ms, found);
             continue;
         }
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
@@ -615,12 +754,221 @@ fn list_transcript_files(
     skipped
 }
 
+/// Antigravity stores both `transcript.jsonl` and `transcript_full.jsonl`
+/// under `<brain_root>/<conv_id>/.system_generated/logs/`; only the compact
+/// `transcript.jsonl` is scanned so steps are never double-counted.
+fn list_antigravity_transcript_files(
+    brain_root: &Path,
+    since_ms: i64,
+    found: &mut Vec<(PathBuf, u64, i64)>,
+) -> usize {
+    let mut skipped = 0;
+    let Ok(entries) = std::fs::read_dir(brain_root) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry
+            .path()
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+        if mtime_ms < since_ms {
+            skipped += 1;
+            continue;
+        }
+        found.push((path, metadata.len(), mtime_ms));
+    }
+    skipped
+}
+
+fn antigravity_conversation_id(transcript_path: &Path) -> Option<String> {
+    transcript_path
+        .parent()?
+        .parent()?
+        .parent()?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn normalize_workspace_path_string(mut text: String) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_lowercase() && bytes[1] == b':' {
+        let upper = (bytes[0] as char).to_ascii_uppercase();
+        let mut normalized = String::with_capacity(text.len());
+        normalized.push(upper);
+        normalized.push_str(&text[1..]);
+        text = normalized;
+    }
+    text
+}
+
+fn antigravity_uri_to_workspace_path(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    let path = parsed.to_file_path().ok()?;
+    let text = normalize_workspace_path_string(path.to_string_lossy().into_owned());
+    (!text.is_empty()).then_some(text)
+}
+
+fn antigravity_workspace_from_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("file://") {
+        return antigravity_uri_to_workspace_path(trimmed);
+    }
+    Some(normalize_workspace_path_string(trimmed.to_owned()))
+}
+
+/// Loads `conversation_id -> workspace_path` once per Antigravity brain root,
+/// preferring `<brain_root>/../conversation_summaries.db` and falling back to
+/// `<brain_root>/../history.jsonl` for unmapped conversations.
+fn load_antigravity_workspace_map(brain_root: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(data_root) = brain_root.parent() else {
+        return map;
+    };
+
+    let db_path = data_root.join("conversation_summaries.db");
+    if db_path.is_file()
+        && let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    {
+        let _ = conn.busy_timeout(Duration::from_millis(100));
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT conversation_id, workspace_uris FROM conversation_summaries WHERE workspace_uris != ''",
+        ) && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                let (conv_id, uris_json) = row;
+                if conv_id.is_empty() {
+                    continue;
+                }
+                let Ok(uris) = serde_json::from_str::<Vec<String>>(&uris_json) else {
+                    continue;
+                };
+                if let Some(workspace) = uris
+                    .iter()
+                    .find_map(|uri| antigravity_uri_to_workspace_path(uri))
+                {
+                    map.entry(conv_id).or_insert(workspace);
+                }
+            }
+        }
+    }
+
+    let history_path = data_root.join("history.jsonl");
+    if let Ok(file) = std::fs::File::open(&history_path) {
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if !line.contains("conversationId") || !line.contains("workspace") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(conv_id) = value
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            if map.contains_key(conv_id) {
+                continue;
+            }
+            if let Some(workspace) = value
+                .get("workspace")
+                .and_then(Value::as_str)
+                .and_then(antigravity_workspace_from_value)
+            {
+                map.insert(conv_id.to_owned(), workspace);
+            }
+        }
+    }
+
+    map
+}
+
+/// Streams one Antigravity `transcript.jsonl` and returns its deduplicated
+/// usage records, or `None` on read error.
+fn read_antigravity_records(
+    path: &Path,
+    session_id: &str,
+    project: &str,
+) -> Option<Vec<UsageRecord>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut records = Vec::new();
+    let mut seen_in_file = HashSet::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        if !might_carry_usage(&line, UsageProvider::Antigravity) {
+            continue;
+        }
+        if let Some(record) = parse_antigravity_line(&line, session_id, project) {
+            if let Some(key) = &record.dedupe_key
+                && !seen_in_file.insert(key.clone())
+            {
+                continue;
+            }
+            records.push(record);
+        }
+    }
+    Some(records)
+}
+
 /// Streams one transcript and returns the usage records it contains, already
 /// de-duplicated within the file, or `None` when it could not be read. The
 /// distinction matters to the cache: an empty transcript is a stable fact
 /// worth memoising, while a transient read failure memoised under the same
 /// `(size, mtime)` would silently drop the file's usage until it changes.
 fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<UsageRecord>> {
+    if provider == UsageProvider::Antigravity {
+        let session_id = antigravity_conversation_id(path).unwrap_or_default();
+        return read_antigravity_records(path, &session_id, "");
+    }
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
     let mut line = String::new();
@@ -667,6 +1015,7 @@ fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<U
                     records.push(record);
                 }
             }
+            UsageProvider::Antigravity => unreachable!("handled above"),
         }
     }
     Some(records)
@@ -698,7 +1047,7 @@ struct Bucket {
 struct ProjectAccumulator {
     cost_usd: f64,
     total_tokens: u64,
-    by_provider: [ProviderDay; 2],
+    by_provider: [ProviderDay; 3],
     sessions: HashSet<(UsageProvider, String)>,
     /// Cost per model, for the row's "top models" caption.
     models: HashMap<String, f64>,
@@ -832,6 +1181,7 @@ fn account_transcript_root(provider: UsageProvider, config_dir: &Path) -> PathBu
     match provider {
         UsageProvider::Claude => config_dir.join("projects"),
         UsageProvider::Codex => config_dir.join("sessions"),
+        UsageProvider::Antigravity => config_dir.join("brain"),
     }
 }
 
@@ -895,9 +1245,11 @@ pub fn scan_with_account_dirs(
     let mut skipped_files = 0;
     let mut errors = Vec::new();
 
-    let default_roots = UsageProvider::ALL
-        .into_iter()
-        .filter_map(|provider| provider_root(provider).map(|root| (provider, root)));
+    let default_roots = UsageProvider::ALL.into_iter().flat_map(|provider| {
+        provider_roots(provider)
+            .into_iter()
+            .map(move |root| (provider, root))
+    });
     let roots_to_scan = collect_scan_roots(default_roots, account_dirs);
 
     for (provider, root) in roots_to_scan {
@@ -906,7 +1258,7 @@ pub fn scan_with_account_dirs(
             continue;
         }
         let mut files = Vec::new();
-        skipped_files += list_transcript_files(&root, mtime_cutoff_ms, &mut files);
+        skipped_files += list_transcript_files(&root, provider, mtime_cutoff_ms, &mut files);
         if files.is_empty() && std::fs::read_dir(&root).is_err() {
             errors.push(format!(
                 "{} transcripts at {} could not be read.",
@@ -915,41 +1267,69 @@ pub fn scan_with_account_dirs(
             ));
             continue;
         }
+        let workspace_map = if provider == UsageProvider::Antigravity && !files.is_empty() {
+            load_antigravity_workspace_map(&root)
+        } else {
+            HashMap::new()
+        };
         for (path, size, mtime_ms) in files {
             scanned_files += 1;
-            let cached = cache.get(&path);
+            let (antigravity_session_id, antigravity_project) =
+                if provider == UsageProvider::Antigravity {
+                    let conv_id = antigravity_conversation_id(&path).unwrap_or_default();
+                    let project = workspace_map.get(&conv_id).cloned().unwrap_or_default();
+                    (conv_id, project)
+                } else {
+                    (String::new(), String::new())
+                };
             // Provider is part of the identity: if both providers were ever
             // pointed at one directory, a hit parsed by the other parser must
             // not be reused.
-            let records = match cached {
-                Some(entry)
-                    if entry.size == size
-                        && entry.mtime_ms == mtime_ms
-                        && entry.provider == provider =>
+            let cache_hit = cache.get(&path).is_some_and(|entry| {
+                entry.size == size && entry.mtime_ms == mtime_ms && entry.provider == provider
+            });
+            if cache_hit {
+                if provider == UsageProvider::Antigravity
+                    && !antigravity_project.is_empty()
+                    && let Some(entry) = cache.get_mut(&path)
                 {
-                    &entry.records
-                }
-                _ => match read_transcript_records(&path, provider) {
-                    Some(records) => {
-                        &cache
-                            .entry(path)
-                            .insert_entry(FileCacheEntry {
-                                size,
-                                mtime_ms,
-                                provider,
-                                records,
-                            })
-                            .into_mut()
-                            .records
+                    for record in &mut entry.records {
+                        if record.project.is_empty() {
+                            record.project = antigravity_project.clone();
+                        }
                     }
-                    // A read failure is not an empty transcript: caching it
-                    // under this (size, mtime) would silently drop the file's
-                    // usage until it changes.
-                    None => continue,
-                },
-            };
-            for record in records {
-                aggregator.add(record, rates);
+                }
+            } else {
+                let parsed = match provider {
+                    UsageProvider::Antigravity => read_antigravity_records(
+                        &path,
+                        &antigravity_session_id,
+                        &antigravity_project,
+                    ),
+                    UsageProvider::Claude | UsageProvider::Codex => {
+                        read_transcript_records(&path, provider)
+                    }
+                };
+                // A read failure is not an empty transcript: caching it
+                // under this (size, mtime) would silently drop the file's
+                // usage until it changes.
+                let Some(records) = parsed else {
+                    continue;
+                };
+                cache.insert(
+                    path.clone(),
+                    FileCacheEntry {
+                        size,
+                        mtime_ms,
+                        provider,
+                        records,
+                    },
+                );
+            }
+            if let Some(entry) = cache.get(&path) {
+                for record in &entry.records {
+                    aggregator.add(record, rates);
+                }
             }
         }
     }
@@ -1011,7 +1391,7 @@ fn derive_history(
             day: *day,
             cost_usd: 0.0,
             total_tokens: 0,
-            by_provider: [ProviderDay::default(); 2],
+            by_provider: [ProviderDay::default(); 3],
         });
         day_entry.cost_usd += bucket.cost_usd;
         day_entry.total_tokens += tokens;
@@ -1071,7 +1451,7 @@ fn derive_history(
                 first_day: first_of_month(day.day),
                 cost_usd: 0.0,
                 total_tokens: 0,
-                by_provider: [ProviderDay::default(); 2],
+                by_provider: [ProviderDay::default(); 3],
                 sessions: 0,
                 active_days: 0,
                 top_models: Vec::new(),
@@ -1746,10 +2126,8 @@ mod tests {
 
     #[test]
     fn collect_scan_roots_deduplicates_canonical_account_and_default_roots() {
-        let base = std::env::temp_dir().join(format!(
-            "waku-usage-roots-dedup-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("waku-usage-roots-dedup-{}", uuid::Uuid::new_v4()));
         let claude_default = base.join("claude-default");
         let claude_work = base.join("claude-work");
         let codex_work = base.join("codex-work");
@@ -1778,19 +2156,26 @@ mod tests {
 
         let roots = collect_scan_roots(default_roots, &account_dirs);
         assert_eq!(roots.len(), 3);
-        assert_eq!(roots[0], (UsageProvider::Claude, claude_default.join("projects")));
-        assert_eq!(roots[1], (UsageProvider::Claude, claude_work.join("projects")));
-        assert_eq!(roots[2], (UsageProvider::Codex, codex_work.join("sessions")));
+        assert_eq!(
+            roots[0],
+            (UsageProvider::Claude, claude_default.join("projects"))
+        );
+        assert_eq!(
+            roots[1],
+            (UsageProvider::Claude, claude_work.join("projects"))
+        );
+        assert_eq!(
+            roots[2],
+            (UsageProvider::Codex, codex_work.join("sessions"))
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn scan_with_account_dirs_scans_multiple_dirs_and_deduplicates_canonical_roots() {
-        let base = std::env::temp_dir().join(format!(
-            "waku-usage-multi-dir-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("waku-usage-multi-dir-{}", uuid::Uuid::new_v4()));
         let project_root = base.join("repo");
         let project_sub = project_root.join("crates/core");
         let claude_dir_a = base.join("claude-a");
@@ -1922,9 +2307,18 @@ mod tests {
                 .find(|slice| slice.provider == provider && slice.model == model)
                 .map(|slice| slice.total_tokens)
         };
-        assert_eq!(model_tokens(UsageProvider::Claude, &claude_model_a), Some(1_250));
-        assert_eq!(model_tokens(UsageProvider::Claude, &claude_model_b), Some(2_500));
-        assert_eq!(model_tokens(UsageProvider::Codex, &codex_model), Some(3_400));
+        assert_eq!(
+            model_tokens(UsageProvider::Claude, &claude_model_a),
+            Some(1_250)
+        );
+        assert_eq!(
+            model_tokens(UsageProvider::Claude, &claude_model_b),
+            Some(2_500)
+        );
+        assert_eq!(
+            model_tokens(UsageProvider::Codex, &codex_model),
+            Some(3_400)
+        );
 
         let project_key = project_root.display().to_string();
         let project = history
@@ -1959,6 +2353,323 @@ mod tests {
             .expect("warm rescan keeps synthetic project totals");
         assert_eq!(rescanned_project.total_tokens, project.total_tokens);
         assert_eq!(rescanned_project.sessions, project.sessions);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn antigravity_lines_parse_disjoint_tokens_and_step_dedupe_key() {
+        let line = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-23T07:31:48Z","model":"gemini-3.8-flash-low","input_tokens":8591,"cache_read_tokens":1200,"output_tokens":217}"#;
+        let record =
+            parse_antigravity_line(line, "conv-123", "/Users/me/repo").expect("line has usage");
+        assert_eq!(record.provider, UsageProvider::Antigravity);
+        assert_eq!(record.model, "gemini-3.8-flash-low");
+        assert_eq!(record.session_id, "conv-123");
+        assert_eq!(record.project, "/Users/me/repo");
+        assert_eq!(record.dedupe_key.as_deref(), Some("conv-123:1"));
+        assert_eq!(record.reported_cost_usd, None);
+        assert_eq!(record.totals.uncached_input, 8591);
+        assert_eq!(record.totals.cached_input, 1200);
+        assert_eq!(record.totals.cache_creation, 0);
+        assert_eq!(record.totals.output, 217);
+        assert_eq!(record.totals.reasoning, 0);
+        assert_eq!(record.totals.total(), 8591 + 1200 + 217);
+
+        let missing_model = r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-23T07:32:00Z","input_tokens":10,"output_tokens":5}"#;
+        let fallback = parse_antigravity_line(missing_model, "conv-123", "").unwrap();
+        assert_eq!(fallback.model, "unknown");
+        assert_eq!(fallback.dedupe_key.as_deref(), Some("conv-123:2"));
+
+        assert!(
+            parse_antigravity_line(
+                r#"{"step_index":3,"type":"USER_INPUT","created_at":"2026-11-23T07:32:00Z","input_tokens":10,"output_tokens":5}"#,
+                "conv-123",
+                "",
+            )
+            .is_none()
+        );
+        assert!(
+            parse_antigravity_line(
+                r#"{"step_index":4,"type":"PLANNER_RESPONSE","created_at":"2026-11-23T07:32:00Z","input_tokens":0,"cache_read_tokens":0,"output_tokens":0}"#,
+                "conv-123",
+                "",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn antigravity_rate_lookup_strips_one_effort_suffix() {
+        let base_rate = ModelRate {
+            input: 1e-6,
+            output: 2e-6,
+            cache_read: 2.5e-7,
+            cache_creation: 1e-6,
+        };
+        let max_override = ModelRate {
+            input: 5e-6,
+            output: 10e-6,
+            cache_read: 1e-6,
+            cache_creation: 5e-6,
+        };
+        let rates = rate_table(&[
+            ("gemini-3.8-flash", base_rate),
+            ("gemini-3.8-flash-max", max_override),
+            ("opus", FLAT_RATE),
+        ]);
+
+        for suffix in ["-low", "-medium", "-high", "-xhigh"] {
+            let model = format!("gemini-3.8-flash{suffix}");
+            assert_eq!(lookup_rate(&rates, &model), Some(&base_rate));
+        }
+        assert_eq!(
+            lookup_rate(&rates, "gemini-3.8-flash-max"),
+            Some(&max_override),
+            "exact rate takes precedence over stripped base"
+        );
+        assert_eq!(
+            lookup_rate(&rates, "gemini-3.8-flash-low-high"),
+            None,
+            "at most one trailing effort suffix is stripped"
+        );
+        assert_eq!(
+            lookup_rate(&rates, "opus-high"),
+            None,
+            "unpriceable bare family names stay unpriced after stripping"
+        );
+    }
+
+    #[test]
+    fn antigravity_brain_roots_respect_priority_and_sidecar_parent() {
+        let home = PathBuf::from("/tmp/home-user");
+        let sidecar = std::ffi::OsStr::new("/tmp/home-user/.gemini/antigravity-cli/sidecar_data");
+        let roots = antigravity_brain_roots_from(Some(sidecar), Some(&home));
+        assert_eq!(
+            roots,
+            vec![
+                home.join(".gemini/antigravity-cli/brain"),
+                home.join(".gemini/antigravity-acp/brain"),
+                home.join(".gemini/antigravity/brain"),
+            ]
+        );
+
+        let custom = std::ffi::OsStr::new("/opt/agy-custom");
+        let custom_roots = antigravity_brain_roots_from(Some(custom), Some(&home));
+        assert_eq!(custom_roots[0], PathBuf::from("/opt/agy-custom/brain"));
+        assert_eq!(custom_roots.len(), 4);
+    }
+
+    #[test]
+    fn antigravity_uri_conversion_handles_windows_encoded_drive_letters() {
+        let converted = antigravity_uri_to_workspace_path("file:///c%3A/Users/alice/git/waku")
+            .expect("file URI parses");
+        #[cfg(windows)]
+        assert_eq!(converted, r"C:\Users\alice\git\waku");
+        #[cfg(not(windows))]
+        assert_eq!(converted, "/c:/Users/alice/git/waku");
+    }
+
+    #[test]
+    fn antigravity_scan_ignores_transcript_full_maps_projects_and_dedupes_steps() {
+        let base =
+            std::env::temp_dir().join(format!("waku-usage-agy-{}", uuid::Uuid::new_v4()));
+        let agy_root = base.join("agy");
+        let brain = agy_root.join("brain");
+        let db_project = base.join("repo-db");
+        let hist_project = base.join("repo-hist");
+        std::fs::create_dir_all(&db_project).unwrap();
+        std::fs::create_dir_all(&hist_project).unwrap();
+
+        let now_rfc3339 = Utc::now().to_rfc3339();
+        let unique_id = uuid::Uuid::new_v4();
+        let base_model = format!("waku-test-gemini-{unique_id}");
+        let effort_model = format!("{base_model}-high");
+        let conv_db = format!("conv-db-{unique_id}");
+        let conv_hist = format!("conv-hist-{unique_id}");
+        let conv_both = format!("conv-both-{unique_id}");
+
+        let agy_line = |step: u64, input: u64, cache_read: u64, output: u64| {
+            serde_json::json!({
+                "step_index": step,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": now_rfc3339,
+                "model": effort_model,
+                "input_tokens": input,
+                "cache_read_tokens": cache_read,
+                "output_tokens": output,
+            })
+            .to_string()
+        };
+
+        let db_logs = brain.join(&conv_db).join(".system_generated/logs");
+        let hist_logs = brain.join(&conv_hist).join(".system_generated/logs");
+        let both_logs = brain.join(&conv_both).join(".system_generated/logs");
+        std::fs::create_dir_all(&db_logs).unwrap();
+        std::fs::create_dir_all(&hist_logs).unwrap();
+        std::fs::create_dir_all(&both_logs).unwrap();
+
+        // Include a duplicate step_index inside transcript.jsonl; only one counts.
+        std::fs::write(
+            db_logs.join("transcript.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                agy_line(1, 1_000, 200, 100),
+                agy_line(1, 1_000, 200, 100),
+                agy_line(2, 500, 0, 50),
+            ),
+        )
+        .unwrap();
+        // transcript_full.jsonl must be ignored by discovery.
+        std::fs::write(
+            db_logs.join("transcript_full.jsonl"),
+            format!("{}\n", agy_line(99, 999_999, 0, 999_999)),
+        )
+        .unwrap();
+        std::fs::write(
+            hist_logs.join("transcript.jsonl"),
+            format!("{}\n", agy_line(1, 300, 100, 40)),
+        )
+        .unwrap();
+        std::fs::write(
+            both_logs.join("transcript.jsonl"),
+            format!("{}\n", agy_line(1, 400, 0, 60)),
+        )
+        .unwrap();
+
+        // Populate conversation_summaries.db with file:// URIs (and verify
+        // percent-encoded Windows drive letter URI parsing inside SQLite too).
+        let db_uri = url::Url::from_file_path(&db_project)
+            .expect("temp path converts to file:// URI")
+            .to_string();
+        let conn = rusqlite::Connection::open(agy_root.join("conversation_summaries.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, workspace_uris TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, workspace_uris) VALUES (?1, ?2)",
+            rusqlite::params![conv_db, serde_json::json!([db_uri]).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, workspace_uris) VALUES (?1, ?2)",
+            rusqlite::params![
+                conv_both,
+                serde_json::json!(["file:///c%3A/Users/alice/from-db"]).to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // history.jsonl maps conv_hist and tries to override conv_both; DB must win for conv_both.
+        std::fs::write(
+            agy_root.join("history.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "conversationId": conv_hist,
+                    "workspace": hist_project.display().to_string(),
+                }),
+                serde_json::json!({
+                    "conversationId": conv_both,
+                    "workspace": hist_project.display().to_string(),
+                }),
+            ),
+        )
+        .unwrap();
+
+        let rates = rate_table(&[(&base_model, FLAT_RATE)]);
+        let project_roots = [db_project.clone(), hist_project.clone()];
+        let mut cache = ScanCache::new();
+        let baseline = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &[],
+        );
+
+        let account_dirs = vec![(UsageProvider::Antigravity, agy_root.clone())];
+        let history = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &account_dirs,
+        );
+
+        assert_eq!(
+            history.scanned_files,
+            baseline.scanned_files + 3,
+            "transcript_full.jsonl must be excluded"
+        );
+        let model_slice = history
+            .models
+            .iter()
+            .find(|slice| {
+                slice.provider == UsageProvider::Antigravity && slice.model == effort_model
+            })
+            .expect("Antigravity model slice present");
+        let expected_db_tokens = (1_000 + 200 + 100) + (500 + 50);
+        let expected_hist_tokens = 300 + 100 + 40;
+        let expected_both_tokens = 400 + 60;
+        assert_eq!(
+            model_slice.total_tokens,
+            expected_db_tokens + expected_hist_tokens + expected_both_tokens
+        );
+        assert!(model_slice.cost_usd > 0.0, "effort-suffix lookup priced the model");
+
+        let db_key = db_project.display().to_string();
+        let db_slice = history
+            .projects
+            .iter()
+            .find(|slice| slice.path == db_key)
+            .expect("DB workspace mapped");
+        assert_eq!(db_slice.total_tokens, expected_db_tokens);
+        assert_eq!(
+            db_slice.by_provider[UsageProvider::Antigravity.index()].total_tokens,
+            expected_db_tokens
+        );
+
+        let hist_key = hist_project.display().to_string();
+        let hist_slice = history
+            .projects
+            .iter()
+            .find(|slice| slice.path == hist_key)
+            .expect("history.jsonl workspace mapped");
+        assert_eq!(
+            hist_slice.total_tokens, expected_hist_tokens,
+            "conv_both stays on DB workspace instead of falling back to history.jsonl"
+        );
+
+        let expected_both_key =
+            antigravity_uri_to_workspace_path("file:///c%3A/Users/alice/from-db").unwrap();
+        let both_slice = history
+            .projects
+            .iter()
+            .find(|slice| slice.path == expected_both_key)
+            .expect("encoded Windows URI workspace mapped");
+        assert_eq!(both_slice.total_tokens, expected_both_tokens);
+
+        // Warm rescan reuses cache and preserves totals.
+        let rescanned = scan_with_account_dirs(
+            &mut cache,
+            &rates,
+            UsageWindow::TrailingDays(7),
+            &project_roots,
+            &account_dirs,
+        );
+        let rescanned_model = rescanned
+            .models
+            .iter()
+            .find(|slice| {
+                slice.provider == UsageProvider::Antigravity && slice.model == effort_model
+            })
+            .unwrap();
+        assert_eq!(rescanned_model.total_tokens, model_slice.total_tokens);
 
         let _ = std::fs::remove_dir_all(&base);
     }

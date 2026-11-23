@@ -325,6 +325,8 @@ pub enum WorkspaceOperation {
     /// path traversal before any filesystem access.
     ReadAntigravitySwarm {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
     },
 }
 

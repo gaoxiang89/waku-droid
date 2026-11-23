@@ -74,7 +74,7 @@ pub fn discover_catalog_reporting_in(
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
         ProviderKind::Amp => (Vec::new(), None),
-        ProviderKind::Antigravity => match discover_antigravity_models(binary) {
+        ProviderKind::Antigravity => match discover_antigravity_models(binary, config_dir) {
             Ok(models) => (models, None),
             Err(error) => {
                 discovery_error = Some(error);
@@ -102,10 +102,18 @@ pub fn discover_catalog_reporting_in(
     let models = if discovered.is_empty() {
         // A failed or empty probe keeps the last successful discovery over
         // the hardcoded catalog, so one bad CLI run can't shrink the picker.
-        cached_models(provider).unwrap_or_else(|| fallback_models(provider))
+        // Skip the shared disk cache for isolated accounts so one account's
+        // model list cannot overwrite or bleed into another's.
+        if config_dir.is_none() {
+            cached_models(provider).unwrap_or_else(|| fallback_models(provider))
+        } else {
+            fallback_models(provider)
+        }
     } else {
         let models = deduplicate(discovered);
-        write_cached_models(provider, &models);
+        if config_dir.is_none() {
+            write_cached_models(provider, &models);
+        }
         models
     };
     let presets = discovered_presets.unwrap_or_else(|| fallback_agent_presets(provider));
@@ -1055,20 +1063,27 @@ fn parse_droid_models(output: &str) -> Vec<ProviderModel> {
     models
 }
 
-/// Shared in-memory cache of slash commands advertised by `agy acp`'s
-/// `available_commands_update` notification, keyed by canonical binary path.
-/// Model discovery populates this opportunistically during its `session/new`
-/// handshake so cold-start composer discovery does not have to launch a second
-/// ACP server.
-static ANTIGRAVITY_ACP_COMMANDS: OnceLock<Mutex<HashMap<PathBuf, Vec<SlashCommand>>>> =
-    OnceLock::new();
+/// Cache key for Antigravity ACP slash-command discovery: canonical binary path
+/// paired with an optional canonicalized account config directory so isolated
+/// accounts never collide in memory.
+type AntigravityCommandCacheKey = (PathBuf, Option<PathBuf>);
 
-fn antigravity_acp_commands_cache() -> &'static Mutex<HashMap<PathBuf, Vec<SlashCommand>>> {
+/// Shared in-memory cache of slash commands advertised by `agy acp`'s
+/// `available_commands_update` notification, keyed by canonical binary path and
+/// optional account config directory. Model discovery populates this
+/// opportunistically during its `session/new` handshake so cold-start composer
+/// discovery does not have to launch a second ACP server.
+static ANTIGRAVITY_ACP_COMMANDS: OnceLock<
+    Mutex<HashMap<AntigravityCommandCacheKey, Vec<SlashCommand>>>,
+> = OnceLock::new();
+
+fn antigravity_acp_commands_cache()
+-> &'static Mutex<HashMap<AntigravityCommandCacheKey, Vec<SlashCommand>>> {
     ANTIGRAVITY_ACP_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn antigravity_binary_cache_key(binary: &Path) -> PathBuf {
-    let resolved = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+fn antigravity_path_cache_key(path: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     {
         PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
@@ -1079,19 +1094,42 @@ fn antigravity_binary_cache_key(binary: &Path) -> PathBuf {
     }
 }
 
-/// Returns the cached ACP slash commands last advertised by `binary`, if any.
+fn antigravity_command_cache_key(
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> AntigravityCommandCacheKey {
+    (
+        antigravity_path_cache_key(binary),
+        config_dir.map(antigravity_path_cache_key),
+    )
+}
+
+/// Returns the cached ACP slash commands last advertised by `binary` for the
+/// default account, if any.
 pub(crate) fn cached_antigravity_acp_commands(binary: &Path) -> Option<Vec<SlashCommand>> {
-    let key = antigravity_binary_cache_key(binary);
+    cached_antigravity_acp_commands_in(binary, None)
+}
+
+/// Returns the cached ACP slash commands last advertised by `binary` for
+/// `config_dir`, if any.
+pub(crate) fn cached_antigravity_acp_commands_in(
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
+    let key = antigravity_command_cache_key(binary, config_dir);
     antigravity_acp_commands_cache().lock().get(&key).cloned()
 }
 
-fn store_antigravity_acp_commands(cache_key: &Path, commands: Vec<SlashCommand>) {
+fn store_antigravity_acp_commands(
+    cache_key: &AntigravityCommandCacheKey,
+    commands: Vec<SlashCommand>,
+) {
     if commands.is_empty() {
         return;
     }
     antigravity_acp_commands_cache()
         .lock()
-        .insert(cache_key.to_path_buf(), commands);
+        .insert(cache_key.clone(), commands);
 }
 
 fn parse_acp_available_commands(update: &AvailableCommandsUpdate) -> Vec<SlashCommand> {
@@ -1122,17 +1160,22 @@ fn parse_acp_available_commands(update: &AvailableCommandsUpdate) -> Vec<SlashCo
         .collect()
 }
 
-/// Returns Antigravity's ACP slash commands for `binary`, hitting the shared
-/// in-memory cache first and falling back to a single bounded `agy acp` probe
-/// (`initialize` → `session/new` → capture `available_commands_update` →
-/// `session/close`) when cold.
-pub(crate) fn discover_antigravity_acp_commands(binary: &Path) -> Option<Vec<SlashCommand>> {
-    if let Some(cached) = cached_antigravity_acp_commands(binary) {
+/// Returns Antigravity's ACP slash commands for `binary` scoped to
+/// `config_dir`, hitting the shared in-memory cache first and falling back to
+/// a single bounded `agy acp` probe (`initialize` → `session/new` → capture
+/// `available_commands_update` → `session/close`) when cold.
+pub(crate) fn discover_antigravity_acp_commands_in(
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> Option<Vec<SlashCommand>> {
+    if let Some(cached) = cached_antigravity_acp_commands_in(binary, config_dir) {
         return Some(cached);
     }
     let cwd = crate::acp_session::catalog_working_directory().ok()?;
-    let agent = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd).ok()?;
-    let cache_key = antigravity_binary_cache_key(binary);
+    let agent =
+        crate::driver::acp::catalog_agent_in(ProviderKind::Antigravity, binary, &cwd, config_dir)
+            .ok()?;
+    let cache_key = antigravity_command_cache_key(binary, config_dir);
     discover_antigravity_acp_commands_with_agent(
         agent,
         cwd,
@@ -1145,7 +1188,7 @@ pub(crate) fn discover_antigravity_acp_commands(binary: &Path) -> Option<Vec<Sla
 fn discover_antigravity_acp_commands_with_agent<C>(
     agent: C,
     cwd: PathBuf,
-    cache_key: PathBuf,
+    cache_key: AntigravityCommandCacheKey,
     timeout: Duration,
     wait_grace: Duration,
 ) -> Option<Vec<SlashCommand>>
@@ -1239,11 +1282,15 @@ where
 ///
 /// The same handshake also captures `available_commands_update` into the shared
 /// slash-command cache and closes the throwaway session when supported.
-fn discover_antigravity_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
+fn discover_antigravity_models(
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> Result<Vec<ProviderModel>, String> {
     let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
-    let agent = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd)
-        .map_err(|error| error.to_string())?;
-    let cache_key = antigravity_binary_cache_key(binary);
+    let agent =
+        crate::driver::acp::catalog_agent_in(ProviderKind::Antigravity, binary, &cwd, config_dir)
+            .map_err(|error| error.to_string())?;
+    let cache_key = antigravity_command_cache_key(binary, config_dir);
     discover_antigravity_models_with_agent(
         agent,
         cwd,
@@ -1257,7 +1304,7 @@ fn discover_antigravity_models(binary: &Path) -> Result<Vec<ProviderModel>, Stri
 fn discover_antigravity_models_with_agent<C>(
     agent: C,
     cwd: PathBuf,
-    cache_key: PathBuf,
+    cache_key: AntigravityCommandCacheKey,
     timeout: Duration,
     effort_budget: Duration,
     command_grace: Duration,
@@ -2566,7 +2613,7 @@ Authentication:
             "waku-agy-model-cmd-cache-{}",
             uuid::Uuid::new_v4()
         ));
-        let cache_key = antigravity_binary_cache_key(&fake_binary);
+        let cache_key = antigravity_command_cache_key(&fake_binary, None);
         assert!(cached_antigravity_acp_commands(&fake_binary).is_none());
 
         let models = discover_antigravity_models_with_agent(
@@ -2671,7 +2718,7 @@ Authentication:
             "waku-agy-cmd-only-cache-{}",
             uuid::Uuid::new_v4()
         ));
-        let cache_key = antigravity_binary_cache_key(&fake_binary);
+        let cache_key = antigravity_command_cache_key(&fake_binary, None);
 
         let discovered = discover_antigravity_acp_commands_with_agent(
             mock_agent,
@@ -2698,6 +2745,67 @@ Authentication:
     }
 
     #[test]
+    fn antigravity_acp_command_cache_isolates_config_dirs() {
+        let fake_binary = std::env::temp_dir().join(format!(
+            "waku-agy-multi-account-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir_a = std::env::temp_dir().join(format!("waku-agy-acct-a-{}", uuid::Uuid::new_v4()));
+        let dir_b = std::env::temp_dir().join(format!("waku-agy-acct-b-{}", uuid::Uuid::new_v4()));
+        let cmd_default = vec![SlashCommand {
+            name: "default-cmd".into(),
+            description: "Default".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        }];
+        let cmd_a = vec![SlashCommand {
+            name: "acct-a-cmd".into(),
+            description: "Account A".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        }];
+        let cmd_b = vec![SlashCommand {
+            name: "acct-b-cmd".into(),
+            description: "Account B".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        }];
+
+        store_antigravity_acp_commands(
+            &antigravity_command_cache_key(&fake_binary, None),
+            cmd_default.clone(),
+        );
+        store_antigravity_acp_commands(
+            &antigravity_command_cache_key(&fake_binary, Some(&dir_a)),
+            cmd_a.clone(),
+        );
+        store_antigravity_acp_commands(
+            &antigravity_command_cache_key(&fake_binary, Some(&dir_b)),
+            cmd_b.clone(),
+        );
+
+        assert_eq!(
+            cached_antigravity_acp_commands(&fake_binary),
+            Some(cmd_default.clone())
+        );
+        assert_eq!(
+            cached_antigravity_acp_commands_in(&fake_binary, None),
+            Some(cmd_default)
+        );
+        assert_eq!(
+            cached_antigravity_acp_commands_in(&fake_binary, Some(&dir_a)),
+            Some(cmd_a)
+        );
+        assert_eq!(
+            cached_antigravity_acp_commands_in(&fake_binary, Some(&dir_b)),
+            Some(cmd_b)
+        );
+    }
+
+    #[test]
     #[ignore = "requires an installed, authenticated agy"]
     fn antigravity_discovery_reads_each_models_thinking_levels() {
         let binary = std::env::var("WAKU_ANTIGRAVITY_BINARY")
@@ -2705,7 +2813,8 @@ Authentication:
             .and_then(|spec| crate::command_env::resolve_binary_override(&spec))
             .or_else(|| crate::command_env::find_executable("agy"))
             .expect("agy is not installed");
-        let models = discover_antigravity_models(&binary).expect("antigravity discovery failed");
+        let models =
+            discover_antigravity_models(&binary, None).expect("antigravity discovery failed");
         assert!(models.iter().any(|model| model.is_default));
         assert!(
             models.iter().any(|model| model.reasoning_efforts.len() > 1),

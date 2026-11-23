@@ -110,16 +110,29 @@ struct AcpLaunch {
     env: Vec<(String, String)>,
 }
 
-fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow::Result<AcpLaunch> {
+fn launch_for(
+    provider: ProviderKind,
+    reasoning_effort: Option<&str>,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<AcpLaunch> {
     match provider {
         // Antigravity's CLI already carries the user's Google sign-in and its
         // account catalog. `agy acp` is the CLI's own long-lived ACP server;
         // Waku takes the installed route instead of T3 Code's downloaded
         // `antigravity-acp` bridge.
-        ProviderKind::Antigravity => Ok(AcpLaunch {
-            args: vec!["acp".into()],
-            env: Vec::new(),
-        }),
+        ProviderKind::Antigravity => {
+            let mut args = vec!["acp".into()];
+            let env = if let Some(dir) = config_dir {
+                args.push("--gemini-dir".into());
+                args.push(dir.to_string_lossy().into_owned());
+                args.push("--app-data-dir".into());
+                args.push(".".into());
+                crate::command_env::antigravity_account_env(dir)
+            } else {
+                Vec::new()
+            };
+            Ok(AcpLaunch { args, env })
+        }
         ProviderKind::Cursor => Ok(AcpLaunch {
             args: vec!["acp".into()],
             env: Vec::new(),
@@ -177,10 +190,13 @@ impl AcpDriver {
             agent_preset: _,
             computer_use_enabled,
             provider_cursor,
-            config_dir: _,
+            config_dir,
         } = options;
         let fork_context = match &provider_cursor {
-            Some(ProviderResumeCursor::Cursor { fork_context, .. }) => fork_context.clone(),
+            Some(
+                ProviderResumeCursor::Cursor { fork_context, .. }
+                | ProviderResumeCursor::Antigravity { fork_context, .. },
+            ) => fork_context.clone(),
             _ => None,
         };
         let resume_session_id = match provider_cursor {
@@ -198,7 +214,7 @@ impl AcpDriver {
             None => None,
         };
 
-        let launch = launch_for(provider, reasoning_effort.as_deref())?;
+        let launch = launch_for(provider, reasoning_effort.as_deref(), config_dir.as_deref())?;
         let computer_use = computer_use_enabled
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
             .transpose()?;
@@ -248,6 +264,7 @@ impl AcpDriver {
                     context_window,
                     resume_session_id,
                     fork_context,
+                    config_dir,
                     acp_mcp_servers,
                     computer_use_instructions,
                     grok_title_home,
@@ -512,7 +529,18 @@ pub(crate) fn catalog_agent(
     binary: &Path,
     cwd: &Path,
 ) -> anyhow::Result<ProviderAgent> {
-    let launch = launch_for(provider, None)?;
+    catalog_agent_in(provider, binary, cwd, None)
+}
+
+/// `config_dir`-scoped variant of [`catalog_agent`] for isolated provider
+/// account profiles (such as Antigravity `--gemini-dir` roots).
+pub(crate) fn catalog_agent_in(
+    provider: ProviderKind,
+    binary: &Path,
+    cwd: &Path,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<ProviderAgent> {
+    let launch = launch_for(provider, None, config_dir)?;
     sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
 }
 
@@ -886,6 +914,7 @@ async fn run_sdk_connection(
     context_window: Option<String>,
     resume_session_id: Option<String>,
     fork_context: Option<String>,
+    config_dir: Option<std::path::PathBuf>,
     acp_mcp_servers: Vec<McpServer>,
     computer_use_instructions: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
@@ -1501,6 +1530,7 @@ async fn run_sdk_connection(
                                     &events,
                                     provider,
                                     &native_session_id,
+                                    config_dir.clone(),
                                     grok_title_home.clone(),
                                     title_refresh.clone(),
                                     stream_state.clone(),
@@ -1527,6 +1557,7 @@ async fn run_sdk_connection(
                         suppress_session_updates.clear_guard();
                         unsolicited_turn.lock().take_active();
                         let prompt_text = format_prompt_with_seed(
+                            provider,
                             fork_context.as_deref(),
                             computer_use_instructions.as_deref(),
                             text,
@@ -1542,6 +1573,7 @@ async fn run_sdk_connection(
                             &events,
                             provider,
                             &native_session_id,
+                            config_dir.clone(),
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
@@ -1585,6 +1617,7 @@ async fn run_sdk_connection(
                             &events,
                             provider,
                             &native_session_id,
+                            config_dir.clone(),
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
@@ -3129,12 +3162,18 @@ enum PromptKind {
 }
 
 fn format_prompt_with_seed(
+    provider: ProviderKind,
     fork_context: Option<&str>,
     computer_use_instructions: Option<&str>,
     text: String,
 ) -> String {
     let text = fork_context
-        .map(|context| crate::cursor_session::prompt_with_fork_context(context, &text))
+        .map(|context| match provider {
+            ProviderKind::Antigravity => {
+                crate::antigravity_session::prompt_with_fork_context(context, &text)
+            }
+            _ => crate::cursor_session::prompt_with_fork_context(context, &text),
+        })
         .unwrap_or(text);
     computer_use_instructions
         .map(|instructions| format!("{instructions}\n\n{text}"))
@@ -3145,6 +3184,7 @@ async fn resolve_native_turn_failure(
     kimi_offset: Option<u64>,
     antigravity_offset: Option<i64>,
     native_session_id: String,
+    config_dir: Option<std::path::PathBuf>,
     produced_content: bool,
     stop_reason: Option<StopReason>,
 ) -> Option<String> {
@@ -3160,11 +3200,12 @@ async fn resolve_native_turn_failure(
             _ => (false, false),
         };
         smol::unblock(move || {
-            crate::antigravity_session::turn_failure(
+            crate::antigravity_session::turn_failure_in(
                 &native_session_id,
                 offset,
                 refusal,
                 empty_end_turn,
+                config_dir.as_deref(),
             )
         })
         .await
@@ -3184,6 +3225,7 @@ fn send_prompt(
     events: &DriverEventSender,
     provider: ProviderKind,
     native_session_id: &str,
+    config_dir: Option<std::path::PathBuf>,
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
@@ -3201,7 +3243,7 @@ fn send_prompt(
     let kimi_offset = (provider == ProviderKind::Kimi)
         .then(|| crate::kimi_session::wire_offset(native_session_id));
     let antigravity_offset = (provider == ProviderKind::Antigravity)
-        .then(|| crate::antigravity_session::step_offset(native_session_id));
+        .then(|| crate::antigravity_session::step_offset_in(native_session_id, config_dir.as_deref()));
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
     let content_blocks = build_prompt_content_blocks(&text, cwd, prompt_capabilities);
@@ -3252,6 +3294,7 @@ fn send_prompt(
                 kimi_offset,
                 antigravity_offset,
                 native_session_id.clone(),
+                config_dir,
                 produced_content,
                 stop_reason,
             )
@@ -6771,7 +6814,7 @@ mod tests {
 
     #[test]
     fn fx_launches_its_documented_acp_subcommand() {
-        let launch = launch_for(ProviderKind::Fx, None).unwrap();
+        let launch = launch_for(ProviderKind::Fx, None, None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
     }
@@ -6788,13 +6831,53 @@ mod tests {
 
     #[test]
     fn antigravity_launches_its_acp_server() {
-        let launch = launch_for(ProviderKind::Antigravity, Some("high")).unwrap();
+        let launch = launch_for(ProviderKind::Antigravity, Some("high"), None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
         assert_eq!(
             reasoning_effort_config_id(ProviderKind::Antigravity),
             "thought_level"
         );
+    }
+
+    #[test]
+    fn antigravity_launches_with_config_dir_isolation_and_account_env() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-acp-antigravity-launch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let adc = root.join("application_default_credentials.json");
+        std::fs::write(&adc, "{}").unwrap();
+        std::fs::write(root.join(".env"), "GEMINI_API_KEY=test-key\n").unwrap();
+
+        let launch = launch_for(ProviderKind::Antigravity, None, Some(&root)).unwrap();
+        assert_eq!(
+            launch.args,
+            vec![
+                "acp".to_owned(),
+                "--gemini-dir".to_owned(),
+                root.to_string_lossy().into_owned(),
+                "--app-data-dir".to_owned(),
+                ".".to_owned(),
+            ]
+        );
+        assert!(
+            launch
+                .env
+                .contains(&("AGY_ADC_AUTH".to_owned(), "true".to_owned()))
+        );
+        assert!(launch.env.contains(&(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+            adc.to_string_lossy().into_owned(),
+        )));
+        assert!(
+            launch
+                .env
+                .contains(&("GEMINI_API_KEY".to_owned(), "test-key".to_owned()))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7778,7 +7861,7 @@ mod tests {
 
     #[test]
     fn droid_launches_the_registry_acp_daemon() {
-        let launch = launch_for(ProviderKind::Droid, None).unwrap();
+        let launch = launch_for(ProviderKind::Droid, None, None).unwrap();
         assert_eq!(launch.args, ["exec", "--output-format", "acp-daemon"]);
         assert!(
             launch
@@ -8321,12 +8404,12 @@ mod tests {
 
     #[test]
     fn grok_launch_passes_reasoning_effort_before_stdio() {
-        let launch = launch_for(ProviderKind::Grok, Some("xhigh")).unwrap();
+        let launch = launch_for(ProviderKind::Grok, Some("xhigh"), None).unwrap();
         assert_eq!(
             launch.args,
             ["agent", "--reasoning-effort", "xhigh", "stdio"]
         );
-        let bare = launch_for(ProviderKind::Grok, None).unwrap();
+        let bare = launch_for(ProviderKind::Grok, None, None).unwrap();
         assert_eq!(bare.args, ["agent", "stdio"]);
     }
 
@@ -9455,6 +9538,7 @@ mod tests {
                     ProviderKind::Cursor,
                     "sess-1",
                     None,
+                    None,
                     title_refresh.clone(),
                     stream_state_clone.clone(),
                     None,
@@ -9501,6 +9585,7 @@ mod tests {
         let mut cu_instructions = Some("CU RULES".to_owned());
 
         let first = format_prompt_with_seed(
+            ProviderKind::Cursor,
             fork_context.as_deref(),
             cu_instructions.as_deref(),
             "first try".to_owned(),
@@ -9512,6 +9597,7 @@ mod tests {
         assert!(cu_instructions.is_some());
 
         let retry = format_prompt_with_seed(
+            ProviderKind::Cursor,
             fork_context.as_deref(),
             cu_instructions.as_deref(),
             "second try".to_owned(),
@@ -9523,11 +9609,25 @@ mod tests {
         fork_context = None;
         cu_instructions = None;
         let next = format_prompt_with_seed(
+            ProviderKind::Cursor,
             fork_context.as_deref(),
             cu_instructions.as_deref(),
             "later turn".to_owned(),
         );
         assert_eq!(next, "later turn");
+    }
+
+    #[test]
+    fn format_prompt_with_seed_frames_antigravity_with_antigravity_envelope() {
+        let seeded = format_prompt_with_seed(
+            ProviderKind::Antigravity,
+            Some("[{\"role\":\"user\",\"content\":\"hi\"}]"),
+            None,
+            "follow up".to_owned(),
+        );
+        assert!(seeded.starts_with("WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1 "));
+        assert!(seeded.contains("WAKU_ANTIGRAVITY_CURRENT_PROMPT_V1 "));
+        assert!(seeded.ends_with("follow up"));
     }
 
     #[test]
@@ -9601,6 +9701,7 @@ mod tests {
                     Some(0),
                     None,
                     format!("nonexistent-session-{}", uuid::Uuid::new_v4()),
+                    None,
                     false,
                     Some(StopReason::EndTurn),
                 )

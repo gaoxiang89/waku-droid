@@ -176,28 +176,40 @@ rewound task can resume a conversation that no longer matches its transcript.
 
 ### Multiple accounts per provider
 
-Claude Code (`CLAUDE_CONFIG_DIR`) and Codex CLI (`CODEX_HOME`) support isolated
-on-disk configuration roots (`ProviderKind::supports_multiple_accounts`). Users
-can add named `ProviderAccount` profiles (`{ id, provider, label, config_dir,
+Claude Code (`CLAUDE_CONFIG_DIR`), Codex CLI (`CODEX_HOME`), and Antigravity
+(`--gemini-dir` + `--app-data-dir .`, per-account `settings.json`,
+`.env`/`application_default_credentials.json`) support isolated on-disk
+configuration roots (`ProviderKind::supports_multiple_accounts`). Users can add
+named `ProviderAccount` profiles (`{ id, provider, label, config_dir,
 binary_override }`) in **Settings → Providers**; each profile runs alongside the
-implicit **Default** account (`account_id: None`, which uses `~/.claude` or
-`~/.codex` and strips any ambient `CLAUDE_CONFIG_DIR` / `CODEX_HOME` inherited
-from the parent shell so Default stays deterministic).
+implicit **Default** account (`account_id: None`, which uses `~/.claude`,
+`~/.codex`, or `~/.gemini/antigravity-cli`).
 
 Every layer keys state by `(ProviderKind, Option<account_id>)`:
 
-- **Process environment (`command_env.rs`).** `DriverStartOptions::config_dir`,
+- **Process launch (`command_env.rs`, `driver/acp.rs`).** `DriverStartOptions::config_dir`,
   model/preset catalog probes, slash-command discovery, Claude session forks,
   commit-message invocations, and cold provider-session imports inject
-  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` when `config_dir` is `Some(...)`, and
-  remove those variables when `config_dir` is `None`.
+  `CLAUDE_CONFIG_DIR` (Claude) or `CODEX_HOME` (Codex) when `config_dir` is
+  `Some(...)`. For Antigravity, named accounts launch `agy acp --gemini-dir
+  <dir> --app-data-dir .` (isolating `settings.json`, skills, conversations,
+  logs, and swarm state under `<dir>`) and apply allowlisted keys from
+  `<dir>/.env` (`GEMINI_API_KEY`, `AGY_ADC_AUTH`, `GOOGLE_APPLICATION_CREDENTIALS`,
+  `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `GOOGLE_CLOUD_LOCATION`)
+  or auto-detected `<dir>/application_default_credentials.json`, while print
+  commands pass `--settings <dir>/settings.json` when present. Note that `agy`'s
+  personal Google OAuth flow stores credentials in a single OS-level keyring
+  entry (`gemini:antigravity`), so distinct Antigravity accounts authenticate
+  separately via Gemini API key, Vertex ADC, or `binary_override`.
 - **Plan usage (`usage.rs`) and usage history (`usage_history.rs`).** Plan usage
   reads `<config_dir>/.credentials.json` (plus macOS Keychain service
   `"Claude Code-credentials-<first 8 hex chars of sha256(config_dir)>"`) for
-  Claude Code and `<config_dir>/auth.json` for Codex, caching limits per
-  `(HostKey, ProviderKind, Option<String>)`. Token/cost history scans both the
-  default root and every configured account's `config_dir` (deduplicated by
-  canonical path).
+  Claude Code, `<config_dir>/auth.json` for Codex, and per-account `--settings` /
+  environment for Antigravity, caching limits per `(HostKey, ProviderKind,
+  Option<String>)`. Token/cost history scans both the default roots and every
+  configured account's `config_dir` (deduplicated by canonical path), including
+  Antigravity `brain/<conv>/.system_generated/logs/transcript.jsonl` paired with
+  `conversation_summaries.db` / `history.jsonl`.
 - **In-task switching (`switch_agent`).** `AgentSession::account_id` and
   `AgentTurn::account_id` track the active and per-turn account; parked cursors
   for named accounts live in `AgentSession::account_cursors` alongside legacy
@@ -207,10 +219,8 @@ Every layer keys state by `(ProviderKind, Option<account_id>)`:
   deterministic `<task-transcript>` handoff with disambiguated speaker labels,
   and labels assistant turns (`Claude · Default`, `Claude · Work`).
 
-Antigravity (`agy acp` ignores `AGY_ACCOUNT` and reads one shared
-`~/.gemini/antigravity` state store) and OpenCode (one shared user-level
-background daemon at `service.json`) do not expose isolated per-process config
-roots and remain single-account.
+OpenCode (one shared user-level background daemon at `service.json`) does not
+expose isolated per-process config roots and remains single-account.
 
 Note what is *not* on the teardown list: finishing a turn. `TurnFinished` leaves
 the long-lived processes resident and idle, which is the point of them — until
@@ -267,7 +277,9 @@ stops a turn, and the short-lived server that backs a Grok fork.
 | Model discovery | yes | yes | yes | yes | no (fixed) | no (modes) | yes | yes | yes | yes | yes | yes |
 | Computer Use | yes | yes (MCP) | yes | no (ships its own) | no | no | no | no | yes | yes | no | no |
 | Restricted to Full access | no | no | yes | yes | no | yes | no | no | no | no | no | no |
-| Rewind and branch at a turn | yes | **no** | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
+| Rewind and branch at a turn | yes | yes | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
+| Multi-account profiles | yes (`CODEX_HOME`) | yes (`--gemini-dir`) | no | no | yes (`CLAUDE_CONFIG_DIR`) | no | no | no | no | no | no | no |
+| Token/cost usage history | yes | yes | no | no | yes | no | no | no | no | no | no | no |
 
 Kimi Code's steering is the transport's, not a probed policy: the ACP driver
 sends the second `session/prompt` for every agent it drives except Fx and
@@ -842,7 +854,17 @@ turn and settle cleanly after quiet/usage boundaries; plan artifacts
 (`RequestFeedback: true` / `exit_plan_mode`) and swarm/subagent/boost tool calls
 are normalized for transcript cards, `/usage` + `/credits` feed the zero-quota
 plan usage meter, and the native Swarm Board panel reads `.system_generated/swarm/`
-through the daemon off the UI thread.
+through the daemon off the UI thread. In addition, `usage_history.rs` scans
+`<root>/brain/<conv>/.system_generated/logs/transcript.jsonl` (paired with
+`conversation_summaries.db` and `history.jsonl`) to include Antigravity token
+and estimated cost breakdowns on the Usage page.
+
+**Rewind and branch** — Because `agy acp` does not expose `session/fork` or a
+turn-boundary rollback RPC, Antigravity preserves branch and rewind semantics
+using Waku-seeded conversation context
+([antigravity_session.rs](../crates/waku-core/src/antigravity_session.rs)),
+mirroring Cursor (`WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1`). Imported or reloaded
+titles and messages unwrap the branch envelope cleanly.
 
 Its multiple-choice questions arrive as `session/request_permission` with a
 `toolCallId` beginning `interaction_`; the permission options are the choices,
@@ -1074,8 +1096,10 @@ current prompt settles.
 
 **Rewind and branch** — unchanged and still out of band: Grok forks through its
 own ACP server plus on-disk truncation
-([grok_session.rs](../crates/waku-core/src/grok_session.rs)), Cursor re-seeds a
-fresh session ([cursor_session.rs](../crates/waku-core/src/cursor_session.rs)).
+([grok_session.rs](../crates/waku-core/src/grok_session.rs)), and Cursor and
+Antigravity re-seed a fresh session
+([cursor_session.rs](../crates/waku-core/src/cursor_session.rs),
+[antigravity_session.rs](../crates/waku-core/src/antigravity_session.rs)).
 
 **Kimi Code, Fx, and Factory Droid have neither, deliberately.** Kimi advertises a `fork` session
 capability, but `session/fork` takes only `{sessionId, cwd}` and copies the
@@ -1130,7 +1154,7 @@ persisted with the session and is what makes a Waku task outlive its process:
 | Provider | Cursor fields | Why |
 | --- | --- | --- |
 | Codex | `thread_id` | `thread/resume` |
-| Antigravity | `session_id` | `session/load`, because `session/resume` returns no context; no turn-aware fork |
+| Antigravity | `session_id`, `fork_context` | `session/load`, because `session/resume` returns no context; `fork_context` is seeded branch history (id is empty until first streamed prompt) |
 | Pi | `session_id`, `session_file` | `switch_session` needs the path |
 | Oh My Pi | `session_id`, `session_file` | same, plus `--fork <file>` for a whole-session copy |
 | Claude | `session_id`, `resume_at` | `resume_at` is the transcript message uuid used for forking |

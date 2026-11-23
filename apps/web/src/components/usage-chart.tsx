@@ -12,7 +12,7 @@ export type UsageMetric = 'cost' | 'tokens'
 interface UsageChartRow {
   id: string
   date: Date
-  provider: 'Claude Code' | 'Codex'
+  provider: 'Claude Code' | 'Codex' | 'Antigravity'
   value: number
 }
 
@@ -38,6 +38,12 @@ export function UsageTrendChart({
         date,
         provider: 'Codex',
         value: metric === 'cost' ? day.byProvider[1].costUsd : day.byProvider[1].totalTokens,
+      },
+      {
+        id: `antigravity-${day.day}`,
+        date,
+        provider: 'Antigravity',
+        value: metric === 'cost' ? day.byProvider[2].costUsd : day.byProvider[2].totalTokens,
       },
     ]
   })
@@ -98,8 +104,8 @@ export function UsageTrendChart({
       },
     },
     color: {
-      domain: ['Claude Code', 'Codex'],
-      range: ['#d97757', 'var(--provider-codex)'],
+      domain: ['Claude Code', 'Codex', 'Antigravity'],
+      range: ['#d97757', 'var(--provider-codex)', '#4285F4'],
     },
     focus: 'group-x',
     maxFocusDistance: Number.POSITIVE_INFINITY,

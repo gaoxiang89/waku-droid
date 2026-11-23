@@ -152,8 +152,15 @@ fn deduplicate_sessions_in_place(sessions: &mut Vec<AgentSession>) {
             let existing = &deduped[existing_index];
             let prefer_candidate = (session.detail_loaded && !existing.detail_loaded)
                 || (session.detail_loaded == existing.detail_loaded
-                    && (session.turns.len(), session.messages.len(), session.updated_at)
-                        > (existing.turns.len(), existing.messages.len(), existing.updated_at));
+                    && (
+                        session.turns.len(),
+                        session.messages.len(),
+                        session.updated_at,
+                    ) > (
+                        existing.turns.len(),
+                        existing.messages.len(),
+                        existing.updated_at,
+                    ));
             if prefer_candidate {
                 deduped[existing_index] = session;
             }
@@ -265,11 +272,12 @@ fn merge_host_task_state(
         .iter()
         .map(|session| session.id)
         .collect::<HashSet<_>>();
-    let (mut sessions, other_sessions) = std::mem::take(&mut state.sessions)
-        .into_iter()
-        .partition(|session| {
-            ownership.session(session.id) == *key || incoming_session_ids.contains(&session.id)
-        });
+    let (mut sessions, other_sessions) =
+        std::mem::take(&mut state.sessions)
+            .into_iter()
+            .partition(|session| {
+                ownership.session(session.id) == *key || incoming_session_ids.contains(&session.id)
+            });
     state.sessions = other_sessions;
     let mut deleted = Vec::new();
     sessions.retain(|session| {
@@ -372,9 +380,9 @@ struct MessageRewindRequest {
     provider_cursor: Option<ProviderResumeCursor>,
     claude_config_dir: Option<PathBuf>,
     session_title: String,
-    /// Cursor has no native branch API, so its background helper needs the
-    /// retained visible transcript. Other providers avoid cloning a long task
-    /// on the click path entirely.
+    /// Antigravity and Cursor have no native branch API, so their background
+    /// helper needs the retained visible transcript. Other providers avoid
+    /// cloning a long task on the click path entirely.
     cursor_source: Option<AgentSession>,
     project_path: PathBuf,
     retained_turn_count: usize,
@@ -629,6 +637,29 @@ fn perform_provider_rewind(
                 .cursor;
             Ok((Some(cursor), None, None))
         }
+        ProviderKind::Antigravity => {
+            let source = request.cursor_source.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(tr!(
+                    "errors.provider_waku_task_unavailable",
+                    provider = "Antigravity"
+                ))
+            })?;
+            Ok((
+                Some(
+                    request
+                        .workspace_client
+                        .fork_provider_session(
+                            waku_client::provider_session::ProviderSessionForkRequest::Antigravity {
+                                source: source.clone(),
+                                turn_count: request.retained_turn_count,
+                            },
+                        )?
+                        .cursor,
+                ),
+                None,
+                None,
+            ))
+        }
         ProviderKind::Cursor => {
             let source = request.cursor_source.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(tr!(
@@ -699,7 +730,7 @@ fn perform_provider_rewind(
         }
         // Unreachable through the UI, which hides rewinding for providers that
         // answer `supports_conversation_rollback` with false.
-        ProviderKind::Antigravity | ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
+        ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
             Err(anyhow::anyhow!(tr!(
                 "errors.provider_turn_branching_unsupported",
                 provider = provider.display_name()
@@ -857,6 +888,19 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
                     let (cursor, prepared_driver) = fork_response_with_driver(&mut request)?;
                     Ok((cursor, None, prepared_driver))
                 }
+                ProviderKind::Antigravity => Ok((
+                    request
+                        .workspace_client
+                        .fork_provider_session(
+                            waku_client::provider_session::ProviderSessionForkRequest::Antigravity {
+                                source: request.source.clone(),
+                                turn_count: request.turn_count,
+                            },
+                        )?
+                        .cursor,
+                    None,
+                    None,
+                )),
                 ProviderKind::Cursor => Ok((
                     request
                         .workspace_client
@@ -996,10 +1040,7 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
                 }
                 // Unreachable through the UI, which hides branching for providers
                 // that answer `supports_conversation_fork` with false.
-                ProviderKind::Antigravity
-                | ProviderKind::Droid
-                | ProviderKind::Fx
-                | ProviderKind::Kimi => anyhow::bail!(tr!(
+                ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => anyhow::bail!(tr!(
                     "errors.provider_turn_branching_unsupported",
                     provider = provider.display_name()
                 )),
@@ -1206,24 +1247,22 @@ impl Waku {
                         )
                     };
                     if let Some(existing_key) = duplicate {
-                        let existing_disconnected =
-                            existing_key != waku_client::hosts::HostKey::Local
-                                && (self.host_disconnected.contains(&existing_key)
-                                    || self
-                                        .hosts
-                                        .get(&existing_key)
-                                        .is_some_and(|host| host.daemon.is_disconnected()));
+                        let existing_disconnected = existing_key
+                            != waku_client::hosts::HostKey::Local
+                            && (self.host_disconnected.contains(&existing_key)
+                                || self
+                                    .hosts
+                                    .get(&existing_key)
+                                    .is_some_and(|host| host.daemon.is_disconnected()));
                         if key == waku_client::hosts::HostKey::Local || existing_disconnected {
                             let selected_on_old = self
                                 .state
                                 .selected_session
                                 .filter(|id| self.hosts.ownership.session(*id) == existing_key);
                             if let Some(selected_id) = selected_on_old
-                                && self
-                                    .state
-                                    .sessions
-                                    .iter()
-                                    .any(|session| session.id == selected_id && session.has_started())
+                                && self.state.sessions.iter().any(|session| {
+                                    session.id == selected_id && session.has_started()
+                                })
                             {
                                 self.pending_host_session = Some(selected_id);
                                 self.state.selected_session = None;
@@ -2733,7 +2772,8 @@ impl Waku {
         let provider = source.provider;
         let provider_cursor = source.provider_cursor.clone();
         let session_title = source.display_title().to_owned();
-        let cursor_source = (provider == ProviderKind::Cursor).then(|| source.clone());
+        let cursor_source = matches!(provider, ProviderKind::Antigravity | ProviderKind::Cursor)
+            .then(|| source.clone());
         let edited_message_id = edit.message_id;
         let Some(edited_message_index) = source
             .turns
@@ -4139,18 +4179,18 @@ impl Waku {
         &self,
         host: &waku_client::hosts::HostKey,
     ) -> bool {
-        self.pending_open_requests.iter().any(|req| {
-            matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host)
-        })
+        self.pending_open_requests
+            .iter()
+            .any(|req| matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host))
     }
 
     pub(super) fn drop_pending_open_requests_for_host(
         &mut self,
         host: &waku_client::hosts::HostKey,
     ) {
-        self.pending_open_requests.retain(|req| {
-            !matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host)
-        });
+        self.pending_open_requests.retain(
+            |req| !matches!(&req.target, OpenWorkspaceTarget::Host(target) if target == host),
+        );
     }
 
     pub(super) fn retarget_pending_open_requests(
@@ -4202,9 +4242,7 @@ impl Waku {
                     path_resolved: false,
                 },
                 None => {
-                    if request.path.is_none()
-                        && source_host == waku_client::hosts::HostKey::Local
-                    {
+                    if request.path.is_none() && source_host == waku_client::hosts::HostKey::Local {
                         continue;
                     }
                     PendingOpenRequest {
@@ -4301,11 +4339,7 @@ impl Waku {
                 Some(raw_path) => {
                     let workspace = waku_client::WorkspaceClient::for_daemon(owner.daemon.clone());
                     self.resolve_and_open_workspace_on_host(
-                        host_key,
-                        generation,
-                        workspace,
-                        raw_path,
-                        cx,
+                        host_key, generation, workspace, raw_path, cx,
                     );
                     changed = true;
                 }
@@ -4342,11 +4376,7 @@ impl Waku {
                 match result {
                     Ok(resolved) => {
                         if owner.store.task_state_loaded() {
-                            this.open_resolved_workspace_on_host(
-                                PathBuf::from(resolved),
-                                host,
-                                cx,
-                            );
+                            this.open_resolved_workspace_on_host(PathBuf::from(resolved), host, cx);
                         } else {
                             this.pending_open_requests.push(PendingOpenRequest {
                                 target: OpenWorkspaceTarget::Host(host),
@@ -4861,11 +4891,8 @@ mod response_fork_title_tests {
         assert!(updated_remote.set_title("Updated title"));
 
         let mut local = vec![skeleton.clone(), hydrated.clone()];
-        let removed = merge_remote_session_catalog(
-            &mut local,
-            vec![skeleton, updated_remote],
-            |_| false,
-        );
+        let removed =
+            merge_remote_session_catalog(&mut local, vec![skeleton, updated_remote], |_| false);
 
         assert!(removed.is_empty());
         assert_eq!(local.len(), 1);

@@ -124,17 +124,20 @@ impl ProviderKind {
         }
     }
 
-    /// Kimi Code, Fx, Factory Droid, and Antigravity are deliberately absent
-    /// from this list and from [`Self::supports_conversation_fork`]. Kimi's ACP
-    /// `session/fork` copies a whole session and takes no turn count, Fx
-    /// exposes no turn-aware fork or truncation method, Droid's ACP session has
-    /// not been shown to accept a turn boundary either, and Antigravity cannot
-    /// rewind its conversation at all. None of them can reproduce Waku's "drop
+    /// Kimi Code, Fx, and Factory Droid are deliberately absent from this list
+    /// and from [`Self::supports_conversation_fork`]. Kimi's ACP `session/fork`
+    /// copies a whole session and takes no turn count, Fx exposes no turn-aware
+    /// fork or truncation method, and Droid's ACP session has not been shown to
+    /// accept a turn boundary either. None of them can reproduce Waku's "drop
     /// the last N turns" semantics without corrupting history.
+    ///
+    /// Cursor and Antigravity preserve branch/rewind semantics via seeded
+    /// conversation context in a fresh ACP session.
     pub fn supports_conversation_rollback(self) -> bool {
         matches!(
             self,
             Self::Amp
+                | Self::Antigravity
                 | Self::Claude
                 | Self::Codex
                 | Self::Cursor
@@ -150,6 +153,7 @@ impl ProviderKind {
         matches!(
             self,
             Self::Amp
+                | Self::Antigravity
                 | Self::Claude
                 | Self::Codex
                 | Self::Cursor
@@ -180,9 +184,9 @@ impl ProviderKind {
     }
 
     /// Whether Waku can run isolated account profiles for this CLI through a
-    /// dedicated configuration-directory environment variable.
+    /// dedicated configuration directory or CLI root flag.
     pub fn supports_multiple_accounts(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex)
+        matches!(self, Self::Antigravity | Self::Claude | Self::Codex)
     }
 }
 
@@ -200,6 +204,8 @@ pub enum ProviderResumeCursor {
     },
     Antigravity {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_context: Option<String>,
     },
     Claude {
         session_id: String,
@@ -257,7 +263,10 @@ impl ProviderResumeCursor {
                 thread_id: id,
                 fork_context: None,
             },
-            ProviderKind::Antigravity => Self::Antigravity { session_id: id },
+            ProviderKind::Antigravity => Self::Antigravity {
+                session_id: id,
+                fork_context: None,
+            },
             ProviderKind::Claude => Self::Claude {
                 session_id: id,
                 resume_at: None,
@@ -308,7 +317,7 @@ impl ProviderResumeCursor {
     pub fn native_id(&self) -> &str {
         match self {
             Self::Amp { thread_id, .. } => thread_id,
-            Self::Antigravity { session_id } => session_id,
+            Self::Antigravity { session_id, .. } => session_id,
             Self::Claude { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::DeepSeek { session_id }
@@ -1186,7 +1195,10 @@ pub struct AgentSession {
     /// Serialized only when `false` so hydrated `session_details` JSON stays
     /// unchanged and older payloads omitting the field still default to `true`,
     /// while skeletons retain their unloaded marker across the daemon wire.
-    #[serde(default = "detail_loaded_default", skip_serializing_if = "is_detail_loaded")]
+    #[serde(
+        default = "detail_loaded_default",
+        skip_serializing_if = "is_detail_loaded"
+    )]
     pub detail_loaded: bool,
 }
 
@@ -4752,6 +4764,7 @@ mod tests {
     fn native_conversation_actions_include_every_provider() {
         for provider in [
             ProviderKind::Amp,
+            ProviderKind::Antigravity,
             ProviderKind::Claude,
             ProviderKind::Codex,
             ProviderKind::Cursor,
@@ -4764,13 +4777,19 @@ mod tests {
             assert!(provider.supports_conversation_rollback());
         }
         for provider in [
-            ProviderKind::Antigravity,
             ProviderKind::Fx,
             ProviderKind::Kimi,
             ProviderKind::Droid,
         ] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
+        }
+        for provider in [
+            ProviderKind::Antigravity,
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+        ] {
+            assert!(provider.supports_multiple_accounts());
         }
     }
 
@@ -5863,7 +5882,10 @@ mod tests {
         let skeleton = hydrated.list_projection();
         assert!(!skeleton.detail_loaded);
         let skeleton_json = serde_json::to_value(&skeleton).unwrap();
-        assert_eq!(skeleton_json.get("detail_loaded"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            skeleton_json.get("detail_loaded"),
+            Some(&serde_json::json!(false))
+        );
         let restored_skeleton: AgentSession = serde_json::from_value(skeleton_json).unwrap();
         assert!(!restored_skeleton.detail_loaded);
         assert!(restored_skeleton.has_started());

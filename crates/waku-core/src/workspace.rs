@@ -414,9 +414,18 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         WorkspaceOperation::RunGitGraphAction { cwd, action } => WorkspaceResult::Branches {
             snapshot: crate::git_graph_ops::run_action(&cwd, &action)?,
         },
-        WorkspaceOperation::ReadAntigravitySwarm { session_id } => {
+        WorkspaceOperation::ReadAntigravitySwarm {
+            session_id,
+            config_dir,
+        } => {
+            let resolved_config_dir = config_dir
+                .as_deref()
+                .and_then(crate::command_env::resolve_config_dir);
             WorkspaceResult::AntigravitySwarm {
-                snapshot: crate::antigravity_swarm::read_swarm_snapshot(&session_id)?,
+                snapshot: crate::antigravity_swarm::read_swarm_snapshot_in(
+                    &session_id,
+                    resolved_config_dir.as_deref(),
+                )?,
             }
         }
     })

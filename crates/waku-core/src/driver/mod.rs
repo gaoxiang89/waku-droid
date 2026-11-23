@@ -1,6 +1,6 @@
 //! Local provider runtime owned by `waku-daemon`.
 
-mod acp;
+pub(crate) mod acp;
 mod activity;
 mod amp;
 mod claude;

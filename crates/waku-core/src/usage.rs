@@ -570,22 +570,52 @@ const ANTIGRAVITY_CREDITS_TIMEOUT: Duration = Duration::from_secs(6);
 /// Blocking, bounded by timeouts with process-group/Windows job cleanup, and
 /// never creates a conversation DB. Never call from the UI thread.
 pub fn fetch_antigravity_plan_usage(binary: &Path) -> anyhow::Result<PlanUsage> {
-    let usage = run_antigravity_print_command(binary, "/usage", ANTIGRAVITY_USAGE_TIMEOUT)?;
+    fetch_antigravity_plan_usage_in(binary, None)
+}
+
+/// Fetch Antigravity's plan usage scoped to `config_dir` when set, injecting
+/// account-isolated auth environment variables and `--settings <path>` when
+/// `<config_dir>/settings.json` is present.
+pub fn fetch_antigravity_plan_usage_in(
+    binary: &Path,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<PlanUsage> {
+    let usage =
+        run_antigravity_print_command(binary, "/usage", ANTIGRAVITY_USAGE_TIMEOUT, config_dir)?;
     let credits =
-        run_antigravity_print_command(binary, "/credits", ANTIGRAVITY_CREDITS_TIMEOUT).ok();
+        run_antigravity_print_command(binary, "/credits", ANTIGRAVITY_CREDITS_TIMEOUT, config_dir)
+            .ok();
     parse_antigravity_plan_usage(&usage, credits.as_ref())
+}
+
+fn antigravity_print_command(
+    binary: &Path,
+    prompt: &str,
+    config_dir: Option<&Path>,
+) -> std::process::Command {
+    let mut command = crate::command_env::command(binary);
+    crate::command_env::apply_provider_config_dir(
+        &mut command,
+        crate::model::ProviderKind::Antigravity,
+        config_dir,
+    );
+    if let Some(settings_path) = crate::command_env::antigravity_settings_arg(config_dir) {
+        command.arg("--settings").arg(settings_path);
+    }
+    command.args(["-p", prompt, "--output-format", "json"]);
+    if let Ok(cwd) = crate::acp_session::catalog_working_directory() {
+        command.current_dir(cwd);
+    }
+    command
 }
 
 fn run_antigravity_print_command(
     binary: &Path,
     prompt: &str,
     timeout: Duration,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<Value> {
-    let mut command = crate::command_env::command(binary);
-    command.args(["-p", prompt, "--output-format", "json"]);
-    if let Ok(cwd) = crate::acp_session::catalog_working_directory() {
-        command.current_dir(cwd);
-    }
+    let mut command = antigravity_print_command(binary, prompt, config_dir);
     let output = crate::command_env::output_with_timeout(&mut command, timeout).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
             anyhow!(tr!("usage_error.antigravity_usage_timeout"))
@@ -2116,6 +2146,47 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn antigravity_print_command_applies_settings_and_account_env() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-agy-usage-cmd-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+        std::fs::write(&settings_path, "{}").unwrap();
+        std::fs::write(dir.join(".env"), "GEMINI_API_KEY=usage-key\n").unwrap();
+
+        let default_cmd = antigravity_print_command(Path::new("agy"), "/usage", None);
+        let default_args: Vec<_> = default_cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(default_args, vec!["-p", "/usage", "--output-format", "json"]);
+
+        let isolated_cmd = antigravity_print_command(Path::new("agy"), "/usage", Some(&dir));
+        let isolated_args: Vec<_> = isolated_cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            isolated_args,
+            vec![
+                "--settings".to_owned(),
+                settings_path.to_string_lossy().into_owned(),
+                "-p".to_owned(),
+                "/usage".to_owned(),
+                "--output-format".to_owned(),
+                "json".to_owned(),
+            ]
+        );
+        assert!(isolated_cmd.get_envs().any(|(key, value)| {
+            key == "GEMINI_API_KEY" && value.and_then(|v| v.to_str()) == Some("usage-key")
+        }));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

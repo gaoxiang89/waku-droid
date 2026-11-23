@@ -78,12 +78,10 @@ pub(crate) fn session_title(
     title
         .map(str::trim)
         .filter(|title| !title.is_empty())
-        .and_then(|title| {
-            if provider == ProviderKind::Cursor {
-                crate::cursor_session::strip_title_envelope(title)
-            } else {
-                Some(title.to_owned())
-            }
+        .and_then(|title| match provider {
+            ProviderKind::Antigravity => crate::antigravity_session::strip_title_envelope(title),
+            ProviderKind::Cursor => crate::cursor_session::strip_title_envelope(title),
+            _ => Some(title.to_owned()),
         })
         .unwrap_or_else(|| {
             let short_id = session_id.chars().take(8).collect::<String>();
@@ -153,10 +151,22 @@ pub fn list_provider_sessions(
     cwd_filters: &[PathBuf],
     limit: usize,
 ) -> anyhow::Result<Vec<ProviderSessionSummary>> {
+    list_provider_sessions_in(provider, binary, cwd_filters, limit, None)
+}
+
+/// `config_dir`-scoped variant of [`list_provider_sessions`].
+pub fn list_provider_sessions_in(
+    provider: ProviderKind,
+    binary: &Path,
+    cwd_filters: &[PathBuf],
+    limit: usize,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<Vec<ProviderSessionSummary>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let agent = crate::driver::catalog_agent(provider, binary, &catalog_working_directory()?)?;
+    let catalog_cwd = catalog_working_directory()?;
+    let agent = crate::driver::acp::catalog_agent_in(provider, binary, &catalog_cwd, config_dir)?;
     list_provider_sessions_with_agent(provider, agent, cwd_filters, limit)
 }
 
@@ -268,10 +278,22 @@ pub fn provider_session_history(
     session_id: &str,
     visible_turn_limit: usize,
 ) -> anyhow::Result<ProviderSessionHistory> {
+    provider_session_history_in(provider, binary, cwd, session_id, visible_turn_limit, None)
+}
+
+/// `config_dir`-scoped variant of [`provider_session_history`].
+pub fn provider_session_history_in(
+    provider: ProviderKind,
+    binary: &Path,
+    cwd: &Path,
+    session_id: &str,
+    visible_turn_limit: usize,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<ProviderSessionHistory> {
     if session_id.trim().is_empty() || visible_turn_limit == 0 {
         return Ok(ProviderSessionHistory::default());
     }
-    let agent = crate::driver::catalog_agent(provider, binary, cwd)?;
+    let agent = crate::driver::acp::catalog_agent_in(provider, binary, cwd, config_dir)?;
     let updates = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&updates);
     let cwd = cwd.to_path_buf();
@@ -576,8 +598,14 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
             activity.complete = true;
         }
     }
-    if provider == ProviderKind::Cursor {
-        crate::cursor_session::expand_imported_history(&mut history);
+    match provider {
+        ProviderKind::Antigravity => {
+            crate::antigravity_session::expand_imported_history(&mut history);
+        }
+        ProviderKind::Cursor => {
+            crate::cursor_session::expand_imported_history(&mut history);
+        }
+        _ => {}
     }
     history
 }
@@ -915,6 +943,56 @@ mod tests {
         assert_eq!(
             session_title(ProviderKind::Cursor, Some(&seeded), "cursor-12345678"),
             "branch follow-up"
+        );
+    }
+
+    #[test]
+    fn antigravity_replay_strips_branch_envelope_and_keeps_block_alignment() {
+        let context = serde_json::to_string(&vec![
+            json!({"role": "user", "content": "prior prompt"}),
+            json!({"role": "assistant", "content": "prior answer"}),
+        ])
+        .unwrap();
+        let seeded =
+            crate::antigravity_session::prompt_with_fork_context(&context, "branch follow-up");
+        let (first_half, second_half) = seeded.split_at(seeded.len() / 2);
+
+        let history = history_from_updates(
+            ProviderKind::Antigravity,
+            &[
+                json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":first_half}}),
+                json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":second_half}}),
+                json!({"sessionUpdate":"tool_call","toolCallId":"c1","title":"read_file","rawInput":{"path":"lib.rs"}}),
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"branch reply"}}),
+            ],
+        );
+
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(history.turns[0].provider, Some(ProviderKind::Antigravity));
+        assert_eq!(history.messages.len(), 4);
+        assert_eq!(history.messages[0].content, "prior prompt");
+        assert_eq!(history.messages[1].content, "prior answer");
+        assert_eq!(history.messages[2].content, "branch follow-up");
+        assert_eq!(history.messages[3].content, "branch reply");
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1"))
+        );
+        assert_eq!(history.transcript_blocks.len(), 1);
+        assert_eq!(history.transcript_blocks[0].after_message, 3);
+        assert_eq!(
+            session_title(ProviderKind::Antigravity, Some(&seeded), "agy-12345678"),
+            "branch follow-up"
+        );
+        assert_eq!(
+            session_title(
+                ProviderKind::Antigravity,
+                Some("WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1 500\n[{\"role\":\"user\"..."),
+                "agy-12345678"
+            ),
+            "Antigravity session agy-1234"
         );
     }
 }

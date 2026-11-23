@@ -291,14 +291,17 @@ mod tests {
 
         let op = WorkspaceOperation::ReadAntigravitySwarm {
             session_id: snapshot.swarm_id.clone(),
+            config_dir: Some("~/.gemini/antigravity-work".into()),
         };
         let op_json = serde_json::to_string(&op).expect("serialize operation");
         let op_decoded: WorkspaceOperation =
             serde_json::from_str(&op_json).expect("deserialize operation");
         assert!(matches!(
             op_decoded,
-            WorkspaceOperation::ReadAntigravitySwarm { session_id }
-                if session_id == snapshot.swarm_id
+            WorkspaceOperation::ReadAntigravitySwarm {
+                session_id,
+                config_dir: Some(config_dir),
+            } if session_id == snapshot.swarm_id && config_dir == "~/.gemini/antigravity-work"
         ));
 
         let result = WorkspaceResult::AntigravitySwarm {

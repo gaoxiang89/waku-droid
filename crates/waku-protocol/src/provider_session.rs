@@ -10,6 +10,10 @@ use crate::model::{AgentSession, ProviderResumeCursor};
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "provider", rename_all = "camelCase")]
 pub enum ProviderSessionForkRequest {
+    Antigravity {
+        source: AgentSession,
+        turn_count: usize,
+    },
     Claude {
         session_id: String,
         resume_at: Option<String>,

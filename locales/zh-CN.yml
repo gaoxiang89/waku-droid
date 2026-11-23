@@ -1409,8 +1409,8 @@ swarm.failed_count: "%{count} 失败"
 swarm.posts_count: "%{count} 条消息"
 swarm.steps_count: "%{count} 步"
 swarm.unread_count: "%{count} 未读"
-swarm.wake_mentions: 仅 @提及
-swarm.wake_anything: 任意消息
+swarm.wake_mentions: 被 @ 时唤醒
+swarm.wake_anything: 有新消息即唤醒
 swarm.truncated_banner: "仅显示最新 %{shown} / %{total} 条消息"
 swarm.empty_non_antigravity: Swarm 看板仅适用于 Antigravity
 swarm.empty_non_antigravity_description: 切换到 Antigravity 任务以查看其 Swarm 看板和成员活动。
@@ -1432,6 +1432,9 @@ swarm.as_of_seq: "截至 #%{seq}"
 swarm.failure_quota: 配额
 swarm.failure_error: 错误
 swarm.brief_badge: 任务书
+swarm.viewing_as: "你是 @%{name}"
+swarm.show_more: 展开
+swarm.show_less: 收起
 usage.credits_remaining: "%{count} 积分"
 usage_error.start_antigravity_probe: "无法启动 `agy` 用量探测"
 usage_error.antigravity_usage_timeout: Antigravity 用量查询超时

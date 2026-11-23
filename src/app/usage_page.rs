@@ -33,6 +33,7 @@ fn provider_kind(provider: UsageProvider) -> ProviderKind {
     match provider {
         UsageProvider::Claude => ProviderKind::Claude,
         UsageProvider::Codex => ProviderKind::Codex,
+        UsageProvider::Antigravity => ProviderKind::Antigravity,
     }
 }
 
@@ -495,17 +496,31 @@ impl Waku {
         host: &waku_client::hosts::HostKey,
         theme: &Theme,
     ) -> Option<Div> {
-        let mut entries: Vec<(ProviderKind, Option<String>)> = super::usage_meter::PLAN_USAGE_PROVIDERS
-            .into_iter()
-            .filter(|provider| {
-                let key: PlanUsageKey = (host.clone(), *provider, None);
-                self.plan_usage.contains_key(&key)
+        let mut entries: Vec<(ProviderKind, Option<String>)> = Vec::new();
+        for provider in super::usage_meter::PLAN_USAGE_PROVIDERS {
+            let enabled = self.provider_enabled_on(host, provider);
+            let mut push_if_visible = |account_id: Option<String>| {
+                let candidate = (provider, account_id);
+                if entries.contains(&candidate) {
+                    return;
+                }
+                let key: PlanUsageKey = (host.clone(), provider, candidate.1.clone());
+                if self.plan_usage.contains_key(&key)
                     || self.plan_usage_error.contains_key(&key)
-                    || (self.provider_enabled_on(host, *provider)
-                        && !self.plan_usage_unconfigured.contains(&key))
-            })
-            .map(|provider| (provider, None))
-            .collect();
+                    || (enabled && !self.plan_usage_unconfigured.contains(&key))
+                {
+                    entries.push(candidate);
+                }
+            };
+            push_if_visible(None);
+            if provider.supports_multiple_accounts() {
+                for account in self.provider_accounts_for(host) {
+                    if account.provider == provider {
+                        push_if_visible(Some(account.id.clone()));
+                    }
+                }
+            }
+        }
 
         if *host == self.selected_host_key()
             && let Some(session) = self.selected_session()
@@ -961,7 +976,7 @@ impl Waku {
         // One column per day, per provider in ALL order. The chart paths and
         // the hover readout both consume this, so the number under the cursor
         // is by construction the number that was plotted.
-        let series: Vec<[f64; 2]> = days
+        let series: Vec<[f64; 3]> = days
             .iter()
             .map(|day| {
                 let slice = history.day(*day);
@@ -976,7 +991,7 @@ impl Waku {
                         })
                         .unwrap_or(0.0)
                 };
-                [value(UsageProvider::Claude), value(UsageProvider::Codex)]
+                UsageProvider::ALL.map(value)
             })
             .collect();
         // The scale tops out at the largest single provider-day, not the
@@ -1023,10 +1038,7 @@ impl Waku {
         }
 
         let hover = self.usage_chart_hover.filter(|index| *index < day_count);
-        let colors = [
-            provider_color(theme, ProviderKind::Claude),
-            provider_color(theme, ProviderKind::Codex),
-        ];
+        let colors = usage_provider_colors(theme);
         let bounds_cell = self.usage_chart_bounds.clone();
         let paint_series = series.clone();
         let paint_ticks = ticks.clone();
@@ -2380,11 +2392,8 @@ fn rank_by_cost(history: &UsageHistory) -> bool {
     history.cost_usd > 0.0
 }
 
-fn usage_provider_colors(theme: &Theme) -> [Hsla; 2] {
-    [
-        provider_color(theme, ProviderKind::Claude),
-        provider_color(theme, ProviderKind::Codex),
-    ]
+fn usage_provider_colors(theme: &Theme) -> [Hsla; 3] {
+    UsageProvider::ALL.map(|provider| provider_color(theme, provider_kind(provider)))
 }
 
 /// The period total in the ranking unit.
@@ -2461,16 +2470,14 @@ fn usage_list_empty_row(theme: &Theme, message: String) -> Div {
 /// one glance carries both size and mix.
 fn usage_split_bar(
     theme: &Theme,
-    colors: [Hsla; 2],
+    colors: [Hsla; 3],
     length: f32,
-    by_provider: &[ProviderDay; 2],
+    by_provider: &[ProviderDay; 3],
     by_cost: bool,
 ) -> Div {
-    let values = [
-        usage_provider_value(&by_provider[0], by_cost),
-        usage_provider_value(&by_provider[1], by_cost),
-    ];
-    let sum = values[0] + values[1];
+    let values = UsageProvider::ALL
+        .map(|provider| usage_provider_value(&by_provider[provider.index()], by_cost));
+    let sum: f64 = values.iter().sum();
     let length = if length > 0.0 {
         length.clamp(0.02, 1.0)
     } else {
@@ -2512,7 +2519,7 @@ fn usage_provider_value(entry: &ProviderDay, by_cost: bool) -> f64 {
 
 /// Per-provider amounts with their marks, skipping providers absent from
 /// the row.
-fn usage_provider_values(theme: &Theme, by_provider: &[ProviderDay; 2], by_cost: bool) -> Div {
+fn usage_provider_values(theme: &Theme, by_provider: &[ProviderDay; 3], by_cost: bool) -> Div {
     let mut row = div().flex().items_center().gap(px(14.0));
     for provider in UsageProvider::ALL {
         let entry = by_provider[provider.index()];
@@ -2638,21 +2645,20 @@ fn usage_month_strip(
     first_day: NaiveDate,
     peak: f64,
     by_cost: bool,
-    colors: [Hsla; 2],
+    colors: [Hsla; 3],
 ) -> impl IntoElement {
     let day_count = usage_history::days_in_month(first_day);
-    let values: Vec<[f64; 2]> = (0..day_count)
+    let values: Vec<[f64; 3]> = (0..day_count)
         .map(|offset| {
             let day = first_day + chrono::Days::new(u64::from(offset));
             history
                 .day(day)
                 .map(|slice| {
-                    [
-                        usage_provider_value(&slice.by_provider[0], by_cost),
-                        usage_provider_value(&slice.by_provider[1], by_cost),
-                    ]
+                    UsageProvider::ALL.map(|provider| {
+                        usage_provider_value(&slice.by_provider[provider.index()], by_cost)
+                    })
                 })
-                .unwrap_or([0.0, 0.0])
+                .unwrap_or([0.0; 3])
         })
         .collect();
     canvas(
@@ -2816,7 +2822,7 @@ fn usage_month_row(
     history: &UsageHistory,
     month: &MonthSlice,
     theme: &Theme,
-    colors: [Hsla; 2],
+    colors: [Hsla; 3],
     by_cost: bool,
     peak: f64,
     day_peak: f64,
@@ -3302,10 +3308,8 @@ mod tests {
                     cost_usd: 1.0,
                     total_tokens: 100,
                 },
-                ProviderDay {
-                    cost_usd: 0.0,
-                    total_tokens: 0,
-                },
+                ProviderDay::default(),
+                ProviderDay::default(),
             ],
             sessions: 1,
             cost_share: 1.0,

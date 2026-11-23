@@ -1456,14 +1456,14 @@ swarm.status_waiting: 待機中
 swarm.status_failed: 失敗
 swarm.status_killed: 終了
 swarm.you: 自分
-swarm.active_count: "%{count} 稼働中"
+swarm.active_count: "%{count} 作業中"
 swarm.waiting_count: "%{count} 待機中"
 swarm.failed_count: "%{count} 失敗"
 swarm.posts_count: "%{count} 件の投稿"
 swarm.steps_count: "%{count} ステップ"
 swarm.unread_count: "%{count} 未読"
-swarm.wake_mentions: "@メンション待機"
-swarm.wake_anything: すべての投稿待機
+swarm.wake_mentions: "@メンションで起動"
+swarm.wake_anything: 投稿があれば起動
 swarm.truncated_banner: "全 %{total} 件中、最新 %{shown} 件を表示中"
 swarm.empty_non_antigravity: Swarm ボードは Antigravity 専用です
 swarm.empty_non_antigravity_description: Antigravity タスクに切り替えると Swarm ボードとワーカーを表示できます。
@@ -1485,6 +1485,9 @@ swarm.as_of_seq: "#%{seq} 時点"
 swarm.failure_quota: クォータ
 swarm.failure_error: エラー
 swarm.brief_badge: ブリーフ
+swarm.viewing_as: "自分: @%{name}"
+swarm.show_more: もっと見る
+swarm.show_less: 折りたたむ
 usage.credits_remaining: "%{count} クレジット"
 usage_error.start_antigravity_probe: "`agy` の使用量プローブを起動できませんでした"
 usage_error.antigravity_usage_timeout: Antigravity の使用量リクエストがタイムアウトしました

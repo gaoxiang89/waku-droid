@@ -450,7 +450,10 @@ impl Backend for WakuBackend {
                         let binary = probe
                             .path
                             .ok_or_else(|| anyhow!("antigravity is not installed"))?;
-                        Some(crate::usage::fetch_antigravity_plan_usage(&binary)?)
+                        Some(crate::usage::fetch_antigravity_plan_usage_in(
+                            &binary,
+                            resolved_config_dir.as_deref(),
+                        )?)
                     }
                     _ => bail!("provider has no plan usage fetcher"),
                 };
@@ -474,6 +477,9 @@ impl Backend for WakuBackend {
                     .into_iter()
                     .filter_map(|account| {
                         let provider = match account.provider {
+                            ProviderKind::Antigravity => {
+                                crate::usage_history::UsageProvider::Antigravity
+                            }
                             ProviderKind::Claude => crate::usage_history::UsageProvider::Claude,
                             ProviderKind::Codex => crate::usage_history::UsageProvider::Codex,
                             _ => return None,
@@ -634,9 +640,13 @@ impl Backend for WakuBackend {
                     ProviderKind::Antigravity
                     | ProviderKind::Cursor
                     | ProviderKind::Droid
-                    | ProviderKind::Fx => {
-                        crate::acp_session::list_provider_sessions(provider, &binary, &[], limit)?
-                    }
+                    | ProviderKind::Fx => crate::acp_session::list_provider_sessions_in(
+                        provider,
+                        &binary,
+                        &[],
+                        limit,
+                        config_dir.as_deref(),
+                    )?,
                     ProviderKind::OpenCode => {
                         crate::opencode_session::list_provider_sessions(&binary, limit)?
                     }
@@ -714,20 +724,22 @@ impl Backend for WakuBackend {
                             VISIBLE_TURN_LIMIT,
                         )?
                     }
-                    ProviderResumeCursor::Antigravity { session_id }
+                    ProviderResumeCursor::Antigravity { session_id, .. }
                     | ProviderResumeCursor::Cursor { session_id, .. }
                     | ProviderResumeCursor::Droid { session_id }
                     | ProviderResumeCursor::Fx { session_id }
                     | ProviderResumeCursor::Grok { session_id }
                     | ProviderResumeCursor::Kimi { session_id } => {
                         let provider = cursor.provider();
-                        let binary = self.provider_binary(provider, None)?;
-                        crate::acp_session::provider_session_history(
+                        let binary = self.provider_binary(provider, account_ref)?;
+                        let config_dir = self.provider_config_dir(provider, account_ref);
+                        crate::acp_session::provider_session_history_in(
                             provider,
                             &binary,
                             &cwd,
                             session_id,
                             VISIBLE_TURN_LIMIT,
+                            config_dir.as_deref(),
                         )?
                     }
                     ProviderResumeCursor::DeepSeek { session_id } => {
@@ -1522,6 +1534,13 @@ impl WakuBackend {
                 self.fork_response_with_driver(source, cwd, turns_to_remove)?,
                 HashMap::new(),
             )),
+            ProviderKind::Antigravity => {
+                let fork = fork_provider_session(ProviderSessionForkRequest::Antigravity {
+                    source: source.clone(),
+                    turn_count,
+                })?;
+                Ok((fork.cursor, HashMap::new()))
+            }
             ProviderKind::Cursor => {
                 let fork = fork_provider_session(ProviderSessionForkRequest::Cursor {
                     source: source.clone(),
@@ -1577,10 +1596,7 @@ impl WakuBackend {
             }
             // Unreachable through the UI, which hides branching for providers
             // that answer `supports_conversation_fork` with false.
-            ProviderKind::Antigravity
-            | ProviderKind::Droid
-            | ProviderKind::Fx
-            | ProviderKind::Kimi => {
+            ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot branch a conversation at a turn",
                     source.provider.display_name()
@@ -1752,6 +1768,14 @@ impl WakuBackend {
                 .cursor;
                 Ok((Some(cursor), HashMap::new(), false))
             }
+            ProviderKind::Antigravity => {
+                let cursor = fork_provider_session(ProviderSessionForkRequest::Antigravity {
+                    source: source.clone(),
+                    turn_count: retained_turn_count,
+                })?
+                .cursor;
+                Ok((Some(cursor), HashMap::new(), false))
+            }
             ProviderKind::Cursor => {
                 let cursor = fork_provider_session(ProviderSessionForkRequest::Cursor {
                     source: source.clone(),
@@ -1785,10 +1809,7 @@ impl WakuBackend {
             )),
             // Unreachable through the UI, which hides rewinding for providers
             // that answer `supports_conversation_rollback` with false.
-            ProviderKind::Antigravity
-            | ProviderKind::Droid
-            | ProviderKind::Fx
-            | ProviderKind::Kimi => {
+            ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot rewind a conversation to a turn",
                     source.provider.display_name()
@@ -2060,8 +2081,14 @@ impl WakuBackend {
                     )?
                     .map(|validated| validated.raw);
             }
-            WorkspaceOperation::ReadAntigravitySwarm { session_id } => {
+            WorkspaceOperation::ReadAntigravitySwarm {
+                session_id,
+                config_dir,
+            } => {
                 crate::antigravity_swarm::validate_session_id(session_id)?;
+                *config_dir = self
+                    .validate_client_config_dir(ProviderKind::Antigravity, config_dir.as_deref())?
+                    .map(|validated| validated.raw);
             }
             _ => {}
         }
@@ -2287,6 +2314,11 @@ fn fork_provider_session(
                 fork_context.as_deref(),
                 turn_count,
             )?,
+            HashMap::new(),
+            None,
+        ),
+        ProviderSessionForkRequest::Antigravity { source, turn_count } => (
+            crate::antigravity_session::fork_session_at_turn(&source, turn_count)?,
             HashMap::new(),
             None,
         ),
@@ -3136,6 +3168,7 @@ mod tests {
             backend
                 .validate_workspace_operation(WorkspaceOperation::ReadAntigravitySwarm {
                     session_id: "b0f6aa6a-fe94-4446-91d5-814e6342a5de".into(),
+                    config_dir: None,
                 })
                 .is_ok()
         );
@@ -3144,11 +3177,20 @@ mod tests {
                 backend
                     .validate_workspace_operation(WorkspaceOperation::ReadAntigravitySwarm {
                         session_id: invalid.into(),
+                        config_dir: None,
                     })
                     .is_err(),
                 "session_id {invalid:?} should be rejected"
             );
         }
+        assert!(
+            backend
+                .validate_workspace_operation(WorkspaceOperation::ReadAntigravitySwarm {
+                    session_id: "b0f6aa6a-fe94-4446-91d5-814e6342a5de".into(),
+                    config_dir: Some(outside_dir.to_string_lossy().into_owned()),
+                })
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3255,5 +3297,38 @@ mod tests {
         assert_eq!(rollback_calls.load(Ordering::Acquire), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_fork_provider_session_seeds_retained_turns() {
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Antigravity);
+        session.begin_turn("first question");
+        session.mark_active_turn_provider_started();
+        session.push_message(crate::model::MessageRole::Assistant, "first answer");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.begin_turn("second question");
+        session.mark_active_turn_provider_started();
+        session.push_message(crate::model::MessageRole::Assistant, "second answer");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+
+        let forked = fork_provider_session(ProviderSessionForkRequest::Antigravity {
+            source: session,
+            turn_count: 1,
+        })
+        .expect("antigravity fork should succeed");
+
+        match forked.cursor {
+            ProviderResumeCursor::Antigravity {
+                session_id,
+                fork_context: Some(context),
+            } => {
+                assert!(session_id.is_empty());
+                assert!(context.contains("first question"));
+                assert!(context.contains("first answer"));
+                assert!(!context.contains("second question"));
+                assert!(!context.contains("second answer"));
+            }
+            other => panic!("unexpected cursor: {other:?}"),
+        }
     }
 }

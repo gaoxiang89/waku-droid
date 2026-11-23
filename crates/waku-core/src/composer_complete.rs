@@ -360,7 +360,8 @@ fn assemble_slash_commands(
             }
         }
         // Antigravity reads `.gemini/skills` first, then the shared skill
-        // trees. Its user-level skills live under the CLI profile.
+        // trees. Its user-level skills live under the CLI profile (or custom
+        // account config dir when isolated).
         ProviderKind::Antigravity => {
             scan_skill_files(
                 provider,
@@ -368,7 +369,13 @@ fn assemble_slash_commands(
                 &mut commands,
             );
             scan_skill_files(provider, &project_root.join(".agent/skills"), &mut commands);
-            if let Some(home) = home.as_deref() {
+            if let Some(config_dir) = account_config_dir {
+                let nested = config_dir.join("config").join("skills");
+                if nested.is_dir() {
+                    scan_skill_files(provider, &nested, &mut commands);
+                }
+                scan_skill_files(provider, &config_dir.join("skills"), &mut commands);
+            } else if let Some(home) = home.as_deref() {
                 scan_skill_files(provider, &home.join(".gemini/config/skills"), &mut commands);
                 scan_skill_files(
                     provider,
@@ -1666,6 +1673,65 @@ mod tests {
             );
         }
         assert!(merged.iter().any(|command| command.name == "extra-live"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn antigravity_account_config_dir_overrides_user_skills_root() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-antigravity-account-skills-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let account_dir = root.join("antigravity-work");
+
+        std::fs::create_dir_all(project.join(".gemini/skills/proj-gemini-skill")).unwrap();
+        std::fs::create_dir_all(project.join(".agent/skills/proj-agent-skill")).unwrap();
+        std::fs::create_dir_all(account_dir.join("skills/work-skill")).unwrap();
+        std::fs::create_dir_all(account_dir.join("config/skills/work-config-skill")).unwrap();
+
+        std::fs::write(
+            project.join(".gemini/skills/proj-gemini-skill/SKILL.md"),
+            "---\nname: proj-gemini-skill\ndescription: Project Gemini skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".agent/skills/proj-agent-skill/SKILL.md"),
+            "---\nname: proj-agent-skill\ndescription: Project Agent skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            account_dir.join("skills/work-skill/SKILL.md"),
+            "---\nname: work-skill\ndescription: Work account skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            account_dir.join("config/skills/work-config-skill/SKILL.md"),
+            "---\nname: work-config-skill\ndescription: Work config skill\n---\nBody",
+        )
+        .unwrap();
+
+        let commands = assemble_slash_commands(
+            ProviderKind::Antigravity,
+            &project,
+            Some(&account_dir),
+            Vec::new(),
+        );
+        for expected in [
+            "proj-gemini-skill",
+            "proj-agent-skill",
+            "work-skill",
+            "work-config-skill",
+        ] {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.name == expected && command.scope == CommandScope::Skill),
+                "missing skill {expected} in {commands:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

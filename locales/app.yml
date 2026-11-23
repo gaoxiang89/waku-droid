@@ -2859,7 +2859,7 @@ swarm.status_killed:
 swarm.you:
   en: you
 swarm.active_count:
-  en: "%{count} active"
+  en: "%{count} working"
 swarm.waiting_count:
   en: "%{count} waiting"
 swarm.failed_count:
@@ -2871,9 +2871,9 @@ swarm.steps_count:
 swarm.unread_count:
   en: "%{count} unread"
 swarm.wake_mentions:
-  en: for @mentions
+  en: wakes on @mention
 swarm.wake_anything:
-  en: any post
+  en: wakes on any post
 swarm.truncated_banner:
   en: "Showing newest %{shown} of %{total} posts"
 swarm.empty_non_antigravity:
@@ -2916,6 +2916,12 @@ swarm.failure_error:
   en: Error
 swarm.brief_badge:
   en: brief
+swarm.viewing_as:
+  en: "you are @%{name}"
+swarm.show_more:
+  en: Show more
+swarm.show_less:
+  en: Show less
 usage.credits_remaining:
   en: "%{count} credits"
 usage_error.start_antigravity_probe:

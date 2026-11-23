@@ -381,6 +381,85 @@ pub fn resolve_config_dir(spec: &str) -> Option<PathBuf> {
     Some(PathBuf::from(spec))
 }
 
+const ANTIGRAVITY_ENV_ALLOWLIST: &[&str] = &[
+    "GEMINI_API_KEY",
+    "AGY_ADC_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+];
+const MAX_ANTIGRAVITY_ENV_FILE_BYTES: u64 = 16 * 1024;
+
+/// Derive process environment overrides for an Antigravity account root.
+///
+/// Inspects `<config_dir>/application_default_credentials.json` (enabling
+/// Vertex ADC via `AGY_ADC_AUTH=true` + `GOOGLE_APPLICATION_CREDENTIALS`) and
+/// allowlisted keys in `<config_dir>/.env` (`GEMINI_API_KEY`, ADC, and GCP
+/// project/location overrides), with `.env` taking precedence over auto-detected
+/// ADC keys.
+pub fn antigravity_account_env(config_dir: &Path) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    let adc_path = config_dir.join("application_default_credentials.json");
+    if adc_path.is_file() {
+        env.push(("AGY_ADC_AUTH".into(), "true".into()));
+        env.push((
+            "GOOGLE_APPLICATION_CREDENTIALS".into(),
+            adc_path.to_string_lossy().into_owned(),
+        ));
+    }
+    let env_file = config_dir.join(".env");
+    if let Ok(meta) = std::fs::metadata(&env_file)
+        && meta.is_file()
+    {
+        let limit = meta.len().min(MAX_ANTIGRAVITY_ENV_FILE_BYTES) as usize;
+        if let Ok(file) = std::fs::File::open(&env_file) {
+            use std::io::Read as _;
+            let mut buf = Vec::with_capacity(limit);
+            if file.take(MAX_ANTIGRAVITY_ENV_FILE_BYTES).read_to_end(&mut buf).is_ok() {
+                let text = String::from_utf8_lossy(&buf);
+                for raw_line in text.lines() {
+                    let line = raw_line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+                    let Some((raw_key, raw_val)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let key = raw_key.trim();
+                    if !ANTIGRAVITY_ENV_ALLOWLIST.contains(&key) {
+                        continue;
+                    }
+                    let val = raw_val.trim();
+                    let unquoted = if val.len() >= 2
+                        && ((val.starts_with('"') && val.ends_with('"'))
+                            || (val.starts_with('\'') && val.ends_with('\'')))
+                    {
+                        &val[1..val.len() - 1]
+                    } else {
+                        val
+                    };
+                    if let Some(existing) = env.iter_mut().find(|(k, _)| k == key) {
+                        existing.1 = unquoted.to_owned();
+                    } else {
+                        env.push((key.to_owned(), unquoted.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    env
+}
+
+/// Returns `<config_dir>/settings.json` when an Antigravity account profile
+/// carries its own CLI settings file.
+pub fn antigravity_settings_arg(config_dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = config_dir?;
+    let settings = dir.join("settings.json");
+    settings.is_file().then_some(settings)
+}
+
 /// Inject the provider-specific configuration root environment variable when a
 /// custom account directory is active.
 ///
@@ -396,6 +475,11 @@ pub fn apply_provider_config_dir(
         return;
     };
     match provider {
+        crate::model::ProviderKind::Antigravity => {
+            for (key, value) in antigravity_account_env(dir) {
+                command.env(key, value);
+            }
+        }
         crate::model::ProviderKind::Claude => {
             command.env("CLAUDE_CONFIG_DIR", dir);
         }
@@ -645,9 +729,7 @@ fn lookup_env_var_os(
 
 fn cached_login_shell_variable(name: &OsStr) -> Option<OsString> {
     let lock = LOGIN_SHELL_ENVIRONMENT.get()?;
-    let guard = lock
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = lock.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     lookup_env_var_os(name, None, guard.as_deref())
 }
 
@@ -1793,5 +1875,50 @@ mod tests {
                 Some(OsStr::new("/tmp/codex-work"))
             )]
         );
+    }
+
+    #[test]
+    fn antigravity_account_env_reads_adc_and_allowlisted_dotenv_only() {
+        let dir = std::env::temp_dir().join(format!("waku-agy-env-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(antigravity_settings_arg(Some(&dir)), None);
+
+        let adc = dir.join("application_default_credentials.json");
+        std::fs::write(&adc, "{}").unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, "{\"modelProvider\":\"gemini\"}").unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "# comment\nGEMINI_API_KEY=\"gk-123\"\nUNRELATED_SECRET=nope\nGOOGLE_CLOUD_PROJECT='proj-1'\nGOOGLE_APPLICATION_CREDENTIALS=/override/adc.json\n",
+        )
+        .unwrap();
+
+        assert_eq!(antigravity_settings_arg(Some(&dir)), Some(settings));
+        let env = antigravity_account_env(&dir);
+        assert_eq!(
+            env,
+            vec![
+                ("AGY_ADC_AUTH".into(), "true".into()),
+                (
+                    "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                    "/override/adc.json".into()
+                ),
+                ("GEMINI_API_KEY".into(), "gk-123".into()),
+                ("GOOGLE_CLOUD_PROJECT".into(), "proj-1".into()),
+            ]
+        );
+
+        let mut cmd = plain_command("echo");
+        apply_provider_config_dir(&mut cmd, crate::model::ProviderKind::Antigravity, Some(&dir));
+        let mut applied: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+            .collect();
+        applied.sort();
+        let mut expected = env.clone();
+        expected.sort();
+        assert_eq!(applied, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

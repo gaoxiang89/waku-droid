@@ -67,12 +67,40 @@ pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
 /// Reads the Antigravity swarm snapshot for `session_id` (whether `session_id`
 /// is the coordinator or a worker listed on a swarm's roster).
 pub fn read_swarm_snapshot(session_id: &str) -> anyhow::Result<Option<AntigravitySwarmSnapshot>> {
+    read_swarm_snapshot_in(session_id, None)
+}
+
+/// `config_dir`-scoped variant of [`read_swarm_snapshot`]. When `config_dir` is
+/// `Some`, looks only inside that account root (plus its parent app-data root
+/// when `config_dir` is a `sidecar_data` directory) without falling back to
+/// default Antigravity data roots.
+pub fn read_swarm_snapshot_in(
+    session_id: &str,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<Option<AntigravitySwarmSnapshot>> {
     validate_session_id(session_id)?;
-    let roots = default_data_roots();
+    let roots = match config_dir {
+        Some(dir) => account_data_roots(dir),
+        None => default_data_roots(),
+    };
     if roots.is_empty() {
         return Ok(None);
     }
     read_swarm_snapshot_in_roots(&roots, session_id, now_unix_ms())
+}
+
+fn account_data_roots(config_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if config_dir.file_name().and_then(|name| name.to_str()) == Some("sidecar_data")
+        && let Some(app_data) = app_data_root_from_sidecar_env(config_dir)
+        && app_data.join("brain").is_dir()
+    {
+        roots.push(app_data);
+    }
+    if config_dir.join("brain").is_dir() && !roots.contains(&config_dir.to_path_buf()) {
+        roots.push(config_dir.to_path_buf());
+    }
+    roots
 }
 
 fn default_data_roots() -> Vec<PathBuf> {
@@ -1686,5 +1714,58 @@ mod tests {
         assert_eq!(parsed.total_messages, 2);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_swarm_snapshot_in_isolates_to_specified_config_dir() {
+        let base = temp_root();
+        let account_a = base.join("account-a");
+        let account_b = base.join("account-b");
+        let sidecar_a = account_a.join("sidecar_data");
+        fs::create_dir_all(&sidecar_a).unwrap();
+
+        let coord_a = "coord-account-a";
+        let coord_b = "coord-account-b";
+        write_file(
+            &swarm_dir(&account_a, coord_a).join("members.json"),
+            r#"{"title":"Swarm A","members":{"coordinator":{"conversation_id":"coord-account-a","role":"coordinator"}}}"#,
+        );
+        write_file(
+            &swarm_dir(&account_b, coord_b).join("members.json"),
+            r#"{"title":"Swarm B","members":{"coordinator":{"conversation_id":"coord-account-b","role":"coordinator"}}}"#,
+        );
+
+        let snap_a = read_swarm_snapshot_in(coord_a, Some(&account_a))
+            .expect("read account_a")
+            .expect("swarm A exists");
+        assert_eq!(snap_a.title, "Swarm A");
+
+        let snap_sidecar = read_swarm_snapshot_in(coord_a, Some(&sidecar_a))
+            .expect("read sidecar_data")
+            .expect("swarm A resolves from sidecar_data parent");
+        assert_eq!(snap_sidecar.title, "Swarm A");
+
+        assert!(
+            read_swarm_snapshot_in(coord_a, Some(&account_b))
+                .expect("read account_b for coord_a")
+                .is_none(),
+            "config_dir isolation must not leak across account roots"
+        );
+        assert!(
+            read_swarm_snapshot_in(coord_b, Some(&account_a))
+                .expect("read account_a for coord_b")
+                .is_none(),
+            "config_dir isolation must not leak to account_b"
+        );
+
+        let empty_account = base.join("empty-account");
+        fs::create_dir_all(&empty_account).unwrap();
+        assert!(
+            read_swarm_snapshot_in(coord_a, Some(&empty_account))
+                .expect("read empty account")
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -72,22 +72,41 @@ impl Waku {
     }
 
     /// Force an immediate background refresh of all enabled plan-usage
-    /// providers on `host` (used by the Usage settings page Refresh control).
+    /// providers (and their configured named accounts) on `host` (used by
+    /// the Usage settings page Refresh control).
     pub(super) fn refresh_all_plan_usage_for_host(
         &mut self,
         host: &waku_client::hosts::HostKey,
         cx: &mut Context<Self>,
     ) {
-        for provider in PLAN_USAGE_PROVIDERS {
-            if !self.provider_enabled_on(host, provider) {
-                continue;
-            }
-            let key: PlanUsageKey = (host.clone(), provider, None);
+        for (provider, account_id) in self.enabled_plan_usage_targets_for_host(host) {
+            let key: PlanUsageKey = (host.clone(), provider, account_id);
             self.plan_usage_checked_at.remove(&key);
             self.plan_usage_unconfigured.remove(&key);
             self.plan_usage_stale.insert(key);
         }
         self.maybe_refresh_plan_usage_for_host(host, cx);
+    }
+
+    fn enabled_plan_usage_targets_for_host(
+        &self,
+        host: &waku_client::hosts::HostKey,
+    ) -> Vec<(ProviderKind, Option<String>)> {
+        PLAN_USAGE_PROVIDERS
+            .into_iter()
+            .filter(|provider| self.provider_enabled_on(host, *provider))
+            .flat_map(|provider| {
+                let account_ids = if provider.supports_multiple_accounts() {
+                    self.provider_accounts_for_kind(host, provider)
+                        .into_iter()
+                        .map(|account| account.id)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                plan_usage_targets_for_provider(provider, account_ids)
+            })
+            .collect()
     }
 
     fn refresh_plan_usage_targets(
@@ -106,11 +125,7 @@ impl Waku {
         };
         let host_generation = owner.generation;
         let daemon = owner.daemon.clone();
-        let mut targets: Vec<(ProviderKind, Option<String>)> = PLAN_USAGE_PROVIDERS
-            .into_iter()
-            .filter(|provider| self.provider_enabled_on(host, *provider))
-            .map(|provider| (provider, None))
-            .collect();
+        let mut targets = self.enabled_plan_usage_targets_for_host(host);
         if let Some(target) = explicit_target
             && !targets.contains(&target)
         {
@@ -776,6 +791,24 @@ pub(super) fn meter_bar(theme: &Theme, percent: f64) -> Div {
         .child(div().h_full().w(relative(fraction)).rounded_full().bg(fill))
 }
 
+/// Expands a plan-usage provider into its default account target `(provider, None)`
+/// plus any configured named accounts when the provider supports multiple accounts.
+fn plan_usage_targets_for_provider(
+    provider: ProviderKind,
+    account_ids: impl IntoIterator<Item = String>,
+) -> Vec<(ProviderKind, Option<String>)> {
+    let mut targets = vec![(provider, None)];
+    if provider.supports_multiple_accounts() {
+        for id in account_ids {
+            let candidate = (provider, Some(id));
+            if !targets.contains(&candidate) {
+                targets.push(candidate);
+            }
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +816,32 @@ mod tests {
     #[test]
     fn plan_usage_providers_include_antigravity() {
         assert!(PLAN_USAGE_PROVIDERS.contains(&ProviderKind::Antigravity));
+    }
+
+    #[test]
+    fn plan_usage_targets_include_named_accounts_only_for_multi_account_providers() {
+        assert_eq!(
+            plan_usage_targets_for_provider(
+                ProviderKind::Antigravity,
+                ["work".to_owned(), "personal".to_owned(), "work".to_owned()]
+            ),
+            vec![
+                (ProviderKind::Antigravity, None),
+                (ProviderKind::Antigravity, Some("work".to_owned())),
+                (ProviderKind::Antigravity, Some("personal".to_owned())),
+            ]
+        );
+        assert_eq!(
+            plan_usage_targets_for_provider(ProviderKind::Claude, ["team".to_owned()]),
+            vec![
+                (ProviderKind::Claude, None),
+                (ProviderKind::Claude, Some("team".to_owned())),
+            ]
+        );
+        assert_eq!(
+            plan_usage_targets_for_provider(ProviderKind::Grok, ["ignored".to_owned()]),
+            vec![(ProviderKind::Grok, None)]
+        );
     }
 
     #[test]
