@@ -19,11 +19,14 @@ enum DaemonTerminalInput {
     Shutdown,
 }
 
+type SharedMaster = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+
 pub struct DaemonTerminal {
     job: Option<crate::process_tree::KillOnCloseJob>,
-    /// Kept so ConPTY outlives a writer thread that has already exited, and dropped
-    /// during `Drop` to close the pseudo-console and unblock `reader.read()`.
-    master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+    /// Shared with the child watcher so natural exit can close the ConPTY and
+    /// unblock output. `Option` makes that close exactly once across watcher,
+    /// reader, and `Drop`, while the mutex serializes close with resize.
+    master: Option<SharedMaster>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     input: Option<Sender<DaemonTerminalInput>>,
     output: TerminalEvents,
@@ -88,7 +91,7 @@ impl DaemonTerminal {
         let child = Arc::new(Mutex::new(child));
         drop(pair.slave);
         let output = TerminalEvents::new(events, cols, rows);
-        let master = Arc::new(Mutex::new(pair.master));
+        let master = Arc::new(Mutex::new(Some(pair.master)));
         let (input, rx) = unbounded::<DaemonTerminalInput>();
         let stopped = Arc::new(AtomicBool::new(false));
         let exit_reported = Arc::new(AtomicBool::new(false));
@@ -100,15 +103,20 @@ impl DaemonTerminal {
             output: output.clone(),
             stopped: stopped.clone(),
         };
-        let replies = input;
+        let replies = input.clone();
+        let watcher_input = input;
         let writer_events = output.clone();
+        let writer_master = master.clone();
         std::thread::Builder::new()
             .name("waku-terminal-input".into())
             .spawn(move || {
                 run_terminal_input(
                     rx,
                     writer,
-                    |size| master.lock().resize(size),
+                    |size| match writer_master.lock().as_mut() {
+                        Some(master) => master.resize(size),
+                        None => Ok(()),
+                    },
                     |error| {
                         let _ = writer_events.send_ephemeral(WireDriverEvent::new(
                             "terminalError",
@@ -119,9 +127,9 @@ impl DaemonTerminal {
             })
             .context("start terminal input")?;
         let watcher_child = terminal.child.clone();
-        let watcher_output = output.clone();
         let watcher_stopped = stopped.clone();
-        let watcher_reported = exit_reported.clone();
+        let watcher_master = master.clone();
+        let reader_master = master.clone();
         std::thread::Builder::new()
             .name("waku-terminal-output".into())
             .spawn(move || {
@@ -141,6 +149,8 @@ impl DaemonTerminal {
                     }
                 }
                 if !stopped.load(Ordering::Acquire) {
+                    close_master(&reader_master);
+                    let _ = replies.send(DaemonTerminalInput::Shutdown);
                     report_exit(&output, &exit_reported);
                 }
             })
@@ -149,7 +159,7 @@ impl DaemonTerminal {
         // ConPTY keeps its output pipe open while the master handle lives,
         // so a shell that exits on its own never produces the pipe EOF the
         // reader waits for. Watch the child handle instead (Zed waits the
-        // same way) and report the exit from here.
+        // same way), close the master, and let the reader report after EOF.
         std::thread::Builder::new()
             .name("waku-terminal-child".into())
             .spawn(move || {
@@ -157,7 +167,10 @@ impl DaemonTerminal {
                     let exited = watcher_child.lock().try_wait().ok().flatten().is_some();
                     if exited {
                         if !watcher_stopped.load(Ordering::Acquire) {
-                            report_exit(&watcher_output, &watcher_reported);
+                            // Closing the master delivers EOF to the output
+                            // reader, which reports exit only after draining.
+                            close_master(&watcher_master);
+                            let _ = watcher_input.send(DaemonTerminalInput::Shutdown);
                         }
                         return;
                     }
@@ -200,8 +213,16 @@ impl Drop for DaemonTerminal {
         self.job.take();
         let _ = self.child.lock().kill();
         let _ = self.child.lock().try_wait();
-        self.master.take();
+        if let Some(master) = self.master.take() {
+            close_master(&master);
+        }
     }
+}
+
+fn close_master(master: &SharedMaster) {
+    // Do not run the ConPTY destructor under the resize mutex.
+    let master = master.lock().take();
+    drop(master);
 }
 
 fn report_exit(output: &TerminalEvents, reported: &AtomicBool) {

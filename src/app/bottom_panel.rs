@@ -935,11 +935,15 @@ impl Waku {
         }
     }
 
-    /// Drop a deleted session's share of the bottom panel. Terminal groups
-    /// belong to the workspace, so they outlive the session while any other
-    /// session still opens into it; only the workspace's last session takes
-    /// the PTYs down.
-    pub(super) fn remove_bottom_panel_session_state(&mut self, session_id: Uuid) {
+    /// Remove a session's share of the bottom panel. Terminal groups belong
+    /// to the workspace, so they outlive the session while any other session
+    /// still opens into it. Host disconnects detach those groups but preserve
+    /// their saved layouts for reconnect.
+    pub(super) fn remove_bottom_panel_session_state(
+        &mut self,
+        session_id: Uuid,
+        preserve_saved_layout: bool,
+    ) {
         let Some(scope) = self.panel_scope_for_session(session_id) else {
             return;
         };
@@ -958,11 +962,11 @@ impl Waku {
             if let Some(removed) = removed {
                 self.bottom_panel_workspace_states.insert(scope, removed);
             }
-        } else {
+        } else if !preserve_saved_layout {
             self.remove_workspace_terminal_layouts(&scope);
         }
-        // A workspace with no sessions left drops its groups, which is what
-        // shuts the PTYs down.
+        // Dropping the last workspace session's groups detaches their views;
+        // the daemon shells remain available until CloseTerminal.
     }
 
     pub(super) fn clear_bottom_panel_state(&mut self) {

@@ -30,6 +30,7 @@ mod platform {
     enum DaemonTerminalInput {
         Write(Vec<u8>),
         Resize(WindowSize),
+        Shutdown,
     }
 
     pub struct DaemonTerminal {
@@ -192,6 +193,7 @@ mod platform {
                                 writer_pty.lock().on_resize(size);
                                 Ok(())
                             }
+                            DaemonTerminalInput::Shutdown => break,
                         };
                         if let Err(error) = result {
                             if !writer_stopped.load(Ordering::Acquire) {
@@ -211,6 +213,7 @@ mod platform {
             let reader_stopped = stopped.clone();
             let reader_events = events.clone();
             let reader_poller_thread = reader_poller.clone();
+            let reader_writer_poller = writer_poller.clone();
             let reply_tx = input_tx.clone();
             let reader = match std::thread::Builder::new()
                 .name("waku-daemon-terminal-output".into())
@@ -306,6 +309,11 @@ mod platform {
                         }
                     }
                     let _ = reader_pty.lock().deregister(&reader_poller_thread);
+                    // A naturally exited shell leaves the daemon terminal record
+                    // alive for snapshots. Explicitly wake both possible writer
+                    // waits so that record does not pin the input OS thread.
+                    let _ = reply_tx.send(DaemonTerminalInput::Shutdown);
+                    let _ = reader_writer_poller.notify();
                 }) {
                 Ok(reader) => reader,
                 Err(error) => {

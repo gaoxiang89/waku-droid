@@ -200,7 +200,7 @@ impl Waku {
                             this.goal_observed_at.remove(&id);
                             this.reset_session_runtime(id);
                             this.remove_right_panel_session_state(id);
-                            this.remove_bottom_panel_session_state(id);
+                            this.remove_bottom_panel_session_state(id, false);
                             this.background_work.remove(&id);
                             this.composer_drafts
                                 .remove(crate::persistence::ComposerDraftKey::Session(id));
@@ -591,7 +591,7 @@ impl Waku {
         // The panel cleanup reads the session's background-work keys, so it
         // runs before that registry is dropped.
         self.remove_right_panel_session_state(session_id);
-        self.remove_bottom_panel_session_state(session_id);
+        self.remove_bottom_panel_session_state(session_id, false);
         self.background_work.remove(&session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);

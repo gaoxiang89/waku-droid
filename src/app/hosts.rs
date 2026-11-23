@@ -784,7 +784,7 @@ impl Waku {
             // Panel cleanup reads the session's background-work keys, so it
             // runs before that registry is dropped.
             self.remove_right_panel_session_state(*id);
-            self.remove_bottom_panel_session_state(*id);
+            self.remove_bottom_panel_session_state(*id, true);
             self.background_work.remove(id);
             self.task_switcher.remove(*id);
         }

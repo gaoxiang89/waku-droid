@@ -253,6 +253,8 @@ impl Waku {
                     Err(error) => this.show_toast(error.to_string()),
                     _ => {}
                 }
+                this.state.bottom_panel_visible = this.bottom_panel_visible;
+                this.state.right_panel_visible = this.right_panel_visible;
                 this.save_terminal_layouts(cx, None);
                 cx.notify();
             });
@@ -366,6 +368,8 @@ impl Waku {
         if !saved.right.is_empty() {
             self.right_panel_visible = saved.right_visible;
         }
+        self.state.bottom_panel_visible = self.bottom_panel_visible;
+        self.state.right_panel_visible = self.right_panel_visible;
     }
 
     pub(super) fn save_terminal_layouts(

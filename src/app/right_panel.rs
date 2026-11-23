@@ -3494,8 +3494,8 @@ impl Waku {
     /// Remove a deleted session's share of the panel state. A review pinned
     /// to one of its turns and the background work it reported close with
     /// it; everything else belongs to the workspace and survives while any
-    /// other session still opens into it. Only when the last session of a
-    /// workspace goes away do the terminals and browsers shut down.
+    /// other session still opens into it. When the last session goes away,
+    /// terminal views detach and browsers close; daemon shells keep running.
     pub(super) fn remove_right_panel_session_state(&mut self, session_id: Uuid) {
         let Some(scope) = self.panel_scope_for_session(session_id) else {
             return;

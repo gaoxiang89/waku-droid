@@ -127,6 +127,7 @@ enum TerminalUiEvent {
     /// BEL, or an OSC 9 / OSC 777 desktop notification (`None` for BEL).
     Alert(Option<TerminalAlert>),
     Exited,
+    Failed(String),
 }
 
 /// A desktop notification a program asked for, as coding agents do when a
@@ -568,6 +569,11 @@ impl RemoteTerminal {
             dirty.store(true, Ordering::Release);
             let _ = wake.try_send(());
         };
+        let failed = |ui_events: &Sender<TerminalUiEvent>, message: String| {
+            let _ = ui_events.send(TerminalUiEvent::Failed(message));
+            dirty.store(true, Ordering::Release);
+            let _ = wake.try_send(());
+        };
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return;
@@ -621,32 +627,54 @@ impl RemoteTerminal {
                         if snapshot.exited {
                             if initial_attach && !respawned {
                                 respawned = true;
-                                if client
-                                    .request(
-                                        self.session_id,
-                                        self.runtime_id,
-                                        waku_client::Command::OpenTerminal {
-                                            cwd: self.working_directory.clone(),
-                                            cols: desired.0 as u16,
-                                            rows: desired.1 as u16,
-                                        },
-                                    )
-                                    .is_ok()
-                                {
-                                    // The dead terminal's terminalExited was
-                                    // queued before its snapshot reported
-                                    // `exited`; drain it so it cannot kill the
-                                    // replacement, then attach the new shell
-                                    // from a clean snapshot.
-                                    while events.try_recv().is_ok() {}
-                                    offset = 0;
-                                    needs_snapshot = true;
-                                    continue;
+                                match client.request(
+                                    self.session_id,
+                                    self.runtime_id,
+                                    waku_client::Command::OpenTerminal {
+                                        cwd: self.working_directory.clone(),
+                                        cols: desired.0 as u16,
+                                        rows: desired.1 as u16,
+                                    },
+                                ) {
+                                    Ok(_) => {
+                                        // The dead terminal's terminalExited was
+                                        // queued before its snapshot reported
+                                        // `exited`; drain it so it cannot kill the
+                                        // replacement, then attach the new shell
+                                        // from a clean snapshot.
+                                        while events.try_recv().is_ok() {}
+                                        offset = 0;
+                                        needs_snapshot = true;
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        failed(
+                                            &ui_events,
+                                            format!("could not restart remote terminal: {error:#}"),
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                             exited(&ui_events);
                             return;
                         }
+                    }
+                    Err(error) if client.is_disconnected() => {
+                        let Some(replacement) = self.await_replacement(&client) else {
+                            if !self.closed.load(Ordering::Acquire) {
+                                failed(
+                                    &ui_events,
+                                    format!("could not reconnect remote terminal: {error:#}"),
+                                );
+                            }
+                            return;
+                        };
+                        client = replacement;
+                        events = client.subscribe(self.session_id, self.runtime_id);
+                        // Retry the same attach on the replacement. `offset`
+                        // and `needs_snapshot` deliberately remain unchanged.
+                        continue;
                     }
                     Err(error)
                         if !create
@@ -659,32 +687,43 @@ impl RemoteTerminal {
                             (term.columns() as u16, term.screen_lines() as u16)
                         };
                         respawned = true;
-                        if client
-                            .request(
-                                self.session_id,
-                                self.runtime_id,
-                                waku_client::Command::OpenTerminal {
-                                    cwd: self.working_directory.clone(),
-                                    cols,
-                                    rows,
-                                },
-                            )
-                            .is_ok()
-                        {
-                            // Same as above: the record vanished, so any
-                            // queued events belonged to the old terminal.
-                            while events.try_recv().is_ok() {}
-                            needs_snapshot = true;
-                            continue;
+                        match client.request(
+                            self.session_id,
+                            self.runtime_id,
+                            waku_client::Command::OpenTerminal {
+                                cwd: self.working_directory.clone(),
+                                cols,
+                                rows,
+                            },
+                        ) {
+                            Ok(_) => {
+                                // Same as above: the record vanished, so any
+                                // queued events belonged to the old terminal.
+                                while events.try_recv().is_ok() {}
+                                needs_snapshot = true;
+                                continue;
+                            }
+                            Err(error) => {
+                                failed(
+                                    &ui_events,
+                                    format!("could not restart remote terminal: {error:#}"),
+                                );
+                                return;
+                            }
                         }
-                        exited(&ui_events);
+                    }
+                    Err(error) => {
+                        failed(
+                            &ui_events,
+                            format!("could not attach to remote terminal: {error:#}"),
+                        );
                         return;
                     }
-                    Err(error)
-                        if !error.to_string().contains("no longer available")
-                            && !error.to_string().contains("runtime does not match") => {}
-                    _ => {
-                        exited(&ui_events);
+                    Ok(_) => {
+                        failed(
+                            &ui_events,
+                            "daemon returned an invalid attachTerminal response".into(),
+                        );
                         return;
                     }
                 }
@@ -732,8 +771,18 @@ impl RemoteTerminal {
                         dirty.store(true, Ordering::Release);
                         let _ = wake.try_send(());
                     }
-                    "terminalExited" | "terminalError" => {
+                    "terminalExited" => {
                         exited(&ui_events);
+                        return;
+                    }
+                    "terminalError" => {
+                        let message = event
+                            .event
+                            .payload
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| tr!("terminal.transport_failed"));
+                        failed(&ui_events, message);
                         return;
                     }
                     _ => {}
@@ -747,7 +796,12 @@ impl RemoteTerminal {
                         return;
                     }
                     let Some(replacement) = self.await_replacement(&client) else {
-                        exited(&ui_events);
+                        if !self.closed.load(Ordering::Acquire) {
+                            failed(
+                                &ui_events,
+                                "daemon supervisor closed before remote terminal recovery".into(),
+                            );
+                        }
                         return;
                     };
                     client = replacement;
@@ -763,9 +817,12 @@ impl RemoteTerminal {
                         self.runtime_id,
                         waku_client::Command::ResizeTerminal { cols, rows },
                     );
-                    if alive.is_err() {
+                    if let Err(error) = alive {
                         self.closed.store(true, Ordering::Release);
-                        exited(&ui_events);
+                        failed(
+                            &ui_events,
+                            format!("could not restore remote terminal after reconnect: {error:#}"),
+                        );
                         return;
                     }
                     needs_snapshot = true;
@@ -2095,7 +2152,7 @@ impl TerminalView {
                         if this.poll(cx) {
                             cx.notify();
                         }
-                        this.session.is_some() && !this.exited
+                        this.session.is_some() && !this.exited && this.error.is_none()
                     })
                     .unwrap_or(false);
                 if !keep_polling {
@@ -2274,6 +2331,10 @@ impl TerminalView {
                     });
                 }
                 TerminalUiEvent::Exited => self.exited = true,
+                TerminalUiEvent::Failed(message) => {
+                    self.error = Some(message);
+                    self.exited = true;
+                }
             }
         }
         changed
@@ -3140,10 +3201,13 @@ impl Render for TerminalView {
             self.set_hovered_link(None);
         }
         let hovered_link = self.hovered_link.as_ref().map(|link| &link.bounds);
-        let snapshot = self
-            .session
-            .as_ref()
-            .map(|session| session.snapshot(theme, selection_color, cursor_style, hovered_link));
+        let snapshot = if self.error.is_some() {
+            None
+        } else {
+            self.session
+                .as_ref()
+                .map(|session| session.snapshot(theme, selection_color, cursor_style, hovered_link))
+        };
         self.cursor_position = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.cursor_position);
@@ -3758,9 +3822,8 @@ fn working_directory_label(path: &Path) -> Option<String> {
     let tail = trimmed
         .rsplit(['/', '\\'])
         .find(|segment| !segment.is_empty())?;
-    let is_drive_root = tail.len() == 2
-        && tail.as_bytes()[0].is_ascii_alphabetic()
-        && tail.as_bytes()[1] == b':';
+    let is_drive_root =
+        tail.len() == 2 && tail.as_bytes()[0].is_ascii_alphabetic() && tail.as_bytes()[1] == b':';
     (!is_drive_root).then(|| tail.to_owned())
 }
 
@@ -5575,7 +5638,11 @@ mod tests {
 
         let win_cwd = Path::new("C:\\Users\\waku\\project");
         assert_eq!(
-            terminal_link_target("C:\\Users\\waku\\project\\src\\main.rs:42:7", win_cwd, false),
+            terminal_link_target(
+                "C:\\Users\\waku\\project\\src\\main.rs:42:7",
+                win_cwd,
+                false
+            ),
             Some(TerminalLinkTarget::File {
                 path: PathBuf::from("C:\\Users\\waku\\project\\src\\main.rs"),
                 location: Some((42, Some(7))),
@@ -5599,7 +5666,11 @@ mod tests {
             })
         );
         assert_eq!(
-            terminal_link_target("file://localhost/C:/Users/waku/my%20file.rs:8", win_cwd, false),
+            terminal_link_target(
+                "file://localhost/C:/Users/waku/my%20file.rs:8",
+                win_cwd,
+                false
+            ),
             Some(TerminalLinkTarget::File {
                 path: PathBuf::from("C:/Users/waku/my file.rs"),
                 location: Some((8, None)),

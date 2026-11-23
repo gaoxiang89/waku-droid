@@ -109,13 +109,13 @@ pub trait Backend: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct EventSink {
     session_id: Uuid,
-    runtime_id: Uuid,
+    runtime: ActiveRuntime,
     hub: Arc<Hub>,
 }
 
 impl EventSink {
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
-        self.hub.emit(self.session_id, self.runtime_id, event, true);
+        self.hub.emit(self.session_id, self.runtime, event, true);
         Ok(())
     }
 
@@ -123,8 +123,12 @@ impl EventSink {
     /// PTY output uses its own byte-bounded recovery buffer and snapshot
     /// protocol; duplicating it in the general event journal wastes memory.
     pub fn send_ephemeral(&self, event: WireDriverEvent) -> anyhow::Result<()> {
-        self.hub
-            .emit(self.session_id, self.runtime_id, event, false);
+        let terminal_ended = matches!(event.kind.as_str(), "terminalExited" | "terminalError");
+        self.hub.emit(self.session_id, self.runtime, event, false);
+        if terminal_ended {
+            self.hub
+                .terminal_runtime_ended(self.session_id, self.runtime);
+        }
         Ok(())
     }
 }
@@ -164,12 +168,29 @@ impl Subscriber {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveRuntime {
+    runtime_id: Uuid,
+    /// Distinguishes a respawn that reuses the client-facing runtime id from
+    /// the terminal incarnation whose exit is being reported.
+    incarnation: Uuid,
+}
+
+impl ActiveRuntime {
+    fn new(runtime_id: Uuid) -> Self {
+        Self {
+            runtime_id,
+            incarnation: Uuid::new_v4(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct HubState {
     next_subscriber_id: u64,
     task_state_revision: u64,
     subscribers: HashMap<u64, Subscriber>,
-    active_runtimes: HashMap<Uuid, Uuid>,
+    active_runtimes: HashMap<Uuid, ActiveRuntime>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
     responses: VecDeque<(Uuid, ResponseOutcome, usize)>,
@@ -229,6 +250,9 @@ impl From<&AgentSession> for SessionCatalogEntry {
 struct Hub {
     epoch: Uuid,
     state: Mutex<HubState>,
+    /// Set by the dispatcher so a terminal's exit event can wake its actor.
+    /// Weak ownership keeps the Hub independent of the dispatcher lifetime.
+    runtime_mailboxes: Mutex<Weak<Mutex<HashMap<Uuid, RuntimeMailbox>>>>,
 }
 
 impl Default for Hub {
@@ -236,6 +260,7 @@ impl Default for Hub {
         Self {
             epoch: Uuid::new_v4(),
             state: Mutex::new(HubState::default()),
+            runtime_mailboxes: Mutex::new(Weak::new()),
         }
     }
 }
@@ -248,7 +273,12 @@ struct DispatchedRequest {
 
 struct RuntimeMailbox {
     id: Uuid,
-    sender: Sender<DispatchedRequest>,
+    sender: Sender<RuntimeMailboxMessage>,
+}
+
+enum RuntimeMailboxMessage {
+    Request(DispatchedRequest),
+    TerminalExited(ActiveRuntime),
 }
 
 struct RequestDispatcher {
@@ -262,7 +292,7 @@ struct RequestDispatcher {
 }
 
 struct DisplacedRuntime {
-    runtime_id: Uuid,
+    runtime: ActiveRuntime,
     sequences: Vec<((Uuid, Uuid), u64)>,
     journal: Vec<((Uuid, Uuid), VecDeque<SequencedEvent>)>,
 }
@@ -284,26 +314,42 @@ fn clear_session_replay(state: &mut HubState, session_id: Uuid) {
 
 impl Hub {
     fn event_sink(self: &Arc<Self>, session_id: Uuid, runtime_id: Uuid) -> EventSink {
+        let runtime = self
+            .state
+            .lock()
+            .active_runtimes
+            .get(&session_id)
+            .copied()
+            .filter(|active| active.runtime_id == runtime_id)
+            .unwrap_or_else(|| ActiveRuntime::new(runtime_id));
         EventSink {
             session_id,
-            runtime_id,
+            runtime,
             hub: self.clone(),
         }
     }
 
-    fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
+    fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) -> ActiveRuntime {
         let mut state = self.state.lock();
-        if state.active_runtimes.get(&session_id) == Some(&runtime_id) {
-            return;
+        if let Some(active) = state.active_runtimes.get(&session_id)
+            && active.runtime_id == runtime_id
+        {
+            return *active;
         }
-        state.active_runtimes.insert(session_id, runtime_id);
+        let active = ActiveRuntime::new(runtime_id);
+        state.active_runtimes.insert(session_id, active);
         clear_session_replay(&mut state, session_id);
+        active
     }
 
     fn end_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
         let mut state = self.state.lock();
-        let matches_active = runtime_id
-            .is_none_or(|runtime_id| state.active_runtimes.get(&session_id) == Some(&runtime_id));
+        let matches_active = runtime_id.is_none_or(|runtime_id| {
+            state
+                .active_runtimes
+                .get(&session_id)
+                .is_some_and(|active| active.runtime_id == runtime_id)
+        });
         if !matches_active {
             return;
         }
@@ -311,20 +357,50 @@ impl Hub {
         clear_session_replay(&mut state, session_id);
     }
 
+    fn terminal_runtime_ended(&self, session_id: Uuid, runtime: ActiveRuntime) {
+        {
+            let mut state = self.state.lock();
+            if state.active_runtimes.get(&session_id) != Some(&runtime) {
+                return;
+            }
+            state.active_runtimes.remove(&session_id);
+            clear_session_replay(&mut state, session_id);
+        }
+
+        // The mailbox registry lock is also held while dispatching requests.
+        // An unbounded control message wakes a worker blocked in `recv`; its
+        // normal empty-queue retirement path then atomically drains queued
+        // requests or unregisters this exact mailbox.
+        let Some(registry) = self.runtime_mailboxes.lock().upgrade() else {
+            return;
+        };
+        let sender = registry
+            .lock()
+            .get(&session_id)
+            .map(|mailbox| mailbox.sender.clone());
+        if let Some(sender) = sender {
+            let _ = sender.send(RuntimeMailboxMessage::TerminalExited(runtime));
+        }
+    }
+
     /// Arms `runtime_id` before a start so events emitted during `handle`
     /// are delivered. A different live runtime is displaced only until the
     /// caller restores it; a rejected create must not wipe that journal.
     fn arm_starting_runtime(&self, session_id: Uuid, runtime_id: Uuid) -> StartArm {
         let mut state = self.state.lock();
-        if state.active_runtimes.get(&session_id) == Some(&runtime_id) {
+        if state
+            .active_runtimes
+            .get(&session_id)
+            .is_some_and(|active| active.runtime_id == runtime_id)
+        {
             return StartArm::AlreadyActive;
         }
         let displaced = state
             .active_runtimes
             .get(&session_id)
             .copied()
-            .map(|runtime_id| DisplacedRuntime {
-                runtime_id,
+            .map(|runtime| DisplacedRuntime {
+                runtime,
                 sequences: state
                     .next_sequences
                     .iter()
@@ -338,7 +414,9 @@ impl Hub {
                     .map(|(key, events)| (*key, events.clone()))
                     .collect(),
             });
-        state.active_runtimes.insert(session_id, runtime_id);
+        state
+            .active_runtimes
+            .insert(session_id, ActiveRuntime::new(runtime_id));
         clear_session_replay(&mut state, session_id);
         match displaced {
             Some(displaced) => StartArm::Displaced(displaced),
@@ -348,9 +426,7 @@ impl Hub {
 
     fn restore_displaced_runtime(&self, session_id: Uuid, displaced: DisplacedRuntime) {
         let mut state = self.state.lock();
-        state
-            .active_runtimes
-            .insert(session_id, displaced.runtime_id);
+        state.active_runtimes.insert(session_id, displaced.runtime);
         clear_session_replay(&mut state, session_id);
         for (key, sequence) in displaced.sequences {
             state.next_sequences.insert(key, sequence);
@@ -362,24 +438,32 @@ impl Hub {
 
     /// Re-arms a runtime a replaced mailbox rediscovered. A different live
     /// runtime is left alone: adopting the command's id would wipe its journal.
-    fn rearm_if_idle(&self, session_id: Uuid, runtime_id: Uuid) -> bool {
+    fn rearm_if_idle(&self, session_id: Uuid, runtime_id: Uuid) -> Option<ActiveRuntime> {
         let mut state = self.state.lock();
         match state.active_runtimes.get(&session_id).copied() {
-            Some(active) if active != runtime_id => false,
-            Some(_) => true,
+            Some(active) if active.runtime_id != runtime_id => None,
+            Some(active) => Some(active),
             None => {
-                state.active_runtimes.insert(session_id, runtime_id);
+                let active = ActiveRuntime::new(runtime_id);
+                state.active_runtimes.insert(session_id, active);
                 clear_session_replay(&mut state, session_id);
-                true
+                Some(active)
             }
         }
     }
 
-    fn emit(&self, session_id: Uuid, runtime_id: Uuid, event: WireDriverEvent, replayable: bool) {
+    fn emit(
+        &self,
+        session_id: Uuid,
+        runtime: ActiveRuntime,
+        event: WireDriverEvent,
+        replayable: bool,
+    ) {
         let mut state = self.state.lock();
-        if state.active_runtimes.get(&session_id) != Some(&runtime_id) {
+        if state.active_runtimes.get(&session_id) != Some(&runtime) {
             return;
         }
+        let runtime_id = runtime.runtime_id;
         let sequence = state
             .next_sequences
             .entry((session_id, runtime_id))
@@ -620,10 +704,12 @@ impl Hub {
 
 impl RequestDispatcher {
     fn new(backend: Arc<dyn Backend>, hub: Arc<Hub>) -> Self {
+        let runtime_mailboxes = Arc::new(Mutex::new(HashMap::new()));
+        *hub.runtime_mailboxes.lock() = Arc::downgrade(&runtime_mailboxes);
         Self {
             backend,
             hub,
-            runtime_mailboxes: Arc::new(Mutex::new(HashMap::new())),
+            runtime_mailboxes,
         }
     }
 
@@ -682,10 +768,16 @@ impl RequestDispatcher {
         loop {
             let mut mailboxes = self.runtime_mailboxes.lock();
             if let Some(mailbox) = mailboxes.get(&session_id) {
-                match mailbox.sender.send(dispatched) {
+                match mailbox
+                    .sender
+                    .send(RuntimeMailboxMessage::Request(dispatched))
+                {
                     Ok(()) => return,
                     Err(error) => {
-                        dispatched = error.0;
+                        dispatched = match error.0 {
+                            RuntimeMailboxMessage::Request(request) => request,
+                            RuntimeMailboxMessage::TerminalExited(_) => unreachable!(),
+                        };
                         mailboxes.remove(&session_id);
                         continue;
                     }
@@ -695,7 +787,7 @@ impl RequestDispatcher {
             let mailbox_id = Uuid::new_v4();
             let (sender, requests) = unbounded();
             sender
-                .send(dispatched)
+                .send(RuntimeMailboxMessage::Request(dispatched))
                 .expect("a new runtime mailbox still has its receiver");
             mailboxes.insert(
                 session_id,
@@ -884,8 +976,7 @@ fn handle_connection(
         .set_write_timeout(Some(SOCKET_WRITE_STALL_TIMEOUT))?;
 
     let (outgoing, outgoing_rx) = bounded(MAX_QUEUED_MESSAGES_PER_SUBSCRIBER);
-    let (subscriber, kicked) =
-        Subscriber::with_identity(outgoing.clone(), client_kind, client_pid);
+    let (subscriber, kicked) = Subscriber::with_identity(outgoing.clone(), client_kind, client_pid);
     let subscriber_id = hub.subscribe(&resume_from, subscriber);
 
     let mut last_inbound = Instant::now();
@@ -1059,20 +1150,42 @@ fn command_targets_runtime(command: &Command) -> bool {
 fn run_runtime_mailbox(
     session_id: Uuid,
     mailbox_id: Uuid,
-    requests: Receiver<DispatchedRequest>,
+    requests: Receiver<RuntimeMailboxMessage>,
     mailbox_registry: Weak<Mutex<HashMap<Uuid, RuntimeMailbox>>>,
     backend: Arc<dyn Backend>,
     hub: Arc<Hub>,
 ) {
-    let mut active_runtime_id = None;
+    let mut active_runtime = None;
+    let mut terminal_retired = false;
     let mut pending = None;
     loop {
-        let dispatched = match pending.take() {
-            Some(request) => request,
+        let message = match pending.take() {
+            Some(message) => message,
             None => match requests.recv() {
-                Ok(request) => request,
+                Ok(message) => message,
                 Err(_) => return,
             },
+        };
+        let dispatched = match message {
+            RuntimeMailboxMessage::Request(request) => request,
+            RuntimeMailboxMessage::TerminalExited(ended) => {
+                if active_runtime == Some(ended) {
+                    active_runtime = None;
+                    terminal_retired = true;
+                }
+                if active_runtime.is_none() {
+                    pending = take_queued_message_or_retire(
+                        session_id,
+                        mailbox_id,
+                        &requests,
+                        &mailbox_registry,
+                    );
+                    if pending.is_none() {
+                        return;
+                    }
+                }
+                continue;
+            }
         };
         let runtime_id = dispatched.request.runtime_id;
         let starts_runtime = matches!(
@@ -1084,6 +1197,13 @@ fn run_runtime_mailbox(
             Command::CloseSession | Command::CloseTerminal | Command::RemoveSession
         );
         let removes_session = matches!(&dispatched.request.command, Command::RemoveSession);
+        let terminal_command = matches!(
+            &dispatched.request.command,
+            Command::AttachTerminal { .. }
+                | Command::WriteTerminal { .. }
+                | Command::ResizeTerminal { .. }
+                | Command::CloseTerminal
+        );
         let handled = handle_request(
             dispatched.request,
             dispatched.outgoing,
@@ -1092,14 +1212,24 @@ fn run_runtime_mailbox(
             hub.clone(),
         );
 
+        if matches!(
+            &handled.outcome,
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::TerminalOutput { snapshot }
+            } if !snapshot.exited
+        ) {
+            terminal_retired = false;
+        }
+
         if handled.executed {
             if starts_runtime {
                 if matches!(&handled.outcome, ResponseOutcome::Ok { .. }) {
-                    active_runtime_id = Some(runtime_id);
-                } else if let Some(existing) = active_runtime_id
-                    && !backend.is_runtime_live(session_id, existing)
+                    active_runtime = Some(handled.runtime);
+                    terminal_retired = false;
+                } else if let Some(existing) = active_runtime
+                    && !backend.is_runtime_live(session_id, existing.runtime_id)
                 {
-                    active_runtime_id = None;
+                    active_runtime = None;
                 }
             } else if let ResponseOutcome::Ok {
                 payload:
@@ -1111,36 +1241,54 @@ fn run_runtime_mailbox(
             {
                 // A replacement mailbox can rediscover a provider runtime
                 // that survived its previous actor worker.
-                active_runtime_id = Some(*attached_runtime_id);
-                hub.begin_runtime(session_id, *attached_runtime_id);
+                active_runtime = Some(hub.begin_runtime(session_id, *attached_runtime_id));
             } else if closes_runtime {
-                if (removes_session || active_runtime_id == Some(runtime_id))
+                let closes_active =
+                    active_runtime.is_some_and(|active| active.runtime_id == runtime_id);
+                if (removes_session || closes_active)
                     && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
                 {
                     hub.end_runtime(session_id, (!removes_session).then_some(runtime_id));
-                    active_runtime_id = None;
+                    active_runtime = None;
                 }
-            } else if active_runtime_id.is_none()
+            } else if active_runtime.is_none()
+                && !(terminal_retired && terminal_command)
+                && !(terminal_command
+                    && matches!(
+                        &handled.outcome,
+                        ResponseOutcome::Ok {
+                            payload: ResponsePayload::Ack
+                        }
+                    ))
                 && !matches!(
                     &handled.outcome,
                     ResponseOutcome::Ok {
                         payload: ResponsePayload::SessionRuntime { .. }
                     }
                 )
+                && !matches!(
+                    &handled.outcome,
+                    ResponseOutcome::Ok {
+                        payload: ResponsePayload::TerminalOutput { snapshot }
+                    } if snapshot.exited
+                )
                 && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
             {
                 // A replaced mailbox can rediscover a backend runtime that
-                // outlived its worker. Do not adopt an id that would displace
-                // a different live runtime.
-                if hub.rearm_if_idle(session_id, runtime_id) {
-                    active_runtime_id = Some(runtime_id);
+                // outlived its worker. A terminal Ack is not liveness evidence:
+                // retained exited terminals still acknowledge resize. A live
+                // terminal re-arms through AttachTerminal instead. An exited
+                // terminal snapshot is retained for attaches, but is not live
+                // work and must not keep an actor or Hub entry alive.
+                if let Some(active) = hub.rearm_if_idle(session_id, runtime_id) {
+                    active_runtime = Some(active);
                 }
             }
         }
 
-        if active_runtime_id.is_none() {
+        if active_runtime.is_none() {
             pending =
-                take_queued_request_or_retire(session_id, mailbox_id, &requests, &mailbox_registry);
+                take_queued_message_or_retire(session_id, mailbox_id, &requests, &mailbox_registry);
             if pending.is_none() {
                 return;
             }
@@ -1148,12 +1296,12 @@ fn run_runtime_mailbox(
     }
 }
 
-fn take_queued_request_or_retire(
+fn take_queued_message_or_retire(
     session_id: Uuid,
     mailbox_id: Uuid,
-    requests: &Receiver<DispatchedRequest>,
+    requests: &Receiver<RuntimeMailboxMessage>,
     mailbox_registry: &Weak<Mutex<HashMap<Uuid, RuntimeMailbox>>>,
-) -> Option<DispatchedRequest> {
+) -> Option<RuntimeMailboxMessage> {
     let Some(mailbox_registry) = mailbox_registry.upgrade() else {
         return requests.try_recv().ok();
     };
@@ -1162,7 +1310,7 @@ fn take_queued_request_or_retire(
     // it either joins this actor before retirement or creates its successor.
     let mut mailboxes = mailbox_registry.lock();
     match requests.try_recv() {
-        Ok(request) => Some(request),
+        Ok(message) => Some(message),
         Err(crossbeam_channel::TryRecvError::Empty) => {
             if mailboxes
                 .get(&session_id)
@@ -1179,6 +1327,7 @@ fn take_queued_request_or_retire(
 struct HandledRequest {
     outcome: ResponseOutcome,
     executed: bool,
+    runtime: ActiveRuntime,
 }
 
 enum TaskCatalogAction {
@@ -1205,14 +1354,21 @@ fn handle_request(
         Command::Start { .. } | Command::OpenTerminal { .. }
     );
     let attaches_terminal = matches!(&request.command, Command::AttachTerminal { .. });
-    let (outcome, executed) = if !notification && let Some(cached) = hub.cached_response(request_id)
+    let (outcome, executed, runtime) = if !notification
+        && let Some(cached) = hub.cached_response(request_id)
     {
-        (cached, false)
+        (
+            cached,
+            false,
+            hub.event_sink(session_id, runtime_id).runtime,
+        )
     } else {
         let start_arm = starts_runtime.then(|| hub.arm_starting_runtime(session_id, runtime_id));
+        let events = hub.event_sink(session_id, runtime_id);
+        let runtime = events.runtime;
         let handled_result = match request.command {
             Command::OpenWorkspace { path, host } => handle_open_workspace(&hub, path, host),
-            _ => backend.handle(request, hub.event_sink(session_id, runtime_id)),
+            _ => backend.handle(request, events),
         };
         let outcome = match handled_result {
             Ok(payload) => ResponseOutcome::Ok { payload },
@@ -1227,7 +1383,7 @@ fn handle_request(
             match start_arm {
                 Some(StartArm::Fresh) => hub.end_runtime(session_id, Some(runtime_id)),
                 Some(StartArm::Displaced(displaced)) => {
-                    if backend.is_runtime_live(session_id, displaced.runtime_id) {
+                    if backend.is_runtime_live(session_id, displaced.runtime.runtime_id) {
                         hub.restore_displaced_runtime(session_id, displaced);
                     } else {
                         hub.end_runtime(session_id, Some(runtime_id));
@@ -1241,11 +1397,20 @@ fn handle_request(
                 None => {}
             }
         }
-        (outcome, true)
+        (outcome, true, runtime)
     };
-    if executed && attaches_terminal && matches!(&outcome, ResponseOutcome::Ok { .. }) {
+    if executed
+        && attaches_terminal
+        && matches!(
+            &outcome,
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::TerminalOutput { snapshot }
+            } if !snapshot.exited
+        )
+    {
         // Restore/reattach never sends OpenTerminal. Re-arm live output so
-        // echo is not dropped after a mailbox worker was replaced.
+        // echo is not dropped after a mailbox worker was replaced. A retained
+        // exited snapshot is readable but is not live work.
         hub.begin_runtime(session_id, runtime_id);
     }
     if executed {
@@ -1277,7 +1442,11 @@ fn handle_request(
             outcome: outcome.clone(),
         });
     }
-    HandledRequest { outcome, executed }
+    HandledRequest {
+        outcome,
+        executed,
+        runtime,
+    }
 }
 
 fn handle_open_workspace(
@@ -3129,6 +3298,38 @@ mod tests {
     }
 
     #[test]
+    fn stale_terminal_exit_does_not_disarm_same_id_respawn() {
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let (outgoing, events) = unbounded();
+        hub.subscribe(&[], Subscriber::new(outgoing).0);
+
+        hub.begin_runtime(session_id, runtime_id);
+        let old_sink = hub.event_sink(session_id, runtime_id);
+        hub.end_runtime(session_id, Some(runtime_id));
+        hub.begin_runtime(session_id, runtime_id);
+        old_sink
+            .send_ephemeral(WireDriverEvent::new(
+                "terminalExited",
+                serde_json::Value::Null,
+            ))
+            .unwrap();
+
+        hub.event_sink(session_id, runtime_id)
+            .send_ephemeral(WireDriverEvent::new(
+                "terminalOutput",
+                json!({"data": "respawned"}),
+            ))
+            .unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(ServerMessage::Event(event)) if event.event.kind == "terminalOutput"
+                && event.event.payload["data"] == "respawned"
+        ));
+    }
+
+    #[test]
     fn replay_cursor_from_an_old_daemon_epoch_does_not_hide_new_events() {
         let hub = Arc::new(Hub::default());
         let session_id = Uuid::new_v4();
@@ -3276,7 +3477,7 @@ mod tests {
             );
         });
         let (response_tx, response_rx) = unbounded();
-        tx.send(DispatchedRequest {
+        tx.send(RuntimeMailboxMessage::Request(DispatchedRequest {
             request: Request {
                 request_id: Uuid::new_v4(),
                 session_id,
@@ -3285,7 +3486,7 @@ mod tests {
             },
             outgoing: response_tx,
             source_subscriber_id: 0,
-        })
+        }))
         .unwrap();
         response_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(tx);
@@ -3864,7 +4065,7 @@ mod tests {
 
     #[test]
     fn failed_start_after_dropping_previous_runtime_clears_hub_state_instead_of_restoring_dead_runtime()
-    {
+     {
         use crate::daemon::WakuBackend;
         use crate::persistence::StateStore;
         use crate::settings::DaemonSettingsStore;
@@ -4062,7 +4263,7 @@ mod tests {
             None,
             crate::driver::DriverHandle::from_control(Arc::new(StubDriverControl)),
         );
-        // Prime the mailbox so its local `active_runtime_id` becomes `Some(live_runtime_id)`.
+        // Prime the mailbox so its local active runtime becomes `live_runtime_id`.
         let (tx, rx) = unbounded();
         dispatcher.dispatch(
             Request {
@@ -4086,7 +4287,12 @@ mod tests {
                 ..
             } if attached == live_runtime_id
         ));
-        assert!(dispatcher.runtime_mailboxes.lock().contains_key(&session_id));
+        assert!(
+            dispatcher
+                .runtime_mailboxes
+                .lock()
+                .contains_key(&session_id)
+        );
 
         // Now fail a replacement Start after dropping the previous driver; the
         // mailbox must clear its active runtime id and retire cleanly.
@@ -4114,7 +4320,11 @@ mod tests {
         ));
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while dispatcher.runtime_mailboxes.lock().contains_key(&session_id) {
+        while dispatcher
+            .runtime_mailboxes
+            .lock()
+            .contains_key(&session_id)
+        {
             assert!(
                 Instant::now() < deadline,
                 "runtime mailbox did not retire after failed Start dropped the active runtime"
@@ -4123,6 +4333,193 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn natural_terminal_exit_retires_mailbox_and_preserves_snapshot_for_respawn() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+
+        let root = std::env::temp_dir().join(format!("waku-natural-exit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let backend = backend.with_terminal_shell(alacritty_terminal::tty::Shell::new(
+            "/bin/sh".into(),
+            vec![],
+        ));
+        let backend = Arc::new(backend);
+        let hub = Arc::new(Hub::default());
+        let dispatcher = RequestDispatcher::new(backend, hub.clone());
+        let session_id = Uuid::new_v4();
+        let runtime_id = session_id;
+        let call = |command| {
+            let (outgoing, responses) = unbounded();
+            dispatcher.dispatch(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command,
+                },
+                outgoing,
+                0,
+            );
+            let ServerMessage::Response { outcome, .. } =
+                responses.recv_timeout(Duration::from_secs(20)).unwrap()
+            else {
+                panic!("missing terminal response");
+            };
+            outcome
+        };
+        let wait_retired = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while dispatcher
+                .runtime_mailboxes
+                .lock()
+                .contains_key(&session_id)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "terminal runtime mailbox did not retire"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!hub.state.lock().active_runtimes.contains_key(&session_id));
+        };
+        let (event_tx, events) = unbounded();
+        hub.subscribe(&[], Subscriber::new(event_tx).0);
+        let open = || Command::OpenTerminal {
+            cwd: root.clone(),
+            cols: 80,
+            rows: 24,
+        };
+        assert!(matches!(
+            call(open()),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+
+        let marker = format!("waku-natural-exit-{}", &session_id.to_string()[..8]);
+        let echo = if cfg!(windows) {
+            format!("echo {marker}\r")
+        } else {
+            format!("printf '%s\\n' '{marker}'\r")
+        };
+        assert!(matches!(
+            call(Command::WriteTerminal {
+                data: echo.into_bytes()
+            }),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut output = Vec::new();
+        while !output
+            .windows(marker.len())
+            .any(|window| window == marker.as_bytes())
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(ServerMessage::Event(event)) = events.recv_timeout(remaining) else {
+                panic!("terminal did not echo its final-screen marker");
+            };
+            if event.event.kind != "terminalOutput" {
+                continue;
+            }
+            if let Some(data) = event.event.payload.get("data").and_then(|v| v.as_str()) {
+                output.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .unwrap(),
+                );
+            }
+            assert!(Instant::now() < deadline, "terminal output timed out");
+        }
+        assert!(matches!(
+            call(Command::WriteTerminal {
+                data: b"exit\r".to_vec()
+            }),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(ServerMessage::Event(event)) = events.recv_timeout(remaining) else {
+                panic!("terminalExited was not emitted");
+            };
+            if event.event.kind == "terminalExited" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "terminal exit timed out");
+        }
+        wait_retired();
+
+        // Both a fresh attach and a cursor attach must reconstruct the final
+        // ShadowEmulator screen. The exited stream's replay ring is gone, so
+        // even cursor zero is a reset rather than an incremental read.
+        for after in [None, Some(0)] {
+            let ResponseOutcome::Ok {
+                payload: ResponsePayload::TerminalOutput { snapshot },
+            } = call(Command::AttachTerminal { after })
+            else {
+                panic!("exited terminal snapshot was not retained");
+            };
+            assert!(snapshot.exited);
+            assert!(snapshot.reset);
+            assert!(
+                String::from_utf8_lossy(&snapshot.data).contains(&marker),
+                "final terminal screen lost its marker"
+            );
+            wait_retired();
+        }
+
+        // A retained exited terminal still acknowledges resize, but that Ack
+        // must not recreate a resident runtime mailbox.
+        assert!(matches!(
+            call(Command::ResizeTerminal { cols: 80, rows: 24 }),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+        wait_retired();
+
+        assert!(matches!(
+            call(open()),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+        assert!(
+            dispatcher
+                .runtime_mailboxes
+                .lock()
+                .contains_key(&session_id)
+        );
+        assert!(hub.state.lock().active_runtimes.contains_key(&session_id));
+        let ResponseOutcome::Ok {
+            payload: ResponsePayload::TerminalOutput { snapshot },
+        } = call(Command::AttachTerminal { after: None })
+        else {
+            panic!("respawned terminal did not attach");
+        };
+        assert!(!snapshot.exited);
+        assert!(matches!(
+            call(Command::CloseTerminal),
+            ResponseOutcome::Ok {
+                payload: ResponsePayload::Ack
+            }
+        ));
+        wait_retired();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4149,12 +4546,11 @@ mod tests {
         std::fs::create_dir_all(root.join("proj")).unwrap();
         let file = root.join("proj").join("main.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
-        let expected_proj = crate::workspace::resolve_workspace_directory(
-            &root.join("proj").to_string_lossy(),
-        )
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+        let expected_proj =
+            crate::workspace::resolve_workspace_directory(&root.join("proj").to_string_lossy())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
 
         // With only a web client connected, delivery is false.
         let web = DaemonClient::connect_with_identity(
@@ -4180,8 +4576,15 @@ mod tests {
             .unwrap();
         assert!(!undelivered.delivered);
         assert_eq!(undelivered.desktop_pid, None);
-        assert_eq!(undelivered.resolved_path.as_deref(), Some(expected_proj.as_str()));
-        assert!(web_open_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            undelivered.resolved_path.as_deref(),
+            Some(expected_proj.as_str())
+        );
+        assert!(
+            web_open_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
 
         // Missing local path returns an RPC error and does not broadcast.
         let err = cli
@@ -4209,15 +4612,24 @@ mod tests {
             .unwrap();
         assert!(outcome.delivered);
         assert_eq!(outcome.desktop_pid, Some(42424));
-        assert_eq!(outcome.resolved_path.as_deref(), Some(expected_proj.as_str()));
         assert_eq!(
-            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            outcome.resolved_path.as_deref(),
+            Some(expected_proj.as_str())
+        );
+        assert_eq!(
+            desktop_open_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
             waku_client::OpenWorkspaceRequest {
                 path: Some(expected_proj.clone()),
                 host: None,
             }
         );
-        assert!(web_open_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(
+            web_open_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
 
         // Remote host forwards path unmodified without checking local filesystem.
         let remote_outcome = cli
@@ -4230,7 +4642,9 @@ mod tests {
             Some("~/remote-only-repo")
         );
         assert_eq!(
-            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            desktop_open_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
             waku_client::OpenWorkspaceRequest {
                 path: Some("~/remote-only-repo".into()),
                 host: Some("ssh:devbox".into()),
@@ -4243,7 +4657,9 @@ mod tests {
         assert_eq!(focus_outcome.desktop_pid, Some(42424));
         assert_eq!(focus_outcome.resolved_path, None);
         assert_eq!(
-            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            desktop_open_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
             waku_client::OpenWorkspaceRequest {
                 path: None,
                 host: None,
@@ -4272,9 +4688,14 @@ mod tests {
         .unwrap();
         assert!(via_state.delivered);
         assert_eq!(via_state.desktop_pid, Some(42424));
-        assert_eq!(via_state.resolved_path.as_deref(), Some(expected_proj.as_str()));
         assert_eq!(
-            desktop_open_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            via_state.resolved_path.as_deref(),
+            Some(expected_proj.as_str())
+        );
+        assert_eq!(
+            desktop_open_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
             waku_client::OpenWorkspaceRequest {
                 path: Some(expected_proj),
                 host: None,

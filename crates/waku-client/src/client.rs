@@ -211,6 +211,11 @@ impl DaemonClient {
         let (events, receiver) = unbounded();
         let key = (session_id, runtime_id);
         let mut sessions = self.inner.sessions.lock();
+        // Disconnect cleanup takes the same lock after setting this flag, so
+        // a subscription either joins a live client or is removed by cleanup.
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return receiver;
+        }
         sessions.insert(key, events.clone());
         // Keep the subscription lock while draining the pre-subscription
         // replay queue. The socket thread takes these locks in the same order,
@@ -460,9 +465,9 @@ pub(crate) fn shutdown_daemon_at(address: &str, token: &str) -> ShutdownProbeOut
                 Err(error) => ShutdownProbeOutcome::Unreachable(format!("{error:#}")),
             }
         }
-        Ok(ShutdownStep::ProtocolMismatch(expected)) => ShutdownProbeOutcome::Rejected(format!(
-            "daemon rejected matching protocol {expected}"
-        )),
+        Ok(ShutdownStep::ProtocolMismatch(expected)) => {
+            ShutdownProbeOutcome::Rejected(format!("daemon rejected matching protocol {expected}"))
+        }
         Err(error) => ShutdownProbeOutcome::Unreachable(format!("{error:#}")),
     }
 }
@@ -481,9 +486,8 @@ fn shutdown_with_protocol(
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_WIRE_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_WIRE_MESSAGE_BYTES));
-    let (mut socket, _) =
-        tungstenite::client::connect_with_config(url.as_str(), Some(config), 3)
-            .context("could not connect to Waku daemon")?;
+    let (mut socket, _) = tungstenite::client::connect_with_config(url.as_str(), Some(config), 3)
+        .context("could not connect to Waku daemon")?;
     set_client_timeouts(
         &mut socket,
         Some(Duration::from_secs(2)),
@@ -544,10 +548,7 @@ fn shutdown_with_protocol(
 
 fn parse_expected_protocol_version(message: &str) -> Option<u32> {
     let tail = message.split("expected ").nth(1)?;
-    let digits: String = tail
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
+    let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;
     }
@@ -823,7 +824,38 @@ mod tests {
             parse_expected_protocol_version("protocol 12 is unsupported; expected 11"),
             Some(11)
         );
-        assert_eq!(parse_expected_protocol_version("authentication failed"), None);
+        assert_eq!(
+            parse_expected_protocol_version("authentication failed"),
+            None
+        );
+    }
+
+    #[test]
+    fn subscribe_after_disconnect_returns_a_disconnected_channel() {
+        let (outgoing, _outgoing_rx) = unbounded();
+        let client = DaemonClient {
+            inner: Arc::new(ClientInner {
+                outgoing,
+                pending: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
+                pending_events: Mutex::new(HashMap::new()),
+                task_state_subscribers: Mutex::new(Vec::new()),
+                open_workspace_subscribers: Mutex::new(Vec::new()),
+                pending_open_workspaces: Mutex::new(VecDeque::new()),
+                last_sequences: Mutex::new(HashMap::new()),
+                disconnected: AtomicBool::new(true),
+                disconnect_reason: Mutex::new(None),
+                daemon_version: "test".into(),
+            }),
+        };
+
+        let events = client.subscribe(Uuid::new_v4(), Uuid::new_v4());
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert!(client.inner.sessions.lock().is_empty());
     }
 
     #[test]
