@@ -885,12 +885,14 @@ upstream API failure as an ordinary chat message and ends the turn with
 `~/.gemini/antigravity-cli/conversations/<session>.db` (or the older
 `antigravity-acp` sibling). [antigravity_session.rs](../crates/waku-core/src/antigravity_session.rs)
 captures the highest step index before the prompt, reads only the newest step
-added after it, and parses the harness's
-`Error <code>, Message: <text>, Status: <status>` line. A quota failure — the
-step's `QUOTA_EXHAUSTED` marker, HTTP 429, `RESOURCE_EXHAUSTED`, or a typed
-`refusal` — becomes the localized quota message; any other API error keeps the
-provider's own message. The lookup is read-only, bounded at one second, and runs
-on the driver thread.
+added after it, and reads the harness's `<STATUS> (code <N>): <message>` line
+(`agy` 1.5 and later; older builds wrote
+`Error <code>, Message: <text>, Status: <status>`) out of the protobuf payload.
+A quota failure — `QUOTA_EXHAUSTED` or `RESOURCE_EXHAUSTED`, HTTP 429, or a
+typed `refusal` — becomes the localized quota message; any other API error
+keeps the provider's own message, and a turn that ends on a failed retry keeps
+the reason behind `API error (attempt <N>): `. The lookup is read-only, bounded
+at one second, and runs on the driver thread.
 
 **Inbound stream** — `session/update` notifications:
 

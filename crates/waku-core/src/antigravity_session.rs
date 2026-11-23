@@ -18,7 +18,8 @@ const ERROR_STEP_TYPE: i64 = 17;
 /// The harness error text leads the payload; a Go stack trace follows it.
 const MAX_ERROR_PAYLOAD_BYTES: usize = 16_384;
 const SERVER_LOG_TAIL_BYTES: u64 = 128 * 1024;
-const MAX_LOG_ERROR_CHARS: usize = 512;
+/// The longest provider reason shown for one failed turn.
+const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -72,35 +73,170 @@ fn quota_message() -> String {
 }
 
 fn failure_message(payload: &str) -> String {
-    if payload.contains("QUOTA_EXHAUSTED") {
-        return quota_message();
-    }
-    match api_error(payload) {
-        Some((http_status, _, status))
-            if http_status == "429" || status == "RESOURCE_EXHAUSTED" =>
-        {
-            quota_message()
-        }
-        Some((_, message, _)) => message,
-        None => tr!("errors.antigravity_turn_failed"),
+    match provider_failure(payload) {
+        Some(ProviderFailure::Quota) => quota_message(),
+        Some(ProviderFailure::Message(message)) => message,
+        None => retry_detail(payload)
+            .or_else(|| headline(payload))
+            .unwrap_or_else(|| tr!("errors.antigravity_turn_failed")),
     }
 }
 
-/// Parses the harness's rendering of a Google API error:
-/// `Error 429, Message: ..., Status: RESOURCE_EXHAUSTED`.
-fn api_error(text: &str) -> Option<(&str, String, &str)> {
+/// What the text `agy` wrote for a failed turn means for the user.
+enum ProviderFailure {
+    /// The account has nothing left to spend, whatever words `agy` put on it.
+    Quota,
+    /// The provider's own reason, without its framing.
+    Message(String),
+}
+
+/// The failure a Google API status names in `text`. A status line carries the
+/// reason; a bare quota status is the only other wording that is certain.
+fn provider_failure(text: &str) -> Option<ProviderFailure> {
+    if let Some((status, code, message)) = api_status(text) {
+        return Some(if code == "429" || status.ends_with("_EXHAUSTED") {
+            ProviderFailure::Quota
+        } else {
+            ProviderFailure::Message(message)
+        });
+    }
+    if text.contains("QUOTA_EXHAUSTED") || text.contains("RESOURCE_EXHAUSTED") {
+        return Some(ProviderFailure::Quota);
+    }
+    None
+}
+
+/// A Google API failure as `(status, code, message)`. Since 1.5.x the payload
+/// carries `RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (…)`,
+/// often behind `API error (attempt 3): `; older builds wrote
+/// `Error 429, Message: …, Status: RESOURCE_EXHAUSTED`.
+fn api_status(text: &str) -> Option<(&str, &str, String)> {
+    grpc_status(text).or_else(|| legacy_api_status(text))
+}
+
+/// The `<STATUS> (code <N>): <message>` line, wherever a retry prefix or the
+/// protobuf framing around the text put it.
+fn grpc_status(text: &str) -> Option<(&str, &str, String)> {
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..].find(" (code ") {
+        let marker = search_from + offset;
+        search_from = marker + " (code ".len();
+        let status_len = text[..marker]
+            .bytes()
+            .rev()
+            .take_while(|byte| byte.is_ascii_uppercase() || *byte == b'_')
+            .count();
+        if status_len == 0 {
+            continue;
+        }
+        let Some((code, message)) = text[search_from..].split_once("): ") else {
+            continue;
+        };
+        if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Some(message) = message_text(message) else {
+            continue;
+        };
+        return Some((&text[marker - status_len..marker], code, message));
+    }
+    None
+}
+
+/// `Error 429, Message: ..., Status: RESOURCE_EXHAUSTED`, the shape older
+/// builds wrote.
+fn legacy_api_status(text: &str) -> Option<(&str, &str, String)> {
     let after_code = text.split_once("Error ")?.1;
-    let (http_status, after_code) = after_code.split_once(", Message: ")?;
+    let (code, after_code) = after_code.split_once(", Message: ")?;
     let (message, after_message) = after_code.split_once(", Status: ")?;
     let status = after_message
         .split(|character: char| character.is_whitespace() || character == ')')
         .next()
         .filter(|status| !status.is_empty())?;
     let message = message.trim();
-    if message.is_empty() {
-        return None;
+    (!message.is_empty()).then(|| (status, code.trim(), message.to_owned()))
+}
+
+/// The reason behind `API error (attempt 3): `, the line a turn ends on when
+/// its last retry failed, such as `request failed: …: EOF`.
+fn retry_detail(payload: &str) -> Option<String> {
+    let (_, attempt) = payload.split_once("API error (attempt ")?;
+    let (_, detail) = attempt.split_once("): ")?;
+    message_text(detail)
+}
+
+/// The harness's own sentence when it words the failure itself, such as
+/// `There was a network issue connecting to the server, please try again.`
+fn headline(payload: &str) -> Option<String> {
+    let mut rest = payload;
+    while let Some(start) = sentence_start(rest) {
+        let sentence = &rest[start..];
+        let end = text_end(sentence);
+        let text = &sentence[..end];
+        rest = &sentence[end..];
+        if let Some(stop) = text.find('.').filter(|stop| text[..*stop].contains(' ')) {
+            return Some(text[..=stop].to_owned());
+        }
     }
-    Some((http_status.trim(), message.to_owned(), status))
+    None
+}
+
+/// Where prose starts: an uppercase letter followed by a lowercase one, which
+/// skips the ids and framing bytes around the text.
+fn sentence_start(text: &str) -> Option<usize> {
+    let mut previous = None;
+    for (index, character) in text.char_indices() {
+        if character.is_ascii_lowercase()
+            && previous.is_some_and(|previous: char| previous.is_ascii_uppercase())
+        {
+            return Some(index - 1);
+        }
+        previous = Some(character);
+    }
+    None
+}
+
+/// One message of a payload: its text, cut off from the protobuf framing that
+/// follows it and shortened to what a transcript can hold.
+fn message_text(text: &str) -> Option<String> {
+    let end = text_end(text);
+    let end = glued_id_start(&text[..end]).unwrap_or(end);
+    let message = text[..end].trim();
+    (!message.is_empty()).then(|| message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect())
+}
+
+/// The payload is protobuf, so its text ends at the first control byte.
+fn text_end(text: &str) -> usize {
+    text.find(|character: char| character.is_control() || character == '\u{FFFD}')
+        .unwrap_or(text.len())
+}
+
+/// Where the `<tag><length><id>` framing after a message starts, when its
+/// bytes happen to be printable and read as part of the text. Real text does
+/// not glue an id to a digit.
+fn glued_id_start(text: &str) -> Option<usize> {
+    const UUID_LEN: usize = 36;
+    let bytes = text.as_bytes();
+    let mut index = 2;
+    while index + UUID_LEN <= bytes.len() {
+        if is_uuid(&bytes[index..]) {
+            return (bytes[index - 2].is_ascii_digit() && bytes[index - 1] != b' ')
+                .then_some(index - 2);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// `bytes` starts with the 36 characters of a UUID. The caller checks the length.
+fn is_uuid(bytes: &[u8]) -> bool {
+    bytes[..36].iter().enumerate().all(|(index, &byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
 }
 
 const DATA_ROOTS: [&str; 3] = [
@@ -237,17 +373,11 @@ fn glog_error_parts(line: &str) -> Option<(&str, &str)> {
 }
 
 fn format_log_error(message: &str) -> String {
-    if message.contains("QUOTA_EXHAUSTED") {
-        return quota_message();
+    match provider_failure(message) {
+        Some(ProviderFailure::Quota) => quota_message(),
+        Some(ProviderFailure::Message(message)) => message,
+        None => message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect(),
     }
-    if let Some((http_status, parsed, status)) = api_error(message) {
-        return if http_status == "429" || status == "RESOURCE_EXHAUSTED" {
-            quota_message()
-        } else {
-            parsed
-        };
-    }
-    message.chars().take(MAX_LOG_ERROR_CHARS).collect()
 }
 
 fn open_read_only(path: &Path) -> Option<Connection> {
@@ -293,13 +423,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_google_api_error_inside_a_stack_trace() {
+    fn reads_the_older_google_api_error_inside_a_stack_trace() {
         let text = "Error 429, Message: Resource exhausted. Please try again., Status: RESOURCE_EXHAUSTED\n\
                     goroutine 1 [running]:\nmain.main()";
-        let (code, message, status) = api_error(text).expect("api error");
-        assert_eq!(code, "429");
-        assert_eq!(message, "Resource exhausted. Please try again.");
-        assert_eq!(status, "RESOURCE_EXHAUSTED");
+        assert_eq!(
+            api_status(text),
+            Some((
+                "RESOURCE_EXHAUSTED",
+                "429",
+                "Resource exhausted. Please try again.".to_owned()
+            ))
+        );
         assert_eq!(failure_message(text), quota_message());
     }
 
@@ -307,6 +441,80 @@ mod tests {
     fn keeps_a_non_quota_provider_message() {
         let text = "Error 500, Message: Internal upstream failure, Status: INTERNAL";
         assert_eq!(failure_message(text), "Internal upstream failure");
+    }
+
+    /// Error steps as `agy` 1.5.15 wrote them: protobuf framing around the
+    /// text, printable often enough to pass for part of the message.
+    #[test]
+    fn reads_the_status_line_agy_writes_for_a_google_api_error() {
+        assert_eq!(
+            failure_message(
+                "/Your AI credits balance is too low to continue.\
+                 \nNRESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\
+                 \nHTTP 429 Too Many Requests"
+            ),
+            quota_message()
+        );
+        assert_eq!(
+            failure_message(
+                "(Agent execution terminated due to error.\
+                 \nOFAILED_PRECONDITION (code 400): User location is not supported for the API use.\
+                 \nHTTP 400 Bad Request"
+            ),
+            "User location is not supported for the API use."
+        );
+        assert_eq!(
+            failure_message(
+                "TAPI error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.2(bd384c9f-6d24-4f67-93cd-a7cca89bc9b2a-240"
+            ),
+            "The service is currently unavailable."
+        );
+    }
+
+    #[test]
+    fn keeps_the_reason_of_a_retry_or_network_failure() {
+        assert_eq!(
+            failure_message(
+                "b$c33e1f12-3e75-4b93-a78c-ff981d3352d0$e14c3d32-23c5-40ba-bc7d-32c8d9a5e235\"$085cf15b-1da9-488c-8ccc-a5593fb5da3e\
+                 \\API error (attempt 1): request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF2'e14c3d32-23c5-40ba-bc7d-32c8d9a5e235-32"
+            ),
+            "request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF"
+        );
+        assert_eq!(
+            failure_message(
+                "EThere was a network issue connecting to the server, please try again.\
+                 \nagent executor error: generating and executing: request failed: net/http: TLS handshake timeout"
+            ),
+            "There was a network issue connecting to the server, please try again."
+        );
+    }
+
+    #[test]
+    fn framing_without_a_reason_is_not_mistaken_for_one() {
+        let framing = "b$c33e1f12-3e75-4b93-a78c-ff981d3352d0$e14c3d32-23c5-40ba-bc7d-32c8d9a5e235\
+                       \"$085cf15b-1da9-488c-8ccc-a5593fb5da3e";
+        assert_eq!(
+            failure_message(framing),
+            tr!("errors.antigravity_turn_failed")
+        );
+    }
+
+    #[test]
+    fn a_status_in_the_server_log_names_the_failure_too() {
+        assert_eq!(
+            format_log_error(
+                "RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+            ),
+            quota_message()
+        );
+        assert_eq!(
+            format_log_error("UNAVAILABLE (code 503): The service is currently unavailable."),
+            "The service is currently unavailable."
+        );
+        assert_eq!(
+            format_log_error("failed to construct executor: open swarm.json: missing"),
+            "failed to construct executor: open swarm.json: missing"
+        );
     }
 
     #[test]
