@@ -263,18 +263,18 @@ stops a turn, and the short-lived server that backs a Grok fork.
 | Bidirectional | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | Reasoning stream | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | Interactive approvals | yes | yes | no | no (has them; Waku runs `--yolo`) | yes | no | yes | yes | yes | yes | yes | yes |
-| Mid-turn steering | yes | **no** | yes | yes | yes | yes | yes | **no** | yes | yes | yes (transport) | **no** |
+| Mid-turn steering | yes | yes | yes | yes | yes | yes | yes | **no** | yes | yes | yes (transport) | **no** |
 | Model discovery | yes | yes | yes | yes | no (fixed) | no (modes) | yes | yes | yes | yes | yes | yes |
 | Computer Use | yes | yes (MCP) | yes | no (ships its own) | no | no | no | no | yes | yes | no | no |
 | Restricted to Full access | no | no | yes | yes | no | yes | no | no | no | no | no | no |
 | Rewind and branch at a turn | yes | **no** | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
 
 Kimi Code's steering is the transport's, not a probed policy: the ACP driver
-sends the second `session/prompt` for every agent it drives except Antigravity,
-Fx, and Factory Droid, but Kimi's superseded-prompt behaviour has not been
-observed against a live turn the way Cursor's and Grok's were. Antigravity is
-kept on the queue path until a second `session/prompt` has been probed against
-its live server; the upstream ACP adapter is one prompt at a time.
+sends the second `session/prompt` for every agent it drives except Fx and
+Factory Droid, though Kimi's superseded-prompt behaviour has not been observed
+against a live turn the way Antigravity's, Cursor's, and Grok's were.
+Antigravity (`agy acp`) accepts a second `session/prompt` mid-stream, settles
+the earlier request cleanly, and pivots into the steered prompt.
 
 Every provider now holds a session across turns. That was not true when this
 document was first written: five of the seven spawned a process per prompt, and
@@ -793,29 +793,51 @@ free to send a cancel while it is outstanding; its reply is what emits
 
 **Antigravity specifics.** `agy acp` advertises `loadSession`, `session/list`,
 `resume`, and `close`. Waku uses `session/load` for both resume and history
-import: on 1.5.5, `session/resume` returns the session's model, mode, and config
-options but no messages, and a fresh process then answers as if the
-conversation had just started. `session/load` replays the history and restores
-the agent's context; the client suppresses those updates because it already has
-the transcript. Its `session/new` response carries the account's model catalog as
-a `model` select whose values are families (`gemini-4-carbon`,
+import: `session/resume` returns the session's model, mode, and config options
+but no messages, and a fresh process then answers as if the conversation had
+just started. `session/load` replays the history (including trailing replay
+chunks emitted briefly after the `session/load` response on large sessions) and
+restores the agent's context; the client suppresses only transcript replay
+updates (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`,
+`tool_call`, `tool_call_update`, `plan`) while letting metadata notifications
+(`available_commands_update`, `usage_update`, `session_info_update`) pass
+through.
+
+Its `session/new` response carries the account's model catalog as
+a `model` select whose values are families (`gemini-4-neon`,
 `claude-opus-5-5`, `gpt-oss-120b-medium`), plus a `thought_level` select for the
 selected family. The full variant ids in `models.availableModels`
-(`gemini-4-carbon-medium`) are accepted by `session/set_config_option` but are
+(`gemini-4-neon-medium`) are accepted by `session/set_config_option` but are
 not picker entries: Waku stores the variant id on the turn, reduces it to the
 advertised family, and applies the variant's effort suffix or the session's own
 effort to `thought_level`. A family without `thought_level`, such as
 `gpt-oss-120b-medium`, gets no thinking picker. Discovery probes each family in a
-throwaway session because the levels are per model.
+throwaway session, captures `available_commands_update` into the cold-start
+slash-command cache, and closes the throwaway session via `session/close`.
 
 Antigravity has no `yolo` or `auto_edit` session mode: the CLI rejects both and
-offers `default`, `accept-edits`, `auto`, and `plan`. Waku keeps `default` for
-every mode except Auto-accept edits, which it maps to `accept-edits`, and
-answers permission requests itself outside Supervised. It does not use the
-native `auto` mode because that would take approvals away from the access mode,
-and it does not use `plan` for Supervised because `plan` changes what the agent
-does, not whether it may act. A live `session/set_mode` probe is accepted for
-`accept-edits`, `default`, `auto`, and `plan` on `agy acp` 1.5.5.
+offers `default`, `accept-edits`, `auto`, and `plan`. Waku maps
+Auto-accept edits to `accept-edits`, Auto to native `auto` (falling back to
+`default` on older builds), and Ask / Full access to `default` while Waku's own
+permission handler governs approvals; live mode changes apply in place via
+`session/set_mode`. It does not map `plan` to an access mode because `plan`
+changes the agent's behavior (invoked directly via `/plan` or `/plan <task>`),
+not whether it may act.
+
+Slash commands are populated cold from the cached ACP `available_commands_update`
+(or a bounded `session/new` → `session/close` fallback), zero-quota
+`agy -p "/skills" --output-format json`, and Waku's locally bridged CLI
+commands (`/usage`, `/quota`, `/credits`, `/model`, `/effort`, plus exact
+`/swarm board` to open the native Swarm Board panel). Agent-side commands
+(`/boost`, `/swarm <task>`, `/plan`, `/goal`, `/grill-me`, `/compact`,
+`/teamwork`, `/schedule`, `/browser`, `/learn`, `/run-workflow`) pass through
+verbatim to `agy acp`. Unsolicited out-of-turn `session/update` notifications
+(from `/swarm` board wakeups, `/schedule` timers, or subagents) open a reactive
+turn and settle cleanly after quiet/usage boundaries; plan artifacts
+(`RequestFeedback: true` / `exit_plan_mode`) and swarm/subagent/boost tool calls
+are normalized for transcript cards, `/usage` + `/credits` feed the zero-quota
+plan usage meter, and the native Swarm Board panel reads `.system_generated/swarm/`
+through the daemon off the UI thread.
 
 Its multiple-choice questions arrive as `session/request_permission` with a
 `toolCallId` beginning `interaction_`; the permission options are the choices,
@@ -943,7 +965,8 @@ oversight.
 
 **Access modes** — Fx exposes native `ask` and `code` modes, so Waku maps
 Supervised to `ask` and the auto modes to `code`. Antigravity exposes
-`accept-edits`, selected only for Auto-accept edits; its other modes stay in
+`accept-edits` (selected for Auto-accept edits) and `auto` (selected for Auto,
+falling back to `default` on older builds); Ask and Full access stay in
 `default` so Waku's own permission policy remains the control. Every other ACP
 agent stays in its ordinary execution mode, and `auto_approves_permissions`
 decides whether Waku answers `session/request_permission` on the user's behalf

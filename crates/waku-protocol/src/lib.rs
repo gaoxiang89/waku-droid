@@ -26,6 +26,7 @@ macro_rules! tr {
     };
 }
 
+pub mod antigravity_swarm;
 pub mod attachments;
 pub mod blob;
 pub mod bridge;

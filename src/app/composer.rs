@@ -2613,9 +2613,254 @@ impl Waku {
         prompt: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.execute_local_composer_command_inner(prompt, false, cx)
+    }
+
+    pub(super) fn execute_local_composer_command_on_accept(
+        &mut self,
+        prompt: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.execute_local_composer_command_inner(prompt, true, cx)
+    }
+
+    fn execute_local_composer_command_inner(
+        &mut self,
+        prompt: &str,
+        from_autocomplete: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.execute_resume_composer_command(prompt, cx)
             || self.execute_fast_mode_toggle(prompt, cx)
             || self.execute_goal_composer_command(prompt, cx)
+            || self.execute_antigravity_local_command(prompt, from_autocomplete, cx)
+    }
+
+    /// Bridge Antigravity's CLI-local commands (`/usage`, `/quota`, `/credits`,
+    /// `/model`, `/effort`, exact `/swarm board`) without starting a turn.
+    /// Agent-side commands (`/boost`, `/swarm <task>`, `/plan <task>`, etc.)
+    /// return `None` from `parse_antigravity_local_command` and pass through
+    /// untouched to `agy acp`.
+    fn execute_antigravity_local_command(
+        &mut self,
+        prompt: &str,
+        from_autocomplete: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::composer_complete::AntigravityLocalCommand;
+
+        let (provider, can_choose_model, session_account_id) = match self.selected_session() {
+            Some(session) => (
+                session.provider,
+                session.can_choose_model(),
+                session.account_id.clone(),
+            ),
+            None => (
+                self.state.last_provider,
+                true,
+                self.state.last_account_id.clone(),
+            ),
+        };
+        let Some(command) = crate::composer_complete::parse_antigravity_local_command(
+            provider,
+            prompt,
+            &self.slash_command_index,
+        ) else {
+            return false;
+        };
+        if from_autocomplete && !command.executes_on_autocomplete_accept() {
+            return false;
+        }
+
+        let host = self.selected_host_key();
+        let account_id = self.validated_account_id_for_host(
+            &host,
+            ProviderKind::Antigravity,
+            session_account_id.as_deref(),
+        );
+
+        match command {
+            AntigravityLocalCommand::Usage => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.usage_settings_host = host.clone();
+                self.usage_view = UsageViewMode::Daily;
+                self.refresh_plan_usage_now(&host, ProviderKind::Antigravity, account_id, cx);
+                self.open_settings_page(SettingsPage::Usage, cx);
+            }
+            AntigravityLocalCommand::ModelPicker => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                if !can_choose_model {
+                    self.show_toast(tr!("commands.model_unavailable"));
+                    cx.notify();
+                } else {
+                    cx.defer(|cx| cx.dispatch_action(&ToggleModelPicker));
+                }
+            }
+            AntigravityLocalCommand::SetModel(query) => {
+                if !can_choose_model {
+                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    self.show_toast(tr!("commands.model_unavailable"));
+                    cx.notify();
+                    return true;
+                }
+                let models = self
+                    .selected_session()
+                    .and_then(|session| self.provider_probe_for_session(session))
+                    .or_else(|| self.provider_probe(ProviderKind::Antigravity))
+                    .map(|probe| probe.models.clone())
+                    .unwrap_or_default();
+                if let Some((model_id, model_name)) = resolve_antigravity_model(&models, &query) {
+                    // Clear before applying so Edited does not repaint the old choice.
+                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    if self.selected_session().is_some() {
+                        self.choose_agent_model(
+                            ProviderKind::Antigravity,
+                            session_account_id,
+                            model_id,
+                            cx,
+                        );
+                    } else {
+                        let (effort, tier, window) =
+                            self.state.model_traits_for(ProviderKind::Antigravity, &model_id);
+                        self.state.last_provider = ProviderKind::Antigravity;
+                        self.state.last_account_id = account_id;
+                        self.state.last_model = Some(model_id);
+                        self.state.last_reasoning_effort = effort;
+                        self.state.last_service_tier = tier;
+                        self.state.last_context_window = window;
+                        self.save();
+                        cx.notify();
+                    }
+                    self.show_success_toast(tr!("commands.model_switched", model = model_name));
+                } else {
+                    if models.is_empty() {
+                        self.refresh_provider_model_discovery(ProviderKind::Antigravity);
+                    }
+                    self.show_toast(tr!("commands.model_not_found", model = query));
+                    cx.notify();
+                }
+            }
+            AntigravityLocalCommand::EffortShow => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                let summary = {
+                    let (model, active_effort) = match self.selected_session() {
+                        Some(session) => (
+                            self.model_metadata_for_session(session),
+                            session.reasoning_effort.as_deref(),
+                        ),
+                        None => {
+                            let probe = self.provider_probe(ProviderKind::Antigravity);
+                            let model = probe.and_then(|probe| {
+                                self.state
+                                    .last_model
+                                    .as_deref()
+                                    .and_then(|id| probe.model(id))
+                                    .or_else(|| probe.preferred_model())
+                            });
+                            (model, self.state.last_reasoning_effort.as_deref())
+                        }
+                    };
+                    model.and_then(|model| {
+                        if model.reasoning_efforts.is_empty() {
+                            return None;
+                        }
+                        let current_id = active_effort
+                            .filter(|selected| {
+                                model
+                                    .reasoning_efforts
+                                    .iter()
+                                    .any(|option| option.id == *selected)
+                            })
+                            .or(model.default_reasoning_effort.as_deref())
+                            .or_else(|| {
+                                model
+                                    .reasoning_efforts
+                                    .first()
+                                    .map(|option| option.id.as_str())
+                            })?;
+                        let current_label = model
+                            .reasoning_efforts
+                            .iter()
+                            .find(|option| option.id == current_id)
+                            .map(|option| option.label.clone())
+                            .unwrap_or_else(|| current_id.to_owned());
+                        let options = model
+                            .reasoning_efforts
+                            .iter()
+                            .map(|option| option.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        Some((current_label, options))
+                    })
+                };
+                match summary {
+                    Some((effort, options)) => {
+                        self.show_success_toast(tr!(
+                            "commands.effort_current",
+                            effort = effort,
+                            options = options
+                        ));
+                    }
+                    None => {
+                        self.show_toast(tr!("commands.effort_unsupported"));
+                    }
+                }
+                cx.notify();
+            }
+            AntigravityLocalCommand::SetEffort(query) => {
+                let efforts = match self.selected_session() {
+                    Some(session) => self.model_metadata_for_session(session),
+                    None => self.provider_probe(ProviderKind::Antigravity).and_then(|probe| {
+                        self.state
+                            .last_model
+                            .as_deref()
+                            .and_then(|id| probe.model(id))
+                            .or_else(|| probe.preferred_model())
+                    }),
+                }
+                .map(|model| model.reasoning_efforts.clone())
+                .unwrap_or_default();
+                if efforts.is_empty() {
+                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    self.show_toast(tr!("commands.effort_unsupported"));
+                    cx.notify();
+                    return true;
+                }
+                if let Some((effort_id, effort_label)) =
+                    resolve_antigravity_effort(&efforts, &query)
+                {
+                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    if self.selected_session().is_some() {
+                        self.set_reasoning_effort(effort_id, cx);
+                    } else {
+                        self.state.last_reasoning_effort = Some(effort_id);
+                        self.save();
+                        cx.notify();
+                    }
+                    self.show_success_toast(tr!(
+                        "commands.effort_switched",
+                        effort = effort_label
+                    ));
+                } else {
+                    let options = efforts
+                        .iter()
+                        .map(|option| option.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.show_toast(tr!(
+                        "commands.effort_invalid",
+                        effort = query,
+                        options = options
+                    ));
+                    cx.notify();
+                }
+            }
+            AntigravityLocalCommand::SwarmBoard => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.open_antigravity_swarm_panel(cx);
+            }
+        }
+        true
     }
 
     fn execute_resume_composer_command(&mut self, prompt: &str, cx: &mut Context<Self>) -> bool {
@@ -3339,9 +3584,7 @@ impl Waku {
                                 } else {
                                     theme.overlay_strong
                                 })
-                                .focus_visible(|style| {
-                                    style.border_1().border_color(theme.accent)
-                                })
+                                .focus_visible(|style| style.border_1().border_color(theme.accent))
                                 .when(can_send, |element| {
                                     element
                                         .tab_index(0)
@@ -4541,4 +4784,126 @@ pub(super) fn visible_picker_entries(
         });
     }
     entries
+}
+
+fn resolve_antigravity_model(models: &[ProviderModel], query: &str) -> Option<(String, String)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(model) = models
+        .iter()
+        .find(|model| model.id.eq_ignore_ascii_case(query))
+    {
+        return Some((model.id.clone(), model.name.clone()));
+    }
+    if let Some(model) = models
+        .iter()
+        .find(|model| model.name.eq_ignore_ascii_case(query))
+    {
+        return Some((model.id.clone(), model.name.clone()));
+    }
+    let lower = query.to_ascii_lowercase();
+    if let Some(model) = models.iter().find(|model| {
+        model
+            .name
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-")
+            == lower
+    }) {
+        return Some((model.id.clone(), model.name.clone()));
+    }
+    let mut matches = models.iter().filter(|model| {
+        model.id.to_ascii_lowercase().contains(&lower)
+            || model.name.to_ascii_lowercase().contains(&lower)
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((first.id.clone(), first.name.clone()))
+}
+
+fn resolve_antigravity_effort(
+    options: &[crate::model::ProviderModelOption],
+    query: &str,
+) -> Option<(String, String)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(option) = options
+        .iter()
+        .find(|option| option.id.eq_ignore_ascii_case(query))
+    {
+        return Some((option.id.clone(), option.label.clone()));
+    }
+    if let Some(option) = options
+        .iter()
+        .find(|option| option.label.eq_ignore_ascii_case(query))
+    {
+        return Some((option.id.clone(), option.label.clone()));
+    }
+    if query.eq_ignore_ascii_case("extra")
+        && let Some(option) = options
+            .iter()
+            .find(|option| option.id.eq_ignore_ascii_case("xhigh"))
+    {
+        return Some((option.id.clone(), option.label.clone()));
+    }
+    None
+}
+
+#[cfg(test)]
+mod antigravity_command_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_antigravity_model_prefers_exact_then_unique_match() {
+        let models = vec![
+            ProviderModel::new("gemini-3.1-pro", "Gemini 3.1 Pro"),
+            ProviderModel::new("gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ProviderModel::new("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ];
+        assert_eq!(
+            resolve_antigravity_model(&models, "GEMINI-3.1-PRO"),
+            Some(("gemini-3.1-pro".into(), "Gemini 3.1 Pro".into()))
+        );
+        assert_eq!(
+            resolve_antigravity_model(&models, "gemini-3.8-flash"),
+            Some(("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()))
+        );
+        assert_eq!(
+            resolve_antigravity_model(&models, "sonnet"),
+            Some(("claude-sonnet-4-6".into(), "Claude Sonnet 4.6".into()))
+        );
+        // Ambiguous substring does not guess.
+        assert_eq!(resolve_antigravity_model(&models, "gemini"), None);
+        assert_eq!(resolve_antigravity_model(&models, "nonexistent"), None);
+    }
+
+    #[test]
+    fn resolve_antigravity_effort_matches_id_label_and_extra_alias() {
+        let options = vec![
+            crate::model::ProviderModelOption::new("low", "Low"),
+            crate::model::ProviderModelOption::new("medium", "Medium"),
+            crate::model::ProviderModelOption::new("high", "High"),
+            crate::model::ProviderModelOption::new("xhigh", "Extra"),
+        ];
+        assert_eq!(
+            resolve_antigravity_effort(&options, "HIGH"),
+            Some(("high".into(), "High".into()))
+        );
+        assert_eq!(
+            resolve_antigravity_effort(&options, "xhigh"),
+            Some(("xhigh".into(), "Extra".into()))
+        );
+        assert_eq!(
+            resolve_antigravity_effort(&options, "extra"),
+            Some(("xhigh".into(), "Extra".into()))
+        );
+        assert_eq!(resolve_antigravity_effort(&options, "max"), None);
+    }
 }

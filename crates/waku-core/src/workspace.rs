@@ -414,6 +414,11 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         WorkspaceOperation::RunGitGraphAction { cwd, action } => WorkspaceResult::Branches {
             snapshot: crate::git_graph_ops::run_action(&cwd, &action)?,
         },
+        WorkspaceOperation::ReadAntigravitySwarm { session_id } => {
+            WorkspaceResult::AntigravitySwarm {
+                snapshot: crate::antigravity_swarm::read_swarm_snapshot(&session_id)?,
+            }
+        }
     })
 }
 
@@ -528,8 +533,9 @@ fn write_file_chunk(
                 if metadata.file_type().is_symlink() {
                     remove_non_dir(&path, &metadata)?;
                 } else if metadata.file_type().is_dir() {
-                    fs::remove_dir_all(&path)
-                        .with_context(|| format!("could not remove directory {}", path.display()))?;
+                    fs::remove_dir_all(&path).with_context(|| {
+                        format!("could not remove directory {}", path.display())
+                    })?;
                 } else if !metadata.file_type().is_file() {
                     bail!("not a regular file: {}", path.display());
                 }
@@ -1627,7 +1633,12 @@ mod tests {
                 overwrite: true,
             })
             .unwrap();
-            assert!(!fs::symlink_metadata(&file_link).unwrap().file_type().is_symlink());
+            assert!(
+                !fs::symlink_metadata(&file_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(fs::read(&file_link).unwrap(), b"local");
             assert_eq!(fs::read(&outside_file).unwrap(), b"untouched");
         }
@@ -1708,7 +1719,10 @@ mod tests {
             let meta = fs::symlink_metadata(&dir_link).unwrap();
             assert!(meta.file_type().is_dir());
             assert!(!meta.file_type().is_symlink());
-            assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "outside");
+            assert_eq!(
+                fs::read_to_string(outside.join("keep.txt")).unwrap(),
+                "outside"
+            );
         }
 
         fs::remove_dir_all(root).unwrap();
@@ -1732,10 +1746,7 @@ mod tests {
             PathBuf::from("missing.txt"),
             PathBuf::from("existing_dir"),
         ];
-        let mut expected = vec![
-            PathBuf::from("existing.txt"),
-            PathBuf::from("existing_dir"),
-        ];
+        let mut expected = vec![PathBuf::from("existing.txt"), PathBuf::from("existing_dir")];
         if has_broken_link {
             query.push(PathBuf::from("broken_link"));
             expected.push(PathBuf::from("broken_link"));
@@ -1835,9 +1846,10 @@ mod tests {
         let file = root.join("nested").join("readme.md");
         fs::write(&file, "hello").unwrap();
 
-        let expected_nested = strip_windows_verbatim(fs::canonicalize(root.join("nested")).unwrap())
-            .to_string_lossy()
-            .into_owned();
+        let expected_nested =
+            strip_windows_verbatim(fs::canonicalize(root.join("nested")).unwrap())
+                .to_string_lossy()
+                .into_owned();
 
         let WorkspaceResult::ResolvedPath { path: dir_resolved } =
             execute(WorkspaceOperation::ResolvePath {
@@ -1883,9 +1895,7 @@ mod tests {
             missing_err.to_string().contains("does not exist"),
             "unexpected error: {missing_err}"
         );
-        assert!(
-            execute(WorkspaceOperation::ResolvePath { path: "   ".into() }).is_err()
-        );
+        assert!(execute(WorkspaceOperation::ResolvePath { path: "   ".into() }).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }

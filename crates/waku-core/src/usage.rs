@@ -4,8 +4,9 @@
 //! `~/.codex/auth.json` token calls the ChatGPT backend's usage endpoint;
 //! OpenCode Go's API key calls `opencode.ai/zen/go/v1/usage`; Grok answers
 //! the `x.ai/billing` extension request on a short-lived `grok agent stdio`
-//! probe. Payload shapes were verified against live responses or the
-//! providers' own schemas, not guessed.
+//! probe; Antigravity answers zero-quota `agy -p "/usage" --output-format json`
+//! (plus best-effort `"/credits"`). Payload shapes were verified against live
+//! responses or the providers' own schemas, not guessed.
 //!
 //! Everything in this module blocks on subprocesses and the network and must
 //! run on the background executor. Render reads only the parsed snapshot the
@@ -561,6 +562,254 @@ fn parse_grok_billing(billing: &Value) -> anyhow::Result<PlanUsage> {
     })
 }
 
+const ANTIGRAVITY_USAGE_TIMEOUT: Duration = Duration::from_secs(15);
+const ANTIGRAVITY_CREDITS_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Fetch Antigravity's plan usage via zero-quota print mode
+/// (`agy -p "/usage" --output-format json`, plus best-effort `"/credits"`).
+/// Blocking, bounded by timeouts with process-group/Windows job cleanup, and
+/// never creates a conversation DB. Never call from the UI thread.
+pub fn fetch_antigravity_plan_usage(binary: &Path) -> anyhow::Result<PlanUsage> {
+    let usage = run_antigravity_print_command(binary, "/usage", ANTIGRAVITY_USAGE_TIMEOUT)?;
+    let credits =
+        run_antigravity_print_command(binary, "/credits", ANTIGRAVITY_CREDITS_TIMEOUT).ok();
+    parse_antigravity_plan_usage(&usage, credits.as_ref())
+}
+
+fn run_antigravity_print_command(
+    binary: &Path,
+    prompt: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let mut command = crate::command_env::command(binary);
+    command.args(["-p", prompt, "--output-format", "json"]);
+    if let Ok(cwd) = crate::acp_session::catalog_working_directory() {
+        command.current_dir(cwd);
+    }
+    let output = crate::command_env::output_with_timeout(&mut command, timeout).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            anyhow!(tr!("usage_error.antigravity_usage_timeout"))
+        } else {
+            anyhow::Error::new(error).context(tr!("usage_error.start_antigravity_probe"))
+        }
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) {
+        if let Some(message) = antigravity_envelope_error(&value) {
+            return Err(anyhow!(tr!(
+                "usage_error.antigravity_answered",
+                error = message
+            )));
+        }
+        if output.status.success() {
+            return Ok(value);
+        }
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| {
+                line.strip_prefix("error:")
+                    .or_else(|| line.strip_prefix("Error:"))
+                    .map(str::trim)
+                    .unwrap_or(line)
+                    .to_owned()
+            })
+            .unwrap_or_else(|| format!("exit {}", output.status));
+        return Err(anyhow!(tr!(
+            "usage_error.antigravity_answered",
+            error = detail
+        )));
+    }
+    serde_json::from_str(stdout.trim()).context(tr!("usage_error.invalid_json"))
+}
+
+fn antigravity_envelope_error(envelope: &Value) -> Option<String> {
+    let status_is_error = envelope
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"));
+    let message = envelope
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned);
+    if message.is_some() {
+        return message;
+    }
+    status_is_error.then(|| tr!("usage_error.unknown_error"))
+}
+
+/// Map `agy -p "/usage" --output-format json` (and optional `"/credits"`) into
+/// [`PlanUsage`]. Verified live against `agy` v1.5.14:
+/// - `command.data.groups[].buckets[]` carries `remaining_fraction` in `0.0..=1.0`
+///   (Go `omitempty`: omitted means `0.0` remaining, i.e., 100% used).
+/// - Untouched buckets (`remaining_fraction == 1.0`) emit Unix epoch zero
+///   (`1970-01-01T00:00:00Z`) for `reset_time`, which maps to `resets_at: None`.
+fn parse_antigravity_plan_usage(
+    envelope: &Value,
+    credits: Option<&Value>,
+) -> anyhow::Result<PlanUsage> {
+    if let Some(error) = antigravity_envelope_error(envelope) {
+        return Err(anyhow!(tr!(
+            "usage_error.antigravity_answered",
+            error = error
+        )));
+    }
+    let data = envelope.pointer("/command/data").unwrap_or(envelope);
+    let mut windows = Vec::new();
+    for group in data
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let group_name = group
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(label) = antigravity_bucket_label(group_name, bucket) else {
+                continue;
+            };
+            // Go `omitempty` omits `remaining_fraction` when 0.0 (fully used).
+            let remaining = match bucket.get("remaining_fraction") {
+                Some(value) => value.as_f64().unwrap_or(0.0),
+                None => 0.0,
+            }
+            .clamp(0.0, 1.0);
+            let percent = ((1.0 - remaining) * 100.0).clamp(0.0, 100.0);
+            let resets_at = parse_antigravity_reset(bucket.get("reset_time"));
+            windows.push(PlanWindow {
+                label,
+                percent,
+                resets_at,
+            });
+        }
+    }
+
+    let tier = data
+        .pointer("/tier/name")
+        .or_else(|| data.get("tier"))
+        .or_else(|| data.get("plan"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_owned);
+    let positive_credits = credits
+        .and_then(parse_antigravity_credits)
+        .filter(|remaining| *remaining > 0);
+    let plan_label = match (tier, positive_credits) {
+        (Some(tier), Some(remaining)) => Some(format!(
+            "{tier} · {}",
+            tr!("usage.credits_remaining", count = remaining)
+        )),
+        (Some(tier), None) => Some(tier),
+        (None, Some(remaining)) => Some(tr!("usage.credits_remaining", count = remaining)),
+        (None, None) => None,
+    };
+
+    if windows.is_empty() && plan_label.is_none() {
+        return Err(anyhow!(tr!("usage_error.antigravity_no_usage_data")));
+    }
+    Ok(PlanUsage {
+        plan_label,
+        windows,
+    })
+}
+
+fn parse_antigravity_credits(envelope: &Value) -> Option<i64> {
+    if antigravity_envelope_error(envelope).is_some() {
+        return None;
+    }
+    envelope
+        .pointer("/command/data/remaining_credits")
+        .or_else(|| envelope.get("remaining_credits"))
+        .and_then(Value::as_i64)
+}
+
+fn parse_antigravity_reset(value: Option<&Value>) -> Option<i64> {
+    parse_reset(value).filter(|timestamp| *timestamp > 0)
+}
+
+fn antigravity_bucket_label(group_name: Option<&str>, bucket: &Value) -> Option<String> {
+    let window_raw = bucket
+        .get("window")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|window| !window.is_empty());
+    let bucket_name = bucket
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let bucket_id = bucket
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+
+    let period_base = window_raw.and_then(antigravity_window_base_label);
+    let suffix = tr!("usage.limit_suffix");
+    match group_name {
+        Some(group) => {
+            let period = period_base
+                .as_deref()
+                .map(|base| base.strip_suffix(&suffix).unwrap_or(base).to_owned())
+                .or_else(|| {
+                    bucket_name.map(|name| {
+                        name.strip_suffix(" Limit Remaining")
+                            .or_else(|| name.strip_suffix(" Remaining"))
+                            .unwrap_or(name)
+                            .to_owned()
+                    })
+                })
+                .or_else(|| window_raw.map(str::to_owned))
+                .or_else(|| bucket_id.map(str::to_owned))?;
+            Some(tr!("usage.scoped_limit", period = period, name = group))
+        }
+        None => period_base
+            .or_else(|| bucket_name.map(str::to_owned))
+            .or_else(|| window_raw.map(str::to_owned))
+            .or_else(|| bucket_id.map(str::to_owned)),
+    }
+}
+
+fn antigravity_window_base_label(window: &str) -> Option<String> {
+    let lower = window.to_ascii_lowercase();
+    match lower.as_str() {
+        "weekly" => Some(tr!("usage.weekly_limit")),
+        "daily" => Some(tr!("usage.daily_limit")),
+        "monthly" => Some(tr!("usage.monthly_limit")),
+        _ => {
+            if let Some(hours) = lower.strip_suffix('h')
+                && let Ok(count) = hours.parse::<i64>()
+                && count > 0
+            {
+                return Some(tr!("usage.hour_limit", count = count));
+            }
+            if let Some(days) = lower.strip_suffix('d')
+                && let Ok(count) = days.parse::<i64>()
+                && count > 0
+            {
+                return Some(tr!("usage.day_limit", count = count));
+            }
+            None
+        }
+    }
+}
+
 /// Map the ChatGPT backend's usage response (primary/secondary windows in
 /// seconds, plus model-scoped `additional_rate_limits`) into the panel's
 /// rows.
@@ -858,8 +1107,7 @@ pub fn http_get(url: &str, headers: &[String]) -> anyhow::Result<(u16, String)> 
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child =
-        crate::command_env::spawn(&mut command).context(tr!("usage_error.run_curl"))?;
+    let mut child = crate::command_env::spawn(&mut command).context(tr!("usage_error.run_curl"))?;
     {
         let stdin = child
             .stdin
@@ -937,8 +1185,8 @@ fn split_status_and_body(raw: &str) -> anyhow::Result<(u16, String)> {
         let Some(remainder) = body else {
             return Ok((status, String::new()));
         };
-        let can_continue = (100..200).contains(&status)
-            || (status == 200 && !has_non_empty_body_header(headers));
+        let can_continue =
+            (100..200).contains(&status) || (status == 200 && !has_non_empty_body_header(headers));
         if can_continue
             && parse_http_status_line(remainder).is_some()
             && split_header_block(remainder).1.is_some()
@@ -1339,8 +1587,12 @@ mod tests {
         );
 
         // Control characters that could inject new curl config lines or HTTP headers.
-        assert!(format_curl_config(&["Authorization: Bearer a\noutput = /tmp/x".to_owned()]).is_err());
-        assert!(format_curl_config(&["Authorization: Bearer a\r\nX-Injected: 1".to_owned()]).is_err());
+        assert!(
+            format_curl_config(&["Authorization: Bearer a\noutput = /tmp/x".to_owned()]).is_err()
+        );
+        assert!(
+            format_curl_config(&["Authorization: Bearer a\r\nX-Injected: 1".to_owned()]).is_err()
+        );
         assert!(format_curl_config(&["Authorization: Bearer a\0b".to_owned()]).is_err());
         assert!(format_curl_config(&["X-Tab: a\tb".to_owned()]).is_err());
         assert!(format_curl_config(&["X-Del: a\x7fb".to_owned()]).is_err());
@@ -1359,16 +1611,12 @@ mod tests {
         std::fs::write(&system_curl, b"").unwrap();
         let path_curl = dir.join("path-curl");
 
-        let resolved = resolve_curl_path_with(
-            &[dir.join("missing"), system_curl.clone()],
-            |_| Some(path_curl.clone()),
-        );
+        let resolved = resolve_curl_path_with(&[dir.join("missing"), system_curl.clone()], |_| {
+            Some(path_curl.clone())
+        });
         assert_eq!(resolved, system_curl);
 
-        let fallback = resolve_curl_path_with(
-            &[dir.join("missing")],
-            |_| Some(path_curl.clone()),
-        );
+        let fallback = resolve_curl_path_with(&[dir.join("missing")], |_| Some(path_curl.clone()));
         assert_eq!(fallback, path_curl);
 
         let bare = resolve_curl_path_with(&[dir.join("missing")], |_| None);
@@ -1694,6 +1942,180 @@ mod tests {
         assert_eq!(usage.windows[0].label, "Weekly limit");
         assert_eq!(usage.windows[0].percent, 37.5);
         assert!(usage.windows[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn antigravity_usage_maps_groups_buckets_and_epoch_zero_resets() {
+        // Sanitized fixture matching live `agy -p "/usage" --output-format json` (v1.5.14).
+        let usage_envelope: Value = serde_json::from_str(
+            r#"{
+                "conversation_id": "",
+                "status": "SUCCESS",
+                "response": "Gemini Models\tWeekly Limit Remaining\t96%",
+                "duration_seconds": 0,
+                "num_turns": 0,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 0
+                },
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "description": "Account usage limits",
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 0.9644,
+                                        "reset_time": "2026-11-30T06:10:13Z"
+                                    },
+                                    {
+                                        "id": "gemini-5h",
+                                        "name": "5-hour Limit Remaining",
+                                        "window": "5h",
+                                        "remaining_fraction": 1.0,
+                                        "reset_time": "1970-01-01T00:00:00Z"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "Claude and GPT models",
+                                "buckets": [
+                                    {
+                                        "id": "3p-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 0.5,
+                                        "reset_time": "2026-11-30T06:10:13Z"
+                                    },
+                                    {
+                                        "id": "3p-5h",
+                                        "name": "5-hour Limit Remaining",
+                                        "window": "5h",
+                                        "reset_time": "2026-11-23T12:00:00Z"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "Gemini 4 Argon",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-argon-wtu-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 1,
+                                        "reset_time": "1970-01-01T00:00:00Z"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let zero_credits: Value = serde_json::from_str(
+            r#"{
+                "conversation_id": "",
+                "status": "SUCCESS",
+                "num_turns": 0,
+                "command": {
+                    "name": "credits",
+                    "data": {
+                        "remaining_credits": 0,
+                        "upgrade_uri": "https://antigravity.google/g1-upgrade"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let parsed = parse_antigravity_plan_usage(&usage_envelope, Some(&zero_credits)).unwrap();
+        assert_eq!(parsed.plan_label, None);
+        assert_eq!(parsed.windows.len(), 5);
+        assert_eq!(parsed.windows[0].label, "Weekly · Gemini Models");
+        assert!((parsed.windows[0].percent - 3.56).abs() < 0.01);
+        assert!(parsed.windows[0].resets_at.is_some());
+
+        // Untouched bucket with epoch-zero reset_time has 0% used and no reset timestamp.
+        assert_eq!(parsed.windows[1].label, "5-hour · Gemini Models");
+        assert_eq!(parsed.windows[1].percent, 0.0);
+        assert_eq!(parsed.windows[1].resets_at, None);
+
+        assert_eq!(parsed.windows[2].label, "Weekly · Claude and GPT models");
+        assert_eq!(parsed.windows[2].percent, 50.0);
+        assert!(parsed.windows[2].resets_at.is_some());
+
+        // Omitted remaining_fraction (Go omitempty for 0.0) maps to 100% used.
+        assert_eq!(parsed.windows[3].label, "5-hour · Claude and GPT models");
+        assert_eq!(parsed.windows[3].percent, 100.0);
+        assert!(parsed.windows[3].resets_at.is_some());
+
+        assert_eq!(parsed.windows[4].label, "Weekly · Gemini 4 Argon");
+        assert_eq!(parsed.windows[4].percent, 0.0);
+        assert_eq!(parsed.windows[4].resets_at, None);
+    }
+
+    #[test]
+    fn antigravity_usage_includes_positive_credits_and_surfaces_errors() {
+        let usage_envelope = json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [{
+                        "name": "Gemini Models",
+                        "buckets": [{
+                            "id": "gemini-weekly",
+                            "window": "weekly",
+                            "remaining_fraction": 0.75,
+                            "reset_time": "2026-11-30T06:10:13Z"
+                        }]
+                    }]
+                }
+            }
+        });
+        let credits_envelope = json!({
+            "status": "SUCCESS",
+            "command": {
+                "name": "credits",
+                "data": {"remaining_credits": 250}
+            }
+        });
+        let parsed = parse_antigravity_plan_usage(&usage_envelope, Some(&credits_envelope)).unwrap();
+        assert_eq!(parsed.plan_label.as_deref(), Some("250 credits"));
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].percent, 25.0);
+
+        // Error envelope surfaces the provider's own error text.
+        let error_envelope = json!({
+            "conversation_id": "",
+            "status": "ERROR",
+            "response": "",
+            "error": "Not signed in to Antigravity",
+            "num_turns": 0,
+            "finished_reason": "error"
+        });
+        let err = parse_antigravity_plan_usage(&error_envelope, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Not signed in to Antigravity"), "{err}");
+
+        // Empty usage with no credits/tier fails instead of showing a blank meter.
+        assert!(
+            parse_antigravity_plan_usage(
+                &json!({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! is session-scoped publish it through their live driver instead. Every probe
 //! runs in the daemon's background workspace operation, never on a render path.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -32,6 +33,7 @@ pub(crate) fn discover(
 ) -> Option<Vec<SlashCommand>> {
     match provider {
         ProviderKind::Amp => discover_amp(binary, project_root),
+        ProviderKind::Antigravity => discover_antigravity(binary, project_root),
         ProviderKind::Claude => discover_claude(binary, project_root, config_dir),
         ProviderKind::Codex => discover_codex(binary, project_root, config_dir),
         ProviderKind::OpenCode => discover_opencode(binary, project_root),
@@ -41,14 +43,164 @@ pub(crate) fn discover(
         // requires an agent id for commands/list. Creating throwaway sessions
         // merely to seed autocomplete would pollute provider history, so their
         // live DriverEvent::AvailableCommands update is the catalog surface.
-        ProviderKind::Antigravity
-        | ProviderKind::Cursor
+        ProviderKind::Cursor
         | ProviderKind::DeepSeek
         | ProviderKind::Droid
         | ProviderKind::Fx
         | ProviderKind::Grok
         | ProviderKind::Kimi => None,
     }
+}
+
+fn discover_antigravity(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
+    let acp_commands = crate::model_catalog::discover_antigravity_acp_commands(binary);
+    let skills = discover_antigravity_skills(binary, project_root);
+    let bridged = antigravity_bridged_cli_commands();
+    let merged = merge_antigravity_catalog(
+        acp_commands.unwrap_or_default(),
+        skills.unwrap_or_default(),
+        bridged,
+    );
+    (!merged.is_empty()).then_some(merged)
+}
+
+fn discover_antigravity_skills(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
+    let value = capture_json(
+        binary,
+        &["-p", "/skills", "--output-format", "json"],
+        project_root,
+    )?;
+    Some(parse_antigravity_skills(&value))
+}
+
+fn parse_antigravity_skills(value: &Value) -> Vec<SlashCommand> {
+    value
+        .pointer("/command/data/skills")
+        .or_else(|| value.get("skills"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|skill| {
+            command(
+                skill.get("name")?.as_str()?,
+                skill.get("description").and_then(Value::as_str),
+                CommandScope::Skill,
+                None,
+                None,
+            )
+        })
+        .take(COMMAND_CATALOG_CAP)
+        .collect()
+}
+
+/// CLI-local Antigravity commands that Waku bridges in the composer without
+/// starting a provider turn. Kept 1:1 with `waku-client/composer_complete.rs`.
+fn antigravity_bridged_cli_commands() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand {
+            name: "usage".to_owned(),
+            description: crate::i18n::translate("commands.usage_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "quota".to_owned(),
+            description: crate::i18n::translate("commands.quota_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "credits".to_owned(),
+            description: crate::i18n::translate("commands.credits_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "model".to_owned(),
+            description: crate::i18n::translate("commands.model_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[<model>]".to_owned()),
+            template: None,
+        },
+        SlashCommand {
+            name: "effort".to_owned(),
+            description: crate::i18n::translate("commands.effort_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[low|medium|high|xhigh|max]".to_owned()),
+            template: None,
+        },
+    ]
+}
+
+fn antigravity_default_argument_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "swarm" => Some("<task> | board"),
+        "boost" => Some("<task>"),
+        "plan" => Some("[<task>]"),
+        "goal" => Some("<objective>"),
+        "compact" => Some("[focus]"),
+        "schedule" => Some("<spec>"),
+        "browser" => Some("<task>"),
+        "teamwork" => Some("<task>"),
+        "run-workflow" => Some("<workflow>"),
+        _ => None,
+    }
+}
+
+/// Merges Antigravity's ACP `available_commands_update` built-ins, zero-quota
+/// `/skills` listing, and Waku-bridged CLI-local commands without letting a
+/// skill entry downgrade an ACP built-in (e.g. `swarm`, `run-workflow`) or
+/// strip its argument hint.
+fn merge_antigravity_catalog(
+    acp_commands: Vec<SlashCommand>,
+    skills: Vec<SlashCommand>,
+    bridged_cli: Vec<SlashCommand>,
+) -> Vec<SlashCommand> {
+    let mut commands = Vec::new();
+    let mut seen_builtins = HashSet::new();
+
+    for mut entry in acp_commands {
+        if entry.argument_hint.is_none()
+            && let Some(hint) = antigravity_default_argument_hint(&entry.name)
+        {
+            entry.argument_hint = Some(hint.to_owned());
+        }
+        if seen_builtins.insert(entry.name.clone()) {
+            commands.push(entry);
+        }
+    }
+    for entry in bridged_cli {
+        if let Some(existing) = commands
+            .iter_mut()
+            .find(|existing| existing.name == entry.name)
+        {
+            if existing.description.is_empty() && !entry.description.is_empty() {
+                existing.description = entry.description;
+            }
+            if existing.argument_hint.is_none() && entry.argument_hint.is_some() {
+                existing.argument_hint = entry.argument_hint;
+            }
+        } else if seen_builtins.insert(entry.name.clone()) {
+            commands.push(entry);
+        }
+    }
+    for skill in skills {
+        if let Some(existing) = commands
+            .iter_mut()
+            .find(|existing| existing.name == skill.name)
+        {
+            if existing.description.is_empty() && !skill.description.is_empty() {
+                existing.description = skill.description;
+            }
+        } else {
+            commands.push(skill);
+        }
+    }
+    commands.truncate(COMMAND_CATALOG_CAP);
+    commands
 }
 
 fn discover_amp(binary: &Path, project_root: &Path) -> Option<Vec<SlashCommand>> {
@@ -450,12 +602,16 @@ fn capture_json(binary: &Path, args: &[&str], cwd: &Path) -> Option<Value> {
         .stderr(Stdio::null());
     isolate_process_group(&mut command);
     let mut child = crate::command_env::spawn(&mut command).ok()?;
+    #[cfg(windows)]
+    let job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
     let Some(stdout) = child.stdout.take() else {
         terminate_child(&mut child);
         return None;
     };
     let reader = thread::spawn(move || read_bounded(stdout, MAX_CAPTURE_BYTES));
     let success = wait_for_child(&mut child, CLI_PROBE_TIMEOUT);
+    #[cfg(windows)]
+    drop(job);
     let output = reader.join().ok().flatten()?;
     success
         .then(|| serde_json::from_slice(&output).ok())
@@ -714,10 +870,8 @@ mod tests {
 
     #[test]
     fn discover_opencode_returns_none_without_running_service_and_normalizes_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "waku-slash-opencode-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("waku-slash-opencode-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
 
         let absent = discover_opencode_with(
@@ -757,6 +911,127 @@ mod tests {
         ]}));
         assert_eq!(amp.len(), 1);
         assert_eq!(amp[0].scope, CommandScope::Skill);
+    }
+
+    #[test]
+    fn parses_antigravity_skills_and_merges_without_downgrading_acp_builtins() {
+        let skills = parse_antigravity_skills(&json!({
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "num_turns": 0,
+            "command": {
+                "name": "skills",
+                "data": {
+                    "skills": [
+                        {"name": "swarm", "description": "Skill swarm description", "builtin": true, "model_invocable": false},
+                        {"name": "antigravity-guide", "description": "Guide to Antigravity", "builtin": true, "model_invocable": true},
+                        {"name": "bad skill", "description": "Ignored whitespace"}
+                    ]
+                }
+            }
+        }));
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "swarm");
+        assert_eq!(skills[0].scope, CommandScope::Skill);
+        assert_eq!(skills[1].name, "antigravity-guide");
+        assert_eq!(skills[1].scope, CommandScope::Skill);
+
+        let acp = vec![
+            SlashCommand {
+                name: "boost".into(),
+                description: "Boost output".into(),
+                scope: CommandScope::Builtin,
+                argument_hint: Some("<prompt>".into()),
+                template: None,
+            },
+            SlashCommand {
+                name: "swarm".into(),
+                description: String::new(),
+                scope: CommandScope::Builtin,
+                argument_hint: Some("<task>".into()),
+                template: None,
+            },
+            SlashCommand {
+                name: "plan".into(),
+                description: "Plan carefully".into(),
+                scope: CommandScope::Builtin,
+                argument_hint: None,
+                template: None,
+            },
+        ];
+        let bridged = vec![SlashCommand {
+            name: "usage".into(),
+            description: "Show usage".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        }];
+        let merged = merge_antigravity_catalog(acp, skills, bridged);
+        let swarm = merged
+            .iter()
+            .find(|command| command.name == "swarm")
+            .expect("swarm should be present");
+        assert_eq!(
+            swarm.scope,
+            CommandScope::Builtin,
+            "ACP builtin must not be downgraded to Skill"
+        );
+        assert_eq!(swarm.argument_hint.as_deref(), Some("<task>"));
+        assert_eq!(
+            swarm.description, "Skill swarm description",
+            "missing ACP description should be backfilled from skill metadata"
+        );
+        let boost = merged
+            .iter()
+            .find(|command| command.name == "boost")
+            .expect("boost should be present");
+        assert_eq!(
+            boost.argument_hint.as_deref(),
+            Some("<prompt>"),
+            "explicit ACP argument_hint must be preserved"
+        );
+        let plan = merged
+            .iter()
+            .find(|command| command.name == "plan")
+            .expect("plan should be present");
+        assert_eq!(
+            plan.argument_hint.as_deref(),
+            Some("[<task>]"),
+            "missing ACP argument_hint should be backfilled"
+        );
+        assert!(
+            !merged.iter().any(|c| c.name == "teamwork"),
+            "unadvertised commands must not be invented"
+        );
+        assert!(merged.iter().any(|c| c.name == "usage" && c.scope == CommandScope::Builtin));
+        assert!(merged
+            .iter()
+            .any(|c| c.name == "antigravity-guide" && c.scope == CommandScope::Skill));
+        assert_eq!(merged.len(), 5);
+    }
+
+    #[test]
+    fn antigravity_bridged_cli_commands_match_client_bridge_contract() {
+        let bridged = antigravity_bridged_cli_commands();
+        let names = bridged
+            .iter()
+            .map(|command| (command.name.as_str(), command.argument_hint.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("usage", None),
+                ("quota", None),
+                ("credits", None),
+                ("model", Some("[<model>]")),
+                ("effort", Some("[low|medium|high|xhigh|max]")),
+            ]
+        );
+        assert!(bridged.iter().all(|command| {
+            command.scope == CommandScope::Builtin
+                && command.template.is_none()
+                && !command.description.is_empty()
+        }));
     }
 
     #[test]

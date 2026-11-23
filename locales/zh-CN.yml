@@ -1382,3 +1382,70 @@ notifications.input: 待回答
 terminal.end_session: 结束终端会话
 terminal.restore_sessions: 恢复工作区终端
 terminal.reconnecting: 连接中断，正在重连
+
+right_panel.swarm: Swarm
+right_panel.swarm_description: 查看 Antigravity Swarm 协作看板与成员状态
+swarm.title_default: Swarm 看板
+swarm.tab_board: 看板
+swarm.tab_members: 成员
+swarm.tab_overview: 总览
+swarm.follow: 跟随
+swarm.following: 跟随中
+swarm.refresh: 刷新 Swarm
+swarm.retry: 重试
+swarm.all_members: 全部
+swarm.clear_filter: 清除
+swarm.jump_latest: 最新
+swarm.show_killed: "显示已结束（%{count}）"
+swarm.hide_killed: "隐藏已结束（%{count}）"
+swarm.status_working: 运行中
+swarm.status_waiting: 等待中
+swarm.status_failed: 失败
+swarm.status_killed: 已结束
+swarm.you: 当前
+swarm.active_count: "%{count} 运行中"
+swarm.waiting_count: "%{count} 等待中"
+swarm.failed_count: "%{count} 失败"
+swarm.posts_count: "%{count} 条消息"
+swarm.steps_count: "%{count} 步"
+swarm.unread_count: "%{count} 未读"
+swarm.wake_mentions: 仅 @提及
+swarm.wake_anything: 任意消息
+swarm.truncated_banner: "仅显示最新 %{shown} / %{total} 条消息"
+swarm.empty_non_antigravity: Swarm 看板仅适用于 Antigravity
+swarm.empty_non_antigravity_description: 切换到 Antigravity 任务以查看其 Swarm 看板和成员活动。
+swarm.empty_title: 当前会话暂无 Swarm
+swarm.empty_description: 输入 /swarm <任务> 启动 Swarm。成员加入后，此面板会自动刷新。
+swarm.loading_title: 正在加载 Swarm 看板
+swarm.loading_description: 正在从主机读取 Antigravity Swarm 状态。
+swarm.error_title: 无法读取 Swarm 看板
+swarm.board_empty: 没有符合筛选条件的消息
+swarm.board_no_posts: 看板上还没有消息
+swarm.members_empty: 没有可显示的活跃成员
+swarm.overview_empty_title: 暂无解说员总览
+swarm.overview_empty_description: 当 Swarm 包含写入 view.json 的解说员成员时，进度摘要、工作流和风险会显示在这里。
+swarm.section_attention: 需要关注
+swarm.section_workstreams: 工作流
+swarm.section_milestones: 里程碑
+swarm.section_risks: 风险
+swarm.as_of_seq: "截至 #%{seq}"
+swarm.failure_quota: 配额
+swarm.failure_error: 错误
+swarm.brief_badge: 任务书
+usage.credits_remaining: "%{count} 积分"
+usage_error.start_antigravity_probe: "无法启动 `agy` 用量探测"
+usage_error.antigravity_usage_timeout: Antigravity 用量查询超时
+usage_error.antigravity_answered: "Antigravity 返回错误：%{error}"
+usage_error.antigravity_no_usage_data: "Antigravity 未返回用量限额；请先运行 `agy` 登录"
+commands.usage_description: 查看套餐用量与配额
+commands.quota_description: 查看套餐用量与配额
+commands.credits_description: 查看剩余积分与用量
+commands.model_description: 打开模型选择器或切换模型
+commands.effort_description: 查看或设置推理强度
+commands.model_switched: "已将模型切换为 %{model}"
+commands.model_not_found: "未知模型：%{model}"
+commands.model_unavailable: 请先停止当前回复再切换模型
+commands.effort_switched: "推理强度已设为 %{effort}"
+commands.effort_current: "当前推理强度：%{effort}（可选：%{options}）"
+commands.effort_unsupported: 当前模型不支持调整推理强度
+commands.effort_invalid: "无效的推理强度 \"%{effort}\"（可选：%{options}）"

@@ -49,6 +49,8 @@ impl Waku {
         self.settings_scroll.set_offset(gpui::Point::default());
         if page == SettingsPage::Usage {
             self.ensure_usage_history(false, cx);
+            let host = self.effective_usage_host();
+            self.maybe_refresh_plan_usage_for_host(&host, cx);
         }
         if page == SettingsPage::Skills {
             self.ensure_skills_catalog(false, cx);
@@ -80,6 +82,7 @@ impl Waku {
         self.usage_months_scroll.set_offset(gpui::Point::default());
         self.usage_projects_list.reset(0);
         self.ensure_usage_history(true, cx);
+        self.maybe_refresh_plan_usage_for_host(&self.effective_usage_host(), cx);
         cx.notify();
     }
 
@@ -237,6 +240,12 @@ impl Waku {
             )
             .when_some(host_tabs, |element, tabs| element.child(tabs))
             .child(self.render_usage_header(range, pending, &theme, cx));
+
+        if self.usage_view == UsageViewMode::Daily
+            && let Some(plan_section) = self.render_plan_usage_section(&host, &theme)
+        {
+            page = page.child(plan_section);
+        }
 
         let Some(history) = history else {
             // First scan (or a window-shape switch) still in flight: a
@@ -441,6 +450,8 @@ impl Waku {
             .child(refresh_glyph)
             .on_activation(cx, |this, _, cx| {
                 this.ensure_usage_history(true, cx);
+                let host = this.effective_usage_host();
+                this.refresh_all_plan_usage_for_host(&host, cx);
             });
 
         let range_label = if monthly {
@@ -474,6 +485,172 @@ impl Waku {
             .child(view_options)
             .children(window_selector)
             .child(refresh)
+    }
+
+    /// Live account plan quota cards for providers with plan-usage fetchers
+    /// (Claude, Codex, OpenCode Go, Grok, Antigravity). Pure snapshot reads;
+    /// background refreshes happen off-thread via [`Self::maybe_refresh_plan_usage_for_host`].
+    fn render_plan_usage_section(
+        &self,
+        host: &waku_client::hosts::HostKey,
+        theme: &Theme,
+    ) -> Option<Div> {
+        let mut entries: Vec<(ProviderKind, Option<String>)> = super::usage_meter::PLAN_USAGE_PROVIDERS
+            .into_iter()
+            .filter(|provider| {
+                let key: PlanUsageKey = (host.clone(), *provider, None);
+                self.plan_usage.contains_key(&key)
+                    || self.plan_usage_error.contains_key(&key)
+                    || (self.provider_enabled_on(host, *provider)
+                        && !self.plan_usage_unconfigured.contains(&key))
+            })
+            .map(|provider| (provider, None))
+            .collect();
+
+        if *host == self.selected_host_key()
+            && let Some(session) = self.selected_session()
+            && super::usage_meter::PLAN_USAGE_PROVIDERS.contains(&session.provider)
+        {
+            let account_id = self.validated_account_id_for_host(
+                host,
+                session.provider,
+                session.account_id.as_deref(),
+            );
+            let candidate = (session.provider, account_id);
+            let key: PlanUsageKey = (host.clone(), candidate.0, candidate.1.clone());
+            if !entries.contains(&candidate)
+                && (self.plan_usage.contains_key(&key)
+                    || self.plan_usage_error.contains_key(&key)
+                    || !self.plan_usage_unconfigured.contains(&key))
+            {
+                entries.push(candidate);
+            }
+        }
+
+        if entries.is_empty() {
+            return None;
+        }
+
+        let now = unix_time() as i64;
+        let mut cards = div().flex().flex_wrap().gap(px(12.0));
+        for (provider, account_id) in entries {
+            let key: PlanUsageKey = (host.clone(), provider, account_id.clone());
+            let plan = self.plan_usage.get(&key);
+            let error = self.plan_usage_error.get(&key);
+            let account_label = self
+                .account_for_host(host, provider, account_id.as_deref())
+                .map(|account| account.label.as_str());
+            let title = match (plan.and_then(|p| p.plan_label.as_deref()), account_label) {
+                (Some(tier), Some(account)) => {
+                    format!("{} · {tier} · {account}", provider.display_name())
+                }
+                (Some(tier), None) => format!("{} · {tier}", provider.display_name()),
+                (None, Some(account)) => format!("{} · {account}", provider.display_name()),
+                (None, None) => provider.display_name().to_owned(),
+            };
+
+            let mut card = div()
+                .min_w(px(260.0))
+                .flex_1()
+                .p(px(14.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .child(provider_mark(provider, 14.0, provider_color(theme, provider)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(title)),
+                        ),
+                );
+
+            if let Some(plan) = plan {
+                for window in &plan.windows {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(sp(12.5))
+                                            .text_color(theme.text)
+                                            .child(SharedString::from(window.label.clone())),
+                                    )
+                                    .children(window.resets_at.map(|resets_at| {
+                                        div()
+                                            .flex_none()
+                                            .text_size(sp(12.0))
+                                            .text_color(theme.text_tertiary)
+                                            .child(SharedString::from(
+                                                crate::usage::reset_label(resets_at, now),
+                                            ))
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(sp(12.5))
+                                            .text_color(theme.text_secondary)
+                                            .child(SharedString::from(format!(
+                                                "{:.0}%",
+                                                window.percent
+                                            ))),
+                                    ),
+                            )
+                            .child(super::usage_meter::meter_bar(theme, window.percent)),
+                    );
+                }
+            } else if let Some(error) = error {
+                card = card.child(
+                    div()
+                        .text_size(sp(12.5))
+                        .text_color(theme.text_secondary)
+                        .child(SharedString::from(tr!("usage.unavailable", error = error))),
+                );
+            } else {
+                card = card.child(super::usage_meter::plan_skeleton(theme));
+            }
+
+            cards = cards.child(card);
+        }
+
+        Some(
+            div()
+                .mt(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .text_size(sp(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text_tertiary)
+                        .child(tr!("usage.plan_limits")),
+                )
+                .child(cards),
+        )
     }
 
     /// The headline figure in the active metric plus one share bar per
@@ -1567,15 +1744,14 @@ fn usage_project_identity_for_host(
     (name, Some(usage_project_path(path, home)))
 }
 
-fn next_segmented_option<T: Copy + PartialEq>(
-    options: &[T],
-    current: T,
-    key: &str,
-) -> Option<T> {
+fn next_segmented_option<T: Copy + PartialEq>(options: &[T], current: T, key: &str) -> Option<T> {
     if options.is_empty() {
         return None;
     }
-    let index = options.iter().position(|option| *option == current).unwrap_or(0);
+    let index = options
+        .iter()
+        .position(|option| *option == current)
+        .unwrap_or(0);
     let last = options.len() - 1;
     let next = match key {
         "left" => index.saturating_sub(1),
@@ -3147,12 +3323,8 @@ mod tests {
         assert_eq!(local_path.as_deref(), Some("~/dev/waku"));
 
         let remote_host = waku_client::hosts::HostKey::Connection("ssh-prod".to_owned());
-        let (remote_name, remote_path) = usage_project_identity_for_host(
-            &slice,
-            &[],
-            Some(home),
-            &remote_host,
-        );
+        let (remote_name, remote_path) =
+            usage_project_identity_for_host(&slice, &[], Some(home), &remote_host);
         assert_eq!(remote_name, "waku");
         assert_eq!(remote_path.as_deref(), Some("/Users/developer/dev/waku"));
     }

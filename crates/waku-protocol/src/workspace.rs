@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::antigravity_swarm::AntigravitySwarmSnapshot;
 use crate::composer::{FileEntry, SlashCommand};
 use crate::git::{
     AgentInvocation, BranchSnapshot, CommitSnapshot, CreatedWorktree, GitCommitDetail, GitDiffSpec,
@@ -319,6 +320,12 @@ pub enum WorkspaceOperation {
         cwd: PathBuf,
         action: GitGraphAction,
     },
+    /// Reads the Antigravity native swarm snapshot for a conversation on the
+    /// daemon host (read-only). `session_id` is strictly validated against
+    /// path traversal before any filesystem access.
+    ReadAntigravitySwarm {
+        session_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
@@ -407,6 +414,9 @@ pub enum WorkspaceResult {
     },
     GitFileDiff {
         diff: GitFileDiff,
+    },
+    AntigravitySwarm {
+        snapshot: Option<AntigravitySwarmSnapshot>,
     },
 }
 

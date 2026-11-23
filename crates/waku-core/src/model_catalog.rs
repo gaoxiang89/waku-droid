@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -14,13 +15,17 @@ use std::os::unix::process::CommandExt as _;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, Implementation, InitializeRequest, NewSessionRequest, SessionConfigKind,
-    SessionConfigOption, SessionConfigSelectOptions, SetSessionConfigOptionRequest,
+    AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities, CloseSessionRequest,
+    Implementation, InitializeRequest, NewSessionRequest, SessionConfigKind, SessionConfigOption,
+    SessionConfigSelectOptions, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, UntypedMessage};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, UntypedMessage};
+use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
 use crate::model::{ProviderAgentPreset, ProviderKind, ProviderModel, ProviderModelOption};
+use waku_protocol::composer::{CommandScope, SlashCommand};
 use waku_protocol::model_catalog::normalize_cursor_reasoning_effort;
 
 const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +37,10 @@ const PI_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CURSOR_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 const ANTIGRAVITY_EFFORT_PROBE_BUDGET: Duration = Duration::from_secs(25);
+const ANTIGRAVITY_COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const ANTIGRAVITY_COMMAND_WAIT_GRACE: Duration = Duration::from_secs(2);
+const ANTIGRAVITY_MODEL_COMMAND_GRACE: Duration = Duration::from_millis(500);
+const ANTIGRAVITY_COMMAND_CATALOG_CAP: usize = 500;
 
 pub use waku_protocol::model_catalog::{fallback_agent_presets, fallback_models};
 
@@ -1046,6 +1055,180 @@ fn parse_droid_models(output: &str) -> Vec<ProviderModel> {
     models
 }
 
+/// Shared in-memory cache of slash commands advertised by `agy acp`'s
+/// `available_commands_update` notification, keyed by canonical binary path.
+/// Model discovery populates this opportunistically during its `session/new`
+/// handshake so cold-start composer discovery does not have to launch a second
+/// ACP server.
+static ANTIGRAVITY_ACP_COMMANDS: OnceLock<Mutex<HashMap<PathBuf, Vec<SlashCommand>>>> =
+    OnceLock::new();
+
+fn antigravity_acp_commands_cache() -> &'static Mutex<HashMap<PathBuf, Vec<SlashCommand>>> {
+    ANTIGRAVITY_ACP_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn antigravity_binary_cache_key(binary: &Path) -> PathBuf {
+    let resolved = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    #[cfg(windows)]
+    {
+        PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        resolved
+    }
+}
+
+/// Returns the cached ACP slash commands last advertised by `binary`, if any.
+pub(crate) fn cached_antigravity_acp_commands(binary: &Path) -> Option<Vec<SlashCommand>> {
+    let key = antigravity_binary_cache_key(binary);
+    antigravity_acp_commands_cache().lock().get(&key).cloned()
+}
+
+fn store_antigravity_acp_commands(cache_key: &Path, commands: Vec<SlashCommand>) {
+    if commands.is_empty() {
+        return;
+    }
+    antigravity_acp_commands_cache()
+        .lock()
+        .insert(cache_key.to_path_buf(), commands);
+}
+
+fn parse_acp_available_commands(update: &AvailableCommandsUpdate) -> Vec<SlashCommand> {
+    update
+        .available_commands
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.name.trim().trim_start_matches('/');
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let argument_hint = entry.input.as_ref().and_then(|input| match input {
+                AvailableCommandInput::Unstructured(unstructured) => {
+                    let hint = unstructured.hint.trim();
+                    (!hint.is_empty()).then(|| hint.to_owned())
+                }
+                _ => None,
+            });
+            Some(SlashCommand {
+                name: name.to_owned(),
+                description: entry.description.trim().to_owned(),
+                scope: CommandScope::Builtin,
+                argument_hint,
+                template: None,
+            })
+        })
+        .take(ANTIGRAVITY_COMMAND_CATALOG_CAP)
+        .collect()
+}
+
+/// Returns Antigravity's ACP slash commands for `binary`, hitting the shared
+/// in-memory cache first and falling back to a single bounded `agy acp` probe
+/// (`initialize` → `session/new` → capture `available_commands_update` →
+/// `session/close`) when cold.
+pub(crate) fn discover_antigravity_acp_commands(binary: &Path) -> Option<Vec<SlashCommand>> {
+    if let Some(cached) = cached_antigravity_acp_commands(binary) {
+        return Some(cached);
+    }
+    let cwd = crate::acp_session::catalog_working_directory().ok()?;
+    let agent = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd).ok()?;
+    let cache_key = antigravity_binary_cache_key(binary);
+    discover_antigravity_acp_commands_with_agent(
+        agent,
+        cwd,
+        cache_key,
+        ANTIGRAVITY_COMMAND_PROBE_TIMEOUT,
+        ANTIGRAVITY_COMMAND_WAIT_GRACE,
+    )
+}
+
+fn discover_antigravity_acp_commands_with_agent<C>(
+    agent: C,
+    cwd: PathBuf,
+    cache_key: PathBuf,
+    timeout: Duration,
+    wait_grace: Duration,
+) -> Option<Vec<SlashCommand>>
+where
+    C: ConnectTo<Client> + 'static,
+{
+    let captured_commands = Arc::new(Mutex::new(Vec::<SlashCommand>::new()));
+    let (ready_tx, ready_rx) = smol::channel::bounded::<()>(1);
+    let notification_commands = Arc::clone(&captured_commands);
+    let notification_key = cache_key.clone();
+
+    let request = Client
+        .builder()
+        .name("waku-antigravity-command-discovery")
+        .on_receive_notification(
+            async move |notification: SessionNotification, _connection| {
+                if let SessionUpdate::AvailableCommandsUpdate(update) = &notification.update {
+                    let parsed = parse_acp_available_commands(update);
+                    if !parsed.is_empty() {
+                        store_antigravity_acp_commands(&notification_key, parsed.clone());
+                        *notification_commands.lock() = parsed;
+                        let _ = ready_tx.try_send(());
+                    }
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(agent, {
+            let captured_commands = Arc::clone(&captured_commands);
+            async move |connection: ConnectionTo<Agent>| {
+                let initialize = connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(ClientCapabilities::new().terminal(false))
+                            .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .block_task()
+                    .await?;
+                let supports_close = initialize
+                    .agent_capabilities
+                    .session_capabilities
+                    .close
+                    .is_some();
+                let response = connection
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                if captured_commands.lock().is_empty() {
+                    let _ = smol::future::race(
+                        async {
+                            let _ = ready_rx.recv().await;
+                        },
+                        async {
+                            smol::Timer::after(wait_grace).await;
+                        },
+                    )
+                    .await;
+                }
+                if supports_close {
+                    let _ = connection
+                        .send_request(CloseSessionRequest::new(response.session_id.clone()))
+                        .block_task()
+                        .await;
+                }
+                Ok(())
+            }
+        });
+    let _ = smol::block_on(smol::future::race(
+        async move { request.await.map_err(|_| ()) },
+        async move {
+            smol::Timer::after(timeout).await;
+            Err(())
+        },
+    ));
+    let commands = std::mem::take(&mut *captured_commands.lock());
+    if commands.is_empty() {
+        return None;
+    }
+    store_antigravity_acp_commands(&cache_key, commands.clone());
+    Some(commands)
+}
+
 /// Antigravity advertises its model families on `session/new` as the `model`
 /// config option. The per-family thinking levels live in `thought_level` and
 /// differ by model (for example, `gpt-oss-120b-medium` has none), so discovery
@@ -1053,71 +1236,144 @@ fn parse_droid_models(output: &str) -> Vec<ProviderModel> {
 /// Antigravity answers with. The full variant ids from `models.availableModels`
 /// are accepted by `session/set_config_option` but are not picker entries;
 /// Waku's effort picker maps them onto the family plus `thought_level`.
+///
+/// The same handshake also captures `available_commands_update` into the shared
+/// slash-command cache and closes the throwaway session when supported.
 fn discover_antigravity_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
     let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
     let agent = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd)
         .map_err(|error| error.to_string())?;
+    let cache_key = antigravity_binary_cache_key(binary);
+    discover_antigravity_models_with_agent(
+        agent,
+        cwd,
+        cache_key,
+        ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT,
+        ANTIGRAVITY_EFFORT_PROBE_BUDGET,
+        ANTIGRAVITY_MODEL_COMMAND_GRACE,
+    )
+}
+
+fn discover_antigravity_models_with_agent<C>(
+    agent: C,
+    cwd: PathBuf,
+    cache_key: PathBuf,
+    timeout: Duration,
+    effort_budget: Duration,
+    command_grace: Duration,
+) -> Result<Vec<ProviderModel>, String>
+where
+    C: ConnectTo<Client> + 'static,
+{
+    let captured_commands = Arc::new(Mutex::new(Vec::<SlashCommand>::new()));
+    let (ready_tx, ready_rx) = smol::channel::bounded::<()>(1);
+    let notification_commands = Arc::clone(&captured_commands);
+    let notification_key = cache_key.clone();
+
     let request = Client
         .builder()
         .name("waku-antigravity-model-discovery")
-        .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
-            connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(ClientCapabilities::new().terminal(false))
-                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
-                )
-                .block_task()
-                .await?;
-            let response = connection
-                .send_request(NewSessionRequest::new(cwd))
-                .block_task()
-                .await?;
-            let options = response.config_options.unwrap_or_default();
-            let mut efforts = AcpModelEfforts::new();
-            if let Some(model_option) = acp_config_option(&options, "model") {
-                if let Some(current) = acp_select_current(model_option) {
-                    efforts.insert(
-                        current.to_owned(),
-                        acp_effort_choices(&options, "thought_level"),
-                    );
+        .on_receive_notification(
+            async move |notification: SessionNotification, _connection| {
+                if let SessionUpdate::AvailableCommandsUpdate(update) = &notification.update {
+                    let parsed = parse_acp_available_commands(update);
+                    if !parsed.is_empty() {
+                        store_antigravity_acp_commands(&notification_key, parsed.clone());
+                        *notification_commands.lock() = parsed;
+                        let _ = ready_tx.try_send(());
+                    }
                 }
-                let probe_until = Instant::now() + ANTIGRAVITY_EFFORT_PROBE_BUDGET;
-                for (id, _) in acp_select_choices(model_option) {
-                    if Instant::now() >= probe_until {
-                        break;
-                    }
-                    if id.is_empty() || efforts.contains_key(&id) {
-                        continue;
-                    }
-                    if let Ok(updated) = connection
-                        .send_request(SetSessionConfigOptionRequest::new(
-                            response.session_id.clone(),
-                            model_option.id.clone(),
-                            id.as_str(),
-                        ))
-                        .block_task()
-                        .await
-                    {
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(agent, {
+            let captured_commands = Arc::clone(&captured_commands);
+            async move |connection: ConnectionTo<Agent>| {
+                let initialize = connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(ClientCapabilities::new().terminal(false))
+                            .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .block_task()
+                    .await?;
+                let supports_close = initialize
+                    .agent_capabilities
+                    .session_capabilities
+                    .close
+                    .is_some();
+                let response = connection
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                let options = response.config_options.unwrap_or_default();
+                let mut efforts = AcpModelEfforts::new();
+                if let Some(model_option) = acp_config_option(&options, "model") {
+                    if let Some(current) = acp_select_current(model_option) {
                         efforts.insert(
-                            id,
-                            acp_effort_choices(&updated.config_options, "thought_level"),
+                            current.to_owned(),
+                            acp_effort_choices(&options, "thought_level"),
                         );
                     }
+                    let probe_until = Instant::now() + effort_budget;
+                    for (id, _) in acp_select_choices(model_option) {
+                        if Instant::now() >= probe_until {
+                            break;
+                        }
+                        if id.is_empty() || efforts.contains_key(&id) {
+                            continue;
+                        }
+                        if let Ok(updated) = connection
+                            .send_request(SetSessionConfigOptionRequest::new(
+                                response.session_id.clone(),
+                                model_option.id.clone(),
+                                id.as_str(),
+                            ))
+                            .block_task()
+                            .await
+                        {
+                            efforts.insert(
+                                id,
+                                acp_effort_choices(&updated.config_options, "thought_level"),
+                            );
+                        }
+                    }
                 }
+                if captured_commands.lock().is_empty() {
+                    let _ = smol::future::race(
+                        async {
+                            let _ = ready_rx.recv().await;
+                        },
+                        async {
+                            smol::Timer::after(command_grace).await;
+                        },
+                    )
+                    .await;
+                }
+                if supports_close {
+                    let _ = connection
+                        .send_request(CloseSessionRequest::new(response.session_id.clone()))
+                        .block_task()
+                        .await;
+                }
+                Ok((options, efforts))
             }
-            Ok((options, efforts))
         });
     let (options, efforts) = smol::block_on(smol::future::race(
         async move { request.await.map_err(|error| acp_discovery_error(&error)) },
         async move {
-            smol::Timer::after(ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT).await;
+            smol::Timer::after(timeout).await;
             Err(format!(
                 "Antigravity did not answer within {} seconds",
-                ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT.as_secs()
+                timeout.as_secs()
             ))
         },
     ))?;
+    let commands = std::mem::take(&mut *captured_commands.lock());
+    if !commands.is_empty() {
+        store_antigravity_acp_commands(&cache_key, commands);
+    }
     Ok(acp_models_from_config(&options, &efforts))
 }
 
@@ -2223,6 +2479,225 @@ Authentication:
     }
 
     #[test]
+    fn antigravity_model_discovery_captures_available_commands_and_closes_session() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, AvailableCommand, CloseSessionResponse, InitializeResponse,
+            NewSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+            SetSessionConfigOptionResponse, UnstructuredCommandInput,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let closed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let closed_for_agent = Arc::clone(&closed_sessions);
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let close_calls_agent = Arc::clone(&close_calls);
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                    );
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, cx| {
+                    let session_id = "agy-probe-session-1";
+                    let options = vec![
+                        SessionConfigOption::select(
+                            "model",
+                            "Model",
+                            "gemini-4-carbon",
+                            vec![
+                                SessionConfigSelectOption::new(
+                                    "gemini-4-carbon",
+                                    "Gemini 4 Carbon",
+                                ),
+                                SessionConfigSelectOption::new("claude-opus-5-5", "Claude Opus 5.5"),
+                            ],
+                        ),
+                        antigravity_effort_option("medium", &["low", "medium", "high"]),
+                    ];
+                    responder.respond(NewSessionResponse::new(session_id).config_options(options))?;
+                    let commands = vec![
+                        AvailableCommand::new("boost", "Boost response quality")
+                            .input(AvailableCommandInput::Unstructured(
+                                UnstructuredCommandInput::new("<prompt>"),
+                            )),
+                        AvailableCommand::new("/swarm", "Run a swarm")
+                            .input(AvailableCommandInput::Unstructured(
+                                UnstructuredCommandInput::new("<task>"),
+                            )),
+                        AvailableCommand::new("bad command", "Ignored whitespace name"),
+                    ];
+                    cx.send_notification(SessionNotification::new(
+                        session_id,
+                        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                            commands,
+                        )),
+                    ))?;
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: SetSessionConfigOptionRequest, responder, _cx| {
+                    responder.respond(SetSessionConfigOptionResponse::new(vec![
+                        antigravity_effort_option("high", &["low", "high"]),
+                    ]))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    close_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    closed_for_agent.lock().push(req.session_id.to_string());
+                    responder.respond(CloseSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let fake_binary = std::env::temp_dir().join(format!(
+            "waku-agy-model-cmd-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache_key = antigravity_binary_cache_key(&fake_binary);
+        assert!(cached_antigravity_acp_commands(&fake_binary).is_none());
+
+        let models = discover_antigravity_models_with_agent(
+            mock_agent,
+            std::env::temp_dir(),
+            cache_key,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .expect("antigravity model discovery should succeed");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*closed_sessions.lock(), vec!["agy-probe-session-1"]);
+
+        let cached = cached_antigravity_acp_commands(&fake_binary)
+            .expect("model discovery must populate the shared ACP command cache");
+        assert_eq!(
+            cached
+                .iter()
+                .map(|command| (
+                    command.name.as_str(),
+                    command.description.as_str(),
+                    command.scope,
+                    command.argument_hint.as_deref(),
+                    command.template.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "boost",
+                    "Boost response quality",
+                    CommandScope::Builtin,
+                    Some("<prompt>"),
+                    None,
+                ),
+                (
+                    "swarm",
+                    "Run a swarm",
+                    CommandScope::Builtin,
+                    Some("<task>"),
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_command_probe_captures_commands_closes_session_and_caches() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, AvailableCommand, CloseSessionResponse, InitializeResponse,
+            NewSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+            UnstructuredCommandInput,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let close_calls_agent = Arc::clone(&close_calls);
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                    );
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, cx| {
+                    let session_id = "agy-cmd-probe-1";
+                    responder.respond(NewSessionResponse::new(session_id))?;
+                    cx.send_notification(SessionNotification::new(
+                        session_id,
+                        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                            AvailableCommand::new("plan", "Enter plan mode").input(
+                                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                                    "<task>",
+                                )),
+                            ),
+                            AvailableCommand::new("compact", "Compact context"),
+                        ])),
+                    ))?;
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: CloseSessionRequest, responder, _cx| {
+                    close_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(CloseSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let fake_binary = std::env::temp_dir().join(format!(
+            "waku-agy-cmd-only-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache_key = antigravity_binary_cache_key(&fake_binary);
+
+        let discovered = discover_antigravity_acp_commands_with_agent(
+            mock_agent,
+            std::env::temp_dir(),
+            cache_key,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .expect("command probe should capture available_commands_update");
+
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|command| (command.name.as_str(), command.argument_hint.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("plan", Some("<task>")), ("compact", None)]
+        );
+        // Subsequent cache lookups hit memory without touching the binary.
+        assert_eq!(
+            cached_antigravity_acp_commands(&fake_binary),
+            Some(discovered)
+        );
+    }
+
+    #[test]
     #[ignore = "requires an installed, authenticated agy"]
     fn antigravity_discovery_reads_each_models_thinking_levels() {
         let binary = std::env::var("WAKU_ANTIGRAVITY_BINARY")
@@ -2240,9 +2715,18 @@ Authentication:
             models
                 .iter()
                 .all(|model| !model.reasoning_efforts.is_empty()
-                    || model.id.starts_with("gpt-oss")),
+                    || model.id.starts_with("gpt-oss")
+                    || model.id.starts_with("gemini-pro-orchestrator")),
             "a reasoning model lost its thinking picker"
         );
+        let cached_commands =
+            cached_antigravity_acp_commands(&binary).expect("antigravity ACP commands not cached");
+        for required in ["boost", "swarm", "plan"] {
+            assert!(
+                cached_commands.iter().any(|command| command.name == required),
+                "missing cached Antigravity ACP command /{required}: {cached_commands:?}"
+            );
+        }
     }
     #[test]
     #[ignore = "requires an installed, authenticated droid"]
@@ -2312,10 +2796,8 @@ Authentication:
 
     #[test]
     fn model_cache_writes_use_unique_temp_files_and_clean_up_on_error() {
-        let directory = std::env::temp_dir().join(format!(
-            "waku-model-cache-atomic-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("waku-model-cache-atomic-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
 
         // Two sequential paths have distinct `.tmp.{pid}.{seq}` names, and
@@ -2347,12 +2829,7 @@ Authentication:
         let leftover_temps: Vec<_> = std::fs::read_dir(&directory)
             .unwrap()
             .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".tmp.")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(
             leftover_temps.is_empty(),

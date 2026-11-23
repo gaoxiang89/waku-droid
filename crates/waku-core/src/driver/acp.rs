@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -98,8 +98,8 @@ pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
     supports_steer: bool,
     mode: Mutex<RuntimeMode>,
-    /// Factory Droid's access mode is a session config option, so it switches
-    /// in place; every other ACP agent restarts to change it.
+    /// Factory Droid (config option) and Antigravity (`session/set_mode`)
+    /// switch access mode in place; every other ACP agent restarts to change it.
     switches_mode_live: bool,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
 }
@@ -268,12 +268,11 @@ impl AcpDriver {
             commands,
             // These reject a second `session/prompt` while one is running, so
             // Waku keeps follow-ups queued until the current turn settles.
-            supports_steer: !matches!(
-                provider,
-                ProviderKind::Antigravity | ProviderKind::Fx | ProviderKind::Droid
-            ),
+            // Antigravity (`agy acp`) accepts mid-turn `session/prompt` and
+            // settles the earlier request cleanly before streaming the steer.
+            supports_steer: !matches!(provider, ProviderKind::Fx | ProviderKind::Droid),
             mode: Mutex::new(mode),
-            switches_mode_live: provider == ProviderKind::Droid,
+            switches_mode_live: matches!(provider, ProviderKind::Droid | ProviderKind::Antigravity),
             computer_use,
         })
     }
@@ -633,6 +632,247 @@ impl PendingPrompts {
 }
 
 type PendingPromptRequests = Arc<Mutex<PendingPrompts>>;
+type SharedSessionModes = Arc<Mutex<Option<SessionModeState>>>;
+
+/// `agy acp` can return `session/load` mid-replay and continue streaming
+/// historical transcript chunks afterward. Draining a short quiet window before
+/// reporting `Connected` and holding a brief post-load guard keeps replay
+/// chunks from duplicating history or opening a spurious reactive turn.
+const ANTIGRAVITY_LOAD_REPLAY_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const ANTIGRAVITY_LOAD_REPLAY_MAX_DRAIN: Duration = Duration::from_secs(2);
+const ANTIGRAVITY_POST_LOAD_GUARD_WINDOW: Duration = Duration::from_millis(500);
+
+/// Out-of-turn reactive wakeups (e.g. `/swarm` board posts, `/schedule`
+/// timers, subagents) have no `session/prompt` response to mark turn end.
+/// Settle once no tools/prompts are active and updates stay quiet.
+const ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const ANTIGRAVITY_UNSOLICITED_IDLE_SETTLE_DELAY: Duration = Duration::from_secs(6);
+const ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY: Duration = Duration::from_secs(25);
+
+struct ReplaySuppressionInner {
+    in_flight: bool,
+    draining_until: Option<Instant>,
+    last_replay_at: Option<Instant>,
+}
+
+struct ReplaySuppression {
+    inner: Mutex<ReplaySuppressionInner>,
+    replay_seen_tx: smol::channel::Sender<()>,
+    replay_seen_rx: smol::channel::Receiver<()>,
+}
+
+impl Default for ReplaySuppression {
+    fn default() -> Self {
+        let (replay_seen_tx, replay_seen_rx) = smol::channel::bounded(1);
+        Self {
+            inner: Mutex::new(ReplaySuppressionInner {
+                in_flight: false,
+                draining_until: None,
+                last_replay_at: None,
+            }),
+            replay_seen_tx,
+            replay_seen_rx,
+        }
+    }
+}
+
+impl ReplaySuppression {
+    fn begin_load(&self) {
+        let mut inner = self.inner.lock();
+        inner.in_flight = true;
+        inner.draining_until = None;
+        inner.last_replay_at = None;
+        while self.replay_seen_rx.try_recv().is_ok() {}
+    }
+
+    fn end_load(&self, post_load_guard: Option<Duration>) {
+        let mut inner = self.inner.lock();
+        inner.in_flight = false;
+        inner.draining_until = post_load_guard.map(|window| Instant::now() + window);
+    }
+
+    fn clear_guard(&self) {
+        self.inner.lock().draining_until = None;
+    }
+
+    fn is_in_flight(&self) -> bool {
+        self.inner.lock().in_flight
+    }
+
+    fn should_suppress_replay(&self, now: Instant, extend_window: Duration) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.in_flight {
+            inner.last_replay_at = Some(now);
+            let _ = self.replay_seen_tx.try_send(());
+            return true;
+        }
+        if let Some(until) = inner.draining_until {
+            if now < until {
+                inner.last_replay_at = Some(now);
+                inner.draining_until = Some(now + extend_window);
+                let _ = self.replay_seen_tx.try_send(());
+                return true;
+            }
+            inner.draining_until = None;
+        }
+        false
+    }
+
+    async fn drain_trailing_replay(
+        &self,
+        quiet_window: Duration,
+        max_drain: Duration,
+        post_load_guard: Duration,
+    ) {
+        while self.replay_seen_rx.try_recv().is_ok() {}
+        let drain_start = Instant::now();
+        let hard_deadline = drain_start + max_drain;
+        loop {
+            let now = Instant::now();
+            if now >= hard_deadline {
+                break;
+            }
+            let reference = self
+                .inner
+                .lock()
+                .last_replay_at
+                .map_or(drain_start, |last| last.max(drain_start));
+            let quiet_deadline = (reference + quiet_window).min(hard_deadline);
+            if now >= quiet_deadline {
+                break;
+            }
+            let saw_more = smol::future::or(
+                async {
+                    let _ = self.replay_seen_rx.recv().await;
+                    true
+                },
+                async {
+                    smol::Timer::at(quiet_deadline).await;
+                    false
+                },
+            )
+            .await;
+            if !saw_more {
+                break;
+            }
+        }
+        self.end_load(Some(post_load_guard));
+    }
+}
+
+#[derive(Default)]
+struct UnsolicitedTurnState {
+    active: bool,
+    generation: u64,
+    settle_at: Option<(Instant, u64)>,
+    saw_message_since_tool: bool,
+    parked_on_swarm_wait: bool,
+}
+
+impl UnsolicitedTurnState {
+    fn on_content_update(&mut self) -> bool {
+        self.generation = self.generation.wrapping_add(1);
+        self.settle_at = None;
+        if !self.active {
+            self.active = true;
+            self.saw_message_since_tool = false;
+            self.parked_on_swarm_wait = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn on_stream_update(&mut self, update: &SessionUpdate, completed_tool_name: Option<&str>) {
+        match update {
+            SessionUpdate::AgentMessageChunk(_) => {
+                self.saw_message_since_tool = true;
+                self.parked_on_swarm_wait = false;
+            }
+            SessionUpdate::ToolCall(_) => {
+                self.saw_message_since_tool = false;
+                self.parked_on_swarm_wait = false;
+            }
+            SessionUpdate::ToolCallUpdate(_) => {
+                if completed_tool_name == Some("swarm_wait") {
+                    self.parked_on_swarm_wait = true;
+                } else {
+                    self.saw_message_since_tool = false;
+                    self.parked_on_swarm_wait = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_delay(&self, update: &SessionUpdate) -> Duration {
+        if self.parked_on_swarm_wait {
+            ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY
+        } else if matches!(update, SessionUpdate::UsageUpdate(_)) && self.saw_message_since_tool {
+            ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY
+        } else if matches!(update, SessionUpdate::AgentMessageChunk(_)) {
+            ANTIGRAVITY_UNSOLICITED_IDLE_SETTLE_DELAY
+        } else {
+            ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY
+        }
+    }
+
+    fn schedule_settle(
+        &mut self,
+        now: Instant,
+        delay: Duration,
+        has_in_flight_work: bool,
+    ) -> bool {
+        if !self.active {
+            return false;
+        }
+        if has_in_flight_work {
+            let changed = self.settle_at.is_some();
+            self.settle_at = None;
+            return changed;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.settle_at = Some((now + delay, self.generation));
+        true
+    }
+
+    fn pause_settle(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        let changed = self.settle_at.is_some();
+        self.settle_at = None;
+        changed
+    }
+
+    fn take_active(&mut self) -> bool {
+        let was_active = self.active;
+        self.active = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.settle_at = None;
+        self.saw_message_since_tool = false;
+        self.parked_on_swarm_wait = false;
+        was_active
+    }
+
+    fn try_settle(&mut self, expected_generation: u64, has_in_flight_work: bool) -> bool {
+        if !self.active || self.generation != expected_generation {
+            return false;
+        }
+        if has_in_flight_work {
+            self.settle_at = None;
+            return false;
+        }
+        self.active = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.settle_at = None;
+        self.saw_message_since_tool = false;
+        self.parked_on_swarm_wait = false;
+        true
+    }
+}
+
+type SharedUnsolicitedTurn = Arc<Mutex<UnsolicitedTurnState>>;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_sdk_connection(
@@ -652,7 +892,7 @@ async fn run_sdk_connection(
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
-    let suppress_session_updates = Arc::new(AtomicBool::new(false));
+    let suppress_session_updates = Arc::new(ReplaySuppression::default());
     let terminals = Arc::new(AcpTerminalRegistry::default());
     let stream_state = Arc::new(Mutex::new(AcpStreamState {
         terminals: terminals.clone(),
@@ -661,10 +901,14 @@ async fn run_sdk_connection(
     let pending_permissions: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_user_inputs: PendingAcpUserInputs = Arc::new(Mutex::new(HashMap::new()));
     let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
+    let unsolicited_turn: SharedUnsolicitedTurn =
+        Arc::new(Mutex::new(UnsolicitedTurnState::default()));
+    let (unsolicited_wake_tx, unsolicited_wake_rx) = smol::channel::bounded::<()>(1);
     let title_refresh = super::title_refresh::NativeTitleRefresh::default();
-    // The access mode can change in place (Droid), so every reader goes
-    // through this cell rather than the mode the session started with.
+    // The access mode can change in place (Droid, Antigravity), so every reader
+    // goes through this cell rather than the mode the session started with.
     let access_mode = Arc::new(Mutex::new(mode));
+    let session_modes: SharedSessionModes = Arc::new(Mutex::new(None));
     let config_options: SharedConfigOptions = Arc::new(Mutex::new(None));
     // Set once the session's own autonomy has been written, so drift
     // correction never races the initial write.
@@ -690,11 +934,32 @@ async fn run_sdk_connection(
                 let events = events.clone();
                 let suppress_session_updates = suppress_session_updates.clone();
                 let stream_state = stream_state.clone();
+                let prompt_requests = prompt_requests.clone();
+                let pending_permissions = pending_permissions.clone();
+                let pending_user_inputs = pending_user_inputs.clone();
+                let unsolicited_turn = unsolicited_turn.clone();
+                let unsolicited_wake_tx = unsolicited_wake_tx.clone();
                 let access_mode = access_mode.clone();
+                let session_modes = session_modes.clone();
                 let config_options = config_options.clone();
                 let droid_autonomy_ready = droid_autonomy_ready.clone();
                 async move |notification: SessionNotification, connection: ConnectionTo<Agent>| {
-                    if !suppress_session_updates.load(Ordering::Acquire) {
+                    let is_replay_chunk = is_replay_transcript_update(&notification.update);
+                    if is_replay_chunk
+                        && suppress_session_updates.should_suppress_replay(
+                            Instant::now(),
+                            ANTIGRAVITY_POST_LOAD_GUARD_WINDOW,
+                        )
+                    {
+                        return Ok(());
+                    }
+                    let in_load = suppress_session_updates.is_in_flight();
+                    if !in_load {
+                        if let SessionUpdate::CurrentModeUpdate(update) = &notification.update
+                            && let Some(modes) = session_modes.lock().as_mut()
+                        {
+                            modes.current_mode_id = update.current_mode_id.clone();
+                        }
                         let drifted = track_session_state(
                             provider,
                             &notification.update,
@@ -710,12 +975,48 @@ async fn run_sdk_connection(
                                 &events,
                             )?;
                         }
-                        handle_session_update(
-                            provider,
-                            notification,
-                            &events,
-                            &mut stream_state.lock(),
-                        )?;
+                    }
+
+                    let is_antigravity_out_of_turn = provider == ProviderKind::Antigravity
+                        && !in_load
+                        && prompt_requests.lock().is_empty();
+                    let is_content = is_unsolicited_turn_content(&notification.update);
+                    let is_usage = matches!(notification.update, SessionUpdate::UsageUpdate(_));
+                    if is_antigravity_out_of_turn && is_content {
+                        let started = unsolicited_turn.lock().on_content_update();
+                        if started {
+                            {
+                                let mut state = stream_state.lock();
+                                state.tools.clear();
+                                state.produced_content = false;
+                            }
+                            let _ = events.send(DriverEvent::TurnStarted);
+                        }
+                    }
+
+                    let update_snapshot = is_antigravity_out_of_turn.then(|| notification.update.clone());
+                    let (has_in_flight_tools, completed_tool_name) = {
+                        let mut state = stream_state.lock();
+                        handle_session_update(provider, notification, &events, &mut state)?;
+                        (
+                            !state.tools.is_empty(),
+                            state.last_completed_tool_name.take(),
+                        )
+                    };
+
+                    if let Some(update_snapshot) = update_snapshot.as_ref()
+                        && (is_content || is_usage)
+                    {
+                        let has_in_flight_work = has_in_flight_tools
+                            || !pending_permissions.lock().is_empty()
+                            || !pending_user_inputs.lock().is_empty();
+                        let mut unsolicited = unsolicited_turn.lock();
+                        unsolicited
+                            .on_stream_update(update_snapshot, completed_tool_name.as_deref());
+                        let delay = unsolicited.settle_delay(update_snapshot);
+                        if unsolicited.schedule_settle(Instant::now(), delay, has_in_flight_work) {
+                            let _ = unsolicited_wake_tx.try_send(());
+                        }
                     }
                     Ok(())
                 }
@@ -753,10 +1054,22 @@ async fn run_sdk_connection(
         .on_receive_request(
             {
                 let events = events.clone();
+                let prompt_requests = prompt_requests.clone();
                 let pending_permissions = pending_permissions.clone();
                 let pending_user_inputs = pending_user_inputs.clone();
+                let unsolicited_turn = unsolicited_turn.clone();
+                let unsolicited_wake_tx = unsolicited_wake_tx.clone();
                 let access_mode = access_mode.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
+                    if provider == ProviderKind::Antigravity && prompt_requests.lock().is_empty() {
+                        let started = unsolicited_turn.lock().on_content_update();
+                        if started {
+                            let _ = events.send(DriverEvent::TurnStarted);
+                        }
+                        if unsolicited_turn.lock().pause_settle() {
+                            let _ = unsolicited_wake_tx.try_send(());
+                        }
+                    }
                     handle_permission_request(
                         provider,
                         request,
@@ -1000,16 +1313,25 @@ async fn run_sdk_connection(
                 &suppress_session_updates,
             )
             .await?;
+            *session_modes.lock() = modes.clone();
             *config_options.lock() = initial_config_options;
 
             if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
                 // Mode selection is opportunistic: an agent can advertise a
                 // mode but reject a later transition without invalidating the
                 // session itself.
-                let _ = connection
-                    .send_request(SetSessionModeRequest::new(session_id.clone(), mode_id))
+                if connection
+                    .send_request(SetSessionModeRequest::new(
+                        session_id.clone(),
+                        mode_id.clone(),
+                    ))
                     .block_task()
-                    .await;
+                    .await
+                    .is_ok()
+                    && let Some(state) = session_modes.lock().as_mut()
+                {
+                    state.current_mode_id = mode_id;
+                }
             }
             if provider == ProviderKind::Droid {
                 let current = config_options.lock().clone();
@@ -1059,13 +1381,60 @@ async fn run_sdk_connection(
             // alive after the handle is dropped.
             let (recovery_tx, recovery_rx) = smol::channel::unbounded::<CommandMessage>();
 
+            enum LoopEvent {
+                Command(Option<CommandMessage>),
+                Wake,
+                SettleUnsolicited(u64),
+            }
+
             loop {
-                let next = smol::future::or(async { recovery_rx.recv().await.ok() }, async {
-                    commands.recv().await.ok()
-                })
+                let settle_target = unsolicited_turn.lock().settle_at;
+                let event = smol::future::or(
+                    smol::future::or(
+                        async { LoopEvent::Command(recovery_rx.recv().await.ok()) },
+                        async { LoopEvent::Command(commands.recv().await.ok()) },
+                    ),
+                    smol::future::or(
+                        async {
+                            if unsolicited_wake_rx.recv().await.is_ok() {
+                                LoopEvent::Wake
+                            } else {
+                                std::future::pending().await
+                            }
+                        },
+                        async {
+                            match settle_target {
+                                Some((deadline, generation)) => {
+                                    smol::Timer::at(deadline).await;
+                                    LoopEvent::SettleUnsolicited(generation)
+                                }
+                                None => std::future::pending().await,
+                            }
+                        },
+                    ),
+                )
                 .await;
-                let Some(command) = next else {
-                    break;
+                let command = match event {
+                    LoopEvent::Wake => continue,
+                    LoopEvent::SettleUnsolicited(generation) => {
+                        let has_in_flight_work = !prompt_requests.lock().is_empty()
+                            || !stream_state.lock().tools.is_empty()
+                            || !pending_permissions.lock().is_empty()
+                            || !pending_user_inputs.lock().is_empty();
+                        if unsolicited_turn
+                            .lock()
+                            .try_settle(generation, has_in_flight_work)
+                        {
+                            stream_state.lock().tools.clear();
+                            let _ = events.send(DriverEvent::TurnFinished {
+                                success: true,
+                                summary: None,
+                            });
+                        }
+                        continue;
+                    }
+                    LoopEvent::Command(Some(command)) => command,
+                    LoopEvent::Command(None) => break,
                 };
                 match command {
                     CommandMessage::RecoverLostSession(text) => {
@@ -1083,18 +1452,24 @@ async fn run_sdk_connection(
                             Ok((fresh_session_id, modes, fresh_config_options)) => {
                                 session_id = fresh_session_id;
                                 native_session_id = session_id.to_string();
+                                *session_modes.lock() = modes.clone();
                                 *config_options.lock() = fresh_config_options;
                                 let live_mode = *access_mode.lock();
                                 if let Some(mode_id) =
                                     desired_access_mode(provider, modes.as_ref(), live_mode)
                                 {
-                                    let _ = connection
+                                    if connection
                                         .send_request(SetSessionModeRequest::new(
                                             session_id.clone(),
-                                            mode_id,
+                                            mode_id.clone(),
                                         ))
                                         .block_task()
-                                        .await;
+                                        .await
+                                        .is_ok()
+                                        && let Some(state) = session_modes.lock().as_mut()
+                                    {
+                                        state.current_mode_id = mode_id;
+                                    }
                                 }
                                 sync_cached_session_model(
                                     &connection,
@@ -1149,6 +1524,8 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Prompt(text) => {
+                        suppress_session_updates.clear_guard();
+                        unsolicited_turn.lock().take_active();
                         let prompt_text = format_prompt_with_seed(
                             fork_context.as_deref(),
                             computer_use_instructions.as_deref(),
@@ -1185,7 +1562,9 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Steer(text) => {
-                        if prompt_requests.lock().is_empty() {
+                        let had_unsolicited =
+                            provider == ProviderKind::Antigravity && unsolicited_turn.lock().active;
+                        if prompt_requests.lock().is_empty() && !had_unsolicited {
                             let _ = events.send(DriverEvent::SteerRejected {
                                 message: text,
                                 reason: format!(
@@ -1195,6 +1574,7 @@ async fn run_sdk_connection(
                             });
                             continue;
                         }
+                        suppress_session_updates.clear_guard();
                         match send_prompt(
                             &connection,
                             &session_id,
@@ -1212,6 +1592,9 @@ async fn run_sdk_connection(
                             PromptKind::Steer,
                         ) {
                             Ok(()) => {
+                                if had_unsolicited {
+                                    unsolicited_turn.lock().take_active();
+                                }
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
                             }
                             Err(error) => {
@@ -1227,6 +1610,15 @@ async fn run_sdk_connection(
                             .send_notification(CancelNotification::new(session_id.clone()));
                         cancel_pending_permissions(&pending_permissions);
                         cancel_pending_user_inputs(&pending_user_inputs);
+                        if unsolicited_turn.lock().take_active()
+                            && prompt_requests.lock().is_empty()
+                        {
+                            stream_state.lock().tools.clear();
+                            let _ = events.send(DriverEvent::TurnFinished {
+                                success: true,
+                                summary: None,
+                            });
+                        }
                     }
                     CommandMessage::RefreshBackgroundWork => {
                         terminals.emit_reconcile(&events);
@@ -1293,6 +1685,20 @@ async fn run_sdk_connection(
                                     }
                                 }
                             }
+                            if provider == ProviderKind::Antigravity
+                                && prompt_requests.lock().is_empty()
+                            {
+                                let has_in_flight_work = !stream_state.lock().tools.is_empty()
+                                    || !pending_permissions.lock().is_empty()
+                                    || !pending_user_inputs.lock().is_empty();
+                                if unsolicited_turn.lock().schedule_settle(
+                                    Instant::now(),
+                                    ANTIGRAVITY_UNSOLICITED_IDLE_SETTLE_DELAY,
+                                    has_in_flight_work,
+                                ) {
+                                    let _ = unsolicited_wake_tx.try_send(());
+                                }
+                            }
                         }
                     }
                     CommandMessage::RespondUserInput {
@@ -1325,6 +1731,20 @@ async fn run_sdk_connection(
                                         .respond(antigravity_question_response(&request, &answers));
                                 }
                             }
+                            if provider == ProviderKind::Antigravity
+                                && prompt_requests.lock().is_empty()
+                            {
+                                let has_in_flight_work = !stream_state.lock().tools.is_empty()
+                                    || !pending_permissions.lock().is_empty()
+                                    || !pending_user_inputs.lock().is_empty();
+                                if unsolicited_turn.lock().schedule_settle(
+                                    Instant::now(),
+                                    ANTIGRAVITY_UNSOLICITED_IDLE_SETTLE_DELAY,
+                                    has_in_flight_work,
+                                ) {
+                                    let _ = unsolicited_wake_tx.try_send(());
+                                }
+                            }
                         }
                     }
                     CommandMessage::Options {
@@ -1335,26 +1755,53 @@ async fn run_sdk_connection(
                             // Stop answering permissions under the old mode
                             // before the agent hears about the new one.
                             *access_mode.lock() = options.mode;
-                            let current = config_options.lock().clone();
-                            let applied = match apply_droid_autonomy(
-                                &connection,
-                                &session_id,
-                                current.as_deref(),
-                                options.mode,
-                            )
-                            .await
-                            {
-                                Ok(updated) => {
-                                    store_config_options(&config_options, updated);
-                                    true
+                            let applied = if provider == ProviderKind::Droid {
+                                let current = config_options.lock().clone();
+                                match apply_droid_autonomy(
+                                    &connection,
+                                    &session_id,
+                                    current.as_deref(),
+                                    options.mode,
+                                )
+                                .await
+                                {
+                                    Ok(updated) => {
+                                        store_config_options(&config_options, updated);
+                                        true
+                                    }
+                                    Err(_) => {
+                                        // The app restarts the session on a
+                                        // refusal; until then nothing is approved
+                                        // on the user's behalf.
+                                        *access_mode.lock() = RuntimeMode::Ask;
+                                        false
+                                    }
                                 }
-                                Err(_) => {
-                                    // The app restarts the session on a
-                                    // refusal; until then nothing is approved
-                                    // on the user's behalf.
-                                    *access_mode.lock() = RuntimeMode::Ask;
-                                    false
+                            } else if provider == ProviderKind::Antigravity {
+                                let current_modes = session_modes.lock().clone();
+                                match apply_antigravity_mode(
+                                    &connection,
+                                    &session_id,
+                                    current_modes.as_ref(),
+                                    options.mode,
+                                )
+                                .await
+                                {
+                                    Ok(updated_mode_id) => {
+                                        if let (Some(mode_id), Some(state)) =
+                                            (updated_mode_id, session_modes.lock().as_mut())
+                                        {
+                                            state.current_mode_id = mode_id;
+                                        }
+                                        true
+                                    }
+                                    Err(_) => {
+                                        *access_mode.lock() = RuntimeMode::Ask;
+                                        false
+                                    }
                                 }
+                            } else {
+                                false
                             };
                             let _ = mode_applied.try_send(applied);
                             if !applied {
@@ -1496,7 +1943,7 @@ async fn establish_session(
     resume_session_id: Option<&str>,
     cwd: &Path,
     mcp_servers: &[McpServer],
-    suppress_session_updates: &AtomicBool,
+    suppress_session_updates: &ReplaySuppression,
 ) -> agent_client_protocol::Result<(
     SessionId,
     Option<SessionModeState>,
@@ -1540,13 +1987,23 @@ async fn establish_session(
         }
 
         if initialize.agent_capabilities.load_session {
-            suppress_session_updates.store(true, Ordering::Release);
+            suppress_session_updates.begin_load();
             let mut request = LoadSessionRequest::new(existing.to_owned(), cwd);
             if !mcp_servers.is_empty() {
                 request = request.mcp_servers(mcp_servers.to_vec());
             }
             let response = connection.send_request(request).block_task().await;
-            suppress_session_updates.store(false, Ordering::Release);
+            if response.is_ok() && provider == ProviderKind::Antigravity {
+                suppress_session_updates
+                    .drain_trailing_replay(
+                        ANTIGRAVITY_LOAD_REPLAY_QUIET_WINDOW,
+                        ANTIGRAVITY_LOAD_REPLAY_MAX_DRAIN,
+                        ANTIGRAVITY_POST_LOAD_GUARD_WINDOW,
+                    )
+                    .await;
+            } else {
+                suppress_session_updates.end_load(None);
+            }
             match response {
                 Ok(response) => {
                     return Ok((
@@ -1583,19 +2040,22 @@ fn desired_access_mode(
 ) -> Option<SessionModeId> {
     let modes = modes?;
     let desired = if provider == ProviderKind::Antigravity {
-        // `agy` supports `default`, `accept-edits`, and `plan`. It has no
-        // auto/yolo mode; Waku answers permission requests itself outside Ask,
-        // so only Auto-accept edits maps to a different native mode.
-        let desired = match mode {
-            RuntimeMode::AutoAcceptEdits => "accept-edits",
-            RuntimeMode::Ask | RuntimeMode::Auto | RuntimeMode::FullAccess => "default",
+        // `agy acp` advertises `default`, `accept-edits`, `auto`, and `plan`.
+        // `RuntimeMode::Auto` selects native `auto` when advertised (falling
+        // back to `default` on older builds); `Ask` and `FullAccess` stay on
+        // `default` while Waku's own permission policy handles prompts.
+        let find_mode = |target: &str| {
+            modes
+                .available_modes
+                .iter()
+                .find(|mode| mode.id.to_string().eq_ignore_ascii_case(target))
+                .map(|mode| mode.id.clone())
         };
-        modes
-            .available_modes
-            .iter()
-            .find(|mode| mode.id.to_string().eq_ignore_ascii_case(desired))?
-            .id
-            .clone()
+        match mode {
+            RuntimeMode::AutoAcceptEdits => find_mode("accept-edits")?,
+            RuntimeMode::Auto => find_mode("auto").or_else(|| find_mode("default"))?,
+            RuntimeMode::Ask | RuntimeMode::FullAccess => find_mode("default")?,
+        }
     } else if provider == ProviderKind::Fx {
         let desired = if mode == RuntimeMode::Ask {
             "ask"
@@ -2015,6 +2475,36 @@ fn auto_approves_permissions(provider: ProviderKind, mode: RuntimeMode) -> bool 
         ProviderKind::Droid => mode == RuntimeMode::FullAccess,
         _ => mode != RuntimeMode::Ask,
     }
+}
+
+/// Applies Antigravity's live ACP mode switch via `session/set_mode`.
+/// `Ok(None)` means the native mode already matches `mode` (e.g. `Ask` and
+/// `FullAccess` both use `default` while Waku's permission handler governs
+/// approvals).
+async fn apply_antigravity_mode(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    modes: Option<&SessionModeState>,
+    mode: RuntimeMode,
+) -> Result<Option<SessionModeId>, String> {
+    let Some(modes) = modes else {
+        return Err(tr!(
+            "errors.set_session_option",
+            error = "Antigravity did not advertise session modes"
+        ));
+    };
+    let Some(desired) = desired_access_mode(ProviderKind::Antigravity, Some(modes), mode) else {
+        return Ok(None);
+    };
+    connection
+        .send_request(SetSessionModeRequest::new(
+            session_id.clone(),
+            desired.clone(),
+        ))
+        .block_task()
+        .await
+        .map(|_| Some(desired))
+        .map_err(|error| tr!("errors.set_session_option", error = error))
 }
 
 /// Writes Droid's autonomy level for `mode`. `Ok(None)` means the session
@@ -3349,10 +3839,7 @@ fn handle_create_terminal_request(
     if events
         .send(DriverEvent::Permission {
             request_id: request_id.clone(),
-            title: tr!(
-                "permission.run_tool",
-                tool = truncate(&command_display, 80)
-            ),
+            title: tr!("permission.run_tool", tool = truncate(&command_display, 80)),
             detail: tr!(
                 "permission.agent_wants_to_run",
                 tool = truncate(&command_display, 200)
@@ -4942,12 +5429,44 @@ fn handle_permission_request(
     Ok(())
 }
 
+/// Replay notifications emitted during `session/load` that duplicate the
+/// already-stored transcript. Metadata updates (`available_commands_update`,
+/// `usage_update`, `session_info_update`) are intentionally NOT suppressed so
+/// resumed sessions receive their live slash commands, context meter, and title.
+fn is_replay_transcript_update(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
+    )
+}
+
+/// Agent-generated content that opens an Antigravity out-of-turn reactive
+/// wakeup (e.g. `/swarm` board mention or `/schedule` timer fire). Deliberately
+/// excludes `UserMessageChunk` and session metadata so replay noise never
+/// spawns a reactive turn.
+fn is_unsolicited_turn_content(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
+    )
+}
+
 fn handle_session_update(
     provider: ProviderKind,
     notification: SessionNotification,
     events: &impl DriverEventSink,
     state: &mut AcpStreamState,
 ) -> agent_client_protocol::Result<()> {
+    state.last_completed_tool_name = None;
     let update = serde_json::to_value(notification.update)?;
     let kind = update.get("sessionUpdate").and_then(Value::as_str);
     if provider == ProviderKind::Fx
@@ -5118,6 +5637,7 @@ struct AcpStreamState {
     /// ends having produced nothing is the shape a swallowed provider error
     /// takes, which is what makes a native failure worth looking up.
     produced_content: bool,
+    last_completed_tool_name: Option<String>,
 }
 
 /// Pull the agent's explanation out of a permission request's tool call.
@@ -5177,6 +5697,471 @@ fn resolve_terminal_content_output(
     (!outputs.is_empty()).then(|| outputs.join("\n\n"))
 }
 
+fn first_non_empty_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| text.trim())
+}
+
+fn arg_find<'a, T>(
+    arguments: Option<&'a Value>,
+    keys: &[&str],
+    extract: impl Fn(&'a Value) -> Option<T> + Copy,
+) -> Option<T> {
+    let object = arguments?.as_object()?;
+    if let Some(value) = lookup_in_map(object, keys, extract) {
+        return Some(value);
+    }
+    for nested_key in ["arguments", "input", "tool_input", "params"] {
+        if let Some(nested) = object.get(nested_key).and_then(Value::as_object)
+            && let Some(value) = lookup_in_map(nested, keys, extract)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn lookup_in_map<'a, T>(
+    object: &'a Map<String, Value>,
+    keys: &[&str],
+    extract: impl Fn(&'a Value) -> Option<T>,
+) -> Option<T> {
+    for key in keys {
+        if let Some(value) = object.get(*key).and_then(&extract) {
+            return Some(value);
+        }
+    }
+    for key in keys {
+        if let Some(value) = object
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| extract(value))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn arg_str<'a>(arguments: Option<&'a Value>, keys: &[&str]) -> Option<&'a str> {
+    arg_find(arguments, keys, |value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
+}
+
+fn arg_u64(arguments: Option<&Value>, keys: &[&str]) -> Option<u64> {
+    arg_find(arguments, keys, Value::as_u64)
+}
+
+fn arg_bool(arguments: Option<&Value>, keys: &[&str]) -> Option<bool> {
+    arg_find(arguments, keys, Value::as_bool)
+}
+
+fn arg_array<'a>(arguments: Option<&'a Value>, keys: &[&str]) -> Option<&'a [Value]> {
+    arg_find(arguments, keys, |value| value.as_array().map(Vec::as_slice))
+}
+
+fn arg_object<'a>(arguments: Option<&'a Value>, keys: &[&str]) -> Option<&'a Value> {
+    arg_find(arguments, keys, |value| value.is_object().then_some(value))
+}
+
+fn normalize_acp_windows_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 4
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes[3] == b'/' || bytes[3] == b'\\')
+    {
+        return path[1..].to_owned();
+    }
+    path.to_owned()
+}
+
+fn path_basename(raw_path: &str) -> Option<&str> {
+    let normalized = raw_path.trim();
+    let trimmed = if normalized.as_bytes().len() >= 4
+        && normalized.as_bytes()[0] == b'/'
+        && normalized.as_bytes()[1].is_ascii_alphabetic()
+        && normalized.as_bytes()[2] == b':'
+        && (normalized.as_bytes()[3] == b'/' || normalized.as_bytes()[3] == b'\\')
+    {
+        &normalized[1..]
+    } else {
+        normalized
+    };
+    trimmed
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+}
+
+fn normalize_acp_locations(locations: &Value) -> Value {
+    let Some(items) = locations.as_array() else {
+        return locations.clone();
+    };
+    let normalized = items
+        .iter()
+        .map(|entry| {
+            let Some(obj) = entry.as_object() else {
+                return entry.clone();
+            };
+            let Some(path) = obj.get("path").and_then(Value::as_str) else {
+                return entry.clone();
+            };
+            let clean = normalize_acp_windows_path(path);
+            if clean == path {
+                return entry.clone();
+            }
+            let mut updated = obj.clone();
+            updated.insert("path".to_owned(), Value::String(clean));
+            Value::Object(updated)
+        })
+        .collect();
+    Value::Array(normalized)
+}
+
+/// Maps Antigravity's coordination/agent tool names (with or without ACP's
+/// `"Run "` display prefix or namespace prefixes such as `default_api:` or
+/// `mcp__server__`) to their canonical name.
+fn antigravity_canonical_tool_name(raw_name: &str) -> Option<&'static str> {
+    let trimmed = raw_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_run = trimmed
+        .strip_prefix("Run ")
+        .or_else(|| trimmed.strip_prefix("run "))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let normalized = without_run.to_ascii_lowercase().replace(['-', ' '], "_");
+    let leaf = normalized
+        .rsplit("__")
+        .next()
+        .unwrap_or(&normalized)
+        .rsplit([':', '.', '/'])
+        .next()
+        .unwrap_or(&normalized);
+    match leaf {
+        "swarm" => Some("swarm"),
+        "post_message" => Some("post_message"),
+        "read_board" => Some("read_board"),
+        "swarm_wait" => Some("swarm_wait"),
+        "invoke_subagent" => Some("invoke_subagent"),
+        "define_subagent" => Some("define_subagent"),
+        "send_message" => Some("send_message"),
+        "manage_subagents" => Some("manage_subagents"),
+        "schedule" => Some("schedule"),
+        "manage_task" => Some("manage_task"),
+        "run_workflow" => Some("run_workflow"),
+        "exit_plan_mode" => Some("exit_plan_mode"),
+        "boost" => Some("boost"),
+        _ => None,
+    }
+}
+
+/// Produces a clean `(title, detail)` pair for Antigravity's native swarm,
+/// subagent, plan, schedule, workflow, and boost tools so transcript cards stay
+/// legible instead of falling back to raw tool ids or colliding on generic
+/// input keys (`action`, `title`).
+fn antigravity_tool_presentation(
+    canonical_name: &str,
+    arguments: Option<&Value>,
+) -> (String, Option<String>) {
+    match canonical_name {
+        "swarm" => {
+            let action = arg_str(arguments, &["action"]);
+            let name = arg_str(arguments, &["name"]);
+            let title = arg_str(arguments, &["title"]);
+            let model = arg_str(arguments, &["model"]);
+            let brief = arg_str(arguments, &["brief"]);
+            let count = arg_u64(arguments, &["n"]);
+            let tasks_len = arg_array(arguments, &["tasks"]).map(<[Value]>::len);
+            match action {
+                Some("add") => {
+                    let heading = match name {
+                        Some(name) if tasks_len.is_some_and(|len| len > 0) => {
+                            format!("Swarm: add {name} ({} tasks)", tasks_len.unwrap_or(0))
+                        }
+                        Some(name) if count.is_some_and(|n| n > 1) => {
+                            format!("Swarm: add {name} (×{})", count.unwrap_or(1))
+                        }
+                        Some(name) => format!("Swarm: add {name}"),
+                        None => "Swarm: add worker".to_owned(),
+                    };
+                    let detail = brief
+                        .map(|brief| truncate(first_non_empty_line(brief), 120))
+                        .or_else(|| model.map(|model| format!("model: {model}")));
+                    (heading, detail)
+                }
+                Some("title") => (
+                    title
+                        .map(|title| format!("Swarm: title \"{}\"", truncate(title, 60)))
+                        .unwrap_or_else(|| "Swarm: set title".to_owned()),
+                    None,
+                ),
+                Some("kill") => (
+                    name.map(|name| format!("Swarm: kill {name}"))
+                        .unwrap_or_else(|| "Swarm: kill worker".to_owned()),
+                    None,
+                ),
+                Some("model") => {
+                    let heading = match (name, model) {
+                        (Some(name), Some(model)) => format!("Swarm: switch {name} to {model}"),
+                        (None, Some(model)) => format!("Swarm: switch model to {model}"),
+                        (Some(name), None) => format!("Swarm: switch model for {name}"),
+                        (None, None) => "Swarm: switch model".to_owned(),
+                    };
+                    (heading, None)
+                }
+                Some("channel") => {
+                    let op = arg_str(arguments, &["op"]);
+                    let channel = arg_str(arguments, &["channel"]);
+                    let topic = arg_str(arguments, &["topic"]);
+                    let heading = match (op, channel) {
+                        (Some(op), Some(channel)) => format!(
+                            "Swarm: channel {} #{}",
+                            truncate(op, 20),
+                            truncate(channel.trim_start_matches('#'), 40)
+                        ),
+                        (Some(op), None) => format!("Swarm: channel {}", truncate(op, 20)),
+                        (None, Some(channel)) => {
+                            format!("Swarm: #{}", truncate(channel.trim_start_matches('#'), 40))
+                        }
+                        (None, None) => "Swarm: channel".to_owned(),
+                    };
+                    let detail = topic
+                        .map(|topic| truncate(first_non_empty_line(topic), 120))
+                        .or_else(|| name.map(|target| format!("@{target}")));
+                    (heading, detail)
+                }
+                Some("status") => ("Swarm: status".to_owned(), None),
+                Some("models") => ("Swarm: list models".to_owned(), None),
+                Some(other) => (
+                    format!("Swarm: {}", truncate(other, 40)),
+                    name.map(str::to_owned),
+                ),
+                None => ("Swarm".to_owned(), None),
+            }
+        }
+        "post_message" => {
+            let text = arg_str(arguments, &["text", "message", "content"]);
+            let mention = text
+                .and_then(|text| text.split_whitespace().next())
+                .filter(|token| token.starts_with('@') && token.len() > 1);
+            let heading = match mention {
+                Some(mention) => format!("Post to swarm board ({})", truncate(mention, 32)),
+                None => "Post to swarm board".to_owned(),
+            };
+            let detail = text.map(|text| truncate(first_non_empty_line(text), 120));
+            (heading, detail)
+        }
+        "read_board" => {
+            if arg_bool(arguments, &["status"]) == Some(true) {
+                return ("Read swarm roster".to_owned(), None);
+            }
+            if let Some(seqs) = arg_array(arguments, &["seqs"]) {
+                let ids = seqs
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|seq| format!("#{seq}"))
+                    .collect::<Vec<_>>();
+                if !ids.is_empty() {
+                    let preview = if ids.len() <= 4 {
+                        ids.join(", ")
+                    } else {
+                        format!("{}, +{}", ids[..4].join(", "), ids.len() - 4)
+                    };
+                    return (format!("Read swarm board ({preview})"), None);
+                }
+            }
+            let heading = match arg_u64(arguments, &["since"]) {
+                Some(since) => format!("Read swarm board (since #{since})"),
+                None => "Read swarm board".to_owned(),
+            };
+            let detail = arg_u64(arguments, &["limit"]).map(|limit| format!("limit {limit}"));
+            (heading, detail)
+        }
+        "swarm_wait" => {
+            let heading = match arg_u64(arguments, &["since"]) {
+                Some(since) => format!("Wait on swarm board (since #{since})"),
+                None => "Wait on swarm board".to_owned(),
+            };
+            let detail = match arg_bool(arguments, &["mentions_only"]) {
+                Some(false) => Some("Waiting for any board message".to_owned()),
+                Some(true) => Some("Waiting for @mention".to_owned()),
+                None => None,
+            };
+            (heading, detail)
+        }
+        "invoke_subagent" => {
+            let agent = arg_str(
+                arguments,
+                &[
+                    "Role",
+                    "TypeName",
+                    "subagent_name",
+                    "subagent_type",
+                    "name",
+                    "agent",
+                    "agent_name",
+                ],
+            );
+            let task = arg_str(
+                arguments,
+                &[
+                    "Prompt",
+                    "description",
+                    "title",
+                    "task",
+                    "instruction",
+                    "message",
+                ],
+            );
+            let model = arg_str(arguments, &["Model", "model"]);
+            let (heading, detail) = match (agent, task) {
+                (Some(agent), Some(task)) => (
+                    format!("Subagent: {}", truncate(agent, 60)),
+                    Some(truncate(first_non_empty_line(task), 120)),
+                ),
+                (Some(agent), None) => (
+                    format!("Subagent: {}", truncate(agent, 60)),
+                    model.map(|model| format!("model: {model}")),
+                ),
+                (None, Some(task)) => (
+                    format!("Subagent: {}", truncate(first_non_empty_line(task), 60)),
+                    None,
+                ),
+                (None, None) => ("Subagent".to_owned(), None),
+            };
+            (heading, detail)
+        }
+        "define_subagent" => {
+            let name = arg_str(arguments, &["Name", "name"]);
+            let description = arg_str(arguments, &["Description", "description"]);
+            let heading = match name {
+                Some(name) => format!("Define subagent: {}", truncate(name, 60)),
+                None => "Define subagent".to_owned(),
+            };
+            let detail = description.map(|desc| truncate(first_non_empty_line(desc), 120));
+            (heading, detail)
+        }
+        "send_message" => {
+            let recipient = arg_str(arguments, &["Recipient", "recipient"]);
+            let message = arg_str(arguments, &["Message", "message", "text", "content"]);
+            let heading = match recipient {
+                Some(recipient) if recipient.chars().count() <= 24 => {
+                    format!("Message subagent ({recipient})")
+                }
+                _ => "Message subagent".to_owned(),
+            };
+            let detail = message.map(|msg| truncate(first_non_empty_line(msg), 120));
+            (heading, detail)
+        }
+        "manage_subagents" => {
+            let action = arg_str(arguments, &["Action", "action"]);
+            let heading = match action {
+                Some(action) => format!("Subagents: {}", truncate(action, 40)),
+                None => "Manage subagents".to_owned(),
+            };
+            (heading, None)
+        }
+        "schedule" => {
+            let cron = arg_str(arguments, &["CronExpression", "cron_expression", "cron"]);
+            let duration = arg_u64(arguments, &["DurationSeconds", "duration_seconds"]);
+            let prompt = arg_str(arguments, &["Prompt", "prompt", "task"]);
+            let heading = match (cron, duration) {
+                (Some(cron), _) => format!("Schedule: {}", truncate(cron, 40)),
+                (None, Some(seconds)) => format!("Schedule: {seconds}s timer"),
+                (None, None) => "Schedule".to_owned(),
+            };
+            let detail = prompt.map(|prompt| truncate(first_non_empty_line(prompt), 120));
+            (heading, detail)
+        }
+        "manage_task" => {
+            let action = arg_str(arguments, &["Action", "action"]);
+            let task_id = arg_str(arguments, &["TaskId", "task_id"]);
+            let heading = match action {
+                Some(action) => format!("Task: {}", truncate(action, 40)),
+                None => "Manage task".to_owned(),
+            };
+            let detail = task_id.map(|id| truncate(id, 60));
+            (heading, detail)
+        }
+        "run_workflow" => {
+            let description = arg_str(arguments, &["Description", "description"]);
+            let script_path = arg_str(arguments, &["ScriptPath", "script_path"]);
+            let heading = description
+                .map(|desc| format!("Workflow: {}", truncate(first_non_empty_line(desc), 60)))
+                .or_else(|| {
+                    script_path
+                        .and_then(path_basename)
+                        .map(|name| format!("Workflow: {}", truncate(name, 60)))
+                })
+                .unwrap_or_else(|| "Run workflow".to_owned());
+            (heading, None)
+        }
+        "exit_plan_mode" => {
+            let plan = arg_str(arguments, &["plan", "content", "summary"]);
+            (
+                "Plan ready".to_owned(),
+                plan.map(|plan| truncate(first_non_empty_line(plan), 120)),
+            )
+        }
+        "boost" => {
+            let mode = arg_str(arguments, &["mode", "action", "level", "model"]);
+            let prompt = arg_str(
+                arguments,
+                &["prompt", "task", "query", "description", "title"],
+            );
+            let (heading, detail) = match (mode, prompt) {
+                (Some(mode), Some(prompt)) => (
+                    format!("Boost: {}", truncate(mode, 60)),
+                    Some(truncate(first_non_empty_line(prompt), 120)),
+                ),
+                (Some(mode), None) => (format!("Boost: {}", truncate(mode, 60)), None),
+                (None, Some(prompt)) => (
+                    format!("Boost: {}", truncate(first_non_empty_line(prompt), 60)),
+                    None,
+                ),
+                (None, None) => ("Boost".to_owned(), None),
+            };
+            (heading, detail)
+        }
+        _ => (canonical_name.to_owned(), None),
+    }
+}
+
+fn antigravity_artifact_presentation(
+    arguments: Option<&Value>,
+) -> Option<(ActivityKind, String, Option<String>, Option<String>)> {
+    let meta = arg_object(arguments, &["ArtifactMetadata"])?;
+    let request_feedback = arg_bool(Some(meta), &["RequestFeedback"]).unwrap_or(false);
+    let user_facing = arg_bool(Some(meta), &["UserFacing"]).unwrap_or(false);
+    if !request_feedback && !user_facing {
+        return None;
+    }
+    let summary = arg_str(Some(meta), &["Summary"]);
+    let basename = arg_str(arguments, &["Path", "TargetFile", "path"]).and_then(path_basename);
+    let detail = summary.map(|text| truncate(first_non_empty_line(text), 140));
+    if request_feedback {
+        let title = basename
+            .map(|name| format!("Plan: {}", truncate(name, 60)))
+            .unwrap_or_else(|| "Implementation plan".to_owned());
+        let inline_content = arg_str(arguments, &["Content", "content"]).map(str::to_owned);
+        Some((ActivityKind::Plan, title, detail, inline_content))
+    } else {
+        let title = basename
+            .map(|name| format!("Artifact: {}", truncate(name, 60)))
+            .unwrap_or_else(|| "Artifact".to_owned());
+        Some((ActivityKind::FileChange, title, detail, None))
+    }
+}
+
 pub(crate) fn build_tool_activity_item(
     update: &Value,
     tools: &mut HashMap<String, StoredToolCall>,
@@ -5202,18 +6187,6 @@ pub(crate) fn build_tool_activity_item(
             tools.get(id).cloned()
         }
     });
-    let mut kind = wire_kind
-        .map(classify)
-        .or_else(|| stored.as_ref().map(|tool| tool.kind))
-        .unwrap_or(ActivityKind::Tool);
-    if matches!(kind, ActivityKind::Search | ActivityKind::Tool)
-        && let Some(wire_title) = wire_title
-    {
-        let named_kind = ActivityKind::from_tool_name(wire_title);
-        if named_kind != ActivityKind::Tool {
-            kind = named_kind;
-        }
-    }
     let arguments = update
         .get("rawInput")
         .filter(|value| !value.is_null())
@@ -5226,10 +6199,60 @@ pub(crate) fn build_tool_activity_item(
         .get("content")
         .filter(|value| !value.is_null())
         .or_else(|| stored.as_ref().and_then(|tool| tool.content.as_ref()));
+
+    let canonical_antigravity_tool = arguments
+        .and_then(|input| input.get("tool_name"))
+        .and_then(Value::as_str)
+        .and_then(antigravity_canonical_tool_name)
+        .or_else(|| wire_title.and_then(antigravity_canonical_tool_name))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|tool| tool.tool_name.as_deref())
+                .and_then(antigravity_canonical_tool_name)
+        });
+
+    let artifact_presentation = canonical_antigravity_tool
+        .is_none()
+        .then(|| antigravity_artifact_presentation(arguments))
+        .flatten();
+
+    let mut kind = if canonical_antigravity_tool == Some("exit_plan_mode") {
+        ActivityKind::Plan
+    } else if canonical_antigravity_tool.is_some() {
+        ActivityKind::Tool
+    } else if let Some((artifact_kind, _, _, _)) = &artifact_presentation {
+        *artifact_kind
+    } else {
+        let mut kind = wire_kind
+            .map(classify)
+            .or_else(|| stored.as_ref().map(|tool| tool.kind))
+            .unwrap_or(ActivityKind::Tool);
+        if matches!(kind, ActivityKind::Search | ActivityKind::Tool)
+            && let Some(wire_title) = wire_title
+        {
+            let named_kind = ActivityKind::from_tool_name(wire_title);
+            if named_kind != ActivityKind::Tool {
+                kind = named_kind;
+            }
+        }
+        kind
+    };
     if kind == ActivityKind::Tool && content_has_diff(content) {
         kind = ActivityKind::FileChange;
     }
-    let title = activity::input_title(arguments)
+
+    let antigravity_presentation = canonical_antigravity_tool
+        .map(|canonical| antigravity_tool_presentation(canonical, arguments))
+        .or_else(|| {
+            artifact_presentation
+                .as_ref()
+                .map(|(_, title, detail, _)| (title.clone(), detail.clone()))
+        });
+    let title = antigravity_presentation
+        .as_ref()
+        .map(|(title, _)| title.clone())
+        .or_else(|| activity::input_title(arguments))
         .or_else(|| {
             wire_title
                 .filter(|title| !title.is_empty())
@@ -5243,12 +6266,17 @@ pub(crate) fn build_tool_activity_item(
                 "Tool".to_owned()
             }
         });
-    let tool_name = arguments
-        .and_then(|input| input.get("tool_name"))
-        .and_then(Value::as_str)
-        .or_else(|| wire_title.filter(|title| title.starts_with("mcp__")))
-        .or_else(|| stored.as_ref().and_then(|tool| tool.tool_name.as_deref()))
-        .map(str::to_owned);
+    let tool_name = canonical_antigravity_tool
+        .map(str::to_owned)
+        .or_else(|| {
+            arguments
+                .and_then(|input| input.get("tool_name"))
+                .and_then(Value::as_str)
+                .or_else(|| wire_title.filter(|title| title.starts_with("mcp__")))
+                .or_else(|| stored.as_ref().and_then(|tool| tool.tool_name.as_deref()))
+                .map(str::to_owned)
+        });
+    let normalized_locations = locations.map(normalize_acp_locations);
     if !complete && let Some(id) = id.as_ref() {
         tools.insert(
             id.clone(),
@@ -5256,29 +6284,45 @@ pub(crate) fn build_tool_activity_item(
                 kind,
                 title: title.clone(),
                 raw_input: arguments.cloned(),
-                locations: locations.cloned(),
+                locations: normalized_locations.clone(),
                 content: content.cloned(),
                 tool_name: tool_name.clone(),
             },
         );
     }
 
-    let output = content.or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
+    let fallback_plan_output = if canonical_antigravity_tool == Some("exit_plan_mode") {
+        arg_str(arguments, &["plan", "content", "summary"])
+            .map(|plan| Value::String(plan.to_owned()))
+    } else {
+        artifact_presentation
+            .as_ref()
+            .and_then(|(_, _, _, content)| content.as_ref())
+            .map(|text| Value::String(text.clone()))
+    };
+    let raw_output = content.or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
+    let output = raw_output.or(fallback_plan_output.as_ref());
     let mut item =
-        activity::tool_activity(id, kind, title, arguments, output, output, failed, complete)
+        activity::tool_activity(id, kind, title, arguments, output, raw_output, failed, complete)
             .with_tool_name(tool_name.as_deref());
-    if locations.is_some() || content.is_some() {
+    if normalized_locations.is_some() || content.is_some() {
         let mut source = Map::new();
         if let Some(arguments) = arguments {
             source.insert("rawInput".to_owned(), arguments.clone());
         }
-        if let Some(locations) = locations {
+        if let Some(locations) = normalized_locations.as_ref() {
             source.insert("locations".to_owned(), locations.clone());
         }
         if let Some(content) = content {
             source.insert("content".to_owned(), content.clone());
         }
         item = item.with_activity_source(Some(&Value::Object(source)));
+    }
+    if let Some((presentation_title, presentation_detail)) = antigravity_presentation {
+        item.display_target = Some(presentation_title);
+        if item.detail.is_none() {
+            item.detail = presentation_detail;
+        }
     }
     if item.output.is_none()
         && let Some(terminals) = terminals
@@ -5291,6 +6335,9 @@ pub(crate) fn build_tool_activity_item(
 
 fn tool_activity(update: &Value, events: &impl DriverEventSink, state: &mut AcpStreamState) {
     let item = build_tool_activity_item(update, &mut state.tools, Some(&state.terminals));
+    if item.complete {
+        state.last_completed_tool_name = item.tool_name.clone();
+    }
     let _ = events.send(DriverEvent::RichActivity(item));
 }
 
@@ -5751,8 +6798,47 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_access_mode_uses_default_and_accept_edits() {
-        let modes = SessionModeState::new(
+    fn antigravity_access_mode_maps_auto_and_falls_back_to_default() {
+        let modes_with_auto = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("accept-edits", "Accept edits"),
+                SessionMode::new("auto", "Auto"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        let mode_with_auto = |runtime| {
+            desired_access_mode(ProviderKind::Antigravity, Some(&modes_with_auto), runtime)
+                .map(|mode| mode.to_string())
+        };
+        assert_eq!(mode_with_auto(RuntimeMode::Ask), None);
+        assert_eq!(mode_with_auto(RuntimeMode::Auto), Some("auto".to_owned()));
+        assert_eq!(
+            mode_with_auto(RuntimeMode::AutoAcceptEdits),
+            Some("accept-edits".to_owned())
+        );
+        assert_eq!(mode_with_auto(RuntimeMode::FullAccess), None);
+
+        // Older `agy` versions without `auto` fall back to `default`.
+        let modes_without_auto = SessionModeState::new(
+            "accept-edits",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("accept-edits", "Accept edits"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&modes_without_auto),
+                RuntimeMode::Auto
+            )
+            .map(|mode| mode.to_string()),
+            Some("default".to_owned())
+        );
+        let modes_already_default = SessionModeState::new(
             "default",
             vec![
                 SessionMode::new("default", "Default"),
@@ -5760,17 +6846,353 @@ mod tests {
                 SessionMode::new("plan", "Plan"),
             ],
         );
-        let mode = |runtime| {
-            desired_access_mode(ProviderKind::Antigravity, Some(&modes), runtime)
-                .map(|mode| mode.to_string())
-        };
-        assert_eq!(mode(RuntimeMode::Ask), None);
-        assert_eq!(mode(RuntimeMode::Auto), None);
         assert_eq!(
-            mode(RuntimeMode::AutoAcceptEdits),
-            Some("accept-edits".to_owned())
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&modes_already_default),
+                RuntimeMode::Auto
+            ),
+            None
         );
-        assert_eq!(mode(RuntimeMode::FullAccess), None);
+    }
+
+    #[test]
+    fn antigravity_live_mode_switching_sends_set_mode_and_handles_noop_and_rejection() {
+        use agent_client_protocol::schema::v1::SetSessionModeResponse;
+
+        let requested_modes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let requested_for_agent = Arc::clone(&requested_modes);
+        let mock_agent = Agent.builder().on_receive_request(
+            async move |req: SetSessionModeRequest, responder, _cx| {
+                let id = req.mode_id.to_string();
+                requested_for_agent.lock().push(id.clone());
+                if id == "accept-edits" {
+                    responder.respond_with_error(agent_client_protocol::util::internal_error(
+                        "mode rejected",
+                    ))
+                } else {
+                    responder.respond(SetSessionModeResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let initial_modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("accept-edits", "Accept edits"),
+                SessionMode::new("auto", "Auto"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        smol::block_on(Client.builder().connect_with(
+            mock_agent,
+            async move |connection: ConnectionTo<Agent>| {
+                let session_id = SessionId::new("agy-sess-1");
+                // Ask <-> FullAccess both map to `default`: live no-op without RPC.
+                assert_eq!(
+                    apply_antigravity_mode(
+                        &connection,
+                        &session_id,
+                        Some(&initial_modes),
+                        RuntimeMode::FullAccess,
+                    )
+                    .await
+                    .unwrap(),
+                    None
+                );
+                // Switching to Auto calls `session/set_mode` with `"auto"`.
+                assert_eq!(
+                    apply_antigravity_mode(
+                        &connection,
+                        &session_id,
+                        Some(&initial_modes),
+                        RuntimeMode::Auto,
+                    )
+                    .await
+                    .unwrap()
+                    .map(|id| id.to_string()),
+                    Some("auto".to_owned())
+                );
+                // A rejected transition returns Err so the caller fails closed.
+                assert!(
+                    apply_antigravity_mode(
+                        &connection,
+                        &session_id,
+                        Some(&initial_modes),
+                        RuntimeMode::AutoAcceptEdits,
+                    )
+                    .await
+                    .is_err()
+                );
+                // Missing mode advertisement returns Err.
+                assert!(
+                    apply_antigravity_mode(&connection, &session_id, None, RuntimeMode::Auto)
+                        .await
+                        .is_err()
+                );
+                Ok(())
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(*requested_modes.lock(), vec!["auto", "accept-edits"]);
+    }
+
+    #[test]
+    fn antigravity_unsolicited_turn_lifecycle_handles_content_tools_usage_and_settlement() {
+        let mut state = UnsolicitedTurnState::default();
+        let now = Instant::now();
+
+        // First content opens a reactive turn; subsequent content does not re-open.
+        assert!(state.on_content_update());
+        assert!(!state.on_content_update());
+        assert!(state.active);
+
+        // In-flight tool pauses settlement.
+        assert!(!state.schedule_settle(now, Duration::from_secs(6), true));
+        assert!(state.settle_at.is_none());
+
+        // Tool completes -> arms idle settle timer.
+        assert!(state.schedule_settle(now, Duration::from_secs(6), false));
+        let (idle_deadline, idle_gen) = state.settle_at.expect("idle settle deadline");
+        assert_eq!(idle_deadline, now + Duration::from_secs(6));
+
+        // Trailing usage_update tightens settle deadline and bumps generation.
+        let t1 = now + Duration::from_millis(50);
+        assert!(state.schedule_settle(t1, Duration::from_secs(2), false));
+        let (usage_deadline, usage_gen) = state.settle_at.expect("usage settle deadline");
+        assert_eq!(usage_deadline, t1 + Duration::from_secs(2));
+        assert_ne!(usage_gen, idle_gen);
+
+        // Stale generation cannot settle.
+        assert!(!state.try_settle(idle_gen, false));
+        assert!(state.active);
+
+        // In-flight work blocks even the current generation.
+        assert!(!state.try_settle(usage_gen, true));
+        assert!(state.active);
+
+        // Re-arm and settle cleanly.
+        assert!(state.schedule_settle(t1, Duration::from_secs(2), false));
+        let (_, settle_gen) = state.settle_at.unwrap();
+        assert!(state.try_settle(settle_gen, false));
+        assert!(!state.active);
+        assert!(state.settle_at.is_none());
+
+        // User prompt/steer/cancel cleanly takes ownership of an active turn.
+        assert!(state.on_content_update());
+        assert!(state.take_active());
+        assert!(!state.active);
+        assert!(!state.take_active());
+
+        // UserMessageChunk and metadata must never trigger unsolicited turns.
+        let user_chunk: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "echo"}
+        }))
+        .unwrap();
+        let usage_update: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 100,
+            "size": 1000
+        }))
+        .unwrap();
+        let agent_chunk: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "woke up"}
+        }))
+        .unwrap();
+        assert!(!is_unsolicited_turn_content(&user_chunk));
+        assert!(!is_unsolicited_turn_content(&usage_update));
+        assert!(is_unsolicited_turn_content(&agent_chunk));
+
+        // Settle delay selection: post-tool thinking uses 25s, pre-tool usage_update
+        // does not shrink to 2s, swarm_wait completion uses 2s, and
+        // AgentMessageChunk + UsageUpdate uses 2s.
+        let tool_call: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "Run read_board",
+            "status": "in_progress"
+        }))
+        .unwrap();
+        let tool_done: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "completed"
+        }))
+        .unwrap();
+        let thought_chunk: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "thinking after tool"}
+        }))
+        .unwrap();
+
+        let mut state = UnsolicitedTurnState::default();
+        assert!(state.on_content_update());
+        // Pre-tool usage_update before any message must NOT shrink settle delay to 2s.
+        state.on_stream_update(&usage_update, None);
+        assert_eq!(
+            state.settle_delay(&usage_update),
+            ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY
+        );
+
+        // Tool runs and finishes -> post-tool thinking gets 25s even on usage_update.
+        state.on_stream_update(&tool_call, None);
+        state.on_stream_update(&tool_done, Some("read_board"));
+        assert_eq!(
+            state.settle_delay(&tool_done),
+            ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY
+        );
+        state.on_stream_update(&thought_chunk, None);
+        assert_eq!(
+            state.settle_delay(&thought_chunk),
+            ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY
+        );
+        state.on_stream_update(&usage_update, None);
+        assert_eq!(
+            state.settle_delay(&usage_update),
+            ANTIGRAVITY_UNSOLICITED_THINKING_SETTLE_DELAY
+        );
+
+        // AgentMessageChunk gets 6s idle, then trailing UsageUpdate shrinks to 2s.
+        state.on_stream_update(&agent_chunk, None);
+        assert_eq!(
+            state.settle_delay(&agent_chunk),
+            ANTIGRAVITY_UNSOLICITED_IDLE_SETTLE_DELAY
+        );
+        state.on_stream_update(&usage_update, None);
+        assert_eq!(
+            state.settle_delay(&usage_update),
+            ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY
+        );
+
+        // Completing swarm_wait settles quickly in 2s.
+        state.on_stream_update(&tool_call, None);
+        state.on_stream_update(&tool_done, Some("swarm_wait"));
+        assert_eq!(
+            state.settle_delay(&tool_done),
+            ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY
+        );
+    }
+
+    #[test]
+    fn antigravity_session_load_drains_post_response_replay_while_delivering_metadata() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, LoadSessionResponse,
+            SessionInfoUpdate,
+        };
+
+        let suppress = Arc::new(ReplaySuppression::default());
+        let suppress_notif = Arc::clone(&suppress);
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let events_notif = events.clone();
+        let stream_state = Arc::new(Mutex::new(AcpStreamState::default()));
+        let stream_notif = Arc::clone(&stream_state);
+
+        let mock_agent = Agent.builder().on_receive_request(
+            async move |req: LoadSessionRequest, responder, cx| {
+                // Pre-response replay chunk.
+                let pre_chunk: SessionUpdate = serde_json::from_value(json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "historical-before"}
+                }))
+                .unwrap();
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    pre_chunk,
+                ))?;
+                responder.respond(LoadSessionResponse::new())?;
+                // Post-response trailing replay + metadata (matching live `agy acp` behavior).
+                let post_chunk: SessionUpdate = serde_json::from_value(json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "historical-after"}
+                }))
+                .unwrap();
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    post_chunk,
+                ))?;
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                        AvailableCommand::new("boost", "Boost quality"),
+                        AvailableCommand::new("swarm", "Run a swarm"),
+                    ])),
+                ))?;
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::SessionInfoUpdate(
+                        SessionInfoUpdate::new().title("Loaded Antigravity"),
+                    ),
+                ))?;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let init = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(AgentCapabilities::new().load_session(true));
+        let cwd = std::env::temp_dir();
+        let suppress_conn = Arc::clone(&suppress);
+        smol::block_on(
+            Client
+                .builder()
+                .on_receive_notification(
+                    async move |notification: SessionNotification, _cx| {
+                        if is_replay_transcript_update(&notification.update)
+                            && suppress_notif.should_suppress_replay(
+                                Instant::now(),
+                                ANTIGRAVITY_POST_LOAD_GUARD_WINDOW,
+                            )
+                        {
+                            return Ok(());
+                        }
+                        handle_session_update(
+                            ProviderKind::Antigravity,
+                            notification,
+                            &events_notif,
+                            &mut stream_notif.lock(),
+                        )
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(mock_agent, async move |connection: ConnectionTo<Agent>| {
+                    let (session_id, _, _) = establish_session(
+                        &connection,
+                        ProviderKind::Antigravity,
+                        &init,
+                        Some("agy-loaded-1"),
+                        &cwd,
+                        &[],
+                        &suppress_conn,
+                    )
+                    .await?;
+                    assert_eq!(session_id.to_string(), "agy-loaded-1");
+                    Ok(())
+                }),
+        )
+        .unwrap();
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, DriverEvent::TextDelta(_))),
+            "both pre- and post-response replay text chunks must be suppressed: {seen:?}"
+        );
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            DriverEvent::AvailableCommands(commands)
+                if commands.iter().any(|c| c.name == "boost")
+                    && commands.iter().any(|c| c.name == "swarm")
+        )));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            DriverEvent::AutoTitleUpdated(Some(title)) if title == "Loaded Antigravity"
+        )));
     }
 
     #[test]
@@ -5890,6 +7312,468 @@ mod tests {
             )],
         );
         assert!(antigravity_user_input_questions(&request).is_none());
+    }
+
+    #[test]
+    fn session_load_suppression_drops_replay_transcript_but_keeps_metadata() {
+        let replay_updates = [
+            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old prompt"}}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}),
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"old thought"}}),
+            json!({"sessionUpdate":"tool_call","toolCallId":"c1","title":"read_file","kind":"read","status":"completed"}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed"}),
+            json!({"sessionUpdate":"plan","entries":[{"content":"Step 1","priority":"high","status":"completed"}]}),
+        ];
+        for raw in replay_updates {
+            let update: SessionUpdate = serde_json::from_value(raw).unwrap();
+            assert!(
+                is_replay_transcript_update(&update),
+                "expected replay transcript update to be suppressed: {update:?}"
+            );
+        }
+
+        let metadata_updates = [
+            json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [{"name": "swarm", "description": "Run a swarm"}]
+            }),
+            json!({"sessionUpdate": "usage_update", "used": 4096, "size": 200_000}),
+            json!({"sessionUpdate": "session_info_update", "title": "Resumed Antigravity task"}),
+        ];
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+        for raw in metadata_updates {
+            let update: SessionUpdate = serde_json::from_value(raw).unwrap();
+            assert!(
+                !is_replay_transcript_update(&update),
+                "metadata update must pass through during session/load: {update:?}"
+            );
+            handle_session_update(
+                ProviderKind::Antigravity,
+                SessionNotification::new("s-load", update),
+                &events,
+                &mut state,
+            )
+            .unwrap();
+        }
+        assert!(
+            !state.produced_content,
+            "metadata updates must not mark produced_content"
+        );
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 3);
+        assert!(matches!(
+            &seen[0],
+            DriverEvent::AvailableCommands(commands)
+                if commands.len() == 1 && commands[0].name == "swarm"
+        ));
+        assert!(matches!(
+            &seen[1],
+            DriverEvent::UsageUpdated {
+                context_tokens: Some(4096),
+                context_window: Some(200_000),
+            }
+        ));
+        assert!(matches!(
+            &seen[2],
+            DriverEvent::AutoTitleUpdated(Some(title)) if title == "Resumed Antigravity task"
+        ));
+    }
+
+    #[test]
+    fn antigravity_swarm_subagent_and_boost_tools_have_readable_presentations() {
+        let mut tools = HashMap::new();
+
+        // 1. swarm add with live `agy acp` "Run swarm" title + update omitting title/rawInput
+        let add_start = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-swarm-add",
+                "title": "Run swarm",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": {
+                    "action": "add",
+                    "name": "acp-core",
+                    "brief": "Own ACP driver updates.\nSecond line."
+                }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(add_start.kind, ActivityKind::Tool);
+        assert_eq!(add_start.tool_name.as_deref(), Some("swarm"));
+        assert_eq!(add_start.title, "Swarm: add acp-core");
+        assert_eq!(
+            add_start.display_target.as_deref(),
+            Some("Swarm: add acp-core")
+        );
+        assert_eq!(add_start.detail.as_deref(), Some("Own ACP driver updates."));
+
+        let add_done = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-swarm-add",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "spawned"}}]
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(add_done.tool_name.as_deref(), Some("swarm"));
+        assert_eq!(add_done.title, "Swarm: add acp-core");
+        assert_eq!(
+            add_done.display_target.as_deref(),
+            Some("Swarm: add acp-core")
+        );
+
+        // 2. swarm title must not collide with generic input_title("title")
+        let title_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-swarm-title",
+                "title": "swarm",
+                "status": "completed",
+                "rawInput": {"action": "title", "title": "Antigravity integration"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(title_item.tool_name.as_deref(), Some("swarm"));
+        assert_eq!(title_item.title, "Swarm: title \"Antigravity integration\"");
+
+        // 3. post_message with live "Run post_message" title and leading @mention
+        let post_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-post",
+                "title": "Run post_message",
+                "kind": "other",
+                "status": "completed",
+                "rawInput": {"text": "@verifier Ready for review\nAll tests pass."}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(post_item.tool_name.as_deref(), Some("post_message"));
+        assert_eq!(post_item.title, "Post to swarm board (@verifier)");
+        assert_eq!(
+            post_item.detail.as_deref(),
+            Some("@verifier Ready for review")
+        );
+
+        // 4. read_board (even when agent sends "Run read_board" or kind="read")
+        let board_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-read-board",
+                "title": "Run read_board",
+                "kind": "read",
+                "status": "completed",
+                "rawInput": {"since": 7, "limit": 20}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(board_item.kind, ActivityKind::Tool);
+        assert_eq!(board_item.tool_name.as_deref(), Some("read_board"));
+        assert_eq!(board_item.title, "Read swarm board (since #7)");
+        assert_eq!(board_item.detail.as_deref(), Some("limit 20"));
+
+        let roster_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-read-roster",
+                "title": "read_board",
+                "status": "completed",
+                "rawInput": {"status": true}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(roster_item.title, "Read swarm roster");
+
+        // 5. swarm_wait
+        let wait_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-wait",
+                "title": "Run swarm_wait",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": {"since": 12, "mentions_only": false}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(wait_item.tool_name.as_deref(), Some("swarm_wait"));
+        assert_eq!(wait_item.title, "Wait on swarm board (since #12)");
+        assert_eq!(
+            wait_item.detail.as_deref(),
+            Some("Waiting for any board message")
+        );
+
+        // 6. invoke_subagent
+        let subagent_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-subagent",
+                "title": "Run invoke_subagent",
+                "kind": "other",
+                "status": "completed",
+                "rawInput": {"subagent_type": "code-reviewer", "description": "Audit ACP changes"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(subagent_item.tool_name.as_deref(), Some("invoke_subagent"));
+        assert_eq!(subagent_item.title, "Subagent: code-reviewer");
+        assert_eq!(subagent_item.detail.as_deref(), Some("Audit ACP changes"));
+
+        // 7. boost + failure detail preservation
+        let boost_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-boost",
+                "title": "Run boost",
+                "kind": "other",
+                "status": "failed",
+                "rawInput": {"mode": "deep", "prompt": "Analyze race condition"},
+                "content": [{"type": "content", "content": {"type": "text", "text": "Quota exceeded"}}]
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(boost_item.tool_name.as_deref(), Some("boost"));
+        assert_eq!(boost_item.title, "Boost: deep");
+        assert!(boost_item.failed);
+        assert_eq!(boost_item.detail.as_deref(), Some("Quota exceeded"));
+
+        // 8. PascalCase invoke_subagent, define_subagent, send_message, manage_subagents,
+        // schedule, manage_task, run_workflow, swarm channel, and exit_plan_mode.
+        let pascal_subagent = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-pascal-subagent",
+                "title": "Run invoke_subagent",
+                "status": "completed",
+                "rawInput": {
+                    "Role": "Codebase Researcher",
+                    "TypeName": "research",
+                    "Prompt": "Survey the ACP driver\nReturn file paths",
+                    "Model": "inherit"
+                }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(pascal_subagent.tool_name.as_deref(), Some("invoke_subagent"));
+        assert_eq!(pascal_subagent.title, "Subagent: Codebase Researcher");
+        assert_eq!(
+            pascal_subagent.detail.as_deref(),
+            Some("Survey the ACP driver")
+        );
+
+        let define_subagent = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-define-subagent",
+                "title": "Run define_subagent",
+                "status": "completed",
+                "rawInput": {"Name": "auditor", "Description": "Security review agent"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(define_subagent.tool_name.as_deref(), Some("define_subagent"));
+        assert_eq!(define_subagent.title, "Define subagent: auditor");
+        assert_eq!(
+            define_subagent.detail.as_deref(),
+            Some("Security review agent")
+        );
+
+        let send_msg = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-send-msg",
+                "title": "Run send_message",
+                "status": "completed",
+                "rawInput": {"Recipient": "auditor-1", "Message": "Check auth flow\nThanks"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(send_msg.tool_name.as_deref(), Some("send_message"));
+        assert_eq!(send_msg.title, "Message subagent (auditor-1)");
+        assert_eq!(send_msg.detail.as_deref(), Some("Check auth flow"));
+
+        let manage_subs = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-manage-subs",
+                "title": "Run manage_subagents",
+                "status": "completed",
+                "rawInput": {"Action": "list"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(manage_subs.tool_name.as_deref(), Some("manage_subagents"));
+        assert_eq!(manage_subs.title, "Subagents: list");
+
+        let sched = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-schedule",
+                "title": "Run schedule",
+                "status": "completed",
+                "rawInput": {"CronExpression": "*/5 * * * *", "Prompt": "Check CI status"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(sched.tool_name.as_deref(), Some("schedule"));
+        assert_eq!(sched.title, "Schedule: */5 * * * *");
+        assert_eq!(sched.detail.as_deref(), Some("Check CI status"));
+
+        let task_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-manage-task",
+                "title": "Run manage_task",
+                "status": "completed",
+                "rawInput": {"Action": "status", "TaskId": "task-42"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(task_item.tool_name.as_deref(), Some("manage_task"));
+        assert_eq!(task_item.title, "Task: status");
+        assert_eq!(task_item.detail.as_deref(), Some("task-42"));
+
+        let workflow_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-workflow",
+                "title": "Run run_workflow",
+                "status": "completed",
+                "rawInput": {"Description": "Fan out lint checks", "ScriptPath": "scripts/lint.py"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(workflow_item.tool_name.as_deref(), Some("run_workflow"));
+        assert_eq!(workflow_item.title, "Workflow: Fan out lint checks");
+
+        let channel_item = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-swarm-channel",
+                "title": "Run swarm",
+                "status": "completed",
+                "rawInput": {"action": "channel", "op": "create", "channel": "parser", "topic": "Lexer and parser"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(channel_item.tool_name.as_deref(), Some("swarm"));
+        assert_eq!(channel_item.title, "Swarm: channel create #parser");
+        assert_eq!(channel_item.detail.as_deref(), Some("Lexer and parser"));
+
+        let exit_plan = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-exit-plan",
+                "title": "Run exit_plan_mode",
+                "kind": "other",
+                "status": "completed",
+                "rawInput": {"plan": "# Plan\n- Step 1\n- Step 2"}
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(exit_plan.kind, ActivityKind::Plan);
+        assert_eq!(exit_plan.tool_name.as_deref(), Some("exit_plan_mode"));
+        assert_eq!(exit_plan.title, "Plan ready");
+        assert_eq!(exit_plan.detail.as_deref(), Some("# Plan"));
+        assert_eq!(exit_plan.output.as_deref(), Some("# Plan\n- Step 1\n- Step 2"));
+
+        // 9. Antigravity /plan write_file with ArtifactMetadata and /C:/... location normalization.
+        let plan_artifact = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-plan-artifact",
+                "title": "File ../../.gemini/antigravity-cli/brain/123/plan.md",
+                "kind": "edit",
+                "status": "completed",
+                "locations": [{"path": "/C:/Users/gaoxi/.gemini/antigravity-cli/brain/123/plan.md"}],
+                "rawInput": {
+                    "ArtifactMetadata": {
+                        "RequestFeedback": true,
+                        "Summary": "2-bullet implementation plan",
+                        "UserFacing": true
+                    },
+                    "Content": "# Plan\n- Add blank line",
+                    "Path": "C:\\Users\\gaoxi\\.gemini\\antigravity-cli\\brain\\123\\plan.md"
+                }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(plan_artifact.kind, ActivityKind::Plan);
+        assert_eq!(plan_artifact.title, "Plan: plan.md");
+        assert_eq!(plan_artifact.display_target.as_deref(), Some("Plan: plan.md"));
+        assert_eq!(
+            plan_artifact.detail.as_deref(),
+            Some("2-bullet implementation plan")
+        );
+        assert_eq!(
+            plan_artifact.output.as_deref(),
+            Some("# Plan\n- Add blank line")
+        );
+        let normalized_locations = normalize_acp_locations(&json!([
+            {"path": "/C:/Users/gaoxi/.gemini/antigravity-cli/brain/123/plan.md"},
+            {"path": "/tmp/plan.md"}
+        ]));
+        assert_eq!(
+            normalized_locations.pointer("/0/path").and_then(Value::as_str),
+            Some("C:/Users/gaoxi/.gemini/antigravity-cli/brain/123/plan.md")
+        );
+        assert_eq!(
+            normalized_locations.pointer("/1/path").and_then(Value::as_str),
+            Some("/tmp/plan.md")
+        );
+
+        let user_artifact = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-user-artifact",
+                "title": "File report.md",
+                "kind": "edit",
+                "status": "completed",
+                "locations": [{"path": "/C:/Users/gaoxi/report.md"}],
+                "rawInput": {
+                    "ArtifactMetadata": {
+                        "RequestFeedback": false,
+                        "Summary": "Audit report",
+                        "UserFacing": true
+                    },
+                    "Path": "/C:/Users/gaoxi/report.md"
+                }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(user_artifact.kind, ActivityKind::FileChange);
+        assert_eq!(user_artifact.title, "Artifact: report.md");
+        assert_eq!(user_artifact.detail.as_deref(), Some("Audit report"));
+        assert_eq!(
+            user_artifact
+                .file_changes
+                .first()
+                .map(|change| change.path.as_str()),
+            Some("C:/Users/gaoxi/report.md")
+        );
     }
 
     #[test]
@@ -6737,8 +8621,11 @@ mod tests {
             std::path::PathBuf::from(""),
         ] {
             assert!(
-                handle_read_text_file(ReadTextFileRequest::new("s", escape.clone()), &workspace_dir)
-                    .is_err(),
+                handle_read_text_file(
+                    ReadTextFileRequest::new("s", escape.clone()),
+                    &workspace_dir
+                )
+                .is_err(),
                 "read should reject `{}`",
                 escape.display()
             );
@@ -6805,7 +8692,10 @@ mod tests {
                 .is_err(),
                 "write should reject file symlink escape"
             );
-            assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "top-secret");
+            assert_eq!(
+                std::fs::read_to_string(&outside_file).unwrap(),
+                "top-secret"
+            );
         }
 
         let dangling_target = outer_dir.join("dangling_out.txt");
@@ -6882,10 +8772,7 @@ mod tests {
         let (events, _event_rx) = crate::driver::test_event_channel();
 
         // Out-of-workspace cwd rejected even in FullAccess.
-        for bad_cwd in [
-            std::path::PathBuf::from(".."),
-            outer_dir.clone(),
-        ] {
+        for bad_cwd in [std::path::PathBuf::from(".."), outer_dir.clone()] {
             let req = CreateTerminalRequest::new("s", "echo").cwd(bad_cwd.clone());
             assert!(
                 registry
@@ -7149,7 +9036,7 @@ mod tests {
         let auth_outcome = smol::block_on(Client.builder().connect_with(
             auth_agent,
             async move |connection: ConnectionTo<Agent>| {
-                let suppress = AtomicBool::new(false);
+                let suppress = ReplaySuppression::default();
                 let result = establish_session(
                     &connection,
                     ProviderKind::Cursor,
@@ -7202,7 +9089,7 @@ mod tests {
         let transport_outcome = smol::block_on(Client.builder().connect_with(
             transport_agent,
             async move |connection: ConnectionTo<Agent>| {
-                let suppress = AtomicBool::new(false);
+                let suppress = ReplaySuppression::default();
                 let result = establish_session(
                     &connection,
                     ProviderKind::Cursor,
@@ -7228,9 +9115,8 @@ mod tests {
             .builder()
             .on_receive_request(
                 async move |_req: ResumeSessionRequest, responder, _cx| {
-                    responder.respond_with_error(agent_client_protocol::Error::resource_not_found(
-                        None,
-                    ))
+                    responder
+                        .respond_with_error(agent_client_protocol::Error::resource_not_found(None))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -7254,7 +9140,7 @@ mod tests {
         let missing_outcome = smol::block_on(Client.builder().connect_with(
             missing_agent,
             async move |connection: ConnectionTo<Agent>| {
-                let suppress = AtomicBool::new(false);
+                let suppress = ReplaySuppression::default();
                 let (session_id, _, _) = establish_session(
                     &connection,
                     ProviderKind::Cursor,
@@ -7680,11 +9566,26 @@ mod tests {
         evict_completed_terminals_in(&registry.terminals, 2);
 
         let map = registry.terminals.lock();
-        assert!(map.contains_key("running-1"), "running terminals must not be evicted");
-        assert!(!map.contains_key("done-1"), "oldest completed terminal should be evicted");
-        assert!(!map.contains_key("done-2"), "second oldest completed terminal should be evicted");
-        assert!(map.contains_key("done-3"), "newer completed terminal should be retained");
-        assert!(map.contains_key("done-4"), "newest completed terminal should be retained");
+        assert!(
+            map.contains_key("running-1"),
+            "running terminals must not be evicted"
+        );
+        assert!(
+            !map.contains_key("done-1"),
+            "oldest completed terminal should be evicted"
+        );
+        assert!(
+            !map.contains_key("done-2"),
+            "second oldest completed terminal should be evicted"
+        );
+        assert!(
+            map.contains_key("done-3"),
+            "newer completed terminal should be retained"
+        );
+        assert!(
+            map.contains_key("done-4"),
+            "newest completed terminal should be retained"
+        );
     }
 
     #[test]

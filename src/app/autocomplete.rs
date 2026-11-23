@@ -406,7 +406,7 @@ impl Waku {
         if matches!(row, AutocompleteRow::Command(_)) {
             let mut submission = self.composer.read(cx).content(cx).to_owned();
             submission.replace_range(trigger.range.clone(), &insert);
-            if self.execute_local_composer_command(&submission, cx) {
+            if self.execute_local_composer_command_on_accept(&submission, cx) {
                 return;
             }
         }

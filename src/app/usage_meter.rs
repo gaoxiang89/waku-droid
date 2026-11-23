@@ -3,8 +3,9 @@
 //! rate-limit lanes, mirroring Claude Code's `/usage` rows. Context numbers
 //! stream in from every provider transport that reports them; plan lanes come
 //! from the Claude OAuth endpoint (fetched off-thread in [`crate::usage`]),
-//! OpenCode Go's usage endpoint, and Codex's own rate-limit
-//! notifications. Frames read only snapshots stored on the entity.
+//! OpenCode Go's usage endpoint, Grok's billing probe, Antigravity's `/usage`
+//! probe, and Codex's own rate-limit notifications. Frames read only snapshots
+//! stored on the entity.
 
 use gpui::{PathBuilder, relative};
 
@@ -15,65 +16,132 @@ const USAGE_METER_MENU_ID: &str = "usage-meter";
 
 /// Providers with an account-level plan fetcher. Codex additionally refreshes
 /// live from its own stream notifications.
-pub(super) const PLAN_USAGE_PROVIDERS: [ProviderKind; 4] = [
+pub(super) const PLAN_USAGE_PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::Claude,
     ProviderKind::Codex,
     ProviderKind::OpenCode,
     ProviderKind::Grok,
+    ProviderKind::Antigravity,
 ];
 
 /// Refresh cadences for the plan snapshots. Quota moves only when turns run,
 /// so idle refreshes stay rare; a settled turn or a just-opened panel asks
-/// sooner. Grok's fetch spawns a probe process, so its idle cadence is wider.
+/// sooner. Providers that spawn a probe process (Grok, Antigravity) keep a
+/// wider idle cadence.
 const PLAN_USAGE_REFRESH: Duration = Duration::from_secs(300);
-const PLAN_USAGE_REFRESH_GROK: Duration = Duration::from_secs(600);
+const PLAN_USAGE_REFRESH_PROBE: Duration = Duration::from_secs(600);
 const PLAN_USAGE_REFRESH_STALE: Duration = Duration::from_secs(30);
 const PLAN_USAGE_RETRY: Duration = Duration::from_secs(90);
 
 impl Waku {
-    /// Start background fetches of any plan meters whose snapshot is due.
-    /// The slow maintenance clock and explicit panel-open requests call this;
-    /// guards keep it to one in-flight fetch per provider.
+    /// Start background fetches of any plan meters whose snapshot is due on
+    /// the selected host. The slow maintenance clock and explicit panel-open
+    /// requests call this; guards keep it to one in-flight fetch per provider.
     pub(super) fn maybe_refresh_plan_usage(&mut self, cx: &mut Context<Self>) {
+        let host = self.selected_host_key();
+        self.maybe_refresh_plan_usage_for_host(&host, cx);
+    }
+
+    /// Start background fetches of any due plan meters on `host`.
+    pub(super) fn maybe_refresh_plan_usage_for_host(
+        &mut self,
+        host: &waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_plan_usage_targets(host, None, cx);
+    }
+
+    /// Force an immediate background refresh for one provider on `host`
+    /// (unless a fetch for that exact key is already in flight).
+    pub(super) fn refresh_plan_usage_now(
+        &mut self,
+        host: &waku_client::hosts::HostKey,
+        provider: ProviderKind,
+        account_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !PLAN_USAGE_PROVIDERS.contains(&provider) {
+            return;
+        }
+        let key: PlanUsageKey = (host.clone(), provider, account_id.clone());
+        self.plan_usage_checked_at.remove(&key);
+        self.plan_usage_error.remove(&key);
+        self.plan_usage_unconfigured.remove(&key);
+        self.plan_usage_stale.insert(key);
+        self.refresh_plan_usage_targets(host, Some((provider, account_id)), cx);
+    }
+
+    /// Force an immediate background refresh of all enabled plan-usage
+    /// providers on `host` (used by the Usage settings page Refresh control).
+    pub(super) fn refresh_all_plan_usage_for_host(
+        &mut self,
+        host: &waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        for provider in PLAN_USAGE_PROVIDERS {
+            if !self.provider_enabled_on(host, provider) {
+                continue;
+            }
+            let key: PlanUsageKey = (host.clone(), provider, None);
+            self.plan_usage_checked_at.remove(&key);
+            self.plan_usage_unconfigured.remove(&key);
+            self.plan_usage_stale.insert(key);
+        }
+        self.maybe_refresh_plan_usage_for_host(host, cx);
+    }
+
+    fn refresh_plan_usage_targets(
+        &mut self,
+        host: &waku_client::hosts::HostKey,
+        explicit_target: Option<(ProviderKind, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
         // Disabling a provider only stops it backing new sessions; a session
         // already locked to it keeps running, and while one is selected its
         // usage panel still owes the account meters. Without this the panel
         // would show its loading skeleton forever: fetchable provider, no
         // snapshot, and no fetch ever allowed to start.
-        let host = self.selected_host_key();
-        let Some(owner) = self.hosts.get(&host) else {
+        let Some(owner) = self.hosts.get(host) else {
             return;
         };
         let host_generation = owner.generation;
+        let daemon = owner.daemon.clone();
         let mut targets: Vec<(ProviderKind, Option<String>)> = PLAN_USAGE_PROVIDERS
             .into_iter()
-            .filter(|provider| self.provider_enabled(*provider))
+            .filter(|provider| self.provider_enabled_on(host, *provider))
             .map(|provider| (provider, None))
             .collect();
-        if let Some(session) = self.selected_session()
-            && PLAN_USAGE_PROVIDERS.contains(&session.provider)
+        if let Some(target) = explicit_target
+            && !targets.contains(&target)
         {
-            let account_id = self.validated_account_id_for_host(
-                &host,
-                session.provider,
-                session.account_id.as_deref(),
-            );
-            let candidate = (session.provider, account_id);
-            if !targets.contains(&candidate) {
-                targets.push(candidate);
-            }
+            targets.push(target);
         }
-        if PLAN_USAGE_PROVIDERS.contains(&self.state.last_provider)
-            && self.provider_enabled(self.state.last_provider)
-        {
-            let account_id = self.validated_account_id_for_host(
-                &host,
-                self.state.last_provider,
-                self.state.last_account_id.as_deref(),
-            );
-            let candidate = (self.state.last_provider, account_id);
-            if !targets.contains(&candidate) {
-                targets.push(candidate);
+        if *host == self.selected_host_key() {
+            if let Some(session) = self.selected_session()
+                && PLAN_USAGE_PROVIDERS.contains(&session.provider)
+            {
+                let account_id = self.validated_account_id_for_host(
+                    host,
+                    session.provider,
+                    session.account_id.as_deref(),
+                );
+                let candidate = (session.provider, account_id);
+                if !targets.contains(&candidate) {
+                    targets.push(candidate);
+                }
+            }
+            if PLAN_USAGE_PROVIDERS.contains(&self.state.last_provider)
+                && self.provider_enabled_on(host, self.state.last_provider)
+            {
+                let account_id = self.validated_account_id_for_host(
+                    host,
+                    self.state.last_provider,
+                    self.state.last_account_id.as_deref(),
+                );
+                let candidate = (self.state.last_provider, account_id);
+                if !targets.contains(&candidate) {
+                    targets.push(candidate);
+                }
             }
         }
 
@@ -86,8 +154,8 @@ impl Waku {
                 PLAN_USAGE_RETRY
             } else if self.plan_usage_stale.contains(&key) {
                 PLAN_USAGE_REFRESH_STALE
-            } else if provider == ProviderKind::Grok {
-                PLAN_USAGE_REFRESH_GROK
+            } else if matches!(provider, ProviderKind::Grok | ProviderKind::Antigravity) {
+                PLAN_USAGE_REFRESH_PROBE
             } else {
                 PLAN_USAGE_REFRESH
             };
@@ -101,7 +169,7 @@ impl Waku {
             self.plan_usage_pending.insert(key);
             let tx = self.plan_usage_tx.clone();
             let event_wake = self.event_wake_tx.clone();
-            let claude_version = if host == waku_client::hosts::HostKey::Local {
+            let claude_version = if *host == waku_client::hosts::HostKey::Local {
                 self.provider_versions
                     .get(&ProviderKind::Claude)
                     .cloned()
@@ -110,10 +178,10 @@ impl Waku {
                 None
             };
             let binary_override =
-                self.effective_binary_override_for_host(&host, provider, account_id.as_deref());
+                self.effective_binary_override_for_host(host, provider, account_id.as_deref());
             let config_dir =
-                self.effective_config_dir_for_host(&host, provider, account_id.as_deref());
-            let daemon = self.selected_daemon().clone();
+                self.effective_config_dir_for_host(host, provider, account_id.as_deref());
+            let daemon = daemon.clone();
             let request_host = host.clone();
             cx.background_executor()
                 .spawn(async move {
@@ -636,7 +704,7 @@ fn usage_panel(
 /// Placeholder for the plan section while its first fetch is in flight:
 /// a header bar and two quota rows, pulsing gently. `with_animation` honors
 /// the system's reduce-motion setting on its own.
-fn plan_skeleton(theme: &Theme) -> AnyElement {
+pub(super) fn plan_skeleton(theme: &Theme) -> AnyElement {
     let theme = *theme;
     let bar = move |width: f32| {
         div()
@@ -685,7 +753,7 @@ fn plan_skeleton(theme: &Theme) -> AnyElement {
 
 /// A quota bar: full-width track, fill proportional to `percent`. A lane in
 /// use keeps a visible sliver even under one percent.
-fn meter_bar(theme: &Theme, percent: f64) -> Div {
+pub(super) fn meter_bar(theme: &Theme, percent: f64) -> Div {
     let fraction = (percent / 100.0).clamp(0.0, 1.0) as f32;
     let fraction = if fraction > 0.0 {
         fraction.max(0.015)
@@ -711,6 +779,11 @@ fn meter_bar(theme: &Theme, percent: f64) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_usage_providers_include_antigravity() {
+        assert!(PLAN_USAGE_PROVIDERS.contains(&ProviderKind::Antigravity));
+    }
 
     #[test]
     fn context_percent_caps_at_full_when_provider_over_reports() {

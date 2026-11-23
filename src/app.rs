@@ -611,6 +611,7 @@ enum RightPanelSurface {
     Diff,
     File(String),
     GitGraph,
+    Swarm,
 }
 
 pub(super) type PlanUsageKey = (waku_client::hosts::HostKey, ProviderKind, Option<String>);
@@ -1551,6 +1552,8 @@ pub struct Waku {
     /// Inline diffs, compare selection, and the action dialog.
     git_graph_ui: git_graph_actions::GitGraphUi,
     git_commit_view: git_commit_view::GitCommitView,
+    /// Right-panel Antigravity Swarm Board state, snapshots, and polling handle.
+    swarm_panel: swarm_panel::SwarmPanelState,
     branch_operation_pending: bool,
     /// Window-modal Git commit/push UI. Its repository snapshot is filled
     /// off-thread; frames only read this in-memory value.
@@ -2072,6 +2075,7 @@ mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod swarm_panel;
 mod task_switcher;
 mod terminal_persistence;
 mod terminal_split;
@@ -3619,6 +3623,7 @@ impl Waku {
                 git_graph_cursor: None,
                 git_graph_ui,
                 git_commit_view: git_commit_view::GitCommitView::new(),
+                swarm_panel: swarm_panel::SwarmPanelState::new(cx),
                 branch_operation_pending: false,
                 commit_dialog: None,
                 goal_dialog: None,
@@ -3895,6 +3900,7 @@ impl Waku {
             this.refresh_composer_sources(cx);
             this.refresh_workspace_surfaces(cx);
             this.start_workspace_watch(cx);
+            this.refresh_selected_antigravity_swarm_if_relevant(cx);
             // Re-detect providers after resolving the user's login-shell
             // environment off-thread. Detection then starts model and version
             // discovery for every CLI it finds, including nvm/fnm-managed

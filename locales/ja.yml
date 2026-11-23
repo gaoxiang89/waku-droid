@@ -1435,3 +1435,70 @@ notifications.input: 回答が必要です
 terminal.end_session: ターミナルセッションを終了
 terminal.restore_sessions: ワークスペースのターミナルを復元
 terminal.reconnecting: 接続が切断されました。再接続中
+
+right_panel.swarm: Swarm
+right_panel.swarm_description: Antigravity Swarm ボードとワーカーを監視します
+swarm.title_default: Swarm ボード
+swarm.tab_board: ボード
+swarm.tab_members: メンバー
+swarm.tab_overview: 概要
+swarm.follow: 追従
+swarm.following: 追従中
+swarm.refresh: Swarm を更新
+swarm.retry: 再試行
+swarm.all_members: すべて
+swarm.clear_filter: クリア
+swarm.jump_latest: 最新へ
+swarm.show_killed: "終了済みを表示 (%{count})"
+swarm.hide_killed: "終了済みを非表示 (%{count})"
+swarm.status_working: 作業中
+swarm.status_waiting: 待機中
+swarm.status_failed: 失敗
+swarm.status_killed: 終了
+swarm.you: 自分
+swarm.active_count: "%{count} 稼働中"
+swarm.waiting_count: "%{count} 待機中"
+swarm.failed_count: "%{count} 失敗"
+swarm.posts_count: "%{count} 件の投稿"
+swarm.steps_count: "%{count} ステップ"
+swarm.unread_count: "%{count} 未読"
+swarm.wake_mentions: "@メンション待機"
+swarm.wake_anything: すべての投稿待機
+swarm.truncated_banner: "全 %{total} 件中、最新 %{shown} 件を表示中"
+swarm.empty_non_antigravity: Swarm ボードは Antigravity 専用です
+swarm.empty_non_antigravity_description: Antigravity タスクに切り替えると Swarm ボードとワーカーを表示できます。
+swarm.empty_title: この会話には Swarm がありません
+swarm.empty_description: /swarm <タスク> で Swarm を開始すると、メンバー参加後に自動更新されます。
+swarm.loading_title: Swarm ボードを読み込み中
+swarm.loading_description: ホストから Antigravity Swarm の状態を読み込んでいます。
+swarm.error_title: Swarm ボードを読み込めませんでした
+swarm.board_empty: このフィルターに一致するメッセージはありません
+swarm.board_no_posts: まだ投稿はありません
+swarm.members_empty: 表示できるアクティブなメンバーがいません
+swarm.overview_empty_title: ナレーター概要はまだありません
+swarm.overview_empty_description: Swarm に view.json を出力するナレーターがいる場合、要約・ワークストリーム・リスクがここに表示されます。
+swarm.section_attention: 要確認
+swarm.section_workstreams: ワークストリーム
+swarm.section_milestones: マイルストーン
+swarm.section_risks: リスク
+swarm.as_of_seq: "#%{seq} 時点"
+swarm.failure_quota: クォータ
+swarm.failure_error: エラー
+swarm.brief_badge: ブリーフ
+usage.credits_remaining: "%{count} クレジット"
+usage_error.start_antigravity_probe: "`agy` の使用量プローブを起動できませんでした"
+usage_error.antigravity_usage_timeout: Antigravity の使用量リクエストがタイムアウトしました
+usage_error.antigravity_answered: "Antigravity の応答エラー: %{error}"
+usage_error.antigravity_no_usage_data: "Antigravity から使用量上限が返されませんでした。`agy` を実行してサインインしてください"
+commands.usage_description: プランの使用量とクォータを表示
+commands.quota_description: プランの使用量とクォータを表示
+commands.credits_description: 残りのクレジットと使用量を表示
+commands.model_description: モデルピッカーを開く、またはモデルを切り替え
+commands.effort_description: 推論の深さを表示または設定
+commands.model_switched: "モデルを %{model} に切り替えました"
+commands.model_not_found: "不明なモデル: %{model}"
+commands.model_unavailable: モデルを切り替える前に現在のターンを停止してください
+commands.effort_switched: "推論の深さを %{effort} に設定しました"
+commands.effort_current: "現在の推論の深さ: %{effort}（選択可能: %{options}）"
+commands.effort_unsupported: このモデルは推論の深さの変更に対応していません
+commands.effort_invalid: "無効な推論の深さ \"%{effort}\"（選択可能: %{options}）"

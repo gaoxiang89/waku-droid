@@ -96,6 +96,9 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
 ///   `skill list --json`, OpenCode's HTTP command catalogues, and Pi/Oh My
 ///   Pi's RPC registries report the commands their non-TUI transports can
 ///   actually invoke.
+/// - Antigravity reuses its cached ACP `available_commands_update` handshake
+///   (or runs a single bounded session-closed probe when cold), merged with
+///   zero-quota `/skills` discovery and locally bridged CLI commands.
 /// - Cursor, Fx, Grok, Kimi Code, and Harness expose commands only after a real
 ///   session exists, so their drivers merge the live registry instead of this
 ///   function creating disposable provider sessions.
@@ -449,6 +452,9 @@ pub fn merge_reported_commands(
             .iter_mut()
             .find(|command| command.name == report.name)
         {
+            if known.scope == CommandScope::Skill && known.template.is_none() {
+                known.scope = CommandScope::Builtin;
+            }
             if known.description.is_empty() {
                 known.description = report.description.clone();
             }
@@ -1586,6 +1592,80 @@ mod tests {
                 crate::i18n::translate("commands.resume_description")
             );
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn antigravity_agent_commands_deduplicate_with_live_reports_and_pass_through_verbatim() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-antigravity-commands-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let agent_commands = [
+            ("boost", Some("<prompt>")),
+            ("swarm", Some("<task>")),
+            ("plan", Some("<task>")),
+            ("goal", Some("<objective>")),
+            ("grill-me", None),
+            ("compact", Some("[instructions]")),
+            ("teamwork", Some("<task>")),
+            ("schedule", Some("<spec>")),
+            ("browser", Some("<task>")),
+            ("learn", None),
+            ("run-workflow", Some("<workflow>")),
+        ];
+        let cli_commands = agent_commands
+            .iter()
+            .map(|(name, hint)| SlashCommand {
+                name: (*name).to_owned(),
+                description: format!("Antigravity {name}"),
+                scope: CommandScope::Builtin,
+                argument_hint: hint.map(str::to_owned),
+                template: None,
+            })
+            .collect::<Vec<_>>();
+
+        let assembled = assemble_slash_commands(ProviderKind::Antigravity, &root, None, cli_commands);
+        let live_reported = agent_commands
+            .iter()
+            .map(|(name, hint)| ReportedCommand {
+                name: (*name).to_owned(),
+                description: format!("Live {name}"),
+                argument_hint: hint.map(str::to_owned),
+            })
+            .chain([ReportedCommand {
+                name: "extra-live".to_owned(),
+                description: "Live-only command".to_owned(),
+                argument_hint: None,
+            }])
+            .collect::<Vec<_>>();
+
+        let merged = merge_reported_commands(&assembled, &live_reported);
+        for (name, _) in agent_commands {
+            let matches = merged
+                .iter()
+                .filter(|command| command.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "Antigravity command /{name} must not duplicate after live merge"
+            );
+            assert!(
+                matches[0].template.is_none(),
+                "Antigravity agent command /{name} must not have a client template"
+            );
+            let invocation = format!("/{name} do the thing");
+            assert_eq!(
+                resolved_submission(ProviderKind::Antigravity, &invocation, &merged),
+                None,
+                "Antigravity agent command `{invocation}` must pass through verbatim"
+            );
+        }
+        assert!(merged.iter().any(|command| command.name == "extra-live"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

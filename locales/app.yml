@@ -2817,3 +2817,136 @@ terminal.restore_sessions:
   en: Restore workspace terminals
 terminal.reconnecting:
   en: Connection lost — reconnecting
+
+right_panel.swarm:
+  en: Swarm
+right_panel.swarm_description:
+  en: Monitor Antigravity swarm board and workers
+swarm.title_default:
+  en: Swarm Board
+swarm.tab_board:
+  en: Board
+swarm.tab_members:
+  en: Members
+swarm.tab_overview:
+  en: Overview
+swarm.follow:
+  en: Follow
+swarm.following:
+  en: Following
+swarm.refresh:
+  en: Refresh swarm
+swarm.retry:
+  en: Retry
+swarm.all_members:
+  en: All
+swarm.clear_filter:
+  en: Clear
+swarm.jump_latest:
+  en: Latest
+swarm.show_killed:
+  en: "Show killed (%{count})"
+swarm.hide_killed:
+  en: "Hide killed (%{count})"
+swarm.status_working:
+  en: Working
+swarm.status_waiting:
+  en: Waiting
+swarm.status_failed:
+  en: Failed
+swarm.status_killed:
+  en: Killed
+swarm.you:
+  en: you
+swarm.active_count:
+  en: "%{count} active"
+swarm.waiting_count:
+  en: "%{count} waiting"
+swarm.failed_count:
+  en: "%{count} failed"
+swarm.posts_count:
+  en: "%{count} posts"
+swarm.steps_count:
+  en: "%{count} steps"
+swarm.unread_count:
+  en: "%{count} unread"
+swarm.wake_mentions:
+  en: for @mentions
+swarm.wake_anything:
+  en: any post
+swarm.truncated_banner:
+  en: "Showing newest %{shown} of %{total} posts"
+swarm.empty_non_antigravity:
+  en: Swarm Board is for Antigravity
+swarm.empty_non_antigravity_description:
+  en: Switch to an Antigravity task to monitor its swarm board and workers.
+swarm.empty_title:
+  en: No swarm in this conversation
+swarm.empty_description:
+  en: Start a swarm with /swarm <task>. This panel updates automatically once members join.
+swarm.loading_title:
+  en: Loading Swarm Board
+swarm.loading_description:
+  en: Reading Antigravity swarm state from the host.
+swarm.error_title:
+  en: Could not read Swarm Board
+swarm.board_empty:
+  en: No messages match this filter
+swarm.board_no_posts:
+  en: No board posts yet
+swarm.members_empty:
+  en: No active members to show
+swarm.overview_empty_title:
+  en: No narrator overview yet
+swarm.overview_empty_description:
+  en: When a swarm includes a narrator publishing view.json, its summary, workstreams, and risks appear here.
+swarm.section_attention:
+  en: Attention
+swarm.section_workstreams:
+  en: Workstreams
+swarm.section_milestones:
+  en: Milestones
+swarm.section_risks:
+  en: Risks
+swarm.as_of_seq:
+  en: "As of #%{seq}"
+swarm.failure_quota:
+  en: Quota
+swarm.failure_error:
+  en: Error
+swarm.brief_badge:
+  en: brief
+usage.credits_remaining:
+  en: "%{count} credits"
+usage_error.start_antigravity_probe:
+  en: "Failed to start `agy` usage probe"
+usage_error.antigravity_usage_timeout:
+  en: Antigravity did not answer the usage request in time
+usage_error.antigravity_answered:
+  en: "Antigravity answered: %{error}"
+usage_error.antigravity_no_usage_data:
+  en: "Antigravity reported no usage limits; run `agy` to sign in"
+commands.usage_description:
+  en: Show plan usage and quota
+commands.quota_description:
+  en: Show plan usage and quota
+commands.credits_description:
+  en: Show remaining credits and usage
+commands.model_description:
+  en: Open the model picker or switch model
+commands.effort_description:
+  en: Show or set reasoning effort
+commands.model_switched:
+  en: "Switched model to %{model}"
+commands.model_not_found:
+  en: "Unknown model: %{model}"
+commands.model_unavailable:
+  en: Stop the current turn before switching models
+commands.effort_switched:
+  en: "Reasoning effort set to %{effort}"
+commands.effort_current:
+  en: "Reasoning effort: %{effort} (available: %{options})"
+commands.effort_unsupported:
+  en: This model does not support reasoning effort selection
+commands.effort_invalid:
+  en: "Unknown reasoning effort \"%{effort}\" (available: %{options})"

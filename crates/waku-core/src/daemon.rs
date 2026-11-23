@@ -443,6 +443,15 @@ impl Backend for WakuBackend {
                         let binary = probe.path.ok_or_else(|| anyhow!("grok is not installed"))?;
                         Some(crate::usage::fetch_grok_plan_usage(&binary)?)
                     }
+                    crate::model::ProviderKind::Antigravity => {
+                        ensure_shell_environment();
+                        let probe =
+                            crate::model::provider_probe(provider, binary_override.as_deref());
+                        let binary = probe
+                            .path
+                            .ok_or_else(|| anyhow!("antigravity is not installed"))?;
+                        Some(crate::usage::fetch_antigravity_plan_usage(&binary)?)
+                    }
                     _ => bail!("provider has no plan usage fetcher"),
                 };
                 Ok(ResponsePayload::PlanUsage { usage })
@@ -1911,9 +1920,9 @@ impl WakuBackend {
             .iter()
             .map(|session| session.project_id)
             .collect::<std::collections::HashSet<_>>();
-        state.projects.retain(|project| {
-            !project.is_projectless() || used_project_ids.contains(&project.id)
-        });
+        state
+            .projects
+            .retain(|project| !project.is_projectless() || used_project_ids.contains(&project.id));
         for session_id in &saved_ids {
             state.mark_session_dirty(*session_id);
         }
@@ -2050,6 +2059,9 @@ impl WakuBackend {
                         invocation.config_dir.as_deref(),
                     )?
                     .map(|validated| validated.raw);
+            }
+            WorkspaceOperation::ReadAntigravitySwarm { session_id } => {
+                crate::antigravity_swarm::validate_session_id(session_id)?;
             }
             _ => {}
         }
@@ -2886,7 +2898,10 @@ mod tests {
         // Hydrate from SQLite and verify every detail and message survived.
         {
             let mut task_state = backend.task_state.lock();
-            backend.task_store.hydrate(&mut task_state.sessions[0]).unwrap();
+            backend
+                .task_store
+                .hydrate(&mut task_state.sessions[0])
+                .unwrap();
             let hydrated = &task_state.sessions[0];
             assert!(hydrated.detail_loaded);
             assert_eq!(hydrated.title, "Renamed via skeleton");
@@ -2935,7 +2950,10 @@ mod tests {
         let fresh_store = StateStore::daemon(db_path);
         let mut fresh_state = fresh_store.load().unwrap();
         assert_eq!(fresh_state.sessions.len(), 1);
-        assert_eq!(fresh_state.sessions[0].title, "Renamed while daemon hydrated");
+        assert_eq!(
+            fresh_state.sessions[0].title,
+            "Renamed while daemon hydrated"
+        );
         assert!(!fresh_state.sessions[0].pinned);
         assert!(fresh_state.sessions[0].archived);
         fresh_store.hydrate(&mut fresh_state.sessions[0]).unwrap();
@@ -3114,6 +3132,23 @@ mod tests {
                 })
                 .is_ok()
         );
+        assert!(
+            backend
+                .validate_workspace_operation(WorkspaceOperation::ReadAntigravitySwarm {
+                    session_id: "b0f6aa6a-fe94-4446-91d5-814e6342a5de".into(),
+                })
+                .is_ok()
+        );
+        for invalid in ["", "../escape", "a/b", "a\\b", "has space"] {
+            assert!(
+                backend
+                    .validate_workspace_operation(WorkspaceOperation::ReadAntigravitySwarm {
+                        session_id: invalid.into(),
+                    })
+                    .is_err(),
+                "session_id {invalid:?} should be rejected"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3195,12 +3230,7 @@ mod tests {
         );
         assert!(
             backend
-                .rollback_response_with_driver(
-                    &other_account,
-                    &dir,
-                    &dir.join("missing-codex"),
-                    1
-                )
+                .rollback_response_with_driver(&other_account, &dir, &dir.join("missing-codex"), 1)
                 .is_err()
         );
         assert_eq!(fork_calls.load(Ordering::Acquire), 1);
@@ -3218,12 +3248,7 @@ mod tests {
         );
         assert!(
             backend
-                .rollback_response_with_driver(
-                    &other_provider,
-                    &dir,
-                    &dir.join("missing-dsh"),
-                    1
-                )
+                .rollback_response_with_driver(&other_provider, &dir, &dir.join("missing-dsh"), 1)
                 .is_err()
         );
         assert_eq!(fork_calls.load(Ordering::Acquire), 1);

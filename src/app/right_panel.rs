@@ -37,6 +37,7 @@ const UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// and give the delete and upload confirm dialogs their confirm/dismiss keys.
 pub fn init(cx: &mut App) {
     super::git_graph::init(cx);
+    super::swarm_panel::init(cx);
     cx.bind_keys([
         KeyBinding::new(
             "escape",
@@ -1517,6 +1518,7 @@ impl RightPanelSurface {
             Self::Files => tr!("right_panel.files"),
             Self::Diff => tr!("right_panel.diff"),
             Self::GitGraph => tr!("right_panel.git_graph"),
+            Self::Swarm => tr!("right_panel.swarm"),
             Self::File(path) => path
                 .rsplit(['/', '\\'])
                 .find(|segment| !segment.is_empty())
@@ -1525,7 +1527,7 @@ impl RightPanelSurface {
         }
     }
 
-    fn icon_path(&self) -> &'static str {
+    pub(super) fn icon_path(&self) -> &'static str {
         match self {
             Self::Browser(_) => "icons/globe.svg",
             Self::Terminal(_) => "icons/terminal.svg",
@@ -1533,6 +1535,7 @@ impl RightPanelSurface {
             Self::Files => "icons/folder.svg",
             Self::Diff => "icons/file-diff.svg",
             Self::GitGraph => "icons/git-commit-horizontal.svg",
+            Self::Swarm => "icons/hexagon.svg",
             Self::File(path) => file_icon_for_path(path),
         }
     }
@@ -1610,7 +1613,8 @@ fn reusable_surface_index(
         RightPanelSurface::Files
         | RightPanelSurface::Diff
         | RightPanelSurface::File(_)
-        | RightPanelSurface::GitGraph => {
+        | RightPanelSurface::GitGraph
+        | RightPanelSurface::Swarm => {
             surfaces.iter().position(|surface| surface == requested)
         }
     }
@@ -2064,8 +2068,9 @@ fn upload_file_chunk(
     if want > 0 {
         use std::io::{Read as _, Seek as _, SeekFrom};
         file.seek(SeekFrom::Start(file_offset))?;
-        file.read_exact(&mut buffer)
-            .with_context(|| format!("the file {} changed while uploading", local_path.display()))?;
+        file.read_exact(&mut buffer).with_context(|| {
+            format!("the file {} changed while uploading", local_path.display())
+        })?;
     }
     let bytes = base64::engine::general_purpose::STANDARD.encode(&buffer);
     match workspace.request(waku_client::WorkspaceOperation::WriteFileChunk {
@@ -2895,6 +2900,7 @@ mod tests {
             RightPanelSurface::Files,
             RightPanelSurface::Diff,
             RightPanelSurface::GitGraph,
+            RightPanelSurface::Swarm,
         ];
 
         assert_eq!(
@@ -2926,6 +2932,10 @@ mod tests {
         assert_eq!(
             reusable_surface_index(&surfaces, &RightPanelSurface::GitGraph),
             Some(5)
+        );
+        assert_eq!(
+            reusable_surface_index(&surfaces, &RightPanelSurface::Swarm),
+            Some(6)
         );
     }
 
@@ -3192,34 +3202,25 @@ mod tests {
         let symlink_created = std::os::windows::fs::symlink_dir(&outside, &symlink_path).is_ok();
 
         // Identical source == target is skipped as a no-op.
-        let self_copy = prepare_upload_candidates(
-            &[workspace.join("existing.txt")],
-            &workspace,
-            "",
-            true,
-        )
-        .unwrap();
+        let self_copy =
+            prepare_upload_candidates(&[workspace.join("existing.txt")], &workspace, "", true)
+                .unwrap();
         assert!(self_copy.is_empty());
 
         // Copying a directory into its own subdirectory fails with the localized error.
-        let err = prepare_upload_candidates(
-            &[workspace.join("dir_a")],
-            &workspace,
-            "dir_a/sub",
-            true,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains(&*tr!("files.upload_into_self_failed")));
+        let err =
+            prepare_upload_candidates(&[workspace.join("dir_a")], &workspace, "dir_a/sub", true)
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&*tr!("files.upload_into_self_failed"))
+        );
 
         // Nested files and empty directories are collected with accurate byte total,
         // and any symlinked subdirectory inside the folder is skipped.
-        let candidates = prepare_upload_candidates(
-            &[external.join("bundle")],
-            &workspace,
-            "dir_a",
-            true,
-        )
-        .unwrap();
+        let candidates =
+            prepare_upload_candidates(&[external.join("bundle")], &workspace, "dir_a", true)
+                .unwrap();
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].is_dir);
 
@@ -3235,7 +3236,8 @@ mod tests {
             })
         );
 
-        let expected_rel = |sub: &str| PathBuf::from(join_workspace_relative_path("dir_a", sub, sep));
+        let expected_rel =
+            |sub: &str| PathBuf::from(join_workspace_relative_path("dir_a", sub, sep));
         assert!(plan.ops.contains(&PlannedUploadOp::EnsureDir {
             rpc_rel: expected_rel("bundle"),
             overwrite: false,
@@ -3713,6 +3715,7 @@ impl Waku {
                 self.git_graph_snapshots.invalidate(&scope);
             }
         }
+        let opened_swarm = surface == RightPanelSurface::Swarm;
         if matches!(
             surface,
             RightPanelSurface::Files | RightPanelSurface::File(_)
@@ -3736,6 +3739,10 @@ impl Waku {
         self.request_active_terminal_focus();
         self.request_active_browser_focus();
         self.set_right_panel_visible(true, cx);
+        if opened_swarm {
+            self.refresh_selected_antigravity_swarm(cx);
+        }
+        self.sync_antigravity_swarm_polling(cx);
         cx.notify();
     }
 
@@ -3861,10 +3868,14 @@ impl Waku {
                 }
             }
         }
+        let closing_swarm = self.right_panel_surfaces[index] == RightPanelSurface::Swarm;
         if let Some(browser_id) = self.right_panel_surfaces[index].browser_id() {
             self.right_panel_browsers.remove(&browser_id);
         }
         self.right_panel_surfaces.remove(index);
+        if closing_swarm {
+            self.mark_antigravity_swarm_dismissed();
+        }
         self.right_panel_active_surface = if self.right_panel_surfaces.is_empty() {
             None
         } else {
@@ -3885,6 +3896,7 @@ impl Waku {
             self.right_panel_pending_browser_focus = None;
             self.set_right_panel_visible(false, cx);
         }
+        self.sync_antigravity_swarm_polling(cx);
         cx.notify();
     }
 
@@ -3925,6 +3937,9 @@ impl Waku {
             .flex()
             .items_center()
             .gap(px(2.0))
+            .when(self.should_show_swarm_header_button(), |buttons| {
+                buttons.child(self.render_header_swarm_button(cx))
+            })
             .child(self.render_header_right_terminal_button(cx))
             .child(self.render_header_surface_button(
                 "header-git-graph-button",
@@ -4236,6 +4251,7 @@ impl Waku {
                 .render_right_panel_diff(width, window, cx)
                 .into_any_element(),
             Some(RightPanelSurface::GitGraph) => self.render_git_graph(width, cx),
+            Some(RightPanelSurface::Swarm) => self.render_swarm_panel(width, cx),
             Some(RightPanelSurface::Terminal(terminal_id)) => {
                 let content_height = (f32::from(window.viewport_size().height)
                     - WINDOW_HEADER_HEIGHT
@@ -4746,6 +4762,11 @@ impl Waku {
                             this.right_panel_active_surface = Some(index);
                             this.reveal_right_panel_tab(index);
                             this.request_active_terminal_focus();
+                            if this.active_right_panel_surface() == Some(&RightPanelSurface::Swarm)
+                            {
+                                this.refresh_selected_antigravity_swarm(cx);
+                            }
+                            this.sync_antigravity_swarm_polling(cx);
                             cx.notify();
                         });
                     }),
@@ -4798,12 +4819,15 @@ impl Waku {
         if !self.right_panel_surfaces.is_empty() {
             let weak = cx.entity().downgrade();
             let existing_surfaces = self.right_panel_surfaces.clone();
-            let options = [
+            let mut options = vec![
                 RightPanelSurface::new_browser(),
                 RightPanelSurface::new_terminal(),
                 RightPanelSurface::Diff,
                 RightPanelSurface::GitGraph,
             ];
+            if self.should_show_swarm_header_button() {
+                options.push(RightPanelSurface::Swarm);
+            }
             let handle = self.menu_handle("add-right-panel-surface", cx);
             header = header.child(
                 div()
@@ -4997,7 +5021,15 @@ impl Waku {
                                 tr!("right_panel.git_graph_description"),
                                 cx,
                             ))
-                            .child(self.render_right_panel_card_placeholder()),
+                            .child(if self.should_show_swarm_header_button() {
+                                self.render_right_panel_card(
+                                    RightPanelSurface::Swarm,
+                                    tr!("right_panel.swarm_description"),
+                                    cx,
+                                )
+                            } else {
+                                self.render_right_panel_card_placeholder()
+                            }),
                     ),
             )
     }
@@ -5276,15 +5308,17 @@ impl Waku {
             .cloned();
 
         let mut list = div().flex().flex_col();
-        list = list.child(self.attach_files_drop_handlers(
-            div()
-                .id("right-panel-files-drop-top-spacer")
-                .w_full()
-                .h(px(6.0))
-                .flex_none(),
-            FilesDropTarget::Root,
-            cx,
-        ));
+        list = list.child(
+            self.attach_files_drop_handlers(
+                div()
+                    .id("right-panel-files-drop-top-spacer")
+                    .w_full()
+                    .h(px(6.0))
+                    .flex_none(),
+                FilesDropTarget::Root,
+                cx,
+            ),
+        );
         if let Some(RightPanelFileRename::Create {
             parent_relative_path,
             depth,
@@ -5293,9 +5327,10 @@ impl Waku {
             && parent_relative_path.is_empty()
         {
             list = list.child(
-                self.attach_files_drop_handlers(div().w_full(), FilesDropTarget::Root, cx).child(
-                    self.render_right_panel_file_create_row("", *depth, *is_dir, &theme, cx),
-                ),
+                self.attach_files_drop_handlers(div().w_full(), FilesDropTarget::Root, cx)
+                    .child(
+                        self.render_right_panel_file_create_row("", *depth, *is_dir, &theme, cx),
+                    ),
             );
         }
         for entry in entries {
@@ -5434,16 +5469,17 @@ impl Waku {
                                 && event.keystroke.modifiers.secondary()
                                 && !event.keystroke.modifiers.shift
                                 && !event.keystroke.modifiers.alt
-                                && let Some(paths) = cx.read_from_clipboard().and_then(|clipboard| {
-                                    clipboard.entries().iter().find_map(|entry| match entry {
-                                        ClipboardEntry::ExternalPaths(external)
-                                            if !external.paths().is_empty() =>
-                                        {
-                                            Some(external.paths().to_vec())
-                                        }
-                                        _ => None,
+                                && let Some(paths) =
+                                    cx.read_from_clipboard().and_then(|clipboard| {
+                                        clipboard.entries().iter().find_map(|entry| match entry {
+                                            ClipboardEntry::ExternalPaths(external)
+                                                if !external.paths().is_empty() =>
+                                            {
+                                                Some(external.paths().to_vec())
+                                            }
+                                            _ => None,
+                                        })
                                     })
-                                })
                             {
                                 this.drop_external_paths_to_right_panel(
                                     paths,
@@ -5720,15 +5756,17 @@ impl Waku {
                                 },
                             ))
                             .child(list)
-                            .child(self.attach_files_drop_handlers(
-                                div()
-                                    .id("right-panel-files-drop-filler")
-                                    .w_full()
-                                    .flex_1()
-                                    .min_h(px(16.0)),
-                                FilesDropTarget::Root,
-                                cx,
-                            )),
+                            .child(
+                                self.attach_files_drop_handlers(
+                                    div()
+                                        .id("right-panel-files-drop-filler")
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h(px(16.0)),
+                                    FilesDropTarget::Root,
+                                    cx,
+                                ),
+                            ),
                     )
                     .child(scrollbar::vertical(
                         &self.right_panel_files_scroll_handle,
@@ -7572,10 +7610,7 @@ impl Waku {
                         }
                     }
                     Err(error) => {
-                        waku.show_toast(tr!(
-                            "files.upload_failed",
-                            error = error.to_string()
-                        ));
+                        waku.show_toast(tr!("files.upload_failed", error = error.to_string()));
                         cx.notify();
                         None
                     }
@@ -7656,10 +7691,7 @@ impl Waku {
                     }
                     Ok(None) => cx.notify(),
                     Err(error) => {
-                        waku.show_toast(tr!(
-                            "files.upload_failed",
-                            error = error.to_string()
-                        ));
+                        waku.show_toast(tr!("files.upload_failed", error = error.to_string()));
                         cx.notify();
                     }
                 }
@@ -7754,10 +7786,7 @@ impl Waku {
                 Ok(plan) => plan,
                 Err(error) => {
                     let _ = waku.update(cx, |waku, cx| {
-                        waku.show_toast(tr!(
-                            "files.upload_failed",
-                            error = error.to_string()
-                        ));
+                        waku.show_toast(tr!("files.upload_failed", error = error.to_string()));
                         cx.notify();
                     });
                     return;
@@ -7869,7 +7898,8 @@ impl Waku {
                                         })
                                         .is_err()
                                     {
-                                        if !existed_before && file_offset > 0 && file_offset < size {
+                                        if !existed_before && file_offset > 0 && file_offset < size
+                                        {
                                             partial_to_delete = Some(rpc_rel.clone());
                                         }
                                         outcome = Outcome::Canceled;
@@ -7898,12 +7928,11 @@ impl Waku {
                         let workspace = workspace.clone();
                         let project_path = project_path.clone();
                         async move {
-                            let _ = workspace.request(
-                                waku_client::WorkspaceOperation::DeletePath {
+                            let _ =
+                                workspace.request(waku_client::WorkspaceOperation::DeletePath {
                                     root: project_path,
                                     relative_path: partial_rel,
-                                },
-                            );
+                                });
                         }
                     })
                     .await;
@@ -7954,10 +7983,7 @@ impl Waku {
                         waku.show_toast(tr!("files.upload_canceled", name = plan.display_name));
                     }
                     Outcome::Failed(error) => {
-                        waku.show_toast(tr!(
-                            "files.upload_failed",
-                            error = error.to_string()
-                        ));
+                        waku.show_toast(tr!("files.upload_failed", error = error.to_string()));
                     }
                 }
                 cx.notify();
@@ -9072,6 +9098,9 @@ impl Waku {
                     self.git_graph_snapshots.invalidate(&scope);
                 }
                 cx.notify();
+            }
+            Some(RightPanelSurface::Swarm) => {
+                self.refresh_selected_antigravity_swarm(cx);
             }
             Some(RightPanelSurface::Files | RightPanelSurface::File(_))
                 if !self.files_panel_visible =>

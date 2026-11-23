@@ -202,6 +202,7 @@ impl Waku {
                             this.remove_right_panel_session_state(id);
                             this.remove_bottom_panel_session_state(id, false);
                             this.background_work.remove(&id);
+                            this.swarm_panel.remove_session(id);
                             this.composer_drafts
                                 .remove(crate::persistence::ComposerDraftKey::Session(id));
                             this.state.sessions.retain(|session| session.id != id);
@@ -465,6 +466,9 @@ impl Waku {
             // finished while another session was selected could otherwise
             // retain the clean snapshot captured before its agent made edits.
             self.refresh_selected_branch_snapshot(cx);
+            self.on_session_activated_for_swarm(session_id, cx);
+        } else {
+            self.sync_antigravity_swarm_polling(cx);
         }
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
@@ -495,6 +499,7 @@ impl Waku {
             .set(self.sidebar_branch_scan_generation.get().wrapping_add(1));
         self.refresh_workspace_surfaces(cx);
         self.invalidate_composer_sources(cx);
+        self.refresh_selected_antigravity_swarm_if_relevant(cx);
     }
 
     pub(super) fn create_session_for(
@@ -593,6 +598,7 @@ impl Waku {
         self.remove_right_panel_session_state(session_id);
         self.remove_bottom_panel_session_state(session_id, false);
         self.background_work.remove(&session_id);
+        self.swarm_panel.remove_session(session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
         if let Err(error) = self
@@ -826,6 +832,10 @@ impl Waku {
                 .track(crate::analytics::Event::RightPanelOpened);
         }
         self.persist_panel_layout();
+        self.sync_antigravity_swarm_polling(cx);
+        if visible && self.active_right_panel_surface() == Some(&RightPanelSurface::Swarm) {
+            self.refresh_selected_antigravity_swarm(cx);
+        }
         cx.notify();
     }
 
@@ -2094,10 +2104,8 @@ pub(super) fn normalize_project_path(path: PathBuf) -> PathBuf {
     };
     let normalized = parsed.normalized();
     let mut rendered = normalized.to_path_string();
-    if matches!(
-        normalized.root,
-        waku_protocol::lexical_path::Root::Drive(_)
-    ) && !rendered.is_empty()
+    if matches!(normalized.root, waku_protocol::lexical_path::Root::Drive(_))
+        && !rendered.is_empty()
     {
         // `Root::Drive` guarantees an ASCII alphabetic first byte.
         rendered[..1].make_ascii_uppercase();
@@ -2142,7 +2150,6 @@ pub(super) fn find_existing_project_on_host(
 }
 
 impl Waku {
-
     pub(super) fn create_projectless_session(&mut self, cx: &mut Context<Self>) {
         self.create_projectless_session_on_host(self.selected_host_key(), cx);
     }

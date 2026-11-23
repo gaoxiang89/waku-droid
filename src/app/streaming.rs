@@ -298,6 +298,10 @@ impl Waku {
                 runtime.last_driver_error = None;
                 runtime.last_background_refresh_at = Instant::now();
                 runtime.driver.refresh_background_work();
+                let is_antigravity_cursor = matches!(
+                    provider_cursor,
+                    Some(ProviderResumeCursor::Antigravity { .. })
+                );
                 if let Some(session) = self.state.session_mut(session_id) {
                     if let Some(ProviderResumeCursor::Claude {
                         resume_at: Some(message_id),
@@ -313,6 +317,9 @@ impl Waku {
                     if session.status == SessionStatus::Connecting {
                         session.status = SessionStatus::Working;
                     }
+                }
+                if is_antigravity_cursor {
+                    self.on_antigravity_session_connected(session_id, cx);
                 }
             }
             DriverEvent::AgentPresetSelected(agent_preset) => {
@@ -369,15 +376,20 @@ impl Waku {
                         session.status = SessionStatus::Working;
                     } else if matches!(
                         session.provider,
-                        ProviderKind::Codex | ProviderKind::Claude | ProviderKind::OpenCode
+                        ProviderKind::Codex
+                            | ProviderKind::Claude
+                            | ProviderKind::OpenCode
+                            | ProviderKind::Antigravity
                     ) {
                         // Some providers start turns on their own: Codex goal
                         // continuation pursues an active goal whenever the
                         // thread is idle, Claude Code re-enters the model
                         // once a backgrounded command, subagent or monitor
-                        // settles, and OpenCode's shared service resumes a
+                        // settles, OpenCode's shared service resumes a
                         // session after a restart or runs one the user's own
-                        // client prompted. Give the turn a transcript home —
+                        // client prompted, and Antigravity wakes the session
+                        // reactively for `/swarm` board posts, subagents, or
+                        // `/schedule` timers. Give the turn a transcript home —
                         // there is no user message for it — so its work
                         // streams in instead of being dropped.
                         session.begin_provider_turn();
@@ -436,6 +448,9 @@ impl Waku {
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
                 }
+                if self.session_is_antigravity(session_id) {
+                    self.on_antigravity_swarm_turn_settled(session_id, cx);
+                }
                 if let Some(title) = park_text {
                     if session_away {
                         self.push_app_notification(
@@ -479,10 +494,15 @@ impl Waku {
                     let refresh_branch = should_refresh_branch_after_activity(kind, complete)
                         && self.state.selected_session == Some(session_id);
                     let item = ActivityItem::new(id, kind, title, detail, complete);
+                    let swarm_activity = self.session_is_antigravity(session_id)
+                        && is_antigravity_swarm_activity(&item);
                     self.observe_foreground_command_activity(session_id, &item);
                     self.update_activity(session_id, runtime, item);
                     if refresh_branch {
                         self.refresh_selected_branch_snapshot(cx);
+                    }
+                    if swarm_activity {
+                        self.on_antigravity_swarm_activity(session_id, cx);
                     }
                 }
             }
@@ -491,10 +511,15 @@ impl Waku {
                     let refresh_branch =
                         should_refresh_branch_after_activity(item.kind, item.complete)
                             && self.state.selected_session == Some(session_id);
+                    let swarm_activity = self.session_is_antigravity(session_id)
+                        && is_antigravity_swarm_activity(&item);
                     self.observe_foreground_command_activity(session_id, &item);
                     self.update_activity(session_id, runtime, item);
                     if refresh_branch {
                         self.refresh_selected_branch_snapshot(cx);
+                    }
+                    if swarm_activity {
+                        self.on_antigravity_swarm_activity(session_id, cx);
                     }
                 }
             }
@@ -835,6 +860,9 @@ impl Waku {
                 }
                 if let Some(previous_kinds) = previous_kinds.as_deref() {
                     self.splice_active_transcript_rows_after_visibility_change(previous_kinds);
+                }
+                if self.session_is_antigravity(session_id) {
+                    self.on_antigravity_swarm_turn_settled(session_id, cx);
                 }
                 if let Some((title, body)) = task_notification {
                     if session_away || system_announce {
@@ -1207,5 +1235,68 @@ pub(super) fn process_exited_fallback_message(provider: ProviderKind) -> String 
             provider.display_name(),
             tr!("session.stopped_before_response")
         )
+    }
+}
+
+/// Identifies Antigravity swarm-coordination tool events so Waku can mark the
+/// swarm snapshot stale and surface the Swarm Board tab without polling when
+/// no swarm is in use.
+pub(super) fn is_antigravity_swarm_activity(item: &ActivityItem) -> bool {
+    if let Some(tool_name) = item.tool_name.as_deref() {
+        let lower = tool_name.trim().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "swarm" | "post_message" | "read_board" | "swarm_wait" | "manage_swarm"
+        ) {
+            return true;
+        }
+    }
+    let title = item.title.trim().to_ascii_lowercase();
+    title == "swarm"
+        || title.starts_with("swarm:")
+        || title.starts_with("run swarm")
+        || title == "post_message"
+        || title.starts_with("run post_message")
+        || title == "read_board"
+        || title.starts_with("run read_board")
+        || title == "swarm_wait"
+        || title.starts_with("run swarm_wait")
+        || title.contains("swarm board")
+}
+
+#[cfg(test)]
+mod swarm_activity_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_antigravity_swarm_tool_activities() {
+        let mut by_tool_name =
+            ActivityItem::new(None, ActivityKind::Tool, "Swarm: add worker", None, true);
+        by_tool_name.tool_name = Some("swarm".to_owned());
+        assert!(is_antigravity_swarm_activity(&by_tool_name));
+
+        let mut post = ActivityItem::new(
+            None,
+            ActivityKind::Tool,
+            "Post to swarm board",
+            None,
+            true,
+        );
+        post.tool_name = Some("post_message".to_owned());
+        assert!(is_antigravity_swarm_activity(&post));
+
+        let fallback_title = ActivityItem::new(
+            None,
+            ActivityKind::Tool,
+            "Run swarm_wait",
+            None,
+            false,
+        );
+        assert!(is_antigravity_swarm_activity(&fallback_title));
+
+        let mut unrelated =
+            ActivityItem::new(None, ActivityKind::FileRead, "Read app.rs", None, true);
+        unrelated.tool_name = Some("read_file".to_owned());
+        assert!(!is_antigravity_swarm_activity(&unrelated));
     }
 }

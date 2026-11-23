@@ -63,6 +63,9 @@ pub fn merge_reported_commands(
             .iter_mut()
             .find(|command| command.name == report.name)
         {
+            if known.scope == CommandScope::Skill && known.template.is_none() {
+                known.scope = CommandScope::Builtin;
+            }
             if known.description.is_empty() {
                 known.description = report.description.clone();
             }
@@ -180,6 +183,92 @@ pub fn parse_goal_submission(
         "resume" => GoalCommand::Resume,
         "clear" => GoalCommand::Clear,
         objective => GoalCommand::Set(objective.to_owned()),
+    })
+}
+
+/// An Antigravity CLI-local slash command bridged directly by Waku without
+/// starting an ACP turn.
+///
+/// Agent-side Antigravity commands (`/boost`, `/swarm <task>`, `/teamwork`,
+/// `/goal`, `/grill-me`, `/compact`, `/schedule`, `/browser`, `/learn`,
+/// `/run-workflow`, `/plan <task>`, etc.) intentionally return `None` and pass
+/// straight through to `agy acp`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AntigravityLocalCommand {
+    /// `/usage`, `/quota`, or `/credits` — open Usage and refresh plan quota.
+    Usage,
+    /// Bare `/model` — open the model picker.
+    ModelPicker,
+    /// `/model <id-or-name>` (single token) — switch the session's model.
+    SetModel(String),
+    /// Bare `/effort` — display the active reasoning effort and available levels.
+    EffortShow,
+    /// `/effort <level>` (single token) — switch the session's reasoning effort.
+    SetEffort(String),
+    /// Exact `/swarm board` — open the native Antigravity Swarm Board panel.
+    SwarmBoard,
+}
+
+impl AntigravityLocalCommand {
+    /// Whether confirming this command in the slash-command autocomplete popup
+    /// should execute immediately instead of inserting `/<name> ` for arguments.
+    pub fn executes_on_autocomplete_accept(&self) -> bool {
+        !matches!(self, Self::EffortShow)
+    }
+}
+
+/// Parse the submitted text as an Antigravity CLI-local command bridged by
+/// Waku. Returns `None` for other providers, agent-side commands, multi-word
+/// prompts, or when a project/user/skill/template command overrides the name.
+pub fn parse_antigravity_local_command(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<AntigravityLocalCommand> {
+    if provider != ProviderKind::Antigravity {
+        return None;
+    }
+    let invocation = prompt.trim().strip_prefix('/')?;
+    let (name, arguments) = invocation
+        .split_once(char::is_whitespace)
+        .map_or((invocation, ""), |(name, arguments)| {
+            (name, arguments.trim())
+        });
+    if command_is_overridden(name, arguments, commands) {
+        return None;
+    }
+    match name {
+        "usage" | "quota" | "credits" if arguments.is_empty() => {
+            Some(AntigravityLocalCommand::Usage)
+        }
+        "model" if arguments.is_empty() => Some(AntigravityLocalCommand::ModelPicker),
+        "model" if !arguments.chars().any(char::is_whitespace) => {
+            Some(AntigravityLocalCommand::SetModel(arguments.to_owned()))
+        }
+        "effort" if arguments.is_empty() => Some(AntigravityLocalCommand::EffortShow),
+        "effort" if !arguments.chars().any(char::is_whitespace) => {
+            Some(AntigravityLocalCommand::SetEffort(arguments.to_owned()))
+        }
+        "swarm" if arguments == "board" => Some(AntigravityLocalCommand::SwarmBoard),
+        _ => None,
+    }
+}
+
+fn command_is_overridden(name: &str, arguments: &str, commands: &[SlashCommand]) -> bool {
+    commands.iter().any(|command| {
+        if command.name != name {
+            return false;
+        }
+        if command.template.is_some() {
+            return true;
+        }
+        // When cold-start `/skills` populates `swarm` before ACP reports it as
+        // a built-in, `/swarm board` should still open Waku's Swarm Board
+        // unless a project/user command explicitly overrides `swarm`.
+        if name == "swarm" && arguments == "board" && command.scope == CommandScope::Skill {
+            return false;
+        }
+        command.scope != CommandScope::Builtin
     })
 }
 
@@ -567,5 +656,187 @@ mod tests {
             parse_goal_submission(ProviderKind::Codex, "/goal", std::slice::from_ref(&project)),
             None
         );
+    }
+
+    #[test]
+    fn antigravity_local_commands_parse_cleanly() {
+        let builtins = [
+            command("usage", CommandScope::Builtin),
+            command("quota", CommandScope::Builtin),
+            command("credits", CommandScope::Builtin),
+            command("model", CommandScope::Builtin),
+            command("effort", CommandScope::Builtin),
+            command("swarm", CommandScope::Builtin),
+        ];
+        let parse =
+            |prompt: &str| parse_antigravity_local_command(ProviderKind::Antigravity, prompt, &builtins);
+
+        assert_eq!(parse("/usage"), Some(AntigravityLocalCommand::Usage));
+        assert_eq!(parse("  /usage  "), Some(AntigravityLocalCommand::Usage));
+        assert_eq!(parse("/quota"), Some(AntigravityLocalCommand::Usage));
+        assert_eq!(parse("/credits"), Some(AntigravityLocalCommand::Usage));
+        assert_eq!(parse("/usage extra"), None);
+
+        assert_eq!(parse("/model"), Some(AntigravityLocalCommand::ModelPicker));
+        assert_eq!(
+            parse("/model gemini-3.1-pro"),
+            Some(AntigravityLocalCommand::SetModel("gemini-3.1-pro".into()))
+        );
+        assert_eq!(parse("/model switch to fast please"), None);
+
+        assert_eq!(parse("/effort"), Some(AntigravityLocalCommand::EffortShow));
+        assert_eq!(
+            parse("/effort high"),
+            Some(AntigravityLocalCommand::SetEffort("high".into()))
+        );
+        assert_eq!(
+            parse("/effort xhigh"),
+            Some(AntigravityLocalCommand::SetEffort("xhigh".into()))
+        );
+        assert_eq!(parse("/effort very high"), None);
+
+        assert_eq!(
+            parse("/swarm board"),
+            Some(AntigravityLocalCommand::SwarmBoard)
+        );
+        assert_eq!(
+            parse("  /swarm   board  "),
+            Some(AntigravityLocalCommand::SwarmBoard)
+        );
+        // Works even before slash-command discovery has populated the index.
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Antigravity, "/usage", &[]),
+            Some(AntigravityLocalCommand::Usage)
+        );
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Antigravity, "/swarm board", &[]),
+            Some(AntigravityLocalCommand::SwarmBoard)
+        );
+    }
+
+    #[test]
+    fn antigravity_agent_commands_always_pass_through() {
+        let builtins = [
+            command("boost", CommandScope::Builtin),
+            command("swarm", CommandScope::Builtin),
+            command("teamwork", CommandScope::Builtin),
+            command("goal", CommandScope::Builtin),
+            command("grill-me", CommandScope::Builtin),
+            command("compact", CommandScope::Builtin),
+            command("schedule", CommandScope::Builtin),
+            command("browser", CommandScope::Builtin),
+            command("learn", CommandScope::Builtin),
+            command("run-workflow", CommandScope::Builtin),
+            command("plan", CommandScope::Builtin),
+        ];
+        for prompt in [
+            "/boost",
+            "/boost fix all failing tests",
+            "/swarm",
+            "/swarm audit the daemon RPC layer",
+            "/swarm board summarize what happened",
+            "/teamwork review this PR",
+            "/goal ship v2",
+            "/grill-me design the cache",
+            "/compact",
+            "/compact keep decisions",
+            "/schedule every 10m check CI",
+            "/browser open localhost:3000",
+            "/learn remember this preference",
+            "/run-workflow bench",
+            "/plan",
+            "/plan refactor the transport",
+            "check /usage in prose",
+        ] {
+            assert_eq!(
+                parse_antigravity_local_command(ProviderKind::Antigravity, prompt, &builtins),
+                None,
+                "agent command {prompt:?} must pass through untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_local_commands_are_provider_scoped_and_respect_overrides() {
+        let builtins = [command("usage", CommandScope::Builtin)];
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Claude, "/usage", &builtins),
+            None
+        );
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Codex, "/model", &[]),
+            None
+        );
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Codex, "/swarm board", &[]),
+            None
+        );
+
+        let mut project = command("usage", CommandScope::Project);
+        project.template = Some("custom usage template".into());
+        assert_eq!(
+            parse_antigravity_local_command(
+                ProviderKind::Antigravity,
+                "/usage",
+                std::slice::from_ref(&project),
+            ),
+            None
+        );
+
+        let user = command("model", CommandScope::User);
+        assert_eq!(
+            parse_antigravity_local_command(
+                ProviderKind::Antigravity,
+                "/model",
+                std::slice::from_ref(&user),
+            ),
+            None
+        );
+
+        let skill = command("effort", CommandScope::Skill);
+        assert_eq!(
+            parse_antigravity_local_command(
+                ProviderKind::Antigravity,
+                "/effort high",
+                std::slice::from_ref(&skill),
+            ),
+            None
+        );
+
+        let project_swarm = command("swarm", CommandScope::Project);
+        assert_eq!(
+            parse_antigravity_local_command(
+                ProviderKind::Antigravity,
+                "/swarm board",
+                std::slice::from_ref(&project_swarm),
+            ),
+            None
+        );
+
+        // Skill-scoped `swarm` from `/skills` cold fallback still lets `/swarm board` work.
+        let skill_swarm = command("swarm", CommandScope::Skill);
+        assert_eq!(
+            parse_antigravity_local_command(
+                ProviderKind::Antigravity,
+                "/swarm board",
+                std::slice::from_ref(&skill_swarm),
+            ),
+            Some(AntigravityLocalCommand::SwarmBoard)
+        );
+        // Live ACP report promotes Skill -> Builtin when template is absent.
+        let promoted = merge_reported_commands(
+            &[skill_swarm],
+            &[ReportedCommand {
+                name: "swarm".into(),
+                description: "Run a swarm".into(),
+                argument_hint: Some("<task>".into()),
+            }],
+        );
+        assert_eq!(promoted[0].scope, CommandScope::Builtin);
+
+        assert!(!AntigravityLocalCommand::EffortShow.executes_on_autocomplete_accept());
+        assert!(AntigravityLocalCommand::Usage.executes_on_autocomplete_accept());
+        assert!(AntigravityLocalCommand::ModelPicker.executes_on_autocomplete_accept());
+        assert!(AntigravityLocalCommand::SwarmBoard.executes_on_autocomplete_accept());
     }
 }
