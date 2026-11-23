@@ -134,6 +134,84 @@ pub fn ensure_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<Pa
     Ok(bin_dir)
 }
 
+/// Prepare the CLI shim and, for release builds on Unix, expose it to shells
+/// outside Waku's own terminal.
+fn prepare_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<PathBuf> {
+    let bin_dir = ensure_cli_shim(state_dir, executable)?;
+    #[cfg(unix)]
+    link_cli_onto_path(&bin_dir.join("waku"));
+    Ok(bin_dir)
+}
+
+/// Link the release CLI into `~/.local/bin` so external SSH and WSL shells
+/// find `waku` after the desktop connects once. Development shims are skipped:
+/// linking one would shadow the released CLI and route to a daemon that exits
+/// with the dev watcher.
+#[cfg(unix)]
+fn link_cli_onto_path(shim: &Path) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let shim = std::path::absolute(shim).unwrap_or_else(|_| shim.to_path_buf());
+    if let Err(error) = link_into_dir(&shim, &PathBuf::from(home).join(".local/bin")) {
+        eprintln!("waku-daemon bridge: could not link the CLI onto PATH: {error:#}");
+    }
+}
+
+/// Install `shim` as `<dir>/<name>`, replacing only a symlink this project
+/// staged under a Waku cache directory. Returns whether the link changed.
+#[cfg(unix)]
+fn link_into_dir(shim: &Path, dir: &Path) -> anyhow::Result<bool> {
+    let name = shim
+        .file_name()
+        .ok_or_else(|| anyhow!("CLI shim has no file name"))?;
+    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let link_path = dir.join(name);
+    match fs::symlink_metadata(&link_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {
+            let existing = fs::read_link(&link_path)
+                .with_context(|| format!("could not read {}", link_path.display()))?;
+            if existing == shim {
+                return Ok(false);
+            }
+            if !is_waku_cache_shim(&existing) {
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not inspect {}", link_path.display()));
+        }
+    }
+    let tmp = link_path.with_file_name(format!(
+        ".{}.tmp.{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(shim, &tmp)
+        .with_context(|| format!("could not create symlink {}", tmp.display()))?;
+    if let Err(error) = fs::rename(&tmp, &link_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("could not install {}", link_path.display()));
+    }
+    Ok(true)
+}
+
+/// A symlink target this project staged, so replacing it cannot destroy a
+/// user's own `waku`.
+#[cfg(unix)]
+fn is_waku_cache_shim(target: &Path) -> bool {
+    target
+        .to_string_lossy()
+        .contains("/.cache/waku/server/bin/")
+}
+
 #[cfg(windows)]
 fn write_shim_if_changed(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     if fs::read(path).ok().as_deref() == Some(contents) {
@@ -181,7 +259,7 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     };
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("could not create {}", state_dir.display()))?;
-    if let Err(error) = ensure_cli_shim(&state_dir, &executable) {
+    if let Err(error) = prepare_cli_shim(&state_dir, &executable) {
         eprintln!("waku-daemon bridge: could not prepare CLI shim: {error:#}");
     }
     let fingerprint = file_fingerprint(&executable)
@@ -420,11 +498,14 @@ fn start_daemon(
     let mut diagnostic_log = log.try_clone().ok();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let idle_secs = IDLE_EXIT_SECONDS.to_string();
-    let cli_bin_dir = match ensure_cli_shim(state_dir, executable) {
+    let cli_bin_dir = match prepare_cli_shim(state_dir, executable) {
         Ok(dir) => Some(dir),
         Err(error) => {
             if let Some(ref mut log) = diagnostic_log {
-                let _ = writeln!(log, "waku-daemon bridge: could not prepare CLI shim: {error:#}");
+                let _ = writeln!(
+                    log,
+                    "waku-daemon bridge: could not prepare CLI shim: {error:#}"
+                );
             }
             None
         }
@@ -893,6 +974,45 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_link_lands_on_path_without_shadowing_foreign_entries() {
+        let root =
+            std::env::temp_dir().join(format!("waku-cli-link-test-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let exe = state.join("waku-daemon");
+        fs::write(&exe, b"stub").unwrap();
+        let shim = ensure_cli_shim(&state, &exe).unwrap().join("waku");
+        let bin = root.join("home/.local/bin");
+
+        assert!(link_into_dir(&shim, &bin).unwrap());
+        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), shim);
+        assert!(!link_into_dir(&shim, &bin).unwrap());
+
+        // A user's own binary is never replaced.
+        fs::remove_file(bin.join("waku")).unwrap();
+        fs::write(bin.join("waku"), b"#!/bin/sh\n").unwrap();
+        assert!(!link_into_dir(&shim, &bin).unwrap());
+        assert_eq!(fs::read_to_string(bin.join("waku")).unwrap(), "#!/bin/sh\n");
+
+        // Nor is a symlink this project did not stage.
+        fs::remove_file(bin.join("waku")).unwrap();
+        let foreign = root.join("other/waku");
+        std::os::unix::fs::symlink(&foreign, bin.join("waku")).unwrap();
+        assert!(!link_into_dir(&shim, &bin).unwrap());
+        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), foreign);
+
+        // A stale link into the Waku cache is refreshed.
+        fs::remove_file(bin.join("waku")).unwrap();
+        std::os::unix::fs::symlink(root.join(".cache/waku/server/bin/waku"), bin.join("waku"))
+            .unwrap();
+        assert!(link_into_dir(&shim, &bin).unwrap());
+        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), shim);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -1368,13 +1488,7 @@ mod platform {
             let mut exit = FILETIME::default();
             let mut kernel = FILETIME::default();
             let mut user = FILETIME::default();
-            let ok = GetProcessTimes(
-                handle,
-                &mut creation,
-                &mut exit,
-                &mut kernel,
-                &mut user,
-            );
+            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
             CloseHandle(handle);
             (ok != 0).then_some(
                 ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64),

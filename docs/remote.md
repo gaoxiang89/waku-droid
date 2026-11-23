@@ -187,21 +187,24 @@ the host, and opens the workspace once its snapshot loads.
 - **Waku's built-in remote terminal** injects the remote CLI directory onto
   `PATH` automatically, so `waku .` and `waku /path/to/project` work out of the
   box.
-- **External SSH or WSL terminals** can use the CLI shim staged by
-  `waku-daemon bridge` at `~/.cache/waku/server/bin/waku` (Unix) or
+- **External SSH or WSL terminals** find `waku` in `~/.local/bin` after the
+  desktop connects to that host once. `waku-daemon bridge` stages the CLI shim
+  at `~/.cache/waku/server/bin/waku` (Unix) or
   `%USERPROFILE%\.cache\waku\server\bin\waku.cmd` alongside a POSIX `waku`
-  script for Git Bash (Windows SSH hosts). Development builds use `waku-dev`
-  instead of `waku`. On Linux, macOS, or WSL hosts, symlink it onto your `PATH`
-  to make `waku` available outside Waku's terminal:
+  script for Git Bash (Windows SSH hosts), and a release bridge links the Unix
+  shim into `~/.local/bin/waku` without replacing any other `waku` already
+  there. Development builds stage under `~/.cache/waku-dev/server` and do not
+  touch `~/.local/bin`, so a dev daemon never shadows the released CLI. If
+  `~/.local/bin` is not on your `PATH`, add it, or link the shim somewhere that
+  is:
 
   ```sh
   mkdir -p ~/.local/bin
   ln -sf ~/.cache/waku/server/bin/waku ~/.local/bin/waku
   ```
 
-  Make sure `~/.local/bin` is on your `PATH` (or add `~/.cache/waku/server/bin`
-  to `PATH` directly). On Windows WSL, using the Linux shim avoids invoking the
-  Windows `waku.exe` over WSL interop.
+  On Windows WSL, the Linux shim avoids invoking the Windows `waku.exe` over
+  WSL interop.
 
 - **Desktop connection required:** running `waku` on a remote host talks to
   that host's daemon and forwards the open request to the connected desktop

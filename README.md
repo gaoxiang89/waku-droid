@@ -78,7 +78,8 @@ waku --host wsl:Ubuntu-24.04 ~/src/app  # open a folder in a WSL distribution
 - **macOS:** symlink the app binary onto your `PATH`:
   `ln -sf /Applications/Waku.app/Contents/MacOS/Waku /usr/local/bin/waku`.
 - **WSL & SSH hosts:** `waku .` works automatically inside Waku's built-in
-  remote terminal ([docs/remote.md](docs/remote.md#opening-workspaces-from-the-command-line)).
+  remote terminal, and a release bridge links `waku` into `~/.local/bin` for
+  other shells ([docs/remote.md](docs/remote.md#opening-workspaces-from-the-command-line)).
 
 ## Supported agents
 
