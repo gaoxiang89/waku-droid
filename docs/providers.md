@@ -803,6 +803,11 @@ updates (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`,
 (`available_commands_update`, `usage_update`, `session_info_update`) pass
 through.
 
+On Windows its `session/list` answers `cwd` as a URL path (`/c:/Users/me/git`,
+`/c%3A/Users/me/My%20Docs`), which Rust does not read as absolute; Waku restores
+the native path before listing, so the agent's own history stays in the Resume
+picker. Any other non-absolute `cwd` is dropped.
+
 Its `session/new` response carries the account's model catalog as
 a `model` select whose values are families (`gemini-4-neon`,
 `claude-opus-5-5`, `gpt-oss-120b-medium`), plus a `thought_level` select for the

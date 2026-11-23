@@ -6,7 +6,7 @@
 //! reasoning and provider-only tool records by construction.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,6 +91,59 @@ pub(crate) fn session_title(
         })
 }
 
+/// The native absolute path a session's `cwd` stands for, or `None` when the
+/// agent reported something Waku cannot treat as one.
+///
+/// `agy` on Windows answers `session/list` with a URL path: a leading slash
+/// before the drive and every special character percent-encoded
+/// (`/c%3A/Users/me/My%20Docs`). Rust reads none of that as absolute, so
+/// without this the agent's whole history drops out of the Resume picker.
+fn native_session_cwd(raw: &Path) -> Option<PathBuf> {
+    if raw.is_absolute() {
+        return Some(raw.to_path_buf());
+    }
+    let decoded = percent_decode(raw.to_string_lossy().strip_prefix('/')?);
+    let bytes = decoded.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'/' | b'\\')
+    {
+        return None;
+    }
+    let path = PathBuf::from(format!(
+        "{}:{MAIN_SEPARATOR}{}",
+        (bytes[0] as char).to_ascii_uppercase(),
+        decoded[3..].replace(['/', '\\'], MAIN_SEPARATOR_STR)
+    ));
+    path.is_absolute().then_some(path)
+}
+
+/// Decodes `%XX` bytes and leaves everything else, including a lone `%`, as is.
+fn percent_decode(text: &str) -> String {
+    let hex = |byte: u8| match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => byte - b'A' + 10,
+    };
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes.get(index..index + 3) {
+            Some([b'%', high, low]) if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() => {
+                decoded.push(hex(*high) << 4 | hex(*low));
+                index += 3;
+            }
+            _ => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Lists every session exposed by an ACP agent. An empty `cwd_filters` list
 /// requests the provider's global catalog; providers such as Kimi that require
 /// a cwd pass their native workspace index here instead.
@@ -159,10 +212,13 @@ where
                     let response = connection.send_request(request).block_task().await?;
                     for session in response.sessions {
                         let session_id = session.session_id.to_string();
-                        if session_id.trim().is_empty()
-                            || !session.cwd.is_absolute()
-                            || !seen.insert(session_id.clone())
-                        {
+                        if session_id.trim().is_empty() {
+                            continue;
+                        }
+                        let Some(cwd) = native_session_cwd(&session.cwd) else {
+                            continue;
+                        };
+                        if !seen.insert(session_id.clone()) {
                             continue;
                         }
                         let updated_at = timestamp(session.updated_at.as_deref());
@@ -172,7 +228,7 @@ where
                                 session_id.clone(),
                             ),
                             title: session_title(provider, session.title.as_deref(), &session_id),
-                            cwd: session.cwd,
+                            cwd,
                             created_at: updated_at,
                             updated_at,
                         });
@@ -751,6 +807,75 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].cursor.native_id(), "newest-3");
         assert_eq!(sessions[1].cursor.native_id(), "mid-2");
+    }
+
+    #[test]
+    fn session_cwd_keeps_absolute_paths_and_drops_the_rest() {
+        let native = std::env::temp_dir();
+        assert_eq!(native_session_cwd(&native), Some(native));
+        assert_eq!(native_session_cwd(Path::new("relative/dir")), None);
+        // A drive without a separator is drive-relative, not absolute.
+        assert_eq!(native_session_cwd(Path::new("c:relative")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_cwd_restores_the_native_path_from_agy_url_forms() {
+        // The shapes `agy` 1.5.15 answers `session/list` with on Windows.
+        assert_eq!(
+            native_session_cwd(Path::new("/c:/Users/me/git/waku")),
+            Some(PathBuf::from(r"C:\Users\me\git\waku"))
+        );
+        assert_eq!(
+            native_session_cwd(Path::new("/C%3A/Users/me/My%20Docs/repo")),
+            Some(PathBuf::from(r"C:\Users\me\My Docs\repo"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lists_sessions_whose_cwd_is_a_url_path() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, ListSessionsResponse, SessionCapabilities,
+            SessionInfo, SessionListCapabilities,
+        };
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().list(SessionListCapabilities::new()),
+                    );
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ListSessionsRequest, responder, _cx| {
+                    responder.respond(ListSessionsResponse::new(vec![
+                        SessionInfo::new("native-1", r"C:\Users\me\git\waku"),
+                        SessionInfo::new("url-2", "/c:/Users/me/git/waku"),
+                        SessionInfo::new("url-3", "/c%3A/Users/me/git/waku"),
+                        SessionInfo::new("relative-4", "Users/me/git"),
+                    ]))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let sessions =
+            list_provider_sessions_with_agent(ProviderKind::Antigravity, mock_agent, &[], 10)
+                .unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.cursor.native_id())
+                .collect::<Vec<_>>(),
+            ["native-1", "url-2", "url-3"]
+        );
+        assert_eq!(sessions[2].cwd, PathBuf::from(r"C:\Users\me\git\waku"));
     }
 
     #[test]
