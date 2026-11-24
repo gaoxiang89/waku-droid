@@ -521,6 +521,7 @@ export function MobileComposer({
             <ComposerAccessMenu
               mode={session.runtime_mode}
               onApply={(mode) => applyOptions({ runtimeMode: mode })}
+              provider={session.provider}
             />
           </>
         )}

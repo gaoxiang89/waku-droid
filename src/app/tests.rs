@@ -2559,7 +2559,11 @@ fn remote_host_model_picker_does_not_report_no_providers_before_host_detection_s
 
     // Local still gates on local_checked_at.
     assert!(host_detection_settled(&HostKey::Local, local_checked, None));
-    assert!(!host_detection_settled(&HostKey::Local, None, Some(&catalog)));
+    assert!(!host_detection_settled(
+        &HostKey::Local,
+        None,
+        Some(&catalog)
+    ));
 }
 
 #[test]
@@ -2567,7 +2571,10 @@ fn provider_path_input_reloads_local_override_after_host_reset() {
     use super::hosts::provider_path_input_value_for_host;
 
     assert_eq!(
-        provider_path_input_value_for_host(Some(ProviderKind::Claude), Some("/usr/local/bin/claude")),
+        provider_path_input_value_for_host(
+            Some(ProviderKind::Claude),
+            Some("/usr/local/bin/claude")
+        ),
         "/usr/local/bin/claude"
     );
     assert_eq!(
@@ -2588,7 +2595,8 @@ fn live_plan_usage_update_clears_error_unconfigured_stale_and_updates_checked_at
 
     let key = (HostKey::Local, ProviderKind::Codex, Some("work".to_owned()));
     let mut plan_usage = HashMap::new();
-    let mut plan_usage_error = HashMap::from([(key.clone(), "rate limit probe timed out".to_owned())]);
+    let mut plan_usage_error =
+        HashMap::from([(key.clone(), "rate limit probe timed out".to_owned())]);
     let mut plan_usage_unconfigured = HashSet::from([key.clone()]);
     let mut plan_usage_stale = HashSet::from([key.clone()]);
     let mut plan_usage_checked_at = HashMap::new();
@@ -2924,4 +2932,269 @@ fn resolve_connection_spec_matches_saved_ssh_aliases_before_synthesizing() {
     assert!(crate::daemon::resolve_connection_spec("", &saved).is_none());
     assert!(crate::daemon::resolve_connection_spec("ssh:", &saved).is_none());
     assert!(crate::daemon::resolve_connection_spec("bogus", &saved).is_none());
+}
+
+#[test]
+fn live_activity_upsert_preserves_specific_kind_and_meaningful_title_against_generic_updates() {
+    use super::streaming::upsert_session_activity;
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Droid);
+    session.begin_turn("Run checks");
+
+    let initial = ActivityItem::new(
+        Some("call-1".into()),
+        ActivityKind::Command,
+        "Execute",
+        None,
+        false,
+    )
+    .with_arguments(Some(
+        serde_json::json!({"command": "cargo test"}).to_string(),
+    ));
+    assert_eq!(upsert_session_activity(&mut session, initial, false), None);
+
+    // A follow-up ACP tool_call_update that loses its kind/title metadata
+    // must not clobber the existing specific kind or meaningful title.
+    let mut generic_update = ActivityItem::new(
+        Some("call-1".into()),
+        ActivityKind::Tool,
+        "Tool",
+        None,
+        true,
+    )
+    .with_output(Some("exit status 1".into()));
+    generic_update.failed = true;
+    assert_eq!(
+        upsert_session_activity(&mut session, generic_update, true),
+        None
+    );
+
+    let activity = &session.transcript_blocks[0].activities[0];
+    assert_eq!(activity.kind, ActivityKind::Command);
+    assert_eq!(activity.title, "Execute");
+    assert!(activity.complete);
+    assert!(activity.failed);
+    assert_eq!(activity.output.as_deref(), Some("exit status 1"));
+
+    // Blank / whitespace-only titles must also never overwrite a meaningful title.
+    let empty_title_update = ActivityItem::new(
+        Some("call-1".into()),
+        ActivityKind::Tool,
+        "   ",
+        None,
+        true,
+    );
+    assert_eq!(
+        upsert_session_activity(&mut session, empty_title_update, true),
+        None
+    );
+    let activity = &session.transcript_blocks[0].activities[0];
+    assert_eq!(activity.kind, ActivityKind::Command);
+    assert_eq!(activity.title, "Execute");
+}
+
+#[test]
+fn live_activity_upsert_upgrades_generic_tool_placeholder_when_specific_update_arrives() {
+    use super::streaming::upsert_session_activity;
+
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Droid);
+    session.begin_turn("Edit file");
+
+    let initial = ActivityItem::new(
+        Some("call-2".into()),
+        ActivityKind::Tool,
+        "Tool",
+        None,
+        false,
+    );
+    assert_eq!(upsert_session_activity(&mut session, initial, false), None);
+
+    let specific = ActivityItem::new(
+        Some("call-2".into()),
+        ActivityKind::FileChange,
+        "Edit src/main.rs",
+        None,
+        true,
+    )
+    .with_arguments(Some(
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-a\n+b\n*** End Patch"
+        })
+        .to_string(),
+    ));
+    let expected_id = session.transcript_blocks[0].activities[0].id;
+    assert_eq!(
+        upsert_session_activity(&mut session, specific, true),
+        Some(expected_id)
+    );
+
+    let activity = &session.transcript_blocks[0].activities[0];
+    assert_eq!(activity.kind, ActivityKind::FileChange);
+    assert_eq!(activity.title, "Edit src/main.rs");
+    assert!(activity.complete);
+}
+
+#[test]
+fn droid_model_effort_and_autonomy_resolution_helpers_work() {
+    use super::composer::{resolve_provider_effort, resolve_provider_model};
+    use crate::composer_complete::resolve_droid_autonomy_mode;
+    use crate::model::{ProviderModel, ProviderModelOption, RuntimeMode};
+
+    let models = vec![
+        ProviderModel::new("claude-opus-4-6", "Claude Opus 4.6"),
+        ProviderModel::new("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ProviderModel::new("gpt-5.4", "GPT-5.4"),
+    ];
+    assert_eq!(
+        resolve_provider_model(&models, "CLAUDE-OPUS-4-6"),
+        Some(("claude-opus-4-6".into(), "Claude Opus 4.6".into()))
+    );
+    assert_eq!(
+        resolve_provider_model(&models, "gpt-5.4"),
+        Some(("gpt-5.4".into(), "GPT-5.4".into()))
+    );
+    assert_eq!(
+        resolve_provider_model(&models, "opus"),
+        Some(("claude-opus-4-6".into(), "Claude Opus 4.6".into()))
+    );
+    assert_eq!(resolve_provider_model(&models, "claude"), None);
+    assert_eq!(resolve_provider_model(&models, "unknown-model"), None);
+
+    let efforts = vec![
+        ProviderModelOption::new("off", "Off"),
+        ProviderModelOption::new("low", "Low"),
+        ProviderModelOption::new("medium", "Medium"),
+        ProviderModelOption::new("high", "High"),
+        ProviderModelOption::new("xhigh", "Extra"),
+    ];
+    assert_eq!(
+        resolve_provider_effort(&efforts, "off"),
+        Some(("off".into(), "Off".into()))
+    );
+    assert_eq!(
+        resolve_provider_effort(&efforts, "Medium"),
+        Some(("medium".into(), "Medium".into()))
+    );
+    assert_eq!(
+        resolve_provider_effort(&efforts, "extra"),
+        Some(("xhigh".into(), "Extra".into()))
+    );
+    assert_eq!(resolve_provider_effort(&efforts, "max"), None);
+
+    for (query, expected_mode, expected_level) in [
+        ("normal", RuntimeMode::Ask, "normal"),
+        ("auto-low", RuntimeMode::AutoAcceptEdits, "auto-low"),
+        ("auto-medium", RuntimeMode::Auto, "auto-medium"),
+        ("auto-high", RuntimeMode::FullAccess, "auto-high"),
+    ] {
+        let resolved = resolve_droid_autonomy_mode(query);
+        assert_eq!(resolved, Some(expected_mode));
+        assert_eq!(expected_mode.droid_autonomy_level(), expected_level);
+    }
+    assert_eq!(resolve_droid_autonomy_mode("invalid-level"), None);
+}
+
+#[test]
+fn background_queued_command_resolution_uses_target_session_catalog() {
+    use super::runtime::session_slash_commands_from_cache;
+    use crate::composer_complete::{CommandScope, SlashCommand, resolved_submission};
+    use crate::model::ReportedCommand;
+    use crate::query::{Query, QueryCache};
+    use std::path::PathBuf;
+    use waku_client::hosts::HostKey;
+
+    let mut cache: QueryCache<super::SlashCommandCacheKey, Vec<SlashCommand>> = QueryCache::new(8);
+    let droid_project_key = (
+        HostKey::Local,
+        ProviderKind::Droid,
+        PathBuf::from("/repos/droid-project"),
+        None,
+        None,
+    );
+    let droid_worktree_key = (
+        HostKey::Local,
+        ProviderKind::Droid,
+        PathBuf::from("/repos/droid-project/.worktrees/wt-1"),
+        None,
+        None,
+    );
+    let claude_selected_key = (
+        HostKey::Local,
+        ProviderKind::Claude,
+        PathBuf::from("/repos/other-claude-project"),
+        None,
+        None,
+    );
+
+    let droid_review = SlashCommand {
+        name: "review".into(),
+        description: "Droid project review".into(),
+        scope: CommandScope::Project,
+        argument_hint: Some("<target>".into()),
+        template: Some("Review $ARGUMENTS using Droid checklist".into()),
+    };
+    let claude_review = SlashCommand {
+        name: "review".into(),
+        description: "Other tab review".into(),
+        scope: CommandScope::Project,
+        argument_hint: None,
+        template: Some("WRONG TAB TEMPLATE $ARGUMENTS".into()),
+    };
+
+    if let Query::Missing(token) = cache.read(&droid_project_key) {
+        assert!(cache.fulfill(token, vec![droid_review]));
+    }
+    if let Query::Missing(token) = cache.read(&claude_selected_key) {
+        assert!(cache.fulfill(token, vec![claude_review]));
+    }
+
+    // Draining a background Droid session resolves against Droid's catalog,
+    // never against the currently selected Claude tab's catalog.
+    let (commands, had_cache) =
+        session_slash_commands_from_cache(&mut cache, &droid_project_key, None, &[]);
+    assert!(had_cache);
+    assert_eq!(
+        resolved_submission(ProviderKind::Droid, "/review src/main.rs", &commands).as_deref(),
+        Some("Review src/main.rs using Droid checklist")
+    );
+
+    // A freshly materialized worktree whose own path is not cached yet falls
+    // back to its project root's cached catalog without stranding a Loading
+    // slot for the worktree key.
+    let (wt_commands, wt_hit) = session_slash_commands_from_cache(
+        &mut cache,
+        &droid_worktree_key,
+        Some(&droid_project_key),
+        &[],
+    );
+    assert!(wt_hit);
+    assert_eq!(
+        resolved_submission(ProviderKind::Droid, "/review diff", &wt_commands).as_deref(),
+        Some("Review diff using Droid checklist")
+    );
+    assert!(cache.peek(&droid_worktree_key).is_none());
+
+    // A cache miss merges only that session's reported commands and does not
+    // strand a Loading slot in the QueryCache.
+    let uncached_key = (
+        HostKey::Local,
+        ProviderKind::Droid,
+        PathBuf::from("/repos/uncached"),
+        None,
+        None,
+    );
+    let reported = vec![ReportedCommand {
+        name: "compact".into(),
+        description: "Compact session".into(),
+        argument_hint: None,
+    }];
+    let (missed_commands, missed_hit) =
+        session_slash_commands_from_cache(&mut cache, &uncached_key, None, &reported);
+    assert!(!missed_hit);
+    assert_eq!(missed_commands.len(), 1);
+    assert_eq!(missed_commands[0].name, "compact");
+    match cache.read(&uncached_key) {
+        Query::Missing(token) => cache.abandon(token),
+        other => panic!("expected uncached key to remain Missing, got {other:?}"),
+    }
 }

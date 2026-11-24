@@ -17,9 +17,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
 use waku_protocol::antigravity_swarm::{
@@ -42,6 +44,51 @@ const MAX_BOARD_MESSAGES: usize = 500;
 const MAX_VIEW_BYTES: u64 = 64 * 1024;
 const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const MAX_BRAIN_SCAN_DIRS: usize = 512;
+const MAX_WORKER_SWARM_CACHE: usize = 256;
+
+fn worker_swarm_cache() -> &'static Mutex<HashMap<String, (PathBuf, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (PathBuf, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn locate_cached_worker_swarm(roots: &[PathBuf], session_id: &str) -> Option<LocatedSwarm> {
+    let cached = worker_swarm_cache().lock().get(session_id).cloned()?;
+    let (cached_root, cached_swarm_id) = cached;
+    if !roots.contains(&cached_root) {
+        return None;
+    }
+    let members_path = swarm_dir(&cached_root, &cached_swarm_id).join("members.json");
+    if let Some((stamp, roster)) = read_roster(&members_path)
+        && let Some(member_name) = member_name_for_conversation(&roster, session_id)
+    {
+        return Some(LocatedSwarm {
+            app_data: cached_root,
+            swarm_id: cached_swarm_id,
+            roster,
+            members_stamp: stamp,
+            current_member: Some(member_name),
+        });
+    }
+    let mut cache = worker_swarm_cache().lock();
+    if cache
+        .get(session_id)
+        .is_some_and(|entry| entry.0 == cached_root && entry.1 == cached_swarm_id)
+    {
+        cache.remove(session_id);
+    }
+    None
+}
+
+fn record_worker_swarm_cache(session_id: &str, app_data: &Path, swarm_id: &str) {
+    let mut cache = worker_swarm_cache().lock();
+    if cache.len() >= MAX_WORKER_SWARM_CACHE && !cache.contains_key(session_id) {
+        cache.clear();
+    }
+    cache.insert(
+        session_id.to_owned(),
+        (app_data.to_path_buf(), swarm_id.to_owned()),
+    );
+}
 const MAX_OVERVIEW_ITEMS: usize = 64;
 const STEP_ERROR_SETTLE_MS: u64 = 60 * 1000;
 const STUCK_MS: u64 = 10 * 60 * 1000;
@@ -390,6 +437,14 @@ fn member_sort_rank(member: &AntigravitySwarmMember) -> (u8, u8) {
 }
 
 fn locate_swarm(roots: &[PathBuf], session_id: &str) -> Option<LocatedSwarm> {
+    locate_swarm_with_cap(roots, session_id, MAX_BRAIN_SCAN_DIRS)
+}
+
+fn locate_swarm_with_cap(
+    roots: &[PathBuf],
+    session_id: &str,
+    max_scan_dirs: usize,
+) -> Option<LocatedSwarm> {
     // Fast path: `session_id` directly owns a swarm dir (coordinator).
     for root in roots {
         let members_path = swarm_dir(root, session_id).join("members.json");
@@ -406,27 +461,46 @@ fn locate_swarm(roots: &[PathBuf], session_id: &str) -> Option<LocatedSwarm> {
         }
     }
 
-    // Worker path: scan brain dirs for a roster whose member points at `session_id`.
+    if let Some(located) = locate_cached_worker_swarm(roots, session_id) {
+        return Some(located);
+    }
+
+    // Worker path: scan the most recently updated `members.json` files first so
+    // non-swarm conversations never crowd out active swarms and updating
+    // `members.json` under `.system_generated/swarm/` is reflected even when
+    // `brain/<id>`'s top-level directory mtime is older.
     for root in roots {
         let Ok(entries) = fs::read_dir(root.join("brain")) else {
             continue;
         };
-        for entry in entries.flatten().take(MAX_BRAIN_SCAN_DIRS) {
-            let file_name = entry.file_name();
-            let Some(candidate_id) = file_name.to_str() else {
-                continue;
-            };
-            if !is_valid_session_id(candidate_id) {
-                continue;
-            }
-            let members_path = swarm_dir(root, candidate_id).join("members.json");
+        let mut candidates: Vec<(Option<SystemTime>, String)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let candidate_id = file_name.to_str()?;
+                if candidate_id == session_id || !is_valid_session_id(candidate_id) {
+                    return None;
+                }
+                let members_path = swarm_dir(root, candidate_id).join("members.json");
+                let metadata = fs::metadata(&members_path).ok()?;
+                if !metadata.is_file() {
+                    return None;
+                }
+                Some((metadata.modified().ok(), candidate_id.to_owned()))
+            })
+            .collect();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+        for (_, candidate_id) in candidates.into_iter().take(max_scan_dirs) {
+            let members_path = swarm_dir(root, &candidate_id).join("members.json");
             let Some((stamp, roster)) = read_roster(&members_path) else {
                 continue;
             };
             if let Some(member_name) = member_name_for_conversation(&roster, session_id) {
+                record_worker_swarm_cache(session_id, root, &candidate_id);
                 return Some(LocatedSwarm {
                     app_data: root.clone(),
-                    swarm_id: candidate_id.to_owned(),
+                    swarm_id: candidate_id,
                     roster,
                     members_stamp: stamp,
                     current_member: Some(member_name),
@@ -1767,5 +1841,61 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn locate_swarm_prioritizes_recent_dirs_and_direct_session_lookup_when_over_cap() {
+        let root = temp_root();
+        let brain = root.join("brain");
+        fs::create_dir_all(&brain).unwrap();
+
+        let coord_id = "zzz-coord-old-dir";
+        let worker_id = format!("worker-in-recent-{}", Uuid::new_v4());
+        // Pre-create the coordinator's `.system_generated/swarm` dir BEFORE the
+        // other swarms so `brain/zzz-coord-old-dir` has an older dir mtime.
+        let coord_swarm_dir = swarm_dir(&root, coord_id);
+        fs::create_dir_all(&coord_swarm_dir).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Create non-swarm brain dirs and older swarm dirs that sort earlier.
+        for index in 0..5 {
+            fs::create_dir_all(brain.join(format!("000-plain-{index:03}"))).unwrap();
+            write_file(
+                &swarm_dir(&root, &format!("000-old-swarm-{index:03}")).join("members.json"),
+                r#"{"title":"Old Swarm","members":{"coordinator":{"conversation_id":"old-coord","role":"coordinator"}}}"#,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Write `members.json` later inside the pre-existing `zzz-coord-old-dir`.
+        write_file(
+            &coord_swarm_dir.join("members.json"),
+            &format!(
+                r#"{{"title":"Recent Swarm","members":{{"coordinator":{{"conversation_id":"{coord_id}","role":"coordinator"}},"alpha":{{"conversation_id":"{worker_id}","role":"worker"}}}}}}"#
+            ),
+        );
+
+        // Fast path locates coordinator directly even if worker scan cap is 0.
+        let coord_located = locate_swarm_with_cap(&[root.clone()], coord_id, 0)
+            .expect("coordinator fast path bypasses scan cap");
+        assert_eq!(coord_located.swarm_id, coord_id);
+
+        // Worker lookup with cap=1 skips the 5 older swarms and finds the newest `members.json`.
+        let worker_located = locate_swarm_with_cap(&[root.clone()], &worker_id, 1)
+            .expect("worker scan prioritizes recently modified members.json");
+        assert_eq!(worker_located.swarm_id, coord_id);
+        assert_eq!(worker_located.current_member.as_deref(), Some("alpha"));
+
+        // Cached worker hit must NOT leak across account roots.
+        let other_root = temp_root();
+        assert!(locate_swarm_with_cap(&[other_root.clone()], &worker_id, 1).is_none());
+
+        // Subsequent lookup on the owning root still succeeds via cache even with cap=0.
+        let cached_hit = locate_swarm_with_cap(&[root.clone()], &worker_id, 0)
+            .expect("cached worker lookup succeeds within matching root");
+        assert_eq!(cached_hit.swarm_id, coord_id);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other_root);
     }
 }

@@ -43,22 +43,23 @@ describe('composer autocomplete', () => {
     })).toEqual({ text: 'read @src/app.ts  then', cursor: 17 })
   })
 
-  test('merges live provider commands without losing discovered templates', () => {
+  test('merges live provider commands without losing discovered templates, hints, or scopes', () => {
     const discovered = [
       command('review', 'Project', 'Review changes', 'Review $ARGUMENTS'),
       command('deploy', 'Skill', 'Deploy the app', null),
       command('resume', 'Waku', 'Resume a session', null),
     ]
     const reported: ReportedCommand[] = [
-      { name: 'review', description: 'Provider review' },
-      { name: 'compact', description: 'Compact context' },
-      { name: 'resume', description: 'Provider resume' },
+      { name: 'review', description: 'Provider review', argument_hint: '[branch]' },
+      { name: 'deploy', description: 'Droid deploy', argument_hint: '[env]' },
+      { name: 'compact', description: 'Compact context', argument_hint: '[focus]' },
+      { name: 'resume', description: 'Provider resume', argument_hint: '[session-id]' },
     ]
     expect(mergeComposerCommands(discovered, reported)).toEqual([
-      command('compact', 'Builtin', 'Compact context', null),
+      { ...command('compact', 'Builtin', 'Compact context', null), argument_hint: '[focus]' },
       discovered[2],
-      discovered[0],
-      discovered[1],
+      { ...discovered[0]!, argument_hint: '[branch]' },
+      { ...discovered[1]!, argument_hint: '[env]' },
     ])
   })
 

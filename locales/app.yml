@@ -2956,3 +2956,13 @@ commands.effort_unsupported:
   en: This model does not support reasoning effort selection
 commands.effort_invalid:
   en: "Unknown reasoning effort \"%{effort}\" (available: %{options})"
+commands.autonomy_description:
+  en: Show or set autonomy level
+commands.new_session_description:
+  en: Start a new session
+commands.autonomy_switched:
+  en: "Autonomy level set to %{level}"
+commands.autonomy_current:
+  en: "Autonomy level: %{level} (available: %{options})"
+commands.autonomy_invalid:
+  en: "Unknown autonomy level \"%{level}\" (available: %{options})"

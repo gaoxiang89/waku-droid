@@ -23,7 +23,7 @@ import { AppSymbol } from './app-symbol';
 import type { ComposerAccessMenuProps } from './composer-access-menu.types';
 import { Radius } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { runtimeModeLabel } from '@/lib/session-presentation';
+import { droidAutonomyLevel, runtimeModeLabel } from '@/lib/session-presentation';
 
 const ACCESS_MODES: Array<{
   id: RuntimeMode;
@@ -46,8 +46,9 @@ const ACCESS_MODES: Array<{
 
 /** The task-page access control uses SwiftUI Menu so it stays attached to the
  * composer trigger and receives the native popover arrow and dismissal model. */
-export function ComposerAccessMenu({ mode, onApply }: ComposerAccessMenuProps) {
+export function ComposerAccessMenu({ mode, provider, onApply }: ComposerAccessMenuProps) {
   const theme = useTheme();
+  const isDroid = provider === 'droid';
   const selected = ACCESS_MODES.find((item) => item.id === mode) ?? ACCESS_MODES[3]!;
 
   return (
@@ -75,7 +76,11 @@ export function ComposerAccessMenu({ mode, onApply }: ComposerAccessMenuProps) {
               }}>
               <Label systemImage={item.icon}>
                 <VStack alignment="leading" spacing={1}>
-                  <SwiftUIText>{runtimeModeLabel(item.id)}</SwiftUIText>
+                  <SwiftUIText>
+                    {isDroid
+                      ? `${runtimeModeLabel(item.id)} (${droidAutonomyLevel(item.id)})`
+                      : runtimeModeLabel(item.id)}
+                  </SwiftUIText>
                   <SwiftUIText
                     modifiers={[
                       font({ textStyle: 'caption' }),

@@ -1,4 +1,4 @@
-import type { ActivityItem, AgentSession } from './generated'
+import type { ActivityItem, AgentSession, ProviderKind } from './generated'
 
 export type AssistantResponseFooter = {
   content: string
@@ -7,12 +7,58 @@ export type AssistantResponseFooter = {
 
 export type Translator = (key: string, params?: Record<string, string | number>) => string
 
+/** Mirrors `ProviderKind::supports_conversation_rollback` in `waku-protocol`. */
+export function supportsConversationRollback(provider: ProviderKind): boolean {
+  switch (provider) {
+    case 'amp':
+    case 'antigravity':
+    case 'claude':
+    case 'codex':
+    case 'cursor':
+    case 'deepSeek':
+    case 'openCode':
+    case 'grok':
+    case 'ohMyPi':
+    case 'pi':
+      return true
+    case 'droid':
+    case 'fx':
+    case 'kimi':
+      return false
+  }
+}
+
+/** Mirrors `ProviderKind::supports_conversation_fork` in `waku-protocol`. */
+export function supportsConversationFork(provider: ProviderKind): boolean {
+  switch (provider) {
+    case 'amp':
+    case 'antigravity':
+    case 'claude':
+    case 'codex':
+    case 'cursor':
+    case 'deepSeek':
+    case 'openCode':
+    case 'grok':
+    case 'ohMyPi':
+    case 'pi':
+      return true
+    case 'droid':
+    case 'fx':
+    case 'kimi':
+      return false
+  }
+}
+
 export function userMessageRewindTurnCount(
   session: AgentSession,
   message: AgentSession['messages'][number],
   availableRetainedTurnCounts: ReadonlySet<number>,
 ): number | null {
-  if (message.role !== 'user' || !['idle', 'failed'].includes(session.status)) return null
+  if (
+    message.role !== 'user'
+    || !['idle', 'failed'].includes(session.status)
+    || !supportsConversationRollback(session.provider)
+  ) return null
   const turn = message.turn_id
     ? session.turns.find((candidate) => candidate.id === message.turn_id)
     : undefined
@@ -21,6 +67,28 @@ export function userMessageRewindTurnCount(
   if (!availableRetainedTurnCounts.has(retainedTurnCount)) return null
   const rollbackTurns = providerTurnsAfter(session, retainedTurnCount)
   if (rollbackTurns > 0 && !session.provider_cursor) return null
+  return turn.turn_count
+}
+
+export function responseForkTurnCount(
+  session: AgentSession,
+  message: AgentSession['messages'][number],
+  footer: AssistantResponseFooter | null,
+  turn?: AgentSession['turns'][number],
+): number | null {
+  if (
+    !footer
+    || message.role !== 'assistant'
+    || !['idle', 'failed'].includes(session.status)
+    || !supportsConversationFork(session.provider)
+    || !turn?.provider_turn_started
+  ) return null
+  // A fork through turns the current agent never ran starts a fresh native
+  // conversation, so only a fork that keeps some of its turns needs its cursor.
+  if (
+    providerTurnsThrough(session, turn.turn_count) > 0
+    && session.provider_cursor?.provider !== session.provider
+  ) return null
   return turn.turn_count
 }
 

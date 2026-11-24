@@ -30,7 +30,7 @@ import {
   resolveServiceTier,
   type ModelTraitSelection,
 } from '@/lib/model-traits';
-import { providerLabel, runtimeModeLabel } from '@/lib/session-presentation';
+import { droidAutonomyLevel, providerLabel, runtimeModeLabel } from '@/lib/session-presentation';
 
 export interface ModelSelection {
   model: string | null;
@@ -478,17 +478,21 @@ export function AccessSheet({
   visible,
   onDismiss,
   mode,
+  provider,
   onApply,
 }: {
   visible: boolean;
   onDismiss: () => void;
   mode: RuntimeMode;
+  provider?: ProviderKind;
   onApply: (mode: RuntimeMode) => void;
 }) {
+  const isDroid = provider === 'droid';
   return (
     <Sheet onDismiss={onDismiss} title="Agent access" visible={visible}>
       {ACCESS_MODES.map((item) => (
         <SheetRow
+          badge={isDroid ? droidAutonomyLevel(item.id) : undefined}
           description={item.description}
           key={item.id}
           label={runtimeModeLabel(item.id)}

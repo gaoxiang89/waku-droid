@@ -47,17 +47,54 @@ pub fn user_skill_locations() -> Vec<SkillLocation> {
     let home = dirs::home_dir();
     let claude_config_dir_env = crate::command_env::env_var_os("CLAUDE_CONFIG_DIR");
     let codex_home_env = crate::command_env::env_var_os("CODEX_HOME");
+    let antigravity_data_dir_env =
+        crate::command_env::env_var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR");
     user_skill_locations_with(
         home.as_deref(),
         claude_config_dir_env.as_deref(),
         codex_home_env.as_deref(),
+        antigravity_data_dir_env.as_deref(),
     )
+}
+
+fn antigravity_data_root(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("sidecar_data") {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+fn push_unique_location(locations: &mut Vec<SkillLocation>, location: SkillLocation) {
+    if !locations.contains(&location) {
+        locations.push(location);
+    }
+}
+
+fn push_antigravity_user_roots(
+    locations: &mut Vec<SkillLocation>,
+    data_root: &Path,
+) {
+    for suffix in ["config/skills", "skills"] {
+        push_unique_location(
+            locations,
+            SkillLocation {
+                source: SkillSource::Provider(ProviderKind::Antigravity),
+                scope: SkillScope::User,
+                root: data_root.join(suffix),
+                project: None,
+            },
+        );
+    }
 }
 
 fn user_skill_locations_with(
     home: Option<&Path>,
     claude_config_dir_env: Option<&std::ffi::OsStr>,
     codex_home_env: Option<&std::ffi::OsStr>,
+    antigravity_data_dir_env: Option<&std::ffi::OsStr>,
 ) -> Vec<SkillLocation> {
     let claude_config_dir = claude_config_dir_env
         .map(PathBuf::from)
@@ -67,15 +104,22 @@ fn user_skill_locations_with(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| home.map(|home| home.join(".codex")));
+    let antigravity_data_dir = antigravity_data_dir_env
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .and_then(|path| antigravity_data_root(&path));
     let mut locations = Vec::new();
     let mut push = |source: SkillSource, root: Option<PathBuf>| {
         if let Some(root) = root {
-            locations.push(SkillLocation {
-                source,
-                scope: SkillScope::User,
-                root,
-                project: None,
-            });
+            push_unique_location(
+                &mut locations,
+                SkillLocation {
+                    source,
+                    scope: SkillScope::User,
+                    root,
+                    project: None,
+                },
+            );
         }
     };
     let home_join = |suffix: &str| home.map(|home| home.join(suffix));
@@ -116,15 +160,24 @@ fn user_skill_locations_with(
         SkillSource::Provider(ProviderKind::Droid),
         home_join(".factory/skills"),
     );
+    drop(push);
+    if let Some(data_dir) = antigravity_data_dir {
+        push_antigravity_user_roots(&mut locations, &data_dir);
+    }
     // `agy` merges the shared Gemini profile with its CLI-private skills.
-    push(
-        SkillSource::Provider(ProviderKind::Antigravity),
-        home_join(".gemini/config/skills"),
-    );
-    push(
-        SkillSource::Provider(ProviderKind::Antigravity),
-        home_join(".gemini/antigravity-cli/skills"),
-    );
+    for suffix in [".gemini/config/skills", ".gemini/antigravity-cli/skills"] {
+        if let Some(root) = home_join(suffix) {
+            push_unique_location(
+                &mut locations,
+                SkillLocation {
+                    source: SkillSource::Provider(ProviderKind::Antigravity),
+                    scope: SkillScope::User,
+                    root,
+                    project: None,
+                },
+            );
+        }
+    }
     locations
 }
 
@@ -174,11 +227,51 @@ pub fn project_skill_locations(project_root: &Path, project_name: &str) -> Vec<S
 /// All roots the scan walks for the given projects: user scope plus each
 /// project's trees, in scan order.
 pub fn skill_locations(projects: &[(String, PathBuf)]) -> Vec<SkillLocation> {
+    skill_locations_for(projects, &[])
+}
+
+/// All roots the scan walks for the given projects and registered isolated
+/// provider account directories: default user scope, isolated account user
+/// roots, then each project's trees.
+pub fn skill_locations_for(
+    projects: &[(String, PathBuf)],
+    account_dirs: &[(ProviderKind, PathBuf)],
+) -> Vec<SkillLocation> {
     let mut locations = user_skill_locations();
+    extend_account_skill_locations(&mut locations, account_dirs);
     for (name, path) in projects {
-        locations.extend(project_skill_locations(path, name));
+        for location in project_skill_locations(path, name) {
+            push_unique_location(&mut locations, location);
+        }
     }
     locations
+}
+
+fn extend_account_skill_locations(
+    locations: &mut Vec<SkillLocation>,
+    account_dirs: &[(ProviderKind, PathBuf)],
+) {
+    for (provider, config_dir) in account_dirs {
+        match provider {
+            ProviderKind::Antigravity => {
+                if let Some(root) = antigravity_data_root(config_dir) {
+                    push_antigravity_user_roots(locations, &root);
+                }
+            }
+            ProviderKind::Claude | ProviderKind::Codex => {
+                push_unique_location(
+                    locations,
+                    SkillLocation {
+                        source: SkillSource::Provider(*provider),
+                        scope: SkillScope::User,
+                        root: config_dir.join("skills"),
+                        project: None,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One skill directory as found on disk, before grouping.
@@ -700,6 +793,7 @@ mod tests {
             Some(&home),
             Some(custom_claude.as_os_str()),
             Some(custom_codex.as_os_str()),
+            None,
         );
         let root_for = |locations: &[SkillLocation], provider: ProviderKind| {
             locations
@@ -722,6 +816,7 @@ mod tests {
             Some(&home),
             Some(std::ffi::OsStr::new("relative/claude")),
             Some(std::ffi::OsStr::new("relative/codex")),
+            Some(std::ffi::OsStr::new("relative/agy")),
         );
         assert_eq!(
             root_for(&fallback, ProviderKind::Claude),
@@ -731,5 +826,68 @@ mod tests {
             root_for(&fallback, ProviderKind::Codex),
             Some(home.join(".codex").join("skills"))
         );
+        assert_eq!(
+            root_for(&fallback, ProviderKind::Antigravity),
+            Some(home.join(".gemini/config/skills"))
+        );
+    }
+
+    #[test]
+    fn antigravity_env_and_account_dirs_register_isolated_skill_roots() {
+        let root = temp_root("antigravity-isolated");
+        let env_sidecar = root.join("agy-env").join("sidecar_data");
+        let account_dir = root.join("agy-work");
+        let claude_account = root.join("claude-work");
+
+        let env_locations = user_skill_locations_with(
+            Some(&root.join("home")),
+            None,
+            None,
+            Some(env_sidecar.as_os_str()),
+        );
+        let env_agy_roots: Vec<PathBuf> = env_locations
+            .iter()
+            .filter(|loc| loc.source == SkillSource::Provider(ProviderKind::Antigravity))
+            .map(|loc| loc.root.clone())
+            .collect();
+        assert!(env_agy_roots.contains(&root.join("agy-env").join("config/skills")));
+        assert!(env_agy_roots.contains(&root.join("agy-env").join("skills")));
+        assert!(env_agy_roots.contains(&root.join("home/.gemini/config/skills")));
+        assert!(env_agy_roots.contains(&root.join("home/.gemini/antigravity-cli/skills")));
+
+        write_skill(
+            &account_dir.join("config/skills"),
+            "agy-config-skill",
+            "---\nname: agy-config-skill\ndescription: Config skill\n---\nBody",
+        );
+        write_skill(
+            &account_dir.join("skills"),
+            "agy-cli-skill",
+            "---\nname: agy-cli-skill\ndescription: CLI skill\n---\nBody",
+        );
+        write_skill(
+            &claude_account.join("skills"),
+            "claude-work-skill",
+            "---\nname: claude-work-skill\ndescription: Claude work\n---\nBody",
+        );
+
+        let mut locations = Vec::new();
+        let accounts = vec![
+            (ProviderKind::Antigravity, account_dir.clone()),
+            (ProviderKind::Antigravity, account_dir.join("sidecar_data")),
+            (ProviderKind::Claude, claude_account.clone()),
+        ];
+        extend_account_skill_locations(&mut locations, &accounts);
+        // `sidecar_data` resolves to the same parent and is deduplicated.
+        assert_eq!(locations.len(), 3);
+
+        let catalog = scan_skills(&locations);
+        let names: Vec<&str> = catalog.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["agy-cli-skill", "agy-config-skill", "claude-work-skill"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

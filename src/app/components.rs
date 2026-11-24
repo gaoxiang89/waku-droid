@@ -1666,6 +1666,55 @@ pub(super) fn activity_file_change_stats(activity: &ActivityItem) -> Option<(u64
     Some((additions, deletions))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ActivityRowStatusIndicator {
+    None,
+    Running,
+    Failed,
+}
+
+/// Trailing status indicator for an activity row header.
+///
+/// Rendered independently of whether the row has expandable detail so collapsed
+/// failed or in-flight tool cards remain visibly marked beside their chevron,
+/// including failed `FileChange` cards whose diff stats are suppressed.
+pub(super) fn activity_row_status_indicator(activity: &ActivityItem) -> ActivityRowStatusIndicator {
+    activity_row_status_indicator_with_background(activity, None)
+}
+
+/// Variant of [`activity_row_status_indicator`] that suppresses duplicate
+/// `Failed` / `Running` indicators when an adjacent `background_badge` already
+/// displays the same live or failed state.
+pub(super) fn activity_row_status_indicator_with_background(
+    activity: &ActivityItem,
+    background_status: Option<crate::model::BackgroundWorkStatus>,
+) -> ActivityRowStatusIndicator {
+    if activity.reasoning.is_some() {
+        ActivityRowStatusIndicator::None
+    } else if activity.failed {
+        if background_status == Some(crate::model::BackgroundWorkStatus::Failed) {
+            ActivityRowStatusIndicator::None
+        } else {
+            ActivityRowStatusIndicator::Failed
+        }
+    } else if !activity.complete {
+        if background_status.is_some_and(crate::model::BackgroundWorkStatus::is_live) {
+            ActivityRowStatusIndicator::None
+        } else {
+            ActivityRowStatusIndicator::Running
+        }
+    } else {
+        ActivityRowStatusIndicator::None
+    }
+}
+
+/// A closed exploration step drops its card and reads as one line so edits and
+/// commands stand out — unless it failed, in which case it keeps its card frame
+/// so the error is unmistakable.
+pub(super) fn activity_uses_compact_row(activity: &ActivityItem, expanded: bool) -> bool {
+    activity_is_exploration(activity.kind) && !expanded && !activity.failed
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ActivityDisclosureSectionKind {
     McpServer,
@@ -2423,5 +2472,116 @@ mod message_time_tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn activity_row_status_indicator_tracks_failed_and_running_with_detail() {
+        let mut command = ActivityItem::new(
+            Some("cmd-1".into()),
+            crate::model::ActivityKind::Command,
+            "Execute",
+            None,
+            false,
+        )
+        .with_arguments(Some(
+            serde_json::json!({"command": "cargo test"}).to_string(),
+        ));
+        assert!(!activity_disclosure_sections(&command).is_empty());
+        assert_eq!(
+            activity_row_status_indicator(&command),
+            ActivityRowStatusIndicator::Running
+        );
+
+        command.complete = true;
+        command.failed = true;
+        assert_eq!(
+            activity_row_status_indicator(&command),
+            ActivityRowStatusIndicator::Failed
+        );
+
+        command.failed = false;
+        assert_eq!(
+            activity_row_status_indicator(&command),
+            ActivityRowStatusIndicator::None
+        );
+
+        let mut failed_edit = ActivityItem::new(
+            Some("edit-fail".into()),
+            crate::model::ActivityKind::FileChange,
+            "Edit",
+            None,
+            true,
+        )
+        .with_arguments(Some(
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+            })
+            .to_string(),
+        ));
+        failed_edit.failed = true;
+        assert_eq!(activity_file_change_stats(&failed_edit), None);
+        assert_eq!(
+            activity_row_status_indicator(&failed_edit),
+            ActivityRowStatusIndicator::Failed
+        );
+
+        let reasoning = ActivityItem::from_reasoning(
+            ReasoningBlock {
+                content: "Thinking".into(),
+                started_at_ms: 0,
+                finished_at_ms: 0,
+            },
+            false,
+        );
+        assert_eq!(
+            activity_row_status_indicator(&reasoning),
+            ActivityRowStatusIndicator::None
+        );
+
+        assert_eq!(
+            activity_row_status_indicator_with_background(
+                &failed_edit,
+                Some(crate::model::BackgroundWorkStatus::Failed),
+            ),
+            ActivityRowStatusIndicator::None
+        );
+        assert_eq!(
+            activity_row_status_indicator_with_background(
+                &failed_edit,
+                Some(crate::model::BackgroundWorkStatus::Completed),
+            ),
+            ActivityRowStatusIndicator::Failed
+        );
+
+        let running_cmd = ActivityItem::new(
+            Some("cmd-run".into()),
+            crate::model::ActivityKind::Command,
+            "Execute",
+            None,
+            false,
+        );
+        assert_eq!(
+            activity_row_status_indicator_with_background(
+                &running_cmd,
+                Some(crate::model::BackgroundWorkStatus::Running),
+            ),
+            ActivityRowStatusIndicator::None
+        );
+    }
+
+    #[test]
+    fn failed_exploration_activity_drops_compact_row_mode() {
+        let mut read = ActivityItem::new(
+            Some("read-fail".into()),
+            crate::model::ActivityKind::FileRead,
+            "Read",
+            None,
+            true,
+        );
+        assert!(activity_uses_compact_row(&read, false));
+        assert!(!activity_uses_compact_row(&read, true));
+
+        read.failed = true;
+        assert!(!activity_uses_compact_row(&read, false));
     }
 }

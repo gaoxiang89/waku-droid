@@ -192,6 +192,17 @@ export function runtimeModeLabel(mode: RuntimeMode): string {
   return labels[mode];
 }
 
+/** Mirrors `RuntimeMode::droid_autonomy_level` in `waku-protocol`. */
+export function droidAutonomyLevel(mode: RuntimeMode): string {
+  const levels: Record<RuntimeMode, string> = {
+    ask: 'normal',
+    autoAcceptEdits: 'auto-low',
+    auto: 'auto-medium',
+    fullAccess: 'auto-high',
+  };
+  return levels[mode];
+}
+
 export function contextPercent(session: AgentSession): number | null {
   const usage = session.context_usage;
   if (!usage || !usage.window) return null;

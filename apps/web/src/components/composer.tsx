@@ -10,6 +10,7 @@ import type {
   Project,
   ProviderModel,
   ProviderProbe,
+  SlashCommand,
   ThreadGoalStatus,
 } from '@waku/client'
 import {
@@ -1191,7 +1192,7 @@ function ComposerAutocomplete({
                   }}
                   onMouseEnter={() => onHighlight(index)}
                 >
-                  <AutocompleteRowContents row={row} />
+                  <AutocompleteRowContents row={row} t={t} />
                 </button>
               )}
             />
@@ -1200,7 +1201,21 @@ function ComposerAutocomplete({
   )
 }
 
-function AutocompleteRowContents({ row }: { row: ComposerAutocompleteRow }) {
+const COMMAND_SCOPE_KEYS: Record<SlashCommand['scope'], string> = {
+  Project: 'command_scope.project',
+  User: 'command_scope.user',
+  Skill: 'command_scope.skill',
+  Builtin: 'command_scope.builtin',
+  Waku: 'command_scope.waku',
+}
+
+function AutocompleteRowContents({
+  row,
+  t,
+}: {
+  row: ComposerAutocompleteRow
+  t: Translator
+}) {
   if (row.kind === 'command') {
     const { command } = row
     return (
@@ -1220,7 +1235,7 @@ function AutocompleteRowContents({ row }: { row: ComposerAutocompleteRow }) {
           {command.description}
         </span>
         <span className="flex h-4 shrink-0 items-center rounded border px-1.5 text-[9px] font-semibold text-[var(--text-tertiary)]">
-          {command.scope === 'Waku' ? 'waku' : command.scope}
+          {t(COMMAND_SCOPE_KEYS[command.scope])}
         </span>
       </>
     )
@@ -1505,11 +1520,12 @@ const ACCESS_MODES: Array<{
   labelKey: string
   descriptionKey: string
   icon: 'lock' | 'pencil' | 'sparkle' | 'lockOpen'
+  droidAutonomy: string
 }> = [
-  { id: 'ask', labelKey: 'mode.supervised', descriptionKey: 'mode.supervised_description', icon: 'lock' },
-  { id: 'autoAcceptEdits', labelKey: 'mode.auto_accept_edits', descriptionKey: 'mode.auto_accept_edits_description', icon: 'pencil' },
-  { id: 'auto', labelKey: 'mode.auto', descriptionKey: 'mode.auto_description', icon: 'sparkle' },
-  { id: 'fullAccess', labelKey: 'mode.full_access', descriptionKey: 'mode.full_access_description', icon: 'lockOpen' },
+  { id: 'ask', labelKey: 'mode.supervised', descriptionKey: 'mode.supervised_description', icon: 'lock', droidAutonomy: 'normal' },
+  { id: 'autoAcceptEdits', labelKey: 'mode.auto_accept_edits', descriptionKey: 'mode.auto_accept_edits_description', icon: 'pencil', droidAutonomy: 'auto-low' },
+  { id: 'auto', labelKey: 'mode.auto', descriptionKey: 'mode.auto_description', icon: 'sparkle', droidAutonomy: 'auto-medium' },
+  { id: 'fullAccess', labelKey: 'mode.full_access', descriptionKey: 'mode.full_access_description', icon: 'lockOpen', droidAutonomy: 'auto-high' },
 ]
 
 function AccessControl({
@@ -1522,6 +1538,7 @@ function AccessControl({
   returnFocus: RefObject<HTMLElement | null>
 }) {
   const { t } = useI18n()
+  const isDroid = session.provider === 'droid'
   const selected = ACCESS_MODES.find((mode) => mode.id === session.runtime_mode) ?? ACCESS_MODES[3]!
   return (
     <ControlMenu
@@ -1531,6 +1548,7 @@ function AccessControl({
         id: mode.id,
         icon: mode.icon,
         label: t(mode.labelKey),
+        badge: isDroid ? mode.droidAutonomy : undefined,
         description: t(mode.descriptionKey),
         selected: mode.id === selected.id,
         onSelect: () => onPatch({ runtime_mode: mode.id }),

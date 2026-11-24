@@ -8,6 +8,7 @@ import {
   buildTranscriptRows,
   contextPercent,
   displaySessionTitle,
+  droidAutonomyLevel,
   expandTranscriptRows,
   findActivityBlock,
   groupSessions,
@@ -67,6 +68,13 @@ describe('mobile session presentation', () => {
     expect(contextPercent(session({}))).toBeNull();
     expect(contextPercent(session({ context_usage: { tokens: 50_000, window: 200_000 } }))).toBe(25);
     expect(contextPercent(session({ context_usage: { tokens: 500, window: null } }))).toBeNull();
+  });
+
+  test('maps access modes to Droid autonomy levels', () => {
+    expect(droidAutonomyLevel('ask')).toBe('normal');
+    expect(droidAutonomyLevel('autoAcceptEdits')).toBe('auto-low');
+    expect(droidAutonomyLevel('auto')).toBe('auto-medium');
+    expect(droidAutonomyLevel('fullAccess')).toBe('auto-high');
   });
 
   test('keeps provider ordering inline when the turn is unknown', () => {

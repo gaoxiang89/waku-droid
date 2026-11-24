@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 export interface ControlMenuItem {
   id: string
   label: string
+  badge?: string
   description?: string
   icon?: WakuIconName
   selected?: boolean
@@ -115,12 +116,17 @@ export function ControlMenu({
                   {item.icon && <WakuIcon className="size-3 text-current" name={item.icon} />}
                   <span className="min-w-0 flex-1">
                     <span className={cn(
-                      'flex items-baseline gap-1 truncate',
+                      'flex items-center gap-1.5 truncate',
                       item.description && 'font-medium',
                       !item.description && item.selected && 'font-medium',
                       item.description && item.selected && 'font-semibold',
                     )}>
                       <span className="truncate">{item.label}</span>
+                      {item.badge && (
+                        <span className="inline-flex h-[17px] shrink-0 items-center rounded-[4px] border bg-accent/60 px-[5px] font-mono text-[10.5px] font-normal leading-none text-[var(--text-tertiary)]">
+                          {item.badge}
+                        </span>
+                      )}
                       {item.suffix && <span className="text-[10.5px] font-normal text-[var(--text-ghost)]">{item.suffix}</span>}
                     </span>
                     {item.description && (

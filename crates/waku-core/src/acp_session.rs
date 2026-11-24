@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -22,13 +22,16 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    ActivityItem, AgentTurn, Message, MessageRole, ProviderKind, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, ReasoningBlock, TranscriptBlock, TurnStatus,
+    ActivityItem, ActivityKind, AgentTurn, Message, MessageRole, ProviderKind,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, ReasoningBlock,
+    TranscriptBlock, TurnStatus,
 };
 
 const MAX_CATALOG_PAGES: usize = 20;
 const MAX_CATALOG_WORKSPACES: usize = 100;
 const ACP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const LOAD_REPLAY_QUIET_WINDOW: Duration = Duration::from_millis(150);
+const LOAD_REPLAY_MAX_DRAIN: Duration = Duration::from_secs(2);
 
 /// Empty, app-owned cwd for provider catalog subprocesses.
 ///
@@ -281,6 +284,41 @@ pub fn provider_session_history(
     provider_session_history_in(provider, binary, cwd, session_id, visible_turn_limit, None)
 }
 
+async fn drain_trailing_replay(
+    last_update_at: &Mutex<Option<Instant>>,
+    update_rx: &smol::channel::Receiver<()>,
+    quiet_window: Duration,
+    max_drain: Duration,
+) {
+    while update_rx.try_recv().is_ok() {}
+    let drain_start = Instant::now();
+    let hard_deadline = drain_start + max_drain;
+    loop {
+        let now = Instant::now();
+        if now >= hard_deadline {
+            break;
+        }
+        let reference = last_update_at
+            .lock()
+            .map_or(drain_start, |last| last.max(drain_start));
+        let quiet_deadline = (reference + quiet_window).min(hard_deadline);
+        if now >= quiet_deadline {
+            break;
+        }
+        let saw_more = smol::future::or(
+            async { update_rx.recv().await.is_ok() },
+            async {
+                smol::Timer::at(quiet_deadline).await;
+                false
+            },
+        )
+        .await;
+        if !saw_more {
+            break;
+        }
+    }
+}
+
 /// `config_dir`-scoped variant of [`provider_session_history`].
 pub fn provider_session_history_in(
     provider: ProviderKind,
@@ -294,8 +332,37 @@ pub fn provider_session_history_in(
         return Ok(ProviderSessionHistory::default());
     }
     let agent = crate::driver::acp::catalog_agent_in(provider, binary, cwd, config_dir)?;
+    provider_session_history_with_agent(
+        provider,
+        agent,
+        cwd,
+        session_id,
+        visible_turn_limit,
+        LOAD_REPLAY_QUIET_WINDOW,
+        LOAD_REPLAY_MAX_DRAIN,
+    )
+}
+
+fn provider_session_history_with_agent<C>(
+    provider: ProviderKind,
+    agent: C,
+    cwd: &Path,
+    session_id: &str,
+    visible_turn_limit: usize,
+    quiet_window: Duration,
+    max_drain: Duration,
+) -> anyhow::Result<ProviderSessionHistory>
+where
+    C: ConnectTo<Client> + 'static,
+{
+    if session_id.trim().is_empty() || visible_turn_limit == 0 {
+        return Ok(ProviderSessionHistory::default());
+    }
     let updates = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&updates);
+    let last_update_at = Arc::new(Mutex::new(None::<Instant>));
+    let last_update_seen = Arc::clone(&last_update_at);
+    let (update_tx, update_rx) = smol::channel::bounded::<()>(1);
     let cwd = cwd.to_path_buf();
     let session_id = session_id.to_owned();
 
@@ -306,6 +373,8 @@ pub fn provider_session_history_in(
             async move |notification: SessionNotification, _connection| {
                 if let Ok(update) = serde_json::to_value(notification.update) {
                     captured.lock().push(update);
+                    *last_update_seen.lock() = Some(Instant::now());
+                    let _ = update_tx.try_send(());
                 }
                 Ok(())
             },
@@ -326,10 +395,9 @@ pub fn provider_session_history_in(
                 .send_request(LoadSessionRequest::new(session_id, cwd))
                 .block_task()
                 .await?;
-            // ACP ordering places replay before the load response. A short
-            // grace still covers providers that flush their final queued
-            // notification immediately after that response.
-            smol::Timer::after(Duration::from_millis(50)).await;
+            // ACP ordering places replay before the load response, but some
+            // providers flush trailing queued notifications after it lands.
+            drain_trailing_replay(&last_update_at, &update_rx, quiet_window, max_drain).await;
             Ok(())
         });
     smol::block_on(smol::future::race(
@@ -397,8 +465,21 @@ fn upsert_replay_activity(
         });
         if let Some(activity) = matching {
             let has_arguments = item.arguments.is_some();
-            activity.kind = item.kind;
-            activity.title = item.title;
+            if item.kind != ActivityKind::Tool || activity.kind == ActivityKind::Tool {
+                activity.kind = item.kind;
+            }
+            let incoming_title = item.title.trim();
+            let incoming_is_generic_tool = incoming_title.eq_ignore_ascii_case("tool")
+                || incoming_title == tr!("activity.tool");
+            let existing_title = activity.title.trim();
+            let existing_is_meaningful = !existing_title.is_empty()
+                && !existing_title.eq_ignore_ascii_case("tool")
+                && existing_title != tr!("activity.tool");
+            if !incoming_title.is_empty()
+                && !(incoming_is_generic_tool && existing_is_meaningful)
+            {
+                activity.title = item.title;
+            }
             if item.tool_name.is_some() {
                 activity.tool_name = item.tool_name;
             }
@@ -994,5 +1075,261 @@ mod tests {
             ),
             "Antigravity session agy-1234"
         );
+    }
+
+    #[test]
+    fn droid_replay_preserves_tool_metadata_across_completed_call_and_sparse_update() {
+        let history = history_from_updates(
+            ProviderKind::Droid,
+            &[
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": "Inspect lib.rs and run tests" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "droid-read-1",
+                    "status": "completed",
+                    "kind": "read",
+                    "title": "Read src/lib.rs",
+                    "rawInput": { "file_path": "src/lib.rs" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "droid-read-1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "content", "content": { "type": "text", "text": "fn main() {}" } }
+                    ],
+                    "rawOutput": "fn main() {}"
+                }),
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "droid-exec-2",
+                    "status": "completed",
+                    "kind": "execute",
+                    "title": "Run cargo test",
+                    "rawInput": { "command": "cargo test" }
+                }),
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "droid-exec-2",
+                    "status": "failed",
+                    "content": [
+                        { "type": "content", "content": { "type": "text", "text": "exit status 101" } }
+                    ],
+                    "rawOutput": "exit status 101"
+                }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Tests failed." }
+                }),
+            ],
+        );
+
+        assert_eq!(history.transcript_blocks.len(), 1);
+        let activities = &history.transcript_blocks[0].activities;
+        assert_eq!(activities.len(), 2);
+
+        assert_eq!(activities[0].kind, ActivityKind::FileRead);
+        assert_eq!(activities[0].title, "Read src/lib.rs");
+        assert!(activities[0].arguments.is_some());
+        assert_eq!(activities[0].output.as_deref(), Some("fn main() {}"));
+        assert!(activities[0].complete);
+        assert!(!activities[0].failed);
+
+        assert_eq!(activities[1].kind, ActivityKind::Command);
+        assert_eq!(activities[1].title, "Run cargo test");
+        assert!(activities[1].arguments.is_some());
+        assert_eq!(activities[1].output.as_deref(), Some("exit status 101"));
+        assert!(activities[1].complete);
+        assert!(activities[1].failed);
+    }
+
+    #[test]
+    fn upsert_replay_activity_guards_against_generic_fallback_clobber() {
+        let mut history = ProviderSessionHistory::default();
+        let turn_id = Uuid::new_v4();
+        let initial = ActivityItem::new(
+            Some("tool-1".to_owned()),
+            ActivityKind::FileChange,
+            "Edit src/main.rs",
+            None,
+            true,
+        );
+        upsert_replay_activity(&mut history, turn_id, initial, false);
+
+        let mut sparse_generic = ActivityItem::new(
+            Some("tool-1".to_owned()),
+            ActivityKind::Tool,
+            "Tool",
+            None,
+            true,
+        );
+        sparse_generic.output = Some("updated diff".to_owned());
+        upsert_replay_activity(&mut history, turn_id, sparse_generic, true);
+
+        let mut empty_title = ActivityItem::new(
+            Some("tool-1".to_owned()),
+            ActivityKind::Tool,
+            "   ",
+            None,
+            true,
+        );
+        empty_title.failed = true;
+        upsert_replay_activity(&mut history, turn_id, empty_title, true);
+
+        let activity = &history.transcript_blocks[0].activities[0];
+        assert_eq!(activity.kind, ActivityKind::FileChange);
+        assert_eq!(activity.title, "Edit src/main.rs");
+        assert_eq!(activity.output.as_deref(), Some("updated diff"));
+        assert!(activity.failed);
+
+        // Conversely, a specific update should upgrade an initially generic activity,
+        // while a whitespace-only update must never clobber an existing `"Tool"` label.
+        let generic_first = ActivityItem::new(
+            Some("tool-2".to_owned()),
+            ActivityKind::Tool,
+            "Tool",
+            None,
+            false,
+        );
+        upsert_replay_activity(&mut history, turn_id, generic_first, true);
+
+        let blank_over_tool = ActivityItem::new(
+            Some("tool-2".to_owned()),
+            ActivityKind::Tool,
+            "   ",
+            None,
+            false,
+        );
+        upsert_replay_activity(&mut history, turn_id, blank_over_tool, true);
+        assert_eq!(history.transcript_blocks[0].activities[1].title, "Tool");
+
+        let specific_later = ActivityItem::new(
+            Some("tool-2".to_owned()),
+            ActivityKind::Search,
+            "Search workspace",
+            None,
+            true,
+        );
+        upsert_replay_activity(&mut history, turn_id, specific_later, true);
+
+        let upgraded = &history.transcript_blocks[0].activities[1];
+        assert_eq!(upgraded.kind, ActivityKind::Search);
+        assert_eq!(upgraded.title, "Search workspace");
+
+        // Failed status is preserved across a follow-up sparse update that omits `status`.
+        let user_json = serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": "Run check" }
+        });
+        let failed_json = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-3",
+            "status": "failed",
+            "kind": "execute",
+            "title": "Run cargo check",
+            "rawInput": { "command": "cargo check" }
+        });
+        let sparse_follow_up = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-3",
+            "rawOutput": "compilation failed"
+        });
+        let replay = history_from_updates(
+            ProviderKind::Droid,
+            &[user_json, failed_json, sparse_follow_up],
+        );
+        let replayed = &replay.transcript_blocks[0].activities[0];
+        assert!(replayed.complete);
+        assert!(replayed.failed);
+        assert_eq!(replayed.output.as_deref(), Some("compilation failed"));
+    }
+
+    #[test]
+    fn drain_trailing_replay_exits_promptly_when_sender_closes() {
+        let last_update_at = Mutex::new(None);
+        let (tx, rx) = smol::channel::bounded::<()>(1);
+        drop(tx);
+        let started = Instant::now();
+        smol::block_on(drain_trailing_replay(
+            &last_update_at,
+            &rx,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "closed update channel must exit immediately instead of spinning"
+        );
+    }
+
+    #[test]
+    fn session_history_drains_trailing_replay_chunks_past_50ms() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentBlock, InitializeResponse, LoadSessionResponse,
+            SessionCapabilities, TextContent,
+        };
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new()
+                        .load_session(true)
+                        .session_capabilities(SessionCapabilities::new());
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: LoadSessionRequest, responder, cx| {
+                    let session_id = req.session_id.clone();
+                    responder.respond(LoadSessionResponse::new())?;
+                    // Emit trailing replay chunks after `session/load` responds,
+                    // spaced past the old fixed 50ms sleep.
+                    let cx_bg = cx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(80));
+                        let _ = cx_bg.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                                agent_client_protocol::schema::v1::ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("delayed prompt")),
+                                ),
+                            ),
+                        ));
+                        std::thread::sleep(Duration::from_millis(90));
+                        let _ = cx_bg.send_notification(SessionNotification::new(
+                            session_id,
+                            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                                agent_client_protocol::schema::v1::ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("delayed answer")),
+                                ),
+                            ),
+                        ));
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let history = provider_session_history_with_agent(
+            ProviderKind::Antigravity,
+            mock_agent,
+            &std::env::temp_dir(),
+            "sess-delayed",
+            10,
+            LOAD_REPLAY_QUIET_WINDOW,
+            LOAD_REPLAY_MAX_DRAIN,
+        )
+        .unwrap();
+
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].content, "delayed prompt");
+        assert_eq!(history.messages[1].content, "delayed answer");
     }
 }

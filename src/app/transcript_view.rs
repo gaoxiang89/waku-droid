@@ -2132,6 +2132,7 @@ impl Waku {
                     self.background_work_for_activity(session_id, source_id)
                         .map(|item| (session_id, item.key.clone(), item.status, item.role.clone()))
                 });
+            let background_status = background_work.as_ref().map(|(_, _, status, _)| *status);
             let background_badge = background_work.map(|(session_id, key, status, role)| {
                 let click_key = key.clone();
                 let kind = key.kind;
@@ -2220,9 +2221,9 @@ impl Waku {
                     .get(&id)
                     .copied()
                     .unwrap_or(false);
-            // A closed exploration step drops its card and reads as one line,
-            // so the edits and commands around it stand out.
-            let compact = activity_is_exploration(activity.kind) && !item_expanded;
+            let status_indicator =
+                activity_row_status_indicator_with_background(activity, background_status);
+            let compact = activity_uses_compact_row(activity, item_expanded);
             let item_focus = self.transcript_control_focus(format!("activity-item-{id}"), cx);
             let mut item = div()
                 .w_full()
@@ -2231,7 +2232,11 @@ impl Waku {
                 .when(!compact, |item| {
                     item.rounded(px(9.0))
                         .border_1()
-                        .border_color(theme.border_strong)
+                        .border_color(if activity.failed {
+                            theme.danger.opacity(0.45)
+                        } else {
+                            theme.border_strong
+                        })
                         .bg(activity_surface)
                 })
                 .flex()
@@ -2266,24 +2271,32 @@ impl Waku {
                         .child(icon(
                             activity_icon(activity.kind),
                             12.0,
-                            theme.text_tertiary,
+                            if activity.failed {
+                                theme.danger
+                            } else {
+                                theme.text_tertiary
+                            },
                         ))
                         .child(
                             div()
                                 .flex_none()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.text_secondary)
+                                .text_color(if activity.failed {
+                                    theme.danger
+                                } else {
+                                    theme.text_secondary
+                                })
                                 .child(SharedString::from(action_label)),
                         )
-                        .when(!row_detail.is_empty(), |element| {
-                            element.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.text_secondary)
-                                    .child(SharedString::from(row_detail)),
-                            )
+                        .child(if row_detail.is_empty() {
+                            div().flex_1()
+                        } else {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_secondary)
+                                .child(SharedString::from(row_detail))
                         })
                         .when_some(file_change_stats, |row, (additions, deletions)| {
                             row.child(
@@ -2321,6 +2334,31 @@ impl Waku {
                         })
                         .children(background_badge)
                         .children(open_file_button)
+                        .when(
+                            status_indicator == ActivityRowStatusIndicator::Failed,
+                            |element| {
+                                element.child(
+                                    div()
+                                        .flex_none()
+                                        .h(px(18.0))
+                                        .px(px(5.0))
+                                        .rounded(px(4.0))
+                                        .bg(theme.danger_soft)
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.0))
+                                        .text_size(sp(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.danger)
+                                        .child(icon("icons/x.svg", 10.0, theme.danger))
+                                        .child(SharedString::from(tr!("background.status.failed"))),
+                                )
+                            },
+                        )
+                        .when(
+                            status_indicator == ActivityRowStatusIndicator::Running,
+                            |element| element.child(pulse_dot(5.0, theme.accent)),
+                        )
                         .when(has_detail, |element| {
                             element.child(icon(
                                 if item_expanded {
@@ -2331,17 +2369,6 @@ impl Waku {
                                 10.0,
                                 theme.text_tertiary,
                             ))
-                        })
-                        .when(!has_detail, |element| {
-                            element
-                                .when(activity.failed, |element| {
-                                    element.child(
-                                        icon("icons/x.svg", 10.0, theme.danger).into_any_element(),
-                                    )
-                                })
-                                .when(!activity.complete && !activity.failed, |element| {
-                                    element.child(pulse_dot(5.0, theme.accent))
-                                })
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if has_detail {

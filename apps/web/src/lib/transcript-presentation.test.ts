@@ -19,6 +19,9 @@ import {
   turnFoldLabel,
   providerTurnsAfter,
   providerTurnsThrough,
+  responseForkTurnCount,
+  supportsConversationFork,
+  supportsConversationRollback,
   userMessageRewindTurnCount,
   formatMessageTime,
   formatWorkingElapsed,
@@ -272,6 +275,33 @@ describe('desktop transcript language', () => {
     session.provider_cursor = { provider: 'codex', threadId: 'thread' }
     session.status = 'working'
     expect(userMessageRewindTurnCount(session, firstMessage, new Set([0]))).toBeNull()
+  })
+
+  test('gates rewind and fork on provider capability', () => {
+    const footer = { content: 'Second half.', timestamp: 200 }
+    for (const provider of ['droid', 'fx', 'kimi'] as const) {
+      expect(supportsConversationRollback(provider)).toBe(false)
+      expect(supportsConversationFork(provider)).toBe(false)
+      const session = transcriptSession()
+      session.provider = provider
+      session.provider_cursor = { provider, sessionId: 'session-1' }
+      expect(userMessageRewindTurnCount(session, session.messages[0]!, new Set([0]))).toBeNull()
+      expect(responseForkTurnCount(session, session.messages[3]!, footer, session.turns[0])).toBeNull()
+    }
+
+    for (const [provider, cursor] of [
+      ['claude', { provider: 'claude', sessionId: 's1' }],
+      ['codex', { provider: 'codex', threadId: 't1' }],
+      ['antigravity', { provider: 'antigravity', sessionId: 's1' }],
+    ] as const) {
+      expect(supportsConversationRollback(provider)).toBe(true)
+      expect(supportsConversationFork(provider)).toBe(true)
+      const session = transcriptSession()
+      session.provider = provider
+      session.provider_cursor = cursor
+      expect(userMessageRewindTurnCount(session, session.messages[0]!, new Set([0]))).toBe(1)
+      expect(responseForkTurnCount(session, session.messages[3]!, footer, session.turns[0])).toBe(1)
+    }
   })
 
   test('counts only the current agent’s turns in its current native conversation', () => {

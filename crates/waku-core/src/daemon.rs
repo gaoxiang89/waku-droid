@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::attachments::AttachmentStore;
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    AgentSession, Checkpoint, CheckpointStatus, DriverEvent, Project, ProviderKind,
+    AgentSession, Checkpoint, CheckpointStatus, DriverEvent, Project, ProviderKind, ProviderProbe,
     ProviderResumeCursor, SessionStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
@@ -384,30 +384,13 @@ impl Backend for WakuBackend {
                 discover_models,
                 probe_version,
             } => {
-                let resolved_config_dir = self
-                    .validate_client_config_dir(provider, config_dir.as_deref())?
-                    .map(|validated| validated.resolved);
-                ensure_shell_environment();
-                let mut probe = match binary_override.as_deref() {
-                    override_value if discover_models || probe_version => {
-                        crate::model::provider_probe(provider, override_value)
-                    }
-                    override_value => crate::model::cached_provider_probe(provider, override_value),
-                };
-                let version = probe_version
-                    .then(|| {
-                        probe
-                            .path
-                            .as_deref()
-                            .and_then(crate::model::probe_provider_version)
-                    })
-                    .flatten();
-                if discover_models {
-                    probe = crate::model::discover_provider_models_in(
-                        probe,
-                        resolved_config_dir.as_deref(),
-                    );
-                }
+                let (probe, version) = self.probe_provider(
+                    provider,
+                    binary_override.as_deref(),
+                    config_dir.as_deref(),
+                    discover_models,
+                    probe_version,
+                )?;
                 Ok(ResponsePayload::ProviderProbe { probe, version })
             }
             Command::FetchPlanUsage {
@@ -471,12 +454,10 @@ impl Backend for WakuBackend {
                 ensure_shell_environment();
                 let rates = crate::usage_history::load_rate_table(&self.usage_rates_dir);
                 let account_dirs = self
-                    .settings
-                    .get()
-                    .provider_accounts
+                    .resolved_account_dirs()
                     .into_iter()
-                    .filter_map(|account| {
-                        let provider = match account.provider {
+                    .filter_map(|(provider, dir)| {
+                        let provider = match provider {
                             ProviderKind::Antigravity => {
                                 crate::usage_history::UsageProvider::Antigravity
                             }
@@ -484,7 +465,6 @@ impl Backend for WakuBackend {
                             ProviderKind::Codex => crate::usage_history::UsageProvider::Codex,
                             _ => return None,
                         };
-                        let dir = crate::command_env::resolve_config_dir(&account.config_dir)?;
                         Some((provider, dir))
                     })
                     .collect::<Vec<_>>();
@@ -497,13 +477,9 @@ impl Backend for WakuBackend {
                 );
                 Ok(ResponsePayload::UsageHistory { history })
             }
-            Command::LoadSkills { projects } => {
-                ensure_shell_environment();
-                let locations = crate::skills::skill_locations(&projects);
-                Ok(ResponsePayload::SkillsCatalog {
-                    catalog: crate::skills::scan_skills(&locations),
-                })
-            }
+            Command::LoadSkills { projects } => Ok(ResponsePayload::SkillsCatalog {
+                catalog: self.load_skills_catalog(&projects),
+            }),
             Command::SetSkillsEnabled { dirs, enabled } => {
                 for dir in dirs {
                     crate::skills::set_skill_enabled(&dir, enabled)
@@ -1027,7 +1003,12 @@ impl Backend for WakuBackend {
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
                 let (event_sender, event_receiver) = driver::event_channel(wake);
-                let handle = driver::start_local(provider, options, event_sender)?;
+                let handle = driver::start_local_with_attachment_roots(
+                    provider,
+                    options,
+                    self.attachment_roots(),
+                    event_sender,
+                )?;
                 let supports_steer = handle.supports_steer();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
@@ -1668,7 +1649,7 @@ impl WakuBackend {
 
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
-        let driver = driver::start_local(
+        let driver = driver::start_local_with_attachment_roots(
             source.provider,
             DriverStartOptions {
                 binary: self.provider_binary(source.provider, source.account_id.as_deref())?,
@@ -1683,6 +1664,7 @@ impl WakuBackend {
                 computer_use_enabled: false,
                 provider_cursor: source.provider_cursor.clone(),
             },
+            self.attachment_roots(),
             event_sender,
         )?;
         driver.fork(turns_to_remove)
@@ -1831,7 +1813,7 @@ impl WakuBackend {
 
         let (wake, _wake_events) = smol::channel::bounded(1);
         let (event_sender, _event_receiver) = driver::event_channel(wake);
-        let driver = driver::start_local(
+        let driver = driver::start_local_with_attachment_roots(
             source.provider,
             DriverStartOptions {
                 binary: binary.to_owned(),
@@ -1846,6 +1828,7 @@ impl WakuBackend {
                 computer_use_enabled: false,
                 provider_cursor: source.provider_cursor.clone(),
             },
+            self.attachment_roots(),
             event_sender,
         )?;
         driver.rollback(rollback_turns)
@@ -1963,6 +1946,68 @@ impl WakuBackend {
         // the echoed clones above still carry the saved detail.
         trim_resident_transcripts(&mut state, &active_runtimes.keys().copied().collect());
         Ok(sessions)
+    }
+
+    fn probe_provider(
+        &self,
+        provider: ProviderKind,
+        binary_override: Option<&str>,
+        config_dir: Option<&str>,
+        discover_models: bool,
+        probe_version: bool,
+    ) -> anyhow::Result<(ProviderProbe, Option<String>)> {
+        let resolved_config_dir = self
+            .validate_client_config_dir(provider, config_dir)?
+            .map(|validated| validated.resolved);
+        ensure_shell_environment();
+        let mut probe = initial_provider_probe(
+            provider,
+            binary_override,
+            resolved_config_dir.is_some(),
+            discover_models,
+            probe_version,
+        );
+        let version = probe_version
+            .then(|| {
+                probe
+                    .path
+                    .as_deref()
+                    .and_then(crate::model::probe_provider_version)
+            })
+            .flatten();
+        if discover_models {
+            probe = crate::model::discover_provider_models_in(
+                probe,
+                resolved_config_dir.as_deref(),
+            );
+        }
+        Ok((probe, version))
+    }
+
+    fn load_skills_catalog(&self, projects: &[(String, PathBuf)]) -> crate::skills::SkillsCatalog {
+        ensure_shell_environment();
+        let account_dirs = self.resolved_account_dirs();
+        let locations = crate::skills::skill_locations_for(projects, &account_dirs);
+        crate::skills::scan_skills(&locations)
+    }
+
+    fn attachment_roots(&self) -> Vec<PathBuf> {
+        let Some(data_dir) = self.task_store.path().parent() else {
+            return Vec::new();
+        };
+        vec![data_dir.join("blobs"), data_dir.join("attachments")]
+    }
+
+    fn resolved_account_dirs(&self) -> Vec<(ProviderKind, PathBuf)> {
+        self.settings
+            .get()
+            .provider_accounts
+            .into_iter()
+            .filter_map(|account| {
+                let dir = crate::command_env::resolve_config_dir(&account.config_dir)?;
+                Some((account.provider, dir))
+            })
+            .collect()
     }
 
     /// Validate a client-supplied `config_dir` string against the daemon's
@@ -2103,6 +2148,42 @@ impl WakuBackend {
 /// components resolve against the real filesystem. Non-existent paths reject
 /// `..` components and canonicalize the deepest existing ancestor before
 /// appending the remaining normal segments.
+fn initial_provider_probe(
+    provider: ProviderKind,
+    binary_override: Option<&str>,
+    has_config_dir: bool,
+    discover_models: bool,
+    probe_version: bool,
+) -> ProviderProbe {
+    initial_provider_probe_with(
+        provider,
+        binary_override,
+        has_config_dir,
+        discover_models,
+        probe_version,
+        crate::model::cached_provider_probe,
+        crate::model::provider_probe,
+    )
+}
+
+fn initial_provider_probe_with(
+    provider: ProviderKind,
+    binary_override: Option<&str>,
+    has_config_dir: bool,
+    discover_models: bool,
+    probe_version: bool,
+    cached_probe: fn(ProviderKind, Option<&str>) -> ProviderProbe,
+    fresh_probe: fn(ProviderKind, Option<&str>) -> ProviderProbe,
+) -> ProviderProbe {
+    // Never hydrate default-account disk-cached models when probing an isolated
+    // account (`config_dir.is_some()`).
+    if discover_models || probe_version || has_config_dir {
+        fresh_probe(provider, binary_override)
+    } else {
+        cached_probe(provider, binary_override)
+    }
+}
+
 fn normalize_config_dir_for_comparison(path: &Path) -> Option<PathBuf> {
     if path.as_os_str().is_empty()
         || !path.is_absolute()
@@ -3330,5 +3411,120 @@ mod tests {
             }
             other => panic!("unexpected cursor: {other:?}"),
         }
+    }
+
+    #[test]
+    fn probe_provider_bypasses_default_cache_when_config_dir_is_set() {
+        fn fake_cached(provider: ProviderKind, _override: Option<&str>) -> ProviderProbe {
+            ProviderProbe {
+                provider,
+                installed: true,
+                path: Some(PathBuf::from("agy")),
+                models: vec![waku_protocol::model::ProviderModel::new(
+                    "default-cached-model",
+                    "Default Cached",
+                )],
+                agent_presets: Vec::new(),
+                discovery_error: None,
+            }
+        }
+        fn fake_fresh(provider: ProviderKind, _override: Option<&str>) -> ProviderProbe {
+            ProviderProbe {
+                provider,
+                installed: true,
+                path: Some(PathBuf::from("agy")),
+                models: Vec::new(),
+                agent_presets: Vec::new(),
+                discovery_error: None,
+            }
+        }
+
+        let default_probe = initial_provider_probe_with(
+            ProviderKind::Antigravity,
+            None,
+            false,
+            false,
+            false,
+            fake_cached,
+            fake_fresh,
+        );
+        assert_eq!(default_probe.models.len(), 1);
+        assert_eq!(default_probe.models[0].id, "default-cached-model");
+
+        let isolated_probe = initial_provider_probe_with(
+            ProviderKind::Antigravity,
+            None,
+            true,
+            false,
+            false,
+            fake_cached,
+            fake_fresh,
+        );
+        assert!(isolated_probe.models.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("waku-daemon-probe-{}", Uuid::new_v4()));
+        let agy_work = dir.join("agy-work");
+        std::fs::create_dir_all(&agy_work).unwrap();
+        let settings_store = DaemonSettingsStore::open(dir.join("settings.json")).unwrap();
+        let mut settings = settings_store.get();
+        settings.provider_accounts = vec![waku_protocol::ProviderAccount {
+            id: "agy-1".into(),
+            provider: ProviderKind::Antigravity,
+            label: "Work".into(),
+            config_dir: agy_work.to_string_lossy().into_owned(),
+            binary_override: None,
+        }];
+        settings_store.replace(settings).unwrap();
+        let backend =
+            WakuBackend::new(settings_store, StateStore::daemon(dir.join("state.db"))).unwrap();
+        let (probe, version) = backend
+            .probe_provider(
+                ProviderKind::Antigravity,
+                None,
+                Some(&agy_work.to_string_lossy()),
+                false,
+                false,
+            )
+            .expect("probe provider with registered config_dir succeeds");
+        assert!(version.is_none());
+        assert_eq!(
+            probe.models,
+            crate::model_catalog::fallback_models(ProviderKind::Antigravity)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skills_discovers_antigravity_account_config_dir_skills() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-skills-{}", Uuid::new_v4()));
+        let agy_work = dir.join("agy-work");
+        let skill_name = format!("isolated-agy-skill-{}", Uuid::new_v4());
+        let skill_dir = agy_work.join("skills").join(&skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: Isolated account skill\n---\nSteps"),
+        )
+        .unwrap();
+
+        let settings_store = DaemonSettingsStore::open(dir.join("settings.json")).unwrap();
+        let mut settings = settings_store.get();
+        settings.provider_accounts = vec![waku_protocol::ProviderAccount {
+            id: "agy-1".into(),
+            provider: ProviderKind::Antigravity,
+            label: "Work".into(),
+            config_dir: agy_work.to_string_lossy().into_owned(),
+            binary_override: None,
+        }];
+        settings_store.replace(settings).unwrap();
+
+        let backend =
+            WakuBackend::new(settings_store, StateStore::daemon(dir.join("state.db"))).unwrap();
+        let catalog = backend.load_skills_catalog(&[]);
+        assert!(
+            catalog.skills.iter().any(|skill| skill.name == skill_name),
+            "isolated Antigravity skill {skill_name} missing from catalog"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

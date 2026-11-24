@@ -118,6 +118,8 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
 /// - Oh My Pi: the same layout under its own root — commands in
 ///   `.omp/commands` and `~/.omp/agent/commands`, skills in `.omp/skills`
 ///   and `~/.omp/agent/skills`.
+/// - Factory Droid: `.factory/commands` in the project and home, expanded by
+///   Waku, plus skills in `.factory/skills` and `~/.factory/skills`.
 /// - Amp registers commands through TypeScript plugins and Grok publishes no
 ///   file convention, so neither has a native command scan; Amp's skills in
 ///   `~/.config/agents/skills` are listed.
@@ -175,7 +177,22 @@ fn assemble_slash_commands(
     account_config_dir: Option<&Path>,
     cli_commands: Vec<SlashCommand>,
 ) -> Vec<SlashCommand> {
-    let home = dirs::home_dir();
+    assemble_slash_commands_with_home(
+        provider,
+        project_root,
+        account_config_dir,
+        dirs::home_dir(),
+        cli_commands,
+    )
+}
+
+fn assemble_slash_commands_with_home(
+    provider: ProviderKind,
+    project_root: &Path,
+    account_config_dir: Option<&Path>,
+    home: Option<PathBuf>,
+    cli_commands: Vec<SlashCommand>,
+) -> Vec<SlashCommand> {
     let claude_config_dir = account_config_dir
         .filter(|_| provider == ProviderKind::Claude)
         .map(Path::to_path_buf)
@@ -384,15 +401,28 @@ fn assemble_slash_commands(
                 );
             }
         }
-        // Factory Droid reads `.factory/skills` in addition to the shared
-        // `.agents/skills` tree scanned for every provider.
+        // Factory Droid reads `.factory/commands` (expanded by Waku) and
+        // `.factory/skills` in addition to the shared `.agents/skills` tree
+        // scanned for every provider.
         ProviderKind::Droid => {
+            scan_command_files(
+                &project_root.join(".factory/commands"),
+                CommandScope::Project,
+                true,
+                &mut commands,
+            );
             scan_skill_files(
                 provider,
                 &project_root.join(".factory/skills"),
                 &mut commands,
             );
             if let Some(home) = home.as_deref() {
+                scan_command_files(
+                    &home.join(".factory/commands"),
+                    CommandScope::User,
+                    true,
+                    &mut commands,
+                );
                 scan_skill_files(provider, &home.join(".factory/skills"), &mut commands);
             }
         }
@@ -459,8 +489,8 @@ pub fn merge_reported_commands(
             .iter_mut()
             .find(|command| command.name == report.name)
         {
-            if known.scope == CommandScope::Skill && known.template.is_none() {
-                known.scope = CommandScope::Builtin;
+            if known.scope == CommandScope::Waku {
+                continue;
             }
             if known.description.is_empty() {
                 known.description = report.description.clone();
@@ -1839,5 +1869,182 @@ mod tests {
                 < paths.iter().position(|p| *p == "src/deep/lib.rs").unwrap()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn droid_discovers_and_expands_factory_commands_and_skills() {
+        let root = std::env::temp_dir().join(format!(
+            "waku-droid-factory-commands-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let home = root.join("home");
+
+        std::fs::create_dir_all(project.join(".factory/commands/ops")).unwrap();
+        std::fs::create_dir_all(project.join(".factory/skills/project-skill")).unwrap();
+        std::fs::create_dir_all(home.join(".factory/commands")).unwrap();
+        std::fs::create_dir_all(home.join(".factory/skills/user-skill")).unwrap();
+
+        std::fs::write(
+            project.join(".factory/commands/review.md"),
+            "---\ndescription: Project review\nargument-hint: <target>\n---\nReview $ARGUMENTS carefully.",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".factory/commands/ops/check.md"),
+            "Check $1 before deploy.",
+        )
+        .unwrap();
+        // Non-markdown executable scripts must be skipped rather than expanded.
+        std::fs::write(
+            project.join(".factory/commands/deploy.sh"),
+            "#!/bin/sh\necho deploy\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".factory/commands/run-script"),
+            "#!/usr/bin/env bash\necho hi\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".factory/commands/review.md"),
+            "---\ndescription: User review\n---\nUser fallback $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".factory/commands/user-note.md"),
+            "---\ndescription: User note\n---\nSummarize $ARGUMENTS",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".factory/skills/project-skill/SKILL.md"),
+            "---\nname: project-skill\ndescription: Project Droid skill\n---\nInstructions",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".factory/skills/user-skill/SKILL.md"),
+            "---\nname: user-skill\ndescription: User Droid skill\n---\nInstructions",
+        )
+        .unwrap();
+
+        let commands = assemble_slash_commands_with_home(
+            ProviderKind::Droid,
+            &project,
+            None,
+            Some(home),
+            Vec::new(),
+        );
+
+        let review = commands
+            .iter()
+            .find(|command| command.name == "review")
+            .expect("project .factory/commands/review.md must be discovered");
+        assert_eq!(review.scope, CommandScope::Project);
+        assert_eq!(review.description, "Project review");
+        assert_eq!(review.argument_hint.as_deref(), Some("<target>"));
+        assert_eq!(
+            resolved_submission(ProviderKind::Droid, "/review auth flow", &commands).as_deref(),
+            Some("Review auth flow carefully.")
+        );
+
+        let ops_check = commands
+            .iter()
+            .find(|command| command.name == "ops:check")
+            .expect("nested .factory/commands/ops/check.md must be namespaced");
+        assert_eq!(ops_check.scope, CommandScope::Project);
+        assert_eq!(
+            resolved_submission(ProviderKind::Droid, "/ops:check api", &commands).as_deref(),
+            Some("Check api before deploy.")
+        );
+
+        let user_note = commands
+            .iter()
+            .find(|command| command.name == "user-note")
+            .expect("~/.factory/commands/user-note.md must be discovered");
+        assert_eq!(user_note.scope, CommandScope::User);
+        assert_eq!(
+            resolved_submission(ProviderKind::Droid, "/user-note diff", &commands).as_deref(),
+            Some("Summarize diff")
+        );
+
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command.name.as_str(), "deploy" | "deploy.sh" | "run-script")),
+            "non-markdown script files under .factory/commands must be ignored: {commands:?}"
+        );
+
+        for skill_name in ["project-skill", "user-skill"] {
+            let skill = commands
+                .iter()
+                .find(|command| command.name == skill_name)
+                .unwrap_or_else(|| panic!("missing Droid skill {skill_name}"));
+            assert_eq!(skill.scope, CommandScope::Skill);
+            assert!(skill.template.is_none());
+            assert_eq!(
+                resolved_submission(ProviderKind::Droid, &format!("/{skill_name} arg"), &commands),
+                None,
+                "Droid skills must pass through verbatim"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_reported_commands_preserves_skill_scope_and_protects_waku_resume() {
+        let discovered = vec![
+            SlashCommand {
+                name: "resume".into(),
+                description: "Resume terminal agent session".into(),
+                scope: CommandScope::Waku,
+                argument_hint: None,
+                template: None,
+            },
+            SlashCommand {
+                name: "factory-skill".into(),
+                description: String::new(),
+                scope: CommandScope::Skill,
+                argument_hint: None,
+                template: None,
+            },
+        ];
+        let reported = vec![
+            ReportedCommand {
+                name: "resume".into(),
+                description: "Provider resume description".into(),
+                argument_hint: Some("[session-id]".into()),
+            },
+            ReportedCommand {
+                name: "factory-skill".into(),
+                description: "Reported skill description".into(),
+                argument_hint: Some("[target]".into()),
+            },
+        ];
+
+        let merged = merge_reported_commands(&discovered, &reported);
+
+        let resume = merged
+            .iter()
+            .find(|command| command.name == "resume")
+            .expect("resume must remain in merged commands");
+        assert_eq!(resume.scope, CommandScope::Waku);
+        assert_eq!(resume.description, "Resume terminal agent session");
+        assert_eq!(
+            resume.argument_hint, None,
+            "Waku-reserved /resume must never inherit a provider argument_hint"
+        );
+
+        let skill = merged
+            .iter()
+            .find(|command| command.name == "factory-skill")
+            .expect("skill must remain in merged commands");
+        assert_eq!(
+            skill.scope,
+            CommandScope::Skill,
+            "ACP-reported skill must keep CommandScope::Skill instead of being downgraded to Builtin"
+        );
+        assert_eq!(skill.description, "Reported skill description");
+        assert_eq!(skill.argument_hint.as_deref(), Some("[target]"));
     }
 }

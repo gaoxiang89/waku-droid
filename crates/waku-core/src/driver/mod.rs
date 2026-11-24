@@ -208,9 +208,19 @@ pub struct SessionOptions {
     pub context_window: Option<String>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn start_local(
     provider: ProviderKind,
+    options: DriverStartOptions,
+    events: DriverEventSender,
+) -> anyhow::Result<DriverHandle> {
+    start_local_with_attachment_roots(provider, options, Vec::new(), events)
+}
+
+pub(crate) fn start_local_with_attachment_roots(
+    provider: ProviderKind,
     mut options: DriverStartOptions,
+    attachment_roots: Vec<PathBuf>,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
     // Computer Use is experimental, so release builds never start its helper
@@ -233,7 +243,12 @@ pub(crate) fn start_local(
         | ProviderKind::Fx
         | ProviderKind::Grok
         | ProviderKind::Kimi
-        | ProviderKind::Droid => Arc::new(acp::AcpDriver::start(provider, options, events)?),
+        | ProviderKind::Droid => Arc::new(acp::AcpDriver::start_with_attachment_roots(
+            provider,
+            options,
+            attachment_roots,
+            events,
+        )?),
         ProviderKind::DeepSeek => Arc::new(deepseek::DeepSeekDriver::start(options, events)?),
         // OpenCode is not a per-workspace server: one adopted background
         // service carries every workspace, and every Waku task rides its one

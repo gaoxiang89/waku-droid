@@ -1,6 +1,88 @@
 use super::notifications::{AppNotificationKind, AppNotificationTarget};
 use super::*;
 
+/// Merge a live activity update into the matching in-flight/existing activity
+/// (or append a new one), preserving a non-generic `kind` and meaningful
+/// `title` when follow-up updates carry generic `"Tool"` or empty fallbacks.
+///
+/// Returns the updated activity's id when `file_changes` were replaced so the
+/// caller can drop any cached diff rows for that activity.
+pub(super) fn upsert_session_activity(
+    session: &mut AgentSession,
+    item: ActivityItem,
+    continuing_work: bool,
+) -> Option<Uuid> {
+    for block in session.transcript_blocks.iter_mut().rev() {
+        let matching = block.activities.iter_mut().rev().find(|activity| {
+            item.source_id
+                .as_ref()
+                .is_some_and(|id| activity.source_id.as_ref() == Some(id))
+                || (item.source_id.is_none() && activity.title == item.title && !activity.complete)
+        });
+        if let Some(activity) = matching {
+            let has_arguments = item.arguments.is_some();
+            let replaces_changes = !item.file_changes.is_empty();
+            let activity_id = activity.id;
+            if item.kind != ActivityKind::Tool || activity.kind == ActivityKind::Tool {
+                activity.kind = item.kind;
+            }
+            let incoming_title = item.title.trim();
+            let incoming_is_generic_tool = incoming_title.eq_ignore_ascii_case("tool")
+                || incoming_title == tr!("activity.tool");
+            let existing_title = activity.title.trim();
+            let existing_is_meaningful = !existing_title.is_empty()
+                && !existing_title.eq_ignore_ascii_case("tool")
+                && existing_title != tr!("activity.tool");
+            if !incoming_title.is_empty()
+                && !(incoming_is_generic_tool && existing_is_meaningful)
+            {
+                activity.title = item.title;
+            }
+            if item.tool_name.is_some() {
+                activity.tool_name = item.tool_name;
+            }
+            if item.mcp_server.is_some() {
+                activity.mcp_server = item.mcp_server;
+            }
+            activity.complete = item.complete;
+            activity.failed = item.failed;
+            if item.detail.is_some() {
+                activity.detail = item.detail;
+            }
+            if item.arguments.is_some() {
+                activity.arguments = item.arguments;
+            }
+            if item.output.is_some() {
+                activity.output = item.output;
+            }
+            if !item.image_urls.is_empty() {
+                activity.image_urls = item.image_urls;
+            }
+            if !item.file_changes.is_empty() {
+                activity.file_changes = item.file_changes;
+            }
+            if item.display_target.is_some() && (activity.display_target.is_none() || has_arguments)
+            {
+                activity.display_target = item.display_target;
+            }
+            if item.display_description.is_some()
+                && (activity.display_description.is_none() || has_arguments)
+            {
+                activity.display_description = item.display_description;
+            }
+            if item.reasoning.is_some() {
+                activity.reasoning = item.reasoning;
+            }
+            session.updated_at = unix_time();
+            return replaces_changes.then_some(activity_id);
+        }
+    }
+
+    push_transcript_activity(session, item, continuing_work);
+    session.updated_at = unix_time();
+    None
+}
+
 impl Waku {
     pub(super) fn finish_streaming_assistant(&mut self, session_id: Uuid) {
         if let Some(session) = self.state.session_mut(session_id) {
@@ -150,71 +232,13 @@ impl Waku {
             previous_phase,
             Some(StreamPhase::Reasoning | StreamPhase::Activity)
         );
-        if let Some(session) = self.state.session_mut(session_id) {
-            for block in session.transcript_blocks.iter_mut().rev() {
-                let matching = block.activities.iter_mut().rev().find(|activity| {
-                    item.source_id
-                        .as_ref()
-                        .is_some_and(|id| activity.source_id.as_ref() == Some(id))
-                        || (item.source_id.is_none()
-                            && activity.title == item.title
-                            && !activity.complete)
-                });
-                if let Some(activity) = matching {
-                    let has_arguments = item.arguments.is_some();
-                    let replaces_changes = !item.file_changes.is_empty();
-                    let activity_id = activity.id;
-                    activity.kind = item.kind;
-                    activity.title = item.title;
-                    if item.tool_name.is_some() {
-                        activity.tool_name = item.tool_name;
-                    }
-                    if item.mcp_server.is_some() {
-                        activity.mcp_server = item.mcp_server;
-                    }
-                    activity.complete = item.complete;
-                    activity.failed = item.failed;
-                    if item.detail.is_some() {
-                        activity.detail = item.detail;
-                    }
-                    if item.arguments.is_some() {
-                        activity.arguments = item.arguments;
-                    }
-                    if item.output.is_some() {
-                        activity.output = item.output;
-                    }
-                    if !item.image_urls.is_empty() {
-                        activity.image_urls = item.image_urls;
-                    }
-                    if !item.file_changes.is_empty() {
-                        activity.file_changes = item.file_changes;
-                    }
-                    if item.display_target.is_some()
-                        && (activity.display_target.is_none() || has_arguments)
-                    {
-                        activity.display_target = item.display_target;
-                    }
-                    if item.display_description.is_some()
-                        && (activity.display_description.is_none() || has_arguments)
-                    {
-                        activity.display_description = item.display_description;
-                    }
-                    if item.reasoning.is_some() {
-                        activity.reasoning = item.reasoning;
-                    }
-                    session.updated_at = unix_time();
-                    runtime.stream_phase = Some(StreamPhase::Activity);
-                    if replaces_changes {
-                        // The rows this activity's diff was built from are gone;
-                        // an expanded card rebuilds from the new ones.
-                        self.activity_diffs.borrow_mut().remove(&activity_id);
-                    }
-                    return;
-                }
-            }
-
-            push_transcript_activity(session, item, continuing_work);
-            session.updated_at = unix_time();
+        if let Some(session) = self.state.session_mut(session_id)
+            && let Some(invalidated_diff_id) =
+                upsert_session_activity(session, item, continuing_work)
+        {
+            // The rows this activity's diff was built from are gone;
+            // an expanded card rebuilds from the new ones.
+            self.activity_diffs.borrow_mut().remove(&invalidated_diff_id);
         }
         runtime.stream_phase = Some(StreamPhase::Activity);
     }

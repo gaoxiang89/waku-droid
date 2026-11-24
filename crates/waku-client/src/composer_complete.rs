@@ -5,7 +5,7 @@ use std::ops::Range;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 pub use waku_protocol::composer::{CommandScope, FileEntry, SlashCommand};
-use waku_protocol::model::{ProviderKind, ProviderModelOption, ReportedCommand};
+use waku_protocol::model::{ProviderKind, ProviderModelOption, ReportedCommand, RuntimeMode};
 
 pub const FILTER_CAP: usize = 64;
 pub const FILE_INDEX_CAP: usize = 50_000;
@@ -63,8 +63,8 @@ pub fn merge_reported_commands(
             .iter_mut()
             .find(|command| command.name == report.name)
         {
-            if known.scope == CommandScope::Skill && known.template.is_none() {
-                known.scope = CommandScope::Builtin;
+            if known.scope == CommandScope::Waku {
+                continue;
             }
             if known.description.is_empty() {
                 known.description = report.description.clone();
@@ -250,6 +250,83 @@ pub fn parse_antigravity_local_command(
             Some(AntigravityLocalCommand::SetEffort(arguments.to_owned()))
         }
         "swarm" if arguments == "board" => Some(AntigravityLocalCommand::SwarmBoard),
+        _ => None,
+    }
+}
+
+/// A Factory Droid CLI-local slash command bridged directly by Waku without
+/// starting an ACP turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DroidLocalCommand {
+    /// Bare `/model` — open the model picker.
+    ModelPicker,
+    /// `/model <id-or-name>` (single token) — switch the session's model.
+    SetModel(String),
+    /// Bare `/reasoning` or `/effort` — display active reasoning effort and options.
+    EffortShow,
+    /// `/reasoning <level>` or `/effort <level>` (single token) — switch reasoning effort.
+    SetEffort(String),
+    /// Bare `/autonomy` — display active autonomy level and valid options.
+    AutonomyShow,
+    /// `/autonomy <level>` (single token) — switch the session's autonomy level.
+    SetAutonomy(String),
+    /// Bare `/new` or `/clear` — start a fresh Droid session in the same workspace.
+    NewSession,
+}
+
+impl DroidLocalCommand {
+    /// Whether confirming this command in the slash-command autocomplete popup
+    /// should execute immediately instead of inserting `/<name> ` for arguments.
+    pub fn executes_on_autocomplete_accept(&self) -> bool {
+        !matches!(self, Self::EffortShow | Self::AutonomyShow)
+    }
+}
+
+/// Parse the submitted text as a Factory Droid CLI-local command bridged by
+/// Waku. Returns `None` for other providers, multi-word prompts, or when a
+/// project/user/skill/template command overrides the name.
+pub fn parse_droid_local_command(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> Option<DroidLocalCommand> {
+    if provider != ProviderKind::Droid {
+        return None;
+    }
+    let invocation = prompt.trim().strip_prefix('/')?;
+    let (name, arguments) = invocation
+        .split_once(char::is_whitespace)
+        .map_or((invocation, ""), |(name, arguments)| {
+            (name, arguments.trim())
+        });
+    if command_is_overridden(name, arguments, commands) {
+        return None;
+    }
+    match name {
+        "model" if arguments.is_empty() => Some(DroidLocalCommand::ModelPicker),
+        "model" if !arguments.chars().any(char::is_whitespace) => {
+            Some(DroidLocalCommand::SetModel(arguments.to_owned()))
+        }
+        "reasoning" | "effort" if arguments.is_empty() => Some(DroidLocalCommand::EffortShow),
+        "reasoning" | "effort" if !arguments.chars().any(char::is_whitespace) => {
+            Some(DroidLocalCommand::SetEffort(arguments.to_owned()))
+        }
+        "autonomy" if arguments.is_empty() => Some(DroidLocalCommand::AutonomyShow),
+        "autonomy" if !arguments.chars().any(char::is_whitespace) => {
+            Some(DroidLocalCommand::SetAutonomy(arguments.to_owned()))
+        }
+        "new" | "clear" if arguments.is_empty() => Some(DroidLocalCommand::NewSession),
+        _ => None,
+    }
+}
+
+/// Map a Factory Droid autonomy level or alias to Waku's [`RuntimeMode`].
+pub fn resolve_droid_autonomy_mode(query: &str) -> Option<RuntimeMode> {
+    match query.trim().to_ascii_lowercase().as_str() {
+        "normal" | "ask" | "supervised" => Some(RuntimeMode::Ask),
+        "auto-low" | "low" | "edits" => Some(RuntimeMode::AutoAcceptEdits),
+        "auto-medium" | "medium" | "auto" => Some(RuntimeMode::Auto),
+        "auto-high" | "high" | "full" | "full-access" => Some(RuntimeMode::FullAccess),
         _ => None,
     }
 }
@@ -823,8 +900,9 @@ mod tests {
             ),
             Some(AntigravityLocalCommand::SwarmBoard)
         );
-        // Live ACP report promotes Skill -> Builtin when template is absent.
-        let promoted = merge_reported_commands(
+        // Live ACP report preserves Skill scope while backfilling metadata,
+        // and `/swarm board` still parses cleanly.
+        let merged = merge_reported_commands(
             &[skill_swarm],
             &[ReportedCommand {
                 name: "swarm".into(),
@@ -832,11 +910,182 @@ mod tests {
                 argument_hint: Some("<task>".into()),
             }],
         );
-        assert_eq!(promoted[0].scope, CommandScope::Builtin);
+        assert_eq!(merged[0].scope, CommandScope::Skill);
+        assert_eq!(merged[0].description, "Run a swarm");
+        assert_eq!(merged[0].argument_hint.as_deref(), Some("<task>"));
+        assert_eq!(
+            parse_antigravity_local_command(ProviderKind::Antigravity, "/swarm board", &merged),
+            Some(AntigravityLocalCommand::SwarmBoard)
+        );
 
         assert!(!AntigravityLocalCommand::EffortShow.executes_on_autocomplete_accept());
         assert!(AntigravityLocalCommand::Usage.executes_on_autocomplete_accept());
         assert!(AntigravityLocalCommand::ModelPicker.executes_on_autocomplete_accept());
         assert!(AntigravityLocalCommand::SwarmBoard.executes_on_autocomplete_accept());
+    }
+
+    #[test]
+    fn merge_reported_commands_preserves_skill_scope_and_protects_waku_resume() {
+        let mut resume = command("resume", CommandScope::Waku);
+        resume.description = "Resume terminal agent session".into();
+        let skill = command("factory-skill", CommandScope::Skill);
+
+        let merged = merge_reported_commands(
+            &[resume, skill],
+            &[
+                ReportedCommand {
+                    name: "resume".into(),
+                    description: "Provider resume".into(),
+                    argument_hint: Some("[session-id]".into()),
+                },
+                ReportedCommand {
+                    name: "factory-skill".into(),
+                    description: "Skill from ACP".into(),
+                    argument_hint: Some("[target]".into()),
+                },
+            ],
+        );
+
+        let merged_resume = merged
+            .iter()
+            .find(|command| command.name == "resume")
+            .expect("resume must remain present");
+        assert_eq!(merged_resume.scope, CommandScope::Waku);
+        assert_eq!(merged_resume.description, "Resume terminal agent session");
+        assert_eq!(merged_resume.argument_hint, None);
+
+        let merged_skill = merged
+            .iter()
+            .find(|command| command.name == "factory-skill")
+            .expect("skill must remain present");
+        assert_eq!(merged_skill.scope, CommandScope::Skill);
+        assert_eq!(merged_skill.description, "Skill from ACP");
+        assert_eq!(merged_skill.argument_hint.as_deref(), Some("[target]"));
+    }
+
+    #[test]
+    fn droid_local_commands_parse_cleanly() {
+        let builtins = [
+            command("model", CommandScope::Builtin),
+            command("reasoning", CommandScope::Builtin),
+            command("effort", CommandScope::Builtin),
+            command("autonomy", CommandScope::Builtin),
+            command("new", CommandScope::Builtin),
+            command("clear", CommandScope::Builtin),
+        ];
+        let parse =
+            |prompt: &str| parse_droid_local_command(ProviderKind::Droid, prompt, &builtins);
+
+        assert_eq!(parse("/model"), Some(DroidLocalCommand::ModelPicker));
+        assert_eq!(parse("  /model  "), Some(DroidLocalCommand::ModelPicker));
+        assert_eq!(
+            parse("/model claude-sonnet-4-5"),
+            Some(DroidLocalCommand::SetModel("claude-sonnet-4-5".into()))
+        );
+        assert_eq!(parse("/model switch to fast please"), None);
+
+        assert_eq!(parse("/reasoning"), Some(DroidLocalCommand::EffortShow));
+        assert_eq!(parse("/effort"), Some(DroidLocalCommand::EffortShow));
+        assert_eq!(
+            parse("/reasoning high"),
+            Some(DroidLocalCommand::SetEffort("high".into()))
+        );
+        assert_eq!(
+            parse("/effort medium"),
+            Some(DroidLocalCommand::SetEffort("medium".into()))
+        );
+        assert_eq!(parse("/effort very high"), None);
+
+        assert_eq!(parse("/autonomy"), Some(DroidLocalCommand::AutonomyShow));
+        assert_eq!(
+            parse("/autonomy auto-medium"),
+            Some(DroidLocalCommand::SetAutonomy("auto-medium".into()))
+        );
+        assert_eq!(parse("/autonomy auto medium"), None);
+
+        assert_eq!(parse("/new"), Some(DroidLocalCommand::NewSession));
+        assert_eq!(parse("/clear"), Some(DroidLocalCommand::NewSession));
+        assert_eq!(parse("  /clear  "), Some(DroidLocalCommand::NewSession));
+        assert_eq!(parse("/new extra"), None);
+        assert_eq!(parse("/clear extra"), None);
+        assert_eq!(parse("please /clear"), None);
+
+        // Works even before slash-command discovery has populated the index.
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Droid, "/model", &[]),
+            Some(DroidLocalCommand::ModelPicker)
+        );
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Droid, "/autonomy auto-high", &[]),
+            Some(DroidLocalCommand::SetAutonomy("auto-high".into()))
+        );
+
+        assert!(DroidLocalCommand::ModelPicker.executes_on_autocomplete_accept());
+        assert!(DroidLocalCommand::SetModel("x".into()).executes_on_autocomplete_accept());
+        assert!(!DroidLocalCommand::EffortShow.executes_on_autocomplete_accept());
+        assert!(DroidLocalCommand::SetEffort("high".into()).executes_on_autocomplete_accept());
+        assert!(!DroidLocalCommand::AutonomyShow.executes_on_autocomplete_accept());
+        assert!(DroidLocalCommand::SetAutonomy("normal".into()).executes_on_autocomplete_accept());
+        assert!(DroidLocalCommand::NewSession.executes_on_autocomplete_accept());
+    }
+
+    #[test]
+    fn droid_local_commands_are_provider_scoped_and_respect_overrides() {
+        let builtins = [command("model", CommandScope::Builtin)];
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Claude, "/model", &builtins),
+            None
+        );
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Antigravity, "/autonomy", &[]),
+            None
+        );
+
+        let mut project = command("model", CommandScope::Project);
+        project.template = Some("custom model prompt".into());
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Droid, "/model", std::slice::from_ref(&project)),
+            None
+        );
+
+        let user = command("autonomy", CommandScope::User);
+        assert_eq!(
+            parse_droid_local_command(
+                ProviderKind::Droid,
+                "/autonomy auto-low",
+                std::slice::from_ref(&user),
+            ),
+            None
+        );
+
+        let skill = command("clear", CommandScope::Skill);
+        assert_eq!(
+            parse_droid_local_command(ProviderKind::Droid, "/clear", std::slice::from_ref(&skill)),
+            None
+        );
+    }
+
+    #[test]
+    fn droid_autonomy_mode_aliases_resolve_case_insensitively() {
+        for alias in ["normal", "NORMAL", "ask", "Supervised", "  normal  "] {
+            assert_eq!(resolve_droid_autonomy_mode(alias), Some(RuntimeMode::Ask));
+        }
+        for alias in ["auto-low", "AUTO-LOW", "low", "edits"] {
+            assert_eq!(
+                resolve_droid_autonomy_mode(alias),
+                Some(RuntimeMode::AutoAcceptEdits)
+            );
+        }
+        for alias in ["auto-medium", "Auto-Medium", "medium", "auto"] {
+            assert_eq!(resolve_droid_autonomy_mode(alias), Some(RuntimeMode::Auto));
+        }
+        for alias in ["auto-high", "AUTO-HIGH", "high", "full", "full-access"] {
+            assert_eq!(
+                resolve_droid_autonomy_mode(alias),
+                Some(RuntimeMode::FullAccess)
+            );
+        }
+        assert_eq!(resolve_droid_autonomy_mode(""), None);
+        assert_eq!(resolve_droid_autonomy_mode("unknown"), None);
     }
 }

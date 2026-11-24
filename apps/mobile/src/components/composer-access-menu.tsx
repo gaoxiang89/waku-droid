@@ -16,7 +16,7 @@ const MODE_ICONS = {
 } as const;
 
 /** Non-iOS fallback. iOS replaces this with a native anchored menu. */
-export function ComposerAccessMenu({ mode, onApply }: ComposerAccessMenuProps) {
+export function ComposerAccessMenu({ mode, provider, onApply }: ComposerAccessMenuProps) {
   const theme = useTheme();
   const [open, setOpen] = useState(false);
 
@@ -33,6 +33,7 @@ export function ComposerAccessMenu({ mode, onApply }: ComposerAccessMenuProps) {
         mode={mode}
         onApply={onApply}
         onDismiss={() => setOpen(false)}
+        provider={provider}
         visible={open}
       />
     </>

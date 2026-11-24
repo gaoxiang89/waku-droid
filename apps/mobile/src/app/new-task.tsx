@@ -434,6 +434,7 @@ export default function NewTaskScreen() {
               <ComposerAccessMenu
                 mode={runtimeMode}
                 onApply={setRuntimeMode}
+                provider={provider ?? undefined}
               />
             </>
           )}

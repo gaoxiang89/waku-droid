@@ -40,8 +40,8 @@ import {
   formatDuration,
   formatMessageTime,
   formatWorkingElapsed,
-  providerTurnsThrough,
   reasoningTitle,
+  responseForkTurnCount,
   shouldVirtualizeActivityText,
   turnAnswerStart,
   turnFoldLabel,
@@ -703,27 +703,6 @@ function buildTranscriptItems(
   }
   items.push({ kind: 'tail', key: 'tail' })
   return items
-}
-
-function responseForkTurnCount(
-  session: AgentSession,
-  message: AgentSession['messages'][number],
-  footer: AssistantResponseFooter | null,
-  turn?: AgentSession['turns'][number],
-): number | null {
-  if (
-    !footer
-    || message.role !== 'assistant'
-    || !['idle', 'failed'].includes(session.status)
-    || !turn?.provider_turn_started
-  ) return null
-  // A fork through turns the current agent never ran starts a fresh native
-  // conversation, so only a fork that keeps some of its turns needs its cursor.
-  if (
-    providerTurnsThrough(session, turn.turn_count) > 0
-    && session.provider_cursor?.provider !== session.provider
-  ) return null
-  return turn.turn_count
 }
 
 function TranscriptItemView({
@@ -1522,7 +1501,12 @@ function ActivityRow({
     updateDetailEdges(viewport)
   }, [activity.complete, expanded, scrollContent, updateDetailEdges])
   return (
-    <div className="min-w-0 overflow-hidden rounded-[9px] border bg-[var(--activity-surface)]">
+    <div
+      className={cn(
+        'min-w-0 overflow-hidden rounded-[9px] border bg-[var(--activity-surface)]',
+        activity.failed && 'border-destructive/45',
+      )}
+    >
       <div className="flex h-7 w-full min-w-0 items-center">
         <button
           aria-expanded={hasDetail ? expanded : undefined}
@@ -1535,12 +1519,27 @@ function ActivityRow({
           type="button"
           onClick={() => setExpanded((value) => !value)}
         >
-          <WakuIcon className="size-3 shrink-0 text-[var(--text-tertiary)]" name={iconName} />
-          <span className="shrink-0 font-semibold text-[var(--text-secondary)]">{actionLabel}</span>
-          {rowDetail && (
+          <WakuIcon
+            className={cn(
+              'size-3 shrink-0',
+              activity.failed ? 'text-destructive' : 'text-[var(--text-tertiary)]',
+            )}
+            name={iconName}
+          />
+          <span
+            className={cn(
+              'shrink-0 font-semibold',
+              activity.failed ? 'text-destructive' : 'text-[var(--text-secondary)]',
+            )}
+          >
+            {actionLabel}
+          </span>
+          {rowDetail ? (
             <span className="min-w-0 flex-1 truncate text-[var(--text-secondary)]">
               {rowDetail}
             </span>
+          ) : (
+            <span className="flex-1" />
           )}
           {fileStats && (
             <>
@@ -1548,7 +1547,13 @@ function ActivityRow({
               <span className="shrink-0 text-destructive">-{fileStats.deletions}</span>
             </>
           )}
-          <ActivityState activity={activity} expanded={expanded} hasDetail={hasDetail} t={t} />
+          <ActivityState
+            activity={activity}
+            backgroundWorkStatus={backgroundWork && onOpenBackgroundWork ? backgroundWork.status : undefined}
+            expanded={expanded}
+            hasDetail={hasDetail}
+            t={t}
+          />
         </button>
         {backgroundWork && onOpenBackgroundWork && (
           <button
@@ -1761,20 +1766,50 @@ function ActivitySectionText({
 
 function ActivityState({
   activity,
+  backgroundWorkStatus,
   expanded,
   hasDetail,
   t,
 }: {
   activity: ActivityItem
+  backgroundWorkStatus?: BackgroundWorkStatus
   expanded: boolean
   hasDetail: boolean
   t: Translator
 }) {
-  if (hasDetail) return <WakuIcon className="size-2.5 text-[var(--text-tertiary)]" name={expanded ? 'chevronDown' : 'chevronRight'} />
-  if (activity.reasoning) return null
-  if (activity.failed) return <WakuIcon label={t('background.status.failed')} className="size-3 text-destructive" name="alert" />
-  if (activity.complete) return null
-  return <span aria-label={t('background.status.running')} className="size-1.5 rounded-full bg-ring motion-safe:animate-pulse" role="img" />
+  const status = activity.reasoning
+    ? null
+    : activity.failed ? (
+      backgroundWorkStatus === 'failed' ? null : (
+        <span className="inline-flex h-[18px] shrink-0 items-center gap-1 rounded-[4px] bg-destructive/10 px-1.5 text-[11px] font-medium text-destructive">
+          <WakuIcon className="size-2.5 shrink-0" name="alert" />
+          <span>{t('background.status.failed')}</span>
+        </span>
+      )
+    ) : !activity.complete ? (
+      backgroundWorkStatus === 'running' ? null : (
+        <span
+          aria-label={t('background.status.running')}
+          className="size-1.5 shrink-0 rounded-full bg-ring motion-safe:animate-pulse"
+          role="img"
+        />
+      )
+    ) : null
+
+  const chevron = hasDetail ? (
+    <WakuIcon
+      className="size-2.5 shrink-0 text-[var(--text-tertiary)]"
+      name={expanded ? 'chevronDown' : 'chevronRight'}
+    />
+  ) : null
+
+  if (!status && !chevron) return null
+  return (
+    <span className="flex shrink-0 items-center gap-1.5">
+      {status}
+      {chevron}
+    </span>
+  )
 }
 
 function ChangedFilesCard({

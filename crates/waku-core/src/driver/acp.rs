@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,8 +33,8 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileResponse,
 };
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
-    UntypedMessage,
+    AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, Handled, LineDirection,
+    Responder, UntypedMessage,
 };
 use anyhow::{Context as _, anyhow};
 use base64::Engine as _;
@@ -55,6 +55,12 @@ use waku_protocol::model_catalog::{
     CursorModelSelection, cursor_suffix_has, normalize_cursor_reasoning_effort,
     resolve_cursor_model,
 };
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PromptKind {
+    Turn,
+    Steer,
+}
 
 enum CommandMessage {
     Prompt(String),
@@ -86,13 +92,48 @@ enum CommandMessage {
     /// The provider no longer has the native session a prompt was sent to;
     /// start a fresh one and resend the prompt. Raised internally by the
     /// prompt callback, never by the handle.
-    RecoverLostSession(String),
+    RecoverLostSession {
+        failed_session_id: String,
+        text: String,
+    },
     Shutdown,
 }
 
 /// How long `apply_options` waits for the agent to accept a live access-mode
 /// switch before asking the app to restart the session instead.
 const MODE_SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
+const ACP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const ACP_CANCEL_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy)]
+struct AcpTimeouts {
+    request: Duration,
+    cancel: Duration,
+}
+
+impl Default for AcpTimeouts {
+    fn default() -> Self {
+        Self {
+            request: ACP_REQUEST_TIMEOUT,
+            cancel: ACP_CANCEL_TIMEOUT,
+        }
+    }
+}
+
+async fn await_acp_request<T>(
+    future: impl std::future::Future<Output = agent_client_protocol::Result<T>>,
+    timeout: Duration,
+    label: &str,
+) -> agent_client_protocol::Result<T> {
+    smol::future::race(future, async {
+        smol::Timer::after(timeout).await;
+        Err(agent_client_protocol::util::internal_error(format!(
+            "{label} timed out after {}s",
+            timeout.as_secs()
+        )))
+    })
+    .await
+}
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
@@ -179,6 +220,15 @@ impl AcpDriver {
         options: DriverStartOptions,
         events: DriverEventSender,
     ) -> anyhow::Result<Self> {
+        Self::start_with_attachment_roots(provider, options, daemon_attachment_roots(), events)
+    }
+
+    pub fn start_with_attachment_roots(
+        provider: ProviderKind,
+        options: DriverStartOptions,
+        attachment_roots: Vec<PathBuf>,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -257,6 +307,7 @@ impl AcpDriver {
                     agent,
                     provider,
                     cwd,
+                    attachment_roots,
                     mode,
                     model,
                     reasoning_effort,
@@ -657,6 +708,10 @@ impl PendingPrompts {
         self.0.remove(index);
         self.0.is_empty()
     }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 type PendingPromptRequests = Arc<Mutex<PendingPrompts>>;
@@ -883,6 +938,18 @@ impl UnsolicitedTurnState {
         was_active
     }
 
+    fn prepare_settle(&mut self, expected_generation: u64, has_in_flight_work: bool) -> bool {
+        if !self.active || self.generation != expected_generation {
+            return false;
+        }
+        if has_in_flight_work {
+            self.settle_at = None;
+            return false;
+        }
+        self.settle_at = None;
+        true
+    }
+
     fn try_settle(&mut self, expected_generation: u64, has_in_flight_work: bool) -> bool {
         if !self.active || self.generation != expected_generation {
             return false;
@@ -907,6 +974,7 @@ async fn run_sdk_connection(
     agent: ProviderAgent,
     provider: ProviderKind,
     cwd: std::path::PathBuf,
+    attachment_roots: Vec<PathBuf>,
     mode: RuntimeMode,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -921,6 +989,53 @@ async fn run_sdk_connection(
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
+    run_sdk_connection_with(
+        agent,
+        provider,
+        cwd,
+        attachment_roots,
+        mode,
+        model,
+        reasoning_effort,
+        service_tier,
+        context_window,
+        resume_session_id,
+        fork_context,
+        config_dir,
+        acp_mcp_servers,
+        computer_use_instructions,
+        grok_title_home,
+        commands,
+        events,
+        AcpTimeouts::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sdk_connection_with<A>(
+    agent: A,
+    provider: ProviderKind,
+    cwd: std::path::PathBuf,
+    attachment_roots: Vec<PathBuf>,
+    mode: RuntimeMode,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    context_window: Option<String>,
+    resume_session_id: Option<String>,
+    fork_context: Option<String>,
+    config_dir: Option<std::path::PathBuf>,
+    acp_mcp_servers: Vec<McpServer>,
+    computer_use_instructions: Option<String>,
+    grok_title_home: Option<std::path::PathBuf>,
+    commands: smol::channel::Receiver<CommandMessage>,
+    events: DriverEventSender,
+    timeouts: AcpTimeouts,
+) -> agent_client_protocol::Result<()>
+where
+    A: ConnectTo<Client> + 'static,
+{
     let suppress_session_updates = Arc::new(ReplaySuppression::default());
     let terminals = Arc::new(AcpTerminalRegistry::default());
     let stream_state = Arc::new(Mutex::new(AcpStreamState {
@@ -1028,7 +1143,7 @@ async fn run_sdk_connection(
                         let mut state = stream_state.lock();
                         handle_session_update(provider, notification, &events, &mut state)?;
                         (
-                            !state.tools.is_empty(),
+                            state.has_in_flight_tools(),
                             state.last_completed_tool_name.take(),
                         )
                     };
@@ -1318,14 +1433,18 @@ async fn run_sdk_connection(
                 meta.insert("parameterizedModelPicker".to_owned(), Value::Bool(true));
                 client_capabilities = client_capabilities.meta(meta);
             }
-            let initialize = connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(client_capabilities)
-                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
-                )
-                .block_task()
-                .await?;
+            let initialize = await_acp_request(
+                connection
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1)
+                            .client_capabilities(client_capabilities)
+                            .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .block_task(),
+                timeouts.request,
+                "ACP initialize",
+            )
+            .await?;
             let prompt_capabilities = initialize.agent_capabilities.prompt_capabilities.clone();
             let supports_fork = initialize
                 .agent_capabilities
@@ -1340,6 +1459,7 @@ async fn run_sdk_connection(
                 &cwd,
                 &acp_mcp_servers,
                 &suppress_session_updates,
+                timeouts.request,
             )
             .await?;
             *session_modes.lock() = modes.clone();
@@ -1349,14 +1469,18 @@ async fn run_sdk_connection(
                 // Mode selection is opportunistic: an agent can advertise a
                 // mode but reject a later transition without invalidating the
                 // session itself.
-                if connection
-                    .send_request(SetSessionModeRequest::new(
-                        session_id.clone(),
-                        mode_id.clone(),
-                    ))
-                    .block_task()
-                    .await
-                    .is_ok()
+                if await_acp_request(
+                    connection
+                        .send_request(SetSessionModeRequest::new(
+                            session_id.clone(),
+                            mode_id.clone(),
+                        ))
+                        .block_task(),
+                    timeouts.request,
+                    "ACP session/set_mode",
+                )
+                .await
+                .is_ok()
                     && let Some(state) = session_modes.lock().as_mut()
                 {
                     state.current_mode_id = mode_id;
@@ -1364,7 +1488,14 @@ async fn run_sdk_connection(
             }
             if provider == ProviderKind::Droid {
                 let current = config_options.lock().clone();
-                match apply_droid_autonomy(&connection, &session_id, current.as_deref(), mode).await
+                match apply_droid_autonomy(
+                    &connection,
+                    &session_id,
+                    current.as_deref(),
+                    mode,
+                    timeouts.request,
+                )
+                .await
                 {
                     Ok(updated) => store_config_options(&config_options, updated),
                     Err(error) => {
@@ -1380,6 +1511,18 @@ async fn run_sdk_connection(
                 droid_autonomy_ready.store(true, Ordering::Release);
             }
             let mut native_session_id = session_id.to_string();
+            let antigravity_step_offset = Arc::new(AtomicI64::new(
+                if provider == ProviderKind::Antigravity {
+                    let sid = native_session_id.clone();
+                    let cfg = config_dir.clone();
+                    smol::unblock(move || {
+                        crate::antigravity_session::step_offset_in(&sid, cfg.as_deref())
+                    })
+                    .await
+                } else {
+                    -1
+                },
+            ));
             let _ = events.send(DriverEvent::Connected {
                 provider_cursor: Some(ProviderResumeCursor::from_session_id(
                     provider,
@@ -1401,6 +1544,7 @@ async fn run_sdk_connection(
                 current_tier.as_deref(),
                 current_window.as_deref(),
                 &events,
+                timeouts.request,
             )
             .await;
             let mut fork_context = fork_context;
@@ -1409,14 +1553,19 @@ async fn run_sdk_connection(
             // `commands`: a clone of the handle's sender would keep this loop
             // alive after the handle is dropped.
             let (recovery_tx, recovery_rx) = smol::channel::unbounded::<CommandMessage>();
+            let mut cancel_deadline: Option<Instant> = None;
 
             enum LoopEvent {
                 Command(Option<CommandMessage>),
                 Wake,
                 SettleUnsolicited(u64),
+                CancelTimeout,
             }
 
             loop {
+                if cancel_deadline.is_some() && prompt_requests.lock().is_empty() {
+                    cancel_deadline = None;
+                }
                 let settle_target = unsolicited_turn.lock().settle_at;
                 let event = smol::future::or(
                     smol::future::or(
@@ -1431,23 +1580,96 @@ async fn run_sdk_connection(
                                 std::future::pending().await
                             }
                         },
-                        async {
-                            match settle_target {
-                                Some((deadline, generation)) => {
-                                    smol::Timer::at(deadline).await;
-                                    LoopEvent::SettleUnsolicited(generation)
+                        smol::future::or(
+                            async {
+                                match settle_target {
+                                    Some((deadline, generation)) => {
+                                        smol::Timer::at(deadline).await;
+                                        LoopEvent::SettleUnsolicited(generation)
+                                    }
+                                    None => std::future::pending().await,
                                 }
-                                None => std::future::pending().await,
-                            }
-                        },
+                            },
+                            async {
+                                match cancel_deadline {
+                                    Some(deadline) => {
+                                        smol::Timer::at(deadline).await;
+                                        LoopEvent::CancelTimeout
+                                    }
+                                    None => std::future::pending().await,
+                                }
+                            },
+                        ),
                     ),
                 )
                 .await;
                 let command = match event {
                     LoopEvent::Wake => continue,
+                    LoopEvent::CancelTimeout => {
+                        cancel_deadline = None;
+                        if !prompt_requests.lock().is_empty() {
+                            prompt_requests.lock().clear();
+                            stream_state.lock().tools.clear();
+                            if provider == ProviderKind::Antigravity {
+                                let sid = native_session_id.clone();
+                                let cfg = config_dir.clone();
+                                let next_offset = smol::unblock(move || {
+                                    crate::antigravity_session::step_offset_in(&sid, cfg.as_deref())
+                                })
+                                .await;
+                                antigravity_step_offset.store(next_offset, Ordering::Release);
+                            }
+                            let _ = events.send(DriverEvent::Error(format!(
+                                "{} ACP session/cancel timed out",
+                                provider.display_name()
+                            )));
+                            let _ = events.send(DriverEvent::TurnFinished {
+                                success: false,
+                                summary: None,
+                            });
+                            // Tear down the wedged ACP connection so lingering server output
+                            // from the cancelled turn cannot desync future prompts or open
+                            // spurious unsolicited turns.
+                            break;
+                        }
+                        continue;
+                    }
                     LoopEvent::SettleUnsolicited(generation) => {
                         let has_in_flight_work = !prompt_requests.lock().is_empty()
-                            || !stream_state.lock().tools.is_empty()
+                            || stream_state.lock().has_in_flight_tools()
+                            || !pending_permissions.lock().is_empty()
+                            || !pending_user_inputs.lock().is_empty();
+                        if !unsolicited_turn
+                            .lock()
+                            .prepare_settle(generation, has_in_flight_work)
+                        {
+                            continue;
+                        }
+                        let produced_content = stream_state.lock().produced_content;
+                        let native_outcome = if provider == ProviderKind::Antigravity {
+                            let offset = antigravity_step_offset.load(Ordering::Acquire);
+                            let stop_reason = produced_content.then_some(StopReason::EndTurn);
+                            let failure = resolve_native_turn_failure(
+                                None,
+                                Some(offset),
+                                native_session_id.clone(),
+                                config_dir.clone(),
+                                produced_content,
+                                stop_reason,
+                            )
+                            .await;
+                            let sid = native_session_id.clone();
+                            let cfg = config_dir.clone();
+                            let next_offset = smol::unblock(move || {
+                                crate::antigravity_session::step_offset_in(&sid, cfg.as_deref())
+                            })
+                            .await;
+                            Some((failure, next_offset))
+                        } else {
+                            None
+                        };
+                        let has_in_flight_work = !prompt_requests.lock().is_empty()
+                            || stream_state.lock().has_in_flight_tools()
                             || !pending_permissions.lock().is_empty()
                             || !pending_user_inputs.lock().is_empty();
                         if unsolicited_turn
@@ -1455,10 +1677,22 @@ async fn run_sdk_connection(
                             .try_settle(generation, has_in_flight_work)
                         {
                             stream_state.lock().tools.clear();
-                            let _ = events.send(DriverEvent::TurnFinished {
-                                success: true,
-                                summary: None,
-                            });
+                            if let Some((Some(failure), next_offset)) = native_outcome {
+                                antigravity_step_offset.store(next_offset, Ordering::Release);
+                                let _ = events.send(DriverEvent::Error(failure));
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                            } else {
+                                if let Some((None, next_offset)) = native_outcome {
+                                    antigravity_step_offset.store(next_offset, Ordering::Release);
+                                }
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: true,
+                                    summary: None,
+                                });
+                            }
                         }
                         continue;
                     }
@@ -1466,7 +1700,49 @@ async fn run_sdk_connection(
                     LoopEvent::Command(None) => break,
                 };
                 match command {
-                    CommandMessage::RecoverLostSession(text) => {
+                    CommandMessage::RecoverLostSession {
+                        failed_session_id,
+                        text,
+                    } => {
+                        cancel_deadline = None;
+                        if failed_session_id != native_session_id {
+                            // Another in-flight request (e.g. the primary Turn
+                            // before a Steer) already established a fresh
+                            // session; resend on that session without creating
+                            // a duplicate or wiping active stream state.
+                            let resend_kind = if !prompt_requests.lock().is_empty() {
+                                PromptKind::Steer
+                            } else {
+                                PromptKind::Turn
+                            };
+                            if let Err(error) = send_prompt(
+                                &connection,
+                                &session_id,
+                                text,
+                                &cwd,
+                                &attachment_roots,
+                                &prompt_capabilities,
+                                &prompt_requests,
+                                &events,
+                                provider,
+                                &native_session_id,
+                                config_dir.clone(),
+                                grok_title_home.clone(),
+                                title_refresh.clone(),
+                                stream_state.clone(),
+                                None,
+                                resend_kind,
+                                Some(antigravity_step_offset.clone()),
+                            ) && prompt_requests.lock().is_empty()
+                            {
+                                let _ = events.send(DriverEvent::Error(error.to_string()));
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                            }
+                            continue;
+                        }
                         match establish_session(
                             &connection,
                             provider,
@@ -1475,6 +1751,7 @@ async fn run_sdk_connection(
                             &cwd,
                             &acp_mcp_servers,
                             &suppress_session_updates,
+                            timeouts.request,
                         )
                         .await
                         {
@@ -1483,18 +1760,34 @@ async fn run_sdk_connection(
                                 native_session_id = session_id.to_string();
                                 *session_modes.lock() = modes.clone();
                                 *config_options.lock() = fresh_config_options;
+                                if provider == ProviderKind::Antigravity {
+                                    let sid = native_session_id.clone();
+                                    let cfg = config_dir.clone();
+                                    let next_offset = smol::unblock(move || {
+                                        crate::antigravity_session::step_offset_in(
+                                            &sid,
+                                            cfg.as_deref(),
+                                        )
+                                    })
+                                    .await;
+                                    antigravity_step_offset.store(next_offset, Ordering::Release);
+                                }
                                 let live_mode = *access_mode.lock();
                                 if let Some(mode_id) =
                                     desired_access_mode(provider, modes.as_ref(), live_mode)
                                 {
-                                    if connection
-                                        .send_request(SetSessionModeRequest::new(
-                                            session_id.clone(),
-                                            mode_id.clone(),
-                                        ))
-                                        .block_task()
-                                        .await
-                                        .is_ok()
+                                    if await_acp_request(
+                                        connection
+                                            .send_request(SetSessionModeRequest::new(
+                                                session_id.clone(),
+                                                mode_id.clone(),
+                                            ))
+                                            .block_task(),
+                                        timeouts.request,
+                                        "ACP session/set_mode",
+                                    )
+                                    .await
+                                    .is_ok()
                                         && let Some(state) = session_modes.lock().as_mut()
                                     {
                                         state.current_mode_id = mode_id;
@@ -1510,6 +1803,7 @@ async fn run_sdk_connection(
                                     current_tier.as_deref(),
                                     current_window.as_deref(),
                                     &events,
+                                    timeouts.request,
                                 )
                                 .await;
                                 let _ = events.send(DriverEvent::Connected {
@@ -1525,6 +1819,7 @@ async fn run_sdk_connection(
                                     &session_id,
                                     text,
                                     &cwd,
+                                    &attachment_roots,
                                     &prompt_capabilities,
                                     &prompt_requests,
                                     &events,
@@ -1536,7 +1831,9 @@ async fn run_sdk_connection(
                                     stream_state.clone(),
                                     None,
                                     PromptKind::Turn,
-                                ) {
+                                    Some(antigravity_step_offset.clone()),
+                                ) && prompt_requests.lock().is_empty()
+                                {
                                     let _ = events.send(DriverEvent::Error(error.to_string()));
                                     let _ = events.send(DriverEvent::TurnFinished {
                                         success: false,
@@ -1545,15 +1842,18 @@ async fn run_sdk_connection(
                                 }
                             }
                             Err(error) => {
-                                let _ = events.send(DriverEvent::Error(error.to_string()));
-                                let _ = events.send(DriverEvent::TurnFinished {
-                                    success: false,
-                                    summary: None,
-                                });
+                                if prompt_requests.lock().is_empty() {
+                                    let _ = events.send(DriverEvent::Error(error.to_string()));
+                                    let _ = events.send(DriverEvent::TurnFinished {
+                                        success: false,
+                                        summary: None,
+                                    });
+                                }
                             }
                         }
                     }
                     CommandMessage::Prompt(text) => {
+                        cancel_deadline = None;
                         suppress_session_updates.clear_guard();
                         unsolicited_turn.lock().take_active();
                         let prompt_text = format_prompt_with_seed(
@@ -1568,6 +1868,7 @@ async fn run_sdk_connection(
                             &session_id,
                             prompt_text,
                             &cwd,
+                            &attachment_roots,
                             &prompt_capabilities,
                             &prompt_requests,
                             &events,
@@ -1579,6 +1880,7 @@ async fn run_sdk_connection(
                             stream_state.clone(),
                             (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
                             PromptKind::Turn,
+                            Some(antigravity_step_offset.clone()),
                         ) {
                             Ok(()) => {
                                 fork_context = None;
@@ -1612,6 +1914,7 @@ async fn run_sdk_connection(
                             &session_id,
                             text.clone(),
                             &cwd,
+                            &attachment_roots,
                             &prompt_capabilities,
                             &prompt_requests,
                             &events,
@@ -1621,10 +1924,12 @@ async fn run_sdk_connection(
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
-                            None,
+                            (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
                             PromptKind::Steer,
+                            Some(antigravity_step_offset.clone()),
                         ) {
                             Ok(()) => {
+                                cancel_deadline = None;
                                 if had_unsolicited {
                                     unsolicited_turn.lock().take_active();
                                 }
@@ -1643,14 +1948,40 @@ async fn run_sdk_connection(
                             .send_notification(CancelNotification::new(session_id.clone()));
                         cancel_pending_permissions(&pending_permissions);
                         cancel_pending_user_inputs(&pending_user_inputs);
-                        if unsolicited_turn.lock().take_active()
-                            && prompt_requests.lock().is_empty()
-                        {
-                            stream_state.lock().tools.clear();
-                            let _ = events.send(DriverEvent::TurnFinished {
-                                success: true,
-                                summary: None,
-                            });
+                        let unsolicited_active =
+                            unsolicited_turn.lock().active && prompt_requests.lock().is_empty();
+                        if unsolicited_active {
+                            let next_offset = if provider == ProviderKind::Antigravity {
+                                let sid = native_session_id.clone();
+                                let cfg = config_dir.clone();
+                                Some(
+                                    smol::unblock(move || {
+                                        crate::antigravity_session::step_offset_in(
+                                            &sid,
+                                            cfg.as_deref(),
+                                        )
+                                    })
+                                    .await,
+                                )
+                            } else {
+                                None
+                            };
+                            if unsolicited_turn.lock().take_active()
+                                && prompt_requests.lock().is_empty()
+                            {
+                                stream_state.lock().tools.clear();
+                                if let Some(next_offset) = next_offset {
+                                    antigravity_step_offset.store(next_offset, Ordering::Release);
+                                }
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: true,
+                                    summary: None,
+                                });
+                                cancel_deadline = None;
+                            }
+                        } else if !prompt_requests.lock().is_empty() {
+                            cancel_deadline
+                                .get_or_insert_with(|| Instant::now() + timeouts.cancel);
                         }
                     }
                     CommandMessage::RefreshBackgroundWork => {
@@ -1721,7 +2052,7 @@ async fn run_sdk_connection(
                             if provider == ProviderKind::Antigravity
                                 && prompt_requests.lock().is_empty()
                             {
-                                let has_in_flight_work = !stream_state.lock().tools.is_empty()
+                                let has_in_flight_work = stream_state.lock().has_in_flight_tools()
                                     || !pending_permissions.lock().is_empty()
                                     || !pending_user_inputs.lock().is_empty();
                                 if unsolicited_turn.lock().schedule_settle(
@@ -1767,7 +2098,7 @@ async fn run_sdk_connection(
                             if provider == ProviderKind::Antigravity
                                 && prompt_requests.lock().is_empty()
                             {
-                                let has_in_flight_work = !stream_state.lock().tools.is_empty()
+                                let has_in_flight_work = stream_state.lock().has_in_flight_tools()
                                     || !pending_permissions.lock().is_empty()
                                     || !pending_user_inputs.lock().is_empty();
                                 if unsolicited_turn.lock().schedule_settle(
@@ -1787,6 +2118,7 @@ async fn run_sdk_connection(
                         if let Some(mode_applied) = mode_applied {
                             // Stop answering permissions under the old mode
                             // before the agent hears about the new one.
+                            let mode_timeout = timeouts.request.min(MODE_SWITCH_TIMEOUT);
                             *access_mode.lock() = options.mode;
                             let applied = if provider == ProviderKind::Droid {
                                 let current = config_options.lock().clone();
@@ -1795,6 +2127,7 @@ async fn run_sdk_connection(
                                     &session_id,
                                     current.as_deref(),
                                     options.mode,
+                                    mode_timeout,
                                 )
                                 .await
                                 {
@@ -1817,6 +2150,7 @@ async fn run_sdk_connection(
                                     &session_id,
                                     current_modes.as_ref(),
                                     options.mode,
+                                    mode_timeout,
                                 )
                                 .await
                                 {
@@ -1860,6 +2194,7 @@ async fn run_sdk_connection(
                                 current_tier.as_deref(),
                                 current_window.as_deref(),
                                 &events,
+                                timeouts.request,
                             )
                             .await;
                         }
@@ -1883,17 +2218,19 @@ async fn run_sdk_connection(
                             if !acp_mcp_servers.is_empty() {
                                 request = request.mcp_servers(acp_mcp_servers.clone());
                             }
-                            connection
-                                .send_request(request)
-                                .block_task()
-                                .await
-                                .map(|response| {
-                                    ProviderResumeCursor::from_session_id(
-                                        provider,
-                                        response.session_id.to_string(),
-                                    )
-                                })
-                                .map_err(|error| anyhow!(error.to_string()))
+                            await_acp_request(
+                                connection.send_request(request).block_task(),
+                                timeouts.request.min(MODE_SWITCH_TIMEOUT),
+                                "ACP session/fork",
+                            )
+                            .await
+                            .map(|response| {
+                                ProviderResumeCursor::from_session_id(
+                                    provider,
+                                    response.session_id.to_string(),
+                                )
+                            })
+                            .map_err(|error| anyhow!(error.to_string()))
                         };
                         let _ = reply.try_send(outcome);
                     }
@@ -1969,6 +2306,7 @@ fn is_session_not_found_message(detail: &str) -> bool {
     names_missing && names_session
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_session(
     connection: &ConnectionTo<Agent>,
     provider: ProviderKind,
@@ -1977,6 +2315,7 @@ async fn establish_session(
     cwd: &Path,
     mcp_servers: &[McpServer],
     suppress_session_updates: &ReplaySuppression,
+    request_timeout: Duration,
 ) -> agent_client_protocol::Result<(
     SessionId,
     Option<SessionModeState>,
@@ -2000,7 +2339,13 @@ async fn establish_session(
             if !mcp_servers.is_empty() {
                 request = request.mcp_servers(mcp_servers.to_vec());
             }
-            match connection.send_request(request).block_task().await {
+            match await_acp_request(
+                connection.send_request(request).block_task(),
+                request_timeout,
+                "ACP session/resume",
+            )
+            .await
+            {
                 Ok(response) => {
                     return Ok((
                         SessionId::new(existing.to_owned()),
@@ -2009,7 +2354,9 @@ async fn establish_session(
                     ));
                 }
                 Err(error) => {
-                    if error.code == agent_client_protocol::ErrorCode::AuthRequired {
+                    if error.code == agent_client_protocol::ErrorCode::AuthRequired
+                        || error.message.contains("timed out")
+                    {
                         return Err(error);
                     }
                     if !can_fallback_from_resume_error(&error) {
@@ -2025,7 +2372,12 @@ async fn establish_session(
             if !mcp_servers.is_empty() {
                 request = request.mcp_servers(mcp_servers.to_vec());
             }
-            let response = connection.send_request(request).block_task().await;
+            let response = await_acp_request(
+                connection.send_request(request).block_task(),
+                request_timeout,
+                "ACP session/load",
+            )
+            .await;
             if response.is_ok() && provider == ProviderKind::Antigravity {
                 suppress_session_updates
                     .drain_trailing_replay(
@@ -2062,7 +2414,12 @@ async fn establish_session(
     if !mcp_servers.is_empty() {
         request = request.mcp_servers(mcp_servers.to_vec());
     }
-    let response = connection.send_request(request).block_task().await?;
+    let response = await_acp_request(
+        connection.send_request(request).block_task(),
+        request_timeout,
+        "ACP session/new",
+    )
+    .await?;
     Ok((response.session_id, response.modes, response.config_options))
 }
 
@@ -2345,6 +2702,7 @@ fn session_config_current_value(option: &SessionConfigOption) -> Option<&str> {
     Some(select.current_value.0.as_ref())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_cursor_variant_configs(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
@@ -2353,6 +2711,7 @@ async fn apply_cursor_variant_configs(
     reasoning_effort: Option<&str>,
     service_tier: Option<&str>,
     context_window: Option<&str>,
+    request_timeout: Duration,
 ) -> agent_client_protocol::Result<()> {
     // Thinking can reveal a thought-level option, so apply it first and use
     // each response's refreshed option set for the next selection.
@@ -2417,15 +2776,19 @@ async fn apply_cursor_variant_configs(
             }
             _ => continue,
         };
-        *options = connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id,
-                value,
-            ))
-            .block_task()
-            .await?
-            .config_options;
+        *options = await_acp_request(
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    option.id,
+                    value,
+                ))
+                .block_task(),
+            request_timeout,
+            "ACP session/set_config_option",
+        )
+        .await?
+        .config_options;
     }
     Ok(())
 }
@@ -2519,6 +2882,7 @@ async fn apply_antigravity_mode(
     session_id: &SessionId,
     modes: Option<&SessionModeState>,
     mode: RuntimeMode,
+    request_timeout: Duration,
 ) -> Result<Option<SessionModeId>, String> {
     let Some(modes) = modes else {
         return Err(tr!(
@@ -2529,15 +2893,19 @@ async fn apply_antigravity_mode(
     let Some(desired) = desired_access_mode(ProviderKind::Antigravity, Some(modes), mode) else {
         return Ok(None);
     };
-    connection
-        .send_request(SetSessionModeRequest::new(
-            session_id.clone(),
-            desired.clone(),
-        ))
-        .block_task()
-        .await
-        .map(|_| Some(desired))
-        .map_err(|error| tr!("errors.set_session_option", error = error))
+    await_acp_request(
+        connection
+            .send_request(SetSessionModeRequest::new(
+                session_id.clone(),
+                desired.clone(),
+            ))
+            .block_task(),
+        request_timeout,
+        "ACP session/set_mode",
+    )
+    .await
+    .map(|_| Some(desired))
+    .map_err(|error| tr!("errors.set_session_option", error = error))
 }
 
 /// Writes Droid's autonomy level for `mode`. `Ok(None)` means the session
@@ -2547,6 +2915,7 @@ async fn apply_droid_autonomy(
     session_id: &SessionId,
     config_options: Option<&[SessionConfigOption]>,
     mode: RuntimeMode,
+    request_timeout: Duration,
 ) -> Result<Option<Vec<SessionConfigOption>>, String> {
     let desired = droid_autonomy_level(mode);
     let Some(option) =
@@ -2566,16 +2935,20 @@ async fn apply_droid_autonomy(
     if session_config_current_value(option) == Some(desired) {
         return Ok(None);
     }
-    connection
-        .send_request(SetSessionConfigOptionRequest::new(
-            session_id.clone(),
-            option.id.clone(),
-            desired,
-        ))
-        .block_task()
-        .await
-        .map(|response| Some(response.config_options))
-        .map_err(|error| tr!("errors.set_session_option", error = error))
+    await_acp_request(
+        connection
+            .send_request(SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                option.id.clone(),
+                desired,
+            ))
+            .block_task(),
+        request_timeout,
+        "ACP session/set_config_option",
+    )
+    .await
+    .map(|response| Some(response.config_options))
+    .map_err(|error| tr!("errors.set_session_option", error = error))
 }
 
 /// The session's config options as the agent last reported them. Responses
@@ -2599,12 +2972,16 @@ fn track_session_state(
 ) -> bool {
     let desired = droid_autonomy_level(mode);
     match update {
+        // Droid also reports its non-autonomy modes (such as `spec`) through
+        // `autonomy_level` config updates; leave those user choices alone.
         SessionUpdate::ConfigOptionUpdate(update) => {
             *config_options.lock() = Some(update.config_options.clone());
             provider == ProviderKind::Droid
                 && config_option_by_id(&update.config_options, "autonomy_level")
                     .and_then(session_config_current_value)
-                    .is_some_and(|current| current != desired)
+                    .is_some_and(|current| {
+                        DROID_AUTONOMY_LEVELS.contains(&current) && current != desired
+                    })
         }
         // Droid's mode ids are its autonomy levels. Other mode ids (its spec
         // mode) are the user's own choice and are left alone.
@@ -2666,6 +3043,7 @@ async fn apply_droid_model(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
+    request_timeout: Duration,
 ) -> Option<Vec<SessionConfigOption>> {
     let mut options = config_options.unwrap_or_default().to_vec();
     let mut updated = false;
@@ -2685,14 +3063,18 @@ async fn apply_droid_model(
             return None;
         }
         if session_config_current_value(&option) != Some(model) {
-            match connection
-                .send_request(SetSessionConfigOptionRequest::new(
-                    session_id.clone(),
-                    option.id.clone(),
-                    model,
-                ))
-                .block_task()
-                .await
+            match await_acp_request(
+                connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        option.id.clone(),
+                        model,
+                    ))
+                    .block_task(),
+                request_timeout,
+                "ACP session/set_config_option",
+            )
+            .await
             {
                 Ok(response) => {
                     options = response.config_options;
@@ -2716,14 +3098,18 @@ async fn apply_droid_model(
         let config_id = option.id.clone();
         // Effort is optional. A rejected value must not discard the model the
         // session already accepted.
-        if let Ok(response) = connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                config_id,
-                effort,
-            ))
-            .block_task()
-            .await
+        if let Ok(response) = await_acp_request(
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    config_id,
+                    effort,
+                ))
+                .block_task(),
+            request_timeout,
+            "ACP session/set_config_option",
+        )
+        .await
         {
             options = response.config_options;
             updated = true;
@@ -2776,6 +3162,7 @@ async fn apply_antigravity_model(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     events: &DriverEventSender,
+    request_timeout: Duration,
 ) -> Option<Vec<SessionConfigOption>> {
     let mut options = config_options.unwrap_or_default().to_vec();
     let mut updated = false;
@@ -2798,14 +3185,18 @@ async fn apply_antigravity_model(
         };
         inferred_effort = inferred;
         if session_config_current_value(&model_option) != Some(selected.as_str()) {
-            match connection
-                .send_request(SetSessionConfigOptionRequest::new(
-                    session_id.clone(),
-                    model_option.id.clone(),
-                    selected.as_str(),
-                ))
-                .block_task()
-                .await
+            match await_acp_request(
+                connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        model_option.id.clone(),
+                        selected.as_str(),
+                    ))
+                    .block_task(),
+                request_timeout,
+                "ACP session/set_config_option",
+            )
+            .await
             {
                 Ok(response) => {
                     options = response.config_options;
@@ -2832,14 +3223,18 @@ async fn apply_antigravity_model(
     {
         // Thinking is optional and per model; a rejected level must not drop
         // the model the session already accepted.
-        if let Ok(response) = connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id.clone(),
-                effort.as_str(),
-            ))
-            .block_task()
-            .await
+        if let Ok(response) = await_acp_request(
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    option.id.clone(),
+                    effort.as_str(),
+                ))
+                .block_task(),
+            request_timeout,
+            "ACP session/set_config_option",
+        )
+        .await
         {
             options = response.config_options;
             updated = true;
@@ -2862,6 +3257,7 @@ async fn sync_cached_session_model(
     service_tier: Option<&str>,
     context_window: Option<&str>,
     events: &DriverEventSender,
+    request_timeout: Duration,
 ) {
     let before = cache.lock().clone();
     let mut config_options = before.clone();
@@ -2875,6 +3271,7 @@ async fn sync_cached_session_model(
         service_tier,
         context_window,
         events,
+        request_timeout,
     )
     .await;
     if config_options != before {
@@ -2893,6 +3290,7 @@ async fn sync_session_model(
     service_tier: Option<&str>,
     context_window: Option<&str>,
     events: &DriverEventSender,
+    request_timeout: Duration,
 ) {
     if provider == ProviderKind::Antigravity {
         if let Some(updated) = apply_antigravity_model(
@@ -2902,6 +3300,7 @@ async fn sync_session_model(
             model,
             reasoning_effort,
             events,
+            request_timeout,
         )
         .await
         {
@@ -2917,6 +3316,7 @@ async fn sync_session_model(
             model,
             reasoning_effort,
             events,
+            request_timeout,
         )
         .await
         {
@@ -2934,6 +3334,7 @@ async fn sync_session_model(
         service_tier,
         context_window,
         events,
+        request_timeout,
     )
     .await;
 }
@@ -2974,6 +3375,7 @@ async fn apply_model(
     service_tier: Option<&str>,
     context_window: Option<&str>,
     events: &DriverEventSender,
+    request_timeout: Duration,
 ) {
     if provider == ProviderKind::Cursor
         && let Some(options) = config_options.as_mut()
@@ -2984,14 +3386,18 @@ async fn apply_model(
                 find_config_option(options, SessionConfigOptionCategory::Model).cloned()
                 && let Some(selection) = cursor_model_selection(&option, model)
             {
-                match connection
-                    .send_request(SetSessionConfigOptionRequest::new(
-                        session_id.clone(),
-                        option.id.clone(),
-                        selection.value.as_str(),
-                    ))
-                    .block_task()
-                    .await
+                match await_acp_request(
+                    connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            option.id.clone(),
+                            selection.value.as_str(),
+                        ))
+                        .block_task(),
+                    request_timeout,
+                    "ACP session/set_config_option",
+                )
+                .await
                 {
                     Ok(response) => {
                         *options = response.config_options;
@@ -3003,6 +3409,7 @@ async fn apply_model(
                             reasoning_effort,
                             service_tier,
                             context_window,
+                            request_timeout,
                         )
                         .await
                         {
@@ -3034,6 +3441,7 @@ async fn apply_model(
                 reasoning_effort,
                 service_tier,
                 context_window,
+                request_timeout,
             )
             .await
             {
@@ -3053,14 +3461,18 @@ async fn apply_model(
         let mut options = config_options.as_deref().unwrap_or_default().to_vec();
         if let Some((provider_option, value)) = fx_model_provider_switch(&options, model) {
             let config_id = provider_option.id.clone();
-            match connection
-                .send_request(SetSessionConfigOptionRequest::new(
-                    session_id.clone(),
-                    config_id,
-                    value,
-                ))
-                .block_task()
-                .await
+            match await_acp_request(
+                connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config_id,
+                        value,
+                    ))
+                    .block_task(),
+                request_timeout,
+                "ACP session/set_config_option",
+            )
+            .await
             {
                 Ok(response) => {
                     options = response.config_options;
@@ -3089,14 +3501,18 @@ async fn apply_model(
             )));
             return;
         }
-        match connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id.clone(),
-                model,
-            ))
-            .block_task()
-            .await
+        match await_acp_request(
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    option.id.clone(),
+                    model,
+                ))
+                .block_task(),
+            request_timeout,
+            "ACP session/set_config_option",
+        )
+        .await
         {
             Ok(response) => {
                 *config_options = Some(response.config_options);
@@ -3128,7 +3544,13 @@ async fn apply_model(
                 return;
             }
         };
-        if let Err(error) = connection.send_request(request).block_task().await {
+        if let Err(error) = await_acp_request(
+            connection.send_request(request).block_task(),
+            request_timeout,
+            "ACP session/set_model",
+        )
+        .await
+        {
             let _ = events.send(DriverEvent::Error(tr!(
                 "errors.select_model",
                 error = error
@@ -3141,24 +3563,22 @@ async fn apply_model(
     {
         // Reasoning effort is an optional config extension and is deliberately
         // non-fatal when an agent does not expose it.
-        if let Ok(response) = connection
-            .send_request(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                reasoning_effort_config_id(provider),
-                effort,
-            ))
-            .block_task()
-            .await
+        if let Ok(response) = await_acp_request(
+            connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    reasoning_effort_config_id(provider),
+                    effort,
+                ))
+                .block_task(),
+            request_timeout,
+            "ACP session/set_config_option",
+        )
+        .await
         {
             *config_options = Some(response.config_options);
         }
     }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum PromptKind {
-    Turn,
-    Steer,
 }
 
 fn format_prompt_with_seed(
@@ -3220,6 +3640,7 @@ fn send_prompt(
     session_id: &SessionId,
     text: String,
     cwd: &Path,
+    attachment_roots: &[PathBuf],
     prompt_capabilities: &PromptCapabilities,
     prompt_requests: &PendingPromptRequests,
     events: &DriverEventSender,
@@ -3231,6 +3652,7 @@ fn send_prompt(
     stream_state: Arc<Mutex<AcpStreamState>>,
     lost_session_recovery: Option<smol::channel::Sender<CommandMessage>>,
     prompt_kind: PromptKind,
+    antigravity_step_offset: Option<Arc<AtomicI64>>,
 ) -> agent_client_protocol::Result<()> {
     if prompt_kind == PromptKind::Turn {
         let mut state = stream_state.lock();
@@ -3246,7 +3668,8 @@ fn send_prompt(
         .then(|| crate::antigravity_session::step_offset_in(native_session_id, config_dir.as_deref()));
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
-    let content_blocks = build_prompt_content_blocks(&text, cwd, prompt_capabilities);
+    let content_blocks =
+        build_prompt_content_blocks_with_roots(&text, cwd, attachment_roots, prompt_capabilities);
     let mut request = PromptRequest::new(session_id.clone(), content_blocks);
     if let Some(extension_id) = extension_id.as_ref() {
         let mut meta = serde_json::Map::new();
@@ -3266,24 +3689,34 @@ fn send_prompt(
     let callback_events = events.clone();
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
-        if settle_prompt_request(&callback_requests, &callback_request_id) {
+        let is_lost_session = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| is_lost_native_session(&error.to_string()));
+        let settled_last = settle_prompt_request(&callback_requests, &callback_request_id);
+        // The resumed session no longer exists on the provider's side, so every
+        // prompt to it fails the same way. Recover even when a concurrent Steer
+        // is still in flight so the primary Turn is never dropped.
+        if is_lost_session
+            && let (Some(recovery), Some(text)) = (lost_session_recovery, retry_text)
+            && recovery
+                .try_send(CommandMessage::RecoverLostSession {
+                    failed_session_id: native_session_id.clone(),
+                    text,
+                })
+                .is_ok()
+        {
+            if settled_last {
+                stream_state.lock().tools.clear();
+            }
+            return Ok(());
+        }
+        if settled_last {
             let produced_content = {
                 let mut state = stream_state.lock();
                 state.tools.clear();
                 state.produced_content
             };
-            // The resumed session no longer exists on the provider's side, so
-            // every prompt to it would fail the same way. Hand the prompt back
-            // to the loop to start a fresh session instead of failing the turn.
-            if let (Some(recovery), Some(text), Err(error)) =
-                (lost_session_recovery, retry_text, &result)
-                && is_lost_native_session(&error.to_string())
-                && recovery
-                    .try_send(CommandMessage::RecoverLostSession(text))
-                    .is_ok()
-            {
-                return Ok(());
-            }
             // Only an empty turn pays for Kimi's lookup. Antigravity always
             // checks its own step log once, because it reports upstream API
             // failures as a chat message and a clean `end_turn`. Both lookups
@@ -3294,11 +3727,21 @@ fn send_prompt(
                 kimi_offset,
                 antigravity_offset,
                 native_session_id.clone(),
-                config_dir,
+                config_dir.clone(),
                 produced_content,
                 stop_reason,
             )
             .await;
+            if provider == ProviderKind::Antigravity
+                && let Some(step_offset) = antigravity_step_offset
+            {
+                let sid = native_session_id.clone();
+                let next_offset = smol::unblock(move || {
+                    crate::antigravity_session::step_offset_in(&sid, config_dir.as_deref())
+                })
+                .await;
+                step_offset.store(next_offset, Ordering::Release);
+            }
             let success = finish_prompt(result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
@@ -3432,43 +3875,19 @@ fn canonicalize_allowing_missing(path: &Path) -> Result<PathBuf, String> {
     Ok(current)
 }
 
-fn resolve_confined_path(
-    workspace_cwd: &Path,
+fn resolve_confined_path_with_canonical_root(
+    workspace_root: &Path,
+    workspace_exists: bool,
     requested: &Path,
-    allow_missing_workspace: bool,
     allow_workspace_root: bool,
 ) -> agent_client_protocol::Result<PathBuf> {
     validate_requested_path(requested).map_err(agent_client_protocol::util::internal_error)?;
-
-    let (workspace_root, workspace_exists) = if allow_missing_workspace {
-        let root = canonicalize_allowing_missing(workspace_cwd)
-            .map_err(agent_client_protocol::util::internal_error)?;
-        let exists = match std::fs::symlink_metadata(&root) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(agent_client_protocol::util::internal_error(format!(
-                    "Failed to inspect workspace `{}`: {error}",
-                    workspace_cwd.display()
-                )));
-            }
-        };
-        (root, exists)
-    } else {
-        let root = std::fs::canonicalize(workspace_cwd).map_err(|error| {
-            agent_client_protocol::util::internal_error(format!(
-                "Failed to resolve workspace `{}`: {error}",
-                workspace_cwd.display()
-            ))
-        })?;
-        (root, true)
-    };
 
     let resolved = if requested.is_absolute() {
         canonicalize_allowing_missing(requested)
             .map_err(agent_client_protocol::util::internal_error)?
     } else {
-        let mut current = workspace_root.clone();
+        let mut current = workspace_root.to_path_buf();
         let mut missing = !workspace_exists;
         for component in requested.components() {
             match component {
@@ -3516,7 +3935,7 @@ fn resolve_confined_path(
         current
     };
 
-    if !resolved.starts_with(&workspace_root)
+    if !resolved.starts_with(workspace_root)
         || (!allow_workspace_root && resolved == workspace_root)
     {
         return Err(agent_client_protocol::util::internal_error(format!(
@@ -3526,6 +3945,43 @@ fn resolve_confined_path(
     }
 
     Ok(strip_windows_verbatim(resolved))
+}
+
+fn resolve_confined_path(
+    workspace_cwd: &Path,
+    requested: &Path,
+    allow_missing_workspace: bool,
+    allow_workspace_root: bool,
+) -> agent_client_protocol::Result<PathBuf> {
+    let (workspace_root, workspace_exists) = if allow_missing_workspace {
+        let root = canonicalize_allowing_missing(workspace_cwd)
+            .map_err(agent_client_protocol::util::internal_error)?;
+        let exists = match std::fs::symlink_metadata(&root) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(agent_client_protocol::util::internal_error(format!(
+                    "Failed to inspect workspace `{}`: {error}",
+                    workspace_cwd.display()
+                )));
+            }
+        };
+        (root, exists)
+    } else {
+        let root = std::fs::canonicalize(workspace_cwd).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "Failed to resolve workspace `{}`: {error}",
+                workspace_cwd.display()
+            ))
+        })?;
+        (root, true)
+    };
+    resolve_confined_path_with_canonical_root(
+        &workspace_root,
+        workspace_exists,
+        requested,
+        allow_workspace_root,
+    )
 }
 
 fn resolve_workspace_read_path(
@@ -3648,9 +4104,146 @@ fn sanitized_terminal_env(
         .collect()
 }
 
+const MAX_MENTION_SPACE_SEGMENTS: usize = 32;
+
+fn daemon_attachment_roots() -> Vec<PathBuf> {
+    let Some(data_dir) = crate::persistence::StateStore::default_path()
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return Vec::new();
+    };
+    vec![data_dir.join("blobs"), data_dir.join("attachments")]
+}
+
+fn resolve_prompt_attachment_path(
+    canonical_cwd: Option<&Path>,
+    canonical_attachment_roots: &[PathBuf],
+    mention: &str,
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    if mention.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(mention);
+    let resolved = canonical_cwd
+        .and_then(|root| resolve_confined_path_with_canonical_root(root, true, candidate, false).ok())
+        .or_else(|| {
+            if !candidate.is_absolute() {
+                return None;
+            }
+            canonical_attachment_roots.iter().find_map(|root| {
+                resolve_confined_path_with_canonical_root(root, true, candidate, false).ok()
+            })
+        })?;
+    let metadata = std::fs::metadata(&resolved).ok()?;
+    metadata.is_file().then_some((resolved, metadata))
+}
+
+fn is_mention_prefix_boundary(text: &str, at_idx: usize) -> bool {
+    let Some(prev) = text[..at_idx].chars().next_back() else {
+        return true;
+    };
+    prev.is_whitespace() || matches!(prev, '(' | '[' | '"' | '\'')
+}
+
+fn find_next_mention_boundary(text: &str) -> usize {
+    let line_end = text.find(['\n', '\r']).unwrap_or(text.len());
+    if let Some(quote) = text.chars().next().filter(|ch| matches!(ch, '"' | '\'')) {
+        let qlen = quote.len_utf8();
+        if let Some(rel_close) = text[qlen..line_end].find(quote) {
+            return qlen + rel_close + qlen;
+        }
+        return line_end;
+    }
+    let bytes = text.as_bytes();
+    for (idx, ch) in text[..line_end].char_indices() {
+        if ch.is_whitespace() {
+            let next_start = idx + ch.len_utf8();
+            if bytes.get(next_start) == Some(&b'@') {
+                return idx;
+            }
+        }
+    }
+    line_end
+}
+
+fn mention_end_offsets(slice: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut in_word = false;
+    for (idx, ch) in slice.char_indices() {
+        if ch.is_whitespace() {
+            if in_word {
+                offsets.push(idx);
+                if offsets.len() >= MAX_MENTION_SPACE_SEGMENTS {
+                    return offsets;
+                }
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+        }
+    }
+    if in_word && offsets.len() < MAX_MENTION_SPACE_SEGMENTS {
+        offsets.push(slice.len());
+    }
+    offsets
+}
+
+fn resolve_mention_candidate<'a>(
+    slice: &'a str,
+    canonical_cwd: Option<&Path>,
+    canonical_attachment_roots: &[PathBuf],
+) -> Option<(&'a str, PathBuf, std::fs::Metadata, usize)> {
+    const TRAILING_PUNCTUATION: [char; 8] = [',', ';', ':', '.', ')', ']', '"', '\''];
+
+    if let Some(quote) = slice.chars().next().filter(|ch| matches!(ch, '"' | '\'')) {
+        let line = slice.split(['\n', '\r']).next().unwrap_or("");
+        if let Some(rel_close) = line[quote.len_utf8()..].find(quote) {
+            let inner = &line[quote.len_utf8()..quote.len_utf8() + rel_close];
+            if let Some((resolved, metadata)) =
+                resolve_prompt_attachment_path(canonical_cwd, canonical_attachment_roots, inner)
+            {
+                return Some((
+                    inner,
+                    resolved,
+                    metadata,
+                    quote.len_utf8() + rel_close + quote.len_utf8(),
+                ));
+            }
+        }
+    }
+
+    for end in mention_end_offsets(slice).into_iter().rev() {
+        let raw = &slice[..end];
+        if let Some((resolved, metadata)) =
+            resolve_prompt_attachment_path(canonical_cwd, canonical_attachment_roots, raw)
+        {
+            return Some((raw, resolved, metadata, end));
+        }
+        let trimmed = raw.trim_end_matches(TRAILING_PUNCTUATION);
+        if trimmed != raw
+            && let Some((resolved, metadata)) =
+                resolve_prompt_attachment_path(canonical_cwd, canonical_attachment_roots, trimmed)
+        {
+            return Some((trimmed, resolved, metadata, trimmed.len()));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
 pub(crate) fn build_prompt_content_blocks(
     text: &str,
     cwd: &Path,
+    capabilities: &PromptCapabilities,
+) -> Vec<ContentBlock> {
+    build_prompt_content_blocks_with_roots(text, cwd, &daemon_attachment_roots(), capabilities)
+}
+
+pub(crate) fn build_prompt_content_blocks_with_roots(
+    text: &str,
+    cwd: &Path,
+    allowed_attachment_roots: &[PathBuf],
     capabilities: &PromptCapabilities,
 ) -> Vec<ContentBlock> {
     let mut blocks = vec![ContentBlock::Text(TextContent::new(text.to_owned()))];
@@ -3658,23 +4251,36 @@ pub(crate) fn build_prompt_content_blocks(
         return blocks;
     }
 
+    let canonical_cwd = std::fs::canonicalize(cwd).ok();
+    let canonical_attachment_roots: Vec<PathBuf> = allowed_attachment_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if canonical_cwd.is_none() && canonical_attachment_roots.is_empty() {
+        return blocks;
+    }
+
     let mut seen_paths = HashSet::new();
-    for token in text.split_whitespace() {
-        let Some(raw_mention) = token.strip_prefix('@') else {
-            continue;
-        };
-        let mention = raw_mention.trim_end_matches([',', ';', ':', '.', ')', ']', '"', '\'']);
-        if mention.is_empty() {
+    let mut cursor = 0;
+    while let Some(rel_at) = text[cursor..].find('@') {
+        let at_idx = cursor + rel_at;
+        if !is_mention_prefix_boundary(text, at_idx) {
+            cursor = at_idx + 1;
             continue;
         }
-        let candidate = Path::new(mention);
-        let Ok(resolved) = resolve_workspace_read_path(cwd, candidate) else {
+        let after_at = &text[at_idx + 1..];
+        let slice_end = find_next_mention_boundary(after_at);
+        let slice = &after_at[..slice_end];
+        let Some((mention, resolved, metadata, consumed)) = resolve_mention_candidate(
+            slice,
+            canonical_cwd.as_deref(),
+            &canonical_attachment_roots,
+        ) else {
+            cursor = at_idx + 1;
             continue;
         };
-        let Ok(metadata) = std::fs::metadata(&resolved) else {
-            continue;
-        };
-        if !metadata.is_file() || !seen_paths.insert(resolved.clone()) {
+        cursor = at_idx + 1 + consumed;
+        if !seen_paths.insert(resolved.clone()) {
             continue;
         }
 
@@ -5670,6 +6276,8 @@ pub(crate) struct StoredToolCall {
     locations: Option<Value>,
     content: Option<Value>,
     tool_name: Option<String>,
+    complete: bool,
+    failed: bool,
 }
 
 #[derive(Default)]
@@ -5681,6 +6289,12 @@ struct AcpStreamState {
     /// takes, which is what makes a native failure worth looking up.
     produced_content: bool,
     last_completed_tool_name: Option<String>,
+}
+
+impl AcpStreamState {
+    fn has_in_flight_tools(&self) -> bool {
+        self.tools.values().any(|tool| !tool.complete)
+    }
 }
 
 /// Pull the agent's explanation out of a permission request's tool call.
@@ -6214,22 +6828,21 @@ pub(crate) fn build_tool_activity_item(
         .get("toolCallId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let status = update
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("pending");
-    let complete = matches!(status, "completed" | "failed");
-    let failed = status == "failed";
+    let stored = id.as_ref().and_then(|id| tools.get(id).cloned());
+    let status = update.get("status").and_then(Value::as_str);
+    let complete = match status {
+        Some("completed" | "failed") => true,
+        Some(_) => false,
+        None => stored.as_ref().is_some_and(|tool| tool.complete),
+    };
+    let failed = match status {
+        Some("failed") => true,
+        Some(_) => false,
+        None => stored.as_ref().is_some_and(|tool| tool.failed),
+    };
 
     let wire_kind = update.get("kind").and_then(Value::as_str);
     let wire_title = update.get("title").and_then(Value::as_str);
-    let stored = id.as_ref().and_then(|id| {
-        if complete {
-            tools.remove(id)
-        } else {
-            tools.get(id).cloned()
-        }
-    });
     let arguments = update
         .get("rawInput")
         .filter(|value| !value.is_null())
@@ -6269,6 +6882,7 @@ pub(crate) fn build_tool_activity_item(
     } else {
         let mut kind = wire_kind
             .map(classify)
+            .filter(|classified| *classified != ActivityKind::Tool || stored.is_none())
             .or_else(|| stored.as_ref().map(|tool| tool.kind))
             .unwrap_or(ActivityKind::Tool);
         if matches!(kind, ActivityKind::Search | ActivityKind::Tool)
@@ -6298,7 +6912,10 @@ pub(crate) fn build_tool_activity_item(
         .or_else(|| activity::input_title(arguments))
         .or_else(|| {
             wire_title
-                .filter(|title| !title.is_empty())
+                .map(str::trim)
+                .filter(|title| {
+                    !title.is_empty() && (!title.eq_ignore_ascii_case("tool") || stored.is_none())
+                })
                 .map(str::to_owned)
         })
         .or_else(|| stored.as_ref().map(|tool| tool.title.clone()))
@@ -6320,7 +6937,7 @@ pub(crate) fn build_tool_activity_item(
                 .map(str::to_owned)
         });
     let normalized_locations = locations.map(normalize_acp_locations);
-    if !complete && let Some(id) = id.as_ref() {
+    if let Some(id) = id.as_ref() {
         tools.insert(
             id.clone(),
             StoredToolCall {
@@ -6328,8 +6945,10 @@ pub(crate) fn build_tool_activity_item(
                 title: title.clone(),
                 raw_input: arguments.cloned(),
                 locations: normalized_locations.clone(),
-                content: content.cloned(),
+                content: (!complete).then(|| content.cloned()).flatten(),
                 tool_name: tool_name.clone(),
+                complete,
+                failed,
             },
         );
     }
@@ -6980,6 +7599,7 @@ mod tests {
                         &session_id,
                         Some(&initial_modes),
                         RuntimeMode::FullAccess,
+                        ACP_REQUEST_TIMEOUT,
                     )
                     .await
                     .unwrap(),
@@ -6992,6 +7612,7 @@ mod tests {
                         &session_id,
                         Some(&initial_modes),
                         RuntimeMode::Auto,
+                        ACP_REQUEST_TIMEOUT,
                     )
                     .await
                     .unwrap()
@@ -7005,15 +7626,22 @@ mod tests {
                         &session_id,
                         Some(&initial_modes),
                         RuntimeMode::AutoAcceptEdits,
+                        ACP_REQUEST_TIMEOUT,
                     )
                     .await
                     .is_err()
                 );
                 // Missing mode advertisement returns Err.
                 assert!(
-                    apply_antigravity_mode(&connection, &session_id, None, RuntimeMode::Auto)
-                        .await
-                        .is_err()
+                    apply_antigravity_mode(
+                        &connection,
+                        &session_id,
+                        None,
+                        RuntimeMode::Auto,
+                        ACP_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .is_err()
                 );
                 Ok(())
             },
@@ -7251,6 +7879,7 @@ mod tests {
                         &cwd,
                         &[],
                         &suppress_conn,
+                        ACP_REQUEST_TIMEOUT,
                     )
                     .await?;
                     assert_eq!(session_id.to_string(), "agy-loaded-1");
@@ -8000,6 +8629,140 @@ mod tests {
     }
 
     #[test]
+    fn config_updates_exempt_droid_spec_mode_from_autonomy_drift() {
+        let cache: SharedConfigOptions = Arc::new(Mutex::new(None));
+        let update = |current| {
+            SessionUpdate::ConfigOptionUpdate(
+                agent_client_protocol::schema::v1::ConfigOptionUpdate::new(vec![
+                    select_config_option(
+                        "autonomy_level",
+                        SessionConfigOptionCategory::Mode,
+                        current,
+                        &["normal", "spec", "auto-low", "auto-medium", "auto-high"],
+                    ),
+                ]),
+            )
+        };
+
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &update("spec"),
+            RuntimeMode::Ask,
+            &cache,
+        ));
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &update("spec"),
+            RuntimeMode::AutoAcceptEdits,
+            &cache,
+        ));
+        assert!(!track_session_state(
+            ProviderKind::Droid,
+            &update("spec"),
+            RuntimeMode::FullAccess,
+            &cache,
+        ));
+        let cached = cache.lock().clone().unwrap();
+        assert_eq!(
+            session_config_current_value(&cached[0]),
+            Some("spec"),
+            "spec mode config update still refreshes the cache without flagging drift"
+        );
+    }
+
+    #[test]
+    fn completed_tool_call_retains_metadata_for_sparse_follow_up_update() {
+        let mut state = AcpStreamState::default();
+        let initial = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-droid-1",
+                "status": "completed",
+                "kind": "read",
+                "title": "Read crates/waku-core/src/lib.rs",
+                "rawInput": {
+                    "file_path": "crates/waku-core/src/lib.rs"
+                },
+                "locations": [
+                    { "path": "crates/waku-core/src/lib.rs", "line": 1 }
+                ]
+            }),
+            &mut state.tools,
+            None,
+        );
+        assert_eq!(initial.kind, ActivityKind::FileRead);
+        assert_eq!(initial.title, "Read crates/waku-core/src/lib.rs");
+        assert!(initial.complete);
+        assert!(
+            !state.has_in_flight_tools(),
+            "retaining completed tool metadata must not mark the tool as in-flight"
+        );
+
+        let follow_up = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-droid-1",
+                "status": "completed",
+                "content": [
+                    { "type": "content", "content": { "type": "text", "text": "pub mod driver;" } }
+                ],
+                "rawOutput": "pub mod driver;"
+            }),
+            &mut state.tools,
+            None,
+        );
+        assert_eq!(follow_up.kind, ActivityKind::FileRead);
+        assert_eq!(follow_up.title, "Read crates/waku-core/src/lib.rs");
+        assert_eq!(follow_up.output.as_deref(), Some("pub mod driver;"));
+        assert!(follow_up.arguments.is_some());
+        assert!(follow_up.complete);
+        assert!(!follow_up.failed);
+        assert!(!state.has_in_flight_tools());
+        assert!(
+            state.tools["call-droid-1"].content.is_none(),
+            "completed tools must not hold onto full content buffers"
+        );
+    }
+
+    #[test]
+    fn failed_tool_call_retains_failed_kind_and_title_across_sparse_generic_update() {
+        let mut state = AcpStreamState::default();
+        let initial = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-fail-1",
+                "status": "failed",
+                "kind": "execute",
+                "title": "Run cargo test",
+                "rawInput": { "command": "cargo test" }
+            }),
+            &mut state.tools,
+            None,
+        );
+        assert!(initial.complete);
+        assert!(initial.failed);
+        assert_eq!(initial.kind, ActivityKind::Command);
+        assert_eq!(initial.title, "Run cargo test");
+
+        // Follow-up omits `status` and sends generic `"title": "Tool"`.
+        let sparse = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-fail-1",
+                "title": "Tool",
+                "rawOutput": "exit code 101"
+            }),
+            &mut state.tools,
+            None,
+        );
+        assert!(sparse.complete);
+        assert!(sparse.failed);
+        assert_eq!(sparse.kind, ActivityKind::Command);
+        assert_eq!(sparse.title, "Run cargo test");
+        assert_eq!(sparse.output.as_deref(), Some("exit code 101"));
+    }
+
+    #[test]
     fn droid_mode_updates_flag_only_autonomy_levels() {
         let cache: SharedConfigOptions = Arc::new(Mutex::new(None));
         let mode = |id: &str| {
@@ -8257,6 +9020,8 @@ mod tests {
                 locations: None,
                 content: None,
                 tool_name: None,
+                complete: false,
+                failed: false,
             },
         );
         let (events, event_rx) = crate::driver::test_event_channel();
@@ -8841,6 +9606,90 @@ mod tests {
     }
 
     #[test]
+    fn acp_prompt_content_blocks_attaches_space_paths_and_daemon_blobs_while_guarding_escapes() {
+        let outer_dir =
+            std::env::temp_dir().join(format!("waku-acp-prompt-spaces-{}", uuid::Uuid::new_v4()));
+        let workspace_dir = outer_dir.join("my workspace");
+        let data_dir = outer_dir.join("Application Support").join("Waku");
+        let blobs_dir = data_dir.join("blobs");
+        let attachments_dir = data_dir.join("attachments");
+        std::fs::create_dir_all(workspace_dir.join("docs with spaces")).unwrap();
+        std::fs::create_dir_all(blobs_dir.join("ab")).unwrap();
+        std::fs::create_dir_all(attachments_dir.join("att-1")).unwrap();
+
+        let outside_file = outer_dir.join("outside secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+        let outside_image = outer_dir.join("outside image.png");
+        std::fs::write(&outside_image, b"\x89PNG\r\n\x1a\nsecretimg").unwrap();
+
+        let ws_doc = workspace_dir.join("docs with spaces/my notes.md");
+        std::fs::write(&ws_doc, "workspace notes").unwrap();
+        let pasted_blob = blobs_dir.join("ab/0123456789abcdef.png");
+        std::fs::write(&pasted_blob, b"\x89PNG\r\n\x1a\npastedblob").unwrap();
+        let dropped_doc = attachments_dir.join("att-1/dropped file.txt");
+        std::fs::write(&dropped_doc, "dropped text").unwrap();
+
+        let blob_link = blobs_dir.join("ab/escape.txt");
+        let has_blob_link = create_test_file_link(&blob_link, &outside_file);
+
+        let doc_with_at = workspace_dir.join("dir with @ sign/file.txt");
+        std::fs::create_dir_all(doc_with_at.parent().unwrap()).unwrap();
+        std::fs::write(&doc_with_at, "at-sign doc").unwrap();
+
+        let prompt = format!(
+            "Check @docs with spaces/my notes.md, @\"dir with @ sign/file.txt\", (@{}), @{}, @../outside secret.txt, @{}, and @{}!",
+            pasted_blob.display(),
+            dropped_doc.display(),
+            outside_image.display(),
+            blob_link.display(),
+        );
+        let capabilities = PromptCapabilities::new().image(true).embedded_context(true);
+        let blocks = build_prompt_content_blocks_with_roots(
+            &prompt,
+            &workspace_dir,
+            &[blobs_dir.clone(), attachments_dir.clone()],
+            &capabilities,
+        );
+
+        assert_eq!(
+            blocks.len(),
+            5,
+            "expected text + workspace doc + quoted @ doc + pasted blob image + dropped doc (has_blob_link={has_blob_link})"
+        );
+        assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+        let ContentBlock::Resource(ws_res) = &blocks[1] else {
+            panic!("expected workspace text resource");
+        };
+        let EmbeddedResourceResource::TextResourceContents(ws_text) = &ws_res.resource else {
+            panic!("expected text contents for workspace doc");
+        };
+        assert_eq!(ws_text.text, "workspace notes");
+
+        let ContentBlock::Resource(at_res) = &blocks[2] else {
+            panic!("expected quoted @-dir text resource");
+        };
+        let EmbeddedResourceResource::TextResourceContents(at_text) = &at_res.resource else {
+            panic!("expected text contents for quoted @-dir doc");
+        };
+        assert_eq!(at_text.text, "at-sign doc");
+
+        let ContentBlock::Image(blob_img) = &blocks[3] else {
+            panic!("expected pasted blob image block");
+        };
+        assert_eq!(blob_img.mime_type, "image/png");
+
+        let ContentBlock::Resource(att_res) = &blocks[4] else {
+            panic!("expected dropped attachment resource block");
+        };
+        let EmbeddedResourceResource::TextResourceContents(att_text) = &att_res.resource else {
+            panic!("expected text contents for dropped attachment");
+        };
+        assert_eq!(att_text.text, "dropped text");
+
+        let _ = std::fs::remove_dir_all(&outer_dir);
+    }
+
+    #[test]
     fn acp_terminal_confines_cwd_checks_access_mode_and_sanitizes_env() {
         use agent_client_protocol::schema::v1::EnvVariable;
 
@@ -9128,6 +9977,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await;
                 assert!(result.is_err());
@@ -9181,6 +10031,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await;
                 let err = result.unwrap_err();
@@ -9232,6 +10083,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await?;
                 assert_eq!(session_id.to_string(), "fresh-session");
@@ -9317,6 +10169,7 @@ mod tests {
                     Some("fast"),
                     Some("1m"),
                     &events,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await;
                 Ok(())
@@ -9414,6 +10267,7 @@ mod tests {
                     None,
                     None,
                     &events,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await;
                 Ok(())
@@ -9469,6 +10323,7 @@ mod tests {
                     None,
                     None,
                     &events,
+                    ACP_REQUEST_TIMEOUT,
                 )
                 .await;
                 Ok(())
@@ -9510,6 +10365,8 @@ mod tests {
                 locations: None,
                 content: None,
                 tool_name: None,
+                complete: false,
+                failed: false,
             },
         );
         let stream_state_clone = Arc::clone(&stream_state);
@@ -9532,6 +10389,7 @@ mod tests {
                     &SessionId::new("sess-1"),
                     "steer message".into(),
                     &cwd,
+                    &[],
                     &PromptCapabilities::new(),
                     &prompt_requests,
                     &events,
@@ -9543,6 +10401,7 @@ mod tests {
                     stream_state_clone.clone(),
                     None,
                     PromptKind::Steer,
+                    None,
                 )?;
                 assert!(
                     stream_state_clone.lock().produced_content,
@@ -9722,6 +10581,700 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "timer took {elapsed:?} instead of ~50ms"
         );
+    }
+
+    #[test]
+    fn acp_connection_enforces_timeouts_on_initialize_establish_and_cancel_not_prompt() {
+        use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeResponse, NewSessionResponse};
+
+        let short_timeouts = AcpTimeouts {
+            request: Duration::from_millis(50),
+            cancel: Duration::from_millis(50),
+        };
+
+        // 1. Hanging initialize times out.
+        let hang_init = Agent.builder().on_receive_request(
+            async move |_req: InitializeRequest, _responder, _cx| {
+                std::future::pending::<agent_client_protocol::Result<()>>().await
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let (events, _rx) = crate::driver::test_event_channel();
+        let (_cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let init_err = smol::block_on(run_sdk_connection_with(
+            hang_init,
+            ProviderKind::Cursor,
+            std::env::temp_dir(),
+            Vec::new(),
+            RuntimeMode::Ask,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            cmd_rx,
+            events,
+            short_timeouts,
+        ))
+        .unwrap_err();
+        assert!(init_err.to_string().contains("ACP initialize timed out"));
+
+        // 2. Hanging session/new times out.
+        let hang_new = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, _responder, _cx| {
+                    std::future::pending::<agent_client_protocol::Result<()>>().await
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (events, _rx) = crate::driver::test_event_channel();
+        let (_cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let new_err = smol::block_on(run_sdk_connection_with(
+            hang_new,
+            ProviderKind::Cursor,
+            std::env::temp_dir(),
+            Vec::new(),
+            RuntimeMode::Ask,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            cmd_rx,
+            events,
+            short_timeouts,
+        ))
+        .unwrap_err();
+        assert!(new_err.to_string().contains("ACP session/new timed out"));
+
+        // 3. Long prompt outlives `timeouts.request`, and hanging cancel settles at `timeouts.cancel`
+        // and tears down the wedged connection cleanly without needing `Shutdown`.
+        let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prompt_count_agent = Arc::clone(&prompt_count);
+        let cancel_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new("sess-cancel"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: PromptRequest, responder, _cx| {
+                    let count = prompt_count_agent.fetch_add(1, Ordering::Relaxed);
+                    if count == 0 {
+                        // Longer than `timeouts.request` (50ms) — must NOT time out.
+                        smol::Timer::after(Duration::from_millis(120)).await;
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    } else {
+                        // Ignore cancel and hang forever.
+                        std::future::pending::<agent_client_protocol::Result<()>>().await
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                cancel_agent,
+                ProviderKind::Cursor,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                short_timeouts,
+            ))
+        });
+
+        // Wait for Connected.
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(ev, DriverEvent::Connected { .. }) {
+                break;
+            }
+        }
+        // First prompt takes 120ms (> 50ms request timeout) and succeeds.
+        cmd_tx.try_send(CommandMessage::Prompt("slow turn".into())).unwrap();
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if let DriverEvent::TurnFinished { success, .. } = ev {
+                assert!(success, "long prompt must not hit short request timeout");
+                break;
+            }
+        }
+        // Second prompt hangs; Cancel must settle after `timeouts.cancel` and exit the loop.
+        cmd_tx.try_send(CommandMessage::Prompt("hung turn".into())).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        cmd_tx.try_send(CommandMessage::Cancel).unwrap();
+        let mut saw_cancel_error = false;
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            match ev {
+                DriverEvent::Error(msg) if msg.contains("session/cancel timed out") => {
+                    saw_cancel_error = true;
+                }
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(!success);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_cancel_error);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn acp_cancel_then_unsolicited_tool_and_steer_does_not_trip_stale_cancel_timeout() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionResponse, ToolCall, ToolCallStatus,
+            ToolCallUpdate, ToolCallUpdateFields,
+        };
+
+        let short_timeouts = AcpTimeouts {
+            request: Duration::from_secs(1),
+            cancel: Duration::from_millis(80),
+        };
+        let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prompt_count_agent = Arc::clone(&prompt_count);
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new("sess-stale-cancel"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: PromptRequest, responder, cx| {
+                    let idx = prompt_count_agent.fetch_add(1, Ordering::Relaxed);
+                    if idx == 0 {
+                        // Settle slightly after Cancel arrives, then kick off an unsolicited
+                        // turn starting with an in-flight tool call (no wake signal).
+                        smol::Timer::after(Duration::from_millis(25)).await;
+                        responder.respond(PromptResponse::new(StopReason::Cancelled))?;
+                        let cx_bg = cx.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(15));
+                            let _ = cx_bg.send_notification(SessionNotification::new(
+                                "sess-stale-cancel",
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new("unsol-tool-1", "Working")
+                                        .status(ToolCallStatus::InProgress),
+                                ),
+                            ));
+                        });
+                        Ok(())
+                    } else {
+                        // Steer outlives `timeouts.cancel` (80ms) — must NOT be killed by
+                        // the stale cancel_deadline from Turn 0.
+                        smol::Timer::after(Duration::from_millis(150)).await;
+                        let _ = cx.send_notification(SessionNotification::new(
+                            "sess-stale-cancel",
+                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                "unsol-tool-1",
+                                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                            )),
+                        ));
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                short_timeouts,
+            ))
+        });
+
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(ev, DriverEvent::Connected { .. }) {
+                break;
+            }
+        }
+        // Prompt 1 -> Cancel -> Prompt 1 settles normally before cancel timeout.
+        cmd_tx.try_send(CommandMessage::Prompt("first".into())).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        cmd_tx.try_send(CommandMessage::Cancel).unwrap();
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if let DriverEvent::TurnFinished { success, .. } = ev {
+                assert!(success);
+                break;
+            }
+        }
+        // Wait for unsolicited tool turn to open, then Steer.
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(ev, DriverEvent::TurnStarted) {
+                break;
+            }
+        }
+        cmd_tx.try_send(CommandMessage::Steer("steer it".into())).unwrap();
+        let mut steer_finished_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(200)) {
+                match ev {
+                    DriverEvent::Error(msg) => panic!("unexpected error: {msg}"),
+                    DriverEvent::TurnFinished { success, .. } => {
+                        steer_finished_ok = success;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(steer_finished_ok);
+        let _ = cmd_tx.try_send(CommandMessage::Shutdown);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn acp_antigravity_unsolicited_turn_checks_native_failure_on_settle() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse,
+            UsageUpdate,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("waku-acp-unsolicited-err-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("agy-config");
+        std::fs::create_dir_all(config_dir.join("conversations")).unwrap();
+        let session_id = "unsolicited-err-1";
+        let db_path = config_dir
+            .join("conversations")
+            .join(format!("{session_id}.db"));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER NOT NULL, step_type INTEGER NOT NULL, step_payload BLOB);
+             INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 1, X'00');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db_path_bg = db_path.clone();
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, cx| {
+                    responder.respond(NewSessionResponse::new(session_id))?;
+                    let cx_bg = cx.clone();
+                    let db_path = db_path_bg.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        // Write a silent native quota error step during the unsolicited turn.
+                        let conn = rusqlite::Connection::open(&db_path).unwrap();
+                        conn.execute(
+                            "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, CAST('Error 429, Message: quota, Status: RESOURCE_EXHAUSTED' AS BLOB))",
+                            [],
+                        )
+                        .unwrap();
+                        let _ = cx_bg.send_notification(SessionNotification::new(
+                            session_id,
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("Model quota exceeded")),
+                            )),
+                        ));
+                        let _ = cx_bg.send_notification(SessionNotification::new(
+                            session_id,
+                            SessionUpdate::UsageUpdate(UsageUpdate::new(100, 1000)),
+                        ));
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let cfg = config_dir.clone();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(cfg),
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        let mut saw_error = false;
+        let mut saw_failed_finish = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(200)) {
+                match ev {
+                    DriverEvent::Error(_) => saw_error = true,
+                    DriverEvent::TurnFinished { success, .. } => {
+                        assert!(!success, "unsolicited turn with native error must fail");
+                        saw_failed_finish = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_error, "expected DriverEvent::Error from native failure");
+        assert!(saw_failed_finish);
+        let _ = cmd_tx.try_send(CommandMessage::Shutdown);
+        handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acp_antigravity_steer_recovers_lost_session() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse,
+        };
+
+        let new_session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let new_session_count_agent = Arc::clone(&new_session_count);
+        let steered_on_fresh = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let steered_on_fresh_agent = Arc::clone(&steered_on_fresh);
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, cx| {
+                    let idx = new_session_count_agent.fetch_add(1, Ordering::Relaxed);
+                    let id = if idx == 0 { "lost-sess" } else { "fresh-sess" };
+                    responder.respond(NewSessionResponse::new(id))?;
+                    if idx == 0 {
+                        // Emit an unsolicited update so Steer can target the session immediately.
+                        let cx_bg = cx.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(30));
+                            let _ = cx_bg.send_notification(SessionNotification::new(
+                                "lost-sess",
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("working...")),
+                                )),
+                            ));
+                        });
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    let sid = req.session_id.to_string();
+                    if sid == "lost-sess" {
+                        return responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(
+                                "not_found: trajectory not found: lost-sess",
+                            ),
+                        );
+                    }
+                    let text = req
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    steered_on_fresh_agent.lock().push((sid.clone(), text));
+                    let _ = cx.send_notification(SessionNotification::new(
+                        sid,
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                            ContentBlock::Text(TextContent::new("steered ok")),
+                        )),
+                    ));
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        // Wait for the unsolicited turn to open, then steer it.
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(ev, DriverEvent::TurnStarted) {
+                break;
+            }
+        }
+        cmd_tx.try_send(CommandMessage::Steer("steer payload".into())).unwrap();
+
+        let mut recovered_cursor = None;
+        let mut finished_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(200)) {
+                match ev {
+                    DriverEvent::Connected {
+                        provider_cursor: Some(cursor),
+                    } => {
+                        recovered_cursor = Some(cursor.native_id().to_owned());
+                    }
+                    DriverEvent::TurnFinished { success, .. } => {
+                        finished_ok = success;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(recovered_cursor.as_deref(), Some("fresh-sess"));
+        assert!(finished_ok);
+        assert_eq!(
+            *steered_on_fresh.lock(),
+            vec![("fresh-sess".to_owned(), "steer payload".to_owned())]
+        );
+        let _ = cmd_tx.try_send(CommandMessage::Shutdown);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn acp_antigravity_concurrent_turn_and_steer_both_recover_on_lost_session() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionResponse,
+        };
+
+        let new_session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let new_session_count_agent = Arc::clone(&new_session_count);
+        let delivered_on_fresh = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let delivered_on_fresh_agent = Arc::clone(&delivered_on_fresh);
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    let idx = new_session_count_agent.fetch_add(1, Ordering::Relaxed);
+                    let id = if idx == 0 { "lost-sess" } else { "fresh-sess" };
+                    responder.respond(NewSessionResponse::new(id))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    let sid = req.session_id.to_string();
+                    let text = req
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if sid == "lost-sess" {
+                        // Make the primary Turn fail slightly before the Steer so
+                        // `settle_prompt_request` returns `false` for the Turn.
+                        if text != "primary turn" {
+                            smol::Timer::after(Duration::from_millis(25)).await;
+                        }
+                        return responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(
+                                "not_found: trajectory not found: lost-sess",
+                            ),
+                        );
+                    }
+                    delivered_on_fresh_agent.lock().push((sid.clone(), text));
+                    smol::Timer::after(Duration::from_millis(15)).await;
+                    let _ = cx.send_notification(SessionNotification::new(
+                        sid,
+                        SessionUpdate::AgentMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("recovered ok")),
+                            ),
+                        ),
+                    ));
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        loop {
+            let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(ev, DriverEvent::Connected { .. }) {
+                break;
+            }
+        }
+        cmd_tx.try_send(CommandMessage::Prompt("primary turn".into())).unwrap();
+        cmd_tx.try_send(CommandMessage::Steer("follow-up steer".into())).unwrap();
+
+        let mut finished_ok = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(200))
+                && let DriverEvent::TurnFinished { success, .. } = ev
+            {
+                finished_ok = success;
+                break;
+            }
+        }
+        assert!(finished_ok);
+        assert_eq!(new_session_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *delivered_on_fresh.lock(),
+            vec![
+                ("fresh-sess".to_owned(), "primary turn".to_owned()),
+                ("fresh-sess".to_owned(), "follow-up steer".to_owned()),
+            ]
+        );
+        let _ = cmd_tx.try_send(CommandMessage::Shutdown);
+        handle.join().unwrap().unwrap();
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:

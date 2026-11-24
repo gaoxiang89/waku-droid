@@ -2634,6 +2634,181 @@ impl Waku {
             || self.execute_fast_mode_toggle(prompt, cx)
             || self.execute_goal_composer_command(prompt, cx)
             || self.execute_antigravity_local_command(prompt, from_autocomplete, cx)
+            || self.execute_droid_local_command(prompt, from_autocomplete, cx)
+    }
+
+    fn execute_provider_model_picker(&mut self, can_choose_model: bool, cx: &mut Context<Self>) {
+        self.composer.update(cx, |input, cx| input.clear(cx));
+        if !can_choose_model {
+            self.show_toast(tr!("commands.model_unavailable"));
+            cx.notify();
+        } else {
+            cx.defer(|cx| cx.dispatch_action(&ToggleModelPicker));
+        }
+    }
+
+    fn execute_provider_set_model(
+        &mut self,
+        provider: ProviderKind,
+        can_choose_model: bool,
+        session_account_id: Option<String>,
+        account_id: Option<String>,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !can_choose_model {
+            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.show_toast(tr!("commands.model_unavailable"));
+            cx.notify();
+            return;
+        }
+        let models = self
+            .selected_session()
+            .and_then(|session| self.provider_probe_for_session(session))
+            .or_else(|| self.provider_probe(provider))
+            .map(|probe| probe.models.clone())
+            .unwrap_or_default();
+        if let Some((model_id, model_name)) = resolve_provider_model(&models, &query) {
+            // Clear before applying so Edited does not repaint the old choice.
+            self.composer.update(cx, |input, cx| input.clear(cx));
+            if self.selected_session().is_some() {
+                self.choose_agent_model(provider, session_account_id, model_id, cx);
+            } else {
+                let (effort, tier, window) = self.state.model_traits_for(provider, &model_id);
+                self.state.last_provider = provider;
+                self.state.last_account_id = account_id;
+                self.state.last_model = Some(model_id);
+                self.state.last_reasoning_effort = effort;
+                self.state.last_service_tier = tier;
+                self.state.last_context_window = window;
+                self.save();
+            }
+            self.show_success_toast(tr!("commands.model_switched", model = model_name));
+            cx.notify();
+        } else {
+            if models.is_empty() {
+                self.refresh_provider_model_discovery(provider);
+            }
+            self.show_toast(tr!("commands.model_not_found", model = query));
+            cx.notify();
+        }
+    }
+
+    fn execute_provider_effort_show(&mut self, provider: ProviderKind, cx: &mut Context<Self>) {
+        self.composer.update(cx, |input, cx| input.clear(cx));
+        let summary = {
+            let (model, active_effort) = match self.selected_session() {
+                Some(session) => (
+                    self.model_metadata_for_session(session),
+                    session.reasoning_effort.as_deref(),
+                ),
+                None => {
+                    let probe = self.provider_probe(provider);
+                    let model = probe.and_then(|probe| {
+                        self.state
+                            .last_model
+                            .as_deref()
+                            .and_then(|id| probe.model(id))
+                            .or_else(|| probe.preferred_model())
+                    });
+                    (model, self.state.last_reasoning_effort.as_deref())
+                }
+            };
+            model.and_then(|model| {
+                if model.reasoning_efforts.is_empty() {
+                    return None;
+                }
+                let current_id = active_effort
+                    .filter(|selected| {
+                        model
+                            .reasoning_efforts
+                            .iter()
+                            .any(|option| option.id == *selected)
+                    })
+                    .or(model.default_reasoning_effort.as_deref())
+                    .or_else(|| {
+                        model
+                            .reasoning_efforts
+                            .first()
+                            .map(|option| option.id.as_str())
+                    })?;
+                let current_label = model
+                    .reasoning_efforts
+                    .iter()
+                    .find(|option| option.id == current_id)
+                    .map(|option| option.label.clone())
+                    .unwrap_or_else(|| current_id.to_owned());
+                let options = model
+                    .reasoning_efforts
+                    .iter()
+                    .map(|option| option.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some((current_label, options))
+            })
+        };
+        match summary {
+            Some((effort, options)) => {
+                self.show_success_toast(tr!(
+                    "commands.effort_current",
+                    effort = effort,
+                    options = options
+                ));
+            }
+            None => {
+                self.show_toast(tr!("commands.effort_unsupported"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn execute_provider_set_effort(
+        &mut self,
+        provider: ProviderKind,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let efforts = match self.selected_session() {
+            Some(session) => self.model_metadata_for_session(session),
+            None => self.provider_probe(provider).and_then(|probe| {
+                self.state
+                    .last_model
+                    .as_deref()
+                    .and_then(|id| probe.model(id))
+                    .or_else(|| probe.preferred_model())
+            }),
+        }
+        .map(|model| model.reasoning_efforts.clone())
+        .unwrap_or_default();
+        if efforts.is_empty() {
+            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.show_toast(tr!("commands.effort_unsupported"));
+            cx.notify();
+            return;
+        }
+        if let Some((effort_id, effort_label)) = resolve_provider_effort(&efforts, &query) {
+            self.composer.update(cx, |input, cx| input.clear(cx));
+            if self.selected_session().is_some() {
+                self.set_reasoning_effort(effort_id, cx);
+            } else {
+                self.state.last_reasoning_effort = Some(effort_id);
+                self.save();
+            }
+            self.show_success_toast(tr!("commands.effort_switched", effort = effort_label));
+            cx.notify();
+        } else {
+            let options = efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.show_toast(tr!(
+                "commands.effort_invalid",
+                effort = query,
+                options = options
+            ));
+            cx.notify();
+        }
     }
 
     /// Bridge Antigravity's CLI-local commands (`/usage`, `/quota`, `/credits`,
@@ -2688,176 +2863,197 @@ impl Waku {
                 self.open_settings_page(SettingsPage::Usage, cx);
             }
             AntigravityLocalCommand::ModelPicker => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
-                if !can_choose_model {
-                    self.show_toast(tr!("commands.model_unavailable"));
-                    cx.notify();
-                } else {
-                    cx.defer(|cx| cx.dispatch_action(&ToggleModelPicker));
-                }
+                self.execute_provider_model_picker(can_choose_model, cx);
             }
             AntigravityLocalCommand::SetModel(query) => {
-                if !can_choose_model {
-                    self.composer.update(cx, |input, cx| input.clear(cx));
-                    self.show_toast(tr!("commands.model_unavailable"));
-                    cx.notify();
-                    return true;
-                }
-                let models = self
-                    .selected_session()
-                    .and_then(|session| self.provider_probe_for_session(session))
-                    .or_else(|| self.provider_probe(ProviderKind::Antigravity))
-                    .map(|probe| probe.models.clone())
-                    .unwrap_or_default();
-                if let Some((model_id, model_name)) = resolve_antigravity_model(&models, &query) {
-                    // Clear before applying so Edited does not repaint the old choice.
-                    self.composer.update(cx, |input, cx| input.clear(cx));
-                    if self.selected_session().is_some() {
-                        self.choose_agent_model(
-                            ProviderKind::Antigravity,
-                            session_account_id,
-                            model_id,
-                            cx,
-                        );
-                    } else {
-                        let (effort, tier, window) =
-                            self.state.model_traits_for(ProviderKind::Antigravity, &model_id);
-                        self.state.last_provider = ProviderKind::Antigravity;
-                        self.state.last_account_id = account_id;
-                        self.state.last_model = Some(model_id);
-                        self.state.last_reasoning_effort = effort;
-                        self.state.last_service_tier = tier;
-                        self.state.last_context_window = window;
-                        self.save();
-                        cx.notify();
-                    }
-                    self.show_success_toast(tr!("commands.model_switched", model = model_name));
-                } else {
-                    if models.is_empty() {
-                        self.refresh_provider_model_discovery(ProviderKind::Antigravity);
-                    }
-                    self.show_toast(tr!("commands.model_not_found", model = query));
-                    cx.notify();
-                }
+                self.execute_provider_set_model(
+                    ProviderKind::Antigravity,
+                    can_choose_model,
+                    session_account_id,
+                    account_id,
+                    query,
+                    cx,
+                );
             }
             AntigravityLocalCommand::EffortShow => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
-                let summary = {
-                    let (model, active_effort) = match self.selected_session() {
-                        Some(session) => (
-                            self.model_metadata_for_session(session),
-                            session.reasoning_effort.as_deref(),
-                        ),
-                        None => {
-                            let probe = self.provider_probe(ProviderKind::Antigravity);
-                            let model = probe.and_then(|probe| {
-                                self.state
-                                    .last_model
-                                    .as_deref()
-                                    .and_then(|id| probe.model(id))
-                                    .or_else(|| probe.preferred_model())
-                            });
-                            (model, self.state.last_reasoning_effort.as_deref())
-                        }
-                    };
-                    model.and_then(|model| {
-                        if model.reasoning_efforts.is_empty() {
-                            return None;
-                        }
-                        let current_id = active_effort
-                            .filter(|selected| {
-                                model
-                                    .reasoning_efforts
-                                    .iter()
-                                    .any(|option| option.id == *selected)
-                            })
-                            .or(model.default_reasoning_effort.as_deref())
-                            .or_else(|| {
-                                model
-                                    .reasoning_efforts
-                                    .first()
-                                    .map(|option| option.id.as_str())
-                            })?;
-                        let current_label = model
-                            .reasoning_efforts
-                            .iter()
-                            .find(|option| option.id == current_id)
-                            .map(|option| option.label.clone())
-                            .unwrap_or_else(|| current_id.to_owned());
-                        let options = model
-                            .reasoning_efforts
-                            .iter()
-                            .map(|option| option.id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        Some((current_label, options))
-                    })
-                };
-                match summary {
-                    Some((effort, options)) => {
-                        self.show_success_toast(tr!(
-                            "commands.effort_current",
-                            effort = effort,
-                            options = options
-                        ));
-                    }
-                    None => {
-                        self.show_toast(tr!("commands.effort_unsupported"));
-                    }
-                }
-                cx.notify();
+                self.execute_provider_effort_show(ProviderKind::Antigravity, cx);
             }
             AntigravityLocalCommand::SetEffort(query) => {
-                let efforts = match self.selected_session() {
-                    Some(session) => self.model_metadata_for_session(session),
-                    None => self.provider_probe(ProviderKind::Antigravity).and_then(|probe| {
-                        self.state
-                            .last_model
-                            .as_deref()
-                            .and_then(|id| probe.model(id))
-                            .or_else(|| probe.preferred_model())
-                    }),
-                }
-                .map(|model| model.reasoning_efforts.clone())
-                .unwrap_or_default();
-                if efforts.is_empty() {
-                    self.composer.update(cx, |input, cx| input.clear(cx));
-                    self.show_toast(tr!("commands.effort_unsupported"));
-                    cx.notify();
-                    return true;
-                }
-                if let Some((effort_id, effort_label)) =
-                    resolve_antigravity_effort(&efforts, &query)
-                {
-                    self.composer.update(cx, |input, cx| input.clear(cx));
-                    if self.selected_session().is_some() {
-                        self.set_reasoning_effort(effort_id, cx);
-                    } else {
-                        self.state.last_reasoning_effort = Some(effort_id);
-                        self.save();
-                        cx.notify();
-                    }
-                    self.show_success_toast(tr!(
-                        "commands.effort_switched",
-                        effort = effort_label
-                    ));
-                } else {
-                    let options = efforts
-                        .iter()
-                        .map(|option| option.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    self.show_toast(tr!(
-                        "commands.effort_invalid",
-                        effort = query,
-                        options = options
-                    ));
-                    cx.notify();
-                }
+                self.execute_provider_set_effort(ProviderKind::Antigravity, query, cx);
             }
             AntigravityLocalCommand::SwarmBoard => {
                 self.composer.update(cx, |input, cx| input.clear(cx));
                 self.open_antigravity_swarm_panel(cx);
+            }
+        }
+        true
+    }
+
+    /// Bridge Factory Droid's CLI-local commands (`/model`, `/reasoning`,
+    /// `/effort`, `/autonomy`, `/new`, `/clear`) without starting an ACP turn.
+    fn execute_droid_local_command(
+        &mut self,
+        prompt: &str,
+        from_autocomplete: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::composer_complete::DroidLocalCommand;
+
+        const DROID_AUTONOMY_OPTIONS: &str = "normal, auto-low, auto-medium, auto-high";
+
+        let (provider, can_choose_model, session_account_id) = match self.selected_session() {
+            Some(session) => (
+                session.provider,
+                session.can_choose_model(),
+                session.account_id.clone(),
+            ),
+            None => (
+                self.state.last_provider,
+                true,
+                self.state.last_account_id.clone(),
+            ),
+        };
+        let Some(command) = crate::composer_complete::parse_droid_local_command(
+            provider,
+            prompt,
+            &self.slash_command_index,
+        ) else {
+            return false;
+        };
+        if from_autocomplete && !command.executes_on_autocomplete_accept() {
+            return false;
+        }
+
+        let host = self.selected_host_key();
+        let account_id = self.validated_account_id_for_host(
+            &host,
+            ProviderKind::Droid,
+            session_account_id.as_deref(),
+        );
+
+        match command {
+            DroidLocalCommand::ModelPicker => {
+                self.execute_provider_model_picker(can_choose_model, cx);
+            }
+            DroidLocalCommand::SetModel(query) => {
+                self.execute_provider_set_model(
+                    ProviderKind::Droid,
+                    can_choose_model,
+                    session_account_id,
+                    account_id,
+                    query,
+                    cx,
+                );
+            }
+            DroidLocalCommand::EffortShow => {
+                self.execute_provider_effort_show(ProviderKind::Droid, cx);
+            }
+            DroidLocalCommand::SetEffort(query) => {
+                self.execute_provider_set_effort(ProviderKind::Droid, query, cx);
+            }
+            DroidLocalCommand::AutonomyShow => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                let mode = self
+                    .selected_session()
+                    .map(|session| session.runtime_mode)
+                    .unwrap_or(self.state.last_runtime_mode);
+                self.show_success_toast(tr!(
+                    "commands.autonomy_current",
+                    level = mode.droid_autonomy_level(),
+                    options = DROID_AUTONOMY_OPTIONS
+                ));
+                cx.notify();
+            }
+            DroidLocalCommand::SetAutonomy(query) => {
+                if let Some(mode) = crate::composer_complete::resolve_droid_autonomy_mode(&query) {
+                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    if self.selected_session().is_some() {
+                        self.set_runtime_mode(mode, cx);
+                    } else {
+                        self.state.last_runtime_mode = mode;
+                        self.save();
+                    }
+                    self.show_success_toast(tr!(
+                        "commands.autonomy_switched",
+                        level = mode.droid_autonomy_level()
+                    ));
+                    cx.notify();
+                } else {
+                    self.show_toast(tr!(
+                        "commands.autonomy_invalid",
+                        level = query,
+                        options = DROID_AUTONOMY_OPTIONS
+                    ));
+                    cx.notify();
+                }
+            }
+            DroidLocalCommand::NewSession => {
+                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.settings_page = None;
+                let current_project = self
+                    .selected_project()
+                    .map(|project| (project.id, project.is_projectless()));
+                let inherited_traits = self.selected_session().map(|session| {
+                    (
+                        session.model.clone(),
+                        session.reasoning_effort.clone(),
+                        session.service_tier.clone(),
+                        session.context_window.clone(),
+                        session.runtime_mode,
+                    )
+                });
+                self.state.last_provider = ProviderKind::Droid;
+                self.state.last_account_id = account_id.clone();
+                if let Some((model, reasoning_effort, service_tier, context_window, runtime_mode)) =
+                    inherited_traits.clone()
+                {
+                    self.state.last_model = model;
+                    self.state.last_reasoning_effort = reasoning_effort;
+                    self.state.last_service_tier = service_tier;
+                    self.state.last_context_window = context_window;
+                    self.state.last_runtime_mode = runtime_mode;
+                }
+                match current_project {
+                    Some((project_id, false)) => {
+                        if let Some(session_id) = self
+                            .session_navigation
+                            .remembered_new_task(&self.state.sessions, project_id)
+                        {
+                            self.select_session(session_id, cx);
+                        } else {
+                            self.create_session_for(project_id, ProviderKind::Droid, cx);
+                        }
+                    }
+                    Some((_, true)) | None => self.create_projectless_session(cx),
+                }
+                let switched_reused_draft = self.selected_session_mut().is_some_and(|session| {
+                    if session.has_started() || session.provider == ProviderKind::Droid {
+                        return false;
+                    }
+                    session.provider = ProviderKind::Droid;
+                    session.account_id = account_id.clone();
+                    if let Some((
+                        model,
+                        reasoning_effort,
+                        service_tier,
+                        context_window,
+                        runtime_mode,
+                    )) = inherited_traits
+                    {
+                        session.model = model;
+                        session.reasoning_effort = reasoning_effort;
+                        session.service_tier = service_tier;
+                        session.context_window = context_window;
+                        session.runtime_mode = runtime_mode;
+                    }
+                    true
+                });
+                if switched_reused_draft {
+                    self.refresh_composer_sources(cx);
+                    self.save();
+                }
+                self.composer_focus_pending = true;
+                cx.notify();
             }
         }
         true
@@ -4786,7 +4982,10 @@ pub(super) fn visible_picker_entries(
     entries
 }
 
-fn resolve_antigravity_model(models: &[ProviderModel], query: &str) -> Option<(String, String)> {
+pub(super) fn resolve_provider_model(
+    models: &[ProviderModel],
+    query: &str,
+) -> Option<(String, String)> {
     let query = query.trim();
     if query.is_empty() {
         return None;
@@ -4826,7 +5025,7 @@ fn resolve_antigravity_model(models: &[ProviderModel], query: &str) -> Option<(S
     Some((first.id.clone(), first.name.clone()))
 }
 
-fn resolve_antigravity_effort(
+pub(super) fn resolve_provider_effort(
     options: &[crate::model::ProviderModelOption],
     query: &str,
 ) -> Option<(String, String)> {
@@ -4857,35 +5056,35 @@ fn resolve_antigravity_effort(
 }
 
 #[cfg(test)]
-mod antigravity_command_tests {
+mod provider_command_tests {
     use super::*;
 
     #[test]
-    fn resolve_antigravity_model_prefers_exact_then_unique_match() {
+    fn resolve_provider_model_prefers_exact_then_unique_match() {
         let models = vec![
             ProviderModel::new("gemini-3.1-pro", "Gemini 3.1 Pro"),
             ProviderModel::new("gemini-3.8-flash", "Gemini 3.8 Flash"),
             ProviderModel::new("claude-sonnet-4-6", "Claude Sonnet 4.6"),
         ];
         assert_eq!(
-            resolve_antigravity_model(&models, "GEMINI-3.1-PRO"),
+            resolve_provider_model(&models, "GEMINI-3.1-PRO"),
             Some(("gemini-3.1-pro".into(), "Gemini 3.1 Pro".into()))
         );
         assert_eq!(
-            resolve_antigravity_model(&models, "gemini-3.8-flash"),
+            resolve_provider_model(&models, "gemini-3.8-flash"),
             Some(("gemini-3.8-flash".into(), "Gemini 3.8 Flash".into()))
         );
         assert_eq!(
-            resolve_antigravity_model(&models, "sonnet"),
+            resolve_provider_model(&models, "sonnet"),
             Some(("claude-sonnet-4-6".into(), "Claude Sonnet 4.6".into()))
         );
         // Ambiguous substring does not guess.
-        assert_eq!(resolve_antigravity_model(&models, "gemini"), None);
-        assert_eq!(resolve_antigravity_model(&models, "nonexistent"), None);
+        assert_eq!(resolve_provider_model(&models, "gemini"), None);
+        assert_eq!(resolve_provider_model(&models, "nonexistent"), None);
     }
 
     #[test]
-    fn resolve_antigravity_effort_matches_id_label_and_extra_alias() {
+    fn resolve_provider_effort_matches_id_label_and_extra_alias() {
         let options = vec![
             crate::model::ProviderModelOption::new("low", "Low"),
             crate::model::ProviderModelOption::new("medium", "Medium"),
@@ -4893,17 +5092,17 @@ mod antigravity_command_tests {
             crate::model::ProviderModelOption::new("xhigh", "Extra"),
         ];
         assert_eq!(
-            resolve_antigravity_effort(&options, "HIGH"),
+            resolve_provider_effort(&options, "HIGH"),
             Some(("high".into(), "High".into()))
         );
         assert_eq!(
-            resolve_antigravity_effort(&options, "xhigh"),
+            resolve_provider_effort(&options, "xhigh"),
             Some(("xhigh".into(), "Extra".into()))
         );
         assert_eq!(
-            resolve_antigravity_effort(&options, "extra"),
+            resolve_provider_effort(&options, "extra"),
             Some(("xhigh".into(), "Extra".into()))
         );
-        assert_eq!(resolve_antigravity_effort(&options, "max"), None);
+        assert_eq!(resolve_provider_effort(&options, "max"), None);
     }
 }

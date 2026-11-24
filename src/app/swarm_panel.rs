@@ -45,6 +45,95 @@ impl SwarmPanelTab {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SwarmSurfaceAction {
+    None,
+    OpenPanel,
+    AttachTab,
+}
+
+#[derive(Default)]
+struct SwarmAutoSurfaceState {
+    /// Tracks whether an auto-reveal was requested for a session's newly
+    /// detected swarm across throttled/in-flight refreshes or while another
+    /// session was active.
+    pending_auto_reveal: HashSet<Uuid>,
+    /// Sessions where we already surfaced the Swarm tab on first detection.
+    auto_surfaced_sessions: HashSet<Uuid>,
+    /// Sessions where the user explicitly closed the Swarm tab.
+    dismissed_sessions: HashSet<Uuid>,
+}
+
+impl SwarmAutoSurfaceState {
+    fn queue_auto_reveal(&mut self, session_id: Uuid) -> bool {
+        if !self.auto_surfaced_sessions.contains(&session_id)
+            && !self.dismissed_sessions.contains(&session_id)
+        {
+            self.pending_auto_reveal.insert(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn has_pending_reveal(&self, session_id: Uuid) -> bool {
+        self.pending_auto_reveal.contains(&session_id)
+    }
+
+    fn mark_opened(&mut self, session_id: Uuid) {
+        self.dismissed_sessions.remove(&session_id);
+        self.pending_auto_reveal.remove(&session_id);
+    }
+
+    fn mark_dismissed(&mut self, session_id: Uuid) {
+        self.dismissed_sessions.insert(session_id);
+        self.pending_auto_reveal.remove(&session_id);
+    }
+
+    fn remove_session(&mut self, session_id: Uuid) {
+        self.pending_auto_reveal.remove(&session_id);
+        self.auto_surfaced_sessions.remove(&session_id);
+        self.dismissed_sessions.remove(&session_id);
+    }
+
+    /// Resolves what surface action to take when a swarm snapshot is detected.
+    ///
+    /// Deferred auto-reveal stays queued while `session_id` is not selected so
+    /// switching back to that session later still opens the Swarm panel once.
+    fn resolve_detected_swarm(
+        &mut self,
+        session_id: Uuid,
+        is_selected: bool,
+        auto_reveal: bool,
+        right_panel_visible: bool,
+        has_swarm_surface: bool,
+    ) -> SwarmSurfaceAction {
+        if !is_selected {
+            if auto_reveal {
+                self.queue_auto_reveal(session_id);
+            }
+            return SwarmSurfaceAction::None;
+        }
+
+        let was_pending = self.pending_auto_reveal.remove(&session_id);
+        let should_reveal = auto_reveal || was_pending;
+        if self.dismissed_sessions.contains(&session_id)
+            || self.auto_surfaced_sessions.contains(&session_id)
+        {
+            return SwarmSurfaceAction::None;
+        }
+        if should_reveal {
+            self.auto_surfaced_sessions.insert(session_id);
+            return SwarmSurfaceAction::OpenPanel;
+        }
+        if right_panel_visible && !has_swarm_surface {
+            self.auto_surfaced_sessions.insert(session_id);
+            return SwarmSurfaceAction::AttachTab;
+        }
+        SwarmSurfaceAction::None
+    }
+}
+
 pub(super) struct SwarmPanelState {
     active_tab: SwarmPanelTab,
     member_filter: Option<String>,
@@ -56,9 +145,6 @@ pub(super) struct SwarmPanelState {
     pending: HashSet<Uuid>,
     stale: HashSet<Uuid>,
     last_activity_refresh_at: HashMap<Uuid, Instant>,
-    /// Tracks whether an auto-reveal was requested for a session's newly
-    /// detected swarm across throttled/in-flight refreshes.
-    pending_auto_reveal: HashSet<Uuid>,
     /// Tracks sessions that emitted swarm tool activity before a snapshot landed.
     saw_swarm_activity: HashSet<Uuid>,
     /// Coalesces trailing-edge throttle timers per session.
@@ -69,10 +155,7 @@ pub(super) struct SwarmPanelState {
     /// Monotonic counter controlling the active 2s polling task.
     poll_generation: u64,
     poll_active: bool,
-    /// Sessions where we already surfaced the Swarm tab on first detection.
-    auto_surfaced_sessions: HashSet<Uuid>,
-    /// Sessions where the user explicitly closed the Swarm tab.
-    dismissed_sessions: HashSet<Uuid>,
+    auto_surface: SwarmAutoSurfaceState,
     /// Virtualized list backing `board.jsonl` messages.
     board_list_state: ListState,
     board_scrollbar: Rc<ScrollbarState>,
@@ -131,15 +214,13 @@ impl SwarmPanelState {
             pending: HashSet::new(),
             stale: HashSet::new(),
             last_activity_refresh_at: HashMap::new(),
-            pending_auto_reveal: HashSet::new(),
             saw_swarm_activity: HashSet::new(),
             throttle_scheduled: HashSet::new(),
             generation: 0,
             session_generations: HashMap::new(),
             poll_generation: 0,
             poll_active: false,
-            auto_surfaced_sessions: HashSet::new(),
-            dismissed_sessions: HashSet::new(),
+            auto_surface: SwarmAutoSurfaceState::default(),
             board_list_state,
             board_scrollbar: ScrollbarState::new(),
             board_list_key: None,
@@ -176,12 +257,10 @@ impl SwarmPanelState {
         self.pending.remove(&session_id);
         self.stale.remove(&session_id);
         self.last_activity_refresh_at.remove(&session_id);
-        self.pending_auto_reveal.remove(&session_id);
         self.saw_swarm_activity.remove(&session_id);
         self.throttle_scheduled.remove(&session_id);
         self.session_generations.remove(&session_id);
-        self.auto_surfaced_sessions.remove(&session_id);
-        self.dismissed_sessions.remove(&session_id);
+        self.auto_surface.remove_session(session_id);
     }
 
     fn tab_focus(&self, tab: SwarmPanelTab) -> &FocusHandle {
@@ -411,16 +490,57 @@ fn collapsed_preview(body: &str) -> Option<String> {
     }
     Some(format!("{}…", excerpt.trim_end()))
 }
+fn extract_hh_mm(time_part: &str) -> Option<String> {
+    let mut parts = time_part.split(':');
+    let hour = parts.next()?;
+    let minute = parts.next()?;
+    let minute = minute.get(..2)?;
+    ((1..=2).contains(&hour.len())
+        && hour.bytes().all(|b| b.is_ascii_digit())
+        && minute.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| format!("{hour}:{minute}"))
+}
+
 fn short_board_time(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some((_, time_part)) = trimmed.split_once(' ') {
-        let mut parts = time_part.split(':');
-        if let (Some(hour), Some(minute)) = (parts.next(), parts.next()) {
-            return format!("{hour}:{minute}");
-        }
-        return time_part.to_owned();
+        return extract_hh_mm(time_part).unwrap_or_else(|| time_part.to_owned());
     }
     trimmed.to_owned()
+}
+
+fn format_overview_updated_at_with_tz<Tz: chrono::TimeZone>(
+    raw: &str,
+    tz: &Tz,
+) -> Option<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(tz).format("%H:%M").to_string());
+    }
+    if let Some((_, time_part)) = trimmed.split_once(' ').or_else(|| trimmed.split_once('T')) {
+        return Some(extract_hh_mm(time_part).unwrap_or_else(|| time_part.to_owned()));
+    }
+    Some(short_board_time(trimmed))
+}
+
+fn format_overview_updated_at(raw: &str) -> Option<String> {
+    format_overview_updated_at_with_tz(raw, &Local)
+}
+
+fn overview_meta_label(as_of_seq: u64, updated_at: Option<&str>) -> Option<String> {
+    let updated = updated_at.and_then(format_overview_updated_at);
+    match (as_of_seq > 0, updated) {
+        (true, Some(time)) => Some(format!("{} · {time}", tr!("swarm.as_of_seq", seq = as_of_seq))),
+        (true, None) => Some(tr!("swarm.as_of_seq", seq = as_of_seq)),
+        (false, Some(time)) => Some(time),
+        (false, None) => None,
+    }
 }
 
 fn swarm_has_active_work(snapshot: &AntigravitySwarmSnapshot) -> bool {
@@ -438,7 +558,7 @@ impl Waku {
     /// Invoked by `/swarm board` in the composer and the header Swarm button.
     pub(super) fn open_antigravity_swarm_panel(&mut self, cx: &mut Context<Self>) {
         if let Some(session_id) = self.state.selected_session {
-            self.swarm_panel.dismissed_sessions.remove(&session_id);
+            self.swarm_panel.auto_surface.mark_opened(session_id);
         }
         self.open_right_panel_surface(RightPanelSurface::Swarm, cx);
         self.refresh_selected_antigravity_swarm(cx);
@@ -477,7 +597,7 @@ impl Waku {
 
     pub(super) fn mark_antigravity_swarm_dismissed(&mut self) {
         if let Some(session_id) = self.state.selected_session {
-            self.swarm_panel.dismissed_sessions.insert(session_id);
+            self.swarm_panel.auto_surface.mark_dismissed(session_id);
         }
     }
 
@@ -498,11 +618,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.swarm_panel.saw_swarm_activity.insert(session_id);
-        if !self.swarm_panel.auto_surfaced_sessions.contains(&session_id)
-            && !self.swarm_panel.dismissed_sessions.contains(&session_id)
-        {
-            self.swarm_panel.pending_auto_reveal.insert(session_id);
-        }
+        let should_reveal = self.swarm_panel.auto_surface.queue_auto_reveal(session_id);
         let now = Instant::now();
         if let Some(last) = self.swarm_panel.last_activity_refresh_at.get(&session_id) {
             let elapsed = now.duration_since(*last);
@@ -521,7 +637,7 @@ impl Waku {
                                     .last_activity_refresh_at
                                     .insert(session_id, Instant::now());
                                 let reveal =
-                                    this.swarm_panel.pending_auto_reveal.contains(&session_id);
+                                    this.swarm_panel.auto_surface.has_pending_reveal(session_id);
                                 this.request_antigravity_swarm_refresh(session_id, reveal, cx);
                             }
                         });
@@ -532,7 +648,7 @@ impl Waku {
             }
         }
         self.swarm_panel.last_activity_refresh_at.insert(session_id, now);
-        self.request_antigravity_swarm_refresh(session_id, true, cx);
+        self.request_antigravity_swarm_refresh(session_id, should_reveal, cx);
         if self.state.selected_session == Some(session_id) {
             self.sync_antigravity_swarm_polling(cx);
         }
@@ -557,7 +673,7 @@ impl Waku {
             || self.swarm_panel.saw_swarm_activity.contains(&session_id)
             || self.swarm_panel.stale.contains(&session_id)
         {
-            let auto_reveal = self.swarm_panel.pending_auto_reveal.contains(&session_id);
+            let auto_reveal = self.swarm_panel.auto_surface.has_pending_reveal(session_id);
             self.request_antigravity_swarm_refresh(session_id, auto_reveal, cx);
             self.sync_antigravity_swarm_polling(cx);
         }
@@ -705,7 +821,7 @@ impl Waku {
         let config_dir = self.effective_config_dir_for_session(session);
 
         if auto_reveal {
-            self.swarm_panel.pending_auto_reveal.insert(session_id);
+            self.swarm_panel.auto_surface.queue_auto_reveal(session_id);
         }
         if self.swarm_panel.pending.contains(&session_id) {
             self.swarm_panel.stale.insert(session_id);
@@ -775,27 +891,30 @@ impl Waku {
                 }
 
                 if detected_now {
-                    let was_pending = this.swarm_panel.pending_auto_reveal.remove(&session_id);
-                    let should_reveal = auto_reveal || was_pending;
-                    if this.state.selected_session == Some(session_id)
-                        && !this.swarm_panel.dismissed_sessions.contains(&session_id)
-                        && this.swarm_panel.auto_surfaced_sessions.insert(session_id)
-                    {
-                        if should_reveal {
+                    let is_selected = this.state.selected_session == Some(session_id);
+                    let has_swarm_surface = this
+                        .right_panel_surfaces
+                        .contains(&RightPanelSurface::Swarm);
+                    match this.swarm_panel.auto_surface.resolve_detected_swarm(
+                        session_id,
+                        is_selected,
+                        auto_reveal,
+                        this.right_panel_visible,
+                        has_swarm_surface,
+                    ) {
+                        SwarmSurfaceAction::OpenPanel => {
                             this.open_right_panel_surface(RightPanelSurface::Swarm, cx);
-                        } else if this.right_panel_visible
-                            && !this
-                                .right_panel_surfaces
-                                .contains(&RightPanelSurface::Swarm)
-                        {
+                        }
+                        SwarmSurfaceAction::AttachTab => {
                             this.right_panel_surfaces.push(RightPanelSurface::Swarm);
                             changed = true;
                         }
+                        SwarmSurfaceAction::None => {}
                     }
                 }
 
                 if this.swarm_panel.stale.remove(&session_id) {
-                    let retry_reveal = this.swarm_panel.pending_auto_reveal.contains(&session_id);
+                    let retry_reveal = this.swarm_panel.auto_surface.has_pending_reveal(session_id);
                     this.request_antigravity_swarm_refresh(session_id, retry_reveal, cx);
                 }
 
@@ -2683,7 +2802,8 @@ fn render_swarm_overview_body(overview: &AntigravitySwarmOverview, theme: &Theme
         (Some(index), Some(total)) => format!("{} ({index}/{total})", phase.label),
         _ => phase.label.clone(),
     });
-    if !overview.headline.is_empty() || phase_label.is_some() || overview.as_of_seq > 0 {
+    let meta_label = overview_meta_label(overview.as_of_seq, overview.updated_at.as_deref());
+    if !overview.headline.is_empty() || phase_label.is_some() || meta_label.is_some() {
         column = column.child(
             div()
                 .px(px(10.0))
@@ -2705,32 +2825,35 @@ fn render_swarm_overview_body(overview: &AntigravitySwarmOverview, theme: &Theme
                             .child(overview.headline.clone()),
                     )
                 })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .when_some(phase_label, |row, label| {
-                            row.child(
-                                div()
-                                    .px(px(6.0))
-                                    .py(px(1.0))
-                                    .rounded(px(4.0))
-                                    .bg(theme.overlay)
-                                    .text_size(sp(11.0))
-                                    .text_color(theme.text_secondary)
-                                    .child(label),
-                            )
-                        })
-                        .when(overview.as_of_seq > 0, |row| {
-                            row.child(
-                                div()
-                                    .text_size(sp(11.0))
-                                    .text_color(theme.text_tertiary)
-                                    .child(tr!("swarm.as_of_seq", seq = overview.as_of_seq)),
-                            )
-                        }),
-                ),
+                .when(phase_label.is_some() || meta_label.is_some(), |card| {
+                    card.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap(px(8.0))
+                            .when_some(phase_label, |row, label| {
+                                row.child(
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(1.0))
+                                        .rounded(px(4.0))
+                                        .bg(theme.overlay)
+                                        .text_size(sp(11.0))
+                                        .text_color(theme.text_secondary)
+                                        .child(label),
+                                )
+                            })
+                            .when_some(meta_label, |row, label| {
+                                row.child(
+                                    div()
+                                        .text_size(sp(11.0))
+                                        .text_color(theme.text_tertiary)
+                                        .child(label),
+                                )
+                            }),
+                    )
+                }),
         );
     }
 
@@ -3075,5 +3198,105 @@ mod tests {
         assert_eq!(shared_swarm_model(&members), Some("model-a"));
         members[1].model = "model-b".to_owned();
         assert_eq!(shared_swarm_model(&members), None);
+    }
+
+    #[test]
+    fn preserves_pending_auto_reveal_until_session_is_selected() {
+        let mut state = SwarmAutoSurfaceState::default();
+        let session_id = Uuid::new_v4();
+
+        assert!(state.queue_auto_reveal(session_id));
+        assert!(state.has_pending_reveal(session_id));
+
+        // Detection while viewing another session must keep pending_auto_reveal intact.
+        assert_eq!(
+            state.resolve_detected_swarm(session_id, false, true, false, false),
+            SwarmSurfaceAction::None
+        );
+        assert!(state.has_pending_reveal(session_id));
+
+        // Switching back triggers a refresh with auto_reveal = false, which consumes pending_auto_reveal.
+        assert_eq!(
+            state.resolve_detected_swarm(session_id, true, false, false, false),
+            SwarmSurfaceAction::OpenPanel
+        );
+        assert!(!state.has_pending_reveal(session_id));
+
+        // Once surfaced, further activity neither re-queues nor re-opens the panel.
+        assert!(!state.queue_auto_reveal(session_id));
+        assert_eq!(
+            state.resolve_detected_swarm(session_id, true, true, true, true),
+            SwarmSurfaceAction::None
+        );
+
+        // Dismissed sessions clear pending state and do not auto-surface.
+        let dismissed_id = Uuid::new_v4();
+        assert!(state.queue_auto_reveal(dismissed_id));
+        state.mark_dismissed(dismissed_id);
+        assert!(!state.has_pending_reveal(dismissed_id));
+        assert!(!state.queue_auto_reveal(dismissed_id));
+        assert_eq!(
+            state.resolve_detected_swarm(dismissed_id, true, true, false, false),
+            SwarmSurfaceAction::None
+        );
+
+        // Without auto-reveal, an already-open right panel still attaches the Swarm tab once.
+        let attach_id = Uuid::new_v4();
+        assert_eq!(
+            state.resolve_detected_swarm(attach_id, true, false, true, false),
+            SwarmSurfaceAction::AttachTab
+        );
+
+        // Detecting a swarm passively while the right panel is closed must NOT
+        // prevent a later activity-driven auto-reveal from opening the panel once.
+        let passive_id = Uuid::new_v4();
+        assert_eq!(
+            state.resolve_detected_swarm(passive_id, true, false, false, false),
+            SwarmSurfaceAction::None
+        );
+        assert!(state.queue_auto_reveal(passive_id));
+        assert_eq!(
+            state.resolve_detected_swarm(passive_id, true, true, false, false),
+            SwarmSurfaceAction::OpenPanel
+        );
+    }
+
+    #[test]
+    fn formats_overview_updated_at_and_meta_label() {
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let plus_eight = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+
+        assert_eq!(
+            format_overview_updated_at_with_tz("2026-11-23T15:30:00Z", &utc).as_deref(),
+            Some("15:30")
+        );
+        assert_eq!(
+            format_overview_updated_at_with_tz("2026-11-23T15:30:00Z", &plus_eight).as_deref(),
+            Some("23:30")
+        );
+        assert_eq!(
+            format_overview_updated_at_with_tz("2026-11-23 15:30:00", &utc).as_deref(),
+            Some("15:30")
+        );
+        assert_eq!(
+            format_overview_updated_at_with_tz("2026-11-23T15:30:00", &utc).as_deref(),
+            Some("15:30")
+        );
+        assert_eq!(
+            format_overview_updated_at_with_tz("15:30", &utc).as_deref(),
+            Some("15:30")
+        );
+        assert_eq!(format_overview_updated_at_with_tz("   ", &utc), None);
+
+        assert_eq!(
+            overview_meta_label(12, Some("2026-11-23 15:30:00")),
+            Some(format!("{} · 15:30", tr!("swarm.as_of_seq", seq = 12)))
+        );
+        assert_eq!(
+            overview_meta_label(0, Some("2026-11-23 15:30:00")),
+            Some("15:30".to_owned())
+        );
+        assert_eq!(overview_meta_label(0, Some("  ")), None);
+        assert_eq!(overview_meta_label(0, None), None);
     }
 }

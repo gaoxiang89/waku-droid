@@ -1405,6 +1405,8 @@ impl StateStore {
         session.provider_cursors = stored.provider_cursors;
         session.account_id = stored.account_id;
         session.account_cursors = stored.account_cursors;
+        session.available_commands = stored.available_commands;
+        session.thread_goal = stored.thread_goal;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
         session.service_tier = stored.service_tier;
@@ -4111,6 +4113,71 @@ mod tests {
                 thread_id: "thread-keep".into(),
             })
         );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn hydrate_restores_available_commands_and_thread_goal_across_save_cycle() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let session_id = state.sessions[0].id;
+        let expected_commands = vec![
+            crate::model::ReportedCommand {
+                name: "review".into(),
+                description: "Review pending changes".into(),
+                argument_hint: Some("[scope]".into()),
+            },
+            crate::model::ReportedCommand {
+                name: "simplify".into(),
+                description: "Simplify changed code".into(),
+                argument_hint: None,
+            },
+        ];
+        let expected_goal = crate::model::ThreadGoal {
+            objective: "Keep Droid command metadata intact across restarts".into(),
+            status: crate::model::ThreadGoalStatus::Active,
+            token_budget: Some(100_000),
+            tokens_used: 4_200,
+            time_used_seconds: 95,
+        };
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.provider = ProviderKind::Droid;
+            session.available_commands = expected_commands.clone();
+            session.thread_goal = Some(expected_goal.clone());
+            session.begin_turn("Start Droid turn");
+            session.push_message(MessageRole::Assistant, "Done");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+        }
+        store.save(&mut state).unwrap();
+
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        assert_eq!(restored.sessions.len(), 1);
+        assert!(!restored.sessions[0].detail_loaded);
+        assert!(restored.sessions[0].available_commands.is_empty());
+        assert!(restored.sessions[0].thread_goal.is_none());
+
+        reopened.hydrate(&mut restored.sessions[0]).unwrap();
+        assert!(restored.sessions[0].detail_loaded);
+        assert_eq!(restored.sessions[0].available_commands, expected_commands);
+        assert_eq!(restored.sessions[0].thread_goal, Some(expected_goal.clone()));
+
+        // Saving a hydrated session again must persist those fields rather than
+        // wiping them in session_details.data.
+        {
+            let session = restored.session_mut(session_id).unwrap();
+            assert!(session.set_title("Updated after hydrate"));
+        }
+        reopened.save(&mut restored).unwrap();
+
+        let verify = store_in(&directory);
+        let mut reloaded = verify.load().unwrap();
+        verify.hydrate(&mut reloaded.sessions[0]).unwrap();
+        assert_eq!(reloaded.sessions[0].title, "Updated after hydrate");
+        assert_eq!(reloaded.sessions[0].available_commands, expected_commands);
+        assert_eq!(reloaded.sessions[0].thread_goal, Some(expected_goal));
         fs::remove_dir_all(directory).ok();
     }
 }

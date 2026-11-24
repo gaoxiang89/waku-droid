@@ -302,6 +302,47 @@ fn merge_host_task_state(
     deleted
 }
 
+/// Resolve a session's merged slash-command catalog from the discovery cache
+/// without reading the currently selected tab's `slash_command_index`.
+///
+/// Falls back to the project root's cache entry when a freshly materialized
+/// worktree has not been scanned yet, and never leaves a `Loading` slot behind
+/// on a miss. Returns `(commands, had_discovered_cache_hit)`.
+pub(super) fn session_slash_commands_from_cache(
+    cache: &mut QueryCache<SlashCommandCacheKey, Vec<SlashCommand>>,
+    primary_key: &SlashCommandCacheKey,
+    fallback_project_key: Option<&SlashCommandCacheKey>,
+    reported: &[crate::model::ReportedCommand],
+) -> (Vec<SlashCommand>, bool) {
+    let mut lookup = |key: &SlashCommandCacheKey| match cache.read(key) {
+        Query::Ready(commands) => Some(commands),
+        Query::Pending => None,
+        Query::Missing(token) => {
+            cache.abandon(token);
+            None
+        }
+    };
+    if let Some(discovered) = lookup(primary_key) {
+        return (
+            crate::composer_complete::merge_reported_commands(&discovered, reported),
+            true,
+        );
+    }
+    if let Some(fallback_key) = fallback_project_key
+        && fallback_key != primary_key
+        && let Some(discovered) = lookup(fallback_key)
+    {
+        return (
+            crate::composer_complete::merge_reported_commands(&discovered, reported),
+            true,
+        );
+    }
+    (
+        crate::composer_complete::merge_reported_commands(&[], reported),
+        false,
+    )
+}
+
 /// Perform every blocking operation between accepting a submission and
 /// starting its provider. This function is called only from the background
 /// executor; the UI thread owns applying the returned workspace afterward.
@@ -3539,7 +3580,11 @@ impl Waku {
             self.enqueue_follow_up_submission(session.id, submission, cx);
             return;
         }
-        let provider_prompt = self.resolve_skill_submission(session.provider, &submission.prompt);
+        let provider_prompt = self.resolve_skill_submission_for_session(
+            session.id,
+            session.provider,
+            &submission.prompt,
+        );
         if let Some(runtime) = self.runtimes.get_mut(&session.id) {
             runtime.driver.steer(provider_prompt);
             runtime.pending_steers.push_back(submission);
@@ -3557,21 +3602,132 @@ impl Waku {
                 .is_some_and(|runtime| runtime.driver.supports_steer())
     }
 
-    /// Resolve presentation-preserving composer syntax immediately before a
-    /// prompt crosses into a provider transport.
-    fn resolve_provider_submission(&self, provider: ProviderKind, prompt: &str) -> String {
-        crate::composer_complete::resolved_submission(provider, prompt, &self.slash_command_index)
-            .unwrap_or_else(|| prompt.to_owned())
+    fn slash_command_cache_key_for_session(
+        &self,
+        session: &AgentSession,
+    ) -> Option<SlashCommandCacheKey> {
+        let scope = self.panel_scope_for_session(session.id)?;
+        let account_id = self.validated_account_id_for_host(
+            &scope.host,
+            session.provider,
+            session.account_id.as_deref(),
+        );
+        let binary_override = self.effective_binary_override_for_host(
+            &scope.host,
+            session.provider,
+            account_id.as_deref(),
+        );
+        Some((
+            scope.host,
+            session.provider,
+            scope.workspace,
+            binary_override,
+            account_id,
+        ))
+    }
+
+    fn slash_command_project_fallback_key(
+        &self,
+        session: &AgentSession,
+    ) -> Option<SlashCommandCacheKey> {
+        let project = self
+            .state
+            .projects
+            .iter()
+            .find(|project| project.id == session.project_id)?;
+        let host = self.hosts.ownership.session(session.id);
+        let account_id = self.validated_account_id_for_host(
+            &host,
+            session.provider,
+            session.account_id.as_deref(),
+        );
+        let binary_override = self.effective_binary_override_for_host(
+            &host,
+            session.provider,
+            account_id.as_deref(),
+        );
+        Some((
+            host,
+            session.provider,
+            project.path.clone(),
+            binary_override,
+            account_id,
+        ))
+    }
+
+    /// Look up the command catalog for `session_id` without consulting the
+    /// currently selected tab's `slash_command_index`. Returns the merged
+    /// commands along with whether discovered commands were found in cache.
+    fn slash_commands_for_session(&mut self, session_id: Uuid) -> (Vec<SlashCommand>, bool) {
+        let Some((primary_key, fallback_key, reported)) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                (
+                    self.slash_command_cache_key_for_session(session),
+                    self.slash_command_project_fallback_key(session),
+                    session.available_commands.clone(),
+                )
+            })
+        else {
+            return (Vec::new(), false);
+        };
+        let Some(primary_key) = primary_key else {
+            return (
+                crate::composer_complete::merge_reported_commands(&[], &reported),
+                false,
+            );
+        };
+        session_slash_commands_from_cache(
+            &mut self.slash_commands,
+            &primary_key,
+            fallback_key.as_ref(),
+            &reported,
+        )
+    }
+
+    /// Resolve presentation-preserving composer syntax for `session_id`
+    /// immediately before a prompt crosses into a provider transport.
+    fn resolve_provider_submission_for_session(
+        &mut self,
+        session_id: Uuid,
+        provider: ProviderKind,
+        prompt: &str,
+        discovered_override: Option<&[SlashCommand]>,
+    ) -> (String, bool) {
+        let (commands, had_cached) = match discovered_override {
+            Some(discovered) => {
+                let reported = self
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.available_commands.as_slice())
+                    .unwrap_or(&[]);
+                (
+                    crate::composer_complete::merge_reported_commands(discovered, reported),
+                    true,
+                )
+            }
+            None => self.slash_commands_for_session(session_id),
+        };
+        let resolved = crate::composer_complete::resolved_submission(provider, prompt, &commands)
+            .unwrap_or_else(|| prompt.to_owned());
+        (resolved, had_cached)
     }
 
     /// Resolve only provider-native skill syntax for a live steering message.
-    fn resolve_skill_submission(&self, provider: ProviderKind, prompt: &str) -> String {
-        crate::composer_complete::resolved_skill_submission(
-            provider,
-            prompt,
-            &self.slash_command_index,
-        )
-        .unwrap_or_else(|| prompt.to_owned())
+    fn resolve_skill_submission_for_session(
+        &mut self,
+        session_id: Uuid,
+        provider: ProviderKind,
+        prompt: &str,
+    ) -> String {
+        let (commands, _) = self.slash_commands_for_session(session_id);
+        crate::composer_complete::resolved_skill_submission(provider, prompt, &commands)
+            .unwrap_or_else(|| prompt.to_owned())
     }
 
     pub(super) fn enqueue_follow_up_submission(
@@ -3806,9 +3962,33 @@ impl Waku {
         } else {
             Vec::new()
         };
-        let resolved_prompt = self.resolve_provider_submission(session_provider, &prompt);
+        let (resolved_prompt, had_cached_commands) =
+            self.resolve_provider_submission_for_session(session_id, session_provider, &prompt, None);
         let session_host = self.hosts.ownership.session(session_id);
         let host_accounts = self.provider_accounts_for(&session_host).to_vec();
+        let command_discovery = (prompt.trim_start().starts_with('/')
+            && (!had_cached_commands || matches!(workspace, SessionWorkspace::NewWorktree { .. })))
+        .then(|| {
+            let raw_account_id = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.account_id.as_deref());
+            let account_id =
+                self.validated_account_id_for_host(&session_host, session_provider, raw_account_id);
+            let binary_override = self.effective_binary_override_for_host(
+                &session_host,
+                session_provider,
+                account_id.as_deref(),
+            );
+            let config_dir = self.effective_config_dir_for_host(
+                &session_host,
+                session_provider,
+                account_id.as_deref(),
+            );
+            (session_provider, binary_override, config_dir)
+        });
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
             // A task may change agents or accounts between turns. The incoming
@@ -3882,13 +4062,17 @@ impl Waku {
         cx.notify();
 
         let preparation_prompt = human_prompt;
+        let project_root_fallback = project.path.clone();
         let workspace_client =
             waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
+        let discovery_client = command_discovery
+            .is_some()
+            .then(|| workspace_client.clone());
         cx.spawn(async move |waku, cx| {
-            let prepared = cx
+            let (prepared, discovered_commands) = cx
                 .background_executor()
                 .spawn(async move {
-                    prepare_submission(
+                    let prepared = prepare_submission(
                         workspace_client,
                         project,
                         workspace,
@@ -3896,11 +4080,46 @@ impl Waku {
                         session_id,
                         &preparation_prompt,
                         next_turn_count,
-                    )
+                    );
+                    let discovered_commands =
+                        match (&prepared, command_discovery, discovery_client) {
+                            (
+                                Ok(prepared),
+                                Some((provider, binary_override, config_dir)),
+                                Some(client),
+                            ) => {
+                                let root = prepared
+                                    .workspace
+                                    .path()
+                                    .unwrap_or(&project_root_fallback)
+                                    .to_path_buf();
+                                match client.request(
+                                    waku_client::WorkspaceOperation::DiscoverSlashCommands {
+                                        provider,
+                                        project_root: root,
+                                        binary_override,
+                                        config_dir,
+                                    },
+                                ) {
+                                    Ok(waku_client::WorkspaceResult::SlashCommands {
+                                        commands,
+                                    }) => Some(commands),
+                                    Ok(_) | Err(_) => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                    (prepared, discovered_commands)
                 })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
-                waku.finish_submission_preparation(session_id, submission, prepared, cx);
+                waku.finish_submission_preparation(
+                    session_id,
+                    submission,
+                    prepared,
+                    discovered_commands,
+                    cx,
+                );
             });
         })
         .detach();
@@ -3911,6 +4130,7 @@ impl Waku {
         session_id: Uuid,
         submission: ComposerSubmission,
         prepared: anyhow::Result<PreparedSubmission>,
+        discovered_commands: Option<Vec<SlashCommand>>,
         cx: &mut Context<Self>,
     ) {
         if !self.submission_preparations.contains(&session_id) {
@@ -4001,6 +4221,17 @@ impl Waku {
             self.reload_clean_right_panel_file_editors(cx);
             self.ensure_right_panel_terminals(cx);
         }
+        if let Some(commands) = discovered_commands.as_ref()
+            && let Some(key) = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| self.slash_command_cache_key_for_session(session))
+            && let Query::Missing(token) = self.slash_commands.read(&key)
+        {
+            self.slash_commands.fulfill(token, commands.clone());
+        }
         let driver = match prepared_driver {
             None => self
                 .runtimes
@@ -4052,7 +4283,12 @@ impl Waku {
             .session_mut(session_id)
             .and_then(|session| session.turns.last_mut())
             .and_then(|turn| turn.handoff_preamble.take());
-        let mut driver_prompt = self.resolve_provider_submission(provider, &prompt);
+        let (mut driver_prompt, _) = self.resolve_provider_submission_for_session(
+            session_id,
+            provider,
+            &prompt,
+            discovered_commands.as_deref(),
+        );
         if let Some(preamble) = handoff_preamble {
             // A provider-native command owns the head of its message, so it
             // travels alone; the incoming agent still resumes its own

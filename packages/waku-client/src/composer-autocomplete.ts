@@ -47,14 +47,16 @@ export function mergeComposerCommands(
   for (const report of reported) {
     const known = merged.find((command) => command.name === report.name)
     if (known) {
+      if (known.scope === 'Waku') continue
       if (!known.description) known.description = report.description ?? ''
+      if (known.argument_hint == null) known.argument_hint = report.argument_hint ?? null
       continue
     }
     merged.push({
       name: report.name,
       description: report.description ?? '',
       scope: 'Builtin',
-      argument_hint: null,
+      argument_hint: report.argument_hint ?? null,
       template: null,
     })
   }

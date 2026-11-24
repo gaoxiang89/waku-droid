@@ -10,7 +10,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { AppSymbol } from '@/components/app-symbol';
 import { liquidGlass } from '@/components/glass-surface';
-import { NativeTint, Radius, Spacing } from '@/constants/theme';
+import { MonoFont, NativeTint, Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 /**
@@ -77,6 +77,7 @@ export function Sheet({
 
 export function SheetRow({
   label,
+  badge,
   description,
   selected = false,
   destructive = false,
@@ -85,6 +86,7 @@ export function SheetRow({
   onPress,
 }: {
   label: string;
+  badge?: string | null;
   description?: string | null;
   selected?: boolean;
   destructive?: boolean;
@@ -108,11 +110,24 @@ export function SheetRow({
       ]}>
       {leading}
       <View style={styles.rowCopy}>
-        <Text
-          numberOfLines={1}
-          style={[styles.rowLabel, { color: destructive ? theme.danger : theme.text }]}>
-          {label}
-        </Text>
+        <View style={styles.rowHeader}>
+          <Text
+            numberOfLines={1}
+            style={[styles.rowLabel, { color: destructive ? theme.danger : theme.text }]}>
+            {label}
+          </Text>
+          {badge ? (
+            <View
+              style={[
+                styles.rowBadge,
+                { backgroundColor: theme.overlay, borderColor: theme.borderStrong },
+              ]}>
+              <Text numberOfLines={1} style={[styles.rowBadgeText, { color: theme.textTertiary }]}>
+                {badge}
+              </Text>
+            </View>
+          ) : null}
+        </View>
         {description ? (
           <Text numberOfLines={2} style={[styles.rowDescription, { color: theme.textTertiary }]}>
             {description}
@@ -154,6 +169,18 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   rowCopy: { flex: 1, minWidth: 0 },
-  rowLabel: { fontSize: 15.5, fontWeight: '500' },
+  rowHeader: { alignItems: 'center', flexDirection: 'row', gap: 6 },
+  rowLabel: { flexShrink: 1, fontSize: 15.5, fontWeight: '500' },
+  rowBadge: {
+    borderRadius: 4,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 5,
+    paddingVertical: 1.5,
+  },
+  rowBadgeText: {
+    fontFamily: MonoFont,
+    fontSize: 11,
+    lineHeight: 14,
+  },
   rowDescription: { fontSize: 12.5, lineHeight: 17, marginTop: 2 },
 });

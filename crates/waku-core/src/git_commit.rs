@@ -98,28 +98,17 @@ pub fn generate_message(
     } else {
         None
     };
-    let args = agent_arguments(
-        invocation.provider,
-        invocation.model.as_deref(),
-        invocation.reasoning_effort.as_deref(),
-        &prompt,
-        amp_settings.as_deref(),
-    );
-    let mut command = crate::command_env::command(&invocation.binary);
     let resolved_config_dir = invocation
         .config_dir
         .as_deref()
         .and_then(crate::command_env::resolve_config_dir);
-    crate::command_env::apply_provider_config_dir(
-        &mut command,
-        invocation.provider,
+    let mut command = build_generate_command(
+        cwd,
+        &prompt,
+        invocation,
         resolved_config_dir.as_deref(),
+        amp_settings.as_deref(),
     );
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("NO_COLOR", "1")
-        .env("CI", "1");
     let result = run_capture(&mut command, AGENT_TIMEOUT).with_context(|| {
         format!(
             "{} could not generate a commit message",
@@ -143,6 +132,42 @@ pub fn generate_message(
             invocation.provider.display_name()
         )
     })
+}
+
+fn build_generate_command(
+    cwd: &Path,
+    prompt: &str,
+    invocation: &AgentInvocation,
+    resolved_config_dir: Option<&Path>,
+    amp_settings: Option<&Path>,
+) -> Command {
+    let antigravity_settings = (invocation.provider == ProviderKind::Antigravity)
+        .then(|| crate::command_env::antigravity_settings_arg(resolved_config_dir))
+        .flatten();
+    let settings_file = match invocation.provider {
+        ProviderKind::Amp => amp_settings,
+        ProviderKind::Antigravity => antigravity_settings.as_deref(),
+        _ => None,
+    };
+    let args = agent_arguments(
+        invocation.provider,
+        invocation.model.as_deref(),
+        invocation.reasoning_effort.as_deref(),
+        prompt,
+        settings_file,
+    );
+    let mut command = crate::command_env::command(&invocation.binary);
+    crate::command_env::apply_provider_config_dir(
+        &mut command,
+        invocation.provider,
+        resolved_config_dir,
+    );
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .env("CI", "1");
+    command
 }
 
 pub fn commit(cwd: &Path, message: &str, include_unstaged: bool) -> anyhow::Result<()> {
@@ -221,7 +246,7 @@ fn agent_arguments(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     prompt: &str,
-    amp_settings: Option<&Path>,
+    settings_file: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = Vec::<OsString>::new();
     fn push(args: &mut Vec<OsString>, value: &str) {
@@ -233,7 +258,7 @@ fn agent_arguments(
             push(&mut args, "--no-color");
             push(&mut args, "--no-ide");
             push(&mut args, "--no-notifications");
-            if let Some(settings) = amp_settings {
+            if let Some(settings) = settings_file {
                 push(&mut args, "--settings-file");
                 args.push(settings.as_os_str().to_owned());
             }
@@ -298,6 +323,10 @@ fn agent_arguments(
             push(&mut args, "--output-format");
             push(&mut args, "text");
             push(&mut args, "--disable-slash-commands");
+            if let Some(settings) = settings_file {
+                push(&mut args, "--settings");
+                args.push(settings.as_os_str().to_owned());
+            }
             if let Some(model) = model {
                 push(&mut args, "--model");
                 push(&mut args, model);
@@ -620,6 +649,8 @@ fn run_capture(command: &mut Command, timeout: Duration) -> anyhow::Result<Captu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = crate::command_env::spawn(command).context("could not start process")?;
+    #[cfg(windows)]
+    let mut job = crate::process_tree::KillOnCloseJob::adopt(child.id()).ok();
     let stdout = child.stdout.take().context("process stdout unavailable")?;
     let stderr = child.stderr.take().context("process stderr unavailable")?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
@@ -635,6 +666,8 @@ fn run_capture(command: &mut Command, timeout: Duration) -> anyhow::Result<Captu
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.kill();
+            #[cfg(windows)]
+            drop(job.take());
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -642,6 +675,8 @@ fn run_capture(command: &mut Command, timeout: Duration) -> anyhow::Result<Captu
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     };
+    #[cfg(windows)]
+    drop(job.take());
     Ok(CapturedOutput {
         status,
         stdout: stdout_reader.join().unwrap_or_default(),
@@ -819,6 +854,7 @@ mod tests {
                     assert!(has_pair(&args, "--print", prompt));
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has(&args, "--disable-slash-commands"));
+                    assert!(has_pair(&args, "--settings", "/tmp/amp.json"));
                     assert!(has_pair(&args, "--model", "model"));
                     assert!(has_pair(&args, "--effort", "low"));
                 }
@@ -897,5 +933,60 @@ mod tests {
         assert!(has_pair(&codex, "-c", CODEX_COMMIT_EFFORT));
         assert!(!has(&codex, "gpt-5.6-sol"));
         assert!(!has(&codex, "high"));
+    }
+
+    #[test]
+    fn antigravity_generate_command_passes_settings_only_when_present() {
+        let dir = std::env::temp_dir().join(format!("waku-commit-agy-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".env"), "GEMINI_API_KEY=commit-key\n").unwrap();
+        let invocation = AgentInvocation {
+            provider: ProviderKind::Antigravity,
+            binary: PathBuf::from("agy"),
+            model: Some("gemini-pro".into()),
+            reasoning_effort: Some("low".into()),
+            config_dir: Some(dir.to_string_lossy().into_owned()),
+        };
+
+        let without_settings =
+            build_generate_command(&dir, "Generate subject", &invocation, Some(&dir), None);
+        let args_without: Vec<OsString> = without_settings
+            .get_args()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(!has(&args_without, "--settings"));
+
+        let settings = dir.join("settings.json");
+        fs::write(&settings, "{}").unwrap();
+        let with_settings =
+            build_generate_command(&dir, "Generate subject", &invocation, Some(&dir), None);
+        let args_with: Vec<OsString> = with_settings.get_args().map(ToOwned::to_owned).collect();
+        assert!(has_pair(
+            &args_with,
+            "--settings",
+            &settings.to_string_lossy()
+        ));
+        assert!(with_settings.get_envs().any(|(key, value)| {
+            key == "GEMINI_API_KEY" && value.and_then(|v| v.to_str()) == Some("commit-key")
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_capture_terminates_grandchildren_on_timeout() {
+        let mut command = crate::command_env::plain_command("cmd.exe");
+        command.args(["/d", "/c", "ping -n 60 127.0.0.1"]);
+        let started = Instant::now();
+        let error = run_capture(&mut command, Duration::from_millis(250))
+            .err()
+            .expect("hanging grandchild should time out");
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout exceeded expected bound: {:?}",
+            started.elapsed()
+        );
     }
 }

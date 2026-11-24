@@ -36,6 +36,7 @@ pub(crate) fn discover(
         ProviderKind::Antigravity => discover_antigravity(binary, project_root, config_dir),
         ProviderKind::Claude => discover_claude(binary, project_root, config_dir),
         ProviderKind::Codex => discover_codex(binary, project_root, config_dir),
+        ProviderKind::Droid => Some(droid_bridged_cli_commands()),
         ProviderKind::OpenCode => discover_opencode(binary, project_root),
         ProviderKind::OhMyPi => discover_oh_my_pi(binary, project_root),
         ProviderKind::Pi => discover_pi(binary, project_root),
@@ -45,7 +46,6 @@ pub(crate) fn discover(
         // live DriverEvent::AvailableCommands update is the catalog surface.
         ProviderKind::Cursor
         | ProviderKind::DeepSeek
-        | ProviderKind::Droid
         | ProviderKind::Fx
         | ProviderKind::Grok
         | ProviderKind::Kimi => None,
@@ -141,6 +141,56 @@ fn antigravity_bridged_cli_commands() -> Vec<SlashCommand> {
             description: crate::i18n::translate("commands.effort_description"),
             scope: CommandScope::Builtin,
             argument_hint: Some("[low|medium|high|xhigh|max]".to_owned()),
+            template: None,
+        },
+    ]
+}
+
+/// CLI-local Factory Droid commands that Waku bridges in the composer without
+/// starting an ACP turn or spawning a throwaway discovery session. Kept 1:1
+/// with `waku-client/composer_complete.rs`.
+fn droid_bridged_cli_commands() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand {
+            name: "model".to_owned(),
+            description: crate::i18n::translate("commands.model_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[model]".to_owned()),
+            template: None,
+        },
+        SlashCommand {
+            name: "reasoning".to_owned(),
+            description: crate::i18n::translate("commands.effort_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[level]".to_owned()),
+            template: None,
+        },
+        SlashCommand {
+            name: "effort".to_owned(),
+            description: crate::i18n::translate("commands.effort_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[level]".to_owned()),
+            template: None,
+        },
+        SlashCommand {
+            name: "autonomy".to_owned(),
+            description: crate::i18n::translate("commands.autonomy_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("[normal|auto-low|auto-medium|auto-high]".to_owned()),
+            template: None,
+        },
+        SlashCommand {
+            name: "new".to_owned(),
+            description: crate::i18n::translate("commands.new_session_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
+            template: None,
+        },
+        SlashCommand {
+            name: "clear".to_owned(),
+            description: crate::i18n::translate("commands.new_session_description"),
+            scope: CommandScope::Builtin,
+            argument_hint: None,
             template: None,
         },
     ]
@@ -1072,6 +1122,42 @@ mod tests {
                 && command.template.is_none()
                 && !command.description.is_empty()
         }));
+    }
+
+    #[test]
+    fn droid_bridged_cli_commands_match_client_bridge_contract_and_discover_without_spawning() {
+        let bridged = droid_bridged_cli_commands();
+        let names = bridged
+            .iter()
+            .map(|command| (command.name.as_str(), command.argument_hint.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("model", Some("[model]")),
+                ("reasoning", Some("[level]")),
+                ("effort", Some("[level]")),
+                ("autonomy", Some("[normal|auto-low|auto-medium|auto-high]")),
+                ("new", None),
+                ("clear", None),
+            ]
+        );
+        assert!(bridged.iter().all(|command| {
+            command.scope == CommandScope::Builtin
+                && command.template.is_none()
+                && !command.description.is_empty()
+        }));
+
+        // Cold-start discovery must return the bridged catalog without spawning
+        // the CLI binary or creating a throwaway provider session.
+        let discovered = discover(
+            ProviderKind::Droid,
+            Path::new("/nonexistent/waku-test-droid"),
+            Path::new("/nonexistent/waku-test-project"),
+            None,
+        )
+        .expect("Droid cold-start discovery must return bridged commands");
+        assert_eq!(discovered, bridged);
     }
 
     #[test]

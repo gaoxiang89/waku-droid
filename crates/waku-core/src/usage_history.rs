@@ -644,6 +644,16 @@ const ANTIGRAVITY_DATA_ROOTS: [&str; 3] = [
     ".gemini/antigravity",
 ];
 
+fn antigravity_data_root(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("sidecar_data") {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
 fn antigravity_brain_roots_from(
     exec_data_dir: Option<&std::ffi::OsStr>,
     home_dir: Option<&Path>,
@@ -655,16 +665,10 @@ fn antigravity_brain_roots_from(
             roots.push(brain);
         }
     };
-    if let Some(exec_dir) = exec_data_dir.filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(exec_dir);
-        let data_root = if path.file_name().and_then(|name| name.to_str()) == Some("sidecar_data") {
-            path.parent().map(Path::to_path_buf)
-        } else {
-            Some(path)
-        };
-        if let Some(root) = data_root {
-            push_data_root(root);
-        }
+    if let Some(exec_dir) = exec_data_dir.filter(|value| !value.is_empty())
+        && let Some(root) = antigravity_data_root(Path::new(exec_dir))
+    {
+        push_data_root(root);
     }
     if let Some(home) = home_dir {
         for relative in ANTIGRAVITY_DATA_ROOTS {
@@ -1181,7 +1185,9 @@ fn account_transcript_root(provider: UsageProvider, config_dir: &Path) -> PathBu
     match provider {
         UsageProvider::Claude => config_dir.join("projects"),
         UsageProvider::Codex => config_dir.join("sessions"),
-        UsageProvider::Antigravity => config_dir.join("brain"),
+        UsageProvider::Antigravity => antigravity_data_root(config_dir)
+            .unwrap_or_else(|| config_dir.to_path_buf())
+            .join("brain"),
     }
 }
 
@@ -2672,5 +2678,25 @@ mod tests {
         assert_eq!(rescanned_model.total_tokens, model_slice.total_tokens);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn account_transcript_root_strips_sidecar_data_consistently() {
+        let base = Path::new("/tmp/agy-work");
+        assert_eq!(
+            account_transcript_root(UsageProvider::Antigravity, base),
+            base.join("brain")
+        );
+        assert_eq!(
+            account_transcript_root(UsageProvider::Antigravity, &base.join("sidecar_data")),
+            base.join("brain")
+        );
+        assert_eq!(
+            antigravity_brain_roots_from(
+                Some(base.join("sidecar_data").as_os_str()),
+                None,
+            ),
+            vec![base.join("brain")]
+        );
     }
 }
