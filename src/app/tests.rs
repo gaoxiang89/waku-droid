@@ -3198,3 +3198,34 @@ fn background_queued_command_resolution_uses_target_session_catalog() {
         other => panic!("expected uncached key to remain Missing, got {other:?}"),
     }
 }
+
+#[test]
+fn droid_auto_runtime_mode_description_uses_droid_autonomy_copy() {
+    use super::composer::runtime_mode_description;
+    use crate::model::RuntimeMode;
+
+    let droid_auto = runtime_mode_description(Some(ProviderKind::Droid), RuntimeMode::Auto);
+    let claude_auto = runtime_mode_description(Some(ProviderKind::Claude), RuntimeMode::Auto);
+    let default_auto = runtime_mode_description(None, RuntimeMode::Auto);
+
+    assert_eq!(droid_auto, tr!("mode.auto_description_droid"));
+    assert_eq!(claude_auto, RuntimeMode::Auto.description());
+    assert_eq!(default_auto, RuntimeMode::Auto.description());
+    assert_ne!(droid_auto, claude_auto);
+    assert!(
+        !droid_auto.to_ascii_lowercase().contains("ai reviewer"),
+        "Droid auto-medium copy must not describe Claude's AI reviewer: {droid_auto}"
+    );
+
+    // Other access modes share the standard descriptions for Droid too.
+    for mode in [
+        RuntimeMode::Ask,
+        RuntimeMode::AutoAcceptEdits,
+        RuntimeMode::FullAccess,
+    ] {
+        assert_eq!(
+            runtime_mode_description(Some(ProviderKind::Droid), mode),
+            mode.description()
+        );
+    }
+}

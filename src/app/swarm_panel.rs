@@ -27,13 +27,14 @@ pub(super) fn init(_cx: &mut App) {}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum SwarmPanelTab {
     #[default]
+    Hive,
     Board,
     Members,
     Overview,
 }
 
 impl SwarmPanelTab {
-    const ALL: [Self; 3] = [Self::Board, Self::Members, Self::Overview];
+    const ALL: [Self; 4] = [Self::Hive, Self::Board, Self::Members, Self::Overview];
 
     fn step(self, delta: isize) -> Self {
         let index = Self::ALL
@@ -135,12 +136,13 @@ impl SwarmAutoSurfaceState {
 }
 
 pub(super) struct SwarmPanelState {
-    active_tab: SwarmPanelTab,
-    member_filter: Option<String>,
-    follow_tail: Rc<Cell<bool>>,
-    show_killed_members: bool,
+    pub(super) active_tab: SwarmPanelTab,
+    pub(super) member_filter: Option<String>,
+    pub(super) follow_tail: Rc<Cell<bool>>,
+    pub(super) show_killed_members: bool,
+    pub(super) hive: super::swarm_hive::SwarmHiveState,
     /// Per-session cached swarm snapshot (`Some(None)` = probed and no swarm).
-    snapshots: HashMap<Uuid, Option<Arc<AntigravitySwarmSnapshot>>>,
+    pub(super) snapshots: HashMap<Uuid, Option<Arc<AntigravitySwarmSnapshot>>>,
     errors: HashMap<Uuid, String>,
     pending: HashSet<Uuid>,
     stale: HashSet<Uuid>,
@@ -177,6 +179,7 @@ pub(super) struct SwarmPanelState {
     overview_scroll: ScrollHandle,
     overview_scrollbar: Rc<ScrollbarState>,
     /// Stable keyboard focus handles.
+    tab_hive_focus: FocusHandle,
     tab_board_focus: FocusHandle,
     tab_members_focus: FocusHandle,
     tab_overview_focus: FocusHandle,
@@ -205,10 +208,11 @@ impl SwarmPanelState {
             }
         });
         Self {
-            active_tab: SwarmPanelTab::Board,
+            active_tab: SwarmPanelTab::Hive,
             member_filter: None,
             follow_tail,
             show_killed_members: false,
+            hive: super::swarm_hive::SwarmHiveState::new(cx),
             snapshots: HashMap::new(),
             errors: HashMap::new(),
             pending: HashSet::new(),
@@ -237,6 +241,7 @@ impl SwarmPanelState {
             member_list_items: Rc::new(Vec::new()),
             overview_scroll: ScrollHandle::new(),
             overview_scrollbar: ScrollbarState::new(),
+            tab_hive_focus: cx.focus_handle(),
             tab_board_focus: cx.focus_handle(),
             tab_members_focus: cx.focus_handle(),
             tab_overview_focus: cx.focus_handle(),
@@ -265,6 +270,7 @@ impl SwarmPanelState {
 
     fn tab_focus(&self, tab: SwarmPanelTab) -> &FocusHandle {
         match tab {
+            SwarmPanelTab::Hive => &self.tab_hive_focus,
             SwarmPanelTab::Board => &self.tab_board_focus,
             SwarmPanelTab::Members => &self.tab_members_focus,
             SwarmPanelTab::Overview => &self.tab_overview_focus,
@@ -393,7 +399,7 @@ const MEMBER_GROUP_ORDER: [AntigravitySwarmMemberStatus; 4] = [
     AntigravitySwarmMemberStatus::Killed,
 ];
 
-fn member_display_status(member: &AntigravitySwarmMember) -> AntigravitySwarmMemberStatus {
+pub(super) fn member_display_status(member: &AntigravitySwarmMember) -> AntigravitySwarmMemberStatus {
     if member.killed {
         AntigravitySwarmMemberStatus::Killed
     } else {
@@ -501,7 +507,7 @@ fn extract_hh_mm(time_part: &str) -> Option<String> {
     .then(|| format!("{hour}:{minute}"))
 }
 
-fn short_board_time(raw: &str) -> String {
+pub(super) fn short_board_time(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some((_, time_part)) = trimmed.split_once(' ') {
         return extract_hh_mm(time_part).unwrap_or_else(|| time_part.to_owned());
@@ -689,6 +695,7 @@ impl Waku {
         self.swarm_panel.board_first_seq = None;
         self.swarm_panel.members_list_key = None;
         self.swarm_panel.follow_tail.set(true);
+        self.swarm_panel.hive.reset_for_session_change();
         let is_antigravity = self
             .state
             .sessions
@@ -759,6 +766,9 @@ impl Waku {
     /// Starts or stops the polite ~2s Swarm polling task so zero background
     /// polling runs while hidden or switched away from an Antigravity swarm.
     pub(super) fn sync_antigravity_swarm_polling(&mut self, cx: &mut Context<Self>) {
+        if !self.is_swarm_surface_visible() {
+            self.swarm_panel.hive.stop_replay();
+        }
         let should_poll = self.should_poll_antigravity_swarm();
         if !should_poll {
             if self.swarm_panel.poll_active {
@@ -1026,7 +1036,7 @@ impl Waku {
 
     pub(super) fn render_swarm_panel(
         &mut self,
-        _panel_width: f32,
+        panel_width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::current(cx);
@@ -1073,11 +1083,26 @@ impl Waku {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if !event.keystroke.modifiers.modified()
                     && event.keystroke.key.as_str() == "escape"
-                    && this.swarm_panel.member_filter.is_some()
                 {
-                    this.swarm_panel.member_filter = None;
-                    cx.notify();
-                    cx.stop_propagation();
+                    if this.swarm_panel.active_tab == SwarmPanelTab::Hive {
+                        if this.swarm_panel.hive.selected_member.take().is_some() {
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if this.swarm_panel.hive.replay_cursor.take().is_some()
+                            || this.swarm_panel.hive.replay_playing
+                        {
+                            this.swarm_panel.hive.stop_replay();
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                    } else if this.swarm_panel.member_filter.is_some() {
+                        this.swarm_panel.member_filter = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
                 }
             }));
 
@@ -1086,6 +1111,9 @@ impl Waku {
                 .child(self.render_swarm_header(&snapshot, &theme, cx))
                 .child(self.render_swarm_tabs(&snapshot, &theme, cx))
                 .child(match self.swarm_panel.active_tab {
+                    SwarmPanelTab::Hive => {
+                        self.render_swarm_hive_tab(session_id, &snapshot, panel_width, &theme, cx)
+                    }
                     SwarmPanelTab::Board => self.render_swarm_board_tab(session_id, &snapshot, &theme, cx),
                     SwarmPanelTab::Members => self.render_swarm_members_tab(session_id, &snapshot, &theme, cx),
                     SwarmPanelTab::Overview => self.render_swarm_overview_tab(&snapshot, &theme, cx),
@@ -1426,6 +1454,14 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let (working_count, _, failed_count, _) = swarm_member_counts(snapshot);
+        let hive_badge = if failed_count > 0 {
+            Some(failed_count)
+        } else if working_count > 0 {
+            Some(working_count)
+        } else {
+            None
+        };
         let member_count = snapshot
             .members
             .iter()
@@ -1438,6 +1474,13 @@ impl Waku {
                 .map_or(0, |overview| overview.attention.len());
 
         let tabs = [
+            (
+                SwarmPanelTab::Hive,
+                "swarm-tab-hive",
+                tr!("swarm.tab_hive"),
+                hive_badge,
+                failed_count > 0,
+            ),
             (
                 SwarmPanelTab::Board,
                 "swarm-tab-board",
@@ -1530,6 +1573,9 @@ impl Waku {
                         )
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if tab != SwarmPanelTab::Hive {
+                            this.swarm_panel.hive.stop_replay();
+                        }
                         this.swarm_panel.active_tab = tab;
                         cx.notify();
                     }))
@@ -1539,12 +1585,18 @@ impl Waku {
                         }
                         match event.keystroke.key.as_str() {
                             "enter" | "space" => {
+                                if tab != SwarmPanelTab::Hive {
+                                    this.swarm_panel.hive.stop_replay();
+                                }
                                 this.swarm_panel.active_tab = tab;
                                 cx.notify();
                                 cx.stop_propagation();
                             }
                             "left" => {
                                 let next = tab.step(-1);
+                                if next != SwarmPanelTab::Hive {
+                                    this.swarm_panel.hive.stop_replay();
+                                }
                                 this.swarm_panel.active_tab = next;
                                 window.focus(this.swarm_panel.tab_focus(next), cx);
                                 cx.notify();
@@ -1552,13 +1604,16 @@ impl Waku {
                             }
                             "right" => {
                                 let next = tab.step(1);
+                                if next != SwarmPanelTab::Hive {
+                                    this.swarm_panel.hive.stop_replay();
+                                }
                                 this.swarm_panel.active_tab = next;
                                 window.focus(this.swarm_panel.tab_focus(next), cx);
                                 cx.notify();
                                 cx.stop_propagation();
                             }
                             "home" => {
-                                let next = SwarmPanelTab::Board;
+                                let next = SwarmPanelTab::Hive;
                                 this.swarm_panel.active_tab = next;
                                 window.focus(this.swarm_panel.tab_focus(next), cx);
                                 cx.notify();
@@ -1566,6 +1621,7 @@ impl Waku {
                             }
                             "end" => {
                                 let next = SwarmPanelTab::Overview;
+                                this.swarm_panel.hive.stop_replay();
                                 this.swarm_panel.active_tab = next;
                                 window.focus(this.swarm_panel.tab_focus(next), cx);
                                 cx.notify();
@@ -2255,7 +2311,7 @@ impl Waku {
     }
 }
 
-fn member_status_color(status: AntigravitySwarmMemberStatus, theme: &Theme) -> Hsla {
+pub(super) fn member_status_color(status: AntigravitySwarmMemberStatus, theme: &Theme) -> Hsla {
     match status {
         AntigravitySwarmMemberStatus::Working => theme.success,
         AntigravitySwarmMemberStatus::Waiting => theme.warning,
@@ -2264,7 +2320,7 @@ fn member_status_color(status: AntigravitySwarmMemberStatus, theme: &Theme) -> H
     }
 }
 
-fn member_status_icon(status: AntigravitySwarmMemberStatus) -> &'static str {
+pub(super) fn member_status_icon(status: AntigravitySwarmMemberStatus) -> &'static str {
     match status {
         AntigravitySwarmMemberStatus::Working => "icons/zap.svg",
         AntigravitySwarmMemberStatus::Waiting => "icons/hourglass.svg",
@@ -2273,7 +2329,7 @@ fn member_status_icon(status: AntigravitySwarmMemberStatus) -> &'static str {
     }
 }
 
-fn member_status_label(status: AntigravitySwarmMemberStatus) -> String {
+pub(super) fn member_status_label(status: AntigravitySwarmMemberStatus) -> String {
     match status {
         AntigravitySwarmMemberStatus::Working => tr!("swarm.status_working"),
         AntigravitySwarmMemberStatus::Waiting => tr!("swarm.status_waiting"),
@@ -2344,7 +2400,7 @@ fn swarm_avatar(name: &str, size: f32, theme: &Theme) -> Div {
         .child(initial)
 }
 
-fn swarm_badge(label: String, color: Hsla, theme: &Theme) -> Div {
+pub(super) fn swarm_badge(label: String, color: Hsla, theme: &Theme) -> Div {
     div()
         .flex_none()
         .px(px(5.0))
@@ -3090,10 +3146,11 @@ mod tests {
 
     #[test]
     fn cycles_swarm_panel_tabs_with_arrow_wraparound() {
+        assert_eq!(SwarmPanelTab::Hive.step(1), SwarmPanelTab::Board);
         assert_eq!(SwarmPanelTab::Board.step(1), SwarmPanelTab::Members);
         assert_eq!(SwarmPanelTab::Members.step(1), SwarmPanelTab::Overview);
-        assert_eq!(SwarmPanelTab::Overview.step(1), SwarmPanelTab::Board);
-        assert_eq!(SwarmPanelTab::Board.step(-1), SwarmPanelTab::Overview);
+        assert_eq!(SwarmPanelTab::Overview.step(1), SwarmPanelTab::Hive);
+        assert_eq!(SwarmPanelTab::Hive.step(-1), SwarmPanelTab::Overview);
     }
 
     #[test]

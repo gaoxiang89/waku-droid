@@ -275,7 +275,7 @@ stops a turn, and the short-lived server that backs a Grok fork.
 | Interactive approvals | yes | yes | no | no (has them; Waku runs `--yolo`) | yes | no | yes | yes | yes | yes | yes | yes |
 | Mid-turn steering | yes | yes | yes | yes | yes | yes | yes | **no** | yes | yes | yes (transport) | **no** |
 | Model discovery | yes | yes | yes | yes | no (fixed) | no (modes) | yes | yes | yes | yes | yes | yes |
-| Computer Use | yes | yes (MCP) | yes | no (ships its own) | no | no | no | no | yes | yes | no | no |
+| Computer Use | yes | yes (MCP) | yes | no (ships its own) | no | no | yes (MCP) | yes (MCP) | yes | yes | yes (MCP) | yes (MCP) |
 | Restricted to Full access | no | no | yes | yes | no | yes | no | no | no | no | no | no |
 | Rewind and branch at a turn | yes | yes | yes | yes | yes | yes | yes | **no** | yes | yes | **no** | **no** |
 | Multi-account profiles | yes (`CODEX_HOME`) | yes (`--gemini-dir`) | no | no | yes (`CLAUDE_CONFIG_DIR`) | no | no | no | no | no | no | no |
@@ -961,8 +961,8 @@ what runs unasked.
 (`elicitation/create`), the same request Zed answers from a form. Waku advertises
 `clientCapabilities.elicitation.form` on every ACP connection and keeps the
 whole form above the composer until it is submitted. Every property stays
-visible and selectable: a `oneOf` title is the option, a boolean is Yes / No
-in the app language, and an integer or open string is a text field. Optional
+visible and selectable: a `oneOf` title is the option, a boolean is Yes / No,
+and an integer or open string is a text field. Optional
 properties can be left blank. The reply is `action: accept` with `content`
 keyed by property name; the `const` value is what goes back, and a blank
 optional property is omitted. The submitted choices are appended to the
@@ -1018,14 +1018,17 @@ session config option.
 
 Factory Droid does not take `session/set_model`. Its `session/new` response
 advertises three select options — `model`, `reasoning_effort`, and
-`autonomy_level` — and Waku writes each with `session/set_config_option`. The
-model catalog is that same `model` option, discovered by opening a short-lived
-ACP session; there is no separate `droid models` listing, so an empty discovery
-leaves the picker empty rather than inventing ids. `reasoning_effort` lists only
-the selected model's levels, and they differ per model, so discovery selects
-each model in that throwaway session and records the levels Droid answers with
-(this does not change the user's Droid defaults). Models not reached within the
-probe budget offer no effort picker. `autonomy_level` is always written at
+`autonomy_level` — and Waku writes each with `session/set_config_option`. Model
+discovery queries Droid's sessionless ACP `_factory/models/list` RPC directly
+after `initialize` (when `agentCapabilities._meta.factory.modelsList` is
+advertised), which returns all live Factory models, `custom:*` routes, and
+inline `supportedReasoningEfforts` / `defaultReasoningEffort` in one round trip
+without calling `session/new` or syncing a throwaway "New Session" to Factory
+web. The configured default model is read from `~/.factory/settings.json`
+(`sessionDefaultSettings.model`), falling back to `auto`. When the ACP RPC is
+unavailable (for example on older CLI builds), discovery falls back to parsing
+`droid exec --help` while retaining cached reasoning efforts for custom routes
+that help omits. `autonomy_level` is always written at
 session start, because an unset session inherits the user's CLI default, which
 may already be `auto-high`. If it cannot be written, the session fails closed
 outside Full access: Waku reports the error and ends the connection rather than
@@ -1131,9 +1134,9 @@ maps into each CLI's own vocabulary.
 | Waku | Codex (`approvalPolicy` / `sandbox` / reviewer) | Claude `--permission-mode` | Antigravity `mode` | Cursor | Fx | OpenCode | Grok | Kimi Code | Factory Droid |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Supervised | `untrusted` / `read-only` / `user` | `default` + `can_use_tool` reaches the user | `default`; requests reach the user | `session/request_permission` reaches the user | `session/set_mode` → `ask` | permission requests reach the user | `session/request_permission` reaches the user | `session/request_permission` reaches the user | `autonomy_level` `normal`; requests reach the user |
-| Auto-accept edits | `on-request` / `workspace-write` / `user` | `acceptEdits` | `accept-edits`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | edits auto-answered (`once`), the rest reach the user | auto-answered | auto-answered | `autonomy_level` `auto-low`; remaining requests auto-answered (`proceed_once`) |
-| Auto | `on-request` / `workspace-write` / `auto_review` | `auto` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-medium`; remaining requests auto-answered (`proceed_once`) |
-| Full access | `never` / `danger-full-access` / `user` | `bypassPermissions` + `--dangerously-skip-permissions` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-high`; remaining requests auto-answered (`proceed_once`) |
+| Auto-accept edits | `on-request` / `workspace-write` / `user` | `acceptEdits` | `accept-edits`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | edits auto-answered (`once`), the rest reach the user | auto-answered | auto-answered | `autonomy_level` `auto-low`; remaining requests reach the user |
+| Auto | `on-request` / `workspace-write` / `auto_review` | `auto` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-medium`; remaining requests reach the user |
+| Full access | `never` / `danger-full-access` / `user` | `bypassPermissions` + `--dangerously-skip-permissions` | `default`; remaining requests auto-answered | auto-answered | `session/set_mode` → `code` | auto-answered (`once`) | auto-answered | auto-answered | `autonomy_level` `auto-high`; remaining requests auto-answered (`allow_once`) |
 
 Amp, Pi, and Oh My Pi accept Full access only and always run wide open
 (`--dangerously-allow-all`, `--approve`, `--yolo`).

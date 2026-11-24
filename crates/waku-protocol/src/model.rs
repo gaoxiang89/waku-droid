@@ -2248,7 +2248,13 @@ impl ActivityKind {
 
         if matches!(
             compact.as_str(),
-            "todo" | "todoread" | "todowrite" | "updateplan" | "plan"
+            "todo"
+                | "todoread"
+                | "todowrite"
+                | "updateplan"
+                | "plan"
+                | "exitspecmode"
+                | "exitplanmode"
         ) {
             Self::Plan
         } else if matches!(
@@ -2321,7 +2327,7 @@ impl ActivityKind {
             Self::FileList
         } else if matches!(
             compact.as_str(),
-            "search" | "searchtool" | "webfetch" | "websearch"
+            "search" | "searchtool" | "webfetch" | "websearch" | "fetchurl"
         ) {
             Self::Search
         } else if matches!(compact.as_str(), "compact" | "compactcontext") {
@@ -2792,12 +2798,7 @@ impl ActivityItem {
 
     pub fn with_tool_name(mut self, name: Option<&str>) -> Self {
         if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
-            if let Some((server, tool)) = name
-                .strip_prefix("mcp__")
-                .and_then(|name| name.split_once("__"))
-                && !server.is_empty()
-                && !tool.is_empty()
-            {
+            if let Some((server, tool)) = parse_prefixed_mcp_tool_name(name) {
                 self.mcp_server = Some(server.to_owned());
                 self.tool_name = Some(tool.to_owned());
             } else {
@@ -2913,7 +2914,7 @@ impl ActivityItem {
             self.display_target = Some(target);
         }
         if self.kind == ActivityKind::Command
-            && let Some(description) = find_activity_string(source, &["description"], 0)
+            && let Some(description) = find_activity_string(source, &["description", "summary"], 0)
         {
             self.display_description = Some(compact_activity_target(&description));
         }
@@ -2930,6 +2931,28 @@ impl ActivityItem {
                 .and_then(normalize_command_activity_output);
         }
     }
+}
+
+fn parse_prefixed_mcp_tool_name(name: &str) -> Option<(&str, &str)> {
+    if let Some((server, tool)) = name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        && !server.is_empty()
+        && !tool.is_empty()
+    {
+        return Some((server, tool));
+    }
+    if name.len() > 4
+        && name[..4].eq_ignore_ascii_case("mcp:")
+        && let Some((server, tool)) = name[4..].split_once('/')
+    {
+        let server = server.trim();
+        let tool = tool.trim();
+        if !server.is_empty() && !tool.is_empty() {
+            return Some((server, tool));
+        }
+    }
+    None
 }
 
 fn normalize_command_activity_command(source: String) -> Option<String> {
@@ -3182,9 +3205,17 @@ fn extract_activity_display_target(
             "notebookPath",
             "notebook_path",
         ],
-        ActivityKind::FileSearch => &["pattern", "query", "regex", "glob"],
-        ActivityKind::FileList => &["path", "directory", "dir", "root"],
-        ActivityKind::Search => &["query", "queries"],
+        ActivityKind::FileSearch => &["pattern", "patterns", "query", "regex", "glob", "folder"],
+        ActivityKind::FileList => &[
+            "path",
+            "directory",
+            "directory_path",
+            "directoryPath",
+            "dir",
+            "root",
+            "folder",
+        ],
+        ActivityKind::Search => &["query", "queries", "url"],
         ActivityKind::Tool => &["title", "description", "task"],
         _ => return None,
     };
@@ -5865,6 +5896,84 @@ mod tests {
             Project::from_path(PathBuf::from(r"/home/user/foo\bar")).name,
             r"foo\bar"
         );
+    }
+
+    #[test]
+    fn droid_activity_metadata_extracts_summary_patterns_folder_url_and_mcp() {
+        let execute = ActivityItem::new(None, ActivityKind::Command, "Run tests", None, true)
+            .with_arguments(Some(
+                serde_json::json!({
+                    "command": "cargo test -p waku-protocol",
+                    "summary": "Run protocol unit tests"
+                })
+                .to_string(),
+            ));
+        assert_eq!(
+            execute.display_target.as_deref(),
+            Some("cargo test -p waku-protocol")
+        );
+        assert_eq!(
+            execute.display_description.as_deref(),
+            Some("Run protocol unit tests")
+        );
+
+        let execute_prefers_description =
+            ActivityItem::new(None, ActivityKind::Command, "Run tests", None, true)
+                .with_arguments(Some(
+                    serde_json::json!({
+                        "command": "cargo test",
+                        "description": "Explicit description",
+                        "summary": "Fallback summary"
+                    })
+                    .to_string(),
+                ));
+        assert_eq!(
+            execute_prefers_description.display_description.as_deref(),
+            Some("Explicit description")
+        );
+
+        let glob = ActivityItem::new(None, ActivityKind::FileSearch, "Find files", None, true)
+            .with_arguments(Some(
+                serde_json::json!({
+                    "patterns": ["icons/chevron*.svg", "icons/arrow*.svg"],
+                    "folder": "assets"
+                })
+                .to_string(),
+            ));
+        assert_eq!(glob.display_target.as_deref(), Some("icons/chevron*.svg"));
+
+        let folder_only =
+            ActivityItem::new(None, ActivityKind::FileSearch, "Find files", None, true)
+                .with_arguments(Some(serde_json::json!({ "folder": "crates/waku-core" }).to_string()));
+        assert_eq!(
+            folder_only.display_target.as_deref(),
+            Some("crates/waku-core")
+        );
+
+        let list = ActivityItem::new(None, ActivityKind::FileList, "List src", None, true)
+            .with_arguments(Some(serde_json::json!({ "directory_path": "src/app" }).to_string()));
+        assert_eq!(list.display_target.as_deref(), Some("src/app"));
+
+        let fetch = ActivityItem::new(None, ActivityKind::Search, "Fetch docs", None, true)
+            .with_arguments(Some(
+                serde_json::json!({ "url": "https://docs.factory.ai/droid" }).to_string(),
+            ));
+        assert_eq!(
+            fetch.display_target.as_deref(),
+            Some("https://docs.factory.ai/droid")
+        );
+
+        assert_eq!(ActivityKind::from_tool_name("ExitSpecMode"), ActivityKind::Plan);
+        assert_eq!(ActivityKind::from_tool_name("FetchUrl"), ActivityKind::Search);
+        assert!(
+            !is_generic_activity_title(ActivityKind::Plan, "Approve Spec"),
+            "Approve Spec must stay a specific title rather than collapsing to generic Plan updated"
+        );
+
+        let droid_mcp = ActivityItem::new(None, ActivityKind::Tool, "github: search_issues", None, true)
+            .with_tool_name(Some("MCP:github/search_issues"));
+        assert_eq!(droid_mcp.mcp_server.as_deref(), Some("github"));
+        assert_eq!(droid_mcp.tool_name.as_deref(), Some("search_issues"));
     }
 
     #[test]

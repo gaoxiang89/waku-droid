@@ -916,14 +916,205 @@ fn parse_grok_models(output: &str) -> Vec<ProviderModel> {
         .collect()
 }
 
-/// Help includes the installed CLI's models, custom routes and per-model
-/// reasoning levels. Unlike ACP `session/new`, it does not persist a probe
-/// session or sync a "New Session" in our temporary directory to Factory web.
+/// Probes Factory Droid's sessionless ACP `_factory/models/list` RPC (gated on
+/// `agentCapabilities._meta.factory.modelsList`) so all live Factory models,
+/// `custom:*` routes, and per-model reasoning levels are discovered in one shot
+/// without opening a throwaway `session/new` (which would pollute Factory web
+/// with a "New Session" entry). Falls back to `droid exec --help` for older
+/// binaries or environments where the ACP RPC is unavailable.
 fn discover_droid_models(binary: &Path) -> Result<Vec<ProviderModel>, String> {
     discover_droid_models_with_timeout(binary, CLI_DISCOVERY_TIMEOUT)
 }
 
 fn discover_droid_models_with_timeout(
+    binary: &Path,
+    timeout: Duration,
+) -> Result<Vec<ProviderModel>, String> {
+    let deadline = Instant::now() + timeout;
+    let default_model = droid_default_model_from_settings();
+    match discover_droid_models_via_acp(binary, timeout, default_model.as_deref()) {
+        Ok(models) if !models.is_empty() => return Ok(models),
+        Ok(_) => {}
+        Err(acp_error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(acp_error);
+            }
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!(
+            "Factory Droid did not answer within {} seconds",
+            timeout.as_secs()
+        ));
+    }
+    discover_droid_models_from_help(binary, remaining)
+}
+
+fn discover_droid_models_via_acp(
+    binary: &Path,
+    timeout: Duration,
+    default_model: Option<&str>,
+) -> Result<Vec<ProviderModel>, String> {
+    let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
+    let agent = crate::driver::catalog_agent(ProviderKind::Droid, binary, &cwd)
+        .map_err(|error| error.to_string())?;
+    discover_droid_models_via_acp_with_agent(agent, timeout, default_model)
+}
+
+fn droid_supports_models_list(
+    initialize: &agent_client_protocol::schema::v1::InitializeResponse,
+) -> bool {
+    initialize
+        .agent_capabilities
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("factory"))
+        .and_then(|factory| factory.get("modelsList"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn discover_droid_models_via_acp_with_agent<C>(
+    agent: C,
+    timeout: Duration,
+    default_model: Option<&str>,
+) -> Result<Vec<ProviderModel>, String>
+where
+    C: ConnectTo<Client> + 'static,
+{
+    let request = Client.builder().name("waku-droid-model-discovery").connect_with(
+        agent,
+        async move |connection: ConnectionTo<Agent>| {
+            let initialize = connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new().terminal(false))
+                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
+            if !droid_supports_models_list(&initialize) {
+                return Err(agent_client_protocol::util::internal_error(
+                    "Factory Droid did not advertise _meta.factory.modelsList",
+                ));
+            }
+            let request = UntypedMessage::new("_factory/models/list", json!({}))?;
+            connection.send_request(request).block_task().await
+        },
+    );
+    let response = smol::block_on(smol::future::race(
+        async move { request.await.map_err(|error| acp_discovery_error(&error)) },
+        async move {
+            smol::Timer::after(timeout).await;
+            Err(format!(
+                "Factory Droid did not answer within {} seconds",
+                timeout.as_secs()
+            ))
+        },
+    ))?;
+    let models = parse_droid_acp_models(&response, default_model);
+    if models.is_empty() {
+        return Err("Factory Droid _factory/models/list returned no models".to_owned());
+    }
+    Ok(models)
+}
+
+fn droid_default_model_from_settings() -> Option<String> {
+    let path = dirs::home_dir()?.join(".factory").join("settings.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&contents).ok()?;
+    parse_droid_settings_default_model(&value)
+}
+
+fn parse_droid_settings_default_model(value: &Value) -> Option<String> {
+    value
+        .pointer("/sessionDefaultSettings/model")
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_droid_acp_models(value: &Value, default_model: Option<&str>) -> Vec<ProviderModel> {
+    let Some(entries) = value.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut models = Vec::<ProviderModel>::new();
+    for entry in entries {
+        if entry.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(id) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if models.iter().any(|model| model.id == id) {
+            continue;
+        }
+        let name = entry
+            .get("displayName")
+            .or_else(|| entry.get("shortDisplayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| display_name_from_slug(id));
+        let mut model = ProviderModel::new(id, name);
+        if entry.get("isDefault").and_then(Value::as_bool) == Some(true) {
+            model = model.default();
+        }
+        let mut options = Vec::<ProviderModelOption>::new();
+        for level in entry
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+        {
+            if !options.iter().any(|option| option.id == level) {
+                options.push(ProviderModelOption::new(
+                    level,
+                    reasoning_effort_label(level),
+                ));
+            }
+        }
+        // A single level (Auto's `none`, for example) offers no choice.
+        if options.len() > 1 {
+            let default_effort = entry
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|effort| options.iter().any(|option| option.id == *effort))
+                .map(str::to_owned)
+                .unwrap_or_else(|| options[0].id.clone());
+            model = model.reasoning(options, default_effort);
+        }
+        models.push(model);
+    }
+    if !models.is_empty() && !models.iter().any(|model| model.is_default) {
+        if let Some(default_id) = default_model
+            && let Some(model) = models.iter_mut().find(|model| model.id == default_id)
+        {
+            model.is_default = true;
+        } else if let Some(auto) = models.iter_mut().find(|model| model.id == "auto") {
+            auto.is_default = true;
+        } else {
+            models[0].is_default = true;
+        }
+    }
+    models
+}
+
+fn discover_droid_models_from_help(
     binary: &Path,
     timeout: Duration,
 ) -> Result<Vec<ProviderModel>, String> {
@@ -2329,6 +2520,213 @@ Authentication:
         assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
         assert!(models[2].reasoning_efforts.is_empty());
         assert!(models[3].reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn droid_acp_models_list_parses_factory_and_custom_models_with_efforts() {
+        let payload = json!({
+            "models": [
+                {
+                    "id": "auto",
+                    "displayName": "Auto Model",
+                    "supportedReasoningEfforts": ["none"],
+                    "defaultReasoningEffort": "none",
+                    "isCustom": false,
+                    "disabled": false
+                },
+                {
+                    "id": "claude-fable-5.2",
+                    "displayName": "Fable 5.2",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+                    "defaultReasoningEffort": "high",
+                    "isCustom": false,
+                    "disabled": false
+                },
+                {
+                    "id": "custom:gpt-5.4(xhigh)",
+                    "displayName": "gpt-5.4(xhigh)",
+                    "supportedReasoningEfforts": ["low", "medium", "high", "xhigh"],
+                    "defaultReasoningEffort": "medium",
+                    "isCustom": true,
+                    "disabled": false
+                },
+                {
+                    "id": "disabled-model",
+                    "displayName": "Disabled",
+                    "supportedReasoningEfforts": ["low", "high"],
+                    "defaultReasoningEffort": "high",
+                    "disabled": true
+                },
+                {
+                    "id": "claude-fable-5.2",
+                    "displayName": "Duplicate should be skipped",
+                    "supportedReasoningEfforts": ["low", "high"],
+                    "defaultReasoningEffort": "low",
+                    "disabled": false
+                }
+            ]
+        });
+
+        let models = parse_droid_acp_models(&payload, Some("custom:gpt-5.4(xhigh)"));
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "auto");
+        assert!(models[0].reasoning_efforts.is_empty());
+        assert!(!models[0].is_default);
+
+        assert_eq!(models[1].id, "claude-fable-5.2");
+        assert_eq!(models[1].name, "Fable 5.2");
+        assert_eq!(
+            models[1]
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
+
+        assert_eq!(models[2].id, "custom:gpt-5.4(xhigh)");
+        assert!(models[2].is_default);
+        assert_eq!(
+            models[2]
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            models[2].default_reasoning_effort.as_deref(),
+            Some("medium")
+        );
+
+        // Without a matching settings default, `auto` becomes default.
+        let fallback_default = parse_droid_acp_models(&payload, Some("missing-model"));
+        assert!(fallback_default[0].is_default);
+        assert_eq!(
+            fallback_default
+                .iter()
+                .filter(|model| model.is_default)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn droid_settings_default_model_reads_session_default_settings() {
+        assert_eq!(
+            parse_droid_settings_default_model(&json!({
+                "sessionDefaultSettings": {
+                    "model": "deepseek-v4.1-flash-1017",
+                    "reasoningEffort": "high"
+                }
+            }))
+            .as_deref(),
+            Some("deepseek-v4.1-flash-1017")
+        );
+        assert_eq!(
+            parse_droid_settings_default_model(&json!({ "model": "claude-opus-5-5" })).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(parse_droid_settings_default_model(&json!({})), None);
+    }
+
+    #[test]
+    fn droid_acp_discovery_queries_models_list_without_opening_a_session() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionResponse,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let new_session_calls = Arc::new(AtomicUsize::new(0));
+        let new_session_calls_agent = Arc::clone(&new_session_calls);
+        let models_list_calls = Arc::new(AtomicUsize::new(0));
+        let models_list_calls_agent = Arc::clone(&models_list_calls);
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let mut meta = Map::new();
+                    meta.insert("factory".to_owned(), json!({ "modelsList": true }));
+                    let caps = AgentCapabilities::new().meta(meta);
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    new_session_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(NewSessionResponse::new("unexpected-session"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: UntypedMessage, responder, _cx| {
+                    assert_eq!(req.method, "_factory/models/list");
+                    models_list_calls_agent.fetch_add(1, Ordering::Relaxed);
+                    responder.respond(json!({
+                        "models": [
+                            {
+                                "id": "auto",
+                                "displayName": "Auto Model",
+                                "supportedReasoningEfforts": ["none"],
+                                "defaultReasoningEffort": "none",
+                                "disabled": false
+                            },
+                            {
+                                "id": "custom:glm-5.1",
+                                "displayName": "GLM 5.1",
+                                "supportedReasoningEfforts": ["off", "high"],
+                                "defaultReasoningEffort": "high",
+                                "isCustom": true,
+                                "disabled": false
+                            }
+                        ]
+                    }))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let models = discover_droid_models_via_acp_with_agent(
+            mock_agent,
+            Duration::from_secs(5),
+            Some("custom:glm-5.1"),
+        )
+        .expect("Droid ACP _factory/models/list discovery should succeed");
+
+        assert_eq!(models_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            new_session_calls.load(Ordering::Relaxed),
+            0,
+            "Droid model discovery must never open a session/new"
+        );
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].id, "custom:glm-5.1");
+        assert!(models[1].is_default);
+        assert_eq!(models[1].reasoning_efforts.len(), 2);
+        assert_eq!(models[1].default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn droid_acp_discovery_errors_cleanly_when_models_list_capability_is_absent() {
+        use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeResponse};
+
+        let mock_agent = Agent.builder().on_receive_request(
+            async move |_req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(ProtocolVersion::V1)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let err = discover_droid_models_via_acp_with_agent(mock_agent, Duration::from_secs(5), None)
+            .expect_err("missing _meta.factory.modelsList must fail cleanly for help fallback");
+        assert!(err.contains("modelsList"), "unexpected error: {err}");
     }
 
     #[test]

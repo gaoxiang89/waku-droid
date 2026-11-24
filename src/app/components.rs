@@ -213,6 +213,14 @@ impl Waku {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct MessageFooterFocus {
+    pub(super) copy: FocusHandle,
+    pub(super) fork: Option<FocusHandle>,
+    pub(super) rewind: Option<FocusHandle>,
+    pub(super) any_focused: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_message_footer(
     theme: &Theme,
@@ -225,11 +233,15 @@ pub(super) fn render_message_footer(
     align_right: bool,
     assistant_message_action: Option<AssistantMessageAction>,
     user_message_action: Option<UserMessageAction>,
+    footer_focus: MessageFooterFocus,
     waku: gpui::WeakEntity<Waku>,
 ) -> AnyElement {
     let theme = *theme;
     let message_id = message.id;
+    let visible = force_visible || footer_focus.any_focused;
     let copy_waku = waku.clone();
+    let key_copy_waku = waku.clone();
+    let key_copy_content = copy_content.clone();
     let footer_color = if theme.is_dark {
         gpui::hsla(126.93 / 360.0, 0.000_000_1, 0.543_95, 1.0)
     } else {
@@ -243,9 +255,17 @@ pub(super) fn render_message_footer(
         .text_size(sp(12.5))
         .line_height(sp(14.0))
         .text_color(footer_color)
+        .when(!visible, |element| {
+            element
+                .opacity(0.0)
+                .group_hover(group_name.clone(), |element| element.opacity(1.0))
+        })
         .child(format_message_time(footer_time));
     let copy_button = div()
         .id(SharedString::from(format!("copy-message-{message_id}")))
+        .track_focus(&footer_focus.copy)
+        .tab_index(0)
+        .tab_stop(true)
         .w(px(27.0))
         .h(px(27.0))
         .rounded(px(8.0))
@@ -253,6 +273,18 @@ pub(super) fn render_message_footer(
         .items_center()
         .justify_center()
         .cursor_default()
+        .when(!visible, |element| {
+            element
+                .opacity(0.0)
+                .group_hover(group_name.clone(), |element| element.opacity(1.0))
+        })
+        .focus_visible(|element| {
+            element
+                .opacity(1.0)
+                .border_1()
+                .border_color(theme.accent)
+                .bg(theme.overlay_strong)
+        })
         .hover(|element| element.bg(theme.overlay_strong))
         .child(icon(
             if copied {
@@ -273,6 +305,17 @@ pub(super) fn render_message_footer(
             let _ = copy_waku.update(cx, |this, cx| {
                 this.show_message_copied(message_id, cx);
             });
+        })
+        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+            if !event.keystroke.modifiers.modified()
+                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(key_copy_content.to_string()));
+                let _ = key_copy_waku.update(cx, |this, cx| {
+                    this.show_message_copied(message_id, cx);
+                });
+                cx.stop_propagation();
+            }
         });
     let mut footer = div()
         .w_full()
@@ -280,11 +323,6 @@ pub(super) fn render_message_footer(
         .flex()
         .items_center()
         .gap(px(1.0))
-        .when(!force_visible, |element| {
-            element
-                .invisible()
-                .group_hover(group_name, |element| element.visible())
-        })
         .when(!align_right, |element| element.ml(-px(7.0)))
         .when(align_right, |element| element.justify_end());
 
@@ -294,13 +332,25 @@ pub(super) fn render_message_footer(
         footer = footer.child(copy_button);
         if let Some(action) = assistant_message_action {
             let fork_waku = waku.clone();
+            let key_fork_waku = waku.clone();
             let fork_icon = if action.preparing {
                 motion::spin(icon("icons/loader-circle.svg", 14.0, footer_color))
             } else {
                 icon("icons/fork.svg", 14.0, footer_color).into_any_element()
             };
+            let rest_opacity = if !action.enabled && !action.preparing {
+                0.45
+            } else {
+                1.0
+            };
             let fork_button = div()
                 .id(SharedString::from(format!("fork-response-{message_id}")))
+                .when_some(footer_focus.fork.as_ref(), |element, handle| {
+                    element
+                        .track_focus(handle)
+                        .tab_index(0)
+                        .tab_stop(action.enabled)
+                })
                 .w(px(27.0))
                 .h(px(27.0))
                 .rounded(px(8.0))
@@ -308,8 +358,15 @@ pub(super) fn render_message_footer(
                 .items_center()
                 .justify_center()
                 .cursor_default()
-                .when(!action.enabled && !action.preparing, |element| {
-                    element.opacity(0.45)
+                .when(!visible, |element| {
+                    element
+                        .opacity(0.0)
+                        .group_hover(group_name.clone(), move |element| {
+                            element.opacity(rest_opacity)
+                        })
+                })
+                .when(visible && rest_opacity < 1.0, |element| {
+                    element.opacity(rest_opacity)
                 })
                 .child(fork_icon)
                 .tooltip(Tooltip::text(if action.enabled {
@@ -319,6 +376,13 @@ pub(super) fn render_message_footer(
                 }));
             footer = footer.child(if action.enabled {
                 fork_button
+                    .focus_visible(|element| {
+                        element
+                            .opacity(1.0)
+                            .border_1()
+                            .border_color(theme.accent)
+                            .bg(theme.overlay_strong)
+                    })
                     .hover(|element| element.bg(theme.overlay_strong))
                     .on_click(move |_, _, cx| {
                         let _ = fork_waku.update(cx, |this, cx| {
@@ -329,6 +393,20 @@ pub(super) fn render_message_footer(
                             );
                         });
                     })
+                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            let _ = key_fork_waku.update(cx, |this, cx| {
+                                this.fork_session_from_response(
+                                    action.session_id,
+                                    action.turn_count,
+                                    cx,
+                                );
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
             } else {
                 fork_button
             });
@@ -337,12 +415,16 @@ pub(super) fn render_message_footer(
     }
 
     if let Some(action) = user_message_action {
-        let edit_waku = waku;
+        let edit_waku = waku.clone();
+        let key_edit_waku = waku;
         footer = footer.child(
             div()
                 .id(SharedString::from(format!(
                     "user-message-action-{message_id}"
                 )))
+                .when_some(footer_focus.rewind.as_ref(), |element, handle| {
+                    element.track_focus(handle).tab_index(0).tab_stop(true)
+                })
                 .w(px(27.0))
                 .h(px(27.0))
                 .rounded(px(8.0))
@@ -350,6 +432,18 @@ pub(super) fn render_message_footer(
                 .items_center()
                 .justify_center()
                 .cursor_default()
+                .when(!visible, |element| {
+                    element
+                        .opacity(0.0)
+                        .group_hover(group_name, |element| element.opacity(1.0))
+                })
+                .focus_visible(|element| {
+                    element
+                        .opacity(1.0)
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.overlay_strong)
+                })
                 .hover(|element| element.bg(theme.overlay_strong))
                 .child(icon("icons/rewind.svg", 14.0, footer_color))
                 .tooltip(Tooltip::text(tr_cow!("session.revert_to_here")))
@@ -357,6 +451,16 @@ pub(super) fn render_message_footer(
                     let _ = edit_waku.update(cx, |this, cx| {
                         this.begin_message_edit(action, window, cx);
                     });
+                })
+                .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        let _ = key_edit_waku.update(cx, |this, cx| {
+                            this.begin_message_edit(action, window, cx);
+                        });
+                        cx.stop_propagation();
+                    }
                 }),
         );
     }
@@ -383,6 +487,7 @@ pub(super) struct MessageRender<'a> {
     pub(super) user_message_viewport: Option<&'a UserMessageScrollViewport>,
     pub(super) user_message_expanded: bool,
     pub(super) user_message_expand_focus: Option<FocusHandle>,
+    pub(super) footer_focus: MessageFooterFocus,
     pub(super) message_edit_input: Option<Entity<ComposerInput>>,
     pub(super) attachment_menus: Vec<ContextMenuHandle>,
     pub(super) attachment_images: Vec<Option<Arc<gpui::Image>>>,
@@ -583,6 +688,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
         user_message_viewport,
         user_message_expanded,
         user_message_expand_focus,
+        footer_focus,
         message_edit_input,
         attachment_menus,
         attachment_images,
@@ -940,6 +1046,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                     true,
                     None,
                     user_message_action,
+                    footer_focus,
                     waku.clone(),
                 ));
             }
@@ -1000,6 +1107,7 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                     false,
                     assistant_message_action,
                     None,
+                    footer_focus,
                     waku.clone(),
                 ));
             }
@@ -1192,14 +1300,20 @@ pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
         return Vec::new();
     };
     let mut steps = Vec::new();
+    let mut in_fence = false;
     for raw_line in source.lines() {
         let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.is_empty() {
             continue;
         }
         let line = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
             .unwrap_or(trimmed);
         let parsed = if let Some(rest) = line
             .strip_prefix("[x] ")
@@ -1217,7 +1331,7 @@ pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
             None
         };
         let Some((status, label)) = parsed else {
-            return Vec::new();
+            continue;
         };
         if !label.is_empty() {
             steps.push(PlanStep {
@@ -1227,6 +1341,97 @@ pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
         }
     }
     steps
+}
+
+pub(super) fn is_spec_activity(activity: &ActivityItem) -> bool {
+    let matches_name = |name: &str| {
+        let normalized = tool_name_leaf(name)
+            .chars()
+            .filter(|character| !matches!(*character, '_' | '-' | ' '))
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        matches!(normalized.as_str(), "exitspecmode" | "approvespec")
+    };
+    matches_name(&activity.title)
+        || activity
+            .tool_name
+            .as_deref()
+            .is_some_and(matches_name)
+}
+
+fn extract_spec_markdown(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('{')
+        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let body = ["plan", "spec", "specification", "markdown"]
+            .into_iter()
+            .find_map(|key| {
+                map.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })?;
+        let title = map
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        return Some(match title {
+            Some(title) if !body.starts_with("# ") => format!("# {title}\n\n{body}"),
+            _ => body.to_owned(),
+        });
+    }
+    if trimmed.starts_with('[')
+        && serde_json::from_str::<serde_json::Value>(trimmed)
+            .is_ok_and(|value| value.is_array())
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// Returns the Markdown source for an activity disclosure section that should
+/// render as formatted prose (non-checklist plans and Droid `ExitSpecMode` /
+/// `Approve Spec` payloads) rather than raw monospace text.
+pub(super) fn activity_section_markdown_body(
+    activity: &ActivityItem,
+    section_kind: ActivityDisclosureSectionKind,
+    content: &str,
+    has_plan_steps: bool,
+) -> Option<String> {
+    if activity.kind == ActivityKind::Plan {
+        if has_plan_steps
+            && matches!(
+                section_kind,
+                ActivityDisclosureSectionKind::Output | ActivityDisclosureSectionKind::Detail
+            )
+        {
+            return None;
+        }
+        if matches!(
+            section_kind,
+            ActivityDisclosureSectionKind::Output | ActivityDisclosureSectionKind::Detail
+        ) || (section_kind == ActivityDisclosureSectionKind::Arguments && is_spec_activity(activity))
+        {
+            return extract_spec_markdown(content);
+        }
+        return None;
+    }
+    if is_spec_activity(activity)
+        && matches!(
+            section_kind,
+            ActivityDisclosureSectionKind::Arguments
+                | ActivityDisclosureSectionKind::Output
+                | ActivityDisclosureSectionKind::Detail
+        )
+    {
+        return extract_spec_markdown(content);
+    }
+    None
 }
 
 /// Exploration only reads the workspace, so it renders as a compact line
@@ -2583,5 +2788,138 @@ mod message_time_tests {
 
         read.failed = true;
         assert!(!activity_uses_compact_row(&read, false));
+    }
+
+    #[test]
+    fn activity_plan_steps_skips_headings_prose_and_code_fences() {
+        let mixed = ActivityItem::new(
+            Some("plan-mixed".into()),
+            crate::model::ActivityKind::Plan,
+            "TodoWrite",
+            None,
+            false,
+        )
+        .with_output(Some(
+            "## Implementation Plan\n\nHere are the remaining steps:\n\n- [x] Parse ACP updates\n- [~] Render markdown specs\n+ [ ] Add regression tests\n\n```md\n- [ ] Not a real checklist step\n```\n\nSummary: nearly done.".into(),
+        ));
+        assert_eq!(
+            activity_plan_steps(&mixed),
+            vec![
+                PlanStep {
+                    status: PlanStepStatus::Completed,
+                    label: "Parse ACP updates".into(),
+                },
+                PlanStep {
+                    status: PlanStepStatus::InProgress,
+                    label: "Render markdown specs".into(),
+                },
+                PlanStep {
+                    status: PlanStepStatus::Pending,
+                    label: "Add regression tests".into(),
+                },
+            ]
+        );
+
+        let prose_only = ActivityItem::new(
+            Some("plan-prose".into()),
+            crate::model::ActivityKind::Plan,
+            "Approve Spec",
+            None,
+            true,
+        )
+        .with_output(Some(
+            "# Spec\n\nThis plan explains the design without checkboxes.\n\n```md\n- [ ] Example checkbox in fence\n```"
+                .into(),
+        ));
+        assert!(activity_plan_steps(&prose_only).is_empty());
+    }
+
+    #[test]
+    fn activity_section_markdown_body_detects_prose_plans_and_droid_specs() {
+        let prose_plan = ActivityItem::new(
+            Some("spec-1".into()),
+            crate::model::ActivityKind::Plan,
+            "Approve Spec",
+            None,
+            true,
+        )
+        .with_output(Some("# Architecture\n\n- Keep UI thread non-blocking".into()));
+        assert!(is_spec_activity(&prose_plan));
+        assert_eq!(
+            activity_section_markdown_body(
+                &prose_plan,
+                ActivityDisclosureSectionKind::Output,
+                prose_plan.output.as_deref().unwrap(),
+                false,
+            ),
+            Some("# Architecture\n\n- Keep UI thread non-blocking".into())
+        );
+
+        // Checklist plans keep their structured checklist view instead of raw Markdown.
+        let checklist_plan = ActivityItem::new(
+            Some("plan-2".into()),
+            crate::model::ActivityKind::Plan,
+            "TodoWrite",
+            None,
+            true,
+        )
+        .with_output(Some("- [x] Done\n- [ ] Next".into()));
+        assert_eq!(
+            activity_section_markdown_body(
+                &checklist_plan,
+                ActivityDisclosureSectionKind::Output,
+                checklist_plan.output.as_deref().unwrap(),
+                true,
+            ),
+            None
+        );
+
+        // Droid ExitSpecMode tool payloads extract Markdown from JSON arguments,
+        // while keeping small non-spec JSON objects in monospace.
+        let exit_spec = ActivityItem::new(
+            Some("spec-2".into()),
+            crate::model::ActivityKind::Tool,
+            "ExitSpecMode",
+            None,
+            true,
+        );
+        assert!(is_spec_activity(&exit_spec));
+        assert_eq!(
+            activity_section_markdown_body(
+                &exit_spec,
+                ActivityDisclosureSectionKind::Arguments,
+                r###"{"title":"Refactor Spec","plan":"## Steps\n\n1. Update parser"}"###,
+                false,
+            ),
+            Some("# Refactor Spec\n\n## Steps\n\n1. Update parser".into())
+        );
+        assert_eq!(
+            activity_section_markdown_body(
+                &exit_spec,
+                ActivityDisclosureSectionKind::Output,
+                r#"{"approved":true}"#,
+                false,
+            ),
+            None
+        );
+
+        // Ordinary tools stay monospace plain text.
+        let grep = ActivityItem::new(
+            Some("grep-1".into()),
+            crate::model::ActivityKind::FileSearch,
+            "Grep",
+            None,
+            true,
+        );
+        assert!(!is_spec_activity(&grep));
+        assert_eq!(
+            activity_section_markdown_body(
+                &grep,
+                ActivityDisclosureSectionKind::Output,
+                "src/main.rs:10: fn main()",
+                false,
+            ),
+            None
+        );
     }
 }

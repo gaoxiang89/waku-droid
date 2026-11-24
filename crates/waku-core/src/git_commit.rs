@@ -167,6 +167,11 @@ fn build_generate_command(
         .current_dir(cwd)
         .env("NO_COLOR", "1")
         .env("CI", "1");
+    if invocation.provider == ProviderKind::Droid {
+        command
+            .env("DROID_DISABLE_AUTO_UPDATE", "true")
+            .env("FACTORY_DROID_AUTO_UPDATE_ENABLED", "false");
+    }
     command
 }
 
@@ -971,6 +976,40 @@ mod tests {
         }));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn droid_generate_command_disables_auto_update() {
+        let dir = std::env::temp_dir();
+        let droid = AgentInvocation {
+            provider: ProviderKind::Droid,
+            binary: PathBuf::from("droid"),
+            model: Some("claude-opus-5-5".into()),
+            reasoning_effort: Some("low".into()),
+            config_dir: None,
+        };
+        let command = build_generate_command(&dir, "Generate subject", &droid, None, None);
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "DROID_DISABLE_AUTO_UPDATE" && value.and_then(|v| v.to_str()) == Some("true")
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "FACTORY_DROID_AUTO_UPDATE_ENABLED"
+                && value.and_then(|v| v.to_str()) == Some("false")
+        }));
+
+        let codex = AgentInvocation {
+            provider: ProviderKind::Codex,
+            binary: PathBuf::from("codex"),
+            model: None,
+            reasoning_effort: None,
+            config_dir: None,
+        };
+        let other = build_generate_command(&dir, "Generate subject", &codex, None, None);
+        assert!(
+            !other
+                .get_envs()
+                .any(|(key, _)| key == "DROID_DISABLE_AUTO_UPDATE")
+        );
     }
 
     #[cfg(windows)]

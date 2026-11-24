@@ -50,6 +50,32 @@ pub(super) fn composer_submit_action(
     }
 }
 
+pub(super) fn runtime_mode_description(
+    provider: Option<ProviderKind>,
+    mode: RuntimeMode,
+) -> String {
+    if provider == Some(ProviderKind::Droid) && mode == RuntimeMode::Auto {
+        tr!("mode.auto_description_droid")
+    } else {
+        mode.description()
+    }
+}
+
+fn permission_detail_viewport_id(request_id: &str) -> Uuid {
+    // Deterministic 128-bit FNV-1a pair with domain separation so each
+    // permission prompt gets its own stable ScrollHandle/ScrollbarState in
+    // `activity_scroll_viewports` without colliding with activity UUIDs.
+    let mut lo: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut hi: u64 = 0x8422_2325_cbf2_9ce4;
+    for byte in b"permission-detail:".iter().chain(request_id.as_bytes()) {
+        lo ^= u64::from(*byte);
+        lo = lo.wrapping_mul(0x0000_0100_0000_01b3);
+        hi ^= u64::from(*byte);
+        hi = hi.wrapping_mul(0x0000_0100_0000_01b3).rotate_left(7);
+    }
+    Uuid::from_u128((u128::from(hi) << 64) | u128::from(lo))
+}
+
 impl Waku {
     // ── Permission ─────────────────────────────────────────────────────────
 
@@ -67,6 +93,13 @@ impl Waku {
         let permission = self.selected_runtime()?.pending_permission.as_ref()?;
         let theme = Theme::current(cx);
         let request_id = permission.request_id.clone();
+        let detail_viewport = self
+            .activity_scroll_viewports
+            .borrow_mut()
+            .entry(permission_detail_viewport_id(&permission.request_id))
+            .or_default()
+            .clone();
+        let detail_wheel_scroll = detail_viewport.scroll_handle.clone();
         let mut buttons = div().flex().items_center().gap(px(8.0)).mt(px(10.0));
         for option in &permission.options {
             let request_id = request_id.clone();
@@ -157,19 +190,46 @@ impl Waku {
                     )
                     .child(
                         div()
-                            .id("permission-detail")
+                            .relative()
                             .mt(px(8.0))
                             .max_h(px(92.0))
-                            .overflow_y_scroll()
-                            .p(px(8.0))
                             .rounded(px(7.0))
                             .bg(theme.inset)
-                            .font_family(crate::md::render::MONO_FAMILY)
-                            .text_size(sp(12.5))
-                            .line_height(sp(16.0))
-                            .text_color(theme.text_secondary)
-                            .whitespace_normal()
-                            .child(SharedString::from(permission.detail.clone())),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("permission-detail")
+                                    .w_full()
+                                    .min_w_0()
+                                    .max_h(px(92.0))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&detail_viewport.scroll_handle)
+                                    .p(px(8.0))
+                                    .pr(px(14.0))
+                                    .font_family(crate::md::render::MONO_FAMILY)
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(16.0))
+                                    .text_color(theme.text_secondary)
+                                    .whitespace_normal()
+                                    .child(SharedString::from(permission.detail.clone()))
+                                    .on_scroll_wheel(move |_, _, cx| {
+                                        contain_scroll(&detail_wheel_scroll, cx);
+                                    }),
+                            )
+                            .child(scrollbar::edge_fade(
+                                detail_viewport.scroll_handle.clone(),
+                                scrollbar::FadeEdge::Top,
+                                theme.inset,
+                            ))
+                            .child(scrollbar::edge_fade(
+                                detail_viewport.scroll_handle.clone(),
+                                scrollbar::FadeEdge::Bottom,
+                                theme.inset,
+                            ))
+                            .child(scrollbar::vertical(
+                                &detail_viewport.scroll_handle,
+                                &detail_viewport.scrollbar,
+                            )),
                     )
                     .child(buttons),
             ),
@@ -450,6 +510,31 @@ impl Waku {
                     .children(custom),
             );
         }
+        let cancel_focus =
+            self.transcript_control_focus(format!("user-input-{request_id}-cancel"), cx);
+        let cancel = div()
+            .id(SharedString::from(format!(
+                "user-input-{request_id}-cancel"
+            )))
+            .track_focus(&cancel_focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .h(px(26.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .cursor_default()
+            .text_size(sp(12.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent).text_color(theme.text))
+            .hover(|style| style.bg(theme.overlay).text_color(theme.text))
+            .active(|style| style.opacity(0.8))
+            .on_activation(cx, |this, _, cx| this.cancel_turn(cx))
+            .child(tr!("common.cancel"));
         let submit_focus =
             self.transcript_control_focus(format!("user-input-{request_id}-submit"), cx);
         let submit = div()
@@ -480,7 +565,9 @@ impl Waku {
                     .active(|style| style.opacity(0.8))
                     .on_click(cx.listener(|this, _, _, cx| this.submit_user_input_form(cx)))
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        if !event.keystroke.modifiers.modified()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
                             this.submit_user_input_form(cx);
                             cx.stop_propagation();
                         }
@@ -517,6 +604,8 @@ impl Waku {
                         .flex()
                         .items_center()
                         .justify_end()
+                        .gap(px(8.0))
+                        .child(cancel)
                         .child(submit),
                 ),
         )
@@ -2065,7 +2154,8 @@ impl Waku {
         let selected_mode = session
             .map(|session| session.runtime_mode)
             .unwrap_or_default();
-        let is_droid = session.is_some_and(|session| session.provider == ProviderKind::Droid);
+        let selected_provider = session.map(|session| session.provider);
+        let is_droid = selected_provider == Some(ProviderKind::Droid);
         let weak = cx.entity().downgrade();
         let handle = self.menu_handle("runtime-mode", cx);
         dropdown_menu(
@@ -2141,7 +2231,10 @@ impl Waku {
                                                 .line_height(sp(14.0))
                                                 .whitespace_normal()
                                                 .text_color(theme.text_tertiary)
-                                                .child(option.description()),
+                                                .child(runtime_mode_description(
+                                                    selected_provider,
+                                                    option,
+                                                )),
                                         ),
                                 )
                                 .when(selected, |element| {

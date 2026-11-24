@@ -1011,6 +1011,8 @@ mode.auto_accept_edits_description:
   en: Auto-approve edits, ask before other actions
 mode.auto_description:
   en: An AI reviewer approves routine actions; risky ones still ask
+mode.auto_description_droid:
+  en: Auto-approve routine local dev actions; risky or external actions still ask
 mode.full_access_description:
   en: Allow commands and edits without prompts
 agent_preset.standard:
@@ -2922,6 +2924,36 @@ swarm.show_more:
   en: Show more
 swarm.show_less:
   en: Show less
+swarm.tab_hive:
+  en: Hive
+swarm.view_hive:
+  en: Hive
+swarm.view_mentions:
+  en: Mentions
+swarm.coordinator:
+  en: Coordinator
+swarm.done_progress:
+  en: "%{done} of %{total} done"
+swarm.live:
+  en: Live
+swarm.pacing_even:
+  en: Even pacing
+swarm.pacing_real:
+  en: Real pacing
+swarm.replay_play:
+  en: Play replay
+swarm.replay_pause:
+  en: Pause replay
+swarm.replay_prev:
+  en: Previous message
+swarm.replay_next:
+  en: Next message
+swarm.view_in_board:
+  en: View in Board
+swarm.hive_empty:
+  en: Waiting for members to join the hive
+swarm.hive_mentions_empty:
+  en: No @mentions on the board yet
 usage.credits_remaining:
   en: "%{count} credits"
 usage_error.start_antigravity_probe:

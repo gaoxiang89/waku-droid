@@ -2075,6 +2075,7 @@ mod settings;
 mod sidebar;
 mod skills_page;
 mod streaming;
+mod swarm_hive;
 mod swarm_panel;
 mod task_switcher;
 mod terminal_persistence;

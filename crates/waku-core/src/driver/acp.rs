@@ -6173,7 +6173,14 @@ fn handle_session_update(
                 .map(|list| {
                     list.iter()
                         .filter_map(|command| {
-                            let name = command.get("name").and_then(Value::as_str)?;
+                            let name = command
+                                .get("name")
+                                .and_then(Value::as_str)?
+                                .trim()
+                                .trim_start_matches('/');
+                            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                                return None;
+                            }
                             let argument_hint = command
                                 .pointer("/input/hint")
                                 .and_then(Value::as_str)
@@ -6186,6 +6193,7 @@ fn handle_session_update(
                                     .get("description")
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
+                                    .trim()
                                     .to_owned(),
                                 argument_hint,
                             })
@@ -6193,9 +6201,7 @@ fn handle_session_update(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if !commands.is_empty() {
-                let _ = events.send(DriverEvent::AvailableCommands(commands));
-            }
+            let _ = events.send(DriverEvent::AvailableCommands(commands));
         }
         Some("session_info_update") => {
             if update.get("title").is_some() {
@@ -6276,6 +6282,7 @@ pub(crate) struct StoredToolCall {
     locations: Option<Value>,
     content: Option<Value>,
     tool_name: Option<String>,
+    mcp_server: Option<String>,
     complete: bool,
     failed: bool,
 }
@@ -6819,6 +6826,91 @@ fn antigravity_artifact_presentation(
     }
 }
 
+fn extract_factory_mcp_identity(
+    update: &Value,
+    wire_title: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let factory = update
+        .pointer("/_meta/factory")
+        .or_else(|| update.pointer("/rawInput/_meta/factory"))
+        .and_then(Value::as_object);
+    let Some(factory) = factory else {
+        return (None, None);
+    };
+    let is_mcp = factory
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("mcp"));
+    let meta_server = factory
+        .get("server")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .map(str::to_owned);
+    let meta_tool = factory
+        .get("tool")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+        .map(str::to_owned);
+    if !is_mcp && (meta_server.is_none() || meta_tool.is_none()) {
+        return (None, None);
+    }
+    let title_pair = wire_title
+        .map(str::trim)
+        .and_then(|title| title.split_once(": "))
+        .map(|(server, tool)| (server.trim(), tool.trim()))
+        .filter(|(server, tool)| !server.is_empty() && !tool.is_empty());
+    let server = meta_server.or_else(|| title_pair.map(|(server, _)| server.to_owned()));
+    let tool = meta_tool.or_else(|| title_pair.map(|(_, tool)| tool.to_owned()));
+    (server, tool)
+}
+
+fn is_file_search_tool(wire_title: Option<&str>, arguments: Option<&Value>) -> bool {
+    if arg_str(arguments, &["url"]).is_some() {
+        return false;
+    }
+    if let Some(title) = wire_title.map(str::trim)
+        && (title.starts_with("Search web")
+            || title.starts_with("search web")
+            || title.starts_with("Fetch "))
+    {
+        return false;
+    }
+    if arg_str(arguments, &["pattern", "glob", "regex", "folder", "file_pattern", "include"])
+        .is_some()
+        || arg_array(arguments, &["patterns"]).is_some_and(|items| !items.is_empty())
+    {
+        return true;
+    }
+    wire_title.map(str::trim).is_some_and(|title| {
+        ActivityKind::from_tool_name(title) == ActivityKind::FileSearch
+            || title.starts_with("Search \"")
+            || title.starts_with("Find ")
+            || title.starts_with("Grep ")
+            || title.starts_with("Glob ")
+    })
+}
+
+fn is_file_list_tool(wire_title: Option<&str>, arguments: Option<&Value>) -> bool {
+    if let Some(title) = wire_title.map(str::trim)
+        && (ActivityKind::from_tool_name(title) == ActivityKind::FileList
+            || title.starts_with("List ")
+            || title.starts_with("list "))
+    {
+        return true;
+    }
+    arg_str(arguments, &["file_path", "filePath"]).is_none()
+        && arg_str(arguments, &["directory_path", "directoryPath"]).is_some()
+}
+
+fn is_spec_approval_title(wire_title: Option<&str>) -> bool {
+    wire_title.map(str::trim).is_some_and(|title| {
+        title.eq_ignore_ascii_case("Approve Spec")
+            || title.eq_ignore_ascii_case("Propose Specification")
+    })
+}
+
 pub(crate) fn build_tool_activity_item(
     update: &Value,
     tools: &mut HashMap<String, StoredToolCall>,
@@ -6855,6 +6947,7 @@ pub(crate) fn build_tool_activity_item(
         .get("content")
         .filter(|value| !value.is_null())
         .or_else(|| stored.as_ref().and_then(|tool| tool.content.as_ref()));
+    let (factory_mcp_server, factory_mcp_tool) = extract_factory_mcp_identity(update, wire_title);
 
     let canonical_antigravity_tool = arguments
         .and_then(|input| input.get("tool_name"))
@@ -6893,6 +6986,13 @@ pub(crate) fn build_tool_activity_item(
                 kind = named_kind;
             }
         }
+        if kind == ActivityKind::Search && is_file_search_tool(wire_title, arguments) {
+            kind = ActivityKind::FileSearch;
+        } else if kind == ActivityKind::FileRead && is_file_list_tool(wire_title, arguments) {
+            kind = ActivityKind::FileList;
+        } else if kind == ActivityKind::Tool && is_spec_approval_title(wire_title) {
+            kind = ActivityKind::Plan;
+        }
         kind
     };
     if kind == ActivityKind::Tool && content_has_diff(content) {
@@ -6926,8 +7026,11 @@ pub(crate) fn build_tool_activity_item(
                 "Tool".to_owned()
             }
         });
+    let mcp_server = factory_mcp_server
+        .or_else(|| stored.as_ref().and_then(|tool| tool.mcp_server.clone()));
     let tool_name = canonical_antigravity_tool
         .map(str::to_owned)
+        .or(factory_mcp_tool)
         .or_else(|| {
             arguments
                 .and_then(|input| input.get("tool_name"))
@@ -6947,14 +7050,17 @@ pub(crate) fn build_tool_activity_item(
                 locations: normalized_locations.clone(),
                 content: (!complete).then(|| content.cloned()).flatten(),
                 tool_name: tool_name.clone(),
+                mcp_server: mcp_server.clone(),
                 complete,
                 failed,
             },
         );
     }
 
-    let fallback_plan_output = if canonical_antigravity_tool == Some("exit_plan_mode") {
-        arg_str(arguments, &["plan", "content", "summary"])
+    let fallback_plan_output = if canonical_antigravity_tool == Some("exit_plan_mode")
+        || kind == ActivityKind::Plan
+    {
+        arg_str(arguments, &["plan", "spec", "content", "summary"])
             .map(|plan| Value::String(plan.to_owned()))
     } else {
         artifact_presentation
@@ -6966,7 +7072,8 @@ pub(crate) fn build_tool_activity_item(
     let output = raw_output.or(fallback_plan_output.as_ref());
     let mut item =
         activity::tool_activity(id, kind, title, arguments, output, raw_output, failed, complete)
-            .with_tool_name(tool_name.as_deref());
+            .with_tool_name(tool_name.as_deref())
+            .with_mcp_server(mcp_server.as_deref());
     if normalized_locations.is_some() || content.is_some() {
         let mut source = Map::new();
         if let Some(arguments) = arguments {
@@ -7009,6 +7116,7 @@ fn classify(kind: &str) -> ActivityKind {
         "edit" | "delete" | "move" => ActivityKind::FileChange,
         "read" => ActivityKind::FileRead,
         "search" | "fetch" => ActivityKind::Search,
+        "switch_mode" => ActivityKind::Plan,
         "think" => ActivityKind::Reasoning,
         _ => ActivityKind::Tool,
     }
@@ -9020,6 +9128,7 @@ mod tests {
                 locations: None,
                 content: None,
                 tool_name: None,
+                mcp_server: None,
                 complete: false,
                 failed: false,
             },
@@ -9875,6 +9984,284 @@ mod tests {
     }
 
     #[test]
+    fn available_commands_update_strips_slashes_rejects_whitespace_and_emits_empty() {
+        let (events, event_rx) = crossbeam_channel::unbounded();
+        let mut state = AcpStreamState::default();
+        let update = serde_json::from_value(json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                { "name": " /review ", "description": "  Code review  " },
+                { "name": "///simplify", "description": "Simplify code" },
+                { "name": "bad command", "description": "Must be dropped" },
+                { "name": "/", "description": "Empty after slash strip" },
+                { "name": "   ", "description": "Blank" }
+            ]
+        }))
+        .unwrap();
+
+        handle_session_update(
+            ProviderKind::Droid,
+            SessionNotification::new("s", update),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+
+        let empty_update = serde_json::from_value(json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": []
+        }))
+        .unwrap();
+
+        handle_session_update(
+            ProviderKind::Droid,
+            SessionNotification::new("s", empty_update),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+
+        let seen = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(seen.len(), 2);
+        let DriverEvent::AvailableCommands(first) = &seen[0] else {
+            panic!("expected first AvailableCommands event");
+        };
+        assert_eq!(
+            first
+                .iter()
+                .map(|cmd| (cmd.name.as_str(), cmd.description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("review", "Code review"), ("simplify", "Simplify code")]
+        );
+        let DriverEvent::AvailableCommands(second) = &seen[1] else {
+            panic!("expected empty AvailableCommands event");
+        };
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn droid_tool_classification_and_metadata_cover_grep_glob_ls_execute_fetch_spec_and_mcp() {
+        let mut tools = HashMap::new();
+
+        // 1. Grep (kind: "search", human title, rawInput.pattern) -> FileSearch
+        let grep = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-grep",
+                "kind": "search",
+                "title": "Search \"swarm\" in .",
+                "status": "completed",
+                "rawInput": { "pattern": "swarm", "path": "." }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(grep.kind, ActivityKind::FileSearch);
+        assert_eq!(grep.display_target.as_deref(), Some("swarm"));
+
+        // 2. Glob (kind: "search", human title, rawInput.{patterns, folder}) -> FileSearch
+        let glob = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-glob",
+                "kind": "search",
+                "title": "Find icons/chevron*.svg in assets",
+                "status": "completed",
+                "rawInput": { "patterns": ["icons/chevron*.svg"], "folder": "assets" }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(glob.kind, ActivityKind::FileSearch);
+        assert_eq!(glob.display_target.as_deref(), Some("icons/chevron*.svg"));
+
+        // 3. WebSearch (kind: "fetch") stays web Search; FetchUrl extracts url
+        let web_search = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-web-search",
+                "kind": "fetch",
+                "title": "Search web: \"rust acp\"",
+                "status": "completed",
+                "rawInput": { "query": "rust acp" }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(web_search.kind, ActivityKind::Search);
+        assert_eq!(web_search.display_target.as_deref(), Some("rust acp"));
+
+        let fetch_url = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-fetch",
+                "kind": "fetch",
+                "title": "Fetch https://docs.factory.ai/droid",
+                "status": "completed",
+                "rawInput": { "url": "https://docs.factory.ai/droid" }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(fetch_url.kind, ActivityKind::Search);
+        assert_eq!(
+            fetch_url.display_target.as_deref(),
+            Some("https://docs.factory.ai/droid")
+        );
+
+        // 4. LS (kind: "read", title "List <dir>") -> FileList
+        let ls = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-ls",
+                "kind": "read",
+                "title": "List crates/waku-core",
+                "status": "completed",
+                "rawInput": { "directory_path": "crates/waku-core" }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(ls.kind, ActivityKind::FileList);
+        assert_eq!(ls.display_target.as_deref(), Some("crates/waku-core"));
+
+        // 5. Execute with rawInput.summary
+        let execute = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-exec",
+                "kind": "execute",
+                "title": "Run cargo test",
+                "status": "completed",
+                "rawInput": {
+                    "command": "cargo test -p waku-core",
+                    "summary": "Run core unit tests"
+                }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(execute.kind, ActivityKind::Command);
+        assert_eq!(
+            execute.display_description.as_deref(),
+            Some("Run core unit tests")
+        );
+
+        // 6. ExitSpecMode (kind: "switch_mode", title: "Approve Spec") -> Plan with preserved title & markdown
+        let spec = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-spec",
+                "kind": "switch_mode",
+                "title": "Approve Spec",
+                "status": "completed",
+                "rawInput": { "plan": "# Auth Refactor\n\n- Step 1" },
+                "content": [
+                    { "type": "content", "content": { "type": "text", "text": "# Auth Refactor\n\n- Step 1" } }
+                ]
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(spec.kind, ActivityKind::Plan);
+        assert_eq!(spec.title, "Approve Spec");
+        assert_eq!(spec.output.as_deref(), Some("# Auth Refactor\n\n- Step 1"));
+
+        // 7. MCP tool via _meta.factory.{source: "mcp", server, tool} and sparse follow-up update
+        let mcp_start = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-mcp-1",
+                "kind": "other",
+                "title": "github: search_issues",
+                "status": "in_progress",
+                "_meta": {
+                    "factory": {
+                        "source": "mcp",
+                        "server": "github",
+                        "tool": "search_issues"
+                    }
+                },
+                "rawInput": { "query": "is:open label:bug" }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(mcp_start.mcp_server.as_deref(), Some("github"));
+        assert_eq!(mcp_start.tool_name.as_deref(), Some("search_issues"));
+
+        let mcp_done = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "droid-mcp-1",
+                "status": "completed",
+                "content": [
+                    { "type": "content", "content": { "type": "text", "text": "3 issues found" } }
+                ]
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(mcp_done.mcp_server.as_deref(), Some("github"));
+        assert_eq!(mcp_done.tool_name.as_deref(), Some("search_issues"));
+        assert_eq!(mcp_done.output.as_deref(), Some("3 issues found"));
+
+        // 8. MCP tool with _meta.factory.source == "mcp" falling back to "<server>: <Tool>" title
+        let mcp_title_fallback = build_tool_activity_item(
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "droid-mcp-2",
+                "kind": "other",
+                "title": "linear: list_issues",
+                "status": "completed",
+                "_meta": { "factory": { "source": "mcp" } }
+            }),
+            &mut tools,
+            None,
+        );
+        assert_eq!(mcp_title_fallback.mcp_server.as_deref(), Some("linear"));
+        assert_eq!(
+            mcp_title_fallback.tool_name.as_deref(),
+            Some("list_issues")
+        );
+    }
+
+    #[test]
+    fn acp_prompt_content_blocks_handles_single_quoted_and_autocomplete_space_mentions() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("waku-acp-mention-spaces-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp_dir.join("folder with spaces")).unwrap();
+        let first = temp_dir.join("folder with spaces/first note.md");
+        let second = temp_dir.join("folder with spaces/second note.md");
+        std::fs::write(&first, "first body").unwrap();
+        std::fs::write(&second, "second body").unwrap();
+
+        // Autocomplete inserts `@<path> ` unquoted; users may also single-quote paths.
+        let prompt = "Compare @folder with spaces/first note.md against @'folder with spaces/second note.md' please";
+        let capabilities = PromptCapabilities::new().image(true).embedded_context(true);
+        let blocks = build_prompt_content_blocks(prompt, &temp_dir, &capabilities);
+
+        assert_eq!(blocks.len(), 3);
+        let ContentBlock::Resource(res1) = &blocks[1] else {
+            panic!("expected first embedded resource");
+        };
+        let EmbeddedResourceResource::TextResourceContents(text1) = &res1.resource else {
+            panic!("expected first text resource");
+        };
+        assert_eq!(text1.text, "first body");
+
+        let ContentBlock::Resource(res2) = &blocks[2] else {
+            panic!("expected second embedded resource");
+        };
+        let EmbeddedResourceResource::TextResourceContents(text2) = &res2.resource else {
+            panic!("expected second text resource");
+        };
+        assert_eq!(text2.text, "second body");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn sdk_agent_and_terminal_path_include_binary_parent_and_deduplicate_path() {
         let base_dir = std::env::temp_dir().join("waku-path-base");
         let bin_dir = std::env::temp_dir().join("waku-bun-bin");
@@ -10365,6 +10752,7 @@ mod tests {
                 locations: None,
                 content: None,
                 tool_name: None,
+                mcp_server: None,
                 complete: false,
                 failed: false,
             },

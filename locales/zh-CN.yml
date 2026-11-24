@@ -496,6 +496,7 @@ mode.full_access: 完全访问
 mode.supervised_description: 执行命令或修改文件前先征求许可
 mode.auto_accept_edits_description: 自动批准文件修改，执行其他操作前先询问
 mode.auto_description: 由 AI 审核并批准常规操作；高风险操作仍会询问
+mode.auto_description_droid: 自动批准常规本地开发操作；高风险或外部操作仍会询问
 mode.full_access_description: 无需确认即可执行命令和修改文件
 agent_preset.standard: 标准模式
 agent_preset.code: 代码模式
@@ -1435,6 +1436,21 @@ swarm.brief_badge: 任务书
 swarm.viewing_as: "你是 @%{name}"
 swarm.show_more: 展开
 swarm.show_less: 收起
+swarm.tab_hive: 蜂巢
+swarm.view_hive: 蜂巢
+swarm.view_mentions: 提及关系
+swarm.coordinator: 协调者
+swarm.done_progress: "已完成 %{done} / %{total}"
+swarm.live: 实时
+swarm.pacing_even: 匀速回放
+swarm.pacing_real: 原速回放
+swarm.replay_play: 播放回放
+swarm.replay_pause: 暂停回放
+swarm.replay_prev: 上一条消息
+swarm.replay_next: 下一条消息
+swarm.view_in_board: 在看板中查看
+swarm.hive_empty: 等待成员加入蜂巢
+swarm.hive_mentions_empty: 看板上还没有 @ 提及记录
 usage.credits_remaining: "%{count} 积分"
 usage_error.start_antigravity_probe: "无法启动 `agy` 用量探测"
 usage_error.antigravity_usage_timeout: Antigravity 用量查询超时

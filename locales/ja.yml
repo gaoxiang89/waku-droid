@@ -515,6 +515,7 @@ mode.full_access: フルアクセス
 mode.supervised_description: コマンドの実行とファイル変更の前に確認します
 mode.auto_accept_edits_description: 編集は自動承認し、その他の操作は事前に確認します
 mode.auto_description: 通常の操作は AI レビュアーが承認し、リスクのある操作は事前に確認します
+mode.auto_description_droid: 通常のローカル開発操作を自動承認し、リスクのある操作や外部操作は事前に確認します
 mode.full_access_description: 確認なしでコマンドの実行と編集を許可します
 
 agent_preset.standard: 標準モード
@@ -1488,6 +1489,21 @@ swarm.brief_badge: ブリーフ
 swarm.viewing_as: "自分: @%{name}"
 swarm.show_more: もっと見る
 swarm.show_less: 折りたたむ
+swarm.tab_hive: ハイブ
+swarm.view_hive: ハイブ
+swarm.view_mentions: メンション
+swarm.coordinator: コーディネーター
+swarm.done_progress: "%{done} / %{total} 完了"
+swarm.live: ライブ
+swarm.pacing_even: 均等ペース
+swarm.pacing_real: 実時間ペース
+swarm.replay_play: リプレイ再生
+swarm.replay_pause: リプレイ一時停止
+swarm.replay_prev: 前のメッセージ
+swarm.replay_next: 次のメッセージ
+swarm.view_in_board: ボードで表示
+swarm.hive_empty: メンバーの参加を待っています
+swarm.hive_mentions_empty: ボード上に @メンションはまだありません
 usage.credits_remaining: "%{count} クレジット"
 usage_error.start_antigravity_probe: "`agy` の使用量プローブを起動できませんでした"
 usage_error.antigravity_usage_timeout: Antigravity の使用量リクエストがタイムアウトしました

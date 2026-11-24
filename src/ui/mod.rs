@@ -548,6 +548,7 @@ mod tests {
             ActivityKind::Search,
             ActivityKind::Plan,
             ActivityKind::Tool,
+            ActivityKind::Compaction,
         ] {
             paths.push(activity_icon(kind));
         }

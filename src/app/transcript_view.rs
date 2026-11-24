@@ -1,5 +1,6 @@
 use super::right_panel::{DiffRowStyle, render_diff_code_row};
 use super::*;
+use crate::ui::ActivationExt as _;
 use base64::Engine as _;
 
 const CHANGED_FILES_PREVIEW_LIMIT: usize = 3;
@@ -10,6 +11,22 @@ const CHANGED_FILES_EXPANDED_LIMIT: usize = 12;
 /// An expanded edit stays one transcript row tall; past this the diff scrolls
 /// in place, the same as long command output.
 const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
+/// Cap expanded tool disclosure payloads (command output, non-command tool
+/// output/arguments, and Markdown specs) so large payloads scroll in place
+/// instead of bloating the transcript vertically.
+const ACTIVITY_SECTION_MAX_HEIGHT: f32 = 400.0;
+
+fn activity_section_cache_key(id: Uuid, section_kind: ActivityDisclosureSectionKind) -> Uuid {
+    let salt: u128 = match section_kind {
+        ActivityDisclosureSectionKind::Output => 0,
+        ActivityDisclosureSectionKind::Arguments => 0x517c_c1b7_2722_0a95_9e37_79b9_7f4a_7c15,
+        ActivityDisclosureSectionKind::Detail => 0x9e37_79b9_7f4a_7c15_517c_c1b7_2722_0a95,
+        ActivityDisclosureSectionKind::Command => 0xa076_1d64_78bd_642f_e703_7ed1_a0b4_28db,
+        ActivityDisclosureSectionKind::McpServer => 0xe703_7ed1_a0b4_28db_a076_1d64_78bd_642f,
+        ActivityDisclosureSectionKind::ToolName => 0x8ebc_6af0_9c88_c6e3_5899_65cc_7537_4cc3,
+    };
+    Uuid::from_u128(id.as_u128() ^ salt)
+}
 /// Aligns a hunk separator with the line numbers in the rows below it; see
 /// `DiffRowStyle::ACTIVITY`.
 const ACTIVITY_DIFF_GUTTER_WIDTH: f32 = 52.0;
@@ -170,6 +187,33 @@ impl Waku {
             .entry(key.into())
             .or_insert_with(|| cx.focus_handle())
             .clone()
+    }
+
+    fn message_footer_focus(
+        &self,
+        message_id: Uuid,
+        has_fork: bool,
+        has_rewind: bool,
+        window: &Window,
+        cx: &mut App,
+    ) -> MessageFooterFocus {
+        let copy = self.transcript_control_focus(format!("copy-message-{message_id}"), cx);
+        let fork = has_fork
+            .then(|| self.transcript_control_focus(format!("fork-response-{message_id}"), cx));
+        let rewind = has_rewind.then(|| {
+            self.transcript_control_focus(format!("user-message-action-{message_id}"), cx)
+        });
+        let any_focused = copy.is_focused(window)
+            || fork.as_ref().is_some_and(|handle| handle.is_focused(window))
+            || rewind
+                .as_ref()
+                .is_some_and(|handle| handle.is_focused(window));
+        MessageFooterFocus {
+            copy,
+            fork,
+            rewind,
+            any_focused,
+        }
     }
 
     pub(super) fn render_transcript(
@@ -1357,6 +1401,13 @@ impl Waku {
                     // one owner per row is already implied when the whole
                     // transcript came from a single agent.
                     let turn_provider = self.assistant_turn_provider_cached(message_index);
+                    let footer_focus = self.message_footer_focus(
+                        message.id,
+                        assistant_message_action.is_some(),
+                        user_message_action.is_some(),
+                        window,
+                        cx,
+                    );
                     let rendered = render_message(
                         MessageRender {
                             theme: &theme,
@@ -1371,6 +1422,7 @@ impl Waku {
                             user_message_viewport: user_message_viewport.as_ref(),
                             user_message_expanded,
                             user_message_expand_focus,
+                            footer_focus,
                             message_edit_input,
                             attachment_menus,
                             attachment_images,
@@ -1409,7 +1461,7 @@ impl Waku {
                 .unwrap_or_else(|| div().into_any_element()),
             TranscriptRowKind::TurnFold(turn_id) => self.render_turn_fold_row(turn_id, &theme, cx),
             TranscriptRowKind::ResponseFooter(turn_id, message_index) => {
-                self.render_response_footer_row(turn_id, message_index, &theme, cx)
+                self.render_response_footer_row(turn_id, message_index, &theme, window, cx)
             }
             TranscriptRowKind::ChangedFiles(turn_id) => self
                 .render_changed_files_row(turn_id, &theme, cx)
@@ -1461,6 +1513,7 @@ impl Waku {
         turn_id: Uuid,
         message_index: usize,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(message) = self
@@ -1476,6 +1529,8 @@ impl Waku {
         };
         let copied = self.copied_message_feedback.contains_key(&message.id);
         let action = self.assistant_message_action_for_message(message_index);
+        let footer_focus =
+            self.message_footer_focus(message.id, action.is_some(), false, window, cx);
         let force_visible = self
             .hovered_response_row
             .is_some_and(|(hovered_turn_id, _)| hovered_turn_id == turn_id);
@@ -1502,6 +1557,7 @@ impl Waku {
                 false,
                 action,
                 None,
+                footer_focus,
                 cx.entity().downgrade(),
             ))
             .into_any_element()
@@ -2455,7 +2511,9 @@ impl Waku {
                         let copied = self
                             .copied_activity_feedback
                             .contains_key(&(id, section_kind));
-                        let copy_waku = cx.entity().downgrade();
+                        let copy_id =
+                            SharedString::from(format!("copy-activity-{}-{}", id, section_kind.id()));
+                        let copy_focus = self.transcript_control_focus(copy_id.to_string(), cx);
                         let copy_tooltip = SharedString::from(if copied {
                             tr!("common.copied")
                         } else {
@@ -2476,17 +2534,22 @@ impl Waku {
                                 .when(!content.is_empty(), |header| {
                                     header.child(
                                         div()
-                                            .id(SharedString::from(format!(
-                                                "copy-activity-{}-{}",
-                                                id,
-                                                section_kind.id()
-                                            )))
+                                            .id(copy_id)
+                                            .track_focus(&copy_focus)
+                                            .tab_index(0)
+                                            .tab_stop(true)
                                             .size(px(20.0))
                                             .rounded(px(5.0))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .cursor_default()
+                                            .focus_visible(|button| {
+                                                button
+                                                    .border_1()
+                                                    .border_color(theme.accent)
+                                                    .bg(theme.overlay_strong)
+                                            })
                                             .hover(|button| button.bg(theme.overlay_strong))
                                             .child(icon(
                                                 if copied {
@@ -2498,23 +2561,22 @@ impl Waku {
                                                 theme.text_ghost,
                                             ))
                                             .tooltip(Tooltip::text(copy_tooltip.clone()))
-                                            .on_click(move |_, _, cx| {
+                                            .on_activation(cx, move |this, _, cx| {
                                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                                     copy_content.clone(),
                                                 ));
-                                                let _ = copy_waku.update(cx, |this, cx| {
-                                                    this.show_activity_section_copied(
-                                                        id,
-                                                        section_kind,
-                                                        cx,
-                                                    );
-                                                });
+                                                this.show_activity_section_copied(
+                                                    id,
+                                                    section_kind,
+                                                    cx,
+                                                );
                                             }),
                                     )
                                 }),
                         );
                     }
                     if !content.is_empty() {
+                        let section_cache_key = activity_section_cache_key(id, section_kind);
                         if activity.kind == ActivityKind::Plan
                             && matches!(
                                 section_kind,
@@ -2600,7 +2662,7 @@ impl Waku {
                             let output_viewport = self
                                 .activity_scroll_viewports
                                 .borrow_mut()
-                                .entry(id)
+                                .entry(section_cache_key)
                                 .or_default()
                                 .clone();
                             let wheel_scroll = output_viewport.scroll_handle.clone();
@@ -2610,7 +2672,7 @@ impl Waku {
                                     .w_full()
                                     .min_w_0()
                                     .relative()
-                                    .max_h(px(400.0))
+                                    .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
                                     .overflow_hidden()
                                     .child(
                                         div()
@@ -2619,7 +2681,7 @@ impl Waku {
                                             )))
                                             .w_full()
                                             .min_w_0()
-                                            .max_h(px(400.0))
+                                            .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
                                             .overflow_y_scroll()
                                             .track_scroll(&output_viewport.scroll_handle)
                                             .py(px(4.0))
@@ -2660,16 +2722,140 @@ impl Waku {
                                         !activity.complete,
                                     )),
                             );
+                        } else if let Some(markdown_body) = activity_section_markdown_body(
+                            activity,
+                            section_kind,
+                            &content,
+                            !plan_steps.is_empty(),
+                        ) {
+                            let md_ctx = self
+                                .markdown_ctx(
+                                    format!("activity-md-{id}-{}", section_kind.id()),
+                                    &palette,
+                                    self.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
+                                    false,
+                                )
+                                .with_math_context_menu(self.menu_handle(
+                                    format!("activity-math-{id}-{}", section_kind.id()),
+                                    cx,
+                                ));
+                            let mut views = self.activity_markdown.borrow_mut();
+                            let view = views.entry(section_cache_key).or_default();
+                            view.set_text(&markdown_body, false);
+                            let rendered_markdown = md::render::markdown(view, &md_ctx)
+                                .unwrap_or_else(|| {
+                                    md::render::plain_text(
+                                        markdown_body.clone(),
+                                        md::render::SANS_FAMILY,
+                                        FontWeight::NORMAL,
+                                        theme.text,
+                                        &md_ctx,
+                                    )
+                                });
+                            drop(views);
+                            let viewport = self
+                                .activity_scroll_viewports
+                                .borrow_mut()
+                                .entry(section_cache_key)
+                                .or_default()
+                                .clone();
+                            let wheel_scroll = viewport.scroll_handle.clone();
+                            section_view = section_view.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .relative()
+                                    .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "activity-section-scroll-{id}-{}",
+                                                section_kind.id()
+                                            )))
+                                            .w_full()
+                                            .min_w_0()
+                                            .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+                                            .overflow_y_scroll()
+                                            .track_scroll(&viewport.scroll_handle)
+                                            .py(px(4.0))
+                                            .pr(px(8.0))
+                                            .font_family(md::render::SANS_FAMILY)
+                                            .text_color(theme.text)
+                                            .child(rendered_markdown)
+                                            .on_scroll_wheel(move |_, _, cx| {
+                                                contain_scroll(&wheel_scroll, cx);
+                                            }),
+                                    )
+                                    .child(scrollbar::edge_fade(
+                                        viewport.scroll_handle.clone(),
+                                        scrollbar::FadeEdge::Top,
+                                        activity_surface,
+                                    ))
+                                    .child(scrollbar::edge_fade(
+                                        viewport.scroll_handle.clone(),
+                                        scrollbar::FadeEdge::Bottom,
+                                        activity_surface,
+                                    ))
+                                    .child(scrollbar::vertical(
+                                        &viewport.scroll_handle,
+                                        &viewport.scrollbar,
+                                    )),
+                            );
                         } else {
-                            section_view = section_view.child(div().w_full().min_w_0().child(
-                                md::render::plain_text(
-                                    content.clone(),
-                                    md::render::MONO_FAMILY,
-                                    FontWeight::NORMAL,
-                                    theme.text_secondary,
-                                    &ctx,
-                                ),
-                            ));
+                            let viewport = self
+                                .activity_scroll_viewports
+                                .borrow_mut()
+                                .entry(section_cache_key)
+                                .or_default()
+                                .clone();
+                            let wheel_scroll = viewport.scroll_handle.clone();
+                            section_view = section_view.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .relative()
+                                    .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "activity-section-scroll-{id}-{}",
+                                                section_kind.id()
+                                            )))
+                                            .w_full()
+                                            .min_w_0()
+                                            .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+                                            .overflow_y_scroll()
+                                            .track_scroll(&viewport.scroll_handle)
+                                            .py(px(4.0))
+                                            .pr(px(8.0))
+                                            .child(md::render::plain_text(
+                                                content.clone(),
+                                                md::render::MONO_FAMILY,
+                                                FontWeight::NORMAL,
+                                                theme.text_secondary,
+                                                &ctx,
+                                            ))
+                                            .on_scroll_wheel(move |_, _, cx| {
+                                                contain_scroll(&wheel_scroll, cx);
+                                            }),
+                                    )
+                                    .child(scrollbar::edge_fade(
+                                        viewport.scroll_handle.clone(),
+                                        scrollbar::FadeEdge::Top,
+                                        activity_surface,
+                                    ))
+                                    .child(scrollbar::edge_fade(
+                                        viewport.scroll_handle.clone(),
+                                        scrollbar::FadeEdge::Bottom,
+                                        activity_surface,
+                                    ))
+                                    .child(scrollbar::vertical(
+                                        &viewport.scroll_handle,
+                                        &viewport.scrollbar,
+                                    )),
+                            );
                         }
                     }
                     detail_card = detail_card.child(section_view);

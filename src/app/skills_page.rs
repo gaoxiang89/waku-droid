@@ -15,6 +15,7 @@ use gpui::KeyBinding;
 
 use super::composer::next_picker_highlight;
 use crate::skills::{SkillEntry, SkillSource, SkillsCatalog};
+use crate::ui::ActivationExt as _;
 
 use super::*;
 
@@ -249,7 +250,10 @@ impl Waku {
                 if let Err(error) = result {
                     this.show_toast(tr!("skills.toggle_failed", error = error));
                 }
+                this.slash_commands
+                    .retain(|(entry_host, ..)| entry_host != &host);
                 this.invalidate_skills_catalog(cx);
+                this.invalidate_composer_sources(cx);
             });
         })
         .detach();
@@ -321,7 +325,10 @@ impl Waku {
                         this.show_toast(tr!("skills.delete_failed", error = error));
                     }
                 }
+                this.slash_commands
+                    .retain(|(entry_host, ..)| entry_host != &host);
                 this.invalidate_skills_catalog(cx);
+                this.invalidate_composer_sources(cx);
             });
         })
         .detach();
@@ -456,7 +463,7 @@ impl Waku {
                 .iter()
                 .find(|skill| &skill.primary().dir == dir)
         }) {
-            self.render_skill_detail_pane(skill, &theme, cx)
+            self.render_skill_detail_pane(skill, &host, &theme, cx)
                 .into_any_element()
         } else {
             skills_detail_placeholder(&theme).into_any_element()
@@ -909,9 +916,9 @@ impl Waku {
                                     })),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_activation(cx, move |this, _, cx| {
                         this.select_skill(dir.clone(), cx);
-                    })),
+                    }),
             )
             .into_any_element()
     }
@@ -921,6 +928,7 @@ impl Waku {
     fn render_skill_detail_pane(
         &self,
         skill: &SkillEntry,
+        host: &HostKey,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -935,40 +943,19 @@ impl Waku {
         };
         let caption = format!("{} · {}", skill.sources_label(), scope_caption);
 
-        let toggle = div()
-            .id(SharedString::from(format!(
-                "skill-enabled-{}",
-                skill.row_key
-            )))
-            .tab_index(0)
-            .focus_visible(|style| style.border_color(theme.accent))
-            .w(px(36.0))
-            .h(px(20.0))
-            .p(px(2.0))
-            .flex_none()
-            .rounded_full()
-            .cursor_default()
-            .bg(if enabled { theme.inverse } else { theme.inset })
-            .border_1()
-            .border_color(if enabled {
-                theme.inverse
-            } else {
-                theme.border_strong
-            })
-            .flex()
-            .items_center()
-            .when(enabled, |element| element.justify_end())
-            .child(div().w(px(14.0)).h(px(14.0)).rounded_full().bg(if enabled {
-                theme.on_inverse
-            } else {
-                theme.text_tertiary
-            }))
-            .on_click(cx.listener({
+        let toggle = toggle_switch(
+            SharedString::from(format!("skill-enabled-{}", skill.row_key)),
+            enabled,
+            false,
+            *theme,
+            cx,
+            {
                 let dir = dir.clone();
-                move |this, _, _, cx| {
+                move |this, _, cx| {
                     this.toggle_skill_enabled(dir.clone(), !enabled, cx);
                 }
-            }));
+            },
+        );
 
         let mut contents = Vec::new();
         if skill.supporting_files == 1 {
@@ -1057,9 +1044,9 @@ impl Waku {
             "icons/pencil.svg",
             tr!("skills.open_file"),
         )
-        .on_click(cx.listener({
+        .on_activation(cx, {
             let skill_file = skill_file.clone();
-            move |this, _, _, cx| {
+            move |this, _, cx| {
                 if this.effective_skills_host() != waku_client::hosts::HostKey::Local
                     || this.daemon.is_remote()
                 {
@@ -1069,16 +1056,16 @@ impl Waku {
                     crate::platform::open_with_default_app(&skill_file, cx);
                 }
             }
-        }));
+        });
 
         let reveal_button = action_button(
             SharedString::from(format!("skill-reveal-{}", skill.row_key)),
             "icons/folder.svg",
             tr!("skills.reveal"),
         )
-        .on_click(cx.listener({
+        .on_activation(cx, {
             let skill_file = skill_file.clone();
-            move |this, _, _, cx| {
+            move |this, _, cx| {
                 if this.effective_skills_host() != waku_client::hosts::HostKey::Local
                     || this.daemon.is_remote()
                 {
@@ -1088,7 +1075,7 @@ impl Waku {
                     crate::platform::reveal_in_file_manager(&skill_file, cx);
                 }
             }
-        }));
+        });
 
         let copy_feedback_id = format!("skill-copy-{}", skill.row_key);
         let copied = self.control_was_copied(&copy_feedback_id);
@@ -1105,14 +1092,14 @@ impl Waku {
                 tr!("skills.copy_path")
             },
         )
-        .on_click(cx.listener({
+        .on_activation(cx, {
             let dir = dir.clone();
             let copy_feedback_id = copy_feedback_id.clone();
-            move |this, _, _, cx| {
+            move |this, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(dir.display().to_string()));
                 this.show_control_copied(copy_feedback_id.clone(), cx);
             }
-        }));
+        });
 
         let delete_button = div()
             .id(SharedString::from(format!(
@@ -1157,9 +1144,9 @@ impl Waku {
             } else {
                 tr!("skills.delete")
             })
-            .on_click(cx.listener({
+            .on_activation(cx, {
                 let dir = dir.clone();
-                move |this, _, _, cx| {
+                move |this, _, cx| {
                     if this.skills_delete_arming.as_ref() == Some(&dir) {
                         this.delete_skill(dir.clone(), cx);
                     } else {
@@ -1167,7 +1154,18 @@ impl Waku {
                         cx.notify();
                     }
                 }
-            }))
+            })
+            .when(armed, |element| {
+                element.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && event.keystroke.key.as_str() == "escape"
+                        && this.skills_delete_arming.take().is_some()
+                    {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+            })
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if this.skills_delete_arming.take().is_some() {
                     cx.notify();
@@ -1195,8 +1193,8 @@ impl Waku {
             )
             .with_math_enabled(self.state.render_math)
             .with_math_context_menu(self.menu_handle("skill-detail-math", cx));
-            // Skills are managed on this computer, so their images are too.
-            let ctx = match self.markdown_image_loader(&HostKey::Local) {
+            // Load relative/local images from the host that owns this skill.
+            let ctx = match self.markdown_image_loader(host) {
                 Some(loader) => ctx.with_images(
                     md::image_path::ImageBase::directory(&skill.primary().dir.to_string_lossy()),
                     loader,
@@ -1545,5 +1543,26 @@ mod tests {
         assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Shared));
         assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Provider(ProviderKind::Droid)));
         assert!(SKILL_FILTER_SOURCES.contains(&SkillSource::Provider(ProviderKind::Antigravity)));
+    }
+
+    #[test]
+    fn skills_page_controls_are_keyboard_activatable_and_host_aware() {
+        let source = include_str!("./skills_page.rs");
+        let prod = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("skills_page.rs must contain a test module");
+        assert!(
+            !prod.contains(".on_click("),
+            "skills page interactive controls must use on_activation/toggle_switch so Enter and Space work"
+        );
+        assert!(
+            !prod.contains("markdown_image_loader(&HostKey::Local)"),
+            "skill detail images must load from the effective skills host, not hardcoded Local"
+        );
+        assert!(
+            prod.matches("invalidate_composer_sources(cx)").count() >= 2,
+            "toggle_skill_enabled and delete_skill must invalidate composer sources"
+        );
     }
 }
