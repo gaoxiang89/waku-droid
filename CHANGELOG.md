@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.55]
+
+- Rebrand executables, app identifiers, installers, and user data/cache paths from Waku to Narel across desktop (`narel`), CLI (`bin/narel`), daemon (`narel-daemon`), JS REPL (`narel_js_repl`), Computer Use helper (`narel_computer_use`), updater (`narel-updater`), `~/.narel`, and `~/.cache/narel`, dropping legacy `waku` executable aliases and install directories so existing Waku installations can be uninstalled cleanly without affecting Narel
+
 ## [0.1.54]
 
 - Expand Antigravity support with slash commands (`/boost`, `/swarm`, `/plan`, `/usage`, `/quota`, `/credits`, `/model`, `/effort`), Swarm Board and Hive honeycomb visualization with timeline replay, branch fork and turn rewind, multi-account profiles, live quota and token/cost usage history, Windows native session listing, and `agy` 1.5 error reporting
