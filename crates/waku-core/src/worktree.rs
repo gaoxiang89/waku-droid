@@ -25,8 +25,8 @@ pub fn create(
     base_branch: Option<&str>,
 ) -> anyhow::Result<CreatedWorktree> {
     let root = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not locate the home directory for ~/.waku/worktrees"))?
-        .join(".waku/worktrees");
+        .ok_or_else(|| anyhow!("could not locate the home directory for ~/.narel/worktrees"))?
+        .join(".narel/worktrees");
     create_in(
         project_path,
         &root,

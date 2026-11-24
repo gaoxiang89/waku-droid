@@ -159,7 +159,7 @@ export function renderAppcast(arch: Architecture, items: AppcastItem[]): string 
   return `<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <title>Waku (Windows ${arch})</title>
+    <title>Narel (Windows ${arch})</title>
 ${entries}
   </channel>
 </rss>
@@ -189,7 +189,7 @@ export async function generateWindowsAppcasts(
   const present = new Set(readdirSync(assetsDir));
   const written: string[] = [];
   for (const arch of architectures) {
-    const installer = `Waku-${version}-${arch}-Setup.exe`;
+    const installer = `Narel-${version}-${arch}-Setup.exe`;
     if (!present.has(installer)) {
       console.warn(`No ${installer} in ${assetsDir}; leaving that feed alone.`);
       continue;
@@ -213,7 +213,7 @@ export async function generateWindowsAppcasts(
     console.log(`Wrote ${feedPath} (${item.length} bytes signed)`);
   }
   if (written.length === 0) {
-    throw new Error(`No Waku-${version}-<arch>-Setup.exe found in ${assetsDir}`);
+    throw new Error(`No Narel-${version}-<arch>-Setup.exe found in ${assetsDir}`);
   }
   return written;
 }

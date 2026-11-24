@@ -1851,7 +1851,7 @@ mod tests {
                     projects: Vec::new(),
                     sessions: self.sessions.lock().clone(),
                     default_cwd: PathBuf::from("/tmp"),
-                    projectless_root: Some(PathBuf::from("/tmp/.waku/projects")),
+                    projectless_root: Some(PathBuf::from("/tmp/.narel/projects")),
                 }),
                 _ => Ok(ResponsePayload::Ack),
             }

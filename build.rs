@@ -84,12 +84,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "Waku\0"
+            VALUE "CompanyName", "Narel\0"
             VALUE "FileDescription", "{description}\0"
             VALUE "FileVersion", "{package_version}\0"
-            VALUE "InternalName", "waku\0"
-            VALUE "OriginalFilename", "waku.exe\0"
-            VALUE "ProductName", "Waku\0"
+            VALUE "InternalName", "narel\0"
+            VALUE "OriginalFilename", "narel.exe\0"
+            VALUE "ProductName", "Narel\0"
             VALUE "ProductVersion", "{package_version}\0"
         END
     END
@@ -102,7 +102,7 @@ END
     );
 
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let script = out_dir.join("waku.rc");
+    let script = out_dir.join("narel.rc");
     std::fs::write(&script, resources).expect("write the resource script");
 
     // GPUI embeds the application manifest through its own resource script,

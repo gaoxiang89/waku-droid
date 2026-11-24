@@ -143,7 +143,7 @@ export function useComposerLocalCommands({
           break;
         }
         case 'swarmBoard':
-          Alert.alert('Swarm board', 'Swarm board is only available in Waku Desktop.');
+          Alert.alert('Swarm board', 'Swarm board is only available in Narel Desktop.');
           break;
       }
       onClear();

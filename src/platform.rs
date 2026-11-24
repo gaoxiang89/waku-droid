@@ -6,7 +6,7 @@ pub fn report_startup_error(message: &str) -> ! {
 
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 
-    let title: Vec<u16> = std::ffi::OsStr::new("Waku")
+    let title: Vec<u16> = std::ffi::OsStr::new(crate::identity::APP_NAME)
         .encode_wide()
         .chain(Some(0))
         .collect();

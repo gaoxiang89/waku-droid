@@ -12,13 +12,13 @@ use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 const OPEN_SUBCOMMAND: &str = "open";
 const NO_DESKTOP_CONNECTED_MESSAGE: &str =
-    "No Waku desktop app is currently connected to this host.";
+    "No Narel desktop app is currently connected to this host.";
 
 fn main() -> anyhow::Result<()> {
     let mut all_arguments = std::env::args();
     let argv0 = all_arguments.next();
     let mut raw_arguments = all_arguments.peekable();
-    if invoked_as_waku_cli(argv0.as_deref()) {
+    if invoked_as_narel_cli(argv0.as_deref()) {
         return run_open_cli(raw_arguments);
     }
     match raw_arguments.peek().map(String::as_str) {
@@ -106,14 +106,14 @@ fn main() -> anyhow::Result<()> {
     )
 }
 
-fn invoked_as_waku_cli(argv0: Option<&str>) -> bool {
+fn invoked_as_narel_cli(argv0: Option<&str>) -> bool {
     let Some(argv0) = argv0 else {
         return false;
     };
     let name = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    stem == "waku"
+    stem == "narel"
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -196,12 +196,12 @@ fn resolve_open_cli_path(raw: &str, cwd: Option<&Path>) -> String {
 }
 
 fn default_open_state_dir() -> anyhow::Result<PathBuf> {
-    let executable = std::env::current_exe().context("could not locate waku-daemon")?;
+    let executable = std::env::current_exe().context("could not locate narel-daemon")?;
     let canonical = std::fs::canonicalize(&executable).unwrap_or(executable);
     canonical
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("waku-daemon has no parent directory"))
+        .ok_or_else(|| anyhow!("narel-daemon has no parent directory"))
 }
 
 fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
@@ -215,8 +215,8 @@ fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(
     match action {
         OpenAction::Help => {
             println!(
-                "Usage: waku [PATH]\n\n\
-                 Open a directory or focus the connected Waku desktop window.\n\n\
+                "Usage: narel [PATH]\n\n\
+                 Open a directory or focus the connected Narel desktop window.\n\n\
                  Options:\n  \
                    --state-dir <DIR>  Override the daemon state directory\n  \
                    -h, --help         Print help\n  \
@@ -225,7 +225,10 @@ fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(
             Ok(())
         }
         OpenAction::Version => {
-            println!("waku {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "narel {} (community fork of egoist/waku, GPL-3.0)",
+                env!("CARGO_PKG_VERSION")
+            );
             Ok(())
         }
         OpenAction::Open { state_dir, path } => {
@@ -407,15 +410,16 @@ mod tests {
     }
 
     #[test]
-    fn detects_waku_multicall_argv0() {
-        assert!(invoked_as_waku_cli(Some("waku")));
-        assert!(invoked_as_waku_cli(Some("WAKU.EXE")));
-        assert!(invoked_as_waku_cli(Some("/home/me/.cache/waku/server/bin/waku")));
-        assert!(invoked_as_waku_cli(Some(r"C:\Users\me\.cache\waku\server\bin\waku.exe")));
-        assert!(!invoked_as_waku_cli(Some("waku-daemon")));
-        assert!(!invoked_as_waku_cli(Some("waku-daemon.exe")));
-        assert!(!invoked_as_waku_cli(Some("waku-debug-daemon")));
-        assert!(!invoked_as_waku_cli(None));
+    fn detects_narel_multicall_argv0() {
+        assert!(invoked_as_narel_cli(Some("narel")));
+        assert!(invoked_as_narel_cli(Some("NAREL.EXE")));
+        assert!(invoked_as_narel_cli(Some("/home/me/.cache/narel/server/bin/narel")));
+        assert!(invoked_as_narel_cli(Some(r"C:\Users\me\.cache\narel\server\bin\narel.exe")));
+        assert!(!invoked_as_narel_cli(Some("waku")));
+        assert!(!invoked_as_narel_cli(Some("narel-daemon")));
+        assert!(!invoked_as_narel_cli(Some("narel-daemon.exe")));
+        assert!(!invoked_as_narel_cli(Some("narel-debug-daemon")));
+        assert!(!invoked_as_narel_cli(None));
     }
 
     #[test]

@@ -125,11 +125,11 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("WAKU_DAEMON_PATH").filter(|path| !path.is_empty()) {
         return Ok(path.into());
     }
-    let executable = format!("waku-daemon{}", std::env::consts::EXE_SUFFIX);
-    let current = std::env::current_exe().context("could not locate the Waku executable")?;
+    let executable = format!("narel-daemon{}", std::env::consts::EXE_SUFFIX);
+    let current = std::env::current_exe().context("could not locate the Narel executable")?;
 
     // Development keeps the daemon beside Cargo's debug artifacts rather than
-    // inside Waku Debug.app. The supervisor watches this file and swaps only
+    // inside Narel Debug.app. The supervisor watches this file and swaps only
     // the daemon when the development watcher relinks it.
     #[cfg(debug_assertions)]
     if let Some(debug_directory) = current
@@ -139,7 +139,7 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
         // Match scripts/dev.ts: its rebuild target is the feature-gated
         // debug daemon. A stale regular daemon may also live beside it.
         for name in [
-            format!("waku-debug-daemon{}", std::env::consts::EXE_SUFFIX),
+            format!("narel-debug-daemon{}", std::env::consts::EXE_SUFFIX),
             executable.clone(),
         ] {
             let external = debug_directory.join(name);
@@ -152,18 +152,18 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     let sibling = current
         .parent()
         .map(|directory| directory.join(&executable))
-        .ok_or_else(|| anyhow!("Waku executable has no parent directory"))?;
+        .ok_or_else(|| anyhow!("Narel executable has no parent directory"))?;
     if sibling.is_file() {
         return Ok(sibling);
     }
     #[cfg(debug_assertions)]
     bail!(
-        "Waku daemon was not found in Cargo's debug directory or next to the app executable: {}",
+        "Narel daemon was not found in Cargo's debug directory or next to the app executable: {}",
         sibling.display(),
     );
     #[cfg(not(debug_assertions))]
     bail!(
-        "Waku daemon is missing next to the app executable: {}",
+        "Narel daemon is missing next to the app executable: {}",
         sibling.display(),
     )
 }

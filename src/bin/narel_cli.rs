@@ -1,4 +1,4 @@
-//! Console-subsystem CLI wrapper for Waku (`waku_cli`, staged as `bin/waku.exe`
+//! Console-subsystem CLI wrapper (`narel_cli`, staged as `bin/narel.exe`
 //! in packaged Windows distributions).
 //!
 //! Keeps terminal stdout/stderr and exit codes intact while handing workspace
@@ -13,7 +13,7 @@ fn main() {
     let action = match cli::parse_args(std::env::args().skip(1), false) {
         Ok(action) => action,
         Err(error) => {
-            eprintln!("waku: {error}");
+            eprintln!("narel: {error}");
             std::process::exit(1);
         }
     };
@@ -37,7 +37,7 @@ fn main() {
         Ok(cli::DeliveryResult::Delivered(_)) => return,
         Ok(cli::DeliveryResult::NotRunning) => {}
         Err(error) => {
-            eprintln!("waku: {error}");
+            eprintln!("narel: {error}");
             std::process::exit(1);
         }
     }
@@ -50,7 +50,7 @@ fn main() {
         match cli::validate_local_workspace_path(raw_path) {
             Ok(resolved) => request.path = Some(resolved),
             Err(error) => {
-                eprintln!("waku: {error}");
+                eprintln!("narel: {error}");
                 std::process::exit(1);
             }
         }
@@ -59,14 +59,14 @@ fn main() {
     let gui_exe = match cli::resolve_gui_executable() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("waku: {error:#}");
+            eprintln!("narel: {error:#}");
             std::process::exit(1);
         }
     };
 
     let forwarded = cli::forwarded_gui_args(&request);
     if let Err(error) = cli::spawn_gui_detached(&gui_exe, &forwarded) {
-        eprintln!("waku: {error:#}");
+        eprintln!("narel: {error:#}");
         std::process::exit(1);
     }
 }

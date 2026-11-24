@@ -1,5 +1,5 @@
 //! Shared CLI argument parsing, path resolution, and desktop delivery for
-//! both `waku` (GUI binary) and `waku_cli` (Windows console helper).
+//! both `narel` (GUI binary) and `narel_cli` (Windows console helper).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,8 +30,8 @@ pub enum DeliveryResult {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage: waku [OPTIONS] [PATH]\n\n\
-     Open a workspace directory in Waku or focus the running Waku window.\n\n\
+    "Usage: narel [OPTIONS] [PATH]\n\n\
+     Open a workspace directory in Narel or focus the running Narel window.\n\n\
      Options:\n  \
        --host <SPEC>    Open on a remote host (ssh:<alias>, wsl:<distro>, or saved id)\n  \
        --remote <SPEC>  Alias for --host\n  \
@@ -40,7 +40,10 @@ pub fn help_text() -> &'static str {
 }
 
 pub fn version_text() -> String {
-    format!("waku {}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "narel {} (community fork of egoist/waku, GPL-3.0)",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Parse CLI arguments shared by `waku` and `waku_cli`.
@@ -311,9 +314,9 @@ pub fn forwarded_gui_args(request: &StartupOpenRequest) -> Vec<String> {
     args
 }
 
-/// Locate the Waku GUI executable relative to the running `waku_cli` binary.
+/// Locate the Narel GUI executable relative to the running `narel_cli` binary.
 pub fn resolve_gui_executable() -> anyhow::Result<PathBuf> {
-    let current = std::env::current_exe().context("could not locate waku CLI executable")?;
+    let current = std::env::current_exe().context("could not locate narel CLI executable")?;
     if let Some(found) = resolve_gui_executable_from(&current) {
         return Ok(found);
     }
@@ -324,25 +327,25 @@ pub fn resolve_gui_executable() -> anyhow::Result<PathBuf> {
         return Ok(found);
     }
     bail!(
-        "could not locate the Waku GUI executable near {}",
+        "could not locate the Narel GUI executable near {}",
         current.display()
     )
 }
 
 /// Pure helper resolving the GUI executable from a given CLI executable path.
 ///
-/// Checks the packaged `<app>\bin\waku.exe` -> `<app>\waku.exe` layout first,
-/// then falls back to the sibling Cargo layout (`target/<profile>/waku_cli` ->
-/// `target/<profile>/waku`), rejecting any candidate that resolves to `cli_exe`
+/// Checks the packaged `<app>\bin\narel.exe` -> `<app>\narel.exe` layout first,
+/// then falls back to the sibling Cargo layout (`target/<profile>/narel_cli` ->
+/// `target/<profile>/narel`), rejecting any candidate that resolves to `cli_exe`
 /// itself so a misconfigured directory can never self-exec loop.
 pub fn resolve_gui_executable_from(cli_exe: &Path) -> Option<PathBuf> {
     let exe_dir = cli_exe.parent()?;
     let candidates: &[&str] = if cfg!(target_os = "windows") {
-        &["waku.exe"]
+        &["narel.exe"]
     } else if cfg!(target_os = "macos") {
-        &["Waku", "waku"]
+        &["Narel", "narel"]
     } else {
-        &["waku"]
+        &["narel"]
     };
 
     let search_dirs: Vec<&Path> = exe_dir
@@ -404,7 +407,7 @@ pub fn spawn_gui_detached(gui_exe: &Path, args: &[String]) -> anyhow::Result<()>
 
     let child = command
         .spawn()
-        .with_context(|| format!("could not launch Waku GUI at {}", gui_exe.display()))?;
+        .with_context(|| format!("could not launch Narel GUI at {}", gui_exe.display()))?;
     allow_set_foreground_window(Some(child.id()));
     Ok(())
 }
@@ -626,19 +629,19 @@ mod tests {
     #[test]
     fn resolves_gui_executable_in_packaged_and_cargo_layouts() {
         let gui_name = if cfg!(target_os = "windows") {
-            "waku.exe"
+            "narel.exe"
         } else {
-            "waku"
+            "narel"
         };
         let cli_cargo_name = if cfg!(target_os = "windows") {
-            "waku_cli.exe"
+            "narel_cli.exe"
         } else {
-            "waku_cli"
+            "narel_cli"
         };
 
-        // 1. Packaged layout: `<app>/bin/waku.exe` -> `<app>/waku.exe`.
+        // 1. Packaged layout: `<app>/bin/narel.exe` -> `<app>/narel.exe`.
         let packaged =
-            std::env::temp_dir().join(format!("waku-cli-packaged-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("narel-cli-packaged-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(packaged.join("bin")).unwrap();
         let packaged_gui = packaged.join(gui_name);
         let packaged_cli = packaged.join("bin").join(gui_name);
@@ -646,15 +649,15 @@ mod tests {
         fs::write(&packaged_cli, b"cli").unwrap();
         assert_resolves_to(&packaged_cli, &packaged_gui);
 
-        // Self-exec guard: if `<app>/waku.exe` is missing, `<app>/bin/waku.exe`
+        // Self-exec guard: if `<app>/narel.exe` is missing, `<app>/bin/narel.exe`
         // must NOT resolve to itself.
         fs::remove_file(&packaged_gui).unwrap();
         assert_eq!(resolve_gui_executable_from(&packaged_cli), None);
         fs::remove_dir_all(&packaged).unwrap();
 
-        // 2. Cargo layout: `target/debug/waku_cli.exe` -> `target/debug/waku.exe`.
+        // 2. Cargo layout: `target/debug/narel_cli.exe` -> `target/debug/narel.exe`.
         let cargo_dir =
-            std::env::temp_dir().join(format!("waku-cli-cargo-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("narel-cli-cargo-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&cargo_dir).unwrap();
         let cargo_gui = cargo_dir.join(gui_name);
         let cargo_cli = cargo_dir.join(cli_cargo_name);

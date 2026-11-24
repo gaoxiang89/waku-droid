@@ -16,7 +16,7 @@ fn main() {
     let action = match waku::cli::parse_args(std::env::args().skip(1), true) {
         Ok(action) => action,
         Err(error) => {
-            eprintln!("waku: {error}");
+            eprintln!("narel: {error}");
             std::process::exit(1);
         }
     };
@@ -39,7 +39,7 @@ fn main() {
         Ok(waku::cli::DeliveryResult::Delivered(_)) => return,
         Ok(waku::cli::DeliveryResult::NotRunning) => {}
         Err(error) => {
-            eprintln!("waku: {error}");
+            eprintln!("narel: {error}");
             std::process::exit(1);
         }
     }
@@ -52,7 +52,7 @@ fn main() {
         match waku::cli::validate_local_workspace_path(raw_path) {
             Ok(resolved) => request.path = Some(resolved),
             Err(error) => {
-                eprintln!("waku: {error}");
+                eprintln!("narel: {error}");
                 std::process::exit(1);
             }
         }

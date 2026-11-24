@@ -339,7 +339,7 @@ fn migrate_projectless_state(
         let old_path = task_state.projects[index].path.clone();
         let workspace = crate::projectless::migrate_workspace(&old_path).with_context(|| {
             format!(
-                "could not move projectless workspace {} under ~/.waku/projects",
+                "could not move projectless workspace {} under ~/.narel/projects",
                 old_path.display()
             )
         })?;

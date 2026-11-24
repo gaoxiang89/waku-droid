@@ -2,7 +2,7 @@
 //
 // Build and package the Windows release: a portable zip and the Inno Setup
 // installer the in-app updater re-runs silently. Mirrors bundle-linux.sh for
-// the archive half and resources/windows/waku.iss for the installer half.
+// the archive half and resources/windows/narel.iss for the installer half.
 //
 // Usage:
 //   bun scripts/bundle-windows.ts
@@ -11,7 +11,7 @@
 //   CARGO_TARGET_DIR              cargo target directory (default: target)
 //   WINDOWS_CERTIFICATE           base64 Authenticode .pfx (optional)
 //   WINDOWS_CERTIFICATE_PASSWORD  password for it
-//   WAKU_REMOTE_DAEMONS_DIR       directory with waku-daemon-linux-{x86_64,aarch64}
+//   WAKU_REMOTE_DAEMONS_DIR       directory with narel-daemon-linux-{x86_64,aarch64}
 //                                 for WSL and SSH hosts (release CI sets it)
 //   WAKU_REQUIRE_REMOTE_DAEMONS   set to "1" to fail if Linux daemons are missing
 import { $ } from "bun";
@@ -92,8 +92,8 @@ function findSigntool(): string {
  *  enforce them; a local package usually carries only the one its WSL
  *  distribution needs, so missing architectures warn unless required. */
 const expectedLinuxDaemons = [
-  "waku-daemon-linux-x86_64",
-  "waku-daemon-linux-aarch64",
+  "narel-daemon-linux-x86_64",
+  "narel-daemon-linux-aarch64",
 ];
 
 interface StagedRemoteDaemons {
@@ -122,7 +122,7 @@ async function stageRemoteDaemons(
   const stagedWindowsExecutables: string[] = [];
   let stagedCount = 0;
   for (const name of readdirSync(directory).sort()) {
-    if (!/^waku-daemon-[A-Za-z0-9_.-]+$/.test(name)) continue;
+    if (!/^narel-daemon-[A-Za-z0-9_.-]+$/.test(name)) continue;
     const file = join(directory, name);
     if (!statSync(file).isFile()) continue;
     if (stagedCount === 0) {
@@ -200,16 +200,16 @@ if (!targetTriple || !architecture) {
   throw new Error(`Unsupported Windows target ${targetTriple ?? "(unknown)"}`);
 }
 
-const packageDirectoryName = `waku-${version}-${targetTriple}`;
+const packageDirectoryName = `narel-${version}-${targetTriple}`;
 const archive = join(releaseDirectory, `${packageDirectoryName}.zip`);
 const installer = join(
   releaseDirectory,
-  `Waku-${version}-${architecture}-Setup.exe`,
+  `Narel-${version}-${architecture}-Setup.exe`,
 );
 
-await $`cargo build --locked --release --package waku --bin waku --bin waku_cli --bin waku_js_repl --package waku-daemon --bin waku-daemon --package waku-computer-use --bin waku_computer_use`;
+await $`cargo build --locked --release --package waku --bin narel --bin narel_cli --bin narel_js_repl --package waku-daemon --bin narel-daemon --package waku-computer-use --bin narel_computer_use`;
 
-const staging = await mkdtemp(join(tmpdir(), "waku-bundle-"));
+const staging = await mkdtemp(join(tmpdir(), "narel-bundle-"));
 try {
   // Both executables stay side by side: the app resolves the daemon next to
   // itself, so the layout is what makes an extracted zip runnable in place.
@@ -220,17 +220,17 @@ try {
     join(packageDirectory, "resources"),
     "release",
   );
-  for (const file of ["waku.exe", "waku-daemon.exe"]) {
+  for (const file of ["narel.exe", "narel-daemon.exe"]) {
     await copyFile(join(releaseDirectory, file), join(packageDirectory, file));
   }
-  // Keep the console-subsystem CLI in bin\waku.exe so adding `{app}\bin` to
-  // PATH gives PowerShell, CMD, Git Bash, and WSL a clean `waku` command
-  // without colliding with the GUI waku.exe or exposing helper binaries.
+  // Keep the console-subsystem CLI in bin\narel.exe so adding `{app}\bin` to
+  // PATH gives PowerShell, CMD, Git Bash, and WSL a clean `narel` command
+  // without colliding with the GUI narel.exe or exposing helper binaries.
   const binDirectory = join(packageDirectory, "bin");
   await mkdir(binDirectory, { recursive: true });
   await copyFile(
-    join(releaseDirectory, "waku_cli.exe"),
-    join(binDirectory, "waku.exe"),
+    join(releaseDirectory, "narel_cli.exe"),
+    join(binDirectory, "narel.exe"),
   );
   await copyFile(
     join(projectRoot, "LICENSE"),
@@ -253,11 +253,11 @@ try {
     await writeFile(certificate, Buffer.from(certificateData, "base64"));
     signtool = findSigntool();
     await sign(signtool, certificate, certificatePassword, [
-      join(packageDirectory, "waku.exe"),
-      join(packageDirectory, "bin", "waku.exe"),
-      join(packageDirectory, "waku-daemon.exe"),
-      join(packageDirectory, "waku_js_repl.exe"),
-      join(packageDirectory, "waku_computer_use.exe"),
+      join(packageDirectory, "narel.exe"),
+      join(packageDirectory, "bin", "narel.exe"),
+      join(packageDirectory, "narel-daemon.exe"),
+      join(packageDirectory, "narel_js_repl.exe"),
+      join(packageDirectory, "narel_computer_use.exe"),
       join(packageDirectory, "cua_driver_sdk.dll"),
       join(packageDirectory, "cua-driver-uia.exe"),
       ...stagedRemoteWindowsDaemons,
@@ -277,7 +277,7 @@ try {
   // The installer is what the in-app updater downloads and re-runs, so it
   // ships from the same signed staging directory as the zip.
   await rm(installer, { force: true });
-  await $`${findInnoSetupCompiler()} ${`/DAppVersion=${version}`} ${`/DArch=${architecture}`} ${`/DStageDir=${packageDirectory}`} ${`/DOutputDir=${releaseDirectory}`} ${`/DHasRemoteDaemons=${hasRemoteDaemons ? 1 : 0}`} ${join(projectRoot, "resources", "windows", "waku.iss")}`;
+  await $`${findInnoSetupCompiler()} ${`/DAppVersion=${version}`} ${`/DArch=${architecture}`} ${`/DStageDir=${packageDirectory}`} ${`/DOutputDir=${releaseDirectory}`} ${`/DHasRemoteDaemons=${hasRemoteDaemons ? 1 : 0}`} ${join(projectRoot, "resources", "windows", "narel.iss")}`;
   if (!existsSync(installer)) {
     throw new Error(`ISCC did not produce ${installer}`);
   }

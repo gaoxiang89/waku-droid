@@ -12,9 +12,9 @@ import { DaemonProvider } from '@/lib/daemon-context'
 import { RuntimeProvider } from '@/lib/runtime-context'
 import appCss from '@/styles.css?url'
 
-const TITLE = 'Waku Web'
+const TITLE = 'Narel Web'
 const DESCRIPTION =
-  'Connect securely to a Waku daemon and continue your coding-agent tasks from the browser.'
+  'Connect securely to a Narel daemon and continue your coding-agent tasks from the browser.'
 
 export const Route = createRootRouteWithContext<{
   queryClient: QueryClient

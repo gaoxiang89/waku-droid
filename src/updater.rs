@@ -786,7 +786,7 @@ mod macos {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
             let library = target_dir
-                .join("debug/Waku Debug.app/Contents/Frameworks/Sparkle.framework/Sparkle");
+                .join("debug/Narel Debug.app/Contents/Frameworks/Sparkle.framework/Sparkle");
             if !library.exists() {
                 return;
             }
@@ -1320,13 +1320,13 @@ mod windows {
             .ok_or_else(|| anyhow::anyhow!("update signature is malformed"))?;
 
         let directory = std::env::temp_dir().join(format!(
-            "waku-update-{}-{}",
+            "narel-update-{}-{}",
             item.version,
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory)?;
-        let installer = directory.join("Waku-Setup.exe");
+        let installer = directory.join("Narel-Setup.exe");
 
         curl(&["-fsSL", "--max-time", "600", "-o"], &installer, &item.url)?;
 

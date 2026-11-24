@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
-# Installs Waku for Linux into ~/.local — no root, no package manager.
+# Installs Narel for Linux into ~/.local — no root, no package manager.
 # Downloads the release tarball from https://releases.waku.sh, unpacks it as
-# ~/.local/waku.app, links the binary onto PATH, and registers the desktop
+# ~/.local/narel.app, links the binary onto PATH, and registers the desktop
 # entry. docs/linux.md documents the equivalent manual steps.
 #
 #   curl -fsSL https://waku.sh/install.sh | sh
@@ -15,22 +15,22 @@ set -eu
 
 usage() {
     cat <<'USAGE'
-Install Waku for Linux into ~/.local.
+Install Narel for Linux into ~/.local.
 
 Usage:
   curl -fsSL https://waku.sh/install.sh | sh
   curl -fsSL https://waku.sh/install.sh | sh -s -- --uninstall
 
 Options:
-  --uninstall   Remove Waku, leaving ~/.waku (projects and settings) alone
+  --uninstall   Remove Narel, leaving ~/.narel (projects and settings) alone
   --help        Show this help
 USAGE
 }
 
 main() {
-    app_dir="$HOME/.local/waku.app"
-    bin_link="$HOME/.local/bin/waku"
-    desktop_file="$HOME/.local/share/applications/sh.waku.desktop"
+    app_dir="$HOME/.local/narel.app"
+    bin_link="$HOME/.local/bin/narel"
+    desktop_file="$HOME/.local/share/applications/sh.narel.desktop"
     releases="${WAKU_RELEASES_URL:-https://releases.waku.sh}"
 
     case "${1:-}" in
@@ -96,9 +96,9 @@ main() {
             echo "No Waku version published for Linux yet." >&2
             exit 1
         fi
-        echo "Downloading Waku $version for $machine"
-        if ! fetch "$releases/waku-$version-$target.tar.gz" >"$archive"; then
-            echo "Download failed: $releases/waku-$version-$target.tar.gz" >&2
+        echo "Downloading Narel $version for $machine"
+        if ! fetch "$releases/narel-$version-$target.tar.gz" >"$archive"; then
+            echo "Download failed: $releases/narel-$version-$target.tar.gz" >&2
             exit 1
         fi
     fi
@@ -116,18 +116,18 @@ main() {
     mkdir -p "$staging" "$(dirname "$bin_link")" "$(dirname "$desktop_file")"
     tar -xzf "$archive" --strip-components=1 -C "$staging"
 
-    # Waku resolves its daemon and self-update helper next to its own
+    # Narel resolves its daemon and self-update helper next to its own
     # executable, so all three must stay together in bin/. Linking only the
     # main binary onto PATH is safe — current_exe() resolves the symlink back
-    # into waku.app.
-    for binary in waku waku-daemon waku-updater; do
+    # into narel.app.
+    for binary in narel narel-daemon narel-updater; do
         if [ ! -x "$staging/bin/$binary" ]; then
             echo "Archive is missing bin/$binary." >&2
             exit 1
         fi
     done
-    if [ "$(cat "$staging/share/waku/self-update-v1" 2>/dev/null || true)" != \
-        "waku-self-update-v1" ]; then
+    if [ "$(cat "$staging/share/narel/self-update-v1" 2>/dev/null || true)" != \
+        "narel-self-update-v1" ]; then
         echo "Archive is missing its managed-install marker." >&2
         exit 1
     fi
@@ -135,49 +135,49 @@ main() {
     # survive the upgrade.
     rm -rf "$app_dir"
     mv "$staging" "$app_dir"
-    ln -sf "$app_dir/bin/waku" "$bin_link"
+    ln -sf "$app_dir/bin/narel" "$bin_link"
 
-    entry="$app_dir/share/applications/sh.waku.desktop"
+    entry="$app_dir/share/applications/sh.narel.desktop"
     if [ -f "$entry" ]; then
         # The packaged entry is relocatable (bare Exec/Icon names). Pin both to
         # this install so the launcher works without PATH or icon-theme setup.
-        sed -e "s|^Exec=waku$|Exec=$app_dir/bin/waku|" \
-            -e "s|^Icon=sh.waku$|Icon=$app_dir/share/icons/hicolor/256x256/apps/sh.waku.png|" \
+        sed -e "s|^Exec=narel$|Exec=$app_dir/bin/narel|" \
+            -e "s|^Icon=sh.narel$|Icon=$app_dir/share/icons/hicolor/256x256/apps/sh.narel.png|" \
             "$entry" >"$desktop_file"
         if command -v update-desktop-database >/dev/null 2>&1; then
             update-desktop-database "$(dirname "$desktop_file")" 2>/dev/null || true
         fi
     fi
 
-    # Linking bin/waku onto PATH lets users launch Waku or open a workspace
-    # directly from a terminal (e.g. `waku .`, `waku <path>`, `waku --host ...`).
-    echo "Waku is installed."
+    # Linking bin/narel onto PATH lets users launch Narel or open a workspace
+    # directly from a terminal (e.g. `narel .`, `narel <path>`, `narel --host ...`).
+    echo "Narel is installed."
     if [ -f "$desktop_file" ]; then
         echo "Open it from your applications menu."
     fi
-    if [ "$(command -v waku || true)" = "$bin_link" ]; then
-        echo "From a terminal: waku [path]"
+    if [ "$(command -v narel || true)" = "$bin_link" ]; then
+        echo "From a terminal: narel [path]"
     else
         echo "From a terminal: $bin_link [path]"
-        echo "Add $(dirname "$bin_link") to PATH to run 'waku' directly."
+        echo "Add $(dirname "$bin_link") to PATH to run 'narel' directly."
     fi
 }
 
 uninstall() {
     if [ ! -d "$app_dir" ] && [ ! -L "$bin_link" ]; then
-        echo "Waku is not installed at $app_dir." >&2
+        echo "Narel is not installed at $app_dir." >&2
         exit 1
     fi
     # Only reclaim the symlink and desktop entry this script created; a
     # distro package's copies of both belong to the package manager.
-    if [ "$(readlink "$bin_link" 2>/dev/null || true)" = "$app_dir/bin/waku" ]; then
+    if [ "$(readlink "$bin_link" 2>/dev/null || true)" = "$app_dir/bin/narel" ]; then
         rm -f "$bin_link"
     fi
-    if [ -f "$desktop_file" ] && grep -qF "$app_dir/bin/waku" "$desktop_file"; then
+    if [ -f "$desktop_file" ] && grep -qF "$app_dir/bin/narel" "$desktop_file"; then
         rm -f "$desktop_file"
     fi
     rm -rf "$app_dir"
-    echo "Waku is uninstalled. Projects and settings remain in ~/.waku."
+    echo "Narel is uninstalled. Projects and settings remain in ~/.narel."
 }
 
 main "$@"

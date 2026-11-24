@@ -2,7 +2,7 @@
 name = "waku-daemon"
 version.workspace = true
 edition = "2024"
-description = "Headless Waku provider daemon"
+description = "Headless Narel provider daemon"
 license = "GPL-3.0-only"
 readme = "README.md"
 
@@ -10,12 +10,12 @@ readme = "README.md"
 dev-binary = []
 
 [[bin]]
-name = "waku-daemon"
+name = "narel-daemon"
 path = "src/main.rs"
 
 [[bin]]
-name = "waku-debug-daemon"
-path = "src/bin/waku-debug-daemon.rs"
+name = "narel-debug-daemon"
+path = "src/bin/narel-debug-daemon.rs"
 required-features = ["dev-binary"]
 
 [lib]

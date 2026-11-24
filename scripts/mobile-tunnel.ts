@@ -125,7 +125,7 @@ function discoverDaemons(repoRoot: string): DiscoveredDaemon[] {
   const candidates: DiscoveredDaemon[] = [];
 
   const appPaths = [
-    { label: 'Desktop release (~/.waku/app.json)', file: path.join(home, '.waku', 'app.json') },
+    { label: 'Desktop release (~/.narel/app.json)', file: path.join(home, '.narel', 'app.json') },
     { label: 'Desktop debug (.waku-cache/app.json)', file: path.join(repoRoot, '.waku-cache', 'app.json') },
   ];
 
@@ -144,8 +144,8 @@ function discoverDaemons(repoRoot: string): DiscoveredDaemon[] {
   }
 
   const bridgePaths = [
-    { label: 'Bridge daemon (~/.cache/waku/server/daemon.json)', file: path.join(home, '.cache', 'waku', 'server', 'daemon.json') },
-    { label: 'Bridge dev daemon (~/.cache/waku-dev/server/daemon.json)', file: path.join(home, '.cache', 'waku-dev', 'server', 'daemon.json') },
+    { label: 'Bridge daemon (~/.cache/narel/server/daemon.json)', file: path.join(home, '.cache', 'narel', 'server', 'daemon.json') },
+    { label: 'Bridge dev daemon (~/.cache/narel-dev/server/daemon.json)', file: path.join(home, '.cache', 'narel-dev', 'server', 'daemon.json') },
   ];
 
   for (const candidate of bridgePaths) {
@@ -207,7 +207,7 @@ function printStatus(discovered: DiscoveredDaemon[], primary: DiscoveredDaemon, 
 
   if (primary.enabled === false) {
     console.log('\n[!] Desktop remote daemon exposure is currently DISABLED (`enabled: false`).');
-    console.log('    Open Waku Desktop -> Settings -> Daemon and enable it so waku-daemon listens on 0.0.0.0:' + primary.port + '.');
+    console.log('    Open Narel Desktop -> Settings -> Daemon and enable it so narel-daemon listens on 0.0.0.0:' + primary.port + '.');
   }
 
   const displayToken = primary.token && showToken ? primary.token : '<WAKU_DAEMON_TOKEN>';
@@ -237,7 +237,7 @@ like wss://waku.example.com (never wss://example.com/waku).
    auth.token = "<FRP_SECRET>"
 
    [[proxies]]
-   name = "waku-daemon"
+   name = "narel-daemon"
    type = "tcp"
    localIP = "127.0.0.1"
    localPort = ${primary.port}
@@ -248,19 +248,19 @@ like wss://waku.example.com (never wss://example.com/waku).
      reverse_proxy 127.0.0.1:${primary.port}
    }
 
-   Then in Waku Android:
+   Then in Narel Android:
      Address: wss://waku.example.com
      Token  : ${displayToken}
      (Optional: add DOMAIN-SUFFIX,waku.example.com,DIRECT in V2Ray for lower latency)
 
 3) Share Live Sessions Between Desktop (SSH) and Android (WSS) on a Linux Host:
-   Run waku-daemon with --state-file pointing to the bridge state file so both
-   Waku Desktop ("waku-daemon bridge" over SSH) and Waku Android attach to the
+   Run narel-daemon with --state-file pointing to the bridge state file so both
+   Narel Desktop ("narel-daemon bridge" over SSH) and Narel Android attach to the
    exact same daemon process:
      WAKU_DAEMON_TOKEN="${displayToken}" \\
-       ~/.cache/waku/server/waku-daemon \\
+       ~/.cache/narel/server/narel-daemon \\
        --bind 127.0.0.1:${DEFAULT_SSH_DAEMON_PORT} \\
-       --state-file ~/.cache/waku/server/daemon.json
+       --state-file ~/.cache/narel/server/daemon.json
    Then tunnel 127.0.0.1:${DEFAULT_SSH_DAEMON_PORT} via frpc or cloudflared as above.
 
 4) Alternative (Single VPN Slot via sing-box / Mihomo):

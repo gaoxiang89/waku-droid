@@ -38,15 +38,19 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Waku Debug"
-    helper_name="Waku Debug Computer Use"
-    bundle_identifier="sh.waku.dev"
+    app_name="Narel Debug"
+    display_name="Narel Debug"
+    helper_name="Narel Debug Computer Use"
+    helper_display_name="Narel Debug Computer Use"
+    bundle_identifier="sh.narel.dev"
     icon_file="AppIconDev.icns"
     ;;
   release)
-    app_name="Waku"
-    helper_name="Waku Computer Use"
-    bundle_identifier="sh.waku"
+    app_name="Narel"
+    display_name="Narel"
+    helper_name="Narel Computer Use"
+    helper_display_name="Narel Computer Use"
+    bundle_identifier="sh.narel"
     icon_file="AppIcon.icns"
     ;;
   *)
@@ -61,19 +65,19 @@ fi
 debug_adhoc_requirement="=designated => identifier \"$bundle_identifier\""
 if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   if [ "$profile" = "release" ]; then
-    cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
+    cargo build --release --package waku --bin narel --bin narel_js_repl --package waku-daemon --bin narel-daemon
   else
-    cargo build --package waku --bin waku --bin waku_js_repl
+    cargo build --package waku --bin narel --bin narel_js_repl
   fi
 fi
 
 bundle="$cargo_target_dir/$profile/$app_name.app"
 contents="$bundle/Contents"
 helper_bundle="$contents/Helpers/$helper_name.app"
-repl_executable="$contents/Resources/waku_js_repl"
-daemon_executable="$contents/MacOS/waku-daemon"
+repl_executable="$contents/Resources/narel_js_repl"
+daemon_executable="$contents/MacOS/narel-daemon"
 swift_module_cache="$cargo_target_dir/$profile/swift-module-cache"
-helper_source="resources/computer-use/WakuComputerUse.swift"
+helper_source="resources/computer-use/NarelComputerUse.swift"
 helper_sdk_source="resources/computer-use/CuaDriver.swift"
 cua_sdk_directory=$(bun scripts/cua-host.ts)
 cua_sdk_library="$cua_sdk_directory/libcua_driver_sdk.dylib"
@@ -86,7 +90,7 @@ helper_fingerprint="$({
     "$cua_sdk_directory/cua-host.h" \
     resources/computer-use/CUA-LICENSE \
     resources/computer-use/Info.plist
-  printf '%s\n' "cua-in-process-v1" "$helper_name" "$bundle_identifier.computer-use" "$codesign_identity" "$(uname -m)-apple-macos13.0"
+  printf '%s\n' "cua-in-process-v1" "$helper_name" "$helper_display_name" "$bundle_identifier.computer-use" "$codesign_identity" "$(uname -m)-apple-macos13.0"
   xcrun swiftc -version
 } | shasum -a 256 | awk '{ print $1 }')"
 helper_cache_root=".waku-cache/computer-use/$profile"
@@ -109,11 +113,11 @@ if [ ! -d "$cached_helper_bundle" ]; then
   cp resources/computer-use/Info.plist "$cached_helper_contents/Info.plist"
   cp resources/computer-use/CUA-LICENSE "$cached_helper_contents/Resources/"
   cp "$cua_sdk_library" "$cached_helper_contents/Frameworks/"
-  printf '%s\n' "$helper_fingerprint" > "$cached_helper_contents/Resources/.waku-helper-fingerprint"
-  plutil -replace CFBundleDisplayName -string "$helper_name" "$cached_helper_contents/Info.plist"
+  printf '%s\n' "$helper_fingerprint" > "$cached_helper_contents/Resources/.narel-helper-fingerprint"
+  plutil -replace CFBundleDisplayName -string "$helper_display_name" "$cached_helper_contents/Info.plist"
   plutil -replace CFBundleExecutable -string "$helper_name" "$cached_helper_contents/Info.plist"
   plutil -replace CFBundleIdentifier -string "$bundle_identifier.computer-use" "$cached_helper_contents/Info.plist"
-  plutil -replace CFBundleName -string "$helper_name" "$cached_helper_contents/Info.plist"
+  plutil -replace CFBundleName -string "$helper_display_name" "$cached_helper_contents/Info.plist"
   xcrun swiftc \
     -O \
     -parse-as-library \
@@ -162,18 +166,18 @@ if [ ! -d "$sparkle_framework_source" ]; then
 fi
 
 rm -rf "$bundle"
-mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resources/skills/waku-computer-use" "$contents/Helpers"
-cp "$cargo_target_dir/$profile/waku" "$contents/MacOS/$app_name"
-cp "$cargo_target_dir/$profile/waku_js_repl" "$repl_executable"
+mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resources/skills/narel-computer-use" "$contents/Helpers"
+cp "$cargo_target_dir/$profile/narel" "$contents/MacOS/$app_name"
+cp "$cargo_target_dir/$profile/narel_js_repl" "$repl_executable"
 chmod 755 "$repl_executable"
 if [ "$profile" = "release" ]; then
-  cp "$cargo_target_dir/$profile/waku-daemon" "$daemon_executable"
+  cp "$cargo_target_dir/$profile/narel-daemon" "$daemon_executable"
   chmod 755 "$daemon_executable"
 fi
 cp resources/Info.plist "$contents/Info.plist"
 cp "resources/$icon_file" "$contents/Resources/AppIcon.icns"
 cp resources/computer-use/pi-extension.ts "$contents/Resources/computer-use/pi-extension.ts"
-bun scripts/cua-api.ts "$cached_helper_bundle/Contents/MacOS/$helper_name" "$contents/Resources/skills/waku-computer-use/SKILL.md"
+bun scripts/cua-api.ts "$cached_helper_bundle/Contents/MacOS/$helper_name" "$contents/Resources/skills/narel-computer-use/SKILL.md"
 frameworks_directory="$contents/Frameworks"
 sparkle_framework="$frameworks_directory/Sparkle.framework"
 mkdir -p "$frameworks_directory"
@@ -192,13 +196,13 @@ done
 # one is a warning: CI always stages both.
 if [ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]; then
   mkdir -p "$contents/Resources/remote"
-  for candidate in "$WAKU_REMOTE_DAEMONS_DIR"/waku-daemon-*; do
+  for candidate in "$WAKU_REMOTE_DAEMONS_DIR"/narel-daemon-*; do
     [ -f "$candidate" ] || continue
     remote_daemon="$(basename "$candidate")"
     cp "$candidate" "$contents/Resources/remote/$remote_daemon"
     chmod 755 "$contents/Resources/remote/$remote_daemon"
   done
-  for remote_daemon in waku-daemon-linux-x86_64 waku-daemon-linux-aarch64; do
+  for remote_daemon in narel-daemon-linux-x86_64 narel-daemon-linux-aarch64; do
     if [ ! -f "$contents/Resources/remote/$remote_daemon" ]; then
       echo "warning: WAKU_REMOTE_DAEMONS_DIR has no $remote_daemon; Linux hosts of that architecture cannot be reached." >&2
     fi
@@ -206,10 +210,10 @@ if [ -n "${WAKU_REMOTE_DAEMONS_DIR:-}" ]; then
 elif [ "$profile" = "release" ]; then
   echo "warning: WAKU_REMOTE_DAEMONS_DIR is not set; this bundle cannot connect to Linux hosts." >&2
 fi
-plutil -replace CFBundleDisplayName -string "$app_name" "$contents/Info.plist"
+plutil -replace CFBundleDisplayName -string "$display_name" "$contents/Info.plist"
 plutil -replace CFBundleExecutable -string "$app_name" "$contents/Info.plist"
 plutil -replace CFBundleIdentifier -string "$bundle_identifier" "$contents/Info.plist"
-plutil -replace CFBundleName -string "$app_name" "$contents/Info.plist"
+plutil -replace CFBundleName -string "$display_name" "$contents/Info.plist"
 cp -R "$cached_helper_bundle" "$helper_bundle"
 # Finder info and resource forks on copied resources make codesign reject the
 # bundle as "detritus"; strip extended attributes before signing.

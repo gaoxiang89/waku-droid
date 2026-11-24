@@ -510,7 +510,7 @@ export function Composer({
         return true
       }
       case 'swarmBoard':
-        toast.info('Swarm board is only available in Waku Desktop.')
+        toast.info('Swarm board is only available in Narel Desktop.')
         return true
     }
   }

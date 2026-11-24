@@ -27,11 +27,11 @@ use super::{ssh, wsl};
 /// Install directory below the remote `$HOME`. Development builds keep their
 /// own so they never replace a production daemon a released app relies on.
 pub const REMOTE_DIRECTORY: &str = if cfg!(debug_assertions) {
-    ".cache/waku-dev/server"
+    ".cache/narel-dev/server"
 } else {
-    ".cache/waku/server"
+    ".cache/narel/server"
 };
-const DAEMON_NAME: &str = "waku-daemon";
+const DAEMON_NAME: &str = "narel-daemon";
 const REMOTE_DEV_DIRECTORY: &str = "remote-dev";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const WSL_DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -55,7 +55,7 @@ impl RemoteOs {
 
     fn daemon_binary_name(self) -> &'static str {
         match self {
-            Self::Windows => "waku-daemon.exe",
+            Self::Windows => "narel-daemon.exe",
             Self::Linux | Self::Darwin => DAEMON_NAME,
         }
     }
@@ -471,8 +471,8 @@ fn artifact_path(target: RemoteTarget) -> anyhow::Result<PathBuf> {
     {
         candidates.push(directory.join("remote").join(&name));
         candidates.push(directory.join("../Resources/remote").join(&name));
-        // The Linux archive keeps executables in bin/ and data in share/waku.
-        candidates.push(directory.join("../share/waku/remote").join(&name));
+        // The Linux archive keeps executables in bin/ and data in share/narel.
+        candidates.push(directory.join("../share/narel/remote").join(&name));
         if cfg!(debug_assertions)
             && let Some(target_directory) = directory
                 .ancestors()
@@ -529,7 +529,7 @@ fn push_host_daemon_candidates(
     executable: &Path,
     target: RemoteTarget,
 ) {
-    let debug_daemon = directory.join(format!("waku-debug-daemon{}", target.executable_suffix()));
+    let debug_daemon = directory.join(format!("narel-debug-daemon{}", target.executable_suffix()));
     let standard_daemon = directory.join(target.daemon_binary_name());
     let debug_mtime = std::fs::metadata(&debug_daemon)
         .and_then(|metadata| metadata.modified())
@@ -540,7 +540,7 @@ fn push_host_daemon_candidates(
     let prefer_debug_on_tie = executable
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.starts_with("waku-debug"));
+        .is_some_and(|stem| stem.starts_with("narel-debug"));
     let standard_first = match (debug_mtime, standard_mtime) {
         (Some(debug_time), Some(standard_time)) => {
             standard_time > debug_time || (standard_time == debug_time && !prefer_debug_on_tie)
@@ -714,7 +714,7 @@ fn deploy_wsl(distro: &str, artifact: &Artifact, force: bool) -> anyhow::Result<
         _ => bail!(
             "{}",
             with_detail(
-                &format!("could not install waku-daemon in WSL {distro}"),
+                &format!("could not install narel-daemon in WSL {distro}"),
                 explain_install_stderr(&wsl::decode_wsl_text(&output.stderr)).trim(),
             )
         ),
@@ -888,7 +888,7 @@ fn deploy_ssh(
     let upload_timeout = install_deadline.saturating_duration_since(std::time::Instant::now());
     let uploaded = match upload_rx.recv_timeout(upload_timeout) {
         Ok(result) => result,
-        Err(_) => return Err(failure(&mut child, &mut job, "timed out uploading waku-daemon")),
+        Err(_) => return Err(failure(&mut child, &mut job, "timed out uploading narel-daemon")),
     };
     match uploaded {
         Ok(copied) if copied == artifact.size => {}
@@ -900,7 +900,7 @@ fn deploy_ssh(
             return Err(failure(&mut child, &mut job, &message));
         }
         Err(error) => {
-            let message = format!("could not upload waku-daemon: {error}");
+            let message = format!("could not upload narel-daemon: {error}");
             return Err(failure(&mut child, &mut job, &message));
         }
     }
@@ -910,7 +910,7 @@ fn deploy_ssh(
         return Err(failure(
             &mut child,
             &mut job,
-            "timed out installing waku-daemon",
+            "timed out installing narel-daemon",
         ));
     }
     let status = wait_with_deadline(&mut child, Duration::from_secs(10));
@@ -926,7 +926,7 @@ fn deploy_ssh(
     }
     Err(anyhow!(
         "{}",
-        with_detail("could not install waku-daemon", &format_stderr())
+        with_detail("could not install narel-daemon", &format_stderr())
     ))
 }
 
@@ -1068,18 +1068,18 @@ mod tests {
     fn artifact_names_follow_the_bundle_layout() {
         assert_eq!(
             RemoteTarget::new(RemoteOs::Linux, RemoteArch::Aarch64).artifact_name(),
-            "waku-daemon-linux-aarch64"
+            "narel-daemon-linux-aarch64"
         );
         assert_eq!(
             RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64).artifact_name(),
-            "waku-daemon-windows-x86_64.exe"
+            "narel-daemon-windows-x86_64.exe"
         );
     }
 
     #[test]
     fn windows_bridge_command_targets_the_installed_daemon() {
         let script = windows_bridge_script(false);
-        assert!(script.contains("waku-daemon.exe"));
+        assert!(script.contains("narel-daemon.exe"));
         assert!(script.contains("bridge"));
         assert!(script.contains("ProcessStartInfo"));
         assert!(!script.contains(waku_protocol::bridge::REPLACE_INCOMPATIBLE_FLAG));
@@ -1554,14 +1554,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let target = RemoteTarget::new(RemoteOs::Windows, RemoteArch::X86_64);
-        let debug_bin = dir.join("waku-debug-daemon.exe");
-        let standard_bin = dir.join("waku-daemon.exe");
+        let debug_bin = dir.join("narel-debug-daemon.exe");
+        let standard_bin = dir.join("narel-daemon.exe");
         std::fs::write(&debug_bin, b"stale-debug").unwrap();
         std::thread::sleep(Duration::from_millis(50));
         std::fs::write(&standard_bin, b"fresh-standard").unwrap();
 
         let mut candidates = Vec::new();
-        push_host_daemon_candidates(&mut candidates, &dir, &dir.join("waku-debug.exe"), target);
+        push_host_daemon_candidates(&mut candidates, &dir, &dir.join("narel-debug.exe"), target);
         assert_eq!(candidates, vec![standard_bin.clone(), debug_bin.clone()]);
 
         std::thread::sleep(Duration::from_millis(50));

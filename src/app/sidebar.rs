@@ -3326,7 +3326,7 @@ mod tests {
 
     #[test]
     fn projectless_sidebar_projects_are_paths_under_the_workspace_root() {
-        let root = Path::new("/tmp/.waku/projects");
+        let root = Path::new("/tmp/.narel/projects");
         let projectless = Project {
             id: Uuid::from_u128(1),
             name: "Task".to_owned(),
@@ -3340,7 +3340,7 @@ mod tests {
             created_at: 0,
         };
 
-        let roots = [PathBuf::from("/home/me/.waku/projects"), root.to_owned()];
+        let roots = [PathBuf::from("/home/me/.narel/projects"), root.to_owned()];
         assert!(sidebar_project_is_projectless(&projectless, &roots));
         assert!(!sidebar_project_is_projectless(&ordinary, &roots));
         assert!(!sidebar_project_is_projectless(&projectless, &[]));
@@ -3351,10 +3351,10 @@ mod tests {
         let windows_projectless = Project {
             id: Uuid::from_u128(3),
             name: "WinTask".to_owned(),
-            path: PathBuf::from(r"c:\Users\Me\.waku\projects\2026-08-23\task"),
+            path: PathBuf::from(r"c:\Users\Me\.narel\projects\2026-08-23\task"),
             created_at: 0,
         };
-        let win_roots = [PathBuf::from(r"C:\users\me\.waku\projects/")];
+        let win_roots = [PathBuf::from(r"C:\users\me\.narel\projects/")];
         assert!(sidebar_project_is_projectless(
             &windows_projectless,
             &win_roots
@@ -3363,10 +3363,10 @@ mod tests {
         let unc_projectless = Project {
             id: Uuid::from_u128(4),
             name: "UncTask".to_owned(),
-            path: PathBuf::from(r"\\Host\Share\.waku\projects\2026-08-23\task"),
+            path: PathBuf::from(r"\\Host\Share\.narel\projects\2026-08-23\task"),
             created_at: 0,
         };
-        let unc_roots = [PathBuf::from("//host/share/.waku/projects")];
+        let unc_roots = [PathBuf::from("//host/share/.narel/projects")];
         assert!(sidebar_project_is_projectless(&unc_projectless, &unc_roots));
     }
 

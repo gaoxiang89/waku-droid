@@ -117,24 +117,24 @@ jobs:
       - name: Build
         run: |
           cargo build --locked --release --target "$TARGET" \
-            --package waku-daemon --bin waku-daemon
+            --package waku-daemon --bin narel-daemon
           mkdir -p remote-daemon
-          cp "target/$TARGET/release/waku-daemon" \
-            "remote-daemon/waku-daemon-linux-${{ matrix.arch }}"
+          cp "target/$TARGET/release/narel-daemon" \
+            "remote-daemon/narel-daemon-linux-${{ matrix.arch }}"
           # A dynamically linked result would install fine and then fail to
           # start on hosts with a different libc.
-          info=$(file -b "remote-daemon/waku-daemon-linux-${{ matrix.arch }}")
+          info=$(file -b "remote-daemon/narel-daemon-linux-${{ matrix.arch }}")
           echo "$info"
           case "$info" in
             *"statically linked"* | *"static-pie linked"*) ;;
-            *) echo "::error::waku-daemon is not statically linked"; exit 1 ;;
+            *) echo "::error::narel-daemon is not statically linked"; exit 1 ;;
           esac
-          "remote-daemon/waku-daemon-linux-${{ matrix.arch }}" --fingerprint
+          "remote-daemon/narel-daemon-linux-${{ matrix.arch }}" --fingerprint
 
       - uses: actions/upload-artifact@v7
         with:
           name: remote-daemon-linux-${{ matrix.arch }}
-          path: remote-daemon/waku-daemon-linux-${{ matrix.arch }}
+          path: remote-daemon/narel-daemon-linux-${{ matrix.arch }}
           if-no-files-found: error
 
   windows-x86_64:
@@ -173,7 +173,7 @@ jobs:
       # clears them.
       - name: Clear stale bundles
         run: |
-          Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe
+          Remove-Item -Force -ErrorAction SilentlyContinue target/release/waku-*.zip, target/release/Waku-*-Setup.exe, target/release/narel-*.zip, target/release/Narel-*-Setup.exe
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/remote-daemons
 
       - uses: actions/download-artifact@v8
@@ -199,8 +199,8 @@ jobs:
         with:
           name: windows-x86_64
           path: |
-            target/release/waku-${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc.zip
-            target/release/Waku-${{ needs.version.outputs.version }}-x86_64-Setup.exe
+            target/release/narel-${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc.zip
+            target/release/Narel-${{ needs.version.outputs.version }}-x86_64-Setup.exe
           if-no-files-found: error
 
   draft-release:

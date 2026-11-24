@@ -1,6 +1,6 @@
 # Remote hosts: WSL and SSH
 
-Waku can run its daemon inside a WSL distribution or on an SSH host, so
+Narel can run its daemon inside a WSL distribution or on an SSH host, so
 agents (Claude Code, Pi, Codex, and every other provider), file access, Git,
 checkpoints, and terminals all run where the code lives. The desktop only
 renders; nothing is synced.
@@ -11,13 +11,13 @@ renders; nothing is synced.
 desktop                                   WSL distribution / SSH host
 DaemonClient ─TCP─▶ loopback relay
                     └─ stdio ⇄ wsl.exe --exec … / ssh -T host …
-                                            └─▶ waku-daemon bridge
+                                            └─▶ narel-daemon bridge
                                                   ├─ starts or reuses the host's daemon
                                                   ├─ prints BridgeReady{token, …}
                                                   └─ relays bytes ⇄ 127.0.0.1:<daemon port>
 ```
 
-- **Same daemon everywhere.** The remote side is the ordinary `waku-daemon`
+- **Same daemon everywhere.** The remote side is the ordinary `narel-daemon`
   speaking the ordinary WebSocket protocol. Nothing about providers or the
   wire contract is remote-specific.
 - **Transport is the user's own `wsl.exe` or `ssh`.** `~/.ssh/config`,
@@ -28,9 +28,9 @@ DaemonClient ─TCP─▶ loopback relay
   `cmd.exe`, Git Bash, MSYS, and Cygwin default shells invoke
   `powershell.exe -EncodedCommand` (resolving `%SystemRoot%` when `PATH` omits
   it).
-- **The remote daemon outlives the connection.** `waku-daemon bridge` starts
+- **The remote daemon outlives the connection.** `narel-daemon bridge` starts
   the daemon in its own session (`setsid`) on Unix and records its address and
-  token in `~/.cache/waku/server/daemon.json` (mode `0600`, or an owner-only
+  token in `~/.cache/narel/server/daemon.json` (mode `0600`, or an owner-only
   DACL on Windows). A dropped network
   only kills the bridge; the desktop starts a new one and resumes every
   runtime from its replay cursor, so a running agent keeps going. On Windows
@@ -52,23 +52,23 @@ On connect the desktop:
 
 1. probes the host with `uname -s; uname -m` on POSIX, then falls back to a
    PowerShell probe on Windows (Linux, macOS, or Windows; x86_64 or aarch64);
-2. compares `~/.cache/waku/server/waku-daemon --fingerprint` (or
-   `%USERPROFILE%\.cache\waku\server\waku-daemon.exe --fingerprint` on
+2. compares `~/.cache/narel/server/narel-daemon --fingerprint` (or
+   `%USERPROFILE%\.cache\narel\server\narel-daemon.exe --fingerprint` on
    Windows) with the daemon it carries for that target, and reuses the
    install when they match;
 3. otherwise copies (WSL, via `wslpath`) or streams over ssh's stdin (SSH)
    the binary into a temporary file, verifies its fingerprint, and moves it
    into place atomically. On Windows the running `.exe` is renamed aside
    before the verified temporary binary is moved in;
-4. launches `waku-daemon bridge`. A reused install that reports another
+4. launches `narel-daemon bridge`. A reused install that reports another
    protocol version is reinstalled once.
 
 Settings → General → About lists the version each connected daemon announced
 in its handshake, so a host still running an older install is visible at a
 glance.
 
-Development builds use `~/.cache/waku-dev/server` (or
-`%USERPROFILE%\.cache\waku-dev\server` on Windows) so they never replace a
+Development builds use `~/.cache/narel-dev/server` (or
+`%USERPROFILE%\.cache\narel-dev\server` on Windows) so they never replace a
 released app's daemon.
 
 The fingerprint is a 64-bit FNV-1a hash of the binary's bytes. It decides
@@ -81,19 +81,19 @@ For a target such as Linux x86_64 the desktop looks, in order, for:
 1. `WAKU_REMOTE_DAEMON_LINUX_X86_64` (likewise `_LINUX_AARCH64`,
    `_DARWIN_AARCH64`, `_DARWIN_X86_64`, `_WINDOWS_X86_64`, and
    `_WINDOWS_AARCH64`);
-2. `waku-daemon-linux-x86_64` (or
-   `waku-daemon-windows-x86_64.exe`) in the package's `remote/` directory:
-   next to `waku.exe` on Windows, `Contents/Resources/remote/` on macOS, and
-   `share/waku/remote/` in the Linux archive;
+2. `narel-daemon-linux-x86_64` (or
+   `narel-daemon-windows-x86_64.exe`) in the package's `remote/` directory:
+   next to `narel.exe` on Windows, `Contents/Resources/remote/` on macOS, and
+   `share/narel/remote/` in the Linux archive;
 3. in development, `target/remote-dev/`, then
-   `target/<triple>/{debug,release}/waku-daemon` for the musl, gnu, and
+   `target/<triple>/{debug,release}/narel-daemon` for the musl, gnu, and
    Windows triples;
-4. the app's own `waku-daemon` when the host has the same platform.
+4. the app's own `narel-daemon` when the host has the same platform.
 
 Release CI builds statically linked `*-unknown-linux-musl` daemons for
 x86_64 and aarch64 (the `remote-daemon` job), so they never depend on the
-host's glibc, and the Windows x64 package carries both next to `waku.exe`.
-It also carries the package's own `waku-daemon.exe`, which serves a Windows
+host's glibc, and the Windows x64 package carries both next to `narel.exe`.
+It also carries the package's own `narel-daemon.exe`, which serves a Windows
 x64 host. The current release workflow does not build a Windows ARM64
 daemon, and packages for other desktop platforms do not carry a Windows
 daemon; for those targets, supply one with the environment variable above
@@ -157,7 +157,7 @@ SSH targets are either `configHost` (an alias) or `direct` (`hostname`,
 `port`, `user`, `identityFile`, `proxyJump`). `authMethod` is `agent`
 (default), `key` (requires `identityFile`, offered exclusively), or
 `password`. Passwords live in the system credential store under the
-connection id; ssh reads them back by launching Waku itself as
+connection id; ssh reads them back by launching Narel itself as
 `SSH_ASKPASS`, so they never appear on a command line or in a file.
 
 Every provider CLI the remote tasks use — `claude`, `pi`, `codex`, and so on
@@ -173,43 +173,43 @@ the remote host itself.
 (`ssh:<alias>`) or WSL distribution (`wsl:<distro>`):
 
 ```sh
-waku --host ssh:build /srv/app
-waku --host ssh:build ~/projects/api
-waku --host wsl:Ubuntu-24.04 ~/src/app
+narel --host ssh:build /srv/app
+narel --host ssh:build ~/projects/api
+narel --host wsl:Ubuntu-24.04 ~/src/app
 ```
 
-If Waku is already running, it routes the request to that host (connecting it
-first if needed) and focuses the window; otherwise it launches Waku, connects
+If Narel is already running, it routes the request to that host (connecting it
+first if needed) and focuses the window; otherwise it launches Narel, connects
 the host, and opens the workspace once its snapshot loads.
 
 **From inside a connected SSH or WSL host:**
 
-- **Waku's built-in remote terminal** injects the remote CLI directory onto
-  `PATH` automatically, so `waku .` and `waku /path/to/project` work out of the
-  box.
-- **External SSH or WSL terminals** find `waku` in `~/.local/bin` after the
-  desktop connects to that host once. `waku-daemon bridge` stages the CLI shim
-  at `~/.cache/waku/server/bin/waku` (Unix) or
-  `%USERPROFILE%\.cache\waku\server\bin\waku.cmd` alongside a POSIX `waku`
-  script for Git Bash (Windows SSH hosts), and a release bridge links the Unix
-  shim into `~/.local/bin/waku` without replacing any other `waku` already
-  there. Development builds stage under `~/.cache/waku-dev/server` and do not
-  touch `~/.local/bin`, so a dev daemon never shadows the released CLI. If
-  `~/.local/bin` is not on your `PATH`, add it, or link the shim somewhere that
-  is:
+- **Narel's built-in remote terminal** injects the remote CLI directory onto
+  `PATH` automatically, so `narel .` and `narel /path/to/project` work out of
+  the box.
+- **External SSH or WSL terminals** find `narel` in `~/.local/bin`
+  after the desktop connects to that host once. `narel-daemon bridge` stages
+  the CLI shim at `~/.cache/narel/server/bin/narel` (Unix) or
+  `%USERPROFILE%\.cache\narel\server\bin\narel.cmd` alongside a
+  POSIX `narel` script for Git Bash (Windows SSH hosts). A release
+  bridge links the Unix shim into `~/.local/bin` without replacing any other
+  `narel` already there. Development builds stage under
+  `~/.cache/narel-dev/server` and do not touch `~/.local/bin`, so a dev daemon
+  never shadows the released CLI. If `~/.local/bin` is not on your `PATH`, add
+  it, or link the shim somewhere that is:
 
   ```sh
   mkdir -p ~/.local/bin
-  ln -sf ~/.cache/waku/server/bin/waku ~/.local/bin/waku
+  ln -sf ~/.cache/narel/server/bin/narel ~/.local/bin/narel
   ```
 
-  On Windows WSL, the Linux shim avoids invoking the Windows `waku.exe` over
+  On Windows WSL, the Linux shim avoids invoking the Windows `narel.exe` over
   WSL interop.
 
-- **Desktop connection required:** running `waku` on a remote host talks to
+- **Desktop connection required:** running `narel` on a remote host talks to
   that host's daemon and forwards the open request to the connected desktop
-  app. The Waku desktop app must be currently connected to that host;
-  otherwise `waku` prints an error to stderr and exits non-zero.
+  app. The Narel desktop app must be currently connected to that host;
+  otherwise `narel` prints an error to stderr and exits non-zero.
 
 ### Markdown images
 
@@ -252,8 +252,8 @@ Without the watcher, build it by hand:
 ```sh
 # in WSL
 rustup target add x86_64-unknown-linux-musl
-CARGO_TARGET_DIR=$HOME/.cache/waku-target cargo build -p waku-daemon --target x86_64-unknown-linux-musl
-cp ~/.cache/waku-target/x86_64-unknown-linux-musl/debug/waku-daemon /mnt/c/path/to/waku/target/remote-dev/waku-daemon-linux-x86_64
+CARGO_TARGET_DIR=$HOME/.cache/waku-target cargo build -p waku-daemon --bin narel-daemon --target x86_64-unknown-linux-musl
+cp ~/.cache/waku-target/x86_64-unknown-linux-musl/debug/narel-daemon /mnt/c/path/to/waku/target/remote-dev/narel-daemon-linux-x86_64
 ```
 
 ```sh
@@ -269,9 +269,9 @@ on some machines and keeps the debug app from starting.
 directory, and with `--drop` kills the remote bridge to confirm the
 supervisor reconnects to the same daemon.
 
-Remote state lives in `~/.cache/waku[-dev]/server/` on Unix and
-`%USERPROFILE%\.cache\waku[-dev]\server\` on Windows: `waku-daemon` (or
-`waku-daemon.exe`), `bin/waku` (or `bin/waku.cmd` and `bin/waku` on Windows),
+Remote state lives in `~/.cache/narel[-dev]/server/` on Unix and
+`%USERPROFILE%\.cache\narel[-dev]\server\` on Windows: `narel-daemon` (or
+`narel-daemon.exe`), `bin/narel` (or `bin/narel.cmd` and `bin/narel` on Windows),
 `daemon.json`, `daemon.lock`, and `daemon.log` (the daemon's stderr).
 
 ## Current limitations
@@ -285,7 +285,7 @@ Remote state lives in `~/.cache/waku[-dev]/server/` on Unix and
   needs the credential entry created by other means. Prefer ssh-agent or a
   key.
 - Hosts can be Linux, macOS, or Windows on x86_64 or aarch64, but a Windows
-  host needs a `waku-daemon-windows-<arch>.exe` for that architecture. The
+  host needs a `narel-daemon-windows-<arch>.exe` for that architecture. The
   Windows x64 package carries one; the current release workflow does not
   build a Windows ARM64 daemon.
 - On Windows, keeping the daemon alive after the SSH session closes depends

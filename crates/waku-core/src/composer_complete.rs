@@ -443,14 +443,14 @@ fn assemble_slash_commands_with_home(
         scan_skill_files(provider, &home.join(".agents/skills"), &mut commands);
     }
     scan_command_files(
-        &project_root.join(".waku/commands"),
+        &project_root.join(".narel/commands"),
         CommandScope::Project,
         true,
         &mut commands,
     );
     if let Some(home) = home.as_deref() {
         scan_command_files(
-            &home.join(".config/waku/commands"),
+            &home.join(".config/narel/commands"),
             CommandScope::User,
             true,
             &mut commands,
@@ -1458,14 +1458,14 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("waku-native-commands-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".opencode/commands")).unwrap();
-        std::fs::create_dir_all(root.join(".waku/commands")).unwrap();
+        std::fs::create_dir_all(root.join(".narel/commands")).unwrap();
         std::fs::write(
             root.join(".opencode/commands/native-review.md"),
             "Review $ARGUMENTS",
         )
         .unwrap();
         std::fs::write(
-            root.join(".waku/commands/waku-review.md"),
+            root.join(".narel/commands/narel-review.md"),
             "Review $ARGUMENTS",
         )
         .unwrap();
@@ -1490,7 +1490,7 @@ mod tests {
             None
         );
         assert_eq!(
-            resolved_submission(ProviderKind::OpenCode, "/waku-review changes", &commands)
+            resolved_submission(ProviderKind::OpenCode, "/narel-review changes", &commands)
                 .as_deref(),
             Some("Review changes")
         );
@@ -1626,8 +1626,8 @@ mod tests {
     fn waku_resume_is_reserved_and_listed_for_every_provider() {
         let root = std::env::temp_dir().join(format!("waku-resume-command-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".waku/commands")).unwrap();
-        std::fs::write(root.join(".waku/commands/resume.md"), "Project override").unwrap();
+        std::fs::create_dir_all(root.join(".narel/commands")).unwrap();
+        std::fs::write(root.join(".narel/commands/resume.md"), "Project override").unwrap();
 
         for provider in ProviderKind::ALL {
             let commands = assemble_slash_commands(provider, &root, None, Vec::new());

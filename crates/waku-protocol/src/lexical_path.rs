@@ -284,7 +284,7 @@ mod tests {
         for raw in [
             "C:foo",
             "relative/path",
-            "~/.waku",
+            "~/.narel",
             "",
             r"\\server",
             "//server",

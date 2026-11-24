@@ -51,7 +51,7 @@ export function renderAppcast(
   return `<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <title>Waku (Linux ${arch})</title>
+    <title>Narel (Linux ${arch})</title>
 ${entries}
   </channel>
 </rss>
@@ -81,7 +81,7 @@ export async function generateLinuxAppcasts(
   const present = new Set(readdirSync(assetsDir));
   const written: string[] = [];
   for (const arch of architectures) {
-    const archive = `waku-${version}-${targetTriple(arch)}.tar.gz`;
+    const archive = `narel-${version}-${targetTriple(arch)}.tar.gz`;
     if (!present.has(archive)) {
       console.warn(`No ${archive} in ${assetsDir}; leaving that feed alone.`);
       continue;
@@ -105,7 +105,7 @@ export async function generateLinuxAppcasts(
     console.log(`Wrote ${feedPath} (${item.length} bytes signed)`);
   }
   if (written.length === 0) {
-    throw new Error(`No waku-${version}-<target>.tar.gz found in ${assetsDir}`);
+    throw new Error(`No narel-${version}-<target>.tar.gz found in ${assetsDir}`);
   }
   return written;
 }

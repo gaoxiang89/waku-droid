@@ -820,7 +820,7 @@ impl PersistedState {
 fn configuration_directory() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join(".waku")
+        .join(".narel")
 }
 
 /// Saved WSL and SSH connections live beside `app.json`; they describe how

@@ -1,6 +1,6 @@
 # Computer Use
 
-Waku embeds **Cua Driver 0.28.0** through its native SDK ABI (1.1). The
+Narel embeds **Cua Driver 0.28.0** through its native SDK ABI (1.1). The
 JavaScript REPL exposes every native tool directly, such as `cua.list_apps()`,
 `cua.get_window_state(args)`, and `cua.click(args)`. Setup binds the native methods internally. The bundled skill contains the
 host-specific method signatures and direct-call examples; agent code does
@@ -16,13 +16,13 @@ build registers the `cua` bridge, attaches the skill, or reaches the SDK.
 
 ## Processes and lifetime
 
-On macOS, the signed `Waku Computer Use.app` hosts the SDK library directly.
+On macOS, the signed `Narel Computer Use.app` hosts the SDK library directly.
 Its Launch Services bridge preserves the helper's existing independent TCC
-identity and Waku's Screen Recording/Accessibility onboarding. The bundled
+identity and Narel's Screen Recording/Accessibility onboarding. The bundled
 library is signed with the same identity as the helper. Permission requests
 remain host-owned: direct SDK permission checks do not open macOS prompts.
 
-On Windows and Linux, `waku_computer_use` loads the packaged SDK library into
+On Windows and Linux, `narel_computer_use` loads the packaged SDK library into
 its own process. It communicates with the REPL over inherited stdin/stdout.
 Windows also packages Cua's UIA support executable. No Cua daemon, installation,
 Python runtime, Node runtime, or separately running service is required.
@@ -35,7 +35,7 @@ automatically retried. The `bring_to_front` tool is omitted from the exposed
 API. Other tool arguments pass through to Cua unchanged. All SDK and IPC work
 occurs outside the GUI process.
 
-Waku's preview decodes each PNG from the agent's `get_window_state` result on
+Narel's preview decodes each PNG from the agent's `get_window_state` result on
 a background worker. The previous decoded frame stays visible until the latest
 replacement is ready; stale or invalid frames are discarded. There is no
 second capture or continuous accessibility walk to change the agent's snapshot.
@@ -48,14 +48,14 @@ Cua Driver. Headless hosts still report unavailable graphics facilities.
 
 ## OpenCode
 
-OpenCode uses the existing shared service. Waku registers one temporary MCP
+OpenCode uses the existing shared service. Narel registers one temporary MCP
 connection per workspace through `/api/experimental/mcp/{server}` and attaches
 a session instruction entry pointing to the bundled skill
-(`/api/experimental/session/{id}/instructions/entries/waku-computer-use`).
+(`/api/experimental/session/{id}/instructions/entries/narel-computer-use`).
 `js` and `js_reset` remain direct tools, with OpenCode's additional codemode
 wrapper disabled for this server.
 
-OpenCode's `_meta.sessionID` selects a Waku-owned registration, so each task
+OpenCode's `_meta.sessionID` selects a Narel-owned registration, so each task
 has independent JavaScript bindings, native helper processes, cancellation,
 and PiP frames. Unregistered sessions cannot execute calls through the bridge.
 Detaching a task revokes its registration and removes its instructions; the
@@ -65,18 +65,18 @@ No OpenCode configuration files or service descriptors are written.
 
 ## Platform requirements
 
-- **macOS:** grant the Waku helper Screen Recording and Accessibility access
+- **macOS:** grant the Narel helper Screen Recording and Accessibility access
   in Settings > Computer Use. Relaunch the permission-owning helper after a
   grant changes; new REPL connections launch a fresh helper.
 - **Windows:** run within the user's interactive desktop. Elevated apps and
   secure desktops remain subject to Windows restrictions. The SDK's native
   capability/error results describe supported input routes.
 - **Linux:** X11 uses the active display and AT-SPI accessibility services.
-  In a Wayland session, Waku enables Cua's experimental native Wayland backend
+  In a Wayland session, Narel enables Cua's experimental native Wayland backend
   unless `CUA_DRIVER_RS_ENABLE_WAYLAND` is already set. Window targeting and
   input depend on the compositor's supported routes and installed desktop
   integrations. Cua's GNOME helper files ship under
-  `share/waku/computer-use/wayland-helper`; Waku does not automatically install
+  `share/narel/computer-use/wayland-helper`; Narel does not automatically install
   shell extensions or compositor plugins. `check_permissions` and the native
   tool catalog describe what is available. Unsupported background delivery
   remains an explicit refusal.
@@ -108,7 +108,7 @@ configuration reads, a request missing required arguments, a synthetic image,
 and REPL reset/reconnect:
 
 ```sh
-cargo build -p waku --bin waku_js_repl -p waku-computer-use --bin waku_computer_use
+cargo build -p waku --bin narel_js_repl -p waku-computer-use --bin narel_computer_use
 bun scripts/cua-driver.ts bundle target/debug target/debug/resources debug
 bun scripts/test-computer-use.ts
 ```

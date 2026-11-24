@@ -3,10 +3,10 @@ name = "waku-computer-use"
 version.workspace = true
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Waku's in-process Cua Driver SDK host"
+description = "Narel's in-process Cua Driver SDK host"
 
 [[bin]]
-name = "waku_computer_use"
+name = "narel_computer_use"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,34 +1,34 @@
-# Waku on Windows
+# Narel on Windows
+
+Narel is a community fork of egoist/waku (GPL-3.0). These steps install this
+fork's Windows package.
 
 ## Install
 
-Download `Waku-<version>-x86_64-Setup.exe` (or the `aarch64` installer on an
-Arm device) from [releases.waku.sh](https://releases.waku.sh) or the
-[GitHub release](https://github.com/egoist/waku/releases) and run it. It
-installs per-user into `%LOCALAPPDATA%\Programs\Waku`, so it never asks for
-administrator rights — which is also what lets Waku update itself later
-without a UAC prompt. By default the installer also checks **Add Waku CLI
-(`waku`) to user PATH**, adding `<install-dir>\bin` to your user `PATH`
-(and remembering your choice across silent updates).
-
-`https://releases.waku.sh/latest-windows.txt` names the current version if you
-want to script the download.
+Download `Narel-<version>-x86_64-Setup.exe` (or the `aarch64` installer on an
+Arm device) from the
+[latest fork release](https://github.com/gaoxiang89/waku-droid/releases/latest)
+and run it. It installs per-user into `%LOCALAPPDATA%\Programs\Narel`, so it never
+asks for administrator rights — which is also what lets Narel update itself
+later without a UAC prompt. By default the installer also checks **Add Narel
+CLI (`narel`) to user PATH**. That adds `<install-dir>\bin` to your user `PATH` (and remembers
+your choice across silent updates).
 
 ### Portable
 
-`waku-<version>-<target>.zip` is the same build without an installer. Unpack it
-anywhere and run `waku.exe` (or `<dir>\bin\waku.exe` from a terminal).
+`narel-<version>-<target>.zip` is the same build without an installer. Unpack it
+anywhere and run `narel.exe` (or `<dir>\bin\narel.exe` from a terminal).
 
-**Keep the installation folder intact.** Waku launches its daemon and
+**Keep the installation folder intact.** Narel launches its daemon and
 Computer Use helpers from this directory and loads the bundled SDK DLL and
-`resources/` files. Moving `waku.exe` out on its own leaves those unavailable.
+`resources/` files. Moving `narel.exe` out on its own leaves those unavailable.
 A shortcut is fine.
 
 A portable copy still updates itself: the updater passes the running
 directory to the installer, so it replaces that copy in place rather than
 creating a second install.
 
-Waku expects:
+Narel expects:
 
 - **Windows 10 version 1809 or newer**, or Windows 11.
 - **A Direct3D 11 driver at feature level 11_0 or newer.** GPUI renders
@@ -36,7 +36,7 @@ Waku expects:
   can run in a VM — see Troubleshooting if the window comes up black.
 - **x86_64 or aarch64.**
 
-Nothing else: Waku links the C runtime statically, so there is no Visual C++
+Nothing else: Narel links the C runtime statically, so there is no Visual C++
 redistributable to install first. That matters most on Arm devices, which
 rarely have the arm64 redistributable already.
 
@@ -46,61 +46,61 @@ release was not code-signed. Choose **More info → Run anyway**.
 ## Command line
 
 The installer registers `<install-dir>\bin` on your user `PATH` by default
-(**Add Waku CLI (`waku`) to user PATH**). Open a new shell after installing so
+(**Add Narel CLI (`narel`) to user PATH**). Open a new shell after installing so
 the updated `PATH` takes effect.
 
-The GUI app stays at `<install-dir>\waku.exe`, while the console CLI lives at
-`<install-dir>\bin\waku.exe`. Putting only `bin\` on `PATH` gives PowerShell,
-Command Prompt, and Git Bash a console `waku` command without colliding with
+The GUI app stays at `<install-dir>\narel.exe`. The console command lives at
+`<install-dir>\bin\narel.exe`. Putting only `bin\` on `PATH` gives PowerShell,
+Command Prompt, and Git Bash a console `narel` command without colliding with
 the GUI executable or exposing helper binaries.
 
 ```powershell
-waku                                    # launch or focus Waku
-waku .                                  # open the current directory
-waku C:\path\to\project                 # open a folder (or a file's parent folder)
-waku --host ssh:build /srv/app          # open a folder on an SSH host
-waku --host wsl:Ubuntu-24.04 ~/src/app  # open a folder in a WSL distribution
+narel                                    # launch or focus Narel
+narel .                                  # open the current directory
+narel C:\path\to\project                 # open a folder (or a file's parent folder)
+narel --host ssh:build /srv/app          # open a folder on an SSH host
+narel --host wsl:Ubuntu-24.04 ~/src/app  # open a folder in a WSL distribution
 ```
 
-If Waku is already running, `waku` focuses the existing window and opens the
-workspace there; otherwise it launches Waku and opens the workspace.
+If Narel is already running, `narel` focuses the existing window and opens the
+workspace there; otherwise it launches Narel and opens the workspace.
 
-With the portable `.zip`, invoke `<dir>\bin\waku.exe` directly or add
+With the portable `.zip`, invoke `<dir>\bin\narel.exe` directly or add
 `<dir>\bin` to your user `PATH`. To open workspaces from inside a WSL or SSH
 shell, see [Remote hosts](remote.md#opening-workspaces-from-the-command-line).
 
 ## Updating
 
-Waku updates itself. It checks once per launch, and an available update
-appears in the sidebar footer; clicking it downloads the installer, verifies
-its signature, and runs it. Waku closes, is replaced in place, and reopens.
-Turn the check off in **Settings → General → Automatic updates** — **Check for
-Updates…** in the app menu still works either way.
+Narel updates itself from this fork's GitHub releases. It checks once per
+launch, and an available update appears in the sidebar footer; clicking it
+downloads the installer, verifies its signature, and runs it. Narel closes,
+is replaced in place, and reopens. Turn the check off in **Settings → General
+→ Automatic updates** — **Check for Updates…** in the app menu still works
+either way.
 
-Updates are the same signed feed macOS uses, with one appcast per
-architecture:
+One appcast per architecture:
 
-- `https://releases.waku.sh/appcast-windows-x86_64.xml`
-- `https://releases.waku.sh/appcast-windows-aarch64.xml`
+- `https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-windows-x86_64.xml`
+- `https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-windows-aarch64.xml`
 
-Every installer carries an EdDSA signature, and Waku refuses one that does not
+Every installer carries an EdDSA signature, and Narel refuses one that does not
 verify against the public key built into it — so a compromised mirror or a
 tampered download cannot install anything. The preference itself lives in
-`%LOCALAPPDATA%\Waku\updater.json`.
+`%LOCALAPPDATA%\Narel\updater.json`.
 
-## Where Waku keeps its data
+## Where Narel keeps its data
 
 | What | Path |
 | --- | --- |
-| Tasks, sessions, transcripts | `%LOCALAPPDATA%\Waku\app.db` |
-| Attachments and blobs | `%LOCALAPPDATA%\Waku\blobs` |
-| Settings | `%USERPROFILE%\.waku\app.json` |
+| Tasks, sessions, transcripts | `%LOCALAPPDATA%\Narel\app.db` |
+| Attachments and blobs | `%LOCALAPPDATA%\Narel\blobs` |
+| Settings | `%USERPROFILE%\.narel\app.json` |
 
 Unpacking a new release over the old directory leaves all of it untouched.
 
 ## Agent CLIs
 
-Waku detects the provider CLIs on `PATH` and, because a fresh `PATH` may
+Narel detects the provider CLIs on `PATH` and, because a fresh `PATH` may
 predate an install, also looks in the usual per-user prefixes:
 `%APPDATA%\npm`, `%USERPROFILE%\.bun\bin`, `%USERPROFILE%\.cargo\bin`,
 `%USERPROFILE%\scoop\shims`, and `%LOCALAPPDATA%\Microsoft\WindowsApps`.
@@ -124,7 +124,7 @@ The right panel's Browser tab runs on WebView2, which is in-box on Windows 11
 and evergreen-installed on Windows 10. Navigation, devtools, downloads, and
 pop-up handling behave as they do on macOS.
 
-Waku hosts it in *visual* mode rather than as a child window: the page renders
+Narel hosts it in *visual* mode rather than as a child window: the page renders
 into a DirectComposition visual that GPUI hands out between its own content
 and its overlay plane, so menus, tooltips and dialogs composite above a live
 page instead of hiding it. That is also why the browser needs a working
@@ -138,7 +138,7 @@ Differences worth knowing:
   its devtools window is open, or to close it, so the shortcut only opens and
   refocuses it.
 - **Pen, touch and dragging files into the page are not wired up.** Visual
-  hosting delivers no input of its own; Waku forwards mouse, wheel, cursor and
+  hosting delivers no input of its own; Narel forwards mouse, wheel, cursor and
   focus, and leaves `SendPointerInput` and the external drop target for later.
   Keyboard and IME are unaffected — those still reach the page directly once
   it holds focus.
@@ -157,19 +157,19 @@ elevated apps and secure desktops retain Windows restrictions. See
 
 ## Troubleshooting
 
-**The window opens black, or the app exits at startup.** Waku needs a working
+**The window opens black, or the app exits at startup.** Narel needs a working
 Direct3D 11 device. Update the GPU driver; in a VM, enable 3D acceleration.
 
 **A provider is listed as not installed.** Open a new PowerShell window and run
 the CLI by name. If the shell cannot find it either, the install did not put a
-shim on `PATH`. If the shell finds it but Waku does not, set the binary path in
+shim on `PATH`. If the shell finds it but Narel does not, set the binary path in
 **Settings → Providers** and file an issue with the install method.
 
-**Git-backed features do nothing.** Waku shells out to `git`. Install Git for
+**Git-backed features do nothing.** Narel shells out to `git`. Install Git for
 Windows and make sure `git --version` works in a new terminal.
 
-**The update never arrives.** Waku reaches the feed with the `curl.exe` in
-System32; a proxy or filter that blocks `releases.waku.sh` blocks updates too.
+**The update never arrives.** Narel reaches the feed with the `curl.exe` in
+System32; a proxy or filter that blocks `github.com` blocks updates too.
 **Check for Updates…** reports the reason, where the once-per-launch check
 stays quiet. Downloading the installer by hand and running it is always
 equivalent.

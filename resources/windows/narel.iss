@@ -1,4 +1,4 @@
-; Waku's Windows installer.
+; Narel's Windows installer (community fork of egoist/waku).
 ;
 ; Per-user by design: %LOCALAPPDATA%\Programs needs no elevation, which is
 ; what lets the in-app updater re-run this silently without a UAC prompt.
@@ -37,21 +37,21 @@
 [Setup]
 ; Never change AppId: it is how Windows and every later installer recognize
 ; an existing install, and how the updater replaces rather than duplicates it.
-AppId={{8B6C6E4A-3E0F-4F0B-9C5F-2E0E9C4B7A11}
-AppName=Waku
+AppId={{D4F8A2C1-7B3E-4A9D-8E21-5C6F9A0B3E47}
+AppName=Narel
 AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
-AppPublisher=Waku
-AppPublisherURL=https://waku.sh
-AppSupportURL=https://github.com/egoist/waku/issues
-AppUpdatesURL=https://github.com/egoist/waku/releases
-DefaultDirName={autopf}\Waku
-DefaultGroupName=Waku
-UninstallDisplayName=Waku
-UninstallDisplayIcon={app}\waku.exe
+AppPublisher=Narel
+AppPublisherURL=https://github.com/gaoxiang89/waku-droid
+AppSupportURL=https://github.com/gaoxiang89/waku-droid/issues
+AppUpdatesURL=https://github.com/gaoxiang89/waku-droid/releases
+DefaultDirName={autopf}\Narel
+DefaultGroupName=Narel
+UninstallDisplayName=Narel
+UninstallDisplayIcon={app}\narel.exe
 LicenseFile={#StageDir}\LICENSE
 OutputDir={#OutputDir}
-OutputBaseFilename=Waku-{#AppVersion}-{#Arch}-Setup
+OutputBaseFilename=Narel-{#AppVersion}-{#Arch}-Setup
 SetupIconFile=AppIcon.ico
 Compression=lzma2/max
 SolidCompression=yes
@@ -63,7 +63,7 @@ ArchitecturesInstallIn64BitMode={#Architectures}
 MinVersion=10.0.17763
 ; Two installers must not race — the updater can be triggered again while an
 ; update is already applying.
-SetupMutex=WakuSetup
+SetupMutex=NarelSetup
 ; No elevation, so an update never has to ask for it either.
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
@@ -75,8 +75,8 @@ UsePreviousAppDir=yes
 UsePreviousTasks=yes
 ; Broadcast WM_SETTINGCHANGE so new shells see PATH changes immediately.
 ChangesEnvironment=yes
-; Waku persists continuously to SQLite, so closing it is safe; a silent
-; update cannot stop to ask, and a locked waku.exe would fail the install.
+; Narel persists continuously to SQLite, so closing it is safe; a silent
+; update cannot stop to ask, and a locked narel.exe would fail the install.
 CloseApplications=force
 RestartApplications=no
 
@@ -84,12 +84,12 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "{#StageDir}\waku.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\narel.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Console-subsystem CLI binary; `{app}\bin` is what gets registered on PATH.
-Source: "{#StageDir}\bin\waku.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#StageDir}\waku-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\waku_js_repl.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\waku_computer_use.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\bin\narel.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#StageDir}\narel-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\narel_js_repl.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\narel_computer_use.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\cua_driver_sdk.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\cua-driver-uia.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -105,16 +105,16 @@ Type: filesandordirs; Name: "{app}\remote"
 #endif
 
 [Icons]
-Name: "{group}\Waku"; Filename: "{app}\waku.exe"
-Name: "{userdesktop}\Waku"; Filename: "{app}\waku.exe"; Tasks: desktopicon
+Name: "{group}\Narel"; Filename: "{app}\narel.exe"
+Name: "{userdesktop}\Narel"; Filename: "{app}\narel.exe"; Tasks: desktopicon
 
 [Tasks]
-Name: "addtopath"; Description: "Add Waku CLI (waku) to user PATH"
+Name: "addtopath"; Description: "Add Narel CLI (narel) to user PATH"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Run]
-; No skipifsilent: this is also how the updater's silent run brings Waku back.
-Filename: "{app}\waku.exe"; Description: "{cm:LaunchProgram,Waku}"; Flags: nowait postinstall
+; No skipifsilent: this is also how the updater's silent run brings Narel back.
+Filename: "{app}\narel.exe"; Description: "{cm:LaunchProgram,Narel}"; Flags: nowait postinstall
 
 [Code]
 const

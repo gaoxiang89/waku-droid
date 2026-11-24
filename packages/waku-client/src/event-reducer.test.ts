@@ -156,7 +156,7 @@ test('MCP tool identity survives partial updates and stays separate in expanded 
   const call = {
     id: 'tool-1', source_id: 'call-1', kind: 'tool' as const,
     title: 'List running apps via CUA', detail: null,
-    tool_name: 'js', mcp_server: 'waku_js_repl', arguments: '{}',
+    tool_name: 'js', mcp_server: 'narel_js_repl', arguments: '{}',
     failed: false, complete: false,
   }
   const started = apply(runningSession(), 'richActivity', call)
@@ -170,7 +170,7 @@ test('MCP tool identity survives partial updates and stays separate in expanded 
   expect(item.id).toBe('tool-1')
   expect(item.title).toBe('List running apps via CUA')
   expect(activityDisclosureSections(item)).toEqual([
-    { kind: 'mcp-server', label: 'MCP server', content: 'waku_js_repl' },
+    { kind: 'mcp-server', label: 'MCP server', content: 'narel_js_repl' },
     { kind: 'tool-name', label: 'Tool', content: 'js' },
     { kind: 'arguments', label: 'Arguments', content: '{}' },
     { kind: 'output', label: 'Output', content: '2 apps' },

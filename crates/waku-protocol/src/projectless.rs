@@ -25,7 +25,7 @@ fn workspace_root_slot() -> &'static RwLock<Roots> {
     static ROOT: OnceLock<RwLock<Roots>> = OnceLock::new();
     ROOT.get_or_init(|| {
         RwLock::new(Roots {
-            primary: dirs::home_dir().map(|home| home.join(".waku").join("projects")),
+            primary: dirs::home_dir().map(|home| home.join(".narel").join("projects")),
             additional: Vec::new(),
         })
     })
@@ -169,9 +169,9 @@ mod tests {
 
     #[test]
     fn classifies_windows_and_posix_projectless_paths_lexically() {
-        let win_root = PathBuf::from(r"C:\Users\Alice\.waku\projects");
-        let unc_root = PathBuf::from(r"\\srv\share\Alice\.waku\projects");
-        let posix_root = PathBuf::from("/home/alice/.waku/projects");
+        let win_root = PathBuf::from(r"C:\Users\Alice\.narel\projects");
+        let unc_root = PathBuf::from(r"\\srv\share\Alice\.narel\projects");
+        let posix_root = PathBuf::from("/home/alice/.narel/projects");
         let roots = vec![win_root.clone(), unc_root.clone(), posix_root.clone()];
 
         assert_eq!(
@@ -189,43 +189,43 @@ mod tests {
 
         assert!(is_projectless_in_roots(
             &roots,
-            Path::new("c:/users/alice/.waku/projects/session-1")
+            Path::new("c:/users/alice/.narel/projects/session-1")
         ));
         assert!(is_projectless_in_roots(
             &roots,
-            Path::new(r"\\SRV\Share\alice\.waku\projects\session-1")
+            Path::new(r"\\SRV\Share\alice\.narel\projects\session-1")
         ));
         assert!(is_projectless_in_roots(
             &roots,
-            Path::new("/home/alice/.waku/projects/session-1")
+            Path::new("/home/alice/.narel/projects/session-1")
         ));
         assert!(!is_projectless_in_roots(
             &roots,
-            Path::new(r"C:\Users\Alice\code\waku")
+            Path::new(r"C:\Users\Alice\code\narel")
         ));
         assert!(!is_projectless_in_roots(
             &roots,
-            Path::new("/home/alice/code/waku")
+            Path::new("/home/alice/code/narel")
         ));
 
-        let win_legacy = Path::new(r"c:\users\alice\.waku\2026-04-01\foo");
-        let posix_legacy = Path::new("/home/alice/.waku/2026-04-01/foo");
+        let win_legacy = Path::new(r"c:\users\alice\.narel\2026-04-01\foo");
+        let posix_legacy = Path::new("/home/alice/.narel/2026-04-01/foo");
         assert!(is_projectless_in_roots(&roots, win_legacy));
         assert!(needs_migration_in_roots(&roots, win_legacy));
         assert!(is_projectless_in_roots(&roots, posix_legacy));
         assert!(needs_migration_in_roots(&roots, posix_legacy));
         assert!(!needs_migration_in_roots(
             &roots,
-            Path::new(r"C:\Users\Alice\.waku\projects\2026-04-01\foo")
+            Path::new(r"C:\Users\Alice\.narel\projects\2026-04-01\foo")
         ));
 
         assert!(is_legacy_root_in_roots(
             &roots,
-            Path::new(r"c:\users\alice\.waku")
+            Path::new(r"c:\users\alice\.narel")
         ));
         assert!(is_legacy_root_in_roots(
             &roots,
-            Path::new("/home/alice/.waku")
+            Path::new("/home/alice/.narel")
         ));
         assert!(!is_legacy_root_in_roots(
             &roots,

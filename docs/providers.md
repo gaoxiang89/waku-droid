@@ -370,9 +370,9 @@ unknown markers are dropped. Private control markers never reach the transcript
 **Models** — a throwaway app-server, `model/list` paged via `nextCursor`, up to
 32 pages ([model_catalog.rs:367](../crates/waku-core/src/model_catalog.rs#L367)).
 
-**Computer Use** — `-c mcp_servers.waku_js_repl.command=…` registers Waku's
+**Computer Use** — `-c mcp_servers.narel_js_repl.command=…` registers Narel's
 QuickJS MCP server, with several `-c` flags disabling Codex's own external
-computer-use plugin/MCP/skill so only Waku's `js` / `js_reset` surface is
+computer-use plugin/MCP/skill so only Narel's `js` / `js_reset` surface is
 visible.
 
 ---

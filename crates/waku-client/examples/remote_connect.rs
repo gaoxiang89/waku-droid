@@ -91,21 +91,21 @@ fn kill_remote_bridge(connection: &Connection) -> anyhow::Result<()> {
     let mut command = match &connection.kind {
         ConnectionKind::Wsl { distro } => waku_client::remote::wsl::command(
             distro,
-            "pkill -f '[w]aku-daemon bridge' || true",
+            "pkill -f '[n]arel-daemon bridge' || true",
             &[],
         ),
         ConnectionKind::Ssh { .. } => {
             let target = waku_client::remote::deploy::probe(connection)?;
             let mut command = waku_client::remote::ssh::command(connection)?;
             if target.os == waku_client::remote::deploy::RemoteOs::Windows {
-                let ps = "Get-CimInstance Win32_Process -Filter \"Name='waku-daemon.exe' OR Name='waku-debug-daemon.exe'\" | ForEach-Object { if ($_.CommandLine -match '\\bbridge\\b') { try { [Diagnostics.Process]::GetProcessById([int]$_.ProcessId).Kill() } catch {} } }";
+                let ps = "Get-CimInstance Win32_Process -Filter \"Name='narel-daemon.exe' OR Name='narel-debug-daemon.exe'\" | ForEach-Object { if ($_.CommandLine -match '\\bbridge\\b') { try { [Diagnostics.Process]::GetProcessById([int]$_.ProcessId).Kill() } catch {} } }";
                 command.arg(waku_client::remote::deploy::wrap_windows_script(
                     target.windows_shell,
                     ps,
                 ));
             } else {
                 command.arg(waku_client::remote::ssh::wrap_posix_script(
-                    "pkill -f '[w]aku-daemon bridge' || true",
+                    "pkill -f '[n]arel-daemon bridge' || true",
                 ));
             }
             command

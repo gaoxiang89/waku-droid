@@ -41,7 +41,7 @@ pub fn file_fingerprint(path: &Path) -> io::Result<String> {
 }
 
 pub fn own_fingerprint() -> anyhow::Result<String> {
-    let executable = std::env::current_exe().context("could not locate waku-daemon")?;
+    let executable = std::env::current_exe().context("could not locate narel-daemon")?;
     file_fingerprint(&executable)
         .with_context(|| format!("could not fingerprint {}", executable.display()))
 }
@@ -76,38 +76,29 @@ pub fn write_state(path: &Path, state: &BridgeState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ensure `<state_dir>/bin` contains a `waku` CLI shim that opens workspaces
-/// against the daemon tracked in `<state_dir>/daemon.json`.
+/// CLI names staged beside the daemon.
+const CLI_SHIM_NAMES: &[&str] = &["narel"];
+
+/// Ensure `<state_dir>/bin` contains the `narel` CLI shim that opens
+/// workspaces against the daemon tracked in `<state_dir>/daemon.json`.
 pub fn ensure_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<PathBuf> {
     let bin_dir = state_dir.join(CLI_BIN_DIR);
     fs::create_dir_all(&bin_dir)
         .with_context(|| format!("could not create {}", bin_dir.display()))?;
     #[cfg(unix)]
     {
-        let link_path = bin_dir.join("waku");
         let canonical_state =
             fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
         let daemon_name = if executable.parent() == Some(state_dir) {
             executable
                 .file_name()
-                .unwrap_or_else(|| OsStr::new("waku-daemon"))
+                .unwrap_or_else(|| OsStr::new("narel-daemon"))
         } else {
-            OsStr::new("waku-daemon")
+            OsStr::new("narel-daemon")
         };
         let target = canonical_state.join(daemon_name);
-        let already_matches = fs::read_link(&link_path)
-            .map(|existing| existing == target)
-            .unwrap_or(false);
-        if !already_matches {
-            let tmp = bin_dir.join(format!(".waku.tmp.{}", std::process::id()));
-            let _ = fs::remove_file(&tmp);
-            std::os::unix::fs::symlink(&target, &tmp)
-                .with_context(|| format!("could not create symlink {}", tmp.display()))?;
-            if let Err(error) = fs::rename(&tmp, &link_path) {
-                let _ = fs::remove_file(&tmp);
-                return Err(error)
-                    .with_context(|| format!("could not install {}", link_path.display()));
-            }
+        for name in CLI_SHIM_NAMES {
+            install_cli_symlink(&bin_dir, name, &target)?;
         }
     }
     #[cfg(windows)]
@@ -116,22 +107,44 @@ pub fn ensure_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<Pa
             executable
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("waku-daemon.exe")
+                .unwrap_or("narel-daemon.exe")
         } else {
-            "waku-daemon.exe"
+            "narel-daemon.exe"
         };
         let cmd_contents = format!(
             "@echo off\r\n\"%~dp0..\\{daemon_name}\" open --state-dir \"%~dp0..\" %*\r\nexit /b %ERRORLEVEL%\r\n"
         );
-        write_shim_if_changed(&bin_dir.join("waku.cmd"), cmd_contents.as_bytes())?;
         let sh_contents = format!(
             "#!/bin/sh\ndir=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && (pwd -W 2>/dev/null || pwd))\"\nexec \"$dir/{daemon_name}\" open --state-dir \"$dir\" \"$@\"\n"
         );
-        write_shim_if_changed(&bin_dir.join("waku"), sh_contents.as_bytes())?;
+        for name in CLI_SHIM_NAMES {
+            write_shim_if_changed(&bin_dir.join(format!("{name}.cmd")), cmd_contents.as_bytes())?;
+            write_shim_if_changed(&bin_dir.join(name), sh_contents.as_bytes())?;
+        }
     }
     #[cfg(not(any(unix, windows)))]
     let _ = executable;
     Ok(bin_dir)
+}
+
+#[cfg(unix)]
+fn install_cli_symlink(bin_dir: &Path, name: &str, target: &Path) -> anyhow::Result<()> {
+    let link_path = bin_dir.join(name);
+    let already_matches = fs::read_link(&link_path)
+        .map(|existing| existing == target)
+        .unwrap_or(false);
+    if already_matches {
+        return Ok(());
+    }
+    let tmp = bin_dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)
+        .with_context(|| format!("could not create symlink {}", tmp.display()))?;
+    if let Err(error) = fs::rename(&tmp, &link_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("could not install {}", link_path.display()));
+    }
+    Ok(())
 }
 
 /// Prepare the CLI shim and, for release builds on Unix, expose it to shells
@@ -139,14 +152,18 @@ pub fn ensure_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<Pa
 fn prepare_cli_shim(state_dir: &Path, executable: &Path) -> anyhow::Result<PathBuf> {
     let bin_dir = ensure_cli_shim(state_dir, executable)?;
     #[cfg(unix)]
-    link_cli_onto_path(&bin_dir.join("waku"));
+    {
+        for name in CLI_SHIM_NAMES {
+            link_cli_onto_path(&bin_dir.join(name));
+        }
+    }
     Ok(bin_dir)
 }
 
 /// Link the release CLI into `~/.local/bin` so external SSH and WSL shells
-/// find `waku` after the desktop connects once. Development shims are skipped:
-/// linking one would shadow the released CLI and route to a daemon that exits
-/// with the dev watcher.
+/// find `narel` and `waku` after the desktop connects once. Development shims
+/// are skipped: linking one would shadow the released CLI and route to a
+/// daemon that exits with the dev watcher.
 #[cfg(unix)]
 fn link_cli_onto_path(shim: &Path) {
     if cfg!(debug_assertions) {
@@ -157,7 +174,7 @@ fn link_cli_onto_path(shim: &Path) {
     };
     let shim = std::path::absolute(shim).unwrap_or_else(|_| shim.to_path_buf());
     if let Err(error) = link_into_dir(&shim, &PathBuf::from(home).join(".local/bin")) {
-        eprintln!("waku-daemon bridge: could not link the CLI onto PATH: {error:#}");
+        eprintln!("narel-daemon bridge: could not link the CLI onto PATH: {error:#}");
     }
 }
 
@@ -204,12 +221,12 @@ fn link_into_dir(shim: &Path, dir: &Path) -> anyhow::Result<bool> {
 }
 
 /// A symlink target this project staged, so replacing it cannot destroy a
-/// user's own `waku`.
+/// user's own `narel`.
 #[cfg(unix)]
 fn is_waku_cache_shim(target: &Path) -> bool {
     target
         .to_string_lossy()
-        .contains("/.cache/waku/server/bin/")
+        .contains("/.cache/narel/server/bin/")
 }
 
 #[cfg(windows)]
@@ -249,18 +266,18 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
             unknown => bail!("unknown bridge argument {unknown:?}"),
         }
     }
-    let executable = std::env::current_exe().context("could not locate waku-daemon")?;
+    let executable = std::env::current_exe().context("could not locate narel-daemon")?;
     let state_dir = match state_dir {
         Some(directory) => directory,
         None => executable
             .parent()
-            .ok_or_else(|| anyhow!("waku-daemon has no parent directory"))?
+            .ok_or_else(|| anyhow!("narel-daemon has no parent directory"))?
             .to_owned(),
     };
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("could not create {}", state_dir.display()))?;
     if let Err(error) = prepare_cli_shim(&state_dir, &executable) {
-        eprintln!("waku-daemon bridge: could not prepare CLI shim: {error:#}");
+        eprintln!("narel-daemon bridge: could not prepare CLI shim: {error:#}");
     }
     let fingerprint = file_fingerprint(&executable)
         .with_context(|| format!("could not fingerprint {}", executable.display()))?;
@@ -288,7 +305,7 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
             None => {
                 let state = start_daemon(&executable, &state_dir, &fingerprint)?;
                 let stream = TcpStream::connect(&state.address)
-                    .with_context(|| format!("could not reach waku-daemon at {}", state.address))?;
+                    .with_context(|| format!("could not reach narel-daemon at {}", state.address))?;
                 (state, stream)
             }
         }
@@ -494,7 +511,7 @@ fn start_daemon(
         .create(true)
         .append(true)
         .open(state_dir.join(LOG_FILE))
-        .context("could not open the waku-daemon log")?;
+        .context("could not open the narel-daemon log")?;
     let mut diagnostic_log = log.try_clone().ok();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let idle_secs = IDLE_EXIT_SECONDS.to_string();
@@ -504,7 +521,7 @@ fn start_daemon(
             if let Some(ref mut log) = diagnostic_log {
                 let _ = writeln!(
                     log,
-                    "waku-daemon bridge: could not prepare CLI shim: {error:#}"
+                    "narel-daemon bridge: could not prepare CLI shim: {error:#}"
                 );
             }
             None
@@ -548,7 +565,7 @@ fn start_daemon(
             .with_context(|| format!("could not launch {}", executable.display()))?;
     if !broke_away && let Some(ref mut log) = diagnostic_log {
         let _ = log.write_all(
-            b"waku-daemon bridge: CREATE_BREAKAWAY_FROM_JOB was denied by the host job object; the daemon will exit when the SSH session closes\n",
+            b"narel-daemon bridge: CREATE_BREAKAWAY_FROM_JOB was denied by the host job object; the daemon will exit when the SSH session closes\n",
         );
     }
     let deadline = std::time::Instant::now() + START_TIMEOUT;
@@ -558,19 +575,19 @@ fn start_daemon(
             && state.pid == child.id()
         {
             if state.fingerprint != fingerprint {
-                bail!("waku-daemon reported an unexpected fingerprint");
+                bail!("narel-daemon reported an unexpected fingerprint");
             }
             return Ok(state);
         }
         if let Ok(Some(status)) = child.try_wait() {
             bail!(
-                "waku-daemon exited during startup ({status}); see {}",
+                "narel-daemon exited during startup ({status}); see {}",
                 state_dir.join(LOG_FILE).display()
             );
         }
         if std::time::Instant::now() >= deadline {
             child.kill();
-            bail!("timed out waiting for waku-daemon to start");
+            bail!("timed out waiting for narel-daemon to start");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -938,12 +955,12 @@ mod tests {
 
     #[test]
     fn ensure_cli_shim_installs_platform_cli_entrypoint() {
-        let dir = std::env::temp_dir().join(format!("waku-cli-shim-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("narel-cli-shim-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let exe_name = if cfg!(windows) {
-            "waku-daemon.exe"
+            "narel-daemon.exe"
         } else {
-            "waku-daemon"
+            "narel-daemon"
         };
         let exe = dir.join(exe_name);
         fs::write(&exe, b"stub").unwrap();
@@ -953,22 +970,27 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let target = fs::read_link(bin_dir.join("waku")).unwrap();
-            let expected = fs::canonicalize(&dir).unwrap().join("waku-daemon");
-            assert_eq!(target, expected);
+            let expected = fs::canonicalize(&dir).unwrap().join("narel-daemon");
+            for name in ["narel"] {
+                assert_eq!(fs::read_link(bin_dir.join(name)).unwrap(), expected);
+            }
             // Calling twice is idempotent.
             ensure_cli_shim(&dir, &exe).unwrap();
-            assert_eq!(fs::read_link(bin_dir.join("waku")).unwrap(), expected);
+            for name in ["narel"] {
+                assert_eq!(fs::read_link(bin_dir.join(name)).unwrap(), expected);
+            }
         }
         #[cfg(windows)]
         {
-            let cmd = fs::read_to_string(bin_dir.join("waku.cmd")).unwrap();
-            assert!(cmd.contains(r#""%~dp0..\waku-daemon.exe" open --state-dir "%~dp0.." %*"#));
-            let sh = fs::read_to_string(bin_dir.join("waku")).unwrap();
-            assert!(sh.starts_with("#!/bin/sh\n"));
-            assert!(!sh.contains('\r'));
-            assert!(sh.contains("waku-daemon.exe"));
-            assert!(sh.contains("open --state-dir"));
+            for name in ["narel"] {
+                let cmd = fs::read_to_string(bin_dir.join(format!("{name}.cmd"))).unwrap();
+                assert!(cmd.contains(r#""%~dp0..\narel-daemon.exe" open --state-dir "%~dp0.." %*"#));
+                let sh = fs::read_to_string(bin_dir.join(name)).unwrap();
+                assert!(sh.starts_with("#!/bin/sh\n"));
+                assert!(!sh.contains('\r'));
+                assert!(sh.contains("narel-daemon.exe"));
+                assert!(sh.contains("open --state-dir"));
+            }
             // Calling twice is idempotent.
             ensure_cli_shim(&dir, &exe).unwrap();
         }
@@ -980,37 +1002,37 @@ mod tests {
     #[test]
     fn cli_link_lands_on_path_without_shadowing_foreign_entries() {
         let root =
-            std::env::temp_dir().join(format!("waku-cli-link-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("narel-cli-link-test-{}", uuid::Uuid::new_v4()));
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
-        let exe = state.join("waku-daemon");
+        let exe = state.join("narel-daemon");
         fs::write(&exe, b"stub").unwrap();
-        let shim = ensure_cli_shim(&state, &exe).unwrap().join("waku");
+        let shim = ensure_cli_shim(&state, &exe).unwrap().join("narel");
         let bin = root.join("home/.local/bin");
 
         assert!(link_into_dir(&shim, &bin).unwrap());
-        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), shim);
+        assert_eq!(fs::read_link(bin.join("narel")).unwrap(), shim);
         assert!(!link_into_dir(&shim, &bin).unwrap());
 
         // A user's own binary is never replaced.
-        fs::remove_file(bin.join("waku")).unwrap();
-        fs::write(bin.join("waku"), b"#!/bin/sh\n").unwrap();
+        fs::remove_file(bin.join("narel")).unwrap();
+        fs::write(bin.join("narel"), b"#!/bin/sh\n").unwrap();
         assert!(!link_into_dir(&shim, &bin).unwrap());
-        assert_eq!(fs::read_to_string(bin.join("waku")).unwrap(), "#!/bin/sh\n");
+        assert_eq!(fs::read_to_string(bin.join("narel")).unwrap(), "#!/bin/sh\n");
 
         // Nor is a symlink this project did not stage.
-        fs::remove_file(bin.join("waku")).unwrap();
-        let foreign = root.join("other/waku");
-        std::os::unix::fs::symlink(&foreign, bin.join("waku")).unwrap();
+        fs::remove_file(bin.join("narel")).unwrap();
+        let foreign = root.join("other/narel");
+        std::os::unix::fs::symlink(&foreign, bin.join("narel")).unwrap();
         assert!(!link_into_dir(&shim, &bin).unwrap());
-        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), foreign);
+        assert_eq!(fs::read_link(bin.join("narel")).unwrap(), foreign);
 
-        // A stale link into the Waku cache is refreshed.
-        fs::remove_file(bin.join("waku")).unwrap();
-        std::os::unix::fs::symlink(root.join(".cache/waku/server/bin/waku"), bin.join("waku"))
+        // A stale link into the Narel cache is refreshed.
+        fs::remove_file(bin.join("narel")).unwrap();
+        std::os::unix::fs::symlink(root.join(".cache/narel/server/bin/narel"), bin.join("narel"))
             .unwrap();
         assert!(link_into_dir(&shim, &bin).unwrap());
-        assert_eq!(fs::read_link(bin.join("waku")).unwrap(), shim);
+        assert_eq!(fs::read_link(bin.join("narel")).unwrap(), shim);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1774,7 +1796,7 @@ mod platform {
     }
 
     pub fn lock(_path: &Path) -> anyhow::Result<Lock> {
-        anyhow::bail!("waku-daemon bridge runs only on Linux, macOS, and Windows hosts")
+        anyhow::bail!("narel-daemon bridge runs only on Linux, macOS, and Windows hosts")
     }
 
     pub fn restrict_file_permissions(_file: &fs::File) -> anyhow::Result<()> {

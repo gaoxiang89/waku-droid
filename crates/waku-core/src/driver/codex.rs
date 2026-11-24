@@ -532,17 +532,17 @@ fn configure_computer_use_command(command: &mut Command, config: Option<&CodexCo
                 &config.process_directory,
             )
             .arg("-c")
-            .arg(format!("mcp_servers.waku_js_repl.command={}", config.repl))
+            .arg(format!("mcp_servers.narel_js_repl.command={}", config.repl))
             .arg("-c")
-            .arg("mcp_servers.waku_js_repl.args=[]")
+            .arg("mcp_servers.narel_js_repl.args=[]")
             .arg("-c")
             .arg(format!(
-                "mcp_servers.waku_js_repl.env.WAKU_COMPUTER_USE_SERVER={}",
+                "mcp_servers.narel_js_repl.env.WAKU_COMPUTER_USE_SERVER={}",
                 config.server
             ))
             .arg("-c")
             .arg(format!(
-                "mcp_servers.waku_js_repl.env.WAKU_COMPUTER_USE_PROCESS_DIRECTORY={}",
+                "mcp_servers.narel_js_repl.env.WAKU_COMPUTER_USE_PROCESS_DIRECTORY={}",
                 config.process_directory_config
             ));
     }
@@ -3608,17 +3608,17 @@ mod tests {
         assert!(
             !enabled_arguments
                 .iter()
-                .any(|argument| argument.contains("mcp_servers.waku_computer_use"))
+                .any(|argument| argument.contains("mcp_servers.narel_computer_use"))
         );
         assert!(
             enabled_arguments
                 .iter()
-                .any(|argument| argument.contains("mcp_servers.waku_js_repl.command"))
+                .any(|argument| argument.contains("mcp_servers.narel_js_repl.command"))
         );
         assert!(
             enabled_arguments
                 .iter()
-                .any(|argument| { argument == "mcp_servers.waku_js_repl.args=[]" })
+                .any(|argument| { argument == "mcp_servers.narel_js_repl.args=[]" })
         );
         assert!(
             enabled_arguments
@@ -4111,7 +4111,7 @@ mod tests {
                 json!({
                     "method": method, "params": {
                         "threadId": "thread-1", "turnId": "turn-9", "item": {
-                            "id": "cua-call", "type": "mcpToolCall", "server": "waku_js_repl", "tool": "js",
+                            "id": "cua-call", "type": "mcpToolCall", "server": "narel_js_repl", "tool": "js",
                             "arguments": {"title": "List running apps via CUA", "code": "cua.list_apps()"}
                         }
                     }
@@ -4132,7 +4132,7 @@ mod tests {
             };
             assert_eq!(item.title, "List running apps via CUA");
             assert_eq!(item.tool_name.as_deref(), Some("js"));
-            assert_eq!(item.mcp_server.as_deref(), Some("waku_js_repl"));
+            assert_eq!(item.mcp_server.as_deref(), Some("narel_js_repl"));
             assert_eq!(item.complete, method == "item/completed");
         }
     }
@@ -4141,7 +4141,7 @@ mod tests {
     fn mcp_tool_title_prefers_the_human_facing_argument() {
         let titled = json!({
             "type": "mcpToolCall",
-            "server": "waku_js_repl",
+            "server": "narel_js_repl",
             "tool": "js",
             "arguments": {
                 "title": "Inspect Helium browser",
@@ -4150,7 +4150,7 @@ mod tests {
         });
         let untitled = json!({
             "type": "mcpToolCall",
-            "server": "waku_js_repl",
+            "server": "narel_js_repl",
             "tool": "js",
             "arguments": { "code": "cua.list_apps()" }
         });

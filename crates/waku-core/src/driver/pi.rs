@@ -2239,10 +2239,10 @@ mod tests {
     #[test]
     fn pi_computer_use_uses_only_session_scoped_extension_and_skill_arguments() {
         let config = computer_use_runtime::ComputerUseConfig {
-            server_path: PathBuf::from("/tmp/Waku Computer Use"),
-            repl_path: PathBuf::from("/Applications/Waku.app/Resources/waku_js_repl"),
-            skill_path: PathBuf::from("/Applications/Waku.app/Resources/skills/SKILL.md"),
-            process_directory: PathBuf::from("/tmp/waku-computer-use/session"),
+            server_path: PathBuf::from("/tmp/Narel Computer Use"),
+            repl_path: PathBuf::from("/Applications/Narel.app/Resources/narel_js_repl"),
+            skill_path: PathBuf::from("/Applications/Narel.app/Resources/skills/SKILL.md"),
+            process_directory: PathBuf::from("/tmp/narel-computer-use/session"),
         };
         let mut command = std::process::Command::new("pi");
 
@@ -2250,7 +2250,7 @@ mod tests {
             &mut command,
             Some((
                 &config,
-                Path::new("/Applications/Waku.app/Resources/computer-use/pi-extension.ts"),
+                Path::new("/Applications/Narel.app/Resources/computer-use/pi-extension.ts"),
             )),
         );
 
@@ -2262,9 +2262,9 @@ mod tests {
             arguments,
             [
                 "--extension",
-                "/Applications/Waku.app/Resources/computer-use/pi-extension.ts",
+                "/Applications/Narel.app/Resources/computer-use/pi-extension.ts",
                 "--skill",
-                "/Applications/Waku.app/Resources/skills/SKILL.md",
+                "/Applications/Narel.app/Resources/skills/SKILL.md",
             ]
         );
         let environment = command
@@ -2279,12 +2279,12 @@ mod tests {
         assert_eq!(
             environment.get("WAKU_JS_REPL_SERVER"),
             Some(&Some(
-                "/Applications/Waku.app/Resources/waku_js_repl".into()
+                "/Applications/Narel.app/Resources/narel_js_repl".into()
             ))
         );
         assert_eq!(
             environment.get("WAKU_COMPUTER_USE_PROCESS_DIRECTORY"),
-            Some(&Some("/tmp/waku-computer-use/session".into()))
+            Some(&Some("/tmp/narel-computer-use/session".into()))
         );
     }
 

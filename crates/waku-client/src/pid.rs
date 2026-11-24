@@ -5,7 +5,7 @@ pub fn is_alive(pid: u32) -> bool {
     imp::is_alive(pid)
 }
 
-/// Whether `pid` names a live `waku-daemon` (or `waku-debug-daemon`) process.
+/// Whether `pid` names a live `narel-daemon` (or `narel-debug-daemon`) process.
 /// Used before acting on a bare PID from `resident-daemon.json` so an OS-reused
 /// PID can never be mistaken for the daemon.
 pub fn is_daemon_process(pid: u32) -> bool {
@@ -18,16 +18,16 @@ pub fn terminate(pid: u32) -> bool {
     imp::terminate(pid)
 }
 
-/// Best-effort forced termination of a `waku-daemon` process when a graceful
+/// Best-effort forced termination of a `narel-daemon` process when a graceful
 /// shutdown request timed out. Refuses to signal any PID whose executable is
-/// not `waku-daemon` / `waku-debug-daemon`.
+/// not `narel-daemon` / `narel-debug-daemon`.
 pub fn terminate_daemon(pid: u32) -> bool {
     imp::terminate_daemon(pid)
 }
 
 #[cfg(any(unix, windows))]
 fn matches_daemon_stem(stem: &str) -> bool {
-    stem.eq_ignore_ascii_case("waku-daemon") || stem.eq_ignore_ascii_case("waku-debug-daemon")
+    stem.eq_ignore_ascii_case("narel-daemon") || stem.eq_ignore_ascii_case("narel-debug-daemon")
 }
 
 #[cfg(unix)]
@@ -249,12 +249,12 @@ mod tests {
 
     #[test]
     fn daemon_stem_matching_is_exact_and_case_insensitive() {
-        assert!(matches_daemon_stem("waku-daemon"));
-        assert!(matches_daemon_stem("WAKU-DAEMON"));
-        assert!(matches_daemon_stem("waku-debug-daemon"));
-        assert!(!matches_daemon_stem("waku"));
+        assert!(matches_daemon_stem("narel-daemon"));
+        assert!(matches_daemon_stem("NAREL-DAEMON"));
+        assert!(matches_daemon_stem("narel-debug-daemon"));
+        assert!(!matches_daemon_stem("narel"));
         assert!(!matches_daemon_stem("powershell"));
-        assert!(!matches_daemon_stem("waku-daemon-other"));
+        assert!(!matches_daemon_stem("narel-daemon-other"));
     }
 
     #[test]

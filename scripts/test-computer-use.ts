@@ -1,5 +1,5 @@
 // Protocol/SDK smoke test. No app discovery, screenshots, input, or TCC prompts.
-// Usage: bun scripts/test-computer-use.ts <waku_js_repl> <computer-use-helper>
+// Usage: bun scripts/test-computer-use.ts <narel_js_repl> <computer-use-helper>
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -10,8 +10,8 @@ import { createInterface } from "node:readline";
 const suffix = process.platform === "win32" ? ".exe" : "";
 const expectCursor = process.argv.includes("--expect-cursor");
 const [
-  repl = `target/debug/waku_js_repl${suffix}`,
-  helper = `target/debug/waku_computer_use${suffix}`,
+  repl = `target/debug/narel_js_repl${suffix}`,
+  helper = `target/debug/narel_computer_use${suffix}`,
 ] = process.argv.slice(2).filter((argument) => argument !== "--expect-cursor");
 assert(repl && helper, "Pass the REPL executable and native helper executable");
 const nativeTools: string[] = JSON.parse(

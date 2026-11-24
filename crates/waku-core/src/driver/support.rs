@@ -85,7 +85,7 @@ impl HeadlessComputerUseRuntime {
             HeadlessComputerUseConfig::AcpMcp { base, .. } => {
                 use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
                 Some(McpServer::Stdio(
-                    McpServerStdio::new("waku_js_repl", base.repl_path.clone()).env(vec![
+                    McpServerStdio::new("narel_js_repl", base.repl_path.clone()).env(vec![
                         EnvVariable::new(
                             "WAKU_COMPUTER_USE_SERVER",
                             base.server_path.display().to_string(),
@@ -113,7 +113,7 @@ fn build_acp_mcp_computer_use_config(
 ) -> anyhow::Result<HeadlessComputerUseConfig> {
     let rules = fs::read_to_string(&base.skill_path).with_context(|| {
         format!(
-            "could not read Waku Computer Use skill {}",
+            "could not read Narel Computer Use skill {}",
             base.skill_path.display()
         )
     })?;
@@ -280,7 +280,7 @@ fn build_grok_computer_use_config_in(
     })?;
     let rules = fs::read_to_string(&base.skill_path).with_context(|| {
         format!(
-            "could not read Waku Computer Use skill {}",
+            "could not read Narel Computer Use skill {}",
             base.skill_path.display()
         )
     })?;
@@ -324,7 +324,7 @@ fn build_grok_computer_use_toml(
     server.insert("args".into(), toml::Value::Array(Vec::new()));
     server.insert("env".into(), toml::Value::Table(environment));
     server.insert("enabled".into(), toml::Value::Boolean(true));
-    mcp_servers.insert("waku_js_repl".into(), toml::Value::Table(server));
+    mcp_servers.insert("narel_js_repl".into(), toml::Value::Table(server));
     toml::to_string(&root).context("could not encode Grok Computer Use configuration")
 }
 
@@ -545,12 +545,12 @@ mod tests {
 
     fn computer_use_config() -> computer_use_runtime::ComputerUseConfig {
         computer_use_runtime::ComputerUseConfig {
-            server_path: PathBuf::from("/tmp/Waku Computer Use"),
-            repl_path: PathBuf::from("/Applications/Waku.app/Contents/Resources/waku_js_repl"),
+            server_path: PathBuf::from("/tmp/Narel Computer Use"),
+            repl_path: PathBuf::from("/Applications/Narel.app/Contents/Resources/narel_js_repl"),
             skill_path: PathBuf::from(
-                "/Applications/Waku.app/Contents/Resources/skills/waku-computer-use/SKILL.md",
+                "/Applications/Narel.app/Contents/Resources/skills/narel-computer-use/SKILL.md",
             ),
-            process_directory: PathBuf::from("/tmp/waku-computer-use/session"),
+            process_directory: PathBuf::from("/tmp/narel-computer-use/session"),
         }
     }
 
@@ -580,7 +580,7 @@ mod tests {
                     [mcp_servers.existing]
                     command = "existing-server"
 
-                    [mcp_servers.waku_js_repl]
+                    [mcp_servers.narel_js_repl]
                     command = "stale-server"
                 "#,
             ),
@@ -603,18 +603,18 @@ mod tests {
         );
         let server = value
             .get("mcp_servers")
-            .and_then(|mcp| mcp.get("waku_js_repl"))
+            .and_then(|mcp| mcp.get("narel_js_repl"))
             .unwrap();
         assert_eq!(
             server.get("command").and_then(toml::Value::as_str),
-            Some("/Applications/Waku.app/Contents/Resources/waku_js_repl")
+            Some("/Applications/Narel.app/Contents/Resources/narel_js_repl")
         );
         assert_eq!(
             server
                 .get("env")
                 .and_then(|env| env.get("WAKU_COMPUTER_USE_SERVER"))
                 .and_then(toml::Value::as_str),
-            Some("/tmp/Waku Computer Use")
+            Some("/tmp/Narel Computer Use")
         );
     }
 
@@ -624,10 +624,10 @@ mod tests {
             base: computer_use_config(),
             grok_home: PathBuf::from("/tmp/waku-computer-use/session/grok-home"),
             auth_path: Some(PathBuf::from("/Users/test/.grok/auth.json")),
-            rules: "Waku Computer Use rules".into(),
+            rules: "Narel Computer Use rules".into(),
         };
         let (arguments, environment) = grok_computer_use_launch_configuration(Some(&config));
-        assert_eq!(arguments, ["--rules=Waku Computer Use rules"]);
+        assert_eq!(arguments, ["--rules=Narel Computer Use rules"]);
         let environment = environment.into_iter().collect::<HashMap<_, _>>();
         assert_eq!(
             environment.get("GROK_HOME"),
@@ -762,7 +762,7 @@ mod tests {
 
         let base = computer_use_runtime::ComputerUseConfig {
             server_path: root.join("server"),
-            repl_path: root.join("waku_js_repl"),
+            repl_path: root.join("narel_js_repl"),
             skill_path,
             process_directory: process_dir.clone(),
         };
@@ -803,7 +803,7 @@ mod tests {
         assert!(!grok_home.join("auth.json.lock").exists());
         let written_toml = fs::read_to_string(grok_home.join("config.toml")).unwrap();
         assert!(written_toml.contains("default_model = \"grok-4\""));
-        assert!(written_toml.contains("waku_js_repl"));
+        assert!(written_toml.contains("narel_js_repl"));
 
         let _ = fs::remove_dir_all(root);
     }

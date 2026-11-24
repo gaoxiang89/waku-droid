@@ -19,14 +19,14 @@ use crate::driver::DriverEventSender;
 use crate::opencode_api;
 use crate::opencode_service::OpenCodeService;
 
-pub(super) const INSTRUCTION_KEY: &str = "waku-computer-use";
+pub(super) const INSTRUCTION_KEY: &str = "narel-computer-use";
 
 pub(super) fn tool_identity(name: &str) -> Option<(&str, &str)> {
     let (server, tool) = name
         .strip_suffix("_js_reset")
         .map(|server| (server, "js_reset"))
         .or_else(|| name.strip_suffix("_js").map(|server| (server, "js")))?;
-    let id = server.strip_prefix("waku_js_repl_")?;
+    let id = server.strip_prefix("narel_js_repl_")?;
     (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some((server, tool))
 }
 
@@ -61,7 +61,7 @@ impl McpBridge {
                 let bridge = Arc::new(Self {
                     service: service.clone(),
                     directory: directory.to_owned(),
-                    server: format!("waku_js_repl_{}", Uuid::new_v4().simple()),
+                    server: format!("narel_js_repl_{}", Uuid::new_v4().simple()),
                     config: json!({
                         "type": "local",
                         "command": [config.repl_path],
@@ -101,7 +101,7 @@ impl McpBridge {
             return Ok(());
         }
         opencode_api::add_mcp(&endpoint, &self.directory, &self.server, &self.config)
-            .context("could not connect OpenCode to Waku Computer Use")?;
+            .context("could not connect OpenCode to Narel Computer Use")?;
         let deadline = Instant::now() + Duration::from_secs(12);
         loop {
             let status = opencode_api::list_mcp(&endpoint, &self.directory)?
@@ -113,14 +113,14 @@ impl McpBridge {
             {
                 Some("connected") => return Ok(()),
                 Some("failed" | "disabled" | "needs_auth") => bail!(
-                    "OpenCode could not start Waku Computer Use: {}",
+                    "OpenCode could not start Narel Computer Use: {}",
                     status
                         .as_ref()
                         .and_then(|server| server["status"]["error"].as_str())
                         .unwrap_or("MCP server unavailable")
                 ),
                 _ if Instant::now() >= deadline => {
-                    bail!("OpenCode timed out connecting Waku Computer Use")
+                    bail!("OpenCode timed out connecting Narel Computer Use")
                 }
                 _ => std::thread::sleep(Duration::from_millis(100)),
             }
@@ -447,7 +447,7 @@ mod tests {
         let bridge = McpBridge {
             service,
             directory: "/work-drop".into(),
-            server: "waku_js_repl_0123456789abcdef0123456789abcdef".into(),
+            server: "narel_js_repl_0123456789abcdef0123456789abcdef".into(),
             sessions_directory: sessions_directory.clone(),
             config: json!({}),
             registration: Mutex::new(()),
@@ -466,7 +466,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("background cleanup should still issue DELETE");
         assert!(
-            request.starts_with("DELETE /api/experimental/mcp/waku_js_repl_0123456789abcdef0123456789abcdef"),
+            request.starts_with("DELETE /api/experimental/mcp/narel_js_repl_0123456789abcdef0123456789abcdef"),
             "{request}"
         );
 

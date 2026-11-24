@@ -4,7 +4,7 @@
 
 use anyhow::{Context as _, bail};
 
-const KEYRING_SERVICE: &str = "sh.waku.ssh";
+const KEYRING_SERVICE: &str = "sh.narel.ssh";
 
 fn entry(connection_id: &str) -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, connection_id)

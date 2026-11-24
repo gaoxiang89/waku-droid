@@ -46,7 +46,7 @@ impl ComputerUseRuntime {
         let server_path = computer_use::mcp_server_command()?;
         let repl_path = computer_use::js_repl_server_path()?;
         let skill_path = computer_use::skill_root_path()?
-            .join("waku-computer-use")
+            .join("narel-computer-use")
             .join("SKILL.md");
         let process_directory = create_process_directory()?;
         let preview_monitor =

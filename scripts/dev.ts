@@ -8,15 +8,15 @@ import { join, resolve } from "node:path";
 const root = resolve(import.meta.dir, "..");
 const isMacOS = process.platform === "darwin";
 const isWindows = process.platform === "win32";
-const appName = "Waku Debug";
+const appName = "Narel Debug";
 const targetDir = resolve(root, process.env.CARGO_TARGET_DIR || "target");
 const executableSuffix = isWindows ? ".exe" : "";
 const appPath = isMacOS
-  ? join(targetDir, "debug/Waku Debug.app")
-  : join(targetDir, `debug/waku${executableSuffix}`);
+  ? join(targetDir, "debug/Narel Debug.app")
+  : join(targetDir, `debug/narel${executableSuffix}`);
 const daemonPath = join(
   targetDir,
-  `debug/waku-debug-daemon${executableSuffix}`,
+  `debug/narel-debug-daemon${executableSuffix}`,
 );
 const watchedDirectories = [
   "src",
@@ -171,15 +171,15 @@ async function prepareHyprlandLaunch(): Promise<void> {
 
     if _G[workspace_key] == nil then
       _G[workspace_key] = hl.window_rule({
-        name = "waku-dev-workspace",
-        match = { initial_class = "sh[.]waku[.]dev" },
+        name = "narel-dev-workspace",
+        match = { initial_class = "sh[.]narel[.]dev" },
         workspace = ${luaString(`${hyprlandWorkspace.selector} silent`)},
       })
     end
     if _G[background_key] == nil then
       _G[background_key] = hl.window_rule({
-        name = "waku-dev-background",
-        match = { initial_class = "sh[.]waku[.]dev" },
+        name = "narel-dev-background",
+        match = { initial_class = "sh[.]narel[.]dev" },
         no_initial_focus = true,
         suppress_event = "activate activatefocus",
       })
@@ -191,7 +191,7 @@ async function prepareHyprlandLaunch(): Promise<void> {
     if _G[subscription_key] == nil then
       local anchor_selector = ${luaString(anchorSelector)}
       _G[subscription_key] = hl.on("window.open", function(window)
-        if not _G[armed_key] or window.initial_class ~= "sh.waku.dev" then
+        if not _G[armed_key] or window.initial_class ~= "sh.narel.dev" then
           return
         end
         _G[armed_key] = false
@@ -319,7 +319,7 @@ async function build(target: BuildTarget): Promise<boolean> {
   }
   const result = isMacOS
     ? await $`${join(root, "scripts/bundle.sh")} debug`.nothrow()
-    : await $`cargo build --package waku --bin waku --bin waku_js_repl --package waku-computer-use --bin waku_computer_use`.nothrow();
+    : await $`cargo build --package waku --bin narel --bin narel_js_repl --package waku-computer-use --bin narel_computer_use`.nothrow();
   if (result.exitCode !== 0) {
     console.error("[waku-dev] Build failed; keeping the current app open.");
     return false;
@@ -340,9 +340,9 @@ async function build(target: BuildTarget): Promise<boolean> {
 }
 
 async function buildDaemon(): Promise<boolean> {
-  console.log("[waku-dev] Building daemon...");
+  console.log("[narel-dev] Building daemon...");
   const result =
-    await $`cargo build --package waku-daemon --features dev-binary --bin waku-debug-daemon`.nothrow();
+    await $`cargo build --package waku-daemon --features dev-binary --bin narel-debug-daemon`.nothrow();
   if (result.exitCode !== 0) {
     console.error(
       "[waku-dev] Daemon build failed; keeping the current daemon running.",
@@ -392,19 +392,19 @@ async function buildWslDaemon(): Promise<void> {
     'command -v cargo >/dev/null || { echo "cargo is not installed in this WSL distribution" >&2; exit 127; }',
     'source_dir=$(wslpath -u "$1")',
     'output_dir=$(wslpath -u "$2")',
-    'export CARGO_TARGET_DIR="$HOME/.cache/waku-target"',
+    'export CARGO_TARGET_DIR="$HOME/.cache/narel-target"',
     'cd "$source_dir"',
     'triple="$(uname -m)-unknown-linux-musl"',
-    'output="$output_dir/waku-daemon-linux-$(uname -m)"',
+    'output="$output_dir/narel-daemon-linux-$(uname -m)"',
     'command -v rustup >/dev/null && rustup target add "$triple" >/dev/null 2>&1 || true',
-    'if cargo build --package waku-daemon --bin waku-daemon --target "$triple" 2>/tmp/waku-dev-musl.log; then built="$CARGO_TARGET_DIR/$triple/debug/waku-daemon"; mkdir -p "$output_dir"; cp "$built" "$output.tmp.$$"; mv -f "$output.tmp.$$" "$output"; echo musl',
-    'else echo "musl build failed; tail of /tmp/waku-dev-musl.log follows" >&2',
-    "tail -n 15 /tmp/waku-dev-musl.log >&2 || true",
-    'host_musl_debug="$source_dir/target/$triple/debug/waku-daemon"',
-    'host_musl_release="$source_dir/target/$triple/release/waku-daemon"',
+    'if cargo build --package waku-daemon --bin narel-daemon --target "$triple" 2>/tmp/narel-dev-musl.log; then built="$CARGO_TARGET_DIR/$triple/debug/narel-daemon"; mkdir -p "$output_dir"; cp "$built" "$output.tmp.$$"; mv -f "$output.tmp.$$" "$output"; echo musl',
+    'else echo "musl build failed; tail of /tmp/narel-dev-musl.log follows" >&2',
+    "tail -n 15 /tmp/narel-dev-musl.log >&2 || true",
+    'host_musl_debug="$source_dir/target/$triple/debug/narel-daemon"',
+    'host_musl_release="$source_dir/target/$triple/release/narel-daemon"',
     'if { [ -f "$host_musl_debug" ] && [ -s "$host_musl_debug" ]; } || { [ -f "$host_musl_release" ] && [ -s "$host_musl_release" ]; }; then rm -f "$output"; echo "host-musl:$triple"',
-    'else cargo build --package waku-daemon --bin waku-daemon',
-    'built="$CARGO_TARGET_DIR/debug/waku-daemon"',
+    'else cargo build --package waku-daemon --bin narel-daemon',
+    'built="$CARGO_TARGET_DIR/debug/narel-daemon"',
     'mkdir -p "$output_dir"',
     'cp "$built" "$output.tmp.$$"',
     'mv -f "$output.tmp.$$" "$output"',
