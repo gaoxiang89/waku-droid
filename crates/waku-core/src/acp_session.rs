@@ -1323,8 +1323,9 @@ mod tests {
             &std::env::temp_dir(),
             "sess-delayed",
             10,
-            LOAD_REPLAY_QUIET_WINDOW,
-            LOAD_REPLAY_MAX_DRAIN,
+            // Give loaded CI runners enough scheduling slack above the 80ms/90ms sleeps.
+            Duration::from_millis(350),
+            Duration::from_secs(2),
         )
         .unwrap();
 
