@@ -1,31 +1,38 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import type {
-  GoalOperation,
-  ProviderKind,
-  ProviderModel,
-  ProviderSessionSummary,
-  RuntimeMode,
-  SlashCommand,
-  ThreadGoal,
+import {
+  resolveProviderAccount,
+  type GoalOperation,
+  type ProviderKind,
+  type ProviderModel,
+  type ProviderSessionSummary,
+  type RuntimeMode,
+  type SlashCommand,
+  type ThreadGoal,
 } from '@waku/client';
 import {
   isFastModeToggleSubmission,
   isResumeSubmission,
+  parseAntigravityLocalCommand,
   parseGoalSubmission,
+  resolveProviderEffort,
+  resolveProviderModel,
   toggledFastServiceTier,
 } from '@waku/client/composer-autocomplete';
 import { fuzzyScore } from '@waku/client/fuzzy-search';
 import * as Crypto from 'expo-crypto';
+import * as Haptics from 'expo-haptics';
 import { router } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, StyleSheet, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, StyleSheet, Text, TextInput, View, useWindowDimensions } from 'react-native';
 
 import { Sheet, SheetRow } from './sheet';
 import { NativeTint, Radius } from '@/constants/theme';
+import { useDaemonSettings } from '@/hooks/use-daemon-data';
 import { useTheme } from '@/hooks/use-theme';
 import {
   createProject,
   daemonKeys,
+  fetchPlanUsage,
   listProviderSessions,
   loadProviderSessionHistory,
   loadTaskState,
@@ -40,35 +47,109 @@ import { providerLabel } from '@/lib/session-presentation';
 /** Desktop's local commands must never leak through as provider prompts. */
 export function useComposerLocalCommands({
   provider,
+  accountId = null,
+  models,
   model,
+  providerVersion = null,
+  reasoningEffort,
   serviceTier,
   runtimeMode,
   goal,
+  canSwitchModel = true,
   contextKey,
+  onOpenModelPicker,
+  onSelectModel,
+  onReasoningEffort,
   onServiceTier,
   onGoal,
   onClear,
 }: {
   provider: ProviderKind | null;
+  accountId?: string | null;
+  models?: ProviderModel[];
   model: ProviderModel | undefined;
+  providerVersion?: string | null;
+  reasoningEffort?: string | null;
   serviceTier: string | null | undefined;
   runtimeMode: RuntimeMode;
   goal?: ThreadGoal | null;
+  canSwitchModel?: boolean;
   contextKey: string;
+  onOpenModelPicker?: () => void;
+  onSelectModel?: (model: ProviderModel) => void | Promise<void>;
+  onReasoningEffort?: (effort: string) => void | Promise<void>;
   onServiceTier: (tier: string) => void | Promise<void>;
   onGoal: (operation: GoalOperation) => Promise<void>;
   onClear: () => void;
 }) {
   const daemon = useDaemon();
   const [resumeOpen, setResumeOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
   const [goalDialog, setGoalDialog] = useState<{ prefill: string | null; replace: boolean } | null>(null);
   useEffect(() => {
     setResumeOpen(false);
+    setUsageOpen(false);
     setGoalDialog(null);
-  }, [contextKey, daemon.activeProfile?.id, provider]);
+  }, [accountId, contextKey, daemon.activeProfile?.id, provider]);
 
   async function execute(prompt: string, commands: SlashCommand[]): Promise<boolean> {
     if (!provider) return false;
+    const antigravity = parseAntigravityLocalCommand(provider, prompt, commands);
+    if (antigravity) {
+      switch (antigravity.kind) {
+        case 'usage':
+          setUsageOpen(true);
+          break;
+        case 'modelPicker':
+          if (!canSwitchModel) throw new Error('Stop the current turn before switching models');
+          onOpenModelPicker?.();
+          break;
+        case 'setModel': {
+          if (!canSwitchModel) throw new Error('Stop the current turn before switching models');
+          const matched = resolveProviderModel(models ?? [], antigravity.query);
+          if (!matched) throw new Error(`Unknown model: ${antigravity.query}`);
+          await onSelectModel?.(matched);
+          void Haptics.selectionAsync();
+          Alert.alert('Model switched', `Switched model to ${matched.name}`);
+          break;
+        }
+        case 'effortShow': {
+          const efforts = model?.reasoning_efforts ?? [];
+          if (!efforts.length) {
+            Alert.alert('Reasoning effort', 'This model does not support reasoning effort selection.');
+          } else {
+            const currentId = efforts.some((option) => option.id === reasoningEffort)
+              ? reasoningEffort
+              : (model?.default_reasoning_effort ?? efforts[0]!.id);
+            const current = efforts.find((option) => option.id === currentId) ?? efforts[0]!;
+            const options = efforts.map((option) => option.label).join(', ');
+            Alert.alert('Reasoning effort', `Reasoning effort: ${current.label} (available: ${options})`);
+          }
+          break;
+        }
+        case 'setEffort': {
+          const efforts = model?.reasoning_efforts ?? [];
+          if (!efforts.length) {
+            throw new Error('This model does not support reasoning effort selection');
+          }
+          const matched = resolveProviderEffort(efforts, antigravity.query);
+          if (!matched) {
+            const options = efforts.map((option) => option.label).join(', ');
+            throw new Error(`Unknown reasoning effort "${antigravity.query}" (available: ${options})`);
+          }
+          await onReasoningEffort?.(matched.id);
+          void Haptics.selectionAsync();
+          Alert.alert('Reasoning effort', `Reasoning effort set to ${matched.label}`);
+          break;
+        }
+        case 'swarmBoard':
+          Alert.alert('Swarm board', 'Swarm board is only available in Waku Desktop.');
+          break;
+      }
+      onClear();
+      return true;
+    }
+
     if (isResumeSubmission(prompt)) {
       setResumeOpen(true);
     } else if (isFastModeToggleSubmission(provider, prompt, commands)) {
@@ -108,7 +189,20 @@ export function useComposerLocalCommands({
     sheets: (
       <>
         {resumeOpen && provider && (
-          <ResumeSessionSheet provider={provider} runtimeMode={runtimeMode} onDismiss={() => setResumeOpen(false)} />
+          <ResumeSessionSheet
+            accountId={accountId}
+            provider={provider}
+            runtimeMode={runtimeMode}
+            onDismiss={() => setResumeOpen(false)}
+          />
+        )}
+        {usageOpen && provider && (
+          <PlanUsageSheet
+            accountId={accountId}
+            provider={provider}
+            providerVersion={providerVersion}
+            onDismiss={() => setUsageOpen(false)}
+          />
         )}
         {goalDialog && (
           <GoalCommandSheet
@@ -124,8 +218,9 @@ export function useComposerLocalCommands({
   };
 }
 
-function ResumeSessionSheet({ provider, runtimeMode, onDismiss }: {
+function ResumeSessionSheet({ provider, accountId = null, runtimeMode, onDismiss }: {
   provider: ProviderKind;
+  accountId?: string | null;
   runtimeMode: RuntimeMode;
   onDismiss: () => void;
 }) {
@@ -138,8 +233,8 @@ function ResumeSessionSheet({ provider, runtimeMode, onDismiss }: {
   const [resuming, setResuming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const sessions = useQuery({
-    queryKey: daemonKeys.providerSessions(profileId, provider),
-    queryFn: () => listProviderSessions(daemon.client!, provider),
+    queryKey: daemonKeys.providerSessions(profileId, provider, accountId),
+    queryFn: () => listProviderSessions(daemon.client!, provider, accountId),
     enabled: daemon.phase === 'connected' && Boolean(daemon.client),
     staleTime: 15_000,
   });
@@ -154,15 +249,19 @@ function ResumeSessionSheet({ provider, runtimeMode, onDismiss }: {
     try {
       const state = await loadTaskState(client);
       let session = state.sessions.find((item) => item.provider_cursor
-        && providerSessionKey(item.provider_cursor) === providerSessionKey(summary.cursor));
+        && providerSessionKey(item.provider_cursor) === providerSessionKey(summary.cursor)
+        && (item.account_id ?? null) === (accountId ?? null));
       if (!session) {
-        const history = await loadProviderSessionHistory(client, summary);
+        const history = await loadProviderSessionHistory(client, summary, accountId);
         let project = state.projects.find((item) => item.path === summary.cwd);
         if (!project) project = (await persistProject(client, createProject(summary.cwd, Crypto.randomUUID()))).project;
-        session = await persistSession(client, createResumedSession(
-          project.id, summary, history, runtimeMode,
-          { nowSeconds: () => Math.floor(Date.now() / 1_000), randomUUID: Crypto.randomUUID },
-        ));
+        session = await persistSession(client, {
+          ...createResumedSession(
+            project.id, summary, history, runtimeMode,
+            { nowSeconds: () => Math.floor(Date.now() / 1_000), randomUUID: Crypto.randomUUID },
+          ),
+          account_id: accountId ?? null,
+        });
         queryClient.setQueryData(daemonKeys.session(profileId, session.id), session);
       }
       await queryClient.invalidateQueries({ queryKey: daemonKeys.taskState(profileId) });
@@ -279,9 +378,121 @@ function GoalCommandSheet({ goal, prefill, replace, onRun, onDismiss }: {
   );
 }
 
+function PlanUsageSheet({
+  provider,
+  accountId = null,
+  providerVersion = null,
+  onDismiss,
+}: {
+  provider: ProviderKind;
+  accountId?: string | null;
+  providerVersion?: string | null;
+  onDismiss: () => void;
+}) {
+  const theme = useTheme();
+  const daemon = useDaemon();
+  const settings = useDaemonSettings();
+  const profileId = daemon.activeProfile?.id ?? 'disconnected';
+  const accountLabel = resolveProviderAccount(settings.data, provider, accountId)?.label ?? null;
+  const usage = useQuery({
+    queryKey: daemonKeys.planUsage(profileId, provider, accountId),
+    queryFn: () => fetchPlanUsage(daemon.client!, provider, settings.data!, providerVersion, accountId),
+    enabled: daemon.phase === 'connected' && Boolean(daemon.client && settings.data),
+    staleTime: 30_000,
+  });
+
+  return (
+    <Sheet
+      onDismiss={onDismiss}
+      title={`${providerLabel(provider)}${accountLabel ? ` · ${accountLabel}` : ''} usage`}
+      visible
+    >
+      {usage.isPending || settings.isPending ? (
+        <ActivityIndicator style={styles.loading} color={theme.textTertiary} />
+      ) : usage.error ? (
+        <>
+          <Text style={[styles.note, { color: theme.danger }]}>
+            {usage.error instanceof Error ? usage.error.message : String(usage.error)}
+          </Text>
+          <SheetRow label="Retry" onPress={() => void usage.refetch()} />
+        </>
+      ) : !usage.data ? (
+        <Text style={[styles.note, { color: theme.textTertiary }]}>
+          No plan usage reported for this account.
+        </Text>
+      ) : (
+        <View style={styles.usageBody}>
+          {usage.data.planLabel && (
+            <Text style={[styles.planLabel, { color: theme.textSecondary }]}>
+              {usage.data.planLabel}
+            </Text>
+          )}
+          {usage.data.windows.length ? usage.data.windows.map((window) => {
+            const percent = Math.min(100, Math.max(0, window.percent));
+            const color = percent >= 95
+              ? theme.danger
+              : percent >= 80
+                ? theme.warning
+                : theme.textSecondary;
+            const reset = window.resetsAt == null ? null : formatMobileResetLabel(window.resetsAt);
+            return (
+              <View key={`${window.label}-${window.resetsAt ?? 'none'}`} style={styles.usageRow}>
+                <View style={styles.usageHeader}>
+                  <Text numberOfLines={1} style={[styles.usageLabel, { color: theme.text }]}>
+                    {window.label}
+                  </Text>
+                  {reset && (
+                    <Text style={[styles.usageReset, { color: theme.textTertiary }]}>{reset}</Text>
+                  )}
+                  <Text style={[styles.usageValue, { color: theme.textSecondary }]}>
+                    {`${window.percent.toFixed(0)}%`}
+                  </Text>
+                </View>
+                <View style={[styles.usageTrack, { backgroundColor: theme.overlayStrong }]}>
+                  <View style={[styles.usageFill, { backgroundColor: color, width: `${percent}%` }]} />
+                </View>
+              </View>
+            );
+          }) : (
+            <Text style={[styles.note, { color: theme.textTertiary }]}>
+              No active quota windows reported.
+            </Text>
+          )}
+        </View>
+      )}
+    </Sheet>
+  );
+}
+
+function formatMobileResetLabel(resetsAt: number): string {
+  const seconds = resetsAt - Math.floor(Date.now() / 1_000);
+  if (seconds <= 0) return 'Resets soon';
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `Resets in ${minutes}m`;
+  if (minutes < 24 * 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    return remainder ? `Resets in ${hours}h ${remainder}m` : `Resets in ${hours}h`;
+  }
+  return `Resets ${new Intl.DateTimeFormat(undefined, {
+    weekday: 'short',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(resetsAt * 1_000))}`;
+}
+
 const styles = StyleSheet.create({
   input: { borderRadius: Radius.medium, fontSize: 15, minHeight: 44, paddingHorizontal: 12, paddingVertical: 10, marginHorizontal: 6, marginBottom: 8 },
   objective: { minHeight: 88, maxHeight: 180, textAlignVertical: 'top' },
   note: { fontSize: 13, lineHeight: 18, paddingHorizontal: 12, paddingVertical: 8 },
   loading: { paddingVertical: 20 },
+  usageBody: { gap: 12, paddingHorizontal: 12, paddingVertical: 8 },
+  planLabel: { fontSize: 12.5, fontWeight: '600' },
+  usageRow: { gap: 6 },
+  usageHeader: { alignItems: 'center', flexDirection: 'row', gap: 8 },
+  usageLabel: { flex: 1, fontSize: 14, fontWeight: '500' },
+  usageReset: { fontSize: 12 },
+  usageValue: { fontSize: 12.5, fontVariant: ['tabular-nums'], fontWeight: '600' },
+  usageTrack: { borderRadius: Radius.pill, height: 4, overflow: 'hidden' },
+  usageFill: { borderRadius: Radius.pill, height: 4 },
 });

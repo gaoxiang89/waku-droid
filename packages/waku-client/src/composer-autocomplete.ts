@@ -1,6 +1,7 @@
 import type {
   FileEntry,
   ProviderKind,
+  ProviderModel,
   ProviderModelOption,
   ReportedCommand,
   SlashCommand,
@@ -121,6 +122,114 @@ export function parseGoalSubmission(
     case 'clear': return { kind: 'clear' }
     default: return { kind: 'set', objective: argument }
   }
+}
+
+export type AntigravityLocalCommand =
+  | { kind: 'usage' }
+  | { kind: 'modelPicker' }
+  | { kind: 'setModel'; query: string }
+  | { kind: 'effortShow' }
+  | { kind: 'setEffort'; query: string }
+  | { kind: 'swarmBoard' }
+
+export function antigravityLocalCommandExecutesOnAccept(
+  command: AntigravityLocalCommand,
+): boolean {
+  return command.kind !== 'effortShow'
+}
+
+/**
+ * Parse the submitted text as an Antigravity CLI-local command bridged by Waku
+ * without starting an ACP turn. Returns `null` for other providers, agent-side
+ * commands (`/boost`, `/swarm <task>`, `/plan <task>`, etc.), or when a
+ * project/user/skill/template command overrides the name.
+ */
+export function parseAntigravityLocalCommand(
+  provider: ProviderKind,
+  prompt: string,
+  commands: SlashCommand[],
+): AntigravityLocalCommand | null {
+  if (provider !== 'antigravity') return null
+  const invocation = prompt.trim()
+  if (!invocation.startsWith('/')) return null
+  const body = invocation.slice(1)
+  const split = body.match(/^(\S+)(?:\s+([\s\S]*))?$/u)
+  if (!split) return null
+  const name = split[1]!
+  const argument = (split[2] ?? '').trim()
+  if (commandIsOverridden(name, argument, commands)) return null
+  switch (name) {
+    case 'usage':
+    case 'quota':
+    case 'credits':
+      return argument === '' ? { kind: 'usage' } : null
+    case 'model':
+      return argument === '' ? { kind: 'modelPicker' } : { kind: 'setModel', query: argument }
+    case 'effort':
+      return argument === '' ? { kind: 'effortShow' } : { kind: 'setEffort', query: argument }
+    case 'swarm':
+      return argument === 'board' ? { kind: 'swarmBoard' } : null
+    default:
+      return null
+  }
+}
+
+export function resolveProviderModel(
+  models: readonly ProviderModel[],
+  query: string,
+): ProviderModel | null {
+  const trimmed = query.trim()
+  if (!trimmed) return null
+  const lower = trimmed.toLocaleLowerCase()
+  const byId = models.find((model) => model.id.toLocaleLowerCase() === lower)
+  if (byId) return byId
+  const byName = models.find((model) => model.name.toLocaleLowerCase() === lower)
+  if (byName) return byName
+  const bySlug = models.find(
+    (model) => model.name.toLocaleLowerCase().split(/\s+/u).filter(Boolean).join('-') === lower,
+  )
+  if (bySlug) return bySlug
+  const matches = models.filter(
+    (model) => model.id.toLocaleLowerCase().includes(lower)
+      || model.name.toLocaleLowerCase().includes(lower),
+  )
+  return matches.length === 1 ? matches[0]! : null
+}
+
+export function resolveProviderEffort(
+  options: readonly ProviderModelOption[],
+  query: string,
+): ProviderModelOption | null {
+  const trimmed = query.trim()
+  if (!trimmed) return null
+  const lower = trimmed.toLocaleLowerCase()
+  const slugLower = lower.split(/\s+/u).filter(Boolean).join('-')
+  const byId = options.find((option) => option.id.toLocaleLowerCase() === lower)
+  if (byId) return byId
+  const byLabel = options.find((option) => option.label.toLocaleLowerCase() === lower)
+  if (byLabel) return byLabel
+  const bySlug = options.find(
+    (option) => option.label.toLocaleLowerCase().split(/\s+/u).filter(Boolean).join('-') === slugLower,
+  )
+  if (bySlug) return bySlug
+  const matches = options.filter(
+    (option) => option.id.toLocaleLowerCase().includes(lower)
+      || option.label.toLocaleLowerCase().includes(lower),
+  )
+  return matches.length === 1 ? matches[0]! : null
+}
+
+function commandIsOverridden(
+  name: string,
+  argument: string,
+  commands: SlashCommand[],
+): boolean {
+  return commands.some((command) => {
+    if (command.name !== name) return false
+    if (command.template !== null && command.template !== undefined) return true
+    if (name === 'swarm' && argument === 'board' && command.scope === 'Skill') return false
+    return command.scope !== 'Builtin'
+  })
 }
 
 export function toggledFastServiceTier(

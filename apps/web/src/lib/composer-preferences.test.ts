@@ -96,6 +96,23 @@ describe('composer preferences', () => {
       contextWindow: null,
     })
   })
+
+  test('remembers the last named provider account across sessions', () => {
+    const storage = memoryStorage()
+    const preferences = rememberComposerSession(
+      readComposerPreferences(storage, 'ws://first'),
+      {
+        provider: 'antigravity',
+        account_id: 'acct-work',
+        model: 'claude-sonnet-4-5',
+        reasoning_effort: null,
+        service_tier: null,
+      },
+    )
+    writeComposerPreferences(storage, 'ws://first', preferences)
+
+    expect(readComposerPreferences(storage, 'ws://first').lastAccountId).toBe('acct-work')
+  })
 })
 
 function memoryStorage() {

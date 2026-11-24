@@ -1736,6 +1736,48 @@ impl Waku {
         }
     }
 
+    fn active_local_provider_account_id(&self, provider: ProviderKind) -> Option<String> {
+        let local_host = waku_client::hosts::HostKey::Local;
+        let local_session_account = (self.selected_host_key() == local_host)
+            .then(|| self.selected_session())
+            .flatten()
+            .filter(|session| session.provider == provider)
+            .map(|session| session.account_id.as_deref());
+        let last_provider_account =
+            (self.state.last_provider == provider).then_some(self.state.last_account_id.as_deref());
+        let raw = resolve_active_local_provider_account_id(
+            provider.supports_multiple_accounts(),
+            self.model_picker_account
+                .get(&provider)
+                .map(Option::as_deref),
+            local_session_account,
+            last_provider_account,
+        );
+        self.validated_account_id_for_host(&local_host, provider, raw)
+    }
+
+    fn local_provider_discovery_scope(
+        &self,
+        provider: ProviderKind,
+    ) -> (Option<String>, Option<String>) {
+        let account_id = self.active_local_provider_account_id(provider);
+        let binary_override = self.effective_binary_override_for_host(
+            &waku_client::hosts::HostKey::Local,
+            provider,
+            account_id.as_deref(),
+        );
+        let config_dir = (provider == ProviderKind::Antigravity)
+            .then(|| {
+                self.effective_config_dir_for_host(
+                    &waku_client::hosts::HostKey::Local,
+                    provider,
+                    account_id.as_deref(),
+                )
+            })
+            .flatten();
+        (binary_override, config_dir)
+    }
+
     fn request_local_provider_model_discovery(&mut self, provider: ProviderKind) {
         if self.state.disabled_providers.contains(&provider)
             || !provider.supports_model_discovery()
@@ -1758,7 +1800,7 @@ impl Waku {
         let provider_probe_tx = self.provider_probe_tx.clone();
         let event_wake = self.event_wake_tx.clone();
         let daemon = self.daemon.client();
-        let binary_override = self.state.provider_binary_overrides.get(&provider).cloned();
+        let (binary_override, config_dir) = self.local_provider_discovery_scope(provider);
         if std::thread::Builder::new()
             .name(format!("waku-{}-model-discovery", provider.id()))
             .spawn(move || {
@@ -1770,7 +1812,7 @@ impl Waku {
                         binary_override,
                         discover_models: true,
                         probe_version: false,
-                        config_dir: None,
+                        config_dir,
                     },
                 ) {
                     Ok(waku_client::ResponsePayload::ProviderProbe { probe, .. }) => probe,
@@ -3012,23 +3054,20 @@ impl Waku {
             // rewound cursor after this driver is installed.
             while prepared.events.try_recv().is_ok() {}
         }
+        let installed_prepared_driver = prepared_driver.is_some();
         if let Some(prepared) = prepared_driver {
             self.install_prepared_driver(session_id, prepared);
         }
         if reset_native_session {
             self.reset_session_runtime(session_id);
-        } else if claude_fork.is_some()
-            || (matches!(
-                provider,
-                ProviderKind::Amp
-                    | ProviderKind::Cursor
-                    | ProviderKind::DeepSeek
-                    | ProviderKind::OpenCode
-                    | ProviderKind::Grok
-            ) && provider_rewind_cursor.is_some())
-        {
-            // Headless drivers retain their original native session ID. Recreate
-            // them lazily so the next prompt resumes the fork instead.
+        } else if should_close_runtime_after_rewind(
+            claude_fork.is_some(),
+            provider_rewind_cursor.is_some(),
+            installed_prepared_driver,
+        ) {
+            // Headless and cursor-rewound drivers (including Antigravity ACP)
+            // retain their original native session ID. Recreate them lazily so
+            // the next prompt resumes from the rewound cursor instead.
             if let Some(runtime) = self.runtimes.remove(&session_id) {
                 runtime.driver.close();
             }
@@ -5138,6 +5177,34 @@ mod response_fork_title_tests {
     }
 }
 
+fn resolve_active_local_provider_account_id<'a>(
+    supports_multiple_accounts: bool,
+    picker_account: Option<Option<&'a str>>,
+    local_session_account: Option<Option<&'a str>>,
+    last_provider_account: Option<Option<&'a str>>,
+) -> Option<&'a str> {
+    if !supports_multiple_accounts {
+        return None;
+    }
+    if let Some(account) = picker_account {
+        account
+    } else if let Some(account) = local_session_account {
+        account
+    } else if let Some(account) = last_provider_account {
+        account
+    } else {
+        None
+    }
+}
+
+fn should_close_runtime_after_rewind(
+    claude_fork_present: bool,
+    has_provider_rewind_cursor: bool,
+    installed_prepared_driver: bool,
+) -> bool {
+    claude_fork_present || (has_provider_rewind_cursor && !installed_prepared_driver)
+}
+
 #[cfg(test)]
 mod version_tests {
     use crate::model::parse_cli_version;
@@ -5171,6 +5238,70 @@ mod version_tests {
         assert_eq!(
             parse_cli_version("cursor-agent 2025.09.12-4f8d8e2"),
             Some("2025.09.12-4f8d8e2".to_owned())
+        );
+    }
+
+    #[test]
+    fn antigravity_cursor_rewind_closes_live_runtime_and_preserves_prepared_drivers() {
+        assert!(super::should_close_runtime_after_rewind(
+            false, true, false
+        ));
+        assert!(super::should_close_runtime_after_rewind(true, false, false));
+        assert!(!super::should_close_runtime_after_rewind(
+            false, true, true
+        ));
+        assert!(!super::should_close_runtime_after_rewind(
+            false, false, false
+        ));
+    }
+
+    #[test]
+    fn active_local_provider_account_prefers_picker_then_session_then_last() {
+        assert_eq!(
+            super::resolve_active_local_provider_account_id(
+                true,
+                Some(Some("agy-work")),
+                Some(Some("agy-personal")),
+                Some(Some("agy-last")),
+            ),
+            Some("agy-work")
+        );
+        // Selecting "Default account" in the picker explicitly overrides the session account.
+        assert_eq!(
+            super::resolve_active_local_provider_account_id(
+                true,
+                Some(None),
+                Some(Some("agy-personal")),
+                Some(Some("agy-last")),
+            ),
+            None
+        );
+        assert_eq!(
+            super::resolve_active_local_provider_account_id(
+                true,
+                None,
+                Some(Some("agy-personal")),
+                Some(Some("agy-last")),
+            ),
+            Some("agy-personal")
+        );
+        assert_eq!(
+            super::resolve_active_local_provider_account_id(
+                true,
+                None,
+                None,
+                Some(Some("agy-last")),
+            ),
+            Some("agy-last")
+        );
+        assert_eq!(
+            super::resolve_active_local_provider_account_id(
+                false,
+                Some(Some("ignored")),
+                Some(Some("ignored")),
+                Some(Some("ignored")),
+            ),
+            None
         );
     }
 }

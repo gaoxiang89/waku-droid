@@ -333,36 +333,46 @@ impl Waku {
             UsageViewMode::Monthly,
             UsageViewMode::Projects,
         ];
-        for (view, label) in [
+        for (index, (view, label)) in [
             (UsageViewMode::Daily, tr!("usage.daily")),
             (UsageViewMode::Monthly, tr!("usage.monthly")),
             (UsageViewMode::Projects, tr!("usage.projects")),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let selected = self.usage_view == view;
             view_options = view_options.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "usage-view-{}",
-                        label.to_ascii_lowercase()
-                    )))
-                    .tab_index(0)
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
-                    .h(px(26.0))
-                    .px(px(11.0))
-                    .flex()
-                    .items_center()
-                    .cursor_default()
-                    .text_size(sp(12.5))
-                    .text_color(if selected {
-                        theme.text
-                    } else {
-                        theme.text_secondary
-                    })
-                    .when(selected, |element| element.bg(theme.overlay))
-                    .when(!selected, |element| {
-                        element.hover(|element| element.text_color(theme.text))
-                    })
-                    .child(label)
+                round_horizontal_segment_edges(
+                    div()
+                        .id(SharedString::from(format!(
+                            "usage-view-{}",
+                            label.to_ascii_lowercase()
+                        )))
+                        .tab_index(0)
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .h(px(26.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |element| element.bg(theme.overlay))
+                        .when(!selected, |element| {
+                            element.hover(|element| element.text_color(theme.text))
+                        }),
+                    index,
+                    VIEW_OPTIONS.len(),
+                    px(6.0),
+                )
+                .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_usage_view(view, cx);
                         cx.stop_propagation();
@@ -830,32 +840,42 @@ impl Waku {
             .flex()
             .overflow_hidden();
         const METRIC_OPTIONS: [UsageMetric; 2] = [UsageMetric::Cost, UsageMetric::Tokens];
-        for (option, label) in [
+        for (index, (option, label)) in [
             (UsageMetric::Cost, tr!("usage.cost_upper")),
             (UsageMetric::Tokens, tr!("usage.tokens_upper")),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let selected = metric == option;
             toggle = toggle.child(
-                div()
-                    .id(SharedString::from(format!("usage-metric-{label}")))
-                    .tab_index(0)
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
-                    .h(px(22.0))
-                    .px(px(9.0))
-                    .flex()
-                    .items_center()
-                    .cursor_default()
-                    .text_size(sp(12.5))
-                    .text_color(if selected {
-                        theme.text
-                    } else {
-                        theme.text_secondary
-                    })
-                    .when(selected, |element| element.bg(theme.overlay))
-                    .when(!selected, |element| {
-                        element.hover(|element| element.text_color(theme.text))
-                    })
-                    .child(label)
+                round_horizontal_segment_edges(
+                    div()
+                        .id(SharedString::from(format!("usage-metric-{label}")))
+                        .tab_index(0)
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |element| element.bg(theme.overlay))
+                        .when(!selected, |element| {
+                            element.hover(|element| element.text_color(theme.text))
+                        }),
+                    index,
+                    METRIC_OPTIONS.len(),
+                    px(6.0),
+                )
+                .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.usage_metric != option {
                             this.usage_metric = option;
@@ -1247,32 +1267,42 @@ impl Waku {
             .flex()
             .overflow_hidden();
         const BREAKDOWN_OPTIONS: [UsageBreakdown; 2] = [UsageBreakdown::Model, UsageBreakdown::Day];
-        for (option, label) in [
+        for (index, (option, label)) in [
             (UsageBreakdown::Model, tr!("usage.model_upper")),
             (UsageBreakdown::Day, tr!("usage.day_upper")),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let selected = breakdown == option;
             toggle = toggle.child(
-                div()
-                    .id(SharedString::from(format!("usage-breakdown-{label}")))
-                    .tab_index(0)
-                    .focus_visible(|style| style.border_1().border_color(theme.accent))
-                    .h(px(22.0))
-                    .px(px(9.0))
-                    .flex()
-                    .items_center()
-                    .cursor_default()
-                    .text_size(sp(12.5))
-                    .text_color(if selected {
-                        theme.text
-                    } else {
-                        theme.text_secondary
-                    })
-                    .when(selected, |element| element.bg(theme.overlay))
-                    .when(!selected, |element| {
-                        element.hover(|element| element.text_color(theme.text))
-                    })
-                    .child(label)
+                round_horizontal_segment_edges(
+                    div()
+                        .id(SharedString::from(format!("usage-breakdown-{label}")))
+                        .tab_index(0)
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .h(px(22.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .cursor_default()
+                        .text_size(sp(12.5))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .when(selected, |element| element.bg(theme.overlay))
+                        .when(!selected, |element| {
+                            element.hover(|element| element.text_color(theme.text))
+                        }),
+                    index,
+                    BREAKDOWN_OPTIONS.len(),
+                    px(6.0),
+                )
+                .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.usage_breakdown != option {
                             this.usage_breakdown = option;
@@ -2490,15 +2520,21 @@ fn usage_split_bar(
         .overflow_hidden()
         .flex();
     if sum > 0.0 {
-        for (index, value) in values.into_iter().enumerate() {
-            if value > 0.0 {
-                bar = bar.child(
-                    div()
-                        .h_full()
-                        .w(relative((value / sum) as f32))
-                        .bg(colors[index]),
-                );
-            }
+        let non_zero: Vec<(usize, f64)> = values
+            .into_iter()
+            .enumerate()
+            .filter(|(_, value)| *value > 0.0)
+            .collect();
+        for (pos, (index, value)) in non_zero.iter().enumerate() {
+            bar = bar.child(round_horizontal_segment_edges(
+                div()
+                    .h_full()
+                    .w(relative((*value / sum) as f32))
+                    .bg(colors[*index]),
+                pos,
+                non_zero.len(),
+                px(2.0),
+            ));
         }
     }
     div()
@@ -2507,6 +2543,21 @@ fn usage_split_bar(
         .rounded_full()
         .bg(theme.overlay)
         .child(bar)
+}
+
+pub(super) fn round_horizontal_segment_edges<E: gpui::Styled>(
+    mut element: E,
+    index: usize,
+    len: usize,
+    radius: gpui::Pixels,
+) -> E {
+    if index == 0 {
+        element = element.rounded_tl(radius).rounded_bl(radius);
+    }
+    if index + 1 == len {
+        element = element.rounded_tr(radius).rounded_br(radius);
+    }
+    element
 }
 
 fn usage_provider_value(entry: &ProviderDay, by_cost: bool) -> f64 {

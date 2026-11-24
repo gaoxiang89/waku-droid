@@ -233,4 +233,29 @@ describe('mobile runtime history', () => {
     ]);
     expect(f.current().turns).toEqual(f.history.turns);
   });
+
+  test('closes a live runtime when switching provider accounts via updateSessionOptions', async () => {
+    const f = fixture();
+    const antigravitySession: AgentSession = {
+      ...f.history,
+      provider: 'antigravity',
+      account_id: 'acct-personal',
+      provider_cursor: { provider: 'antigravity', sessionId: 'personal-1' },
+    };
+    f.queryClient.setQueryData(f.key, antigravitySession);
+    await f.runtime.attachSession(antigravitySession);
+    await f.runtime.updateSessionOptions(antigravitySession.id, {
+      accountId: 'acct-work',
+      model: 'claude-sonnet-4-5',
+    });
+
+    expect(f.commands.some((command) => command.type === 'closeSession')).toBe(true);
+    expect(f.commands.some((command) => command.type === 'applyOptions')).toBe(false);
+    expect(f.current().account_id).toBe('acct-work');
+    expect(f.current().model).toBe('claude-sonnet-4-5');
+    expect(f.current().account_cursors).toEqual([{
+      accountId: 'acct-personal',
+      cursor: { provider: 'antigravity', sessionId: 'personal-1' },
+    }]);
+  });
 });

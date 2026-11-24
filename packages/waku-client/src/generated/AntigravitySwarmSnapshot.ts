@@ -20,4 +20,4 @@ currentMember?: string | null, title: string, headSeq: number, totalMessages: nu
  * Change token computed from on-disk metadata so clients can skip
  * redundant list resets when polls observe identical state.
  */
-fingerprint: string, };
+fingerprint: string, channels: Array<string>, boardFingerprint?: string | null, rosterFingerprint?: string | null, };

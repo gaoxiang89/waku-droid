@@ -1,12 +1,13 @@
-import type {
-  AgentSession,
-  MessageAttachment,
-  Project,
-  ProviderKind,
-  ProviderSessionHistory,
-  ProviderSessionSummary,
-  RuntimeMode,
-  SequencedEvent,
+import {
+  switchSessionAgent,
+  type AgentSession,
+  type MessageAttachment,
+  type Project,
+  type ProviderKind,
+  type ProviderSessionHistory,
+  type ProviderSessionSummary,
+  type RuntimeMode,
+  type SequencedEvent,
 } from '@waku/client';
 
 export interface MobileRuntimeClock {
@@ -15,6 +16,7 @@ export interface MobileRuntimeClock {
 }
 
 export interface NewSessionOptions {
+  accountId?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
   serviceTier?: string | null;
@@ -102,6 +104,7 @@ export function createSession(
       ? { kind: 'newWorktree', baseBranch: options.baseBranch ?? null }
       : { kind: 'local' },
     provider,
+    account_id: options.accountId ?? null,
     model: options.model ?? null,
     runtime_mode: options.runtimeMode ?? 'fullAccess',
     reasoning_effort: options.reasoningEffort ?? null,
@@ -219,6 +222,8 @@ export function sessionIsRunning(
 }
 
 export interface SessionOptionChanges {
+  provider?: ProviderKind;
+  accountId?: string | null;
   model?: string | null;
   reasoningEffort?: string | null;
   serviceTier?: string | null;
@@ -231,17 +236,27 @@ export function applySessionOptions(
   changes: SessionOptionChanges,
   clock: MobileRuntimeClock,
 ): AgentSession {
+  const updatedAt = clock.nowSeconds();
+  const nextProvider = changes.provider ?? session.provider;
+  const nextAccountId = changes.accountId !== undefined
+    ? changes.accountId
+    : session.account_id;
+  const base =
+    nextProvider !== session.provider
+      || (nextAccountId ?? null) !== (session.account_id ?? null)
+      ? switchSessionAgent(session, nextProvider, nextAccountId, updatedAt)
+      : session;
   return {
-    ...session,
-    model: changes.model !== undefined ? changes.model : session.model,
+    ...base,
+    model: changes.model !== undefined ? changes.model : base.model,
     reasoning_effort:
-      changes.reasoningEffort !== undefined ? changes.reasoningEffort : session.reasoning_effort,
+      changes.reasoningEffort !== undefined ? changes.reasoningEffort : base.reasoning_effort,
     service_tier:
-      changes.serviceTier !== undefined ? changes.serviceTier : session.service_tier,
+      changes.serviceTier !== undefined ? changes.serviceTier : base.service_tier,
     context_window:
-      changes.contextWindow !== undefined ? changes.contextWindow : session.context_window,
-    runtime_mode: changes.runtimeMode ?? session.runtime_mode,
-    updated_at: clock.nowSeconds(),
+      changes.contextWindow !== undefined ? changes.contextWindow : base.context_window,
+    runtime_mode: changes.runtimeMode ?? base.runtime_mode,
+    updated_at: updatedAt,
   };
 }
 

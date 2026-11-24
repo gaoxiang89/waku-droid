@@ -387,11 +387,12 @@ fn assemble_slash_commands_with_home(
             );
             scan_skill_files(provider, &project_root.join(".agent/skills"), &mut commands);
             if let Some(config_dir) = account_config_dir {
-                let nested = config_dir.join("config").join("skills");
+                let data_root = antigravity_account_data_root(config_dir);
+                let nested = data_root.join("config").join("skills");
                 if nested.is_dir() {
                     scan_skill_files(provider, &nested, &mut commands);
                 }
-                scan_skill_files(provider, &config_dir.join("skills"), &mut commands);
+                scan_skill_files(provider, &data_root.join("skills"), &mut commands);
             } else if let Some(home) = home.as_deref() {
                 scan_skill_files(provider, &home.join(".gemini/config/skills"), &mut commands);
                 scan_skill_files(
@@ -595,6 +596,15 @@ fn scan_command_files(
     }
 }
 
+fn antigravity_account_data_root(config_dir: &Path) -> PathBuf {
+    if config_dir.file_name().and_then(|name| name.to_str()) == Some("sidecar_data")
+        && let Some(parent) = config_dir.parent().filter(|parent| !parent.as_os_str().is_empty())
+    {
+        return parent.to_path_buf();
+    }
+    config_dir.to_path_buf()
+}
+
 /// Collect skills — one directory per skill with a `SKILL.md` — as provider
 /// commands. Always passthrough: the provider-native invocation goes through
 /// verbatim, and its own skill machinery resolves it.
@@ -620,6 +630,9 @@ fn scan_skill_files(provider: ProviderKind, root: &Path, commands: &mut Vec<Slas
             continue;
         };
         let front = parse_frontmatter(&contents);
+        if front.disable_slash_command {
+            continue;
+        }
         let short_name = front.name.unwrap_or(dir_name);
         let plugin_name = (provider == ProviderKind::Codex)
             .then(|| codex_plugin_name(&entry.path()))
@@ -670,6 +683,7 @@ struct Frontmatter<'a> {
     name: Option<String>,
     description: Option<String>,
     argument_hint: Option<String>,
+    disable_slash_command: bool,
     body: &'a str,
 }
 
@@ -681,12 +695,16 @@ fn parse_frontmatter(contents: &str) -> Frontmatter<'_> {
         name: None,
         description: None,
         argument_hint: None,
+        disable_slash_command: false,
         body: contents,
     };
     front.body = crate::frontmatter::parse_frontmatter_fields(contents, |key, value| match key {
         "name" => front.name = Some(value),
         "description" => front.description = Some(value),
         "argument-hint" => front.argument_hint = Some(value),
+        "disable-slash-command" => {
+            front.disable_slash_command = value.eq_ignore_ascii_case("true");
+        }
         _ => {}
     });
     front
@@ -1716,15 +1734,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let project = root.join("project");
         let account_dir = root.join("antigravity-work");
+        let sidecar_dir = account_dir.join("sidecar_data");
 
         std::fs::create_dir_all(project.join(".gemini/skills/proj-gemini-skill")).unwrap();
         std::fs::create_dir_all(project.join(".agent/skills/proj-agent-skill")).unwrap();
+        std::fs::create_dir_all(project.join(".gemini/skills/hidden-skill")).unwrap();
         std::fs::create_dir_all(account_dir.join("skills/work-skill")).unwrap();
         std::fs::create_dir_all(account_dir.join("config/skills/work-config-skill")).unwrap();
 
         std::fs::write(
             project.join(".gemini/skills/proj-gemini-skill/SKILL.md"),
             "---\nname: proj-gemini-skill\ndescription: Project Gemini skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".gemini/skills/hidden-skill/SKILL.md"),
+            "---\nname: hidden-skill\ndescription: Hidden slash command\ndisable-slash-command: true\n---\nBody",
         )
         .unwrap();
         std::fs::write(
@@ -1743,23 +1768,30 @@ mod tests {
         )
         .unwrap();
 
-        let commands = assemble_slash_commands(
-            ProviderKind::Antigravity,
-            &project,
-            Some(&account_dir),
-            Vec::new(),
-        );
-        for expected in [
-            "proj-gemini-skill",
-            "proj-agent-skill",
-            "work-skill",
-            "work-config-skill",
-        ] {
+        for cfg_dir in [&account_dir, &sidecar_dir] {
+            let commands = assemble_slash_commands(
+                ProviderKind::Antigravity,
+                &project,
+                Some(cfg_dir),
+                Vec::new(),
+            );
+            for expected in [
+                "proj-gemini-skill",
+                "proj-agent-skill",
+                "work-skill",
+                "work-config-skill",
+            ] {
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| command.name == expected && command.scope == CommandScope::Skill),
+                    "missing skill {expected} for {} in {commands:?}",
+                    cfg_dir.display()
+                );
+            }
             assert!(
-                commands
-                    .iter()
-                    .any(|command| command.name == expected && command.scope == CommandScope::Skill),
-                "missing skill {expected} in {commands:?}"
+                !commands.iter().any(|command| command.name == "hidden-skill"),
+                "disable-slash-command: true must omit skill from slash autocomplete"
             );
         }
 

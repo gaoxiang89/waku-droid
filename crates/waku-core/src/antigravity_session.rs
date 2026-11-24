@@ -319,7 +319,7 @@ pub(crate) fn expand_imported_history(history: &mut ProviderSessionHistory) {
 const ERROR_STEP_TYPE: i64 = 17;
 /// The harness error text leads the payload; a Go stack trace follows it.
 const MAX_ERROR_PAYLOAD_BYTES: usize = 16_384;
-const SERVER_LOG_TAIL_BYTES: u64 = 128 * 1024;
+const SERVER_LOG_TAIL_BYTES: u64 = 512 * 1024;
 /// The longest provider reason shown for one failed turn.
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -372,7 +372,7 @@ pub fn turn_failure_in(
             if let Some(text) = read_new_error(&path, offset) {
                 return Some(failure_message(&text));
             }
-            if !refusal || Instant::now() >= deadline {
+            if (!refusal && !empty_end_turn) || Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -1133,6 +1133,39 @@ mod tests {
             turn_failure_in(session_b, -1, false, true, Some(&account_a)),
             Some(tr!("errors.antigravity_turn_failed"))
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_end_turn_polls_for_delayed_error_step() {
+        let root =
+            std::env::temp_dir().join(format!("waku-agy-delayed-err-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let session_id = "delayed-err-session";
+        let db_path = root.join("conversations").join(format!("{session_id}.db"));
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER NOT NULL, step_type INTEGER NOT NULL, step_payload BLOB);
+             INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, X'00');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let bg_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            let conn = Connection::open(&bg_path).unwrap();
+            conn.execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, CAST(?1 AS BLOB))",
+                params!["UNAVAILABLE (code 503): Delayed upstream failure."],
+            )
+            .unwrap();
+        });
+
+        let recovered = turn_failure_in(session_id, 0, false, true, Some(&root));
+        writer.join().unwrap();
+        assert_eq!(recovered.as_deref(), Some("Delayed upstream failure."));
 
         let _ = fs::remove_dir_all(&root);
     }

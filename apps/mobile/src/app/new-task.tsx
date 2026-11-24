@@ -1,5 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
-import type { ProviderKind, RuntimeMode } from '@waku/client';
+import {
+  resolveProviderAccount,
+  supportsMultipleAccounts,
+  validatedAccountId,
+  type ProviderKind,
+  type RuntimeMode,
+} from '@waku/client';
 import {
   rememberedModelTraits,
   rememberComposerSession,
@@ -39,7 +45,12 @@ import {
 } from '@/components/session-option-sheets';
 import { Sheet, SheetRow } from '@/components/sheet';
 import { Radius, Spacing } from '@/constants/theme';
-import { useAllProviderModels, useProviderCatalog, useTaskState } from '@/hooks/use-daemon-data';
+import {
+  useAllProviderModels,
+  useDaemonSettings,
+  useProviderCatalog,
+  useTaskState,
+} from '@/hooks/use-daemon-data';
 import { useComposerPicker } from '@/hooks/use-composer-picker';
 import { useSyncedComposerDraft } from '@/hooks/use-synced-composer-draft';
 import { useTheme } from '@/hooks/use-theme';
@@ -74,9 +85,11 @@ export default function NewTaskScreen() {
   const daemon = useDaemon();
   const runtime = useRuntime();
   const taskState = useTaskState();
+  const settings = useDaemonSettings();
   const catalog = useProviderCatalog();
   const [projectId, setProjectId] = useState<string | null>(null);
   const [provider, setProvider] = useState<ProviderKind | null>(null);
+  const [accountId, setAccountId] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
   const [serviceTier, setServiceTier] = useState<string | null>(null);
@@ -89,11 +102,20 @@ export default function NewTaskScreen() {
   const [openSheet, setOpenSheet] = useState<SheetKind | null>(null);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const activeAccountId = provider && supportsMultipleAccounts(provider)
+    ? (settings.data ? validatedAccountId(settings.data, provider, accountId) : accountId)
+    : null;
   const installedProviders = useMemo(
     () => catalog.providers.filter((item) => item.installed).map((item) => item.id),
     [catalog.providers],
   );
-  const modelCatalog = useAllProviderModels(installedProviders);
+  const modelAccountIds = useMemo(
+    () => (provider && supportsMultipleAccounts(provider)
+      ? { [provider]: activeAccountId }
+      : undefined),
+    [activeAccountId, provider],
+  );
+  const modelCatalog = useAllProviderModels(installedProviders, modelAccountIds);
   const projects = taskState.data?.projects ?? [];
   const selectedProject = projects.find((item) => item.id === projectId);
   const projectless = selectedProject?.name === 'No project';
@@ -124,6 +146,7 @@ export default function NewTaskScreen() {
     const preferred = installedProviders.includes('codex') ? 'codex' : installedProviders[0];
     if (preferred) {
       setProvider(preferred);
+      setAccountId(null);
       setModel(null);
       setReasoningEffort(null);
       setServiceTier(null);
@@ -151,6 +174,7 @@ export default function NewTaskScreen() {
       setIsolated(extras.isolated);
       if (extras.projectId) setProjectId(extras.projectId);
       setProvider(prefs.lastProvider);
+      setAccountId(prefs.lastAccountId ?? null);
       setModel(prefs.lastModel);
       setReasoningEffort(prefs.lastReasoningEffort);
       setServiceTier(prefs.lastServiceTier);
@@ -171,6 +195,7 @@ export default function NewTaskScreen() {
         let next: ComposerPreferences = {
           ...prefs,
           ...(provider ? { lastProvider: provider } : {}),
+          lastAccountId: activeAccountId,
           lastModel: model,
           lastReasoningEffort: reasoningEffort,
           lastServiceTier: serviceTier,
@@ -179,6 +204,7 @@ export default function NewTaskScreen() {
         if (provider && model) {
           next = rememberComposerSession(next, {
             provider,
+            account_id: activeAccountId,
             model,
             reasoning_effort: reasoningEffort,
             service_tier: serviceTier,
@@ -196,6 +222,7 @@ export default function NewTaskScreen() {
     }, 300);
     return () => clearTimeout(timer);
   }, [
+    activeAccountId,
     contextWindow,
     daemon.activeProfile?.address,
     isolated,
@@ -226,6 +253,7 @@ export default function NewTaskScreen() {
       setPrompt(value);
     },
     provider,
+    accountId: activeAccountId,
     root: selectedProject?.path ?? null,
     contextKey: selectedProject?.id ?? 'new-task',
   });
@@ -243,6 +271,7 @@ export default function NewTaskScreen() {
     if (preferences && provider && model) {
       preferences = rememberComposerSession(preferences, {
         provider,
+        account_id: activeAccountId,
         model,
         reasoning_effort: reasoningEffort,
         service_tier: serviceTier,
@@ -254,6 +283,11 @@ export default function NewTaskScreen() {
       ? rememberedModelTraits(preferences, selection.provider, selection.model)
       : undefined;
     setProvider(selection.provider);
+    setAccountId(
+      supportsMultipleAccounts(selection.provider)
+        ? (selection.accountId ?? null)
+        : null,
+    );
     setModel(selection.model);
     setReasoningEffort(remembered ? remembered.reasoningEffort : selection.reasoningEffort);
     setServiceTier(remembered ? remembered.serviceTier : selection.serviceTier);
@@ -283,6 +317,7 @@ export default function NewTaskScreen() {
         isolated && !projectless,
         value,
         {
+          accountId: activeAccountId,
           model,
           reasoningEffort,
           serviceTier,
@@ -302,6 +337,7 @@ export default function NewTaskScreen() {
             next = {
               ...next,
               lastProvider: session.provider,
+              lastAccountId: session.account_id ?? null,
               lastModel: null,
               lastReasoningEffort: session.reasoning_effort ?? null,
               lastServiceTier: session.service_tier ?? null,
@@ -334,15 +370,31 @@ export default function NewTaskScreen() {
     : providerModels.find((item) => item.is_default) ?? providerModels[0];
   const localCommands = useComposerLocalCommands({
     provider,
+    accountId: activeAccountId,
+    models: providerModels,
     model: activeModel,
+    reasoningEffort,
     serviceTier,
     runtimeMode,
     contextKey: selectedProject?.id ?? 'new-task',
+    onOpenModelPicker: () => setOpenSheet('model'),
+    onSelectModel: (nextModel) => {
+      if (!provider) return;
+      applyModelSelection({
+        provider,
+        accountId: activeAccountId,
+        model: nextModel.id,
+        reasoningEffort: nextModel.default_reasoning_effort ?? null,
+        serviceTier: nextModel.default_service_tier ?? null,
+        contextWindow: nextModel.default_context_window ?? null,
+      });
+    },
+    onReasoningEffort: setReasoningEffort,
     onServiceTier: setServiceTier,
     onGoal: async (operation) => {
       if (!selectedProject || !provider) throw new Error('Choose a project and model first');
       const session = await runtime.createTask(selectedProject.id, provider, isolated && !projectless, '', {
-        model, reasoningEffort, serviceTier, contextWindow, runtimeMode, baseBranch,
+        accountId: activeAccountId, model, reasoningEffort, serviceTier, contextWindow, runtimeMode, baseBranch,
       });
       await runtime.sendGoalOperation(session, operation);
       router.push({ pathname: '/session/[id]', params: { id: session.id } });
@@ -352,9 +404,13 @@ export default function NewTaskScreen() {
       setPrompt('');
     },
   });
-  const modelLabel = !provider
+  const accountLabel = provider
+    ? resolveProviderAccount(settings.data, provider, activeAccountId)?.label
+    : null;
+  const baseModelLabel = !provider
     ? catalog.isPending ? 'Checking agents…' : 'No agents installed'
     : activeModel?.name ?? model ?? providerLabel(provider);
+  const modelLabel = accountLabel ? `${baseModelLabel} · ${accountLabel}` : baseModelLabel;
   const branchLabel = baseBranch
     ?? branches.data?.default_branch
     ?? branches.data?.current
@@ -493,6 +549,7 @@ export default function NewTaskScreen() {
       </Sheet>
 
       <ModelPickerSheet
+        accountId={activeAccountId}
         model={model}
         onApply={applyModelSelection}
         onDismiss={() => setOpenSheet(null)}

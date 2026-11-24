@@ -7,19 +7,23 @@
 //! ~15 fps only while at least one bee is working or replay playback is active,
 //! dropping to 0 Hz CPU when idle.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
+use std::rc::Rc;
 
 use chrono::{DateTime, NaiveDateTime, NaiveTime};
-use gpui::{Bounds, ClickEvent, PathBuilder, Pixels, Point, SharedString};
+use gpui::{
+    Bounds, ClickEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, SharedString,
+};
 use waku_client::antigravity_swarm::{
     AntigravitySwarmMember, AntigravitySwarmMemberStatus, AntigravitySwarmMessage,
     AntigravitySwarmSnapshot,
 };
 
 use super::swarm_panel::{
-    SwarmPanelTab, member_display_status, member_status_color, member_status_icon,
-    member_status_label, short_board_time, swarm_badge,
+    SwarmPanelTab, localized_member_activity, member_display_status, member_status_color,
+    member_status_icon, member_status_label, short_board_time, swarm_badge,
 };
 use super::*;
 use crate::ui::ActivationExt as _;
@@ -122,15 +126,29 @@ impl SwarmHivePacing {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HiveSceneCacheKey {
+    session_id: Uuid,
+    snapshot_fp: String,
+    width_bucket: i32,
+    mode: SwarmHiveMode,
+    show_killed: bool,
+    selected_member: Option<String>,
+    replay_cursor_seq: Option<u64>,
+}
+
 pub(super) struct SwarmHiveState {
     pub(super) mode: SwarmHiveMode,
     pub(super) pacing: SwarmHivePacing,
     pub(super) selected_member: Option<String>,
-    pub(super) replay_cursor: Option<usize>,
+    pub(super) replay_cursor_seq: Option<u64>,
     pub(super) replay_playing: bool,
     pub(super) replay_generation: u64,
     pub(super) scroll: ScrollHandle,
     pub(super) scrollbar: Rc<ScrollbarState>,
+    scrub_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    scrub_dragging: bool,
+    cached_scene: Option<(HiveSceneCacheKey, Rc<HiveSceneLayout>)>,
     mode_hive_focus: FocusHandle,
     mode_mentions_focus: FocusHandle,
     pacing_focus: FocusHandle,
@@ -149,11 +167,14 @@ impl SwarmHiveState {
             mode: SwarmHiveMode::Hive,
             pacing: SwarmHivePacing::Even,
             selected_member: None,
-            replay_cursor: None,
+            replay_cursor_seq: None,
             replay_playing: false,
             replay_generation: 0,
             scroll: ScrollHandle::new(),
             scrollbar: ScrollbarState::new(),
+            scrub_bounds: Rc::new(Cell::new(None)),
+            scrub_dragging: false,
+            cached_scene: None,
             mode_hive_focus: cx.focus_handle(),
             mode_mentions_focus: cx.focus_handle(),
             pacing_focus: cx.focus_handle(),
@@ -174,7 +195,11 @@ impl SwarmHiveState {
 
     pub(super) fn reset_for_session_change(&mut self) {
         self.selected_member = None;
-        self.replay_cursor = None;
+        self.replay_cursor_seq = None;
+        self.scrub_dragging = false;
+        self.cached_scene = None;
+        self.scroll.set_offset(gpui::Point::default());
+        self.bee_focuses.borrow_mut().clear();
         self.stop_replay();
     }
 
@@ -209,6 +234,7 @@ struct HiveBeeNode {
     cx: f32,
     cy: f32,
     pixel_size: f32,
+    label_width: f32,
     phase_seed: f32,
     highlighted: bool,
     selected: bool,
@@ -298,19 +324,19 @@ fn flat_top_hex_vertices(cx: f32, cy: f32, radius: f32) -> [(f32, f32); 6] {
 
 /// Computes balanced `(x, y)` bee centers strictly inside a flat-top hexagon,
 /// leaving top or bottom space for the chamber header label.
-fn pack_bees_in_hex(
+fn pack_bees_in_hex_with_spacing(
     count: usize,
     cx: f32,
     cy: f32,
     hex_r: f32,
     label_at_bottom: bool,
-) -> Vec<(f32, f32)> {
+) -> (Vec<(f32, f32)>, f32) {
     if count == 0 {
-        return Vec::new();
+        return (Vec::new(), 78.0);
     }
     if count == 1 {
         let y_shift = if label_at_bottom { -hex_r * 0.10 } else { hex_r * 0.06 };
-        return vec![(cx, cy + y_shift)];
+        return (vec![(cx, cy + y_shift)], (hex_r * 0.95).clamp(52.0, 84.0));
     }
 
     let row_counts: Vec<usize> = match count {
@@ -337,25 +363,30 @@ fn pack_bees_in_hex(
     let half_h = hex_r * HEX_HEIGHT_RATIO * 0.5;
     let band_top = if label_at_bottom {
         cy - half_h * 0.62
+    } else if row_counts.len() >= 3 {
+        cy - half_h * 0.34
     } else {
         cy - half_h * 0.30
     };
     let band_bottom = if label_at_bottom {
         cy + half_h * 0.30
+    } else if row_counts.len() >= 3 {
+        cy + half_h * 0.74
     } else {
         cy + half_h * 0.70
     };
     let rows_len = row_counts.len();
     let max_cols = row_counts.iter().copied().max().unwrap_or(1);
     let col_step = if max_cols <= 2 {
-        hex_r * 0.50
+        hex_r * 0.54
     } else if max_cols == 3 {
-        hex_r * 0.44
+        hex_r * 0.46
     } else {
-        hex_r * 0.36
+        hex_r * 0.38
     };
 
     let mut positions = Vec::with_capacity(count);
+    let mut min_step = f32::MAX;
     for (row_idx, cols) in row_counts.into_iter().enumerate() {
         let y = if rows_len == 1 {
             (band_top + band_bottom) * 0.5
@@ -366,20 +397,37 @@ fn pack_bees_in_hex(
 
         // Clamp horizontal spread to stay safely inside the sloped hex sides at `y`.
         let dy_frac = ((y - cy).abs() / half_h.max(1.0)).clamp(0.0, 0.95);
-        let hex_half_w_at_y = hex_r * (1.0 - 0.5 * dy_frac) * 0.78;
-        let row_span = (cols.saturating_sub(1) as f32) * col_step;
+        let hex_half_w_at_y = hex_r * (1.0 - 0.5 * dy_frac) * 0.80;
         let step = if cols <= 1 {
             0.0
         } else {
-            col_step.min((hex_half_w_at_y * 2.0) / (cols - 1) as f32)
+            let s = col_step.min((hex_half_w_at_y * 2.0) / (cols - 1) as f32);
+            min_step = min_step.min(s);
+            s
         };
-        let actual_span = ((cols.saturating_sub(1)) as f32) * step.min(row_span / (cols - 1).max(1) as f32);
+        let actual_span = (cols.saturating_sub(1) as f32) * step;
         let start_x = cx - actual_span * 0.5;
         for col in 0..cols {
             positions.push((start_x + col as f32 * step, y));
         }
     }
-    positions
+    let label_width = if min_step.is_finite() {
+        (min_step - 4.0).clamp(44.0, 78.0)
+    } else {
+        78.0
+    };
+    (positions, label_width)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn pack_bees_in_hex(
+    count: usize,
+    cx: f32,
+    cy: f32,
+    hex_r: f32,
+    label_at_bottom: bool,
+) -> Vec<(f32, f32)> {
+    pack_bees_in_hex_with_spacing(count, cx, cy, hex_r, label_at_bottom).0
 }
 
 fn compute_worker_done_counts(members: &[AntigravitySwarmMember]) -> (usize, usize) {
@@ -390,11 +438,43 @@ fn compute_worker_done_counts(members: &[AntigravitySwarmMember]) -> (usize, usi
             continue;
         }
         total += 1;
-        if member.killed || member.status == AntigravitySwarmMemberStatus::Waiting {
+        if member.killed || member.has_posted_done {
             done += 1;
         }
     }
     (done, total)
+}
+
+fn resolve_replay_index(
+    messages: &[AntigravitySwarmMessage],
+    cursor_seq: Option<u64>,
+) -> Option<usize> {
+    let seq = cursor_seq?;
+    if messages.is_empty() {
+        return None;
+    }
+    messages
+        .iter()
+        .position(|msg| msg.seq == seq)
+        .or_else(|| messages.iter().position(|msg| msg.seq > seq))
+        .or_else(|| Some(messages.len() - 1))
+}
+
+fn scrub_x_to_fraction(x: f32, bounds_left: f32, bounds_width: f32) -> f32 {
+    if bounds_width <= 1.0 {
+        return 0.0;
+    }
+    ((x - bounds_left) / bounds_width).clamp(0.0, 1.0)
+}
+
+fn scrub_fraction_to_index(fraction: f32, count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    if count == 1 {
+        return Some(0);
+    }
+    Some(((fraction.clamp(0.0, 1.0)) * (count - 1) as f32).round() as usize)
 }
 
 fn visible_hive_members(
@@ -575,11 +655,12 @@ fn build_hive_scene_layout(
     mode: SwarmHiveMode,
     show_killed: bool,
     selected_member: Option<&str>,
-    replay_cursor: Option<usize>,
+    replay_cursor_seq: Option<u64>,
 ) -> HiveSceneLayout {
-    let stage_width = (panel_width - 16.0).max(264.0);
+    let stage_width = (panel_width - 16.0).max(220.0);
     let visible = visible_hive_members(snapshot, show_killed);
     let visible_names: Vec<&str> = visible.iter().map(|m| m.name.as_str()).collect();
+    let replay_cursor = resolve_replay_index(&snapshot.messages, replay_cursor_seq);
 
     let (highlighted_names, replay_active_pair): (Vec<&str>, Option<(Vec<&str>, usize)>) =
         if let Some(idx) = replay_cursor.filter(|&i| i < snapshot.messages.len()) {
@@ -602,10 +683,11 @@ fn build_hive_scene_layout(
 
     match mode {
         SwarmHiveMode::Hive => {
-            const GROUP_ORDER: [AntigravitySwarmMemberStatus; 4] = [
+            const GROUP_ORDER: [AntigravitySwarmMemberStatus; 5] = [
                 AntigravitySwarmMemberStatus::Failed,
                 AntigravitySwarmMemberStatus::Working,
                 AntigravitySwarmMemberStatus::Waiting,
+                AntigravitySwarmMemberStatus::Stopped,
                 AntigravitySwarmMemberStatus::Killed,
             ];
             let mut groups: Vec<(AntigravitySwarmMemberStatus, Vec<&AntigravitySwarmMember>)> =
@@ -614,7 +696,11 @@ fn build_hive_scene_layout(
                 let members: Vec<&AntigravitySwarmMember> = visible
                     .iter()
                     .copied()
-                    .filter(|m| !is_coordinator_member(m) && member_display_status(m) == status)
+                    .filter(|m| {
+                        !is_coordinator_member(m)
+                            && !m.is_role_worker
+                            && member_display_status(m) == status
+                    })
                     .collect();
                 if !members.is_empty() {
                     groups.push((status, members));
@@ -625,7 +711,11 @@ fn build_hive_scene_layout(
             let gap_y = 12.0;
 
             let (done_count, total_workers) = compute_worker_done_counts(&snapshot.members);
-            let use_triad = stage_width >= 460.0 && groups.len() == 2 && coordinator.is_some();
+            let has_dense_group = groups.iter().any(|(_, members)| members.len() > 6);
+            let use_triad = stage_width >= 460.0
+                && groups.len() == 2
+                && !has_dense_group
+                && coordinator.is_some();
 
             if use_triad {
                 let r = ((stage_width - 32.0) / 4.8).clamp(86.0, 118.0);
@@ -648,7 +738,8 @@ fn build_hive_scene_layout(
                         label_at_bottom: false,
                     });
                     let pixel_size = if members.len() > 6 { 1.65 } else { 2.0 };
-                    let pts = pack_bees_in_hex(members.len(), cx, top_cy, r, false);
+                    let (pts, label_width) =
+                        pack_bees_in_hex_with_spacing(members.len(), cx, top_cy, r, false);
                     for (member, (bx, by)) in members.iter().zip(pts) {
                         let status = member_display_status(member);
                         if status == AntigravitySwarmMemberStatus::Working {
@@ -663,6 +754,7 @@ fn build_hive_scene_layout(
                             cx: bx,
                             cy: by,
                             pixel_size,
+                            label_width,
                             phase_seed: (name_hash(&member.name) % 100) as f32 / 100.0,
                             highlighted: highlighted_names.contains(&member.name.as_str()),
                             selected: selected_member == Some(member.name.as_str()),
@@ -699,6 +791,7 @@ fn build_hive_scene_layout(
                         cx: bx,
                         cy: by,
                         pixel_size: 2.35,
+                        label_width: 84.0,
                         phase_seed: 0.0,
                         highlighted: highlighted_names.contains(&coord.name.as_str()),
                         selected: selected_member == Some(coord.name.as_str()),
@@ -726,11 +819,16 @@ fn build_hive_scene_layout(
                 };
             }
 
-            // Centered honeycomb column (matches the screenshot for 1 worker chamber + Coordinator).
-            let r = if groups.len() <= 1 {
-                (stage_width * 0.37).clamp(92.0, 142.0)
+            // Centered honeycomb column; scale chamber radius up when a status holds >6 workers.
+            let max_group_len = groups.iter().map(|(_, m)| m.len()).max().unwrap_or(0);
+            let r = if max_group_len > 9 {
+                (stage_width * 0.44).clamp(112.0, 176.0)
+            } else if max_group_len > 6 {
+                (stage_width * 0.42).clamp(102.0, 160.0)
+            } else if groups.len() <= 1 {
+                (stage_width * 0.37).clamp(88.0, 142.0)
             } else {
-                (stage_width * 0.34).clamp(84.0, 126.0)
+                (stage_width * 0.34).clamp(82.0, 126.0)
             };
             let hex_h = r * HEX_HEIGHT_RATIO;
             let half_h = hex_h * 0.5;
@@ -747,8 +845,15 @@ fn build_hive_scene_layout(
                     status_accent: Some(*status),
                     label_at_bottom: false,
                 });
-                let pixel_size = if members.len() > 6 { 1.65 } else { 2.0 };
-                let pts = pack_bees_in_hex(members.len(), center_x, cursor_cy, r, false);
+                let pixel_size = if members.len() > 9 {
+                    1.45
+                } else if members.len() > 6 {
+                    1.65
+                } else {
+                    2.0
+                };
+                let (pts, label_width) =
+                    pack_bees_in_hex_with_spacing(members.len(), center_x, cursor_cy, r, false);
                 for (member, (bx, by)) in members.iter().zip(pts) {
                     let status = member_display_status(member);
                     if status == AntigravitySwarmMemberStatus::Working {
@@ -763,6 +868,7 @@ fn build_hive_scene_layout(
                         cx: bx,
                         cy: by,
                         pixel_size,
+                        label_width,
                         phase_seed: (name_hash(&member.name) % 100) as f32 / 100.0,
                         highlighted: highlighted_names.contains(&member.name.as_str()),
                         selected: selected_member == Some(member.name.as_str()),
@@ -772,6 +878,7 @@ fn build_hive_scene_layout(
             }
 
             if let Some(coord) = coordinator {
+                let coord_r = r.min(138.0);
                 chambers.push(HiveChamberLayout {
                     title: tr!("swarm.coordinator"),
                     subtitle: tr!(
@@ -781,11 +888,11 @@ fn build_hive_scene_layout(
                     ),
                     cx: center_x,
                     cy: cursor_cy,
-                    radius: r,
+                    radius: coord_r,
                     status_accent: None,
                     label_at_bottom: true,
                 });
-                let (bx, by) = (center_x, cursor_cy - r * 0.12);
+                let (bx, by) = (center_x, cursor_cy - coord_r * 0.12);
                 let status = member_display_status(coord);
                 if status == AntigravitySwarmMemberStatus::Working {
                     any_working = true;
@@ -799,6 +906,7 @@ fn build_hive_scene_layout(
                     cx: bx,
                     cy: by,
                     pixel_size: 2.5,
+                    label_width: 84.0,
                     phase_seed: 0.0,
                     highlighted: highlighted_names.contains(&coord.name.as_str()),
                     selected: selected_member == Some(coord.name.as_str()),
@@ -831,8 +939,8 @@ fn build_hive_scene_layout(
             }
         }
         SwarmHiveMode::Mentions => {
-            let orbit_r = (stage_width * 0.34).clamp(88.0, 140.0);
-            let center_hex_r = (stage_width * 0.15).clamp(40.0, 56.0);
+            let orbit_r = (stage_width * 0.34).clamp(76.0, 140.0);
+            let center_hex_r = (stage_width * 0.15).clamp(36.0, 56.0);
             let pad_y = 42.0;
             let cx = stage_width * 0.5;
             let cy = orbit_r + pad_y;
@@ -860,7 +968,8 @@ fn build_hive_scene_layout(
                     killed: coord.killed,
                     cx,
                     cy,
-                    pixel_size: 2.2,
+                    pixel_size: 2.1,
+                    label_width: (center_hex_r * 1.65).clamp(58.0, 84.0),
                     phase_seed: 0.0,
                     highlighted: highlighted_names.contains(&coord.name.as_str()),
                     selected: selected_member == Some(coord.name.as_str()),
@@ -873,6 +982,15 @@ fn build_hive_scene_layout(
                 .filter(|m| !is_coordinator_member(m))
                 .collect();
             let count = orbit_members.len().max(1);
+            let chord = 2.0 * orbit_r * (PI / count as f32).sin();
+            let orbit_label_w = (chord - 4.0).clamp(44.0, 78.0);
+            let orbit_px = if count > 9 {
+                1.5
+            } else if count > 6 {
+                1.7
+            } else {
+                1.9
+            };
             for (idx, member) in orbit_members.iter().enumerate() {
                 let angle = -PI * 0.5 + (idx as f32) * (TAU / count as f32);
                 let bx = cx + orbit_r * angle.cos();
@@ -889,7 +1007,8 @@ fn build_hive_scene_layout(
                     killed: member.killed,
                     cx: bx,
                     cy: by,
-                    pixel_size: 1.9,
+                    pixel_size: orbit_px,
+                    label_width: orbit_label_w,
                     phase_seed: (name_hash(&member.name) % 100) as f32 / 100.0,
                     highlighted: highlighted_names.contains(&member.name.as_str()),
                     selected: selected_member == Some(member.name.as_str()),
@@ -1115,11 +1234,12 @@ fn paint_hex_chamber(
     let fill_color = if theme.is_dark {
         gpui::hsla(240.0 / 360.0, 0.10, 0.085, 0.96)
     } else {
-        theme.surface.opacity(0.95)
+        theme.composer.opacity(0.96)
     };
     let border_color = match chamber.status_accent {
-        Some(AntigravitySwarmMemberStatus::Failed) => theme.danger.opacity(0.55),
-        Some(AntigravitySwarmMemberStatus::Working) => theme.border_strong.opacity(1.15),
+        Some(AntigravitySwarmMemberStatus::Failed) => theme.danger.opacity(0.60),
+        Some(AntigravitySwarmMemberStatus::Working) => theme.success.opacity(0.55),
+        Some(AntigravitySwarmMemberStatus::Stopped) => theme.text_tertiary.opacity(0.55),
         _ => theme.border_strong,
     };
 
@@ -1142,6 +1262,23 @@ fn paint_hex_chamber(
     if let Ok(built) = stroke_path.build() {
         window.paint_path(built, border_color);
     }
+}
+
+fn cubic_bezier_tangent(
+    p0: (f32, f32),
+    c1: (f32, f32),
+    c2: (f32, f32),
+    p3: (f32, f32),
+    t: f32,
+) -> (f32, f32) {
+    let u = 1.0 - t;
+    let dx = 3.0 * u * u * (c1.0 - p0.0)
+        + 6.0 * u * t * (c2.0 - c1.0)
+        + 3.0 * t * t * (p3.0 - c2.0);
+    let dy = 3.0 * u * u * (c1.1 - p0.1)
+        + 6.0 * u * t * (c2.1 - c1.1)
+        + 3.0 * t * t * (p3.1 - c2.1);
+    (dx, dy)
 }
 
 fn paint_arc_edge(
@@ -1178,6 +1315,32 @@ fn paint_arc_edge(
     );
     if let Ok(path) = builder.build() {
         window.paint_path(path, line_color);
+    }
+
+    let chord = ((p3.0 - p0.0).powi(2) + (p3.1 - p0.1).powi(2)).sqrt();
+    if chord >= 22.0 && edge.opacity >= 0.05 {
+        let tip_t = 0.84;
+        let tip = cubic_bezier_point(p0, c1, c2, p3, tip_t);
+        let tangent = cubic_bezier_tangent(p0, c1, c2, p3, tip_t);
+        let t_len = (tangent.0 * tangent.0 + tangent.1 * tangent.1).sqrt();
+        if t_len > 0.5 {
+            let ux = tangent.0 / t_len;
+            let uy = tangent.1 / t_len;
+            let nx = -uy;
+            let ny = ux;
+            let head_len = 5.2 + edge.stroke_width * 0.75;
+            let half_w = 2.6 + edge.stroke_width * 0.4;
+            let base_x = tip.0 - ux * head_len;
+            let base_y = tip.1 - uy * head_len;
+            let mut arrow = PathBuilder::fill();
+            arrow.move_to(point(px(tip.0), px(tip.1)));
+            arrow.line_to(point(px(base_x + nx * half_w), px(base_y + ny * half_w)));
+            arrow.line_to(point(px(base_x - nx * half_w), px(base_y - ny * half_w)));
+            arrow.close();
+            if let Ok(built) = arrow.build() {
+                window.paint_path(built, line_color);
+            }
+        }
     }
 
     if edge.active_pulse {
@@ -1245,6 +1408,33 @@ fn stroke_circle_arc(path: &mut PathBuilder, center: Point<Pixels>, radius: Pixe
     path.close();
 }
 
+fn bee_sprite_pixel_color(
+    ch: u8,
+    palette: &BeePalette,
+    eye_color: Hsla,
+    glint_color: Hsla,
+    wing_bright: Hsla,
+    wing_edge: Hsla,
+    crown_gold: Hsla,
+    crown_tip: Hsla,
+) -> Option<Hsla> {
+    match ch {
+        b'.' => None,
+        b'o' | b't' => Some(palette.outline),
+        b'b' => Some(palette.body),
+        b'h' => Some(palette.highlight),
+        b's' => Some(palette.shadow),
+        b'k' => Some(palette.stripe),
+        b'e' => Some(eye_color),
+        b'g' => Some(glint_color),
+        b'w' => Some(wing_bright),
+        b'W' => Some(wing_edge),
+        b'c' => Some(crown_gold),
+        b'C' => Some(crown_tip),
+        _ => None,
+    }
+}
+
 fn paint_pixel_bee(
     window: &mut Window,
     origin: Point<Pixels>,
@@ -1254,6 +1444,7 @@ fn paint_pixel_bee(
     theme: &Theme,
 ) {
     let is_working = bee.status == AntigravitySwarmMemberStatus::Working && !bee.killed;
+    let is_stopped = bee.status == AntigravitySwarmMemberStatus::Stopped && !bee.killed;
     let bob_y = if is_working && animate {
         ((phase * TAU * 2.0) + bee.phase_seed * TAU).sin() * 1.6
     } else {
@@ -1284,16 +1475,49 @@ fn paint_pixel_bee(
             px(1.5),
             theme.danger.opacity(0.85),
         );
+    } else if is_stopped {
+        paint_stroked_circle(
+            window,
+            point(px(center_x), px(center_y)),
+            px(bee.pixel_size * 9.2),
+            px(1.1),
+            theme.text_tertiary.opacity(0.55),
+        );
+    } else if is_working && !animate {
+        paint_stroked_circle(
+            window,
+            point(px(center_x), px(center_y)),
+            px(bee.pixel_size * 9.2),
+            px(1.2),
+            theme.success.opacity(0.65),
+        );
     }
 
-    let alpha = if bee.killed { 0.42 } else { 1.0 };
+    let alpha = if bee.killed {
+        0.42
+    } else if is_stopped {
+        0.78
+    } else {
+        1.0
+    };
     let palette = bee_palette(&bee.name, bee.is_coordinator, theme.is_dark, alpha);
     let eye_color = gpui::hsla(0.0, 0.0, 0.08, alpha);
     let glint_color = gpui::hsla(0.0, 0.0, 0.98, alpha);
-    let wing_bright = gpui::hsla(205.0 / 360.0, 0.55, 0.88, 0.88 * alpha);
-    let wing_edge = gpui::hsla(212.0 / 360.0, 0.48, 0.70, 0.68 * alpha);
-    let crown_gold = gpui::hsla(45.0 / 360.0, 0.96, 0.56, alpha);
-    let crown_tip = gpui::hsla(52.0 / 360.0, 1.0, 0.78, alpha);
+    let (wing_bright, wing_edge, crown_gold, crown_tip) = if theme.is_dark {
+        (
+            gpui::hsla(205.0 / 360.0, 0.55, 0.88, 0.88 * alpha),
+            gpui::hsla(212.0 / 360.0, 0.48, 0.70, 0.68 * alpha),
+            gpui::hsla(45.0 / 360.0, 0.96, 0.56, alpha),
+            gpui::hsla(52.0 / 360.0, 1.0, 0.78, alpha),
+        )
+    } else {
+        (
+            gpui::hsla(210.0 / 360.0, 0.58, 0.72, 0.92 * alpha),
+            gpui::hsla(214.0 / 360.0, 0.50, 0.48, 0.82 * alpha),
+            gpui::hsla(40.0 / 360.0, 0.92, 0.45, alpha),
+            gpui::hsla(45.0 / 360.0, 0.96, 0.60, alpha),
+        )
+    };
 
     let (cols, rows, sprite): (usize, usize, &[&str]) = if bee.is_coordinator {
         (
@@ -1315,43 +1539,76 @@ fn paint_pixel_bee(
     let x0 = (center_x - total_w * 0.5).round();
     let y0 = (center_y - total_h * 0.5).round();
 
+    // Merge consecutive identical sprite pixels per row (horizontal RLE) to reduce draw quads.
     for (row_idx, line) in sprite.iter().enumerate() {
         let py0 = (y0 + row_idx as f32 * cell).round();
         let py1 = (y0 + (row_idx + 1) as f32 * cell).round();
         let cell_h = (py1 - py0).max(1.0);
-        for (col_idx, ch) in line.bytes().enumerate() {
-            let color = match ch {
-                b'.' => continue,
-                b'o' | b't' => palette.outline,
-                b'b' => palette.body,
-                b'h' => palette.highlight,
-                b's' => palette.shadow,
-                b'k' => palette.stripe,
-                b'e' => eye_color,
-                b'g' => glint_color,
-                b'w' => wing_bright,
-                b'W' => wing_edge,
-                b'c' => crown_gold,
-                b'C' => crown_tip,
-                _ => continue,
+        let bytes = line.as_bytes();
+        let mut col_idx = 0usize;
+        while col_idx < bytes.len() {
+            let Some(color) = bee_sprite_pixel_color(
+                bytes[col_idx],
+                &palette,
+                eye_color,
+                glint_color,
+                wing_bright,
+                wing_edge,
+                crown_gold,
+                crown_tip,
+            ) else {
+                col_idx += 1;
+                continue;
             };
-            let px0 = (x0 + col_idx as f32 * cell).round();
-            let px1 = (x0 + (col_idx + 1) as f32 * cell).round();
-            let cell_w = (px1 - px0).max(1.0);
+            let run_start = col_idx;
+            let key_ch = bytes[col_idx];
+            col_idx += 1;
+            while col_idx < bytes.len() && bytes[col_idx] == key_ch {
+                col_idx += 1;
+            }
+            let px0 = (x0 + run_start as f32 * cell).round();
+            let px1 = (x0 + col_idx as f32 * cell).round();
+            let run_w = (px1 - px0).max(1.0);
             window.paint_quad(gpui::fill(
-                Bounds::new(point(px(px0), px(py0)), gpui::size(px(cell_w), px(cell_h))),
+                Bounds::new(point(px(px0), px(py0)), gpui::size(px(run_w), px(cell_h))),
                 color,
             ));
         }
     }
 
-    // Extra accessible non-color cue for Failed workers: tiny exclamation dot at top-right.
+    // Accessible non-color status badges at top-right of bee sprite.
     if bee.status == AntigravitySwarmMemberStatus::Failed && !bee.killed {
+        let bx = x0 + total_w - 1.5;
+        let by = y0 + 2.5;
+        paint_filled_circle(window, point(px(bx), px(by)), px(4.5), theme.danger);
+        let fg = gpui::white();
+        window.paint_quad(gpui::fill(
+            Bounds::new(point(px(bx - 0.75), px(by - 2.6)), gpui::size(px(1.5), px(3.0))),
+            fg,
+        ));
+        window.paint_quad(gpui::fill(
+            Bounds::new(point(px(bx - 0.75), px(by + 1.2)), gpui::size(px(1.5), px(1.5))),
+            fg,
+        ));
+    } else if is_stopped {
+        let bx = x0 + total_w - 2.5;
+        let by = y0 + 2.5;
+        paint_filled_circle(window, point(px(bx), px(by)), px(4.2), theme.text_tertiary);
+        let fg = if theme.is_dark { theme.inset } else { gpui::white() };
+        window.paint_quad(gpui::fill(
+            Bounds::new(point(px(bx - 1.8), px(by - 1.8)), gpui::size(px(1.2), px(3.6))),
+            fg,
+        ));
+        window.paint_quad(gpui::fill(
+            Bounds::new(point(px(bx + 0.6), px(by - 1.8)), gpui::size(px(1.2), px(3.6))),
+            fg,
+        ));
+    } else if is_working && !animate {
         paint_filled_circle(
             window,
             point(px(x0 + total_w - 2.0), px(y0 + 3.0)),
-            px(3.2),
-            theme.danger,
+            px(2.8),
+            theme.success,
         );
     }
 }
@@ -1367,7 +1624,7 @@ fn bee_tooltip_text(member: &AntigravitySwarmMember) -> String {
         ),
     ];
     if let Some(activity) = member.activity.as_ref().filter(|s| !s.is_empty()) {
-        parts.push(activity.clone());
+        parts.push(localized_member_activity(activity));
     }
     if let Some(failure) = member.failure.as_ref() {
         parts.push(failure.message.clone());
@@ -1437,16 +1694,25 @@ impl Waku {
     pub(super) fn start_swarm_hive_replay(
         &mut self,
         session_id: Uuid,
-        message_count: usize,
         cx: &mut Context<Self>,
     ) {
-        if message_count == 0 {
+        let Some(snapshot) = self
+            .swarm_panel
+            .snapshots
+            .get(&session_id)
+            .and_then(|entry| entry.as_ref())
+        else {
+            return;
+        };
+        if snapshot.messages.is_empty() {
             return;
         }
-        if self.swarm_panel.hive.replay_cursor.is_none()
-            || self.swarm_panel.hive.replay_cursor == Some(message_count - 1)
-        {
-            self.swarm_panel.hive.replay_cursor = Some(0);
+        let current_idx = resolve_replay_index(
+            &snapshot.messages,
+            self.swarm_panel.hive.replay_cursor_seq,
+        );
+        if current_idx.is_none() || current_idx == Some(snapshot.messages.len() - 1) {
+            self.swarm_panel.hive.replay_cursor_seq = Some(snapshot.messages[0].seq);
         }
         self.swarm_panel.hive.replay_playing = true;
         self.swarm_panel.hive.replay_generation =
@@ -1462,15 +1728,18 @@ impl Waku {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        let Some(cursor) = self.swarm_panel.hive.replay_cursor else {
-            return;
-        };
         let Some(snapshot) = self
             .swarm_panel
             .snapshots
             .get(&session_id)
             .and_then(|entry| entry.as_ref())
         else {
+            return;
+        };
+        let Some(cursor) = resolve_replay_index(
+            &snapshot.messages,
+            self.swarm_panel.hive.replay_cursor_seq,
+        ) else {
             return;
         };
         let delay = replay_step_delay(&snapshot.messages, cursor, self.swarm_panel.hive.pacing);
@@ -1498,10 +1767,13 @@ impl Waku {
                     this.swarm_panel.hive.stop_replay();
                     return;
                 };
-                let count = snapshot.messages.len();
-                let next_idx = this.swarm_panel.hive.replay_cursor.map_or(0, |c| c + 1);
-                if next_idx < count {
-                    this.swarm_panel.hive.replay_cursor = Some(next_idx);
+                let next_idx = resolve_replay_index(
+                    &snapshot.messages,
+                    this.swarm_panel.hive.replay_cursor_seq,
+                )
+                .map_or(0, |c| c + 1);
+                if let Some(next_msg) = snapshot.messages.get(next_idx) {
+                    this.swarm_panel.hive.replay_cursor_seq = Some(next_msg.seq);
                     this.schedule_swarm_hive_replay_step(session_id, generation, cx);
                 } else {
                     this.swarm_panel.hive.stop_replay();
@@ -1521,13 +1793,15 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Div {
         let msg_count = snapshot.messages.len();
-        if let Some(cursor) = self.swarm_panel.hive.replay_cursor
-            && (msg_count == 0 || cursor >= msg_count)
-        {
-            self.swarm_panel.hive.replay_cursor = msg_count.checked_sub(1);
-            if msg_count == 0 {
-                self.swarm_panel.hive.stop_replay();
-            }
+        let replay_idx = resolve_replay_index(
+            &snapshot.messages,
+            self.swarm_panel.hive.replay_cursor_seq,
+        );
+        if replay_idx.is_none() && self.swarm_panel.hive.replay_cursor_seq.is_some() {
+            self.swarm_panel.hive.replay_cursor_seq = None;
+            self.swarm_panel.hive.stop_replay();
+        } else if let Some(idx) = replay_idx {
+            self.swarm_panel.hive.replay_cursor_seq = Some(snapshot.messages[idx].seq);
         }
         if let Some(selected) = self.swarm_panel.hive.selected_member.as_deref()
             && !snapshot.members.iter().any(|m| m.name == selected)
@@ -1537,11 +1811,11 @@ impl Waku {
 
         let mode = self.swarm_panel.hive.mode;
         let pacing = self.swarm_panel.hive.pacing;
-        let replay_cursor = self.swarm_panel.hive.replay_cursor;
+        let replay_cursor_seq = self.swarm_panel.hive.replay_cursor_seq;
         let replay_playing = self.swarm_panel.hive.replay_playing;
         let show_killed = self.swarm_panel.show_killed_members;
 
-        let telemetry = if let Some(cursor) = replay_cursor {
+        let telemetry = if let Some(cursor) = replay_idx {
             format_replay_telemetry(&snapshot.messages, cursor)
         } else if snapshot.head_seq > 0 {
             format!("{} · #{}", tr!("swarm.live"), snapshot.head_seq)
@@ -1572,7 +1846,7 @@ impl Waku {
                     .gap(px(6.0))
                     .child(
                         div().size(px(6.0)).flex_none().rounded_full().bg(
-                            if replay_cursor.is_some() {
+                            if replay_idx.is_some() {
                                 theme.accent
                             } else {
                                 theme.success
@@ -1613,12 +1887,12 @@ impl Waku {
                                     .h(px(20.0))
                                     .px(px(8.0))
                                     .rounded(px(5.0))
+                                    .border_1()
+                                    .border_color(gpui::transparent_black())
                                     .flex()
                                     .items_center()
                                     .cursor_default()
-                                    .focus_visible(|style| {
-                                        style.border_1().border_color(theme.accent)
-                                    })
+                                    .focus_visible(|style| style.border_color(theme.accent))
                                     .when(mode == SwarmHiveMode::Hive, |el| {
                                         el.bg(theme.overlay_strong)
                                     })
@@ -1651,12 +1925,12 @@ impl Waku {
                                     .h(px(20.0))
                                     .px(px(8.0))
                                     .rounded(px(5.0))
+                                    .border_1()
+                                    .border_color(gpui::transparent_black())
                                     .flex()
                                     .items_center()
                                     .cursor_default()
-                                    .focus_visible(|style| {
-                                        style.border_1().border_color(theme.accent)
-                                    })
+                                    .focus_visible(|style| style.border_color(theme.accent))
                                     .when(mode == SwarmHiveMode::Mentions, |el| {
                                         el.bg(theme.overlay_strong)
                                     })
@@ -1711,14 +1985,32 @@ impl Waku {
                     }),
             );
 
-        let scene = build_hive_scene_layout(
-            snapshot,
-            panel_width,
+        let cache_key = HiveSceneCacheKey {
+            session_id,
+            snapshot_fp: snapshot.fingerprint.clone(),
+            width_bucket: (panel_width.round() as i32),
             mode,
             show_killed,
-            self.swarm_panel.hive.selected_member.as_deref(),
-            replay_cursor,
-        );
+            selected_member: self.swarm_panel.hive.selected_member.clone(),
+            replay_cursor_seq,
+        };
+        let scene: Rc<HiveSceneLayout> = match &self.swarm_panel.hive.cached_scene {
+            Some((cached_key, cached_layout)) if cached_key == &cache_key => {
+                Rc::clone(cached_layout)
+            }
+            _ => {
+                let built = Rc::new(build_hive_scene_layout(
+                    snapshot,
+                    panel_width,
+                    mode,
+                    show_killed,
+                    self.swarm_panel.hive.selected_member.as_deref(),
+                    replay_cursor_seq,
+                ));
+                self.swarm_panel.hive.cached_scene = Some((cache_key, Rc::clone(&built)));
+                built
+            }
+        };
 
         let stage_body: AnyElement = if scene.bees.is_empty() {
             div()
@@ -1736,28 +2028,25 @@ impl Waku {
             let reduce_motion = cx.reduce_motion();
             let has_pulse_edge = scene.edges.iter().any(|edge| edge.active_pulse);
             let needs_animation = !reduce_motion
-                && (replay_playing || (replay_cursor.is_none() && scene.any_working));
-            let animate_motion = needs_animation && (scene.any_working || has_pulse_edge || replay_playing);
+                && (replay_playing || (replay_idx.is_none() && scene.any_working));
+            let animate_motion =
+                needs_animation && (scene.any_working || has_pulse_edge || replay_playing);
 
-            let chambers_paint = scene.chambers.clone();
-            let edges_paint = scene.edges.clone();
-            let bees_paint = scene.bees.clone();
+            let scene_for_paint = Rc::clone(&scene);
             let theme_copy = *theme;
             let stage_w = scene.stage_width;
             let stage_h = scene.stage_height;
 
             let paint_scene = move |phase: f32| {
-                let chambers = chambers_paint.clone();
-                let edges = edges_paint.clone();
-                let bees = bees_paint.clone();
+                let scene = Rc::clone(&scene_for_paint);
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, _| {
                         let origin = bounds.origin;
-                        for chamber in &chambers {
+                        for chamber in &scene.chambers {
                             paint_hex_chamber(window, origin, chamber, &theme_copy);
                         }
-                        for edge in &edges {
+                        for edge in &scene.edges {
                             paint_arc_edge(
                                 window,
                                 origin,
@@ -1767,7 +2056,7 @@ impl Waku {
                                 &theme_copy,
                             );
                         }
-                        for bee in &bees {
+                        for bee in &scene.bees {
                             paint_pixel_bee(
                                 window,
                                 origin,
@@ -1829,12 +2118,27 @@ impl Waku {
                             col.child(
                                 div()
                                     .max_w_full()
-                                    .truncate()
-                                    .text_center()
-                                    .text_size(sp(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(title_color)
-                                    .child(chamber.title.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(4.0))
+                                    .when_some(chamber.status_accent, |row, status| {
+                                        row.child(icon(
+                                            member_status_icon(status),
+                                            10.5,
+                                            member_status_color(status, theme),
+                                        ))
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_center()
+                                            .text_size(sp(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(title_color)
+                                            .child(chamber.title.clone()),
+                                    ),
                             )
                         })
                         .when(!chamber.subtitle.is_empty(), |col| {
@@ -1863,11 +2167,12 @@ impl Waku {
                     continue;
                 };
                 let focus = self.swarm_panel.hive.bee_focus(&bee.name, cx);
-                let hit_w = (bee.pixel_size * 22.0).max(46.0);
-                let hit_h = (bee.pixel_size * 18.0).max(36.0);
-                let label_w = if bee.is_coordinator { 84.0 } else { 78.0 };
+                let hit_w = (bee.pixel_size * 22.0).max(38.0).min(bee.label_width);
+                let hit_h = (bee.pixel_size * 18.0).max(32.0);
+                let label_w = bee.label_width;
                 let tooltip = bee_tooltip_text(member);
                 let toggle_name_act = bee.name.clone();
+                let show_name_label = mode == SwarmHiveMode::Mentions || !bee.is_coordinator;
 
                 stage_layers = stage_layers.child(
                     div()
@@ -1884,8 +2189,10 @@ impl Waku {
                         .items_center()
                         .gap(px(2.0))
                         .rounded(px(6.0))
+                        .border_1()
+                        .border_color(gpui::transparent_black())
                         .cursor_default()
-                        .focus_visible(|style| style.border_1().border_color(theme.accent))
+                        .focus_visible(|style| style.border_color(theme.accent))
                         .hover(|style| style.bg(theme.overlay.opacity(0.6)))
                         .tooltip(Tooltip::text(tooltip))
                         .on_activation(cx, move |this, _, cx| {
@@ -1900,7 +2207,7 @@ impl Waku {
                             cx.notify();
                         })
                         .child(div().w(px(hit_w)).h(px(hit_h)))
-                        .when(!bee.is_coordinator, |col| {
+                        .when(show_name_label, |col| {
                             col.child(
                                 div()
                                     .max_w(px(label_w))
@@ -1916,7 +2223,7 @@ impl Waku {
                                     .text_color(if bee.selected || bee.highlighted {
                                         theme.text
                                     } else if bee.killed {
-                                        theme.text_ghost
+                                        theme.text_tertiary
                                     } else {
                                         theme.text_secondary
                                     })
@@ -1943,6 +2250,7 @@ impl Waku {
             div()
                 .flex_1()
                 .min_h_0()
+                .overflow_hidden()
                 .relative()
                 .child(
                     div()
@@ -1951,7 +2259,13 @@ impl Waku {
                         .overflow_y_scroll()
                         .track_scroll(&self.swarm_panel.hive.scroll)
                         .py(px(6.0))
-                        .child(stage_layers),
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(stage_layers),
+                        ),
                 )
                 .child(scrollbar::vertical(
                     &self.swarm_panel.hive.scroll,
@@ -1975,7 +2289,7 @@ impl Waku {
                     .failure
                     .as_ref()
                     .map(|f| f.message.clone())
-                    .or_else(|| member.activity.clone())
+                    .or_else(|| member.activity.as_deref().map(localized_member_activity))
                     .unwrap_or_else(|| {
                         format!(
                             "{} · {}",
@@ -2050,11 +2364,13 @@ impl Waku {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.text)
                             .child(tr!("swarm.view_in_board"))
-                            .on_activation(cx, move |this, _, cx| {
+                            .on_activation(cx, move |this, window, cx| {
                                 this.swarm_panel.hive.stop_replay();
                                 this.swarm_panel.member_filter = Some(filter_name.clone());
+                                this.swarm_panel.clear_board_selection();
                                 this.swarm_panel.active_tab = SwarmPanelTab::Board;
                                 this.swarm_panel.follow_tail.set(true);
+                                window.focus(&this.swarm_panel.tab_board_focus, cx);
                                 cx.notify();
                             }),
                     )
@@ -2066,15 +2382,23 @@ impl Waku {
             let next_focus = self.swarm_panel.hive.replay_next_focus.clone();
             let live_focus = self.swarm_panel.hive.replay_live_focus.clone();
             let scrub_focus = self.swarm_panel.hive.scrub_bar_focus.clone();
-            let is_live = replay_cursor.is_none();
-            let fraction = match replay_cursor {
+            let is_live = replay_idx.is_none();
+            let fraction = match replay_idx {
                 None => 1.0,
                 Some(_) if msg_count <= 1 => 1.0,
                 Some(idx) => (idx as f32 / (msg_count - 1) as f32).clamp(0.0, 1.0),
             };
-            let caption = replay_cursor
+            let caption = replay_idx
                 .and_then(|idx| snapshot.messages.get(idx))
                 .map(replay_caption_text);
+            let msg_seqs: Rc<Vec<u64>> =
+                Rc::new(snapshot.messages.iter().map(|m| m.seq).collect());
+            let bounds_for_canvas = self.swarm_panel.hive.scrub_bounds.clone();
+            let seqs_for_down = Rc::clone(&msg_seqs);
+            let seqs_for_move = Rc::clone(&msg_seqs);
+            let seqs_for_prev = Rc::clone(&msg_seqs);
+            let seqs_for_next = Rc::clone(&msg_seqs);
+            let seqs_for_key = Rc::clone(&msg_seqs);
 
             div()
                 .flex_none()
@@ -2086,6 +2410,38 @@ impl Waku {
                 .flex()
                 .flex_col()
                 .gap(px(5.0))
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if !this.swarm_panel.hive.scrub_dragging {
+                        return;
+                    }
+                    if !event.dragging() {
+                        this.swarm_panel.hive.scrub_dragging = false;
+                        return;
+                    }
+                    if let Some(bounds) = this.swarm_panel.hive.scrub_bounds.get() {
+                        let frac = scrub_x_to_fraction(
+                            f32::from(event.position.x),
+                            f32::from(bounds.origin.x),
+                            f32::from(bounds.size.width),
+                        );
+                        if let Some(idx) = scrub_fraction_to_index(frac, seqs_for_move.len()) {
+                            this.swarm_panel.hive.replay_cursor_seq = Some(seqs_for_move[idx]);
+                            cx.notify();
+                        }
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, _| {
+                        this.swarm_panel.hive.scrub_dragging = false;
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, _| {
+                        this.swarm_panel.hive.scrub_dragging = false;
+                    }),
+                )
                 .when_some(caption, |col, text| {
                     col.child(
                         div()
@@ -2102,21 +2458,32 @@ impl Waku {
                         .items_center()
                         .gap(px(5.0))
                         .child(
-                            icon_button("swarm-hive-prev", "icons/arrow-left.svg", *theme)
+                            div()
+                                .id("swarm-hive-prev")
                                 .track_focus(&prev_focus)
                                 .tab_index(0)
                                 .tab_stop(true)
-                                .focus_visible(|style| {
-                                    style.border_1().border_color(theme.accent)
-                                })
+                                .size(px(22.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(gpui::transparent_black())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_default()
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .hover(|style| style.bg(theme.overlay))
+                                .active(|style| style.bg(theme.overlay_strong))
+                                .child(icon("icons/arrow-left.svg", 13.0, theme.text_tertiary))
                                 .tooltip(Tooltip::text(tr!("swarm.replay_prev")))
                                 .on_activation(cx, move |this, _, cx| {
                                     this.swarm_panel.hive.stop_replay();
-                                    let prev = match this.swarm_panel.hive.replay_cursor {
-                                        None => msg_count.saturating_sub(1),
+                                    let prev_idx = match replay_idx {
+                                        None => seqs_for_prev.len().saturating_sub(1),
                                         Some(c) => c.saturating_sub(1),
                                     };
-                                    this.swarm_panel.hive.replay_cursor = Some(prev);
+                                    this.swarm_panel.hive.replay_cursor_seq =
+                                        seqs_for_prev.get(prev_idx).copied();
                                     cx.notify();
                                 }),
                         )
@@ -2163,31 +2530,42 @@ impl Waku {
                                         this.swarm_panel.hive.stop_replay();
                                         cx.notify();
                                     } else {
-                                        this.start_swarm_hive_replay(session_id, msg_count, cx);
+                                        this.start_swarm_hive_replay(session_id, cx);
                                     }
                                 }),
                         )
                         .child(
-                            icon_button("swarm-hive-next", "icons/arrow-right.svg", *theme)
+                            div()
+                                .id("swarm-hive-next")
                                 .track_focus(&next_focus)
                                 .tab_index(0)
                                 .tab_stop(true)
-                                .focus_visible(|style| {
-                                    style.border_1().border_color(theme.accent)
-                                })
+                                .size(px(22.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(gpui::transparent_black())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_default()
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .hover(|style| style.bg(theme.overlay))
+                                .active(|style| style.bg(theme.overlay_strong))
+                                .child(icon("icons/arrow-right.svg", 13.0, theme.text_tertiary))
                                 .tooltip(Tooltip::text(tr!("swarm.replay_next")))
                                 .on_activation(cx, move |this, _, cx| {
                                     this.swarm_panel.hive.stop_replay();
-                                    let next = match this.swarm_panel.hive.replay_cursor {
-                                        None => msg_count.saturating_sub(1),
-                                        Some(c) if c + 1 < msg_count => c + 1,
+                                    let next_idx = match replay_idx {
+                                        None => seqs_for_next.len().saturating_sub(1),
+                                        Some(c) if c + 1 < seqs_for_next.len() => c + 1,
                                         Some(_) => {
-                                            this.swarm_panel.hive.replay_cursor = None;
+                                            this.swarm_panel.hive.replay_cursor_seq = None;
                                             cx.notify();
                                             return;
                                         }
                                     };
-                                    this.swarm_panel.hive.replay_cursor = Some(next);
+                                    this.swarm_panel.hive.replay_cursor_seq =
+                                        seqs_for_next.get(next_idx).copied();
                                     cx.notify();
                                 }),
                         )
@@ -2197,16 +2575,28 @@ impl Waku {
                                 .track_focus(&scrub_focus)
                                 .tab_index(0)
                                 .tab_stop(true)
+                                .relative()
                                 .flex_1()
                                 .h(px(16.0))
                                 .px(px(2.0))
                                 .rounded(px(4.0))
+                                .border_1()
+                                .border_color(gpui::transparent_black())
                                 .flex()
                                 .items_center()
                                 .cursor_default()
-                                .focus_visible(|style| {
-                                    style.border_1().border_color(theme.accent)
-                                })
+                                .tooltip(Tooltip::text(tr!("swarm.hive_scrubber")))
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .child(
+                                    canvas(
+                                        move |bounds, _, _| {
+                                            bounds_for_canvas.set(Some(bounds));
+                                        },
+                                        |_, _, _, _| (),
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
                                 .child(
                                     div()
                                         .w_full()
@@ -2227,42 +2617,63 @@ impl Waku {
                                         ),
                                 )
                                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                                    if event.keystroke.modifiers.modified() || msg_count == 0 {
+                                    if event.keystroke.modifiers.modified() || seqs_for_key.is_empty()
+                                    {
                                         return;
                                     }
-                                    let next = match event.keystroke.key.as_str() {
-                                        "left" => Some(
-                                            this.swarm_panel
-                                                .hive
-                                                .replay_cursor
-                                                .map_or(msg_count.saturating_sub(1), |c| {
-                                                    c.saturating_sub(1)
-                                                }),
-                                        ),
-                                        "right" => match this.swarm_panel.hive.replay_cursor {
+                                    let current = resolve_replay_index_from_seqs(
+                                        &seqs_for_key,
+                                        this.swarm_panel.hive.replay_cursor_seq,
+                                    );
+                                    let next_seq = match event.keystroke.key.as_str() {
+                                        "left" => {
+                                            let idx = current.map_or(
+                                                seqs_for_key.len().saturating_sub(1),
+                                                |c| c.saturating_sub(1),
+                                            );
+                                            Some(seqs_for_key[idx])
+                                        }
+                                        "right" => match current {
                                             None => None,
-                                            Some(c) if c + 1 < msg_count => Some(c + 1),
+                                            Some(c) if c + 1 < seqs_for_key.len() => {
+                                                Some(seqs_for_key[c + 1])
+                                            }
                                             Some(_) => None,
                                         },
-                                        "home" => Some(0),
+                                        "home" => Some(seqs_for_key[0]),
                                         "end" => None,
                                         _ => return,
                                     };
                                     this.swarm_panel.hive.stop_replay();
-                                    this.swarm_panel.hive.replay_cursor = next;
+                                    this.swarm_panel.hive.replay_cursor_seq = next_seq;
                                     cx.notify();
                                     cx.stop_propagation();
                                 }))
-                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                    this.swarm_panel.hive.stop_replay();
-                                    let next = match this.swarm_panel.hive.replay_cursor {
-                                        None => Some(0),
-                                        Some(c) if c + 1 < msg_count => Some(c + 1),
-                                        Some(_) => None,
-                                    };
-                                    let _ = event;
-                                    this.swarm_panel.hive.replay_cursor = next;
-                                    cx.notify();
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.swarm_panel.hive.stop_replay();
+                                        this.swarm_panel.hive.scrub_dragging = true;
+                                        if let Some(bounds) = this.swarm_panel.hive.scrub_bounds.get()
+                                        {
+                                            let frac = scrub_x_to_fraction(
+                                                f32::from(event.position.x),
+                                                f32::from(bounds.origin.x),
+                                                f32::from(bounds.size.width),
+                                            );
+                                            if let Some(idx) =
+                                                scrub_fraction_to_index(frac, seqs_for_down.len())
+                                            {
+                                                this.swarm_panel.hive.replay_cursor_seq =
+                                                    Some(seqs_for_down[idx]);
+                                            }
+                                        }
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
                                 })),
                         )
                         .child(
@@ -2309,7 +2720,7 @@ impl Waku {
                                 )
                                 .on_activation(cx, |this, _, cx| {
                                     this.swarm_panel.hive.stop_replay();
-                                    this.swarm_panel.hive.replay_cursor = None;
+                                    this.swarm_panel.hive.replay_cursor_seq = None;
                                     cx.notify();
                                 }),
                         ),
@@ -2326,6 +2737,17 @@ impl Waku {
             .children(selected_card)
             .children(replay_bar)
     }
+}
+
+fn resolve_replay_index_from_seqs(seqs: &[u64], cursor_seq: Option<u64>) -> Option<usize> {
+    let seq = cursor_seq?;
+    if seqs.is_empty() {
+        return None;
+    }
+    seqs.iter()
+        .position(|&s| s == seq)
+        .or_else(|| seqs.iter().position(|&s| s > seq))
+        .or_else(|| Some(seqs.len() - 1))
 }
 
 #[cfg(test)]
@@ -2348,6 +2770,8 @@ mod tests {
             wake_mode: "mentions".to_owned(),
             status,
             killed,
+            has_posted_done: false,
+            task: None,
             last_read_seq: 0,
             unread: 0,
             posts: 1,
@@ -2369,6 +2793,8 @@ mod tests {
             mentions_all: false,
             kind: None,
             channel: None,
+            channel_mentions: vec![],
+            screenshots: vec![],
         }
     }
 
@@ -2408,25 +2834,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_done_counts_exclude_coordinator_and_role_workers() {
-        use AntigravitySwarmMemberStatus::{Failed, Waiting, Working};
+    fn worker_done_counts_use_has_posted_done_and_exclude_role_workers() {
+        use AntigravitySwarmMemberStatus::{Failed, Stopped, Waiting, Working};
         let mut monitor = make_member("monitor", "monitor", Working, false);
         monitor.is_role_worker = true;
+        let mut done_waiting = make_member("c", "worker", Waiting, false);
+        done_waiting.has_posted_done = true;
+        let idle_waiting = make_member("f", "worker", Waiting, false);
+        let stopped_member = make_member("g", "worker", Stopped, false);
         let members = vec![
             make_member("coordinator", "coordinator", Waiting, false),
             make_member("a", "worker", Working, false),
             make_member("b", "worker", Working, false),
-            make_member("c", "worker", Waiting, false),
+            done_waiting,
+            idle_waiting,
+            stopped_member,
             make_member("d", "worker", Failed, false),
             make_member("e", "worker", Working, true),
             monitor,
         ];
-        assert_eq!(compute_worker_done_counts(&members), (2, 5));
+        // Done: done_waiting + killed e (2 out of 7 regular workers). idle_waiting & stopped_member are not done.
+        assert_eq!(compute_worker_done_counts(&members), (2, 7));
     }
 
     #[test]
     fn build_hive_scene_layout_produces_working_and_coordinator_chambers() {
-        use AntigravitySwarmMemberStatus::{Waiting, Working};
+        use AntigravitySwarmMemberStatus::{Stopped, Waiting, Working};
+        let mut role_narrator = make_member("narrator", "narrator", Working, false);
+        role_narrator.is_role_worker = true;
         let snapshot = AntigravitySwarmSnapshot {
             swarm_id: "swarm-1".to_owned(),
             current_member: Some("coordinator".to_owned()),
@@ -2434,6 +2869,7 @@ mod tests {
             head_seq: 5,
             total_messages: 2,
             messages_truncated: false,
+            channels: vec!["main".to_owned()],
             members: vec![
                 make_member("coordinator", "coordinator", Waiting, false),
                 make_member("animator", "worker", Working, false),
@@ -2441,6 +2877,8 @@ mod tests {
                 make_member("brand-assets", "worker", Working, false),
                 make_member("reviewer", "worker", Working, false),
                 make_member("storyboard", "worker", Working, false),
+                make_member("paused-one", "worker", Stopped, false),
+                role_narrator,
             ],
             messages: vec![
                 make_message(1, "coordinator", &["animator"], "2026-11-24 15:27:00"),
@@ -2449,18 +2887,21 @@ mod tests {
             overview: None,
             system_attention: vec![],
             fingerprint: "fp-1".to_owned(),
+            board_fingerprint: None,
+            roster_fingerprint: None,
         };
 
         let live = build_hive_scene_layout(&snapshot, 360.0, SwarmHiveMode::Hive, false, None, None);
-        assert_eq!(live.chambers.len(), 2);
-        assert_eq!(live.bees.len(), 6);
+        // Working chamber (5, narrator excluded), Stopped chamber (1), Coordinator chamber (1).
+        assert_eq!(live.chambers.len(), 3);
+        assert_eq!(live.bees.len(), 7);
         assert!(live.any_working);
         assert!(!live.chambers[0].label_at_bottom);
-        assert!(live.chambers[1].label_at_bottom);
+        assert!(live.chambers[2].label_at_bottom);
         assert!(!live.edges.is_empty());
 
         let replay =
-            build_hive_scene_layout(&snapshot, 360.0, SwarmHiveMode::Hive, false, None, Some(1));
+            build_hive_scene_layout(&snapshot, 360.0, SwarmHiveMode::Hive, false, None, Some(5));
         assert!(replay.edges.iter().any(|e| e.highlighted && e.active_pulse));
         assert!(replay.bees.iter().any(|b| b.name == "reviewer" && b.highlighted));
         assert!(replay.bees.iter().any(|b| b.name == "coordinator" && b.highlighted));
@@ -2474,8 +2915,30 @@ mod tests {
             None,
         );
         assert_eq!(mentions.chambers.len(), 1);
-        assert_eq!(mentions.bees.len(), 6);
+        assert_eq!(mentions.bees.len(), 8);
         assert_eq!(mentions.edges.len(), 2);
+    }
+
+    #[test]
+    fn replay_cursor_seq_and_scrub_coordinate_mapping() {
+        let messages = vec![
+            make_message(10, "coordinator", &["alpha"], "2026-11-24 15:27:00"),
+            make_message(14, "alpha", &["coordinator"], "2026-11-24 15:27:10"),
+            make_message(20, "beta", &["coordinator"], "2026-11-24 15:27:20"),
+        ];
+        assert_eq!(resolve_replay_index(&messages, None), None);
+        assert_eq!(resolve_replay_index(&messages, Some(14)), Some(1));
+        assert_eq!(resolve_replay_index(&messages, Some(3)), Some(0));
+        assert_eq!(resolve_replay_index(&messages, Some(99)), Some(2));
+        assert_eq!(resolve_replay_index(&[], Some(10)), None);
+
+        assert!((scrub_x_to_fraction(50.0, 50.0, 200.0) - 0.0).abs() < 0.001);
+        assert!((scrub_x_to_fraction(150.0, 50.0, 200.0) - 0.5).abs() < 0.001);
+        assert!((scrub_x_to_fraction(300.0, 50.0, 200.0) - 1.0).abs() < 0.001);
+        assert_eq!(scrub_fraction_to_index(0.0, 3), Some(0));
+        assert_eq!(scrub_fraction_to_index(0.5, 3), Some(1));
+        assert_eq!(scrub_fraction_to_index(1.0, 3), Some(2));
+        assert_eq!(scrub_fraction_to_index(0.5, 0), None);
     }
 
     #[test]

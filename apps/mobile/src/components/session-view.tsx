@@ -45,8 +45,14 @@ import {
   type TranscriptListHandle,
 } from '@/components/transcript-list';
 import { SessionEmpty } from '@/components/transcript-rows';
-import { useProviderModels, useSession, useTaskState } from '@/hooks/use-daemon-data';
+import {
+  useDaemonSettings,
+  useProviderModels,
+  useSession,
+  useTaskState,
+} from '@/hooks/use-daemon-data';
 import { useTheme } from '@/hooks/use-theme';
+import { resolveProviderAccount } from '@/lib/daemon-api';
 import { useDaemon } from '@/lib/daemon-context';
 import { sessionBusy } from '@/lib/mobile-runtime';
 import { useRuntime } from '@/lib/runtime-context';
@@ -90,11 +96,16 @@ export function SessionView({
   const { openTaskDrawer } = useTaskDrawer();
   const query = useSession(sessionId);
   const session = query.data;
-  const modelProbe = useProviderModels(session?.provider ?? null);
+  const settings = useDaemonSettings();
+  const modelProbe = useProviderModels(session?.provider ?? null, session?.account_id ?? null);
   const models = modelProbe.data?.models;
+  const accountLabel = session
+    ? resolveProviderAccount(settings.data, session.provider, session.account_id)?.label
+    : undefined;
   const modelLabel = modelDisplayName(
     models,
     session?.model ?? models?.find((item) => item.is_default)?.id ?? models?.[0]?.id ?? null,
+    accountLabel,
   );
   const modelIcon = session ? PROVIDER_MENU_ICONS[session.provider] : undefined;
   const [taskSurface, setTaskSurface] = useState<TaskSurface | null>(null);
@@ -429,6 +440,7 @@ export function SessionView({
         <MobileComposer
           key={`composer:${session.id}`}
           session={session}
+          onOpenModelPicker={() => setModelSheetOpen(true)}
           onSubmitted={() => listRef.current?.followNextGrowth()}
         />
       )}
@@ -447,6 +459,7 @@ export function SessionView({
       )}
       {session && (
         <ModelSheet
+          accountId={session.account_id ?? null}
           key={`model-sheet:${session.id}`}
           model={session.model ?? null}
           onApply={applyModelSelection}

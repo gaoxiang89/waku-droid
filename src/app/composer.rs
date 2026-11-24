@@ -54,8 +54,12 @@ pub(super) fn runtime_mode_description(
     provider: Option<ProviderKind>,
     mode: RuntimeMode,
 ) -> String {
-    if provider == Some(ProviderKind::Droid) && mode == RuntimeMode::Auto {
-        tr!("mode.auto_description_droid")
+    if mode == RuntimeMode::Auto {
+        match provider {
+            Some(ProviderKind::Antigravity) => tr!("mode.auto_description_antigravity"),
+            Some(ProviderKind::Droid) => tr!("mode.auto_description_droid"),
+            _ => mode.description(),
+        }
     } else {
         mode.description()
     }
@@ -317,10 +321,6 @@ impl Waku {
                     .is_some_and(|answer| !answer.trim().is_empty());
             let multi_select = question.multi_select;
             let mut options = div().mt(px(8.0)).flex().flex_col().gap(px(4.0));
-            for (index, option) in question.options.iter().enumerate() {
-                let is_selected = selected.iter().any(|answer| answer == &option.label);
-                let question_id = question.id.clone();
-                let key_question_id = question.id.clone();
             // Arrow keys move between the choices of one question.
             let option_focuses = (0..question.options.len())
                 .map(|index| {
@@ -330,8 +330,12 @@ impl Waku {
                     )
                 })
                 .collect::<Vec<_>>();
-                let click_label = option.label.clone();
+            for (index, option) in question.options.iter().enumerate() {
                 let option_focuses = option_focuses.clone();
+                let is_selected = selected.iter().any(|answer| answer == &option.label);
+                let question_id = question.id.clone();
+                let key_question_id = question.id.clone();
+                let click_label = option.label.clone();
                 let key_label = option.label.clone();
                 let focus = self.transcript_control_focus(
                     format!("user-input-{request_id}-{}-option-{index}", question.id),
@@ -619,10 +623,6 @@ impl Waku {
                 .tab_index(0)
                 .tab_group()
                 .tab_stop(false)
-                .child(
-                    div()
-                        .id("user-input-fields")
-                        .max_h(px(420.0))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     // Same as the Cancel button, so the form is never keyboard-only
                     // dismissible through Tab order alone.
@@ -631,6 +631,10 @@ impl Waku {
                         cx.stop_propagation();
                     }
                 }))
+                .child(
+                    div()
+                        .id("user-input-fields")
+                        .max_h(px(420.0))
                         .overflow_y_scroll()
                         .child(fields),
                 )
@@ -1178,6 +1182,7 @@ impl Waku {
                         reset_search.update(cx, |search, cx| search.clear(cx));
                         this.reveal_selected_picker_model();
                     } else {
+                        this.model_picker_account.clear();
                         let focus_handle = this.composer.read(cx).focus();
                         window.focus(&focus_handle, cx);
                     }
@@ -1857,6 +1862,10 @@ impl Waku {
         }
         self.model_picker_account.insert(provider, validated);
         self.model_picker_highlight = None;
+        if provider == ProviderKind::Antigravity {
+            self.provider_model_discoveries_pending.remove(&provider);
+            self.refresh_provider_model_discovery(provider);
+        }
         self.reveal_selected_picker_model();
         cx.notify();
     }
@@ -5233,5 +5242,27 @@ mod provider_command_tests {
             Some(("xhigh".into(), "Extra".into()))
         );
         assert_eq!(resolve_provider_effort(&options, "max"), None);
+    }
+
+    #[test]
+    fn antigravity_auto_runtime_mode_description_uses_antigravity_copy() {
+        use crate::model::RuntimeMode;
+
+        let antigravity_auto =
+            runtime_mode_description(Some(ProviderKind::Antigravity), RuntimeMode::Auto);
+        let default_auto = runtime_mode_description(None, RuntimeMode::Auto);
+
+        assert_eq!(antigravity_auto, tr!("mode.auto_description_antigravity"));
+        assert_ne!(antigravity_auto, default_auto);
+        for mode in [
+            RuntimeMode::Ask,
+            RuntimeMode::AutoAcceptEdits,
+            RuntimeMode::FullAccess,
+        ] {
+            assert_eq!(
+                runtime_mode_description(Some(ProviderKind::Antigravity), mode),
+                mode.description()
+            );
+        }
     }
 }

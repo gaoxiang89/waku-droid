@@ -240,6 +240,29 @@ describe('mobile runtime projection', () => {
     expect(cleared.service_tier).toBe('fast');
     expect(cleared.context_window).toBe('1m');
   });
+
+  test('parks and restores cursors when switching accounts with applySessionOptions', () => {
+    const current = session({
+      provider: 'antigravity',
+      account_id: 'acct-personal',
+      provider_cursor: { provider: 'antigravity', sessionId: 'personal-1' },
+      account_cursors: [{
+        accountId: 'acct-work',
+        cursor: { provider: 'antigravity', sessionId: 'work-1' },
+      }],
+    });
+    const switched = applySessionOptions(current, { accountId: 'acct-work', model: 'gemini-2.5-pro' }, {
+      nowSeconds: () => 88,
+      randomUUID: () => 'unused',
+    });
+    expect(switched.account_id).toBe('acct-work');
+    expect(switched.model).toBe('gemini-2.5-pro');
+    expect(switched.provider_cursor).toEqual({ provider: 'antigravity', sessionId: 'work-1' });
+    expect(switched.account_cursors).toEqual([{
+      accountId: 'acct-personal',
+      cursor: { provider: 'antigravity', sessionId: 'personal-1' },
+    }]);
+  });
 });
 
 function session(overrides: Partial<AgentSession> = {}): AgentSession {

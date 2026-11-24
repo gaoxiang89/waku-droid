@@ -15,6 +15,7 @@ export type { AntigravitySwarmMemberStatus } from "./AntigravitySwarmMemberStatu
 export type { AntigravitySwarmMessage } from "./AntigravitySwarmMessage";
 export type { AntigravitySwarmOverview } from "./AntigravitySwarmOverview";
 export type { AntigravitySwarmPhase } from "./AntigravitySwarmPhase";
+export type { AntigravitySwarmScreenshot } from "./AntigravitySwarmScreenshot";
 export type { AntigravitySwarmSnapshot } from "./AntigravitySwarmSnapshot";
 export type { AntigravitySwarmViewItem } from "./AntigravitySwarmViewItem";
 export type { AntigravitySwarmWorkstream } from "./AntigravitySwarmWorkstream";

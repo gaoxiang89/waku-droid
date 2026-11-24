@@ -1,17 +1,19 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Popover } from '@base-ui/react/popover'
-import type {
-  AgentSession,
-  BranchSnapshot,
-  ComposerDraft,
-  GoalOperation,
-  MessageAttachment,
-  PlanUsage,
-  Project,
-  ProviderModel,
-  ProviderProbe,
-  SlashCommand,
-  ThreadGoalStatus,
+import {
+  resolveProviderAccount,
+  switchSessionAgent,
+  validatedAccountId,
+  type AgentSession,
+  type BranchSnapshot,
+  type ComposerDraft,
+  type GoalOperation,
+  type MessageAttachment,
+  type Project,
+  type ProviderModel,
+  type ProviderProbe,
+  type SlashCommand,
+  type ThreadGoalStatus,
 } from '@waku/client'
 import {
   useEffect,
@@ -28,6 +30,12 @@ import { GoalDialog, goalStatusClass, goalUsageReadout } from '@/components/goal
 import { DaemonFilePicker } from '@/components/daemon-file-picker'
 import { PreviewableImage } from '@/components/image-preview'
 import { ModelPicker } from '@/components/model-picker'
+import {
+  PLAN_USAGE_PROVIDERS,
+  PlanUsageLanes,
+  UsageLane,
+  UsageSkeleton,
+} from '@/components/plan-usage'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { FileTypeIcon, WakuIcon } from '@/components/waku-icon'
@@ -49,14 +57,18 @@ import {
 import { useDaemon } from '@/lib/daemon-context'
 import { useI18n } from '@/lib/i18n'
 import {
+  antigravityLocalCommandExecutesOnAccept,
   composerAutocompleteRows,
   detectComposerTrigger,
   expandedComposerSubmission,
   isFastModeToggleSubmission,
   isResumeSubmission,
   mergeComposerCommands,
+  parseAntigravityLocalCommand,
   parseGoalSubmission,
   replaceComposerTrigger,
+  resolveProviderEffort,
+  resolveProviderModel,
   toggledFastServiceTier,
   type ComposerAutocompleteRow,
 } from '@/lib/composer-autocomplete'
@@ -175,12 +187,14 @@ export function Composer({
     userInputs,
     runtimes,
   } = useRuntime()
-  const probe = useProviderProbe(session.provider)
+  const probe = useProviderProbe(session.provider, session.account_id ?? null)
   const cwd = sessionCwd(session, project)
   const branches = useWorkspaceBranches(cwd)
   const composerFiles = useComposerFiles(cwd)
-  const composerCommands = useComposerCommands(session.provider, cwd)
+  const composerCommands = useComposerCommands(session.provider, cwd, session.account_id ?? null)
   const [prompt, setPrompt] = useState(initialComposerDraft?.text ?? '')
+  const [localModelPickerSignal, setLocalModelPickerSignal] = useState(0)
+  const [localUsagePanelSignal, setLocalUsagePanelSignal] = useState(0)
   const [goalDialog, setGoalDialog] = useState<{ prefill: string | null; replace: boolean } | null>(
     null,
   )
@@ -371,10 +385,134 @@ export function Composer({
     ].filter(Boolean).join(' ')
   }
 
-  function executeLocalComposerCommand(submittedPrompt = prompt): boolean {
+  function executeLocalComposerCommand(
+    submittedPrompt = prompt,
+    fromAutocomplete = false,
+  ): boolean {
     return executeResumeCommand(submittedPrompt)
       || executeFastModeToggle(submittedPrompt)
       || executeGoalCommand(submittedPrompt)
+      || executeAntigravityCommand(submittedPrompt, fromAutocomplete)
+  }
+
+  function applyModelSelection(
+    provider: AgentSession['provider'],
+    model: ProviderModel,
+    accountId: string | null = session.account_id ?? null,
+  ) {
+    const preferences = config
+      ? readComposerPreferences(browserComposerPreferenceStorage(), config.address)
+      : null
+    const remembered = preferences
+      ? rememberedModelTraits(preferences, provider, model.id)
+      : undefined
+    const switched = switchSessionAgent(session, provider, accountId)
+    const agentChanged =
+      switched.provider !== session.provider
+      || (switched.account_id ?? null) !== (session.account_id ?? null)
+    savePatch({
+      provider: switched.provider,
+      account_id: switched.account_id,
+      provider_cursor: switched.provider_cursor,
+      provider_cursors: switched.provider_cursors,
+      account_cursors: switched.account_cursors,
+      turns: switched.turns,
+      ...(agentChanged
+        ? {
+            thread_goal: switched.thread_goal,
+            context_usage: switched.context_usage,
+            available_commands: switched.available_commands,
+            provider_session_id: switched.provider_session_id,
+          }
+        : {}),
+      model: model.id,
+      reasoning_effort: remembered?.reasoningEffort
+        ?? model.default_reasoning_effort
+        ?? null,
+      service_tier: remembered?.serviceTier
+        ?? model.default_service_tier
+        ?? null,
+      context_window: remembered?.contextWindow
+        ?? model.default_context_window
+        ?? null,
+      agent_preset: provider === session.provider ? session.agent_preset : null,
+    })
+  }
+
+  function executeAntigravityCommand(
+    submittedPrompt: string,
+    fromAutocomplete: boolean,
+  ): boolean {
+    const command = parseAntigravityLocalCommand(
+      session.provider,
+      submittedPrompt,
+      availableCommands,
+    )
+    if (!command) return false
+    if (fromAutocomplete && !antigravityLocalCommandExecutesOnAccept(command)) return false
+    clearComposerDraft()
+    switch (command.kind) {
+      case 'usage':
+        setLocalUsagePanelSignal((value) => value + 1)
+        return true
+      case 'modelPicker':
+        if (session.status !== 'idle') {
+          toast.error(t('commands.model_unavailable'))
+          return true
+        }
+        setLocalModelPickerSignal((value) => value + 1)
+        return true
+      case 'setModel': {
+        if (session.status !== 'idle') {
+          toast.error(t('commands.model_unavailable'))
+          return true
+        }
+        const matched = resolveProviderModel(probe.data?.models ?? [], command.query)
+        if (!matched) {
+          toast.error(t('commands.model_not_found', { model: command.query }))
+          return true
+        }
+        applyModelSelection(session.provider, matched, session.account_id ?? null)
+        toast.success(t('commands.model_switched', { model: matched.name }))
+        return true
+      }
+      case 'effortShow': {
+        const efforts = selectedModel?.reasoning_efforts ?? []
+        if (!efforts.length) {
+          toast.info(t('commands.effort_unsupported'))
+          return true
+        }
+        const currentId = efforts.some((option) => option.id === session.reasoning_effort)
+          ? session.reasoning_effort
+          : (selectedModel?.default_reasoning_effort ?? efforts[0]!.id)
+        const current = efforts.find((option) => option.id === currentId) ?? efforts[0]!
+        const currentLabel = modelOptionLabel(current.id, current.label, t)
+        const options = efforts.map((option) => modelOptionLabel(option.id, option.label, t)).join(', ')
+        toast.info(t('commands.effort_current', { effort: currentLabel, options }))
+        return true
+      }
+      case 'setEffort': {
+        const efforts = selectedModel?.reasoning_efforts ?? []
+        if (!efforts.length) {
+          toast.error(t('commands.effort_unsupported'))
+          return true
+        }
+        const matched = resolveProviderEffort(efforts, command.query)
+        if (!matched) {
+          const options = efforts.map((option) => modelOptionLabel(option.id, option.label, t)).join(', ')
+          toast.error(t('commands.effort_invalid', { effort: command.query, options }))
+          return true
+        }
+        savePatch({ reasoning_effort: matched.id })
+        toast.success(t('commands.effort_switched', {
+          effort: modelOptionLabel(matched.id, matched.label, t),
+        }))
+        return true
+      }
+      case 'swarmBoard':
+        toast.info('Swarm board is only available in Waku Desktop.')
+        return true
+    }
   }
 
   function clearComposerDraft() {
@@ -572,7 +710,7 @@ export function Composer({
     const row = autocompleteRows[index]
     if (!row) return
     const replacement = replaceComposerTrigger(prompt, autocompleteTrigger, row)
-    if (row.kind === 'command' && executeLocalComposerCommand(replacement.text)) return
+    if (row.kind === 'command' && executeLocalComposerCommand(replacement.text, true)) return
     pendingCursor.current = replacement.cursor
     setPrompt(replacement.text)
     setDismissedAutocomplete(null)
@@ -771,28 +909,15 @@ export function Composer({
           >
             <ModelPicker
               currentProbe={probe.data}
-              openSignal={modelPickerSignal}
-              onOpenSignalHandled={onModelPickerSignalHandled}
+              openSignal={(modelPickerSignal ?? 0) + localModelPickerSignal}
+              onOpenSignalHandled={() => {
+                setLocalModelPickerSignal(0)
+                onModelPickerSignalHandled?.()
+              }}
               returnFocus={composerInput}
               session={session}
-              onChange={(provider, model) => {
-                const preferences = config
-                  ? readComposerPreferences(browserComposerPreferenceStorage(), config.address)
-                  : null
-                const remembered = preferences
-                  ? rememberedModelTraits(preferences, provider, model.id)
-                  : undefined
-                savePatch({
-                  provider,
-                  model: model.id,
-                  reasoning_effort: remembered?.reasoningEffort
-                    ?? model.default_reasoning_effort
-                    ?? null,
-                  service_tier: remembered?.serviceTier
-                    ?? model.default_service_tier
-                    ?? null,
-                  agent_preset: provider === session.provider ? session.agent_preset : null,
-                })
+              onChange={(provider, model, accountId) => {
+                applyModelSelection(provider, model, accountId)
               }}
             />
             {selectedModel && (
@@ -968,6 +1093,7 @@ export function Composer({
           <div className="flex-1" />
           {runtime?.starting && <span>{t('composer.starting_agent')}</span>}
           <UsageMeter
+            forceOpenSignal={localUsagePanelSignal}
             openSignal={usagePanelSignal}
             providerVersion={probe.data?.version ?? null}
             returnFocus={composerInput}
@@ -1876,23 +2002,18 @@ function BranchPicker({
   )
 }
 
-const PLAN_USAGE_PROVIDERS: AgentSession['provider'][] = [
-  'claude',
-  'codex',
-  'openCode',
-  'grok',
-]
-
 function UsageMeter({
   session,
   providerVersion,
   openSignal,
+  forceOpenSignal,
   onOpenSignalHandled,
   returnFocus,
 }: {
   session: AgentSession
   providerVersion: string | null
   openSignal?: number
+  forceOpenSignal?: number
   onOpenSignalHandled?: () => void
   returnFocus: RefObject<HTMLElement | null>
 }) {
@@ -1906,9 +2027,21 @@ function UsageMeter({
     ? context.tokens * 100 / context.window
     : null
   const supportsPlanUsage = PLAN_USAGE_PROVIDERS.includes(session.provider)
+  const accountId = validatedAccountId(settings.data, session.provider, session.account_id)
+  const accountLabel = resolveProviderAccount(
+    settings.data,
+    session.provider,
+    accountId,
+  )?.label ?? null
   const plan = useQuery({
-    queryKey: daemonKeys.planUsage(config?.address ?? 'disconnected', session.provider),
-    queryFn: () => fetchPlanUsage(client!, session.provider, settings.data!, providerVersion),
+    queryKey: daemonKeys.planUsage(config?.address ?? 'disconnected', session.provider, accountId),
+    queryFn: () => fetchPlanUsage(
+      client!,
+      session.provider,
+      settings.data!,
+      providerVersion,
+      accountId,
+    ),
     enabled: open && Boolean(client && config && settings.data && supportsPlanUsage),
     staleTime: 30_000,
   })
@@ -1918,6 +2051,11 @@ function UsageMeter({
     setOpen((current) => !current)
     onOpenSignalHandled?.()
   }, [openSignal, onOpenSignalHandled])
+
+  useEffect(() => {
+    if (!forceOpenSignal) return
+    setOpen(true)
+  }, [forceOpenSignal])
 
   const error = plan.error ? errorMessage(plan.error) : null
   const tooltip = error
@@ -1961,7 +2099,15 @@ function UsageMeter({
                 : formatTokens(context?.tokens ?? 0)}
             />
             {(plan.data || plan.isFetching || error) && <div className="h-px bg-border" />}
-            {plan.data && <PlanUsageLanes locale={locale} plan={plan.data} provider={session.provider} t={t} />}
+            {plan.data && (
+              <PlanUsageLanes
+                accountLabel={accountLabel}
+                locale={locale}
+                plan={plan.data}
+                provider={session.provider}
+                t={t}
+              />
+            )}
             {plan.isFetching && supportsPlanUsage && <UsageSkeleton t={t} />}
             {error && (
               <div className="space-y-1 text-[11px]">
@@ -2011,121 +2157,6 @@ function ContextGauge({ percent }: { percent: number | null }) {
       )}
     </svg>
   )
-}
-
-function PlanUsageLanes({
-  plan,
-  provider,
-  locale,
-  t,
-}: {
-  plan: PlanUsage
-  provider: AgentSession['provider']
-  locale: string
-  t: Translator
-}) {
-  const usageUrl = provider === 'claude'
-    ? 'https://claude.ai/settings/usage'
-    : provider === 'codex'
-      ? 'https://chatgpt.com/codex/settings/usage'
-      : null
-  const header = plan.planLabel
-    ? t('usage.plan_limits_named', { plan: plan.planLabel })
-    : t('usage.plan_limits')
-  return (
-    <>
-      {usageUrl ? (
-        <a
-          className="flex min-w-0 items-center gap-1 text-[11px] text-[var(--text-tertiary)] outline-none hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-ring"
-          href={usageUrl}
-          rel="noreferrer"
-          target="_blank"
-        >
-          <span className="min-w-0 flex-1 truncate">{header}</span>
-          <WakuIcon className="size-2.5" name="arrowRight" />
-        </a>
-      ) : (
-        <div className="truncate text-[11px] text-[var(--text-tertiary)]">{header}</div>
-      )}
-      {plan.windows.map((window) => (
-        <UsageLane
-          key={`${window.label}-${window.resetsAt ?? 'none'}`}
-          label={window.label}
-          percent={window.percent}
-          reset={window.resetsAt == null ? undefined : resetLabel(window.resetsAt, locale, t)}
-          value={`${window.percent.toFixed(0)}%`}
-        />
-      ))}
-    </>
-  )
-}
-
-function UsageLane({
-  label,
-  percent,
-  reset,
-  value,
-}: {
-  label: string
-  percent: number
-  reset?: string
-  value: string
-}) {
-  return (
-    <div className="space-y-[7px]">
-      <div className="flex min-w-0 items-center gap-2">
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-        {reset && <span className="shrink-0 text-[11px] text-[var(--text-tertiary)]">{reset}</span>}
-        <span className="shrink-0 text-[11px] text-[var(--text-secondary)]">{value}</span>
-      </div>
-      <div className="h-[3px] overflow-hidden rounded-full bg-accent">
-        <div
-          className={cn(
-            'h-full rounded-full bg-[var(--text-secondary)]',
-            percent >= 80 && 'bg-[var(--warning)]',
-            percent >= 95 && 'bg-destructive',
-          )}
-          style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
-        />
-      </div>
-    </div>
-  )
-}
-
-function UsageSkeleton({ t }: { t: Translator }) {
-  return (
-    <div aria-label={t('usage.plan_limits')} className="space-y-3" role="status">
-      <div className="h-2.5 w-24 rounded bg-accent motion-safe:animate-pulse" />
-      {[0, 1].map((row) => (
-        <div className="space-y-2" key={row}>
-          <div className="flex justify-between">
-            <div className="h-2.5 w-20 rounded bg-accent motion-safe:animate-pulse" />
-            <div className="h-2.5 w-10 rounded bg-accent motion-safe:animate-pulse" />
-          </div>
-          <div className="h-[3px] rounded-full bg-accent motion-safe:animate-pulse" />
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function resetLabel(resetsAt: number, locale: string, t: Translator) {
-  const seconds = resetsAt - Math.floor(Date.now() / 1_000)
-  if (seconds <= 0) return t('usage.resets_soon')
-  const minutes = Math.ceil(seconds / 60)
-  if (minutes < 60) return t('usage.resets_in_minutes', { count: minutes })
-  if (minutes < 24 * 60) {
-    const hours = Math.floor(minutes / 60)
-    const remainder = minutes % 60
-    return remainder
-      ? t('usage.resets_in_hours_minutes', { hours, minutes: remainder })
-      : t('usage.resets_in_hours', { count: hours })
-  }
-  return t('usage.resets_date', { date: new Intl.DateTimeFormat(locale, {
-    weekday: 'short',
-    hour: 'numeric',
-    minute: '2-digit',
-  }).format(new Date(resetsAt * 1_000)) })
 }
 
 function formatTokens(tokens: number) {

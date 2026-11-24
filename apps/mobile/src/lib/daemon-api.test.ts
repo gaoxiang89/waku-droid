@@ -1,7 +1,17 @@
 import { describe, expect, test } from 'bun:test';
-import type { WakuClient } from '@waku/client';
+import type { DaemonSettings, WakuClient } from '@waku/client';
 
-import { browseDaemonDirectory, createProject, daemonKeys, discoverComposerCommands, listComposerFiles, persistProject, providerSessionKey } from './daemon-api';
+import {
+  browseDaemonDirectory,
+  createProject,
+  daemonKeys,
+  discoverComposerCommands,
+  fetchPlanUsage,
+  listComposerFiles,
+  persistProject,
+  probeProvider,
+  providerSessionKey,
+} from './daemon-api';
 
 describe('mobile daemon API', () => {
   test('requests composer catalogs from the selected daemon workspace and provider override', async () => {
@@ -108,5 +118,77 @@ describe('mobile daemon API', () => {
       liveSessionIds: ['live'],
       sessions: [],
     });
+  });
+
+  test('threads account configDir and binaryOverride into probeProvider, fetchPlanUsage, and composerCommands', async () => {
+    const requests: unknown[] = [];
+    const settings: DaemonSettings = {
+      computer_use_enabled: false,
+      computer_use_allowed_apps: [],
+      disabled_providers: [],
+      provider_binary_overrides: { antigravity: '/bin/agy' },
+      provider_accounts: [{
+        id: 'acct-work',
+        provider: 'antigravity',
+        label: 'Work',
+        configDir: '~/.gemini/work',
+        binaryOverride: '/custom/agy',
+      }],
+    };
+    const client = {
+      request: async (command: any) => {
+        requests.push(command);
+        if (command.type === 'probeProvider') {
+          return {
+            type: 'providerProbe',
+            version: '1.2.0',
+            probe: { provider: 'antigravity', installed: true, path: '/custom/agy', models: [], agent_presets: [] },
+          };
+        }
+        if (command.type === 'fetchPlanUsage') {
+          return { type: 'planUsage', usage: { planLabel: 'Pro', windows: [] } };
+        }
+        return { type: 'workspace', result: { type: 'slashCommands', commands: [] } };
+      },
+    } as unknown as WakuClient;
+
+    expect(daemonKeys.planUsage('profile', 'antigravity', 'acct-work')).toEqual([
+      'daemon', 'profile', 'plan-usage', 'antigravity', 'acct-work',
+    ]);
+    expect(daemonKeys.composerCommands('profile', 'antigravity', '/repo', '/custom/agy', '~/.gemini/work')).toEqual([
+      'daemon', 'profile', 'composer-commands', 'antigravity', '/repo', '/custom/agy', '~/.gemini/work',
+    ]);
+
+    await probeProvider(client, 'antigravity', settings, { accountId: 'acct-work', probeVersion: true });
+    await fetchPlanUsage(client, 'antigravity', settings, '1.2.0', 'acct-work');
+    await discoverComposerCommands(client, 'antigravity', '/repo', '/custom/agy', '~/.gemini/work');
+
+    expect(requests).toEqual([
+      {
+        type: 'probeProvider',
+        provider: 'antigravity',
+        binaryOverride: '/custom/agy',
+        configDir: '~/.gemini/work',
+        discoverModels: true,
+        probeVersion: true,
+      },
+      {
+        type: 'fetchPlanUsage',
+        provider: 'antigravity',
+        binaryOverride: '/custom/agy',
+        configDir: '~/.gemini/work',
+        cliVersion: '1.2.0',
+      },
+      {
+        type: 'workspace',
+        operation: {
+          type: 'discoverSlashCommands',
+          provider: 'antigravity',
+          project_root: '/repo',
+          binary_override: '/custom/agy',
+          config_dir: '~/.gemini/work',
+        },
+      },
+    ]);
   });
 });

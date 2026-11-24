@@ -213,6 +213,14 @@ pub fn project_skill_locations(project_root: &Path, project_name: &str) -> Vec<S
             SkillSource::Provider(ProviderKind::Antigravity),
             ".agent/skills",
         ),
+        (
+            SkillSource::Provider(ProviderKind::Antigravity),
+            "_agents/skills",
+        ),
+        (
+            SkillSource::Provider(ProviderKind::Antigravity),
+            "_agent/skills",
+        ),
     ]
     .into_iter()
     .map(|(source, suffix)| SkillLocation {
@@ -232,13 +240,25 @@ pub fn skill_locations(projects: &[(String, PathBuf)]) -> Vec<SkillLocation> {
 
 /// All roots the scan walks for the given projects and registered isolated
 /// provider account directories: default user scope, isolated account user
-/// roots, then each project's trees.
+/// roots, Antigravity `skills.json` declared roots, then each project's trees.
 pub fn skill_locations_for(
     projects: &[(String, PathBuf)],
     account_dirs: &[(ProviderKind, PathBuf)],
 ) -> Vec<SkillLocation> {
+    let home = dirs::home_dir();
+    let antigravity_data_dir = crate::command_env::env_var_os("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .and_then(|path| antigravity_data_root(&path));
     let mut locations = user_skill_locations();
     extend_account_skill_locations(&mut locations, account_dirs);
+    extend_antigravity_skills_json_locations(
+        &mut locations,
+        home.as_deref(),
+        antigravity_data_dir.as_deref(),
+        projects,
+        account_dirs,
+    );
     for (name, path) in projects {
         for location in project_skill_locations(path, name) {
             push_unique_location(&mut locations, location);
@@ -272,6 +292,171 @@ fn extend_account_skill_locations(
             _ => {}
         }
     }
+}
+
+const SKILLS_MANIFEST_FILE: &str = "skills.json";
+const SKILLS_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+const SKILLS_MANIFEST_MAX_DEPTH: usize = 8;
+
+fn extend_antigravity_skills_json_locations(
+    locations: &mut Vec<SkillLocation>,
+    home: Option<&Path>,
+    antigravity_data_dir: Option<&Path>,
+    projects: &[(String, PathBuf)],
+    account_dirs: &[(ProviderKind, PathBuf)],
+) {
+    let mut visited = std::collections::HashSet::new();
+    let mut user_manifests = Vec::new();
+    if let Some(home) = home {
+        user_manifests.push(home.join(".gemini/config").join(SKILLS_MANIFEST_FILE));
+    }
+    if let Some(data_dir) = antigravity_data_dir {
+        user_manifests.push(data_dir.join("config").join(SKILLS_MANIFEST_FILE));
+    }
+    for (provider, config_dir) in account_dirs {
+        if *provider == ProviderKind::Antigravity
+            && let Some(root) = antigravity_data_root(config_dir)
+        {
+            user_manifests.push(root.join("config").join(SKILLS_MANIFEST_FILE));
+        }
+    }
+    for manifest in user_manifests {
+        collect_skills_json_manifest(
+            &manifest,
+            None,
+            home,
+            SkillScope::User,
+            None,
+            0,
+            &mut visited,
+            locations,
+        );
+    }
+
+    for (name, project_root) in projects {
+        for dir_name in [".agents", ".agent", "_agents", "_agent", ".gemini"] {
+            let manifest = project_root.join(dir_name).join(SKILLS_MANIFEST_FILE);
+            collect_skills_json_manifest(
+                &manifest,
+                Some(project_root),
+                home,
+                SkillScope::Project,
+                Some(name.as_str()),
+                0,
+                &mut visited,
+                locations,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_skills_json_manifest(
+    manifest_path: &Path,
+    project_root: Option<&Path>,
+    home: Option<&Path>,
+    scope: SkillScope,
+    project: Option<&str>,
+    depth: usize,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    locations: &mut Vec<SkillLocation>,
+) {
+    if depth >= SKILLS_MANIFEST_MAX_DEPTH {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(manifest_path) else {
+        return;
+    };
+    if !metadata.is_file() || metadata.len() > SKILLS_MANIFEST_MAX_BYTES {
+        return;
+    }
+    let canonical = std::fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(manifest_path) else {
+        return;
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return;
+    };
+    let base_dir = manifest_path.parent();
+    for inherit in doc
+        .get("inherits")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw_path) = inherit.get("path").and_then(serde_json::Value::as_str)
+            && let Some(resolved) = resolve_skills_json_path(raw_path, base_dir, project_root, home)
+        {
+            collect_skills_json_manifest(
+                &resolved,
+                project_root,
+                home,
+                scope,
+                project,
+                depth + 1,
+                visited,
+                locations,
+            );
+        }
+    }
+    for entry in doc
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(raw_path) = entry.get("path").and_then(serde_json::Value::as_str)
+            && let Some(resolved) = resolve_skills_json_path(raw_path, base_dir, project_root, home)
+        {
+            push_unique_location(
+                locations,
+                SkillLocation {
+                    source: SkillSource::Provider(ProviderKind::Antigravity),
+                    scope,
+                    root: resolved,
+                    project: project.map(str::to_owned),
+                },
+            );
+        }
+    }
+}
+
+fn resolve_skills_json_path(
+    raw: &str,
+    base_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "~" {
+        return home.map(Path::to_path_buf);
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        return home.map(|home_dir| home_dir.join(rest));
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Some(candidate.to_path_buf());
+    }
+    if let Some(root) = project_root {
+        let from_root = root.join(candidate);
+        if from_root.exists() {
+            return Some(from_root);
+        }
+    }
+    if let Some(base) = base_dir {
+        let from_base = base.join(candidate);
+        if from_base.exists() || project_root.is_none() {
+            return Some(from_base);
+        }
+    }
+    project_root.map(|root| root.join(candidate))
 }
 
 /// One skill directory as found on disk, before grouping.
@@ -480,6 +665,8 @@ struct SkillFrontmatter<'a> {
     name: Option<String>,
     description: Option<String>,
     allowed_tools: Option<String>,
+    #[allow(dead_code)]
+    disable_slash_command: bool,
     /// The document below the frontmatter block.
     body: &'a str,
 }
@@ -492,12 +679,16 @@ fn parse_skill_frontmatter(contents: &str) -> SkillFrontmatter<'_> {
         name: None,
         description: None,
         allowed_tools: None,
+        disable_slash_command: false,
         body: contents,
     };
     front.body = crate::frontmatter::parse_frontmatter_fields(contents, |key, value| match key {
         "name" => front.name = Some(value),
         "description" => front.description = Some(value),
         "allowed-tools" => front.allowed_tools = Some(value),
+        "disable-slash-command" => {
+            front.disable_slash_command = value.eq_ignore_ascii_case("true");
+        }
         _ => {}
     });
     front
@@ -887,6 +1078,83 @@ mod tests {
             names,
             vec!["agy-cli-skill", "agy-config-skill", "claude-work-skill"]
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn antigravity_underscore_roots_skills_json_and_disable_slash_command_work() {
+        let root = temp_root("antigravity-customizations");
+        let project = root.join("repo");
+        let extra_rel = project.join("tools/shared-skills");
+        let inherited_dir = root.join("inherited-pack");
+        let inherited_skills = inherited_dir.join("skills");
+
+        write_skill(
+            &project.join("_agents/skills"),
+            "team-under-agents",
+            "---\nname: team-under-agents\ndescription: Under _agents\n---\nBody",
+        );
+        write_skill(
+            &project.join("_agent/skills"),
+            "team-under-agent",
+            "---\nname: team-under-agent\ndescription: Under _agent\ndisable-slash-command: true\n---\nBody",
+        );
+        write_skill(
+            &extra_rel,
+            "manifest-skill",
+            "---\nname: manifest-skill\ndescription: From skills.json\n---\nBody",
+        );
+        write_skill(
+            &inherited_skills,
+            "inherited-skill",
+            "---\nname: inherited-skill\ndescription: From inherited skills.json\n---\nBody",
+        );
+
+        std::fs::create_dir_all(inherited_dir.clone()).unwrap();
+        let inherited_manifest = inherited_dir.join("skills.json");
+        std::fs::write(
+            &inherited_manifest,
+            serde_json::json!({
+                "entries": [{ "path": "skills" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        std::fs::write(
+            project.join(".agents/skills.json"),
+            serde_json::json!({
+                "inherits": [{ "path": inherited_manifest }],
+                "entries": [{ "path": "tools/shared-skills" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let projects = vec![("repo".to_owned(), project.clone())];
+        let locations = skill_locations_for(&projects, &[]);
+        let catalog = scan_skills(&locations);
+        let names: Vec<&str> = catalog.skills.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "team-under-agents",
+            "team-under-agent",
+            "manifest-skill",
+            "inherited-skill",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing Antigravity skill {expected} in {names:?}"
+            );
+        }
+
+        let disabled_front = parse_skill_frontmatter(
+            "---\nname: hidden\ndisable-slash-command: true\n---\nBody",
+        );
+        assert!(disabled_front.disable_slash_command);
+        let enabled_front = parse_skill_frontmatter("---\nname: visible\n---\nBody");
+        assert!(!enabled_front.disable_slash_command);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -848,10 +848,16 @@ fn antigravity_workspace_from_value(raw: &str) -> Option<String> {
     Some(normalize_workspace_path_string(trimmed.to_owned()))
 }
 
+#[cfg(test)]
+static ANTIGRAVITY_WORKSPACE_MAP_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Loads `conversation_id -> workspace_path` once per Antigravity brain root,
 /// preferring `<brain_root>/../conversation_summaries.db` and falling back to
 /// `<brain_root>/../history.jsonl` for unmapped conversations.
 fn load_antigravity_workspace_map(brain_root: &Path) -> HashMap<String, String> {
+    #[cfg(test)]
+    ANTIGRAVITY_WORKSPACE_MAP_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut map = HashMap::new();
     let Some(data_root) = brain_root.parent() else {
         return map;
@@ -1273,21 +1279,9 @@ pub fn scan_with_account_dirs(
             ));
             continue;
         }
-        let workspace_map = if provider == UsageProvider::Antigravity && !files.is_empty() {
-            load_antigravity_workspace_map(&root)
-        } else {
-            HashMap::new()
-        };
+        let mut workspace_map: Option<HashMap<String, String>> = None;
         for (path, size, mtime_ms) in files {
             scanned_files += 1;
-            let (antigravity_session_id, antigravity_project) =
-                if provider == UsageProvider::Antigravity {
-                    let conv_id = antigravity_conversation_id(&path).unwrap_or_default();
-                    let project = workspace_map.get(&conv_id).cloned().unwrap_or_default();
-                    (conv_id, project)
-                } else {
-                    (String::new(), String::new())
-                };
             // Provider is part of the identity: if both providers were ever
             // pointed at one directory, a hit parsed by the other parser must
             // not be reused.
@@ -1296,22 +1290,29 @@ pub fn scan_with_account_dirs(
             });
             if cache_hit {
                 if provider == UsageProvider::Antigravity
-                    && !antigravity_project.is_empty()
                     && let Some(entry) = cache.get_mut(&path)
+                    && entry.records.iter().any(|record| record.project.is_empty())
                 {
-                    for record in &mut entry.records {
-                        if record.project.is_empty() {
-                            record.project = antigravity_project.clone();
+                    let conv_id = antigravity_conversation_id(&path).unwrap_or_default();
+                    let map = workspace_map
+                        .get_or_insert_with(|| load_antigravity_workspace_map(&root));
+                    if let Some(antigravity_project) = map.get(&conv_id).filter(|p| !p.is_empty()) {
+                        for record in &mut entry.records {
+                            if record.project.is_empty() {
+                                record.project = antigravity_project.clone();
+                            }
                         }
                     }
                 }
             } else {
                 let parsed = match provider {
-                    UsageProvider::Antigravity => read_antigravity_records(
-                        &path,
-                        &antigravity_session_id,
-                        &antigravity_project,
-                    ),
+                    UsageProvider::Antigravity => {
+                        let conv_id = antigravity_conversation_id(&path).unwrap_or_default();
+                        let map = workspace_map
+                            .get_or_insert_with(|| load_antigravity_workspace_map(&root));
+                        let antigravity_project = map.get(&conv_id).cloned().unwrap_or_default();
+                        read_antigravity_records(&path, &conv_id, &antigravity_project)
+                    }
                     UsageProvider::Claude | UsageProvider::Codex => {
                         read_transcript_records(&path, provider)
                     }
@@ -2660,13 +2661,21 @@ mod tests {
             .expect("encoded Windows URI workspace mapped");
         assert_eq!(both_slice.total_tokens, expected_both_tokens);
 
-        // Warm rescan reuses cache and preserves totals.
+        // Warm rescan reuses cache, preserves totals, and skips re-opening
+        // `conversation_summaries.db` / `history.jsonl` when cached records
+        // already know their project.
+        let loads_before_warm = ANTIGRAVITY_WORKSPACE_MAP_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         let rescanned = scan_with_account_dirs(
             &mut cache,
             &rates,
             UsageWindow::TrailingDays(7),
             &project_roots,
             &account_dirs,
+        );
+        let loads_after_warm = ANTIGRAVITY_WORKSPACE_MAP_LOADS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            loads_after_warm, loads_before_warm,
+            "warm ScanCache hits must not reload conversation_summaries.db or history.jsonl"
         );
         let rescanned_model = rescanned
             .models

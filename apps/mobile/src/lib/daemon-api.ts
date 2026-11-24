@@ -1,22 +1,26 @@
-import type {
-  AgentSession,
-  BranchSnapshot,
-  ComposerDraftChange,
-  DaemonSettings,
-  FileEntry,
-  Project,
-  ProviderKind,
-  ProviderProbe,
-  ProviderSessionSummary,
-  ProviderSessionHistory,
-  ReviewDiffData,
-  ReviewDiffSource,
-  ResponsePayload,
-  SlashCommand,
-  WakuClient,
-  WorkingTreeEntry,
-  WorkspaceResult,
+import {
+  resolveProviderExecutionConfig,
+  type AgentSession,
+  type BranchSnapshot,
+  type ComposerDraftChange,
+  type DaemonSettings,
+  type FileEntry,
+  type PlanUsage,
+  type Project,
+  type ProviderKind,
+  type ProviderProbe,
+  type ProviderSessionSummary,
+  type ProviderSessionHistory,
+  type ReviewDiffData,
+  type ReviewDiffSource,
+  type ResponsePayload,
+  type SlashCommand,
+  type WakuClient,
+  type WorkingTreeEntry,
+  type WorkspaceResult,
 } from '@waku/client';
+
+export { resolveProviderAccount } from '@waku/client';
 
 export type TaskState = Extract<ResponsePayload, { type: 'taskState' }>;
 export type DaemonDirectory = Extract<WorkspaceResult, { type: 'directory' }>;
@@ -30,12 +34,23 @@ export const daemonKeys = {
     sessionId,
   ] as const,
   settings: (profileId: string) => ['daemon', profileId, 'settings'] as const,
-  provider: (profileId: string, provider: ProviderKind) => [
+  provider: (
+    profileId: string,
+    provider: ProviderKind,
+    configKey: string | null = null,
+  ) => [
     'daemon',
     profileId,
     'provider',
     provider,
+    configKey ?? null,
   ] as const,
+  planUsageRoot: (profileId: string) => ['daemon', profileId, 'plan-usage'] as const,
+  planUsage: (
+    profileId: string,
+    provider: ProviderKind,
+    accountId: string | null = null,
+  ) => [...daemonKeys.planUsageRoot(profileId), provider, accountId ?? null] as const,
   directory: (profileId: string, path: string | null) => [
     'daemon',
     profileId,
@@ -67,13 +82,16 @@ export const daemonKeys = {
     provider: ProviderKind | null,
     root: string | null,
     binaryOverride: string | null,
-  ) => ['daemon', profileId, 'composer-commands', provider, root, binaryOverride] as const,
+    configDir: string | null = null,
+  ) => ['daemon', profileId, 'composer-commands', provider, root, binaryOverride, configDir ?? null] as const,
   composerFiles: (profileId: string, root: string | null) => [
     'daemon', profileId, 'composer-files', root,
   ] as const,
-  providerSessions: (profileId: string, provider: ProviderKind) => [
-    'daemon', profileId, 'provider-sessions', provider,
-  ] as const,
+  providerSessions: (
+    profileId: string,
+    provider: ProviderKind,
+    accountId: string | null = null,
+  ) => ['daemon', profileId, 'provider-sessions', provider, accountId ?? null] as const,
   workspaceDiff: (profileId: string, root: string, source: ReviewDiffSource) => [
     'daemon',
     profileId,
@@ -155,17 +173,6 @@ export async function loadDaemonSettings(client: WakuClient): Promise<DaemonSett
   };
 }
 
-export function resolveProviderAccount(
-  settings: DaemonSettings,
-  provider: ProviderKind,
-  accountId: string | null | undefined,
-) {
-  if (!accountId) return null;
-  return settings.provider_accounts?.find(
-    (account) => account.provider === provider && account.id === accountId,
-  ) ?? null;
-}
-
 export async function probeProvider(
   client: WakuClient,
   provider: ProviderKind,
@@ -177,16 +184,13 @@ export async function probeProvider(
     configDir?: string | null;
   } = {},
 ): Promise<ProviderProbe & { version: string | null }> {
-  const account = resolveProviderAccount(settings, provider, options.accountId);
-  const binaryOverride = account?.binaryOverride?.trim()
-    || settings.provider_binary_overrides?.[provider]
-    || null;
-  const configDir = options.configDir ?? account?.configDir ?? null;
+  const resolved = resolveProviderExecutionConfig(settings, provider, options.accountId);
+  const configDir = options.configDir ?? resolved.configDir;
   const response = expectResponse(
     await client.request({
       type: 'probeProvider',
       provider,
-      binaryOverride,
+      binaryOverride: resolved.binaryOverride,
       ...(configDir ? { configDir } : {}),
       discoverModels: options.discoverModels ?? true,
       probeVersion: options.probeVersion ?? false,
@@ -194,6 +198,27 @@ export async function probeProvider(
     'providerProbe',
   );
   return { ...response.probe, version: response.version ?? null };
+}
+
+export async function fetchPlanUsage(
+  client: WakuClient,
+  provider: ProviderKind,
+  settings: DaemonSettings,
+  cliVersion: string | null,
+  accountId: string | null = null,
+): Promise<PlanUsage | null> {
+  const { binaryOverride, configDir } = resolveProviderExecutionConfig(settings, provider, accountId);
+  const response = expectResponse(
+    await client.request({
+      type: 'fetchPlanUsage',
+      provider,
+      binaryOverride,
+      ...(configDir ? { configDir } : {}),
+      cliVersion,
+    }),
+    'planUsage',
+  );
+  return response.usage;
 }
 
 export async function browseDaemonDirectory(
@@ -349,6 +374,7 @@ export async function discoverComposerCommands(
   provider: ProviderKind,
   root: string,
   binaryOverride: string | null,
+  configDir: string | null = null,
 ): Promise<SlashCommand[]> {
   const response = expectResponse(await client.request({
     type: 'workspace',
@@ -357,6 +383,7 @@ export async function discoverComposerCommands(
       provider,
       project_root: root,
       binary_override: binaryOverride,
+      ...(configDir ? { config_dir: configDir } : {}),
     },
   }), 'workspace');
   if (response.result.type !== 'slashCommands') {

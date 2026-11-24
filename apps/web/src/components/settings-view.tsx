@@ -1,8 +1,15 @@
 import { useQueryClient } from '@tanstack/react-query'
-import type {
-  DaemonSettings,
-  Project,
-  ProviderKind,
+import {
+  abbreviateHomePath,
+  defaultAccountExampleDir,
+  defaultAccountTildeDir,
+  formatAccountLoginCommand,
+  normalizeAccountConfigDirKey,
+  supportsMultipleAccounts,
+  type DaemonSettings,
+  type Project,
+  type ProviderAccount,
+  type ProviderKind,
 } from '@waku/client'
 import { useEffect, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
@@ -257,7 +264,12 @@ function ProvidersSettings() {
     try {
       await updateDaemonSettings(client, next)
       queryClient.setQueryData(daemonKeys.settings(config.address), next)
-      await queryClient.invalidateQueries({ queryKey: daemonKeys.providers(config.address) })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: daemonKeys.providers(config.address) }),
+        queryClient.invalidateQueries({ queryKey: daemonKeys.composerSources(config.address) }),
+        queryClient.invalidateQueries({ queryKey: daemonKeys.planUsageRoot(config.address) }),
+        queryClient.invalidateQueries({ queryKey: daemonKeys.skills(config.address) }),
+      ])
     } catch (error) {
       toast.error(errorMessage(error))
     }
@@ -402,12 +414,273 @@ function ProvidersSettings() {
                   <p className="truncate text-[10px] text-[var(--text-ghost)]" title={providerProbeCaption(provider.command, probe, Boolean(settings.data.provider_binary_overrides?.[provider.id]), t)}>
                     {providerProbeCaption(provider.command, probe, Boolean(settings.data.provider_binary_overrides?.[provider.id]), t)}
                   </p>
+                  {supportsMultipleAccounts(provider.id) && (
+                    <ProviderAccountsSection
+                      providerId={provider.id}
+                      providerName={provider.name}
+                      settings={settings.data}
+                      onApply={apply}
+                    />
+                  )}
                 </div>
               )}
             </div>
           )
         })}
       </div>
+    </div>
+  )
+}
+
+function ProviderAccountsSection({
+  providerId,
+  providerName,
+  settings,
+  onApply,
+}: {
+  providerId: ProviderKind
+  providerName: string
+  settings: DaemonSettings
+  onApply: (next: DaemonSettings) => Promise<void>
+}) {
+  const { t } = useI18n()
+  const accounts = (settings.provider_accounts ?? []).filter(
+    (account) => account.provider === providerId,
+  )
+  const defaultDir = defaultAccountTildeDir(providerId)
+  const exampleDir = defaultAccountExampleDir(providerId)
+  const [draft, setDraft] = useState<{
+    editingId: string | null
+    label: string
+    configDir: string
+    error: string | null
+  } | null>(null)
+
+  function openNewDraft() {
+    setDraft({ editingId: null, label: '', configDir: '', error: null })
+  }
+
+  function openEditDraft(account: ProviderAccount) {
+    setDraft({
+      editingId: account.id,
+      label: account.label,
+      configDir: account.configDir,
+      error: null,
+    })
+  }
+
+  function saveDraft() {
+    if (!draft) return
+    const label = draft.label.trim()
+    const configDir = draft.configDir.trim()
+    if (!label) {
+      setDraft({ ...draft, error: t('providers.account_error_empty_name') })
+      return
+    }
+    if (!configDir) {
+      setDraft({ ...draft, error: t('providers.account_error_empty_dir') })
+      return
+    }
+    const dirKey = normalizeAccountConfigDirKey(configDir)
+    if (dirKey === normalizeAccountConfigDirKey(defaultDir)) {
+      setDraft({ ...draft, error: t('providers.account_error_default_dir', { path: defaultDir }) })
+      return
+    }
+    const duplicate = accounts.some(
+      (account) =>
+        account.id !== draft.editingId
+        && normalizeAccountConfigDirKey(account.configDir) === dirKey,
+    )
+    if (duplicate) {
+      setDraft({
+        ...draft,
+        error: t('providers.account_error_duplicate_dir', { provider: providerName }),
+      })
+      return
+    }
+    const existing = settings.provider_accounts ?? []
+    const nextAccounts = draft.editingId
+      ? existing.map((account) =>
+          account.id === draft.editingId
+            ? { ...account, label, configDir }
+            : account)
+      : [
+          ...existing,
+          {
+            id: crypto.randomUUID(),
+            provider: providerId,
+            label,
+            configDir,
+            binaryOverride: null,
+          },
+        ]
+    setDraft(null)
+    void onApply({ ...settings, provider_accounts: nextAccounts })
+  }
+
+  function removeAccount(accountId: string) {
+    if (draft?.editingId === accountId) setDraft(null)
+    const nextAccounts = (settings.provider_accounts ?? []).filter(
+      (account) => account.id !== accountId,
+    )
+    void onApply({ ...settings, provider_accounts: nextAccounts })
+  }
+
+  return (
+    <div className="mt-3 border-t border-border/60 pt-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[11.5px] font-medium">{t('providers.accounts')}</div>
+          <p className="mt-0.5 text-[10.5px] leading-[15px] text-[var(--text-tertiary)]">
+            {t('providers.accounts_description', { provider: providerName })}
+          </p>
+        </div>
+        {!draft && (
+          <Button size="sm" type="button" variant="outline" onClick={openNewDraft}>
+            <WakuIcon className="size-3" name="plus" />
+            {t('providers.add_account')}
+          </Button>
+        )}
+      </div>
+
+      <div className="mt-2.5 flex flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-3 rounded-[8px] border border-border/60 bg-background/60 px-2.5 py-2">
+          <div className="min-w-0">
+            <div className="text-[11.5px] font-medium">{t('providers.default_account')}</div>
+            <div className="truncate font-mono text-[10px] text-[var(--text-tertiary)]">
+              {t('providers.default_account_hint', { path: defaultDir })}
+            </div>
+          </div>
+        </div>
+
+        {accounts.map((account) => (
+          <ProviderAccountRow
+            account={account}
+            key={account.id}
+            onEdit={() => openEditDraft(account)}
+            onRemove={() => removeAccount(account.id)}
+          />
+        ))}
+      </div>
+
+      {draft && (
+        <div className="mt-2.5 flex flex-col gap-2 rounded-[9px] border bg-background p-3">
+          <div className="text-[11px] font-medium">
+            {t(draft.editingId ? 'providers.edit_account' : 'providers.add_account')}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-[160px_1fr]">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10.5px] text-[var(--text-secondary)]">
+                {t('providers.account_name')}
+              </span>
+              <Input
+                className="h-[29px] bg-[var(--inset)] text-[11.5px]"
+                placeholder={t('providers.account_name_placeholder')}
+                value={draft.label}
+                onChange={(event) =>
+                  setDraft({ ...draft, label: event.target.value, error: null })
+                }
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') saveDraft()
+                  else if (event.key === 'Escape') setDraft(null)
+                }}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10.5px] text-[var(--text-secondary)]">
+                {t('providers.account_config_dir')}
+              </span>
+              <Input
+                className="h-[29px] bg-[var(--inset)] font-mono text-[11px]"
+                placeholder={t('providers.account_config_dir_placeholder', { path: exampleDir })}
+                value={draft.configDir}
+                onChange={(event) =>
+                  setDraft({ ...draft, configDir: event.target.value, error: null })
+                }
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') saveDraft()
+                  else if (event.key === 'Escape') setDraft(null)
+                }}
+              />
+            </label>
+          </div>
+          {draft.error && (
+            <div className="text-[10.5px] text-destructive" role="alert">
+              {draft.error}
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            <Button size="sm" type="button" variant="outline" onClick={() => setDraft(null)}>
+              {t('providers.account_cancel')}
+            </Button>
+            <Button size="sm" type="button" onClick={saveDraft}>
+              {t('providers.account_save')}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ProviderAccountRow({
+  account,
+  onEdit,
+  onRemove,
+}: {
+  account: ProviderAccount
+  onEdit: () => void
+  onRemove: () => void
+}) {
+  const { t } = useI18n()
+  const copyFeedback = useCopyFeedback()
+  const loginCommand = formatAccountLoginCommand(account.provider, account.configDir)
+
+  return (
+    <div className="flex items-center gap-2 rounded-[8px] border border-border/60 bg-background/60 px-2.5 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-[11.5px] font-medium">{account.label}</div>
+        <div
+          className="truncate font-mono text-[10px] text-[var(--text-tertiary)]"
+          title={account.configDir}
+        >
+          {abbreviateHomePath(account.configDir)}
+        </div>
+      </div>
+      {loginCommand && (
+        <Button
+          size="sm"
+          title={loginCommand}
+          type="button"
+          variant="outline"
+          onClick={() => {
+            void copyFeedback.copyText(loginCommand).then((ok) => {
+              if (ok) toast.success(t('providers.account_login_copied'))
+            })
+          }}
+        >
+          <WakuIcon name={copyFeedback.copied ? 'check' : 'copy'} />
+          {t('providers.account_copy_login')}
+        </Button>
+      )}
+      <button
+        aria-label={t('providers.edit_account')}
+        className="grid size-7 shrink-0 place-items-center rounded-[7px] text-[var(--text-tertiary)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+        title={t('providers.edit_account')}
+        type="button"
+        onClick={onEdit}
+      >
+        <WakuIcon className="size-3" name="pencil" />
+      </button>
+      <button
+        aria-label={t('providers.account_remove')}
+        className="grid size-7 shrink-0 place-items-center rounded-[7px] text-[var(--text-tertiary)] outline-none hover:bg-accent hover:text-destructive focus-visible:ring-1 focus-visible:ring-ring"
+        title={t('providers.account_remove')}
+        type="button"
+        onClick={onRemove}
+      >
+        <WakuIcon className="size-3" name="trash" />
+      </button>
     </div>
   )
 }
@@ -454,13 +727,6 @@ function providerCheckedLabel(updatedAt: number, t: Translator) {
 }
 
 type Translator = (key: string, params?: Record<string, string | number>) => string
-
-function abbreviateHomePath(path: string) {
-  return path
-    .replace(/^\/Users\/[^/]+(?=\/|$)/, '~')
-    .replace(/^\/home\/[^/]+(?=\/|$)/, '~')
-    .replace(/^\/root(?=\/|$)/, '~')
-}
 
 function DaemonSettings() {
   const { t } = useI18n()

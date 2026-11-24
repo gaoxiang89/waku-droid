@@ -1,5 +1,11 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import type { FileEntry, ProviderKind, ReportedCommand, SlashCommand } from '@waku/client';
+import {
+  resolveProviderExecutionConfig,
+  type FileEntry,
+  type ProviderKind,
+  type ReportedCommand,
+  type SlashCommand,
+} from '@waku/client';
 import { mergeComposerCommands, type ComposerAutocompleteRow, type ComposerTriggerKind } from '@waku/client/composer-autocomplete';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Keyboard, type TextInputProps } from 'react-native';
@@ -16,10 +22,11 @@ const NO_FILES: FileEntry[] = [];
 
 /** Explicit + menu pickers. Typing / or @ never opens a popup, and hiding
  * the keyboard leaves an open picker available for browsing. */
-export function useComposerPicker({ text, onChangeText, provider, root, reported = NO_REPORTED, contextKey }: {
+export function useComposerPicker({ text, onChangeText, provider, accountId = null, root, reported = NO_REPORTED, contextKey }: {
   text: string;
   onChangeText: (text: string) => void;
   provider: ProviderKind | null;
+  accountId?: string | null;
   root: string | null;
   reported?: ReportedCommand[];
   contextKey: string;
@@ -37,11 +44,13 @@ export function useComposerPicker({ text, onChangeText, provider, root, reported
   const insertionPoint = useRef<{ text: string; selection: ComposerSelection } | null>(null);
   const focusAfterDismiss = useRef(false);
   const profileId = daemon.activeProfile?.id ?? 'disconnected';
-  const binaryOverride = provider ? settings.data?.provider_binary_overrides?.[provider] ?? null : null;
+  const { binaryOverride, configDir } = provider
+    ? resolveProviderExecutionConfig(settings.data, provider, accountId)
+    : { binaryOverride: null, configDir: null };
   const enabled = daemon.phase === 'connected' && Boolean(daemon.client && provider && root);
   const commandOptions = {
-    queryKey: daemonKeys.composerCommands(profileId, provider, root, binaryOverride),
-    queryFn: () => discoverComposerCommands(daemon.client!, provider!, root!, binaryOverride),
+    queryKey: daemonKeys.composerCommands(profileId, provider, root, binaryOverride, configDir),
+    queryFn: () => discoverComposerCommands(daemon.client!, provider!, root!, binaryOverride, configDir),
     staleTime: 60_000,
   };
   const catalog = useQuery({ ...commandOptions, enabled: enabled && visible && Boolean(settings.data) && kind === 'command' });
@@ -54,7 +63,7 @@ export function useComposerPicker({ text, onChangeText, provider, root, reported
     staleTime: 30_000,
   });
   const fileIndex = files.data ?? NO_FILES;
-  const scope = JSON.stringify([profileId, contextKey, root, provider, binaryOverride, kind]);
+  const scope = JSON.stringify([profileId, contextKey, root, provider, binaryOverride, configDir, kind]);
   const [results, setResults] = useState<ComposerPickerResults | null>(null);
   useEffect(() => {
     if (!kind || !visible) return;
@@ -71,7 +80,7 @@ export function useComposerPicker({ text, onChangeText, provider, root, reported
     setForcedSelection(undefined);
     focusAfterDismiss.current = false;
     insertionPoint.current = null;
-  }, [contextKey, profileId, provider, root]);
+  }, [accountId, contextKey, profileId, provider, root]);
 
   const search = composerPickerSearchState(results, scope, query, commands, fileIndex);
   const source = kind === 'file' ? files : catalog;
@@ -96,11 +105,23 @@ export function useComposerPicker({ text, onChangeText, provider, root, reported
       // project templates cannot be bypassed by a quick send.
       const readySettings = settings.data ?? (await settings.refetch()).data;
       if (!readySettings) throw settings.error ?? new Error('Could not load daemon settings');
-      const override = readySettings.provider_binary_overrides?.[provider!] ?? null;
+      const exec = resolveProviderExecutionConfig(readySettings, provider!, accountId);
       const discoveredCommands = await queryClient.fetchQuery({
         ...commandOptions,
-        queryKey: daemonKeys.composerCommands(profileId, provider, root, override),
-        queryFn: () => discoverComposerCommands(daemon.client!, provider!, root!, override),
+        queryKey: daemonKeys.composerCommands(
+          profileId,
+          provider,
+          root,
+          exec.binaryOverride,
+          exec.configDir,
+        ),
+        queryFn: () => discoverComposerCommands(
+          daemon.client!,
+          provider!,
+          root!,
+          exec.binaryOverride,
+          exec.configDir,
+        ),
       });
       return mergeComposerCommands(discoveredCommands, reported);
     },

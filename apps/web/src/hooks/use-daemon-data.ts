@@ -1,5 +1,9 @@
 import { useQueries, useQuery } from '@tanstack/react-query'
-import type { ProviderKind } from '@waku/client'
+import {
+  providerProbeConfigKey,
+  resolveProviderExecutionConfig,
+  type ProviderKind,
+} from '@waku/client'
 import { PROVIDERS } from '@/components/waku-icon'
 import { useDaemon } from '@/lib/daemon-context'
 import {
@@ -83,24 +87,27 @@ export function useComposerFiles(cwd: string | undefined) {
 export function useComposerCommands(
   provider: ProviderKind | undefined,
   cwd: string | undefined,
+  accountId: string | null = null,
 ) {
   const { client, config, phase } = useDaemon()
   const settings = useDaemonSettings()
-  const binaryOverride = settings.data && provider
-    ? settings.data.provider_binary_overrides?.[provider] ?? null
-    : null
+  const { binaryOverride, configDir } = provider
+    ? resolveProviderExecutionConfig(settings.data, provider, accountId)
+    : { binaryOverride: null, configDir: null }
   return useQuery({
     queryKey: daemonKeys.slashCommands(
       config?.address ?? 'disconnected',
       provider ?? 'codex',
       cwd ?? 'none',
       binaryOverride,
+      configDir,
     ),
     queryFn: () => discoverComposerCommands(
       requireClient(client),
       provider!,
       cwd!,
       binaryOverride,
+      configDir,
     ),
     enabled: phase === 'connected' && Boolean(
       client && config && provider && cwd && settings.data,
@@ -129,31 +136,50 @@ export function useDaemonSettings() {
   })
 }
 
-export function useProviderProbe(provider: ProviderKind | undefined) {
+export function useProviderProbe(
+  provider: ProviderKind | undefined,
+  accountId: string | null = null,
+) {
   const { client, config, phase } = useDaemon()
   const settings = useDaemonSettings()
   const address = config?.address ?? 'disconnected'
+  const resolved = provider
+    ? resolveProviderExecutionConfig(settings.data, provider, accountId)
+    : { accountId: null, binaryOverride: null, configDir: null }
+  const accountKey = settings.data ? resolved.accountId : (accountId ?? null)
   const cached = config && provider
-    ? readProviderProbeCache(browserProviderProbeStorage(), address, provider)
+    ? readProviderProbeCache(
+        browserProviderProbeStorage(),
+        address,
+        provider,
+        undefined,
+        undefined,
+        accountKey,
+      )
     : undefined
-  const binaryOverride = settings.data && provider
-    ? settings.data.provider_binary_overrides?.[provider] ?? null
+  const configKey = settings.data
+    ? providerProbeConfigKey(resolved.binaryOverride, resolved.configDir)
     : cached?.binaryOverride ?? null
-  const initial = cached?.binaryOverride === binaryOverride ? cached : undefined
+  const initial = cached?.binaryOverride === configKey ? cached : undefined
   return useQuery({
     queryKey: daemonKeys.provider(
       address,
       provider ?? 'codex',
-      binaryOverride,
+      configKey,
     ),
     queryFn: async () => {
-      const data = await probeProvider(requireClient(client), provider!, settings.data!)
+      const data = await probeProvider(requireClient(client), provider!, settings.data!, {
+        accountId: resolved.accountId,
+        configDir: resolved.configDir,
+      })
       writeProviderProbeCache(
         browserProviderProbeStorage(),
         address,
         provider!,
-        binaryOverride,
+        configKey,
         data,
+        undefined,
+        resolved.accountId,
       )
       return data
     },
@@ -166,7 +192,10 @@ export function useProviderProbe(provider: ProviderKind | undefined) {
   })
 }
 
-export function useProviderProbes(enabled = true) {
+export function useProviderProbes(
+  enabled = true,
+  accountIds?: Partial<Record<ProviderKind, string | null>>,
+) {
   const { client, config, phase } = useDaemon()
   const settings = useDaemonSettings()
   const address = config?.address ?? 'disconnected'
@@ -174,16 +203,24 @@ export function useProviderProbes(enabled = true) {
   const active = enabled && phase === 'connected' && Boolean(client && config && settings.data)
   const queries = useQueries({
     queries: PROVIDERS.map(({ id }) => {
-      const cached = config ? readProviderProbeCache(storage, address, id) : undefined
-      const binaryOverride = settings.data
-        ? settings.data.provider_binary_overrides?.[id] ?? null
+      const requestedAccountId = accountIds?.[id] ?? null
+      const resolved = resolveProviderExecutionConfig(settings.data, id, requestedAccountId)
+      const accountKey = settings.data ? resolved.accountId : requestedAccountId
+      const cached = config
+        ? readProviderProbeCache(storage, address, id, undefined, undefined, accountKey)
+        : undefined
+      const configKey = settings.data
+        ? providerProbeConfigKey(resolved.binaryOverride, resolved.configDir)
         : cached?.binaryOverride ?? null
-      const initial = cached?.binaryOverride === binaryOverride ? cached : undefined
+      const initial = cached?.binaryOverride === configKey ? cached : undefined
       return {
-        queryKey: daemonKeys.provider(address, id, binaryOverride),
+        queryKey: daemonKeys.provider(address, id, configKey),
         queryFn: async () => {
-          const data = await probeProvider(requireClient(client), id, settings.data!)
-          writeProviderProbeCache(storage, address, id, binaryOverride, data)
+          const data = await probeProvider(requireClient(client), id, settings.data!, {
+            accountId: resolved.accountId,
+            configDir: resolved.configDir,
+          })
+          writeProviderProbeCache(storage, address, id, configKey, data, undefined, resolved.accountId)
           return data
         },
         enabled: active,

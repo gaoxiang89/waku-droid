@@ -1,5 +1,9 @@
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ProviderKind } from '@waku/client';
+import {
+  providerProbeConfigKey,
+  resolveProviderExecutionConfig,
+  type ProviderKind,
+} from '@waku/client';
 import {
   PROVIDER_PROBE_CACHE_STALE_TIME,
   readProviderProbeCache,
@@ -79,29 +83,50 @@ function providerModelsQuery(
   daemon: ReturnType<typeof useDaemon>,
   settings: ReturnType<typeof useDaemonSettings>,
   provider: ProviderKind,
+  accountId: string | null = null,
+  enabled = true,
 ) {
   const address = daemon.activeProfile?.address ?? 'disconnected';
+  const resolved = resolveProviderExecutionConfig(settings.data, provider, accountId);
+  const accountKey = settings.data ? resolved.accountId : (accountId ?? null);
   const cached = daemon.activeProfile
-    ? readProviderProbeCache(persistentStorageSync(), address, provider)
+    ? readProviderProbeCache(
+        persistentStorageSync(),
+        address,
+        provider,
+        undefined,
+        undefined,
+        accountKey,
+      )
     : undefined;
-  const binaryOverride = settings.data
-    ? settings.data.provider_binary_overrides?.[provider] ?? null
-    : cached?.binaryOverride ?? null;
-  const initial = cached && cached.binaryOverride === binaryOverride ? cached : undefined;
+  const configKey = settings.data
+    ? providerProbeConfigKey(resolved.binaryOverride, resolved.configDir)
+    : (cached?.binaryOverride ?? null);
+  const initial = cached && cached.binaryOverride === configKey ? cached : undefined;
   return {
     queryKey: [
-      ...daemonKeys.provider(daemon.activeProfile?.id ?? 'disconnected', provider),
+      ...daemonKeys.provider(daemon.activeProfile?.id ?? 'disconnected', provider, configKey),
       'models',
     ],
     queryFn: async () => {
       const data = await probeProvider(requireClient(daemon.client), provider, settings.data!, {
         discoverModels: true,
         probeVersion: false,
+        accountId: resolved.accountId,
+        configDir: resolved.configDir,
       });
-      writeProviderProbeCache(persistentStorageSync(), address, provider, binaryOverride, data);
+      writeProviderProbeCache(
+        persistentStorageSync(),
+        address,
+        provider,
+        configKey,
+        data,
+        undefined,
+        resolved.accountId,
+      );
       return data;
     },
-    enabled: daemon.phase === 'connected' &&
+    enabled: enabled && daemon.phase === 'connected' &&
       Boolean(daemon.activeProfile && daemon.client && settings.data),
     initialData: initial?.data,
     initialDataUpdatedAt: initial?.updatedAt,
@@ -111,19 +136,28 @@ function providerModelsQuery(
 
 /** Full probe with model discovery, for the model picker. Screens mount this
  * ahead of opening the sheet so the list is warm by the time it appears. */
-export function useProviderModels(provider: ProviderKind | null) {
+export function useProviderModels(
+  provider: ProviderKind | null,
+  accountId: string | null = null,
+) {
   const daemon = useDaemon();
   const settings = useDaemonSettings();
-  return useQuery(providerModelsQuery(daemon, settings, provider ?? 'codex'));
+  return useQuery(
+    providerModelsQuery(daemon, settings, provider ?? 'codex', accountId, Boolean(provider)),
+  );
 }
 
 /** Model discovery across every given provider, cache-shared with
  * useProviderModels. Backs the cross-provider model picker. */
-export function useAllProviderModels(providers: ProviderKind[]) {
+export function useAllProviderModels(
+  providers: ProviderKind[],
+  accountIds?: Partial<Record<ProviderKind, string | null>>,
+) {
   const daemon = useDaemon();
   const settings = useDaemonSettings();
   const queries = useQueries({
-    queries: providers.map((provider) => providerModelsQuery(daemon, settings, provider)),
+    queries: providers.map((provider) =>
+      providerModelsQuery(daemon, settings, provider, accountIds?.[provider] ?? null)),
   });
   return providers.map((id, index) => ({
     id,

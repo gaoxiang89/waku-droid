@@ -167,6 +167,7 @@ enum PaletteAction {
     ToggleBottomPanel,
     ToggleFilesSurface,
     ToggleGitGraphSurface,
+    ToggleSwarmSurface,
     NewTerminal,
     RestoreTerminals,
     EndTerminal(Uuid),
@@ -859,6 +860,15 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⇧⌘G", "Ctrl+Shift+G")),
                 PaletteAction::ToggleGitGraphSurface,
                 "toggle show hide git graph commits branches tags history panel",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.toggle_swarm"),
+                "icons/hexagon.svg",
+                None,
+                PaletteAction::ToggleSwarmSurface,
+                "toggle show hide swarm board hive members overview antigravity",
                 next(),
             ),
             CommandPaletteItem::command(
@@ -1888,6 +1898,13 @@ impl Waku {
             }
             PaletteAction::ToggleGitGraphSurface => {
                 self.toggle_git_graph_surface_action(&ToggleGitGraphSurface, window, cx)
+            }
+            PaletteAction::ToggleSwarmSurface => {
+                if self.is_swarm_surface_visible() {
+                    self.set_right_panel_visible(false, cx);
+                } else {
+                    self.open_antigravity_swarm_panel(cx);
+                }
             }
             PaletteAction::NewTerminal => self.new_terminal_action(&NewTerminal, window, cx),
             PaletteAction::RestoreTerminals => self.restore_detached_terminals(cx),

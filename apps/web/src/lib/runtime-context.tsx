@@ -1,6 +1,9 @@
 import { useQueryClient } from '@tanstack/react-query'
-import type {
-  AgentSession,
+import {
+  providerProbeConfigKey,
+  resolveProviderExecutionConfig,
+  validatedAccountId,
+  type AgentSession,
   DaemonSettings,
   GoalOperation,
   MessageAttachment,
@@ -33,7 +36,6 @@ import {
   materializeWorktree,
   persistSession,
   probeProvider,
-  resolveProviderAccount,
   sessionCwd,
   type TaskState,
 } from './daemon-api'
@@ -458,8 +460,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         } else if (event.event.kind === 'error' && typeof event.event.payload === 'string') {
           entry.lastDriverError = event.event.payload
         } else if (event.event.kind === 'planUsageUpdated') {
+          const cachedSettings = queryClient.getQueryData<DaemonSettings>(
+            daemonKeys.settings(config.address),
+          )
+          const accountId = cachedSettings
+            ? validatedAccountId(cachedSettings, current.provider, current.account_id)
+            : (current.account_id ?? null)
           queryClient.setQueryData<PlanUsage>(
-            daemonKeys.planUsage(config.address, current.provider),
+            daemonKeys.planUsage(config.address, current.provider, accountId),
             event.event.payload as PlanUsage,
           )
         }
@@ -672,18 +680,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             queryFn: () => loadDaemonSettings(client),
             staleTime: 60_000,
           })
-          const account = resolveProviderAccount(settings, currentSession.provider, currentSession.account_id)
-          const binaryOverride = account?.binaryOverride?.trim()
-            || settings.provider_binary_overrides?.[currentSession.provider]
-            || null
-          const configDir = account?.configDir ?? null
-          const probeCacheKey = configDir ? `${binaryOverride ?? ''}|${configDir}` : binaryOverride
+          const resolved = resolveProviderExecutionConfig(
+            settings,
+            currentSession.provider,
+            currentSession.account_id,
+          )
+          const probeCacheKey = providerProbeConfigKey(resolved.binaryOverride, resolved.configDir)
           const providerProbe = await queryClient.fetchQuery({
             queryKey: daemonKeys.provider(config.address, currentSession.provider, probeCacheKey),
             queryFn: async () => {
               const data = await probeProvider(client, currentSession.provider, settings, {
-                accountId: currentSession.account_id ?? null,
-                configDir,
+                accountId: resolved.accountId,
+                configDir: resolved.configDir,
               })
               writeProviderProbeCache(
                 browserProviderProbeStorage(),
@@ -691,11 +699,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
                 currentSession.provider,
                 probeCacheKey,
                 data,
+                undefined,
+                resolved.accountId,
               )
               return data
             },
             staleTime: PROVIDER_PROBE_CACHE_STALE_TIME,
           })
+          const configDir = resolved.configDir
           if (!providerProbe.installed || !providerProbe.path) {
             throw new Error(translate(localeRef.current, 'errors.provider_not_installed', {
               provider: providerName(currentSession.provider),
@@ -926,17 +937,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         queryFn: () => loadDaemonSettings(client),
         staleTime: 60_000,
       })
-      const account = resolveProviderAccount(settings, currentSession.provider, currentSession.account_id)
-      const binaryOverride = account?.binaryOverride?.trim()
-        || settings.provider_binary_overrides?.[currentSession.provider]
-        || null
-      const configDir = account?.configDir ?? null
-      const probeCacheKey = configDir ? `${binaryOverride ?? ''}|${configDir}` : binaryOverride
+      const resolved = resolveProviderExecutionConfig(
+        settings,
+        currentSession.provider,
+        currentSession.account_id,
+      )
+      const configDir = resolved.configDir
+      const probeCacheKey = providerProbeConfigKey(resolved.binaryOverride, configDir)
       const providerProbe = await queryClient.fetchQuery({
         queryKey: daemonKeys.provider(config.address, currentSession.provider, probeCacheKey),
         queryFn: async () => {
           const data = await probeProvider(client, currentSession.provider, settings, {
-            accountId: currentSession.account_id ?? null,
+            accountId: resolved.accountId,
             configDir,
           })
           writeProviderProbeCache(
@@ -945,6 +957,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             currentSession.provider,
             probeCacheKey,
             data,
+            undefined,
+            resolved.accountId,
           )
           return data
         },
@@ -1405,7 +1419,7 @@ export function useRuntime() {
   return context
 }
 
-function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentSession {
+export function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentSession {
   return {
     ...previous,
     title: next.title,
@@ -1418,6 +1432,7 @@ function mergeSessionSummary(previous: AgentSession, next: AgentSession): AgentS
     runtime_mode: next.runtime_mode,
     reasoning_effort: next.reasoning_effort,
     service_tier: next.service_tier,
+    context_window: next.context_window,
     agent_preset: next.agent_preset,
     status: next.status,
     updated_at: next.updated_at,

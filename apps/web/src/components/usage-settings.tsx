@@ -1,21 +1,38 @@
-import type {
-  DaySlice,
-  ModelSlice,
-  MonthSlice,
-  Project,
-  ProjectSlice,
-  ProviderDay,
-  ProviderSlice,
-  UsageHistory,
-  UsageProvider,
-  UsageWindow,
+import { useQueries, useQueryClient } from '@tanstack/react-query'
+import {
+  resolveProviderExecutionConfig,
+  supportsMultipleAccounts,
+  type DaySlice,
+  type ModelSlice,
+  type MonthSlice,
+  type PlanUsage,
+  type Project,
+  type ProjectSlice,
+  type ProviderAccount,
+  type ProviderDay,
+  type ProviderKind,
+  type ProviderSlice,
+  type UsageHistory,
+  type UsageProvider,
+  type UsageWindow,
 } from '@waku/client'
 import { useState, type ReactNode } from 'react'
 import { Virtuoso } from 'react-virtuoso'
 import { ControlMenu } from '@/components/control-menu'
+import {
+  PLAN_USAGE_PROVIDERS,
+  PlanUsageLanes,
+  UsageSkeleton as PlanUsageSkeleton,
+} from '@/components/plan-usage'
 import { UsageTrendChart, type UsageMetric } from '@/components/usage-chart'
-import { ProviderIcon, WakuIcon } from '@/components/waku-icon'
-import { useUsageHistory } from '@/hooks/use-daemon-data'
+import { ProviderIcon, providerMeta, WakuIcon } from '@/components/waku-icon'
+import {
+  useDaemonSettings,
+  useProviderProbes,
+  useUsageHistory,
+} from '@/hooks/use-daemon-data'
+import { daemonKeys, fetchPlanUsage } from '@/lib/daemon-api'
+import { useDaemon } from '@/lib/daemon-context'
 import { useI18n, type AppLocale } from '@/lib/i18n'
 import type { Translator } from '@/lib/transcript-presentation'
 import { projectDisplayName } from '@/lib/project-presentation'
@@ -50,6 +67,8 @@ const USAGE_WINDOWS: Array<{ window: UsageWindow; labelKey: string }> = [
 
 export function UsageSettings({ projects }: { projects: Project[] }) {
   const { locale, t } = useI18n()
+  const { config } = useDaemon()
+  const queryClient = useQueryClient()
   const [view, setView] = useState<UsageView>('daily')
   const [window, setWindow] = useState<UsageWindow>({ trailingDays: 30 })
   const [metric, setMetric] = useState<UsageMetric>('cost')
@@ -91,7 +110,14 @@ export function UsageSettings({ projects }: { projects: Project[] }) {
           className="grid size-7 place-items-center rounded-[7px] border text-[var(--text-tertiary)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
           title={t(usage.isFetching ? 'usage.scanning' : 'usage.rescan')}
           type="button"
-          onClick={() => void usage.refetch()}
+          onClick={() => {
+            void usage.refetch()
+            if (config) {
+              void queryClient.invalidateQueries({
+                queryKey: daemonKeys.planUsageRoot(config.address),
+              })
+            }
+          }}
         >
           <WakuIcon className={cn('size-3', usage.isFetching && 'motion-safe:animate-spin')} name={usage.isFetching ? 'loaderCircle' : 'rotateCw'} />
         </button>
@@ -107,6 +133,8 @@ export function UsageSettings({ projects }: { projects: Project[] }) {
         </UsageNotice>
       )}
 
+      {view === 'daily' && <PlanUsageSection />}
+
       {!history ? (
         <UsageSkeleton view={view} />
       ) : (
@@ -118,7 +146,7 @@ export function UsageSettings({ projects }: { projects: Project[] }) {
           {view === 'projects' && (
             <ProjectsUsage history={history} projects={projects} filter={projectFilter} onFilterChange={setProjectFilter} />
           )}
-          <div className="mt-4 text-[9.5px] text-[var(--text-ghost)]">
+      <div className="mt-4 text-[9.5px] text-[var(--text-ghost)]">
             {t('usage.scan_summary', {
               scanned: formatCount(history.scannedFiles, locale),
               skipped: formatCount(history.skippedFiles, locale),
@@ -128,6 +156,183 @@ export function UsageSettings({ projects }: { projects: Project[] }) {
           </div>
         </>
       )}
+    </div>
+  )
+}
+
+interface PlanUsageTarget {
+  key: string
+  provider: ProviderKind
+  accountId: string | null
+  accountLabel: string | null
+  installed: boolean
+  cliVersion: string | null
+}
+
+function PlanUsageSection() {
+  const { locale, t } = useI18n()
+  const { client, config, phase } = useDaemon()
+  const settings = useDaemonSettings()
+  const probes = useProviderProbes(phase === 'connected')
+
+  const targets: PlanUsageTarget[] = settings.data
+    ? PLAN_USAGE_PROVIDERS.flatMap((provider) => {
+        if (settings.data!.disabled_providers.includes(provider)) return []
+        const probe = probes.data[provider]
+        const installed = probe?.installed ?? false
+        const cliVersion = probe?.version ?? null
+        const accounts: ProviderAccount[] = supportsMultipleAccounts(provider)
+          ? (settings.data!.provider_accounts ?? []).filter(
+              (account) => account.provider === provider,
+            )
+          : []
+        const entries: PlanUsageTarget[] = []
+        if (installed) {
+          entries.push({
+            key: `${provider}:default`,
+            provider,
+            accountId: null,
+            accountLabel: accounts.length ? t('providers.default_account') : null,
+            installed: true,
+            cliVersion,
+          })
+        }
+        for (const account of accounts) {
+          const { binaryOverride } = resolveProviderExecutionConfig(
+            settings.data,
+            provider,
+            account.id,
+          )
+          if (!installed && !binaryOverride) continue
+          entries.push({
+            key: `${provider}:${account.id}`,
+            provider,
+            accountId: account.id,
+            accountLabel: account.label,
+            installed: true,
+            cliVersion,
+          })
+        }
+        return entries
+      })
+    : []
+
+  const queries = useQueries({
+    queries: targets.map((target) => ({
+      queryKey: daemonKeys.planUsage(
+        config?.address ?? 'disconnected',
+        target.provider,
+        target.accountId,
+      ),
+      queryFn: () =>
+        fetchPlanUsage(
+          client!,
+          target.provider,
+          settings.data!,
+          target.cliVersion,
+          target.accountId,
+        ),
+      enabled:
+        phase === 'connected'
+        && Boolean(client && config && settings.data && target.installed),
+      staleTime: 30_000,
+    })),
+  })
+
+  const cards = targets
+    .map((target, index) => ({
+      target,
+      query: queries[index]!,
+    }))
+    .filter(({ query }) => query.isPending || Boolean(query.error) || Boolean(query.data))
+
+  if (!cards.length) return null
+
+  return (
+    <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+      {cards.map(({ target, query }) => (
+        <PlanUsageCard
+          key={target.key}
+          locale={locale}
+          plan={query.data ?? null}
+          error={query.error}
+          pending={query.isPending}
+          target={target}
+        />
+      ))}
+    </div>
+  )
+}
+
+function PlanUsageCard({
+  target,
+  plan,
+  pending,
+  error,
+  locale,
+}: {
+  target: PlanUsageTarget
+  plan: PlanUsage | null
+  pending: boolean
+  error: unknown
+  locale: AppLocale
+}) {
+  const { t } = useI18n()
+  const meta = providerMeta(target.provider)
+  const usageUrl = target.provider === 'claude'
+    ? 'https://claude.ai/settings/usage'
+    : target.provider === 'codex'
+      ? 'https://chatgpt.com/codex/settings/usage'
+      : null
+
+  return (
+    <div className="flex flex-col gap-3 rounded-[13px] bg-[var(--raised)] px-4 py-3.5 text-xs">
+      <div className="flex min-w-0 items-center gap-2">
+        <ProviderIcon className="size-3.5 shrink-0" provider={target.provider} />
+        <span className="min-w-0 flex-1 truncate font-medium">
+          {meta.name}
+          {target.accountLabel ? ` · ${target.accountLabel}` : ''}
+        </span>
+        {plan?.planLabel && (
+          <span className="shrink-0 truncate text-[11px] text-[var(--text-tertiary)]">
+            {plan.planLabel}
+          </span>
+        )}
+        {usageUrl && (
+          <a
+            aria-label={meta.name}
+            className="grid size-5 shrink-0 place-items-center rounded text-[var(--text-tertiary)] outline-none hover:bg-accent hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-ring"
+            href={usageUrl}
+            rel="noreferrer"
+            target="_blank"
+          >
+            <WakuIcon className="size-2.5" name="arrowRight" />
+          </a>
+        )}
+      </div>
+      {pending && !plan ? (
+        <PlanUsageSkeleton t={t} />
+      ) : error ? (
+        <div className="break-words text-[11px] text-[var(--text-secondary)]">
+          {t('usage.unavailable', { error: errorMessage(error) })}
+        </div>
+      ) : plan ? (
+        plan.windows.length ? (
+          <div className="space-y-3">
+            <PlanUsageLanes
+              locale={locale}
+              plan={plan}
+              provider={target.provider}
+              showHeader={false}
+              t={t}
+            />
+          </div>
+        ) : (
+          <div className="text-[11px] text-[var(--text-tertiary)]">
+            {t('usage.no_activity_window')}
+          </div>
+        )
+      ) : null}
     </div>
   )
 }

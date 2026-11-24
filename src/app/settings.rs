@@ -760,6 +760,13 @@ impl Waku {
                 env!("CARGO_PKG_VERSION").into(),
             ))
             .children(daemon_rows)
+            .child(
+                div()
+                    .mt(px(10.0))
+                    .text_size(sp(12.0))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("settings.about_provenance")),
+            )
     }
 
     fn set_analytics_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1766,6 +1773,7 @@ impl Waku {
                 .border_color(theme.border_strong)
                 .flex()
                 .overflow_hidden();
+            let hosts_len = self.hosts.hosts.len();
             let selected_index = self
                 .hosts
                 .hosts
@@ -1782,26 +1790,33 @@ impl Waku {
                 };
                 let selected = &key == selected_host;
                 tabs = tabs.child(
-                    div()
-                        .id(SharedString::from(format!("{id_prefix}-host-tab-{index}")))
-                        .tab_index(0)
-                        .focus_visible(|style| style.border_1().border_color(theme.accent))
-                        .h(px(26.0))
-                        .px(px(11.0))
-                        .flex()
-                        .items_center()
-                        .cursor_default()
-                        .text_size(sp(12.5))
-                        .text_color(if selected {
-                            theme.text
-                        } else {
-                            theme.text_secondary
-                        })
-                        .when(selected, |element| element.bg(theme.overlay))
-                        .when(!selected, |element| {
-                            element.hover(|element| element.text_color(theme.text))
-                        })
-                        .child(label)
+                    super::usage_page::round_horizontal_segment_edges(
+                        div()
+                            .id(SharedString::from(format!("{id_prefix}-host-tab-{index}")))
+                            .tab_index(0)
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .h(px(26.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .cursor_default()
+                            .text_size(sp(12.5))
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_secondary
+                            })
+                            .when(selected, |element| element.bg(theme.overlay))
+                            .when(!selected, |element| {
+                                element.hover(|element| element.text_color(theme.text))
+                            }),
+                        index,
+                        hosts_len,
+                        px(6.0),
+                    )
+                    .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             on_select(this, key.clone(), cx);
                             cx.stop_propagation();
@@ -2961,8 +2976,30 @@ impl Waku {
         self.plan_usage_stale.insert(usage_key);
         self.cancel_provider_account_form(cx);
         self.invalidate_composer_sources(cx);
+        self.invalidate_skills_catalog_for_host(&host_key, cx);
+        if kind == ProviderKind::Antigravity && host_key == self.selected_host_key() {
+            if local {
+                self.provider_model_discoveries_pending.remove(&kind);
+            }
+            self.refresh_provider_model_discovery(kind);
+        }
         self.maybe_refresh_plan_usage(cx);
         cx.notify();
+    }
+
+    fn invalidate_skills_catalog_for_host(
+        &mut self,
+        host_key: &waku_client::hosts::HostKey,
+        cx: &mut Context<Self>,
+    ) {
+        if self.skills_catalog_host.as_ref() == Some(host_key) {
+            self.skills_scanned_at = None;
+        }
+        if self.effective_skills_host() == *host_key {
+            self.skills_scan_generation += 1;
+            self.skills_scan_pending = false;
+            self.ensure_skills_catalog(true, cx);
+        }
     }
 
     fn remove_provider_account(
@@ -3034,6 +3071,13 @@ impl Waku {
             self.save();
         }
         self.invalidate_composer_sources(cx);
+        self.invalidate_skills_catalog_for_host(&host_key, cx);
+        if kind == ProviderKind::Antigravity && host_key == self.selected_host_key() {
+            if local {
+                self.provider_model_discoveries_pending.remove(&kind);
+            }
+            self.refresh_provider_model_discovery(kind);
+        }
         self.maybe_refresh_plan_usage(cx);
         cx.notify();
     }

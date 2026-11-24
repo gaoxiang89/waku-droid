@@ -242,9 +242,7 @@ pub fn parse_antigravity_local_command(
             Some(AntigravityLocalCommand::Usage)
         }
         "model" if arguments.is_empty() => Some(AntigravityLocalCommand::ModelPicker),
-        "model" if !arguments.chars().any(char::is_whitespace) => {
-            Some(AntigravityLocalCommand::SetModel(arguments.to_owned()))
-        }
+        "model" => Some(AntigravityLocalCommand::SetModel(arguments.to_owned())),
         "effort" if arguments.is_empty() => Some(AntigravityLocalCommand::EffortShow),
         "effort" if !arguments.chars().any(char::is_whitespace) => {
             Some(AntigravityLocalCommand::SetEffort(arguments.to_owned()))
@@ -759,7 +757,14 @@ mod tests {
             parse("/model gemini-3.1-pro"),
             Some(AntigravityLocalCommand::SetModel("gemini-3.1-pro".into()))
         );
-        assert_eq!(parse("/model switch to fast please"), None);
+        assert_eq!(
+            parse("/model Gemini 4 Neon"),
+            Some(AntigravityLocalCommand::SetModel("Gemini 4 Neon".into()))
+        );
+        assert_eq!(
+            parse("/model Claude Opus 5.5"),
+            Some(AntigravityLocalCommand::SetModel("Claude Opus 5.5".into()))
+        );
 
         assert_eq!(parse("/effort"), Some(AntigravityLocalCommand::EffortShow));
         assert_eq!(

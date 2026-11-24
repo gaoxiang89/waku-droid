@@ -28,9 +28,10 @@ export function readProviderProbeCache(
   provider: ProviderKind,
   expectedBinaryOverride?: string | null,
   now = Date.now(),
+  accountKey?: string | null,
 ): CachedProviderProbe | undefined {
   const state = readState(storage)
-  const entry = state?.entries[entryKey(address, provider)]
+  const entry = state?.entries[entryKey(address, provider, accountKey)]
   if (!entry || now - entry.updatedAt > CACHE_MAX_AGE) return undefined
   if (expectedBinaryOverride !== undefined && entry.binaryOverride !== expectedBinaryOverride) {
     return undefined
@@ -45,6 +46,7 @@ export function writeProviderProbeCache(
   binaryOverride: string | null,
   data: ProviderProbeResult,
   now = Date.now(),
+  accountKey?: string | null,
 ): void {
   if (!storage) return
   const state = readState(storage) ?? { version: CACHE_VERSION, entries: {} }
@@ -54,7 +56,7 @@ export function writeProviderProbeCache(
       .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
       .slice(0, CACHE_MAX_ENTRIES - 1),
   )
-  entries[entryKey(address, provider)] = { binaryOverride, data, updatedAt: now }
+  entries[entryKey(address, provider, accountKey)] = { binaryOverride, data, updatedAt: now }
   try {
     storage.setItem(CACHE_KEY, JSON.stringify({ version: CACHE_VERSION, entries }))
   } catch {
@@ -105,6 +107,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function entryKey(address: string, provider: ProviderKind): string {
-  return `${address}\u0000${provider}`
+function entryKey(address: string, provider: ProviderKind, accountKey?: string | null): string {
+  return accountKey
+    ? `${address}\u0000${provider}\u0000${accountKey}`
+    : `${address}\u0000${provider}`
 }

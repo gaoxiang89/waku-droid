@@ -16,6 +16,9 @@ import {
   createProject,
   createResumedSession,
   createSession,
+  daemonKeys,
+  discoverComposerCommands,
+  fetchPlanUsage,
   listProviderSessions,
   loadProviderSessionHistory,
   persistProject,
@@ -429,6 +432,133 @@ describe('removeSession', () => {
     expect(commands).toEqual([
       { type: 'removeSession' },
       { type: 'loadTaskState' },
+    ])
+  })
+})
+
+describe('provider accounts execution config & keys', () => {
+  test('keys planUsage and slashCommands per provider account', () => {
+    expect(daemonKeys.planUsage('http://localhost:3000', 'antigravity')).toEqual([
+      'daemon',
+      'http://localhost:3000',
+      'plan-usage',
+      'antigravity',
+      null,
+    ])
+    expect(daemonKeys.planUsage('http://localhost:3000', 'antigravity', 'acct-work')).toEqual([
+      'daemon',
+      'http://localhost:3000',
+      'plan-usage',
+      'antigravity',
+      'acct-work',
+    ])
+    expect(
+      daemonKeys.slashCommands('http://localhost:3000', 'antigravity', '/repo', null, '~/.gemini/work'),
+    ).toEqual([
+      'daemon',
+      'http://localhost:3000',
+      'composer-sources',
+      'commands',
+      'antigravity',
+      '/repo',
+      null,
+      '~/.gemini/work',
+    ])
+  })
+
+  test('threads configDir and binaryOverride into probeProvider, fetchPlanUsage, and discoverComposerCommands', async () => {
+    const requests: unknown[] = []
+    const settings: DaemonSettings = {
+      computer_use_enabled: false,
+      computer_use_allowed_apps: [],
+      analytics_enabled: true,
+      disabled_providers: [],
+      default_workspace_mode: 'local',
+      notifications_enabled: true,
+      provider_binary_overrides: { antigravity: 'C:\\bin\\agy.exe' },
+      provider_accounts: [{
+        id: 'acct-work',
+        provider: 'antigravity',
+        label: 'Work',
+        configDir: 'C:\\Users\\alice\\.gemini\\work',
+        binaryOverride: 'C:\\custom\\agy.exe',
+      }],
+    }
+    const client = {
+      request: async (command: unknown) => {
+        requests.push(command)
+        if ((command as { type: string }).type === 'probeProvider') {
+          return {
+            type: 'providerProbe',
+            probe: {
+              provider: 'antigravity',
+              installed: true,
+              path: 'C:\\custom\\agy.exe',
+              models: [],
+              agent_presets: [],
+            },
+            version: '1.0.0',
+          }
+        }
+        if ((command as { type: string }).type === 'fetchPlanUsage') {
+          return {
+            type: 'planUsage',
+            usage: { planLabel: 'Pro', windows: [] },
+          }
+        }
+        return {
+          type: 'workspace',
+          result: { type: 'slashCommands', commands: [] },
+        }
+      },
+    } as unknown as WakuClient
+
+    await probeProvider(client, 'antigravity', settings, { accountId: 'acct-work' })
+    await fetchPlanUsage(client, 'antigravity', settings, '1.0.0', 'acct-work')
+    await discoverComposerCommands(client, 'antigravity', '/repo', null)
+    await discoverComposerCommands(
+      client,
+      'antigravity',
+      '/repo',
+      'C:\\custom\\agy.exe',
+      'C:\\Users\\alice\\.gemini\\work',
+    )
+
+    expect(requests).toEqual([
+      {
+        type: 'probeProvider',
+        provider: 'antigravity',
+        binaryOverride: 'C:\\custom\\agy.exe',
+        configDir: 'C:\\Users\\alice\\.gemini\\work',
+        discoverModels: true,
+        probeVersion: true,
+      },
+      {
+        type: 'fetchPlanUsage',
+        provider: 'antigravity',
+        binaryOverride: 'C:\\custom\\agy.exe',
+        configDir: 'C:\\Users\\alice\\.gemini\\work',
+        cliVersion: '1.0.0',
+      },
+      {
+        type: 'workspace',
+        operation: {
+          type: 'discoverSlashCommands',
+          provider: 'antigravity',
+          project_root: '/repo',
+          binary_override: null,
+        },
+      },
+      {
+        type: 'workspace',
+        operation: {
+          type: 'discoverSlashCommands',
+          provider: 'antigravity',
+          project_root: '/repo',
+          binary_override: 'C:\\custom\\agy.exe',
+          config_dir: 'C:\\Users\\alice\\.gemini\\work',
+        },
+      },
     ])
   })
 })

@@ -1,5 +1,6 @@
-import type {
-  AgentSession,
+import {
+  resolveProviderExecutionConfig,
+  type AgentSession,
   AgentInvocation,
   BranchSnapshot,
   Checkpoint,
@@ -41,12 +42,16 @@ export const daemonKeys = {
     ['daemon', address, 'session', sessionId] as const,
   settings: (address: string) => ['daemon', address, 'settings'] as const,
   providers: (address: string) => ['daemon', address, 'providers'] as const,
-  provider: (address: string, provider: ProviderKind, binaryOverride: string | null = null) =>
-    [...daemonKeys.providers(address), 'catalog', provider, binaryOverride] as const,
+  provider: (address: string, provider: ProviderKind, configKey: string | null = null) =>
+    [...daemonKeys.providers(address), 'catalog', provider, configKey] as const,
   providerDetection: (address: string, provider: ProviderKind) =>
     [...daemonKeys.providers(address), 'detection', provider] as const,
-  planUsage: (address: string, provider: ProviderKind) =>
-    ['daemon', address, 'plan-usage', provider] as const,
+  planUsageRoot: (address: string) => ['daemon', address, 'plan-usage'] as const,
+  planUsage: (
+    address: string,
+    provider: ProviderKind,
+    accountId: string | null = null,
+  ) => [...daemonKeys.planUsageRoot(address), provider, accountId ?? null] as const,
   skills: (address: string) => ['daemon', address, 'skills'] as const,
   usage: (address: string, window: UsageWindow) =>
     ['daemon', address, 'usage', JSON.stringify(window)] as const,
@@ -64,7 +69,15 @@ export const daemonKeys = {
     provider: ProviderKind,
     cwd: string,
     binaryOverride: string | null,
-  ) => [...daemonKeys.composerSources(address), 'commands', provider, cwd, binaryOverride] as const,
+    configDir: string | null = null,
+  ) => [
+    ...daemonKeys.composerSources(address),
+    'commands',
+    provider,
+    cwd,
+    binaryOverride,
+    configDir ?? null,
+  ] as const,
   workspaceTree: (address: string, cwd: string, expanded: string[]) =>
     ['daemon', address, 'workspace-tree', cwd, ...[...expanded].sort()] as const,
   directory: (address: string, path: string | null) =>
@@ -177,24 +190,6 @@ export async function loadDaemonSettings(
   }
 }
 
-export function resolveProviderAccount(
-  settings: DaemonSettings,
-  provider: ProviderKind,
-  accountId: string | null | undefined,
-) {
-  if (!accountId) return null
-  return settings.provider_accounts?.find(
-    (account) => account.provider === provider && account.id === accountId,
-  ) ?? null
-}
-
-export async function updateDaemonSettings(
-  client: WakuClient,
-  settings: DaemonSettings,
-): Promise<void> {
-  expectResponse(await client.request({ type: 'updateSettings', settings }), 'ack')
-}
-
 export async function probeProvider(
   client: WakuClient,
   provider: ProviderKind,
@@ -207,16 +202,13 @@ export async function probeProvider(
   } = {},
 ): Promise<ProviderProbe & { version: string | null }> {
   const { discoverModels = true, probeVersion = true } = options
-  const account = resolveProviderAccount(settings, provider, options.accountId)
-  const binaryOverride = account?.binaryOverride?.trim()
-    || settings.provider_binary_overrides?.[provider]
-    || null
-  const configDir = options.configDir ?? account?.configDir ?? null
+  const resolved = resolveProviderExecutionConfig(settings, provider, options.accountId)
+  const configDir = options.configDir ?? resolved.configDir
   const response = expectResponse(
     await client.request({
       type: 'probeProvider',
       provider,
-      binaryOverride,
+      binaryOverride: resolved.binaryOverride,
       ...(configDir ? { configDir } : {}),
       discoverModels,
       probeVersion,
@@ -224,6 +216,13 @@ export async function probeProvider(
     'providerProbe',
   )
   return { ...response.probe, version: response.version }
+}
+
+export async function updateDaemonSettings(
+  client: WakuClient,
+  settings: DaemonSettings,
+): Promise<void> {
+  expectResponse(await client.request({ type: 'updateSettings', settings }), 'ack')
 }
 
 export async function loadSkills(
@@ -275,11 +274,7 @@ export async function fetchPlanUsage(
   version: string | null,
   accountId: string | null = null,
 ): Promise<PlanUsage | null> {
-  const account = resolveProviderAccount(settings, provider, accountId)
-  const binaryOverride = account?.binaryOverride?.trim()
-    || settings.provider_binary_overrides?.[provider]
-    || null
-  const configDir = account?.configDir ?? null
+  const { binaryOverride, configDir } = resolveProviderExecutionConfig(settings, provider, accountId)
   const response = expectResponse(
     await client.request({
       type: 'fetchPlanUsage',
@@ -458,12 +453,14 @@ export async function discoverComposerCommands(
   provider: ProviderKind,
   projectRoot: string,
   binaryOverride: string | null,
+  configDir: string | null = null,
 ): Promise<SlashCommand[]> {
   const result = await workspaceRequest(client, {
     type: 'discoverSlashCommands',
     provider,
     project_root: projectRoot,
     binary_override: binaryOverride,
+    ...(configDir ? { config_dir: configDir } : {}),
   })
   if (result.type !== 'slashCommands') {
     throw new Error('The daemon returned an unexpected slash-command response')

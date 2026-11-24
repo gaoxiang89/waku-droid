@@ -580,6 +580,22 @@ pub fn fetch_antigravity_plan_usage_in(
     binary: &Path,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<PlanUsage> {
+    if let Some(dir) = config_dir {
+        let env = crate::command_env::antigravity_account_env(dir);
+        let uses_api_key = env
+            .iter()
+            .any(|(key, val)| key == "GEMINI_API_KEY" && !val.trim().is_empty());
+        let uses_adc = env
+            .iter()
+            .any(|(key, val)| key == "AGY_ADC_AUTH" && val.trim().eq_ignore_ascii_case("true"));
+        // Root `agy -p "/usage"` has no `--gemini-dir` flag and falls back to
+        // the default OS keyring OAuth account when only `GEMINI_API_KEY` is set.
+        if uses_api_key && !uses_adc {
+            return Err(anyhow!(
+                "Antigravity plan quota is unavailable for GEMINI_API_KEY profiles (usage probes only support OAuth accounts)."
+            ));
+        }
+    }
     let usage =
         run_antigravity_print_command(binary, "/usage", ANTIGRAVITY_USAGE_TIMEOUT, config_dir)?;
     let credits =
@@ -2185,6 +2201,14 @@ mod tests {
         assert!(isolated_cmd.get_envs().any(|(key, value)| {
             key == "GEMINI_API_KEY" && value.and_then(|v| v.to_str()) == Some("usage-key")
         }));
+
+        let err = fetch_antigravity_plan_usage_in(Path::new("/nonexistent/agy"), Some(&dir))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("GEMINI_API_KEY"),
+            "API-key profile must not fall back to default OAuth quota: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

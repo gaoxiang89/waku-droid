@@ -1,10 +1,18 @@
 import { BottomSheetFlatList } from '@expo/ui/community/bottom-sheet';
-import type { ProviderKind, ProviderModel, RuntimeMode } from '@waku/client';
+import {
+  supportsMultipleAccounts,
+  validatedAccountId,
+  type ProviderAccount,
+  type ProviderKind,
+  type ProviderModel,
+  type RuntimeMode,
+} from '@waku/client';
 import * as Haptics from 'expo-haptics';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -22,7 +30,11 @@ import { AppSymbol } from './app-symbol';
 import { ProviderIcon } from './provider-icon';
 import { Sheet, SheetRow } from './sheet';
 import { NativeTint, Radius } from '@/constants/theme';
-import { useAllProviderModels, useProviderModels } from '@/hooks/use-daemon-data';
+import {
+  useAllProviderModels,
+  useDaemonSettings,
+  useProviderModels,
+} from '@/hooks/use-daemon-data';
 import { useModelSheetListHeight } from '@/hooks/use-model-sheet-list-height';
 import { useTheme } from '@/hooks/use-theme';
 import {
@@ -33,6 +45,7 @@ import {
 import { droidAutonomyLevel, providerLabel, runtimeModeLabel } from '@/lib/session-presentation';
 
 export interface ModelSelection {
+  accountId?: string | null;
   model: string | null;
   reasoningEffort: string | null;
 }
@@ -40,9 +53,12 @@ export interface ModelSelection {
 export function modelDisplayName(
   models: ProviderModel[] | undefined,
   model: string | null,
+  accountLabel?: string | null,
 ): string {
-  if (!model) return 'Default model';
-  return models?.find((item) => item.id === model)?.name ?? model;
+  const base = !model
+    ? 'Default model'
+    : (models?.find((item) => item.id === model)?.name ?? model);
+  return accountLabel ? `${base} · ${accountLabel}` : base;
 }
 
 /** Current-provider model picker opened from the task header. */
@@ -50,18 +66,31 @@ export function ModelSheet({
   visible,
   onDismiss,
   provider,
+  accountId = null,
   model,
   onApply,
 }: {
   visible: boolean;
   onDismiss: () => void;
   provider: ProviderKind;
+  accountId?: string | null;
   model: string | null;
   onApply: (selection: ModelSelection) => void;
 }) {
   const theme = useTheme();
   const listHeight = useModelSheetListHeight(visible);
-  const probe = useProviderModels(provider);
+  const settings = useDaemonSettings();
+  const initialAccountId = settings.data
+    ? validatedAccountId(settings.data, provider, accountId)
+    : (supportsMultipleAccounts(provider) ? (accountId ?? null) : null);
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(initialAccountId);
+  const accounts = supportsMultipleAccounts(provider)
+    ? (settings.data?.provider_accounts ?? []).filter((account) => account.provider === provider)
+    : [];
+  const activeAccountId = settings.data
+    ? validatedAccountId(settings.data, provider, selectedAccountId)
+    : selectedAccountId;
+  const probe = useProviderModels(provider, activeAccountId);
   const [search, setSearch] = useState('');
   const models = probe.data?.models ?? [];
   const defaultModel = models.find((item) => item.is_default) ?? models[0];
@@ -71,12 +100,15 @@ export function ModelSheet({
   );
 
   useEffect(() => {
-    if (visible) setSearch('');
-  }, [provider, visible]);
+    if (!visible) return;
+    setSearch('');
+    setSelectedAccountId(initialAccountId);
+  }, [initialAccountId, provider, visible]);
 
   function pickModel(next: ProviderModel) {
     void Haptics.selectionAsync();
     onApply({
+      accountId: supportsMultipleAccounts(provider) ? activeAccountId : null,
       model: next.id,
       reasoningEffort: next.default_reasoning_effort ?? null,
     });
@@ -89,6 +121,13 @@ export function ModelSheet({
       scrollable={false}
       visible={visible}>
       <ModelSearchField onChangeText={setSearch} value={search} />
+      {accounts.length > 0 && (
+        <AccountPills
+          accounts={accounts}
+          activeId={activeAccountId}
+          onSelect={setSelectedAccountId}
+        />
+      )}
       {probe.isPending ? (
         <View style={styles.loading}>
           <ActivityIndicator color={theme.textTertiary} />
@@ -100,7 +139,7 @@ export function ModelSheet({
       ) : (
         <BottomSheetFlatList
           data={items}
-          extraData={model}
+          extraData={`${model ?? ''}:${activeAccountId ?? ''}`}
           initialNumToRender={14}
           keyExtractor={(item) => item.id}
           keyboardShouldPersistTaps="handled"
@@ -109,7 +148,10 @@ export function ModelSheet({
               description={item.sub_provider ?? undefined}
               label={item.name}
               onPress={() => pickModel(item)}
-              selected={model === item.id || (!model && defaultModel?.id === item.id)}
+              selected={
+                activeAccountId === initialAccountId
+                && (model === item.id || (!model && defaultModel?.id === item.id))
+              }
             />
           )}
           showsVerticalScrollIndicator={false}
@@ -248,6 +290,7 @@ function ServiceTierOptions({
 
 export interface ProviderModelSelection extends ModelTraitSelection {
   provider: ProviderKind;
+  accountId?: string | null;
   model: string | null;
 }
 
@@ -262,6 +305,7 @@ export function ModelPickerSheet({
   onDismiss,
   providers,
   provider,
+  accountId = null,
   model,
   onApply,
 }: {
@@ -269,12 +313,32 @@ export function ModelPickerSheet({
   onDismiss: () => void;
   providers: ProviderKind[];
   provider: ProviderKind | null;
+  accountId?: string | null;
   model: string | null;
   onApply: (selection: ProviderModelSelection) => void;
 }) {
   const theme = useTheme();
   const listHeight = useModelSheetListHeight(visible);
-  const catalog = useAllProviderModels(visible ? providers : []);
+  const settings = useDaemonSettings();
+  const initialSessionAccountId = provider && supportsMultipleAccounts(provider)
+    ? (settings.data ? validatedAccountId(settings.data, provider, accountId) : (accountId ?? null))
+    : null;
+  const [accountByProvider, setAccountByProvider] = useState<Partial<Record<ProviderKind, string | null>>>({});
+  const accountIds = useMemo(
+    () =>
+      Object.fromEntries(
+        providers.map((id) => {
+          if (!supportsMultipleAccounts(id)) return [id, null];
+          const raw = accountByProvider[id] !== undefined
+            ? accountByProvider[id]
+            : (id === provider ? initialSessionAccountId : null);
+          const resolved = settings.data ? validatedAccountId(settings.data, id, raw) : (raw ?? null);
+          return [id, resolved];
+        }),
+      ) as Partial<Record<ProviderKind, string | null>>,
+    [accountByProvider, initialSessionAccountId, provider, providers, settings.data],
+  );
+  const catalog = useAllProviderModels(visible ? providers : [], accountIds);
   const [browsing, setBrowsing] = useState<ProviderKind | null>(provider);
   const [search, setSearch] = useState('');
   const reduceMotion = useReducedMotion();
@@ -290,8 +354,13 @@ export function ModelPickerSheet({
     const initial = provider ?? providers[0] ?? null;
     setBrowsing(initial);
     setSearch('');
+    setAccountByProvider(
+      provider && supportsMultipleAccounts(provider)
+        ? { [provider]: initialSessionAccountId }
+        : {},
+    );
     progress.value = initial ? 1 : 0;
-  }, [progress, provider, providers, visible]);
+  }, [initialSessionAccountId, progress, provider, providers, visible]);
 
   function slideTo(target: 0 | 1) {
     progress.value = reduceMotion
@@ -302,6 +371,10 @@ export function ModelPickerSheet({
   const entry = catalog.find((item) => item.id === browsing);
   const preferredModelId = entry?.models.find((item) => item.is_default)?.id
     ?? entry?.models[0]?.id;
+  const browsingAccounts = browsing && supportsMultipleAccounts(browsing)
+    ? (settings.data?.provider_accounts ?? []).filter((account) => account.provider === browsing)
+    : [];
+  const browsingAccountId = browsing ? (accountIds[browsing] ?? null) : null;
   const items = useMemo(
     () => filterModels(entry?.models, search),
     [entry?.models, search],
@@ -312,6 +385,7 @@ export function ModelPickerSheet({
     void Haptics.selectionAsync();
     onApply({
       provider: browsing,
+      accountId: supportsMultipleAccounts(browsing) ? browsingAccountId : null,
       model: next.id,
       reasoningEffort: next.default_reasoning_effort ?? null,
       serviceTier: next.default_service_tier ?? null,
@@ -372,6 +446,15 @@ export function ModelPickerSheet({
               </Text>
             </Pressable>
             <ModelSearchField onChangeText={setSearch} value={search} />
+            {browsing && browsingAccounts.length > 0 && (
+              <AccountPills
+                accounts={browsingAccounts}
+                activeId={browsingAccountId}
+                onSelect={(nextId) => {
+                  setAccountByProvider((current) => ({ ...current, [browsing]: nextId }));
+                }}
+              />
+            )}
             {entry?.isPending ? (
               <View style={[styles.loading, { height: listHeight }]}>
                 <ActivityIndicator color={theme.textTertiary} />
@@ -379,6 +462,7 @@ export function ModelPickerSheet({
             ) : (
               <BottomSheetFlatList
                 data={items}
+                extraData={`${browsing ?? ''}:${browsingAccountId ?? ''}:${model ?? ''}`}
                 initialNumToRender={14}
                 keyExtractor={(item) => item.id}
                 keyboardShouldPersistTaps="handled"
@@ -388,6 +472,7 @@ export function ModelPickerSheet({
                     label={item.name}
                     onPress={() => pickModel(item)}
                     selected={provider === browsing &&
+                      browsingAccountId === initialSessionAccountId &&
                       (model === item.id || (!model && item.id === preferredModelId))}
                   />
                 )}
@@ -508,6 +593,57 @@ export function AccessSheet({
   );
 }
 
+function AccountPills({
+  accounts,
+  activeId,
+  onSelect,
+}: {
+  accounts: ProviderAccount[];
+  activeId: string | null;
+  onSelect: (id: string | null) => void;
+}) {
+  const theme = useTheme();
+  return (
+    <ScrollView
+      horizontal
+      keyboardShouldPersistTaps="handled"
+      showsHorizontalScrollIndicator={false}
+      style={styles.accountRow}
+      contentContainerStyle={styles.accountRowContent}>
+      {[{ id: null, label: 'Default' }, ...accounts].map((account) => {
+        const selected = activeId === account.id;
+        return (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ selected }}
+            key={account.id ?? 'default'}
+            onPress={() => {
+              void Haptics.selectionAsync();
+              onSelect(account.id);
+            }}
+            style={({ pressed }) => [
+              styles.accountPill,
+              {
+                backgroundColor: selected ? theme.backgroundSelected : theme.surfaceMuted,
+                borderColor: selected ? theme.borderStrong : 'transparent',
+                opacity: pressed ? 0.7 : 1,
+              },
+            ]}>
+            <Text
+              numberOfLines={1}
+              style={[
+                styles.accountPillLabel,
+                { color: selected ? theme.text : theme.textSecondary },
+              ]}>
+              {account.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+}
+
 function optionDescription(description: string | null | undefined, isDefault: boolean) {
   if (description && isDefault) return `Default · ${description}`;
   return description ?? (isDefault ? 'Default' : undefined);
@@ -546,4 +682,14 @@ const styles = StyleSheet.create({
     marginHorizontal: 12,
     marginTop: 14,
   },
+  accountRow: { flexGrow: 0, marginBottom: 8 },
+  accountRowContent: { gap: 6, paddingHorizontal: 4 },
+  accountPill: {
+    borderRadius: Radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    minHeight: 30,
+    justifyContent: 'center',
+    paddingHorizontal: 11,
+  },
+  accountPillLabel: { fontSize: 12.5, fontWeight: '500' },
 });

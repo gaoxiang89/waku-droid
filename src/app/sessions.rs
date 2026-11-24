@@ -364,6 +364,7 @@ impl Waku {
                             waku.reset_visible_state();
                             waku.reset_transcript_rows(waku.transcript_row_count());
                             waku.refresh_composer_sources(cx);
+                            waku.refresh_selected_antigravity_swarm_if_relevant(cx);
                         }
                     }
                     Err(error) => {

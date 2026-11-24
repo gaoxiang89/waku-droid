@@ -10,4 +10,4 @@ export type AntigravitySwarmMember = { name: string, conversationId: string, mod
  * System observer roles (e.g., `narrator`, `monitor`) excluded from
  * task-worker counts and status summaries.
  */
-isRoleWorker: boolean, wakeMode: string, status: AntigravitySwarmMemberStatus, killed: boolean, lastReadSeq: number, unread: number, posts: number, steps: number, activity?: string | null, activityKind?: string | null, failure?: AntigravitySwarmFailure | null, transcriptMtimeMs?: number | null, };
+isRoleWorker: boolean, wakeMode: string, status: AntigravitySwarmMemberStatus, killed: boolean, lastReadSeq: number, unread: number, posts: number, steps: number, activity?: string | null, activityKind?: string | null, failure?: AntigravitySwarmFailure | null, transcriptMtimeMs?: number | null, hasPostedDone: boolean, task?: string | null, };

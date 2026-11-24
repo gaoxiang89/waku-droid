@@ -1,13 +1,18 @@
 import { useQueryClient } from '@tanstack/react-query';
-import type {
-  AgentSession,
-  GoalOperation,
-  MessageAttachment,
-  PendingPermission,
-  PendingUserInput,
-  ProviderKind,
-  SequencedEvent,
-  UserInputAnswer,
+import {
+  providerProbeConfigKey,
+  resolveProviderExecutionConfig,
+  validatedAccountId,
+  type AgentSession,
+  type DaemonSettings,
+  type GoalOperation,
+  type MessageAttachment,
+  type PendingPermission,
+  type PendingUserInput,
+  type PlanUsage,
+  type ProviderKind,
+  type SequencedEvent,
+  type UserInputAnswer,
 } from '@waku/client';
 import { reduceRuntimeEvent } from '@waku/client/event-reducer';
 import { writeProviderProbeCache } from '@waku/client/provider-probe-cache';
@@ -32,7 +37,6 @@ import {
   persistSession,
   probeProvider,
   removeDaemonSession,
-  resolveProviderAccount,
   type TaskState,
 } from './daemon-api';
 import { persistentStorageSync } from './composer-preferences-store';
@@ -351,6 +355,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         entry.lastDriverError = null;
       } else if (event.event.kind === 'error' && typeof event.event.payload === 'string') {
         entry.lastDriverError = event.event.payload;
+      } else if (event.event.kind === 'planUsageUpdated') {
+        const cachedSettings = queryClient.getQueryData<DaemonSettings>(daemonKeys.settings(profileId));
+        const accountId = cachedSettings
+          ? validatedAccountId(cachedSettings, state.current.provider, state.current.account_id)
+          : (state.current.account_id ?? null);
+        queryClient.setQueryData<PlanUsage>(
+          daemonKeys.planUsage(profileId, state.current.provider, accountId),
+          event.event.payload as PlanUsage,
+        );
       }
       if (event.event.kind === 'steerAccepted') {
         const payload = event.event.payload as { message?: string };
@@ -568,13 +581,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         current = await persistOrdered(current);
       }
       const settings = await loadDaemonSettings(client);
-      const account = resolveProviderAccount(settings, current.provider, current.account_id);
-      const binaryOverride = account?.binaryOverride?.trim()
-        || settings.provider_binary_overrides?.[current.provider]
-        || null;
-      const configDir = account?.configDir ?? null;
+      const resolved = resolveProviderExecutionConfig(
+        settings,
+        current.provider,
+        current.account_id,
+      );
+      const configDir = resolved.configDir;
+      const probeCacheKey = providerProbeConfigKey(resolved.binaryOverride, configDir);
       const probe = await probeProvider(client, current.provider, settings, {
-        accountId: current.account_id ?? null,
+        accountId: resolved.accountId,
         configDir,
       });
       if (!probe.installed || !probe.path) {
@@ -585,8 +600,10 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           persistentStorageSync(),
           daemon.activeProfile.address,
           current.provider,
-          binaryOverride,
+          probeCacheKey,
           probe,
+          undefined,
+          resolved.accountId,
         );
       }
       startup = { binary: probe.path, cwd: sessionCwd(current, project), configDir };
@@ -731,10 +748,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       const project = state.projects.find((item) => item.id === current.project_id);
       if (!project) throw new Error('This task’s project is no longer available on the daemon');
       const settings = await loadDaemonSettings(client);
-      const account = resolveProviderAccount(settings, current.provider, current.account_id);
-      const configDir = account?.configDir ?? null;
+      const resolved = resolveProviderExecutionConfig(
+        settings,
+        current.provider,
+        current.account_id,
+      );
+      const configDir = resolved.configDir;
       const probe = await probeProvider(client, current.provider, settings, {
-        accountId: current.account_id ?? null,
+        accountId: resolved.accountId,
         configDir,
       });
       if (!probe.installed || !probe.path) throw new Error('Codex is not installed on the daemon host');
@@ -840,7 +861,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     cacheSession(next);
     try {
       const runtime = entries.current.get(sessionId);
-      if (runtime && !runtime.starting) {
+      const requiresRuntimeReset = Boolean(
+        runtime
+          && (current.provider !== next.provider
+            || (current.account_id ?? null) !== (next.account_id ?? null)
+            || (current.agent_preset ?? null) !== (next.agent_preset ?? null)),
+      );
+      if (runtime && requiresRuntimeReset) {
+        if (!runtime.starting) {
+          await client.request({ type: 'closeSession' }, sessionId, runtime.runtimeId);
+        }
+        removeRuntime(sessionId);
+      } else if (runtime && !runtime.starting) {
         const response = await client.request({
           type: 'applyOptions',
           options: {

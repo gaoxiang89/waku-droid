@@ -145,6 +145,49 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+fn strip_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+fn normalized_comparable_path(path: &Path) -> PathBuf {
+    let target = strip_windows_verbatim_path(
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    );
+    let mut normalized = PathBuf::new();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+fn paths_match_normalized(left: &Path, right: &Path) -> bool {
+    let left = normalized_comparable_path(left);
+    let right = normalized_comparable_path(right);
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 /// Lists every session exposed by an ACP agent. An empty `cwd_filters` list
 /// requests the provider's global catalog; providers such as Kimi that require
 /// a cwd pass their native workspace index here instead.
@@ -170,9 +213,10 @@ pub fn list_provider_sessions_in(
     }
     let catalog_cwd = catalog_working_directory()?;
     let agent = crate::driver::acp::catalog_agent_in(provider, binary, &catalog_cwd, config_dir)?;
-    list_provider_sessions_with_agent(provider, agent, cwd_filters, limit)
+    list_provider_sessions_with_agent_in(provider, agent, cwd_filters, limit, Some(&catalog_cwd))
 }
 
+#[cfg(test)]
 fn list_provider_sessions_with_agent<C>(
     provider: ProviderKind,
     agent: C,
@@ -182,9 +226,23 @@ fn list_provider_sessions_with_agent<C>(
 where
     C: ConnectTo<Client> + 'static,
 {
+    list_provider_sessions_with_agent_in(provider, agent, cwd_filters, limit, None)
+}
+
+fn list_provider_sessions_with_agent_in<C>(
+    provider: ProviderKind,
+    agent: C,
+    cwd_filters: &[PathBuf],
+    limit: usize,
+    catalog_cwd: Option<&Path>,
+) -> anyhow::Result<Vec<ProviderSessionSummary>>
+where
+    C: ConnectTo<Client> + 'static,
+{
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let catalog_cwd = catalog_cwd.map(Path::to_path_buf);
     let filters = if cwd_filters.is_empty() {
         vec![None]
     } else {
@@ -231,6 +289,12 @@ where
                         let Some(cwd) = native_session_cwd(&session.cwd) else {
                             continue;
                         };
+                        if catalog_cwd
+                            .as_deref()
+                            .is_some_and(|catalog| paths_match_normalized(&cwd, catalog))
+                        {
+                            continue;
+                        }
                         if !seen.insert(session_id.clone()) {
                             continue;
                         }
@@ -1332,5 +1396,89 @@ mod tests {
         assert_eq!(history.messages.len(), 2);
         assert_eq!(history.messages[0].content, "delayed prompt");
         assert_eq!(history.messages[1].content, "delayed answer");
+    }
+
+    #[test]
+    fn list_provider_sessions_filters_ephemeral_catalog_working_directory() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, ListSessionsResponse, SessionCapabilities,
+            SessionInfo, SessionListCapabilities,
+        };
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "waku-acp-session-catalog-filter-{}",
+            Uuid::new_v4()
+        ));
+        let catalog_dir = temp_root.join("waku-provider-session-catalog-9999");
+        let real_workspace = temp_root.join("real-workspace");
+        std::fs::create_dir_all(&catalog_dir).unwrap();
+        std::fs::create_dir_all(&real_workspace).unwrap();
+
+        #[cfg(windows)]
+        let catalog_variants = {
+            let raw = catalog_dir.to_string_lossy().into_owned();
+            let lowercase = raw.to_ascii_lowercase();
+            let bytes = raw.as_bytes();
+            let url_form = if bytes.len() >= 3 && bytes[1] == b':' {
+                format!(
+                    "/{}%3A/{}",
+                    (bytes[0] as char).to_ascii_lowercase(),
+                    raw[3..].replace('\\', "/")
+                )
+            } else {
+                raw.replace('\\', "/")
+            };
+            vec![lowercase, url_form]
+        };
+        #[cfg(not(windows))]
+        let catalog_variants = vec![catalog_dir.to_string_lossy().into_owned()];
+
+        let real_workspace_str = real_workspace.to_string_lossy().into_owned();
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    let caps = AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().list(SessionListCapabilities::new()),
+                    );
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ListSessionsRequest, responder, _cx| {
+                    let mut entries: Vec<SessionInfo> = catalog_variants
+                        .iter()
+                        .enumerate()
+                        .map(|(index, cwd)| {
+                            SessionInfo::new(format!("projectless-{index}"), cwd.as_str())
+                                .title("Projectless session")
+                        })
+                        .collect();
+                    entries.push(
+                        SessionInfo::new("real-1", real_workspace_str.as_str())
+                            .title("Real workspace session"),
+                    );
+                    responder.respond(ListSessionsResponse::new(entries))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let sessions = list_provider_sessions_with_agent_in(
+            ProviderKind::Antigravity,
+            mock_agent,
+            &[],
+            10,
+            Some(&catalog_dir),
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cursor.native_id(), "real-1");
+        assert_eq!(sessions[0].cwd, real_workspace);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

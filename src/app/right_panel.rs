@@ -8,6 +8,7 @@ use gpui::{ClipboardEntry, KeyBinding, actions};
 use waku_protocol::lexical_path;
 
 use super::*;
+use crate::ui::ActivationExt as _;
 
 actions!(
     waku_right_panel,
@@ -3875,6 +3876,7 @@ impl Waku {
         self.right_panel_surfaces.remove(index);
         if closing_swarm {
             self.mark_antigravity_swarm_dismissed();
+            self.swarm_panel.clear_board_selection();
         }
         self.right_panel_active_surface = if self.right_panel_surfaces.is_empty() {
             None
@@ -4251,7 +4253,7 @@ impl Waku {
                 .render_right_panel_diff(width, window, cx)
                 .into_any_element(),
             Some(RightPanelSurface::GitGraph) => self.render_git_graph(width, cx),
-            Some(RightPanelSurface::Swarm) => self.render_swarm_panel(width, cx),
+            Some(RightPanelSurface::Swarm) => self.render_swarm_panel(width, window, cx),
             Some(RightPanelSurface::Terminal(terminal_id)) => {
                 let content_height = (f32::from(window.viewport_size().height)
                     - WINDOW_HEADER_HEIGHT
@@ -4665,20 +4667,32 @@ impl Waku {
                 || matches!(&surface, RightPanelSurface::Files)
                     && self.right_panel_files_selected_path.is_some();
             let activate_weak = cx.entity().downgrade();
+            let key_activate_weak = activate_weak.clone();
             let close_weak = cx.entity().downgrade();
+            let close_key_weak = close_weak.clone();
+            let tab_focus = self.transcript_control_focus(format!("right-panel-tab-{index}"), cx);
+            let close_focus =
+                self.transcript_control_focus(format!("close-right-panel-tab-{index}"), cx);
+            let surface_count = self.right_panel_surfaces.len();
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("right-panel-tab-{index}")))
+                    .track_focus(&tab_focus)
+                    .tab_index(0)
+                    .tab_stop(true)
                     .h(px(28.0))
                     .min_w(px(100.0))
                     .max_w(px(176.0))
                     .px(px(8.0))
                     .rounded(px(6.0))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
                     .cursor_default()
+                    .focus_visible(|style| style.border_color(theme.accent))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -4742,12 +4756,18 @@ impl Waku {
                     .child(
                         div()
                             .id(SharedString::from(format!("close-right-panel-tab-{index}")))
+                            .track_focus(&close_focus)
+                            .tab_index(0)
+                            .tab_stop(true)
                             .w(px(16.0))
                             .h(px(16.0))
                             .rounded(px(4.0))
+                            .border_1()
+                            .border_color(gpui::transparent_black())
                             .flex()
                             .items_center()
                             .justify_center()
+                            .focus_visible(|style| style.border_color(theme.accent))
                             .hover(|element| element.bg(theme.overlay_strong))
                             .child(icon("icons/x.svg", 10.0, theme.text_tertiary))
                             .on_click(move |_, _, cx| {
@@ -4755,6 +4775,16 @@ impl Waku {
                                 let _ = close_weak.update(cx, |this, cx| {
                                     this.close_right_panel_surface(index, cx);
                                 });
+                            })
+                            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                if !event.keystroke.modifiers.modified()
+                                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                {
+                                    cx.stop_propagation();
+                                    let _ = close_key_weak.update(cx, |this, cx| {
+                                        this.close_right_panel_surface(index, cx);
+                                    });
+                                }
                             }),
                     )
                     .on_click(move |_, _, cx| {
@@ -4765,10 +4795,52 @@ impl Waku {
                             if this.active_right_panel_surface() == Some(&RightPanelSurface::Swarm)
                             {
                                 this.refresh_selected_antigravity_swarm(cx);
+                            } else {
+                                this.swarm_panel.clear_board_selection();
                             }
                             this.sync_antigravity_swarm_polling(cx);
                             cx.notify();
                         });
+                    })
+                    .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.modified() || surface_count == 0 {
+                            return;
+                        }
+                        let target_idx = match event.keystroke.key.as_str() {
+                            "enter" | "space" => index,
+                            "left" => {
+                                if index == 0 {
+                                    surface_count - 1
+                                } else {
+                                    index - 1
+                                }
+                            }
+                            "right" => (index + 1) % surface_count,
+                            "home" => 0,
+                            "end" => surface_count - 1,
+                            _ => return,
+                        };
+                        let _ = key_activate_weak.update(cx, |this, cx| {
+                            this.right_panel_active_surface = Some(target_idx);
+                            this.reveal_right_panel_tab(target_idx);
+                            this.request_active_terminal_focus();
+                            if this.active_right_panel_surface() == Some(&RightPanelSurface::Swarm)
+                            {
+                                this.refresh_selected_antigravity_swarm(cx);
+                            } else {
+                                this.swarm_panel.clear_board_selection();
+                            }
+                            if target_idx != index {
+                                let focus = this.transcript_control_focus(
+                                    format!("right-panel-tab-{target_idx}"),
+                                    cx,
+                                );
+                                window.focus(&focus, cx);
+                            }
+                            this.sync_antigravity_swarm_polling(cx);
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
                     }),
             );
         }
@@ -5055,11 +5127,13 @@ impl Waku {
         let theme = Theme::current(cx);
         let icon_path = surface.icon_path();
         let label = surface.label();
+        let id_str = format!("right-panel-card-{}", label.to_lowercase());
+        let focus = self.transcript_control_focus(id_str.clone(), cx);
         div()
-            .id(SharedString::from(format!(
-                "right-panel-card-{}",
-                label.to_lowercase()
-            )))
+            .id(SharedString::from(id_str))
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(true)
             .h(px(112.0))
             .flex_1()
             .min_w_0()
@@ -5072,6 +5146,7 @@ impl Waku {
             .flex_col()
             .items_start()
             .cursor_default()
+            .focus_visible(|style| style.border_color(theme.accent))
             .hover(|element| element.bg(theme.raised).border_color(theme.text_ghost))
             .active(|element| element.bg(theme.overlay_strong))
             .child(icon(icon_path, 18.0, theme.text_secondary))
@@ -5094,9 +5169,9 @@ impl Waku {
                     .text_overflow(gpui::TextOverflow::Truncate("...".into()))
                     .child(description),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_activation(cx, move |this, _, cx| {
                 this.open_right_panel_surface(surface.clone(), cx);
-            }))
+            })
     }
 
     fn render_right_panel_files(

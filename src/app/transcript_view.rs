@@ -485,11 +485,16 @@ impl Waku {
             .or_else(|| self.toast_selection.selection.borrow().selected_text())
             .or_else(|| self.skills_selection.selection.borrow().selected_text())
             .or_else(|| {
-                self.swarm_panel
-                    .board_selection
-                    .selection
-                    .borrow()
-                    .selected_text()
+                (self.is_swarm_surface_visible()
+                    && self.swarm_panel.active_tab == super::swarm_panel::SwarmPanelTab::Board)
+                    .then(|| {
+                        self.swarm_panel
+                            .board_selection
+                            .selection
+                            .borrow()
+                            .selected_text()
+                    })
+                    .flatten()
             })
             .or_else(|| self.transcript_selection.selection.borrow().selected_text());
         match selected {

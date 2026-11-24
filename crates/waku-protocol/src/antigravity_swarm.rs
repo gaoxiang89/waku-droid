@@ -18,8 +18,22 @@ pub enum AntigravitySwarmMemberStatus {
     Working,
     #[default]
     Waiting,
+    Stopped,
     Killed,
     Failed,
+}
+
+/// Screenshot captured for a swarm board message or overview timeline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravitySwarmScreenshot {
+    pub path: String,
+    #[serde(default)]
+    pub caption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Classification of a member's latest failure step.
@@ -65,6 +79,10 @@ pub struct AntigravitySwarmMember {
     pub failure: Option<AntigravitySwarmFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_mtime_ms: Option<u64>,
+    #[serde(default)]
+    pub has_posted_done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 /// One message entry from `board.jsonl`.
@@ -83,6 +101,10 @@ pub struct AntigravitySwarmMessage {
     pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    #[serde(default)]
+    pub channel_mentions: Vec<String>,
+    #[serde(default)]
+    pub screenshots: Vec<AntigravitySwarmScreenshot>,
 }
 
 /// Optional phase progress reported by the narrator's `view.json`.
@@ -152,6 +174,12 @@ pub struct AntigravitySwarmOverview {
     pub risks: Vec<AntigravitySwarmViewItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback_ack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_line: Option<String>,
+    #[serde(default)]
+    pub screenshots: Vec<AntigravitySwarmScreenshot>,
 }
 
 /// Complete read-only snapshot of an Antigravity native swarm.
@@ -177,6 +205,12 @@ pub struct AntigravitySwarmSnapshot {
     /// Change token computed from on-disk metadata so clients can skip
     /// redundant list resets when polls observe identical state.
     pub fingerprint: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_fingerprint: Option<String>,
 }
 
 #[cfg(test)]
@@ -211,6 +245,8 @@ mod tests {
                     activity_kind: None,
                     failure: None,
                     transcript_mtime_ms: Some(1_763_882_700_000),
+                    has_posted_done: false,
+                    task: Some("Coordinate all tracks".to_owned()),
                 },
                 AntigravitySwarmMember {
                     name: "swarm-ui".to_owned(),
@@ -232,6 +268,8 @@ mod tests {
                         message: "RESOURCE_EXHAUSTED".to_owned(),
                     }),
                     transcript_mtime_ms: Some(1_763_882_705_000),
+                    has_posted_done: true,
+                    task: Some("Build swarm panel".to_owned()),
                 },
             ],
             messages: vec![AntigravitySwarmMessage {
@@ -243,6 +281,13 @@ mod tests {
                 mentions_all: false,
                 kind: None,
                 channel: None,
+                channel_mentions: vec!["design".to_owned()],
+                screenshots: vec![AntigravitySwarmScreenshot {
+                    path: "/tmp/brain/worker-1/shot.png".to_owned(),
+                    caption: "Swarm panel ready".to_owned(),
+                    seq: Some(12),
+                    agent: Some("swarm-ui".to_owned()),
+                }],
             }],
             overview: Some(AntigravitySwarmOverview {
                 as_of_seq: 12,
@@ -277,6 +322,14 @@ mod tests {
                     text: "Quota ceiling".to_owned(),
                 }],
                 feedback_ack: Some("Acknowledged #8".to_owned()),
+                source: Some("plan".to_owned()),
+                goal_line: Some("Deliver board, overview, and screenshot reel.".to_owned()),
+                screenshots: vec![AntigravitySwarmScreenshot {
+                    path: "/tmp/brain/worker-1/shot.png".to_owned(),
+                    caption: "Swarm panel ready".to_owned(),
+                    seq: Some(12),
+                    agent: Some("swarm-ui".to_owned()),
+                }],
             }),
             system_attention: vec![AntigravitySwarmAttentionItem {
                 id: "sys-swarm-ui-quota".to_owned(),
@@ -287,6 +340,9 @@ mod tests {
                 member: Some("swarm-ui".to_owned()),
             }],
             fingerprint: "fp-12".to_owned(),
+            channels: vec!["main".to_owned(), "design".to_owned()],
+            board_fingerprint: Some("bfp-12".to_owned()),
+            roster_fingerprint: Some("rfp-12".to_owned()),
         };
 
         let op = WorkspaceOperation::ReadAntigravitySwarm {
@@ -316,5 +372,53 @@ mod tests {
             } => assert_eq!(decoded, snapshot),
             other => panic!("unexpected workspace result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_swarm_snapshot_json_deserializes_with_defaults_and_stopped_status() {
+        let raw = serde_json::json!({
+            "swarmId": "s-1",
+            "title": "Legacy",
+            "headSeq": 1,
+            "totalMessages": 1,
+            "members": [{
+                "name": "worker-1",
+                "conversationId": "c-1",
+                "model": "gemini-4-neon",
+                "role": "worker",
+                "wakeMode": "mentions",
+                "status": "stopped",
+                "killed": false,
+                "lastReadSeq": 0,
+                "unread": 1,
+                "posts": 0,
+                "steps": 0
+            }],
+            "messages": [{
+                "seq": 1,
+                "agent": "coordinator",
+                "text": "hi",
+                "time": "2026-11-24T12:00:00Z"
+            }],
+            "overview": {
+                "asOfSeq": 1,
+                "headline": "Legacy overview"
+            },
+            "fingerprint": "fp-1"
+        });
+        let decoded: AntigravitySwarmSnapshot =
+            serde_json::from_value(raw).expect("legacy payload should deserialize");
+        assert_eq!(decoded.members[0].status, AntigravitySwarmMemberStatus::Stopped);
+        assert!(!decoded.members[0].has_posted_done);
+        assert_eq!(decoded.members[0].task, None);
+        assert!(decoded.messages[0].channel_mentions.is_empty());
+        assert!(decoded.messages[0].screenshots.is_empty());
+        assert!(decoded.channels.is_empty());
+        assert_eq!(decoded.board_fingerprint, None);
+        assert_eq!(decoded.roster_fingerprint, None);
+        let ov = decoded.overview.unwrap();
+        assert_eq!(ov.source, None);
+        assert_eq!(ov.goal_line, None);
+        assert!(ov.screenshots.is_empty());
     }
 }

@@ -12,6 +12,7 @@ export interface RememberedModelTraits {
 
 export interface ComposerPreferences {
   lastProvider: ProviderKind
+  lastAccountId?: string | null
   lastModel: string | null
   lastReasoningEffort: string | null
   lastServiceTier: string | null
@@ -21,6 +22,7 @@ export interface ComposerPreferences {
 
 const DEFAULT_PREFERENCES: ComposerPreferences = {
   lastProvider: 'codex',
+  lastAccountId: null,
   lastModel: null,
   lastReasoningEffort: null,
   lastServiceTier: null,
@@ -91,7 +93,7 @@ export function rememberComposerSession(
   preferences: ComposerPreferences,
   session: Pick<
     AgentSession,
-    'provider' | 'model' | 'reasoning_effort' | 'service_tier' | 'context_window'
+    'provider' | 'account_id' | 'model' | 'reasoning_effort' | 'service_tier' | 'context_window'
   >,
 ): ComposerPreferences {
   if (!session.model) return preferences
@@ -101,6 +103,7 @@ export function rememberComposerSession(
   return {
     ...preferences,
     lastProvider: session.provider,
+    lastAccountId: session.account_id ?? null,
     lastModel: session.model,
     lastReasoningEffort: reasoningEffort,
     lastServiceTier: serviceTier,
@@ -162,6 +165,7 @@ function parsePreferences(value: unknown): ComposerPreferences {
   }
   return {
     lastProvider,
+    lastAccountId: nullableString(value.lastAccountId) ?? null,
     lastModel: nullableString(value.lastModel) ?? null,
     lastReasoningEffort: nullableString(value.lastReasoningEffort) ?? null,
     lastServiceTier: nullableString(value.lastServiceTier) ?? null,

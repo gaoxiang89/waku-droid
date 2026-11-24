@@ -1,4 +1,12 @@
-import type { AgentSession, ProviderKind, ProviderModel, ProviderProbe } from '@waku/client'
+import {
+  resolveProviderAccount,
+  supportsMultipleAccounts,
+  validatedAccountId,
+  type AgentSession,
+  type ProviderKind,
+  type ProviderModel,
+  type ProviderProbe,
+} from '@waku/client'
 import { Popover } from '@base-ui/react/popover'
 import { useEffect, useRef, useState, type RefObject } from 'react'
 import { ProviderIcon, PROVIDERS, providerMeta, WakuIcon } from '@/components/waku-icon'
@@ -24,13 +32,14 @@ export function ModelPicker({
   currentProbe?: ProviderProbe
   openSignal?: number
   onOpenSignalHandled?: () => void
-  onChange: (provider: ProviderKind, model: ProviderModel) => void
+  onChange: (provider: ProviderKind, model: ProviderModel, accountId: string | null) => void
   returnFocus?: RefObject<HTMLElement | null>
 }) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [tab, setTab] = useState<PickerTab>(session.provider)
+  const [accountByProvider, setAccountByProvider] = useState<Partial<Record<ProviderKind, string | null>>>({})
   const [highlight, setHighlight] = useState<number | null>(null)
   const [favorites, setFavorites] = useState<string[]>(() => {
     if (typeof window === 'undefined') return []
@@ -40,13 +49,28 @@ export function ModelPicker({
   const search = useRef<HTMLInputElement>(null)
   const list = useRef<HTMLDivElement>(null)
   const settings = useDaemonSettings()
-  const probes = useProviderProbes(open)
+  const sessionAccountId = settings.data
+    ? validatedAccountId(settings.data, session.provider, session.account_id)
+    : (supportsMultipleAccounts(session.provider) ? (session.account_id ?? null) : null)
+  const accountIds = Object.fromEntries(
+    PROVIDERS.map(({ id }) => {
+      if (!supportsMultipleAccounts(id)) return [id, null]
+      const raw = accountByProvider[id] !== undefined
+        ? accountByProvider[id]
+        : (id === session.provider ? sessionAccountId : null)
+      const resolved = settings.data ? validatedAccountId(settings.data, id, raw) : (raw ?? null)
+      return [id, resolved]
+    }),
+  ) as Partial<Record<ProviderKind, string | null>>
+  const probes = useProviderProbes(open, accountIds)
   const lockedProvider = session.messages.length ? session.provider : null
   const currentModel = currentProbe?.models.find((model) => model.id === session.model)
     ?? currentProbe?.models.find((model) => model.is_default)
     ?? currentProbe?.models[0]
   const selectedModelId = session.model ?? currentModel?.id
   const selectedName = currentModel?.name ?? session.model ?? providerMeta(session.provider).shortName
+  const sessionAccount = resolveProviderAccount(settings.data, session.provider, session.account_id)
+  const triggerLabel = sessionAccount ? `${selectedName} · ${sessionAccount.label}` : selectedName
 
   useEffect(() => {
     if (!openSignal) return
@@ -58,13 +82,24 @@ export function ModelPicker({
     if (!open) return
     setQuery('')
     setTab(session.provider)
+    setAccountByProvider(
+      supportsMultipleAccounts(session.provider)
+        ? { [session.provider]: sessionAccountId }
+        : {},
+    )
     setHighlight(null)
-  }, [open, session.provider])
+  }, [open, session.provider, sessionAccountId])
 
   const probeMap = ({
     ...(probes.data ?? {}),
-    ...(currentProbe ? { [session.provider]: currentProbe } : {}),
+    ...(currentProbe && accountIds[session.provider] === sessionAccountId
+      ? { [session.provider]: currentProbe }
+      : {}),
   }) as Partial<Record<ProviderKind, ProviderProbe>>
+  const tabAccounts = tab !== 'favorites' && supportsMultipleAccounts(tab)
+    ? (settings.data?.provider_accounts ?? []).filter((account) => account.provider === tab)
+    : []
+  const activeTabAccountId = tab !== 'favorites' ? (accountIds[tab] ?? null) : null
 
   const usable = PROVIDERS.filter(({ id }) => {
     if (lockedProvider && id !== lockedProvider) return false
@@ -85,7 +120,7 @@ export function ModelPicker({
   const selectedIndex = selectedModelPickerIndex(
     rows,
     session.provider,
-    selectedModelId,
+    accountIds[session.provider] === sessionAccountId ? selectedModelId : undefined,
   )
 
   useEffect(() => {
@@ -111,7 +146,7 @@ export function ModelPicker({
   function choose(index: number) {
     const row = rows[index]
     if (!row) return
-    onChange(row.provider, row.model)
+    onChange(row.provider, row.model, accountIds[row.provider] ?? null)
     setOpen(false)
   }
 
@@ -135,7 +170,7 @@ export function ModelPicker({
         disabled={session.status !== 'idle'}
       >
         <ProviderIcon className="size-[10.5px]" provider={session.provider} />
-        <span className="truncate">{selectedName}</span>
+        <span className="truncate">{triggerLabel}</span>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Positioner
@@ -213,6 +248,32 @@ export function ModelPicker({
                 />
               </label>
             </div>
+            {!query.trim() && tab !== 'favorites' && tabAccounts.length > 0 && (
+              <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b px-3 pb-2">
+                {[{ id: null, label: t('providers.default_account') }, ...tabAccounts].map((account) => {
+                  const selectedAccount = activeTabAccountId === account.id
+                  return (
+                    <button
+                      aria-pressed={selectedAccount}
+                      className={cn(
+                        'shrink-0 rounded-full border px-2 py-0.5 text-[10.5px] outline-none transition-colors focus-visible:ring-1 focus-visible:ring-ring',
+                        selectedAccount
+                          ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                          : 'border-transparent bg-[var(--raised)] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]',
+                      )}
+                      key={account.id ?? 'default'}
+                      type="button"
+                      onClick={() => {
+                        setAccountByProvider((current) => ({ ...current, [tab]: account.id }))
+                        setHighlight(null)
+                      }}
+                    >
+                      {account.label}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
             <div className="min-h-0 flex-1 overflow-y-auto p-[9px]" ref={list}>
               {!rows.length && (
                 <div className="grid h-full place-items-center px-4 text-center text-[11.5px] text-[var(--text-ghost)]">
@@ -228,7 +289,9 @@ export function ModelPicker({
                 </div>
               )}
               {rows.map((row, index) => {
-                const selected = row.provider === session.provider && row.model.id === selectedModelId
+                const selected = row.provider === session.provider
+                  && accountIds[row.provider] === sessionAccountId
+                  && row.model.id === selectedModelId
                 const favorite = favorites.includes(`${row.provider}:${row.model.id}`)
                 return (
                   <div

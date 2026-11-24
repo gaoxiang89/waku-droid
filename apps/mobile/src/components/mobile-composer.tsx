@@ -180,11 +180,13 @@ export function SendButton({
 export function MobileComposer({
   session,
   onSubmitted,
+  onOpenModelPicker,
 }: {
   session: AgentSession;
   /** Fires as the submission begins — before the runtime round-trip — so the
    * transcript can pin to the tail the moment the message lands. */
   onSubmitted?: () => void;
+  onOpenModelPicker?: () => void;
 }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
@@ -196,7 +198,7 @@ export function MobileComposer({
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [traitsSheetOpen, setTraitsSheetOpen] = useState(false);
-  const modelProbe = useProviderModels(session.provider);
+  const modelProbe = useProviderModels(session.provider, session.account_id ?? null);
   const models = modelProbe.data?.models ?? [];
   const activeModel = session.model
     ? models.find((item) => item.id === session.model)
@@ -242,17 +244,32 @@ export function MobileComposer({
       setDraft(value);
     },
     provider: session.provider,
+    accountId: session.account_id ?? null,
     root: project ? sessionCwd(session, project) : null,
     reported: session.available_commands,
     contextKey: session.id,
   });
   const localCommands = useComposerLocalCommands({
     provider: session.provider,
+    accountId: session.account_id ?? null,
+    models,
     model: activeModel,
+    providerVersion: modelProbe.data?.version ?? null,
+    reasoningEffort: session.reasoning_effort ?? null,
     serviceTier: session.service_tier,
     runtimeMode: session.runtime_mode,
     goal: session.thread_goal,
+    canSwitchModel: session.status === 'idle',
     contextKey: session.id,
+    onOpenModelPicker,
+    onSelectModel: (nextModel) => runtime.updateSessionOptions(session.id, {
+      model: nextModel.id,
+      reasoningEffort: nextModel.default_reasoning_effort ?? null,
+      serviceTier: nextModel.default_service_tier ?? null,
+      contextWindow: nextModel.default_context_window ?? null,
+    }),
+    onReasoningEffort: (reasoningEffort) =>
+      runtime.updateSessionOptions(session.id, { reasoningEffort }),
     onServiceTier: (serviceTier) => runtime.updateSessionOptions(session.id, { serviceTier }),
     onGoal: (operation) => runtime.sendGoalOperation(session, operation),
     onClear: () => {

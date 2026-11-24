@@ -66,6 +66,7 @@ command_palette.hide_bottom_panel: 隐藏底部面板
 command_palette.new_terminal: 新建终端
 command_palette.toggle_files: 切换文件面板
 command_palette.toggle_git_graph: 切换 Git Graph 面板
+command_palette.toggle_swarm: 切换 Swarm 面板
 command_palette.current: 当前
 command_palette.you: 你
 command_palette.agent: 智能体
@@ -91,8 +92,8 @@ settings.general_keywords: 通用 本地 项目 对话 隐私 匿名 使用数�
 settings.appearance_keywords: 外观 主题 系统 浅色 深色 语言 英语 中文 简体 字号 字体 大小 编辑器
 settings.providers_keywords: 服务商 智能体 模型 命令行 版本 安装 检测 antigravity agy gemini claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills: 技能
-settings.skills_keywords: 技能 技能库 智能体 禁用 启用 删除 claude codex cursor opencode pi amp 共享
-settings.usage_keywords: 用量 令牌 费用 支出 缓存 每日 图表 模型 明细 历史 claude codex
+settings.skills_keywords: 技能 技能库 智能体 禁用 启用 删除 antigravity agy gemini claude codex cursor opencode pi amp 共享
+settings.usage_keywords: 用量 令牌 费用 支出 缓存 每日 图表 模型 明细 历史 antigravity agy gemini claude codex
 settings.daemon_keywords: 守护进程 服务 远程 网页 网络 暴露 来源 令牌 端口 websocket
 settings.computer_use_keywords: 电脑操作 屏幕录制 辅助功能 应用 控制 codex
 settings.back: 返回
@@ -198,6 +199,7 @@ settings.automatic_updates_description: 在后台检查新版本，并在发现�
 settings.check_for_updates: 检查更新
 settings.check_for_updates_description: 检查 GitHub Releases 获取 Waku 的最新版本
 settings.about: 关于
+settings.about_provenance: 社区版，基于 egoist/waku，GPL-3.0
 settings.about_local_daemon: 本机守护进程
 settings.about_host_daemon: "%{host} 上的守护进程"
 settings.share_anonymous_usage_data: 分享匿名使用数据
@@ -496,6 +498,7 @@ mode.full_access: 完全访问
 mode.supervised_description: 执行命令或修改文件前先征求许可
 mode.auto_accept_edits_description: 自动批准文件修改，执行其他操作前先询问
 mode.auto_description: 由 AI 审核并批准常规操作；高风险操作仍会询问
+mode.auto_description_antigravity: 由 Antigravity 自动批准常规操作；高风险操作仍会询问
 mode.auto_description_droid: 自动批准常规本地开发操作；高风险或外部操作仍会询问
 mode.full_access_description: 无需确认即可执行命令和修改文件
 agent_preset.standard: 标准模式
@@ -1267,7 +1270,7 @@ usage.model_many: "%{count} 个模型"
 usage.active_day_one: "%{count} 个活跃日"
 usage.active_day_many: "%{count} 个活跃日"
 usage.filter_projects: 筛选项目…
-usage.chart_description: Claude Code 与 Codex 的每日%{metric}分布。
+usage.chart_description: Claude Code、Codex 与 Antigravity 的每日%{metric}分布。
 usage.refresh_failed: "用量刷新失败：%{error}"
 usage.context_used: 上下文窗口已使用 %{percent}%（%{shortcut}）
 usage.shortcut: 用量（%{shortcut}）
@@ -1401,11 +1404,14 @@ swarm.show_killed: "显示已结束（%{count}）"
 swarm.hide_killed: "隐藏已结束（%{count}）"
 swarm.status_working: 运行中
 swarm.status_waiting: 等待中
+swarm.status_stopped: 已停止
 swarm.status_failed: 失败
 swarm.status_killed: 已结束
 swarm.you: 当前
+swarm.done_badge: 已完成
 swarm.active_count: "%{count} 运行中"
 swarm.waiting_count: "%{count} 等待中"
+swarm.stopped_count: "%{count} 已停止"
 swarm.failed_count: "%{count} 失败"
 swarm.posts_count: "%{count} 条消息"
 swarm.steps_count: "%{count} 步"
@@ -1451,6 +1457,41 @@ swarm.replay_next: 下一条消息
 swarm.view_in_board: 在看板中查看
 swarm.hive_empty: 等待成员加入蜂巢
 swarm.hive_mentions_empty: 看板上还没有 @ 提及记录
+swarm.stale_error_banner: "刷新失败（显示缓存看板）：%{error}"
+swarm.retrying: 正在重试…
+swarm.more_attention: "还有 %{count} 项"
+swarm.all_channels: 全部频道
+swarm.board_no_posts_truncated: 当前保留窗口内暂无消息
+swarm.plan_overview: 计划总览
+swarm.section_threads: 任务分支
+swarm.section_screenshots: 截图
+swarm.role_coordinator: 协调者
+swarm.role_worker: 成员
+swarm.role_narrator: 解说员
+swarm.role_monitor: 监控员
+swarm.role_verifier: 验证者
+swarm.role_investigator: 调查员
+swarm.attention_decision: 待决策
+swarm.attention_failure: 失败
+swarm.attention_review: 待审查
+swarm.attention_stuck: 卡住
+swarm.attention_quota: 配额
+swarm.attention_error: 错误
+swarm.attention_fyi: 提示
+swarm.state_active: 进行中
+swarm.state_blocked: 已阻塞
+swarm.state_review: 审查中
+swarm.state_done: 已完成
+swarm.state_failed: 失败
+swarm.state_queued: 排队中
+swarm.activity_waiting_posts: 正在等待新消息
+swarm.activity_reading_board: 正在读取看板
+swarm.activity_posting_board: 正在发送看板消息
+swarm.activity_read_file: "正在读取 %{target}"
+swarm.activity_write_file: "正在写入 %{target}"
+swarm.activity_edit_file: "正在编辑 %{target}"
+swarm.activity_search: "正在搜索 %{target}"
+swarm.hive_scrubber: 回放时间线
 usage.credits_remaining: "%{count} 积分"
 usage_error.start_antigravity_probe: "无法启动 `agy` 用量探测"
 usage_error.antigravity_usage_timeout: Antigravity 用量查询超时

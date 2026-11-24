@@ -135,6 +135,53 @@ async fn await_acp_request<T>(
     .await
 }
 
+enum StartupOutcome<T> {
+    Ready(T),
+    Shutdown,
+}
+
+async fn wait_for_startup_shutdown(
+    commands: &smol::channel::Receiver<CommandMessage>,
+    buffered_commands: &Mutex<std::collections::VecDeque<CommandMessage>>,
+) {
+    loop {
+        match commands.recv().await {
+            Ok(CommandMessage::Shutdown) | Err(_) => return,
+            Ok(other) => buffered_commands.lock().push_back(other),
+        }
+    }
+}
+
+async fn race_startup_with_shutdown<T>(
+    commands: &smol::channel::Receiver<CommandMessage>,
+    buffered_commands: &Mutex<std::collections::VecDeque<CommandMessage>>,
+    startup: impl std::future::Future<Output = agent_client_protocol::Result<T>>,
+) -> agent_client_protocol::Result<StartupOutcome<T>> {
+    smol::future::or(
+        async move { startup.await.map(StartupOutcome::Ready) },
+        async move {
+            wait_for_startup_shutdown(commands, buffered_commands).await;
+            Ok(StartupOutcome::Shutdown)
+        },
+    )
+    .await
+}
+
+fn connected_provider_cursor(
+    provider: ProviderKind,
+    native_session_id: String,
+    fork_context: Option<String>,
+) -> ProviderResumeCursor {
+    if provider == ProviderKind::Antigravity {
+        ProviderResumeCursor::Antigravity {
+            session_id: native_session_id,
+            fork_context,
+        }
+    } else {
+        ProviderResumeCursor::from_session_id(provider, native_session_id)
+    }
+}
+
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
     supports_steer: bool,
@@ -353,6 +400,8 @@ impl AcpDriver {
 pub(crate) struct ProviderAgent {
     agent: AcpAgent,
     #[cfg_attr(not(windows), allow(dead_code))]
+    cwd: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
     stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
@@ -365,6 +414,73 @@ fn record_stderr_line(lines: &Mutex<Vec<String>>, line: &str) {
         lines.remove(0);
     }
     lines.push(line.to_owned());
+}
+
+async fn drain_lossy_stderr_lines<R: smol::io::AsyncRead + Unpin>(
+    stderr: R,
+    stderr_lines: &Mutex<Vec<String>>,
+) {
+    use smol::io::AsyncBufReadExt as _;
+
+    const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+    let mut reader = smol::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.len() > MAX_STDERR_LINE_BYTES {
+                    line.truncate(MAX_STDERR_LINE_BYTES);
+                }
+                let text = String::from_utf8_lossy(&line);
+                record_stderr_line(stderr_lines, text.trim_end_matches(['\r', '\n']));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_windows_agent_process(
+    config: &agent_client_protocol::AcpAgentConfig,
+    cwd: &Path,
+) -> agent_client_protocol::Result<(
+    smol::process::ChildStdin,
+    smol::process::ChildStdout,
+    smol::process::ChildStderr,
+    smol::process::Child,
+)> {
+    use agent_client_protocol::util::internal_error;
+
+    let mut std_cmd = crate::command_env::plain_command(config.command());
+    std_cmd.args(config.arguments());
+    std_cmd.envs(config.environment());
+    if !cwd.as_os_str().is_empty() && cwd.is_dir() {
+        std_cmd.current_dir(cwd);
+    }
+    let mut cmd = smol::process::Command::from(std_cmd);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| internal_error("Failed to open stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| internal_error("Failed to open stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| internal_error("Failed to open stderr"))?;
+    Ok((stdin, stdout, stderr, child))
 }
 
 impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
@@ -382,8 +498,6 @@ impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
         client: impl agent_client_protocol::ConnectTo<Agent>,
     ) -> agent_client_protocol::Result<()> {
         use agent_client_protocol::util::internal_error;
-        use smol::io::AsyncBufReadExt as _;
-        use smol::stream::StreamExt as _;
 
         const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -392,7 +506,8 @@ impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
             Exited(std::io::Result<std::process::ExitStatus>),
         }
 
-        let (stdin, stdout, stderr, mut child) = self.agent.spawn_process()?;
+        let (stdin, stdout, stderr, mut child) =
+            spawn_windows_agent_process(self.agent.config(), &self.cwd)?;
         let job = match crate::process_tree::KillOnCloseJob::adopt(child.id()) {
             Ok(job) => Some(job),
             Err(error) => {
@@ -406,10 +521,7 @@ impl agent_client_protocol::ConnectTo<Client> for ProviderAgent {
 
         let stderr_lines = self.stderr_lines.clone();
         let drain_stderr = async move {
-            let mut lines = smol::io::BufReader::new(stderr).lines();
-            while let Some(Ok(line)) = lines.next().await {
-                record_stderr_line(&stderr_lines, &line);
-            }
+            drain_lossy_stderr_lines(stderr, &stderr_lines).await;
             std::future::pending::<First>().await
         };
         let mut protocol = Box::pin(agent_client_protocol::ConnectTo::<Client>::connect_to(
@@ -517,6 +629,22 @@ fn sdk_agent_environment(
     environment
 }
 
+fn unix_chdir_program_and_args(
+    binary: &str,
+    cwd: &str,
+    launch_args: Vec<String>,
+) -> (&'static str, Vec<String>) {
+    let mut args = vec![
+        "-c".to_owned(),
+        "cd -- \"$1\" && shift && exec \"$@\"".to_owned(),
+        "sh".to_owned(),
+        cwd.to_owned(),
+        binary.to_owned(),
+    ];
+    args.extend(launch_args);
+    ("/bin/sh", args)
+}
+
 fn sdk_agent(
     binary: &Path,
     cwd: &Path,
@@ -527,7 +655,7 @@ fn sdk_agent(
     let binary_str = binary
         .to_str()
         .ok_or_else(|| anyhow!("the ACP executable path is not valid UTF-8"))?;
-    let cwd = cwd
+    let cwd_str = cwd
         .to_str()
         .ok_or_else(|| anyhow!("the ACP working directory is not valid UTF-8"))?;
     let (computer_args, computer_env) =
@@ -542,19 +670,15 @@ fn sdk_agent(
         computer_env,
     );
 
-    // `AcpAgentConfig` deliberately contains only argv and environment. macOS
-    // `env -C` supplies the session cwd without a shell, preserving exact
-    // argument boundaries and the SDK's process-group lifecycle management.
-    // Windows has no `/usr/bin/env`: the resolved agent is spawned directly —
-    // `Command` runs `.cmd`/`.bat` shims through `cmd.exe` itself — and the
-    // session cwd reaches the agent through the ACP `session/new`, `resume`,
-    // and `load` requests instead.
+    // `AcpAgentConfig` deliberately contains only argv and environment. Unix
+    // `sh -c 'cd -- "$1" && shift && exec "$@"'` supplies the session cwd
+    // without relying on GNU/BSD `env -C` (missing on Alpine/BusyBox and older
+    // Linux distros). On Windows, `ProviderAgent::connect_to` spawns the child
+    // directly with `.current_dir(cwd)` and `CREATE_NO_WINDOW`.
     let (program, args) = if cfg!(windows) {
         (binary_str, launch.args)
     } else {
-        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary_str.to_owned()];
-        args.extend(launch.args);
-        ("/usr/bin/env", args)
+        unix_chdir_program_and_args(binary_str, cwd_str, launch.args)
     };
     let config = AcpAgentConfig::new(program).args(args).envs(environment);
     let debug_lines = stderr_lines.clone();
@@ -565,6 +689,7 @@ fn sdk_agent(
     });
     Ok(ProviderAgent {
         agent,
+        cwd: cwd.to_path_buf(),
         stderr_lines,
     })
 }
@@ -872,11 +997,7 @@ impl UnsolicitedTurnState {
                 self.saw_message_since_tool = true;
                 self.parked_on_swarm_wait = false;
             }
-            SessionUpdate::ToolCall(_) => {
-                self.saw_message_since_tool = false;
-                self.parked_on_swarm_wait = false;
-            }
-            SessionUpdate::ToolCallUpdate(_) => {
+            SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_) => {
                 if completed_tool_name == Some("swarm_wait") {
                     self.parked_on_swarm_wait = true;
                 } else {
@@ -1053,6 +1174,7 @@ where
     // goes through this cell rather than the mode the session started with.
     let access_mode = Arc::new(Mutex::new(mode));
     let session_modes: SharedSessionModes = Arc::new(Mutex::new(None));
+    let antigravity_modes = Arc::new(Mutex::new(AntigravityNativeModeState::default()));
     let config_options: SharedConfigOptions = Arc::new(Mutex::new(None));
     // Set once the session's own autonomy has been written, so drift
     // correction never races the initial write.
@@ -1085,6 +1207,7 @@ where
                 let unsolicited_wake_tx = unsolicited_wake_tx.clone();
                 let access_mode = access_mode.clone();
                 let session_modes = session_modes.clone();
+                let antigravity_modes = antigravity_modes.clone();
                 let config_options = config_options.clone();
                 let droid_autonomy_ready = droid_autonomy_ready.clone();
                 async move |notification: SessionNotification, connection: ConnectionTo<Agent>| {
@@ -1099,10 +1222,13 @@ where
                     }
                     let in_load = suppress_session_updates.is_in_flight();
                     if !in_load {
-                        if let SessionUpdate::CurrentModeUpdate(update) = &notification.update
-                            && let Some(modes) = session_modes.lock().as_mut()
-                        {
-                            modes.current_mode_id = update.current_mode_id.clone();
+                        if let SessionUpdate::CurrentModeUpdate(update) = &notification.update {
+                            set_current_session_mode_id(
+                                provider,
+                                &session_modes,
+                                &antigravity_modes,
+                                update.current_mode_id.clone(),
+                            );
                         }
                         let drifted = track_session_state(
                             provider,
@@ -1204,6 +1330,7 @@ where
                 let unsolicited_turn = unsolicited_turn.clone();
                 let unsolicited_wake_tx = unsolicited_wake_tx.clone();
                 let access_mode = access_mode.clone();
+                let antigravity_modes = antigravity_modes.clone();
                 async move |request: RequestPermissionRequest, responder, _connection| {
                     if provider == ProviderKind::Antigravity && prompt_requests.lock().is_empty() {
                         let started = unsolicited_turn.lock().on_content_update();
@@ -1214,11 +1341,17 @@ where
                             let _ = unsolicited_wake_tx.try_send(());
                         }
                     }
+                    let auto_approve = auto_approves_session_permissions(
+                        provider,
+                        *access_mode.lock(),
+                        &antigravity_modes.lock(),
+                    );
                     handle_permission_request(
                         provider,
                         request,
                         responder,
-                        auto_approves_permissions(provider, *access_mode.lock()),
+                        auto_approve,
+                        matches!(provider, ProviderKind::Droid | ProviderKind::Antigravity),
                         provider == ProviderKind::Droid,
                         &pending_permissions,
                         &pending_user_inputs,
@@ -1440,121 +1573,164 @@ where
                 meta.insert("parameterizedModelPicker".to_owned(), Value::Bool(true));
                 client_capabilities = client_capabilities.meta(meta);
             }
-            let initialize = await_acp_request(
-                connection
-                    .send_request(
-                        InitializeRequest::new(ProtocolVersion::V1)
-                            .client_capabilities(client_capabilities)
-                            .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
-                    )
-                    .block_task(),
-                timeouts.request,
-                "ACP initialize",
-            )
-            .await?;
-            let prompt_capabilities = initialize.agent_capabilities.prompt_capabilities.clone();
-            let supports_fork = initialize
-                .agent_capabilities
-                .session_capabilities
-                .fork
-                .is_some();
-            let (mut session_id, modes, initial_config_options) = establish_session(
-                &connection,
-                provider,
-                &initialize,
-                resume_session_id.as_deref(),
-                &cwd,
-                &acp_mcp_servers,
-                &suppress_session_updates,
-                timeouts.request,
-            )
-            .await?;
-            *session_modes.lock() = modes.clone();
-            *config_options.lock() = initial_config_options;
-
-            if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
-                // Mode selection is opportunistic: an agent can advertise a
-                // mode but reject a later transition without invalidating the
-                // session itself.
-                if await_acp_request(
-                    connection
-                        .send_request(SetSessionModeRequest::new(
-                            session_id.clone(),
-                            mode_id.clone(),
-                        ))
-                        .block_task(),
-                    timeouts.request,
-                    "ACP session/set_mode",
-                )
-                .await
-                .is_ok()
-                    && let Some(state) = session_modes.lock().as_mut()
-                {
-                    state.current_mode_id = mode_id;
-                }
-            }
-            if provider == ProviderKind::Droid {
-                let current = config_options.lock().clone();
-                match apply_droid_autonomy(
-                    &connection,
-                    &session_id,
-                    current.as_deref(),
-                    mode,
-                    timeouts.request,
-                )
-                .await
-                {
-                    Ok(updated) => store_config_options(&config_options, updated),
-                    Err(error) => {
-                        let _ = events.send(DriverEvent::Error(error));
-                        // Fail closed: an unwritten level is the user's CLI
-                        // default, which can pre-approve far more than the
-                        // selected mode. Only Full access has nothing to lose.
-                        if mode != RuntimeMode::FullAccess {
-                            return Ok(());
-                        }
-                    }
-                }
-                droid_autonomy_ready.store(true, Ordering::Release);
-            }
-            let mut native_session_id = session_id.to_string();
-            let antigravity_step_offset = Arc::new(AtomicI64::new(
-                if provider == ProviderKind::Antigravity {
-                    let sid = native_session_id.clone();
-                    let cfg = config_dir.clone();
-                    smol::unblock(move || {
-                        crate::antigravity_session::step_offset_in(&sid, cfg.as_deref())
-                    })
-                    .await
-                } else {
-                    -1
-                },
+            let antigravity_fork_context = Arc::new(Mutex::new(
+                fork_context
+                    .as_ref()
+                    .filter(|_| provider == ProviderKind::Antigravity)
+                    .cloned(),
             ));
-            let _ = events.send(DriverEvent::Connected {
-                provider_cursor: Some(ProviderResumeCursor::from_session_id(
-                    provider,
-                    native_session_id.clone(),
-                )),
-            });
-
+            let mut fork_context = fork_context.filter(|_| provider != ProviderKind::Antigravity);
+            let buffered_commands = Mutex::new(std::collections::VecDeque::new());
             let mut current_model = model;
             let mut current_effort = reasoning_effort;
             let mut current_tier = service_tier;
             let mut current_window = context_window;
-            sync_cached_session_model(
-                &connection,
-                provider,
-                &session_id,
-                &config_options,
-                current_model.as_deref(),
-                current_effort.as_deref(),
-                current_tier.as_deref(),
-                current_window.as_deref(),
-                &events,
-                timeouts.request,
-            )
-            .await;
-            let mut fork_context = fork_context;
+            let startup = race_startup_with_shutdown(&commands, &buffered_commands, async {
+                let initialize = await_acp_request(
+                    connection
+                        .send_request(
+                            InitializeRequest::new(ProtocolVersion::V1)
+                                .client_capabilities(client_capabilities)
+                                .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                        )
+                        .block_task(),
+                    timeouts.request,
+                    "ACP initialize",
+                )
+                .await?;
+                let prompt_capabilities = initialize.agent_capabilities.prompt_capabilities.clone();
+                let supports_fork = initialize
+                    .agent_capabilities
+                    .session_capabilities
+                    .fork
+                    .is_some();
+                let (session_id, modes, initial_config_options) = establish_session(
+                    &connection,
+                    provider,
+                    &initialize,
+                    resume_session_id.as_deref(),
+                    &cwd,
+                    &acp_mcp_servers,
+                    &suppress_session_updates,
+                    timeouts.request,
+                )
+                .await?;
+                sync_session_modes_state(
+                    provider,
+                    &session_modes,
+                    &antigravity_modes,
+                    modes.clone(),
+                );
+                *config_options.lock() = initial_config_options;
+
+                if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
+                    // Mode selection is opportunistic: an agent can advertise a
+                    // mode but reject a later transition without invalidating the
+                    // session itself.
+                    if await_acp_request(
+                        connection
+                            .send_request(SetSessionModeRequest::new(
+                                session_id.clone(),
+                                mode_id.clone(),
+                            ))
+                            .block_task(),
+                        timeouts.request,
+                        "ACP session/set_mode",
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        set_current_session_mode_id(
+                            provider,
+                            &session_modes,
+                            &antigravity_modes,
+                            mode_id,
+                        );
+                    }
+                }
+                if provider == ProviderKind::Droid {
+                    let current = config_options.lock().clone();
+                    match apply_droid_autonomy(
+                        &connection,
+                        &session_id,
+                        current.as_deref(),
+                        mode,
+                        timeouts.request,
+                    )
+                    .await
+                    {
+                        Ok(updated) => store_config_options(&config_options, updated),
+                        Err(error) => {
+                            let _ = events.send(DriverEvent::Error(error));
+                            // Fail closed: an unwritten level is the user's CLI
+                            // default, which can pre-approve far more than the
+                            // selected mode. Only Full access has nothing to lose.
+                            if mode != RuntimeMode::FullAccess {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    droid_autonomy_ready.store(true, Ordering::Release);
+                }
+                let native_session_id = session_id.to_string();
+                let antigravity_step_offset = Arc::new(AtomicI64::new(
+                    if provider == ProviderKind::Antigravity {
+                        let sid = native_session_id.clone();
+                        let cfg = config_dir.clone();
+                        smol::unblock(move || {
+                            crate::antigravity_session::step_offset_in(&sid, cfg.as_deref())
+                        })
+                        .await
+                    } else {
+                        -1
+                    },
+                ));
+                let _ = events.send(DriverEvent::Connected {
+                    provider_cursor: Some(connected_provider_cursor(
+                        provider,
+                        native_session_id.clone(),
+                        antigravity_fork_context.lock().clone(),
+                    )),
+                });
+
+                sync_cached_session_model(
+                    &connection,
+                    provider,
+                    &session_id,
+                    &config_options,
+                    current_model.as_deref(),
+                    current_effort.as_deref(),
+                    current_tier.as_deref(),
+                    current_window.as_deref(),
+                    &events,
+                    timeouts.request,
+                )
+                .await;
+
+                Ok(Some((
+                    initialize,
+                    prompt_capabilities,
+                    supports_fork,
+                    session_id,
+                    native_session_id,
+                    antigravity_step_offset,
+                )))
+            })
+            .await?;
+
+            let StartupOutcome::Ready(Some((
+                initialize,
+                prompt_capabilities,
+                supports_fork,
+                mut session_id,
+                mut native_session_id,
+                antigravity_step_offset,
+            ))) = startup
+            else {
+                cancel_pending_permissions(&pending_permissions);
+                cancel_pending_user_inputs(&pending_user_inputs);
+                return Ok(());
+            };
             let mut computer_use_instructions = computer_use_instructions;
             // Prompt callbacks raise lost-session recovery here rather than on
             // `commands`: a clone of the handle's sender would keep this loop
@@ -1573,43 +1749,47 @@ where
                 if cancel_deadline.is_some() && prompt_requests.lock().is_empty() {
                     cancel_deadline = None;
                 }
-                let settle_target = unsolicited_turn.lock().settle_at;
-                let event = smol::future::or(
+                let event = if let Some(buffered) = buffered_commands.lock().pop_front() {
+                    LoopEvent::Command(Some(buffered))
+                } else {
+                    let settle_target = unsolicited_turn.lock().settle_at;
                     smol::future::or(
-                        async { LoopEvent::Command(recovery_rx.recv().await.ok()) },
-                        async { LoopEvent::Command(commands.recv().await.ok()) },
-                    ),
-                    smol::future::or(
-                        async {
-                            if unsolicited_wake_rx.recv().await.is_ok() {
-                                LoopEvent::Wake
-                            } else {
-                                std::future::pending().await
-                            }
-                        },
+                        smol::future::or(
+                            async { LoopEvent::Command(recovery_rx.recv().await.ok()) },
+                            async { LoopEvent::Command(commands.recv().await.ok()) },
+                        ),
                         smol::future::or(
                             async {
-                                match settle_target {
-                                    Some((deadline, generation)) => {
-                                        smol::Timer::at(deadline).await;
-                                        LoopEvent::SettleUnsolicited(generation)
-                                    }
-                                    None => std::future::pending().await,
+                                if unsolicited_wake_rx.recv().await.is_ok() {
+                                    LoopEvent::Wake
+                                } else {
+                                    std::future::pending().await
                                 }
                             },
-                            async {
-                                match cancel_deadline {
-                                    Some(deadline) => {
-                                        smol::Timer::at(deadline).await;
-                                        LoopEvent::CancelTimeout
+                            smol::future::or(
+                                async {
+                                    match settle_target {
+                                        Some((deadline, generation)) => {
+                                            smol::Timer::at(deadline).await;
+                                            LoopEvent::SettleUnsolicited(generation)
+                                        }
+                                        None => std::future::pending().await,
                                     }
-                                    None => std::future::pending().await,
-                                }
-                            },
+                                },
+                                async {
+                                    match cancel_deadline {
+                                        Some(deadline) => {
+                                            smol::Timer::at(deadline).await;
+                                            LoopEvent::CancelTimeout
+                                        }
+                                        None => std::future::pending().await,
+                                    }
+                                },
+                            ),
                         ),
-                    ),
-                )
-                .await;
+                    )
+                    .await
+                };
                 let command = match event {
                     LoopEvent::Wake => continue,
                     LoopEvent::CancelTimeout => {
@@ -1740,6 +1920,8 @@ where
                                 None,
                                 resend_kind,
                                 Some(antigravity_step_offset.clone()),
+                                (provider == ProviderKind::Antigravity)
+                                    .then(|| antigravity_fork_context.clone()),
                             ) && prompt_requests.lock().is_empty()
                             {
                                 let _ = events.send(DriverEvent::Error(error.to_string()));
@@ -1765,7 +1947,12 @@ where
                             Ok((fresh_session_id, modes, fresh_config_options)) => {
                                 session_id = fresh_session_id;
                                 native_session_id = session_id.to_string();
-                                *session_modes.lock() = modes.clone();
+                                sync_session_modes_state(
+                                    provider,
+                                    &session_modes,
+                                    &antigravity_modes,
+                                    modes.clone(),
+                                );
                                 *config_options.lock() = fresh_config_options;
                                 if provider == ProviderKind::Antigravity {
                                     let sid = native_session_id.clone();
@@ -1795,9 +1982,13 @@ where
                                     )
                                     .await
                                     .is_ok()
-                                        && let Some(state) = session_modes.lock().as_mut()
                                     {
-                                        state.current_mode_id = mode_id;
+                                        set_current_session_mode_id(
+                                            provider,
+                                            &session_modes,
+                                            &antigravity_modes,
+                                            mode_id,
+                                        );
                                     }
                                 }
                                 sync_cached_session_model(
@@ -1814,9 +2005,10 @@ where
                                 )
                                 .await;
                                 let _ = events.send(DriverEvent::Connected {
-                                    provider_cursor: Some(ProviderResumeCursor::from_session_id(
+                                    provider_cursor: Some(connected_provider_cursor(
                                         provider,
                                         native_session_id.clone(),
+                                        antigravity_fork_context.lock().clone(),
                                     )),
                                 });
                                 // The turn already started; only resend it,
@@ -1839,6 +2031,8 @@ where
                                     None,
                                     PromptKind::Turn,
                                     Some(antigravity_step_offset.clone()),
+                                    (provider == ProviderKind::Antigravity)
+                                        .then(|| antigravity_fork_context.clone()),
                                 ) && prompt_requests.lock().is_empty()
                                 {
                                     let _ = events.send(DriverEvent::Error(error.to_string()));
@@ -1863,9 +2057,14 @@ where
                         cancel_deadline = None;
                         suppress_session_updates.clear_guard();
                         unsolicited_turn.lock().take_active();
+                        let active_fork_context = if provider == ProviderKind::Antigravity {
+                            antigravity_fork_context.lock().clone()
+                        } else {
+                            fork_context.clone()
+                        };
                         let prompt_text = format_prompt_with_seed(
                             provider,
-                            fork_context.as_deref(),
+                            active_fork_context.as_deref(),
                             computer_use_instructions.as_deref(),
                             text,
                         );
@@ -1888,6 +2087,8 @@ where
                             (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
                             PromptKind::Turn,
                             Some(antigravity_step_offset.clone()),
+                            (provider == ProviderKind::Antigravity)
+                                .then(|| antigravity_fork_context.clone()),
                         ) {
                             Ok(()) => {
                                 fork_context = None;
@@ -1934,6 +2135,8 @@ where
                             (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
                             PromptKind::Steer,
                             Some(antigravity_step_offset.clone()),
+                            (provider == ProviderKind::Antigravity)
+                                .then(|| antigravity_fork_context.clone()),
                         ) {
                             Ok(()) => {
                                 cancel_deadline = None;
@@ -2178,10 +2381,13 @@ where
                                 .await
                                 {
                                     Ok(updated_mode_id) => {
-                                        if let (Some(mode_id), Some(state)) =
-                                            (updated_mode_id, session_modes.lock().as_mut())
-                                        {
-                                            state.current_mode_id = mode_id;
+                                        if let Some(mode_id) = updated_mode_id {
+                                            set_current_session_mode_id(
+                                                provider,
+                                                &session_modes,
+                                                &antigravity_modes,
+                                                mode_id,
+                                            );
                                         }
                                         true
                                     }
@@ -2883,16 +3089,100 @@ fn config_option_by_id<'a>(
 /// The values of Droid's `autonomy_level`, which are also its ACP mode ids.
 const DROID_AUTONOMY_LEVELS: [&str; 4] = ["normal", "auto-low", "auto-medium", "auto-high"];
 
+#[derive(Clone, Default)]
+struct AntigravityNativeModeState {
+    current_native_mode: Option<String>,
+    advertised_accept_edits: bool,
+    advertised_auto: bool,
+}
+
+impl AntigravityNativeModeState {
+    fn sync_from_modes(&mut self, modes: Option<&SessionModeState>) {
+        let Some(modes) = modes else {
+            self.current_native_mode = None;
+            self.advertised_accept_edits = false;
+            self.advertised_auto = false;
+            return;
+        };
+        self.current_native_mode = Some(modes.current_mode_id.to_string());
+        self.advertised_accept_edits = modes
+            .available_modes
+            .iter()
+            .any(|mode| mode.id.to_string().eq_ignore_ascii_case("accept-edits"));
+        self.advertised_auto = modes
+            .available_modes
+            .iter()
+            .any(|mode| mode.id.to_string().eq_ignore_ascii_case("auto"));
+    }
+
+    fn set_current_mode(&mut self, mode_id: &SessionModeId) {
+        self.current_native_mode = Some(mode_id.to_string());
+    }
+
+    fn allows_auto_approve(&self, mode: RuntimeMode) -> bool {
+        if mode != RuntimeMode::FullAccess {
+            return false;
+        }
+        // Fail closed if native scoped modes exist (`accept-edits` / `auto`)
+        // and the active mode is unknown, or while native `plan`,
+        // `accept-edits`, or `auto` is active.
+        let Some(native_mode) = self.current_native_mode.as_deref() else {
+            return !self.advertised_accept_edits && !self.advertised_auto;
+        };
+        !native_mode.eq_ignore_ascii_case("plan")
+            && !native_mode.eq_ignore_ascii_case("accept-edits")
+            && !native_mode.eq_ignore_ascii_case("auto")
+    }
+}
+
+fn sync_session_modes_state(
+    provider: ProviderKind,
+    session_modes: &SharedSessionModes,
+    antigravity_modes: &Mutex<AntigravityNativeModeState>,
+    modes: Option<SessionModeState>,
+) {
+    if provider == ProviderKind::Antigravity {
+        antigravity_modes.lock().sync_from_modes(modes.as_ref());
+    }
+    *session_modes.lock() = modes;
+}
+
+fn set_current_session_mode_id(
+    provider: ProviderKind,
+    session_modes: &SharedSessionModes,
+    antigravity_modes: &Mutex<AntigravityNativeModeState>,
+    mode_id: SessionModeId,
+) {
+    if provider == ProviderKind::Antigravity {
+        antigravity_modes.lock().set_current_mode(&mode_id);
+    }
+    if let Some(state) = session_modes.lock().as_mut() {
+        state.current_mode_id = mode_id;
+    }
+}
+
 /// Whether Waku answers the agent's permission requests for the user.
 ///
-/// Droid's autonomy level already pre-approves everything the selected mode
-/// allows, so a request that still arrives is exactly what that mode keeps
-/// for the user; answering it would turn every mode into Full access. Other
-/// ACP agents stay in their ordinary mode and rely on Waku to answer.
+/// Droid's autonomy level and Antigravity's native `accept-edits` / `auto`
+/// modes already pre-approve everything the selected mode allows, so a request
+/// that still arrives is exactly what that mode keeps for the user; answering
+/// it would turn every mode into Full access. Other ACP agents stay in their
+/// ordinary mode and rely on Waku to answer.
 fn auto_approves_permissions(provider: ProviderKind, mode: RuntimeMode) -> bool {
     match provider {
-        ProviderKind::Droid => mode == RuntimeMode::FullAccess,
+        ProviderKind::Droid | ProviderKind::Antigravity => mode == RuntimeMode::FullAccess,
         _ => mode != RuntimeMode::Ask,
+    }
+}
+
+fn auto_approves_session_permissions(
+    provider: ProviderKind,
+    mode: RuntimeMode,
+    antigravity_modes: &AntigravityNativeModeState,
+) -> bool {
+    match provider {
+        ProviderKind::Antigravity => antigravity_modes.allows_auto_approve(mode),
+        _ => auto_approves_permissions(provider, mode),
     }
 }
 
@@ -3676,6 +3966,7 @@ fn send_prompt(
     lost_session_recovery: Option<smol::channel::Sender<CommandMessage>>,
     prompt_kind: PromptKind,
     antigravity_step_offset: Option<Arc<AtomicI64>>,
+    antigravity_fork_context: Option<Arc<Mutex<Option<String>>>>,
 ) -> agent_client_protocol::Result<()> {
     if prompt_kind == PromptKind::Turn {
         let mut state = stream_state.lock();
@@ -3764,6 +4055,22 @@ fn send_prompt(
                 })
                 .await;
                 step_offset.store(next_offset, Ordering::Release);
+            }
+            let completed_cleanly = native_failure.is_none()
+                && result
+                    .as_ref()
+                    .is_ok_and(|response| response.stop_reason == StopReason::EndTurn);
+            if completed_cleanly
+                && provider == ProviderKind::Antigravity
+                && let Some(fork_ctx) = antigravity_fork_context
+                && fork_ctx.lock().take().is_some()
+            {
+                let _ = callback_events.send(DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::from_session_id(
+                        provider,
+                        native_session_id.clone(),
+                    )),
+                });
             }
             let success = finish_prompt(result, native_failure, &callback_events);
             if provider == ProviderKind::Grok && success {
@@ -5839,6 +6146,90 @@ fn elicitation_content_value(
     })
 }
 
+/// Whether a property the agent requires is one Waku cannot render.
+fn elicitation_has_unrenderable_required(
+    schema: &agent_client_protocol::schema::v1::ElicitationSchema,
+) -> bool {
+    schema.required.iter().flatten().any(|name| {
+        matches!(
+            schema.properties.get(name),
+            Some(ElicitationPropertySchema::Other(_))
+        )
+    })
+}
+
+fn range_error<T: PartialOrd + std::fmt::Display>(
+    value: T,
+    minimum: Option<T>,
+    maximum: Option<T>,
+) -> Option<String> {
+    match (minimum, maximum) {
+        (Some(min), Some(max)) if value < min || value > max => {
+            Some(tr!("user_input.out_of_range", min = min, max = max))
+        }
+        (Some(min), None) if value < min => Some(tr!("user_input.at_least", min = min)),
+        (None, Some(max)) if value > max => Some(tr!("user_input.at_most", max = max)),
+        _ => None,
+    }
+}
+
+/// The first submitted numeric answer the schema rejects, as the question id
+/// and a user-facing reason. Choice, boolean, and free-text answers cannot be
+/// invalid; the form only offers valid choices.
+fn elicitation_answer_error(
+    request: &CreateElicitationRequest,
+    submitted: &[UserInputAnswer],
+) -> Option<(String, String)> {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    for (name, property) in ordered_elicitation_properties(&form.requested_schema) {
+        let text = submitted
+            .iter()
+            .find(|answer| answer.question_id == name)
+            .and_then(|answer| {
+                answer
+                    .answers
+                    .iter()
+                    .map(|answer| answer.trim())
+                    .find(|answer| !answer.is_empty())
+            });
+        let Some(text) = text else { continue };
+        let error = match property {
+            ElicitationPropertySchema::Integer(schema) => match text.parse::<i64>() {
+                Ok(value) => range_error(value, schema.minimum, schema.maximum),
+                Err(_) => Some(tr!("user_input.invalid_integer")),
+            },
+            ElicitationPropertySchema::Number(schema) => {
+                match text.parse::<f64>().ok().filter(|value| value.is_finite()) {
+                    Some(value) => range_error(value, schema.minimum, schema.maximum),
+                    None => Some(tr!("user_input.invalid_number")),
+                }
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            return Some((name.to_owned(), error));
+        }
+    }
+    None
+}
+
+/// The form again, with the rejected question's text led by the reason.
+fn elicitation_retry_questions(
+    request: &CreateElicitationRequest,
+    error: &(String, String),
+) -> Vec<UserInputQuestion> {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return Vec::new();
+    };
+    let mut questions = elicitation_user_input_questions(&request.message, &form.requested_schema);
+    if let Some(question) = questions.iter_mut().find(|question| question.id == error.0) {
+        question.question = format!("{}\n\n{}", error.1, question.question);
+    }
+    questions
+}
+
 fn resolve_elicitation_choice(choices: &[ElicitationChoice], answer: &str) -> String {
     choices
         .iter()
@@ -6005,16 +6396,18 @@ fn antigravity_question_response(
     }
 }
 
-/// `allow_once_only` is Droid's: its "always" answer raises the session's
-/// autonomy level, so it is neither chosen automatically nor offered, and the
-/// access mode stays the one control over what runs unasked.
+/// `hide_allow_always_in_prompt` is Droid's: its "always" answer raises the
+/// session's autonomy level, so it is neither chosen automatically nor
+/// offered. `prefer_allow_once_on_auto` applies to both Droid and Antigravity
+/// so auto-approvals in Full access do not leave permanent always-allow grants.
 #[allow(clippy::too_many_arguments)]
 fn handle_permission_request(
     provider: ProviderKind,
     request: RequestPermissionRequest,
     responder: PermissionResponder,
     auto_approve: bool,
-    allow_once_only: bool,
+    prefer_allow_once_on_auto: bool,
+    hide_allow_always_in_prompt: bool,
     pending: &PendingPermissions,
     pending_user_inputs: &PendingAcpUserInputs,
     events: &impl DriverEventSink,
@@ -6048,10 +6441,10 @@ fn handle_permission_request(
         return Ok(());
     }
 
-    let options = offered_permission_options(&request.options, allow_once_only);
+    let options = offered_permission_options(&request.options, hide_allow_always_in_prompt);
 
     if auto_approve {
-        return match auto_permission_choice(&request.options, allow_once_only) {
+        return match auto_permission_choice(&request.options, prefer_allow_once_on_auto) {
             Some(choice) => responder.respond(RequestPermissionResponse::new(
                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                     choice.option_id.clone(),
@@ -6146,90 +6539,6 @@ fn handle_session_update(
         && !state.produced_content
         && kind == Some("agent_message_chunk")
         && update
-/// Whether a property the agent requires is one Waku cannot render.
-fn elicitation_has_unrenderable_required(
-    schema: &agent_client_protocol::schema::v1::ElicitationSchema,
-) -> bool {
-    schema.required.iter().flatten().any(|name| {
-        matches!(
-            schema.properties.get(name),
-            Some(ElicitationPropertySchema::Other(_))
-        )
-    })
-}
-
-fn range_error<T: PartialOrd + std::fmt::Display>(
-    value: T,
-    minimum: Option<T>,
-    maximum: Option<T>,
-) -> Option<String> {
-    match (minimum, maximum) {
-        (Some(min), Some(max)) if value < min || value > max => {
-            Some(tr!("user_input.out_of_range", min = min, max = max))
-        }
-        (Some(min), None) if value < min => Some(tr!("user_input.at_least", min = min)),
-        (None, Some(max)) if value > max => Some(tr!("user_input.at_most", max = max)),
-        _ => None,
-    }
-}
-
-/// The first submitted numeric answer the schema rejects, as the question id
-/// and a user-facing reason. Choice, boolean, and free-text answers cannot be
-/// invalid; the form only offers valid choices.
-fn elicitation_answer_error(
-    request: &CreateElicitationRequest,
-    submitted: &[UserInputAnswer],
-) -> Option<(String, String)> {
-    let ElicitationMode::Form(form) = &request.mode else {
-        return None;
-    };
-    for (name, property) in ordered_elicitation_properties(&form.requested_schema) {
-        let text = submitted
-            .iter()
-            .find(|answer| answer.question_id == name)
-            .and_then(|answer| {
-                answer
-                    .answers
-                    .iter()
-                    .map(|answer| answer.trim())
-                    .find(|answer| !answer.is_empty())
-            });
-        let Some(text) = text else { continue };
-        let error = match property {
-            ElicitationPropertySchema::Integer(schema) => match text.parse::<i64>() {
-                Ok(value) => range_error(value, schema.minimum, schema.maximum),
-                Err(_) => Some(tr!("user_input.invalid_integer")),
-            },
-            ElicitationPropertySchema::Number(schema) => {
-                match text.parse::<f64>().ok().filter(|value| value.is_finite()) {
-                    Some(value) => range_error(value, schema.minimum, schema.maximum),
-                    None => Some(tr!("user_input.invalid_number")),
-                }
-            }
-            _ => None,
-        };
-        if let Some(error) = error {
-            return Some((name.to_owned(), error));
-        }
-    }
-    None
-}
-
-/// The form again, with the rejected question's text led by the reason.
-fn elicitation_retry_questions(
-    request: &CreateElicitationRequest,
-    error: &(String, String),
-) -> Vec<UserInputQuestion> {
-    let ElicitationMode::Form(form) = &request.mode else {
-        return Vec::new();
-    };
-    let mut questions = elicitation_user_input_questions(&request.message, &form.requested_schema);
-    if let Some(question) = questions.iter_mut().find(|question| question.id == error.0) {
-        question.question = format!("{}\n\n{}", error.1, question.question);
-    }
-    questions
-}
-
             .pointer("/content/text")
             .and_then(Value::as_str)
             .is_some_and(fx_context_notice)
@@ -10963,6 +11272,7 @@ mod tests {
                     None,
                     PromptKind::Steer,
                     None,
+                    None,
                 )?;
                 assert!(
                     stream_state_clone.lock().produced_content,
@@ -12229,5 +12539,695 @@ mod tests {
             reply.to_ascii_uppercase().contains("PINEAPPLE"),
             "the resumed turn lost the conversation: {reply:?}"
         );
+    }
+
+    #[test]
+    fn antigravity_permission_policy_requires_full_access_and_default_native_mode() {
+        let mut state = AntigravityNativeModeState::default();
+        assert!(!state.allows_auto_approve(RuntimeMode::Ask));
+        assert!(!state.allows_auto_approve(RuntimeMode::AutoAcceptEdits));
+        assert!(!state.allows_auto_approve(RuntimeMode::Auto));
+        assert!(state.allows_auto_approve(RuntimeMode::FullAccess));
+
+        let modes = SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("accept-edits", "Accept edits"),
+                SessionMode::new("auto", "Auto"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+        state.sync_from_modes(Some(&modes));
+        assert!(state.allows_auto_approve(RuntimeMode::FullAccess));
+        assert!(!state.allows_auto_approve(RuntimeMode::Ask));
+        assert!(!state.allows_auto_approve(RuntimeMode::AutoAcceptEdits));
+        assert!(!state.allows_auto_approve(RuntimeMode::Auto));
+
+        for restricted in ["plan", "accept-edits", "auto"] {
+            state.set_current_mode(&SessionModeId::new(restricted));
+            assert!(
+                !state.allows_auto_approve(RuntimeMode::FullAccess),
+                "native mode {restricted} must never auto-approve"
+            );
+        }
+        state.set_current_mode(&SessionModeId::new("default"));
+        assert!(state.allows_auto_approve(RuntimeMode::FullAccess));
+
+        // Fail closed if scoped modes exist and active mode is cleared/unknown.
+        state.current_native_mode = None;
+        assert!(!state.allows_auto_approve(RuntimeMode::FullAccess));
+
+        state.sync_from_modes(Some(&modes));
+        assert!(!auto_approves_session_permissions(
+            ProviderKind::Antigravity,
+            RuntimeMode::Auto,
+            &state
+        ));
+        assert!(!auto_approves_session_permissions(
+            ProviderKind::Antigravity,
+            RuntimeMode::AutoAcceptEdits,
+            &state
+        ));
+        assert!(auto_approves_session_permissions(
+            ProviderKind::Antigravity,
+            RuntimeMode::FullAccess,
+            &state
+        ));
+        assert!(auto_approves_session_permissions(
+            ProviderKind::Cursor,
+            RuntimeMode::Auto,
+            &state
+        ));
+        assert!(!auto_approves_session_permissions(
+            ProviderKind::Cursor,
+            RuntimeMode::Ask,
+            &state
+        ));
+    }
+
+    #[test]
+    fn antigravity_runtime_mode_auto_approve_tracks_mode_updates_and_preserves_allow_always() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, CurrentModeUpdate, InitializeResponse,
+            NewSessionResponse, PermissionOption as AcpPermissionOption,
+        };
+
+        fn sample_permission_request(call_id: &str) -> RequestPermissionRequest {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "agy.security.warning".into(),
+                json!({"message": "Host modification warning"}),
+            );
+            RequestPermissionRequest::new(
+                "agy-perm-1",
+                ToolCallUpdate::new(
+                    call_id.to_owned(),
+                    ToolCallUpdateFields::new().title("Run shell command"),
+                ),
+                vec![
+                    AcpPermissionOption::new(
+                        "allow-always",
+                        "Allow always",
+                        PermissionOptionKind::AllowAlways,
+                    )
+                    .meta(meta),
+                    AcpPermissionOption::new(
+                        "allow-once",
+                        "Allow once",
+                        PermissionOptionKind::AllowOnce,
+                    ),
+                ],
+            )
+        }
+
+        let prompt_step = Arc::new(Mutex::new(0usize));
+        let recorded_outcomes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let prompt_step_agent = Arc::clone(&prompt_step);
+        let outcomes_agent = Arc::clone(&recorded_outcomes);
+
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new("agy-perm-1").modes(
+                        SessionModeState::new(
+                            "default",
+                            vec![
+                                SessionMode::new("default", "Default"),
+                                SessionMode::new("accept-edits", "Accept edits"),
+                                SessionMode::new("auto", "Auto"),
+                                SessionMode::new("plan", "Plan"),
+                            ],
+                        ),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: PromptRequest, responder, cx| {
+                    let step = {
+                        let mut count = prompt_step_agent.lock();
+                        *count += 1;
+                        *count
+                    };
+                    if step == 2 {
+                        let _ = cx.send_notification(SessionNotification::new(
+                            "agy-perm-1",
+                            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("plan")),
+                        ));
+                    } else if step == 3 {
+                        let _ = cx.send_notification(SessionNotification::new(
+                            "agy-perm-1",
+                            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                                "accept-edits",
+                            )),
+                        ));
+                    }
+                    let outcomes = Arc::clone(&outcomes_agent);
+                    let cx_reply = cx.clone();
+                    cx.send_request(sample_permission_request(&format!("call-{step}")))
+                        .on_receiving_result(async move |res| {
+                            if let Ok(resp) = res
+                                && let RequestPermissionOutcome::Selected(sel) = resp.outcome
+                            {
+                                outcomes.lock().push(sel.option_id.to_string());
+                            }
+                            let _ = cx_reply.send_notification(SessionNotification::new(
+                                "agy-perm-1",
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("ok")),
+                                )),
+                            ));
+                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                            Ok(())
+                        })
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let isolated_cfg =
+            std::env::temp_dir().join(format!("waku-acp-perm-{}", uuid::Uuid::new_v4()));
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                mock_agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::FullAccess,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(isolated_cfg),
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        let wait_event = |predicate: &dyn Fn(&DriverEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                    if let DriverEvent::Error(err) = &ev {
+                        panic!("unexpected driver error: {err}");
+                    }
+                    if predicate(&ev) {
+                        return ev;
+                    }
+                }
+            }
+            panic!("timed out waiting for expected DriverEvent");
+        };
+
+        wait_event(&|ev| matches!(ev, DriverEvent::Connected { .. }));
+
+        // Step 1: default native mode + FullAccess auto-approves using AllowOnce.
+        cmd_tx
+            .try_send(CommandMessage::Prompt("step 1".into()))
+            .unwrap();
+        wait_event(&|ev| {
+            assert!(
+                !matches!(ev, DriverEvent::Permission { .. }),
+                "FullAccess in default mode should auto-approve without prompting"
+            );
+            matches!(ev, DriverEvent::TurnFinished { success: true, .. })
+        });
+
+        // Step 2: CurrentModeUpdate("plan") stops auto-approve and retains AllowAlways + warning.
+        cmd_tx
+            .try_send(CommandMessage::Prompt("step 2".into()))
+            .unwrap();
+        let perm2 = wait_event(&|ev| matches!(ev, DriverEvent::Permission { .. }));
+        let DriverEvent::Permission {
+            request_id,
+            detail,
+            options,
+            ..
+        } = perm2
+        else {
+            unreachable!();
+        };
+        assert!(detail.contains("Host modification warning"));
+        assert!(options.iter().any(|o| o.id == "allow-always"));
+        assert!(options.iter().any(|o| o.id == "allow-once"));
+        cmd_tx
+            .try_send(CommandMessage::Respond {
+                request_id,
+                option_id: "allow-always".into(),
+            })
+            .unwrap();
+        wait_event(&|ev| matches!(ev, DriverEvent::TurnFinished { success: true, .. }));
+
+        // Step 3: CurrentModeUpdate("accept-edits") also leaves permissions to the user.
+        cmd_tx
+            .try_send(CommandMessage::Prompt("step 3".into()))
+            .unwrap();
+        let perm3 = wait_event(&|ev| matches!(ev, DriverEvent::Permission { .. }));
+        let DriverEvent::Permission { request_id, .. } = perm3 else {
+            unreachable!();
+        };
+        cmd_tx
+            .try_send(CommandMessage::Respond {
+                request_id,
+                option_id: "allow-once".into(),
+            })
+            .unwrap();
+        wait_event(&|ev| matches!(ev, DriverEvent::TurnFinished { success: true, .. }));
+
+        cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            *recorded_outcomes.lock(),
+            vec!["allow-once", "allow-always", "allow-once"]
+        );
+    }
+
+    #[test]
+    fn drain_lossy_stderr_lines_survives_non_utf8_bytes() {
+        let raw = b"\xff\xfe bad utf8 sequence\nsecond valid line\r\nthird line".to_vec();
+        let lines = Mutex::new(Vec::new());
+        smol::block_on(drain_lossy_stderr_lines(smol::io::Cursor::new(raw), &lines));
+        let recorded = lines.lock().clone();
+        assert_eq!(recorded.len(), 3);
+        assert!(recorded[0].contains('\u{FFFD}'));
+        assert!(recorded[0].contains("bad utf8 sequence"));
+        assert_eq!(recorded[1], "second valid line");
+        assert_eq!(recorded[2], "third line");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_uses_requested_working_directory() {
+        use smol::io::AsyncReadExt as _;
+
+        let cwd = std::env::temp_dir().join(format!("waku-win-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let config = AcpAgentConfig::new("cmd.exe").args(["/c", "cd"]);
+
+        let output = smol::block_on(async {
+            let (stdin, mut stdout, stderr, mut child) =
+                spawn_windows_agent_process(&config, &cwd).expect("spawn cmd.exe in cwd");
+            drop(stdin);
+            drop(stderr);
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.unwrap();
+            let status = child.status().await.unwrap();
+            assert!(status.success());
+            String::from_utf8_lossy(&bytes).trim().to_owned()
+        });
+
+        let expected = strip_windows_verbatim(std::fs::canonicalize(&cwd).unwrap());
+        let actual = strip_windows_verbatim(std::fs::canonicalize(Path::new(&output)).unwrap());
+        let _ = std::fs::remove_dir_all(&cwd);
+        assert!(
+            actual
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "expected child cwd {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn unix_chdir_program_and_args_uses_posix_sh() {
+        let (program, args) = unix_chdir_program_and_args(
+            "/usr/local/bin/agy",
+            "/tmp/my workspace",
+            vec!["acp".into(), "--verbose".into()],
+        );
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "cd -- \"$1\" && shift && exec \"$@\"",
+                "sh",
+                "/tmp/my workspace",
+                "/usr/local/bin/agy",
+                "acp",
+                "--verbose",
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_shutdown_cancels_slow_handshake_and_buffers_early_commands() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse,
+        };
+
+        // 1. Early Shutdown / Drop interrupts hanging initialize immediately without waiting for timeout.
+        let held_responder = Arc::new(Mutex::new(None));
+        let held_for_agent = Arc::clone(&held_responder);
+        let slow_agent = Agent.builder().on_receive_request(
+            async move |_req: InitializeRequest, responder, _cx| {
+                *held_for_agent.lock() = Some(responder);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let timeouts = AcpTimeouts {
+            request: Duration::from_secs(30),
+            cancel: Duration::from_secs(30),
+        };
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                slow_agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                timeouts,
+            ))
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        drop(cmd_tx);
+        let join_res = handle.join().unwrap();
+        assert!(join_res.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "startup drop should cancel before 30s request timeout"
+        );
+        assert!(
+            !event_rx
+                .try_iter()
+                .any(|ev| matches!(ev, DriverEvent::Error(_))),
+            "clean startup drop must not emit DriverEvent::Error"
+        );
+        drop(held_responder);
+
+        // 2. Non-Shutdown commands queued before handshake finishes are buffered and delivered FIFO.
+        let seen_prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_for_agent = Arc::clone(&seen_prompts);
+        let delaying_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(80));
+                        let _ = responder.respond(
+                            InitializeResponse::new(ProtocolVersion::V1)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        );
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new("early-cmd-sess"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    let text = req
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    seen_for_agent.lock().push(text);
+                    let _ = cx.send_notification(SessionNotification::new(
+                        "early-cmd-sess",
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("ok"),
+                        ))),
+                    ));
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("queued during init".into()))
+            .unwrap();
+        let isolated_cfg =
+            std::env::temp_dir().join(format!("waku-acp-early-{}", uuid::Uuid::new_v4()));
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                delaying_agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(isolated_cfg),
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_finished = false;
+        while Instant::now() < deadline {
+            if let Ok(DriverEvent::TurnFinished { success: true, .. }) =
+                event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                saw_finished = true;
+                break;
+            }
+        }
+        assert!(saw_finished, "early buffered prompt should execute after handshake");
+        cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+        assert_eq!(*seen_prompts.lock(), vec!["queued during init"]);
+    }
+
+    #[test]
+    fn antigravity_fork_context_persists_across_turn1_failure_and_cancel_until_end_turn() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse,
+        };
+
+        let received_prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let prompts_for_agent = Arc::clone(&received_prompts);
+        let mock_agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(ProtocolVersion::V1)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new("agy-fork-1"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest, responder, cx| {
+                    let text = req
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let call_idx = {
+                        let mut seen = prompts_for_agent.lock();
+                        seen.push(text);
+                        seen.len()
+                    };
+                    match call_idx {
+                        1 => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error("network hiccup"),
+                        ),
+                        2 => responder.respond(PromptResponse::new(StopReason::Cancelled)),
+                        _ => {
+                            let _ = cx.send_notification(SessionNotification::new(
+                                "agy-fork-1",
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("ok")),
+                                )),
+                            ));
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let isolated_cfg =
+            std::env::temp_dir().join(format!("waku-acp-fork-{}", uuid::Uuid::new_v4()));
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                mock_agent,
+                ProviderKind::Antigravity,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("prior branch context".into()),
+                Some(isolated_cfg),
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+
+        let mut connected_events = Vec::new();
+        let collect_until_finish = |expected_success: bool,
+                                    connected_out: &mut Vec<Option<String>>| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                    match ev {
+                        DriverEvent::Connected {
+                            provider_cursor: Some(ProviderResumeCursor::Antigravity { fork_context, .. }),
+                        } => connected_out.push(fork_context),
+                        DriverEvent::TurnFinished { success, .. } => {
+                            assert_eq!(success, expected_success);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            panic!("timed out waiting for TurnFinished");
+        };
+
+        // Initial Connected keeps fork_context.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && connected_events.is_empty() {
+            if let Ok(DriverEvent::Connected {
+                provider_cursor: Some(ProviderResumeCursor::Antigravity { fork_context, .. }),
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                connected_events.push(fork_context);
+            }
+        }
+        assert_eq!(connected_events, vec![Some("prior branch context".into())]);
+
+        // Turn 1 fails: fork_context remains preserved.
+        cmd_tx.try_send(CommandMessage::Prompt("try 1".into())).unwrap();
+        collect_until_finish(false, &mut connected_events);
+        assert_eq!(connected_events.len(), 1);
+
+        // Turn 2 is cancelled: fork_context remains preserved.
+        cmd_tx.try_send(CommandMessage::Prompt("try 2".into())).unwrap();
+        collect_until_finish(true, &mut connected_events);
+        assert_eq!(connected_events.len(), 1);
+
+        // Turn 3 ends cleanly: fork_context clears and emits updated Connected before TurnFinished.
+        cmd_tx.try_send(CommandMessage::Prompt("try 3".into())).unwrap();
+        collect_until_finish(true, &mut connected_events);
+        assert_eq!(
+            connected_events,
+            vec![Some("prior branch context".into()), None]
+        );
+
+        // Turn 4 no longer receives fork_context.
+        cmd_tx.try_send(CommandMessage::Prompt("try 4".into())).unwrap();
+        collect_until_finish(true, &mut connected_events);
+        assert_eq!(connected_events.len(), 2);
+
+        cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+
+        let prompts = received_prompts.lock().clone();
+        assert_eq!(prompts.len(), 4);
+        assert!(prompts[0].contains("prior branch context") && prompts[0].contains("try 1"));
+        assert!(prompts[1].contains("prior branch context") && prompts[1].contains("try 2"));
+        assert!(prompts[2].contains("prior branch context") && prompts[2].contains("try 3"));
+        assert!(!prompts[3].contains("prior branch context") && prompts[3].contains("try 4"));
+    }
+
+    #[test]
+    fn unsolicited_turn_state_marks_parked_on_single_shot_swarm_wait() {
+        let mut state = UnsolicitedTurnState::default();
+        assert!(state.on_content_update());
+        let single_shot_swarm_wait: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sw-1",
+            "title": "mcp__antigravity__swarm_wait",
+            "status": "completed"
+        }))
+        .unwrap();
+        state.on_stream_update(&single_shot_swarm_wait, Some("swarm_wait"));
+        assert!(state.parked_on_swarm_wait);
+
+        let usage: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 100,
+            "size": 1000
+        }))
+        .unwrap();
+        assert_eq!(
+            state.settle_delay(&usage),
+            ANTIGRAVITY_UNSOLICITED_USAGE_SETTLE_DELAY
+        );
+
+        let active_tool: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sw-2",
+            "title": "Run read_file",
+            "status": "in_progress"
+        }))
+        .unwrap();
+        state.on_stream_update(&active_tool, None);
+        assert!(!state.parked_on_swarm_wait);
     }
 }

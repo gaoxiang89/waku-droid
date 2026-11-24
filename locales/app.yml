@@ -134,6 +134,8 @@ command_palette.toggle_files:
   en: Toggle Files panel
 command_palette.toggle_git_graph:
   en: Toggle Git Graph panel
+command_palette.toggle_swarm:
+  en: Toggle Swarm panel
 command_palette.current:
   en: Current
 command_palette.you:
@@ -187,9 +189,9 @@ settings.providers_keywords:
 settings.skills:
   en: Skills
 settings.skills_keywords:
-  en: skills skill library agent disable enable delete claude codex cursor opencode pi amp shared
+  en: skills skill library agent disable enable delete antigravity agy gemini claude codex cursor opencode pi amp shared
 settings.usage_keywords:
-  en: usage tokens cost spend cache daily chart model breakdown history claude codex
+  en: usage tokens cost spend cache daily chart model breakdown history antigravity agy gemini claude codex
 settings.daemon_keywords:
   en: daemon server remote web network expose origin token port websocket
 settings.computer_use_keywords:
@@ -403,6 +405,8 @@ settings.check_for_updates_description:
   en: Check GitHub Releases for the latest version of Waku
 settings.about:
   en: About
+settings.about_provenance:
+  en: Community fork of egoist/waku, GPL-3.0
 settings.about_local_daemon:
   en: Daemon on this computer
 settings.about_host_daemon:
@@ -1011,6 +1015,8 @@ mode.auto_accept_edits_description:
   en: Auto-approve edits, ask before other actions
 mode.auto_description:
   en: An AI reviewer approves routine actions; risky ones still ask
+mode.auto_description_antigravity:
+  en: Let Antigravity auto-approve routine actions and ask for risky ones
 mode.auto_description_droid:
   en: Auto-approve routine local dev actions; risky or external actions still ask
 mode.full_access_description:
@@ -2589,7 +2595,7 @@ usage.active_day_many:
 usage.filter_projects:
   en: Filter projects…
 usage.chart_description:
-  en: Daily %{metric} split between Claude Code and Codex.
+  en: Daily %{metric} split across Claude Code, Codex, and Antigravity.
 
 usage.refresh_failed:
   en: "Usage refresh failed: %{error}"
@@ -2854,16 +2860,22 @@ swarm.status_working:
   en: Working
 swarm.status_waiting:
   en: Waiting
+swarm.status_stopped:
+  en: Stopped
 swarm.status_failed:
   en: Failed
 swarm.status_killed:
   en: Killed
 swarm.you:
   en: you
+swarm.done_badge:
+  en: done
 swarm.active_count:
   en: "%{count} working"
 swarm.waiting_count:
   en: "%{count} waiting"
+swarm.stopped_count:
+  en: "%{count} stopped"
 swarm.failed_count:
   en: "%{count} failed"
 swarm.posts_count:
@@ -2954,6 +2966,76 @@ swarm.hive_empty:
   en: Waiting for members to join the hive
 swarm.hive_mentions_empty:
   en: No @mentions on the board yet
+swarm.stale_error_banner:
+  en: "Refresh failed (showing cached board): %{error}"
+swarm.retrying:
+  en: Retrying…
+swarm.more_attention:
+  en: "+%{count} more"
+swarm.all_channels:
+  en: All channels
+swarm.board_no_posts_truncated:
+  en: No messages in the retained board window
+swarm.plan_overview:
+  en: Plan overview
+swarm.section_threads:
+  en: Threads
+swarm.section_screenshots:
+  en: Screenshots
+swarm.role_coordinator:
+  en: coordinator
+swarm.role_worker:
+  en: worker
+swarm.role_narrator:
+  en: narrator
+swarm.role_monitor:
+  en: monitor
+swarm.role_verifier:
+  en: verifier
+swarm.role_investigator:
+  en: investigator
+swarm.attention_decision:
+  en: decision
+swarm.attention_failure:
+  en: failure
+swarm.attention_review:
+  en: review
+swarm.attention_stuck:
+  en: stuck
+swarm.attention_quota:
+  en: quota
+swarm.attention_error:
+  en: error
+swarm.attention_fyi:
+  en: fyi
+swarm.state_active:
+  en: active
+swarm.state_blocked:
+  en: blocked
+swarm.state_review:
+  en: review
+swarm.state_done:
+  en: done
+swarm.state_failed:
+  en: failed
+swarm.state_queued:
+  en: queued
+swarm.activity_waiting_posts:
+  en: Waiting for posts
+swarm.activity_reading_board:
+  en: Reading the board
+swarm.activity_posting_board:
+  en: Posting to the board
+swarm.activity_read_file:
+  en: "Reading %{target}"
+swarm.activity_write_file:
+  en: "Writing %{target}"
+swarm.activity_edit_file:
+  en: "Editing %{target}"
+swarm.activity_search:
+  en: "Searching %{target}"
+swarm.hive_scrubber:
+  en: Replay timeline
 usage.credits_remaining:
   en: "%{count} credits"
 usage_error.start_antigravity_probe:

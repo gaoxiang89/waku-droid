@@ -1,6 +1,6 @@
 //! Provider model and agent-preset discovery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, UntypedMessage};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde_json::{Map, Value, json};
 
 use crate::model::{ProviderAgentPreset, ProviderKind, ProviderModel, ProviderModelOption};
@@ -1268,6 +1268,62 @@ static ANTIGRAVITY_ACP_COMMANDS: OnceLock<
     Mutex<HashMap<AntigravityCommandCacheKey, Vec<SlashCommand>>>,
 > = OnceLock::new();
 
+#[derive(Default)]
+struct AntigravityModelProbeFlights {
+    active: HashSet<AntigravityCommandCacheKey>,
+}
+
+fn antigravity_model_probe_flights() -> &'static (Mutex<AntigravityModelProbeFlights>, Condvar) {
+    static FLIGHTS: OnceLock<(Mutex<AntigravityModelProbeFlights>, Condvar)> = OnceLock::new();
+    FLIGHTS.get_or_init(|| (Mutex::new(AntigravityModelProbeFlights::default()), Condvar::new()))
+}
+
+struct AntigravityModelProbeGuard {
+    key: AntigravityCommandCacheKey,
+}
+
+impl AntigravityModelProbeGuard {
+    fn enter(key: AntigravityCommandCacheKey) -> Self {
+        let (lock, _) = antigravity_model_probe_flights();
+        lock.lock().active.insert(key.clone());
+        Self { key }
+    }
+}
+
+impl Drop for AntigravityModelProbeGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = antigravity_model_probe_flights();
+        lock.lock().active.remove(&self.key);
+        cvar.notify_all();
+    }
+}
+
+fn wait_for_inflight_antigravity_acp_commands(
+    binary: &Path,
+    config_dir: Option<&Path>,
+    cache_key: &AntigravityCommandCacheKey,
+    timeout: Duration,
+) -> Option<Vec<SlashCommand>> {
+    let deadline = Instant::now() + timeout;
+    let (lock, cvar) = antigravity_model_probe_flights();
+    let mut guard = lock.lock();
+    loop {
+        if let Some(cached) = cached_antigravity_acp_commands_in(binary, config_dir) {
+            return Some(cached);
+        }
+        if !guard.active.contains(cache_key) {
+            return None;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return None;
+        };
+        if remaining.is_zero() {
+            return None;
+        }
+        cvar.wait_for(&mut guard, remaining);
+    }
+}
+
 fn antigravity_acp_commands_cache()
 -> &'static Mutex<HashMap<AntigravityCommandCacheKey, Vec<SlashCommand>>> {
     ANTIGRAVITY_ACP_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1321,6 +1377,8 @@ fn store_antigravity_acp_commands(
     antigravity_acp_commands_cache()
         .lock()
         .insert(cache_key.clone(), commands);
+    let (_, cvar) = antigravity_model_probe_flights();
+    cvar.notify_all();
 }
 
 fn parse_acp_available_commands(update: &AvailableCommandsUpdate) -> Vec<SlashCommand> {
@@ -1352,9 +1410,9 @@ fn parse_acp_available_commands(update: &AvailableCommandsUpdate) -> Vec<SlashCo
 }
 
 /// Returns Antigravity's ACP slash commands for `binary` scoped to
-/// `config_dir`, hitting the shared in-memory cache first and falling back to
-/// a single bounded `agy acp` probe (`initialize` → `session/new` → capture
-/// `available_commands_update` → `session/close`) when cold.
+/// `config_dir`, hitting the shared in-memory cache first (or waiting briefly on
+/// an in-flight model discovery probe for the same binary/config_dir) and
+/// falling back to a single bounded `agy acp` probe when cold.
 pub(crate) fn discover_antigravity_acp_commands_in(
     binary: &Path,
     config_dir: Option<&Path>,
@@ -1362,11 +1420,19 @@ pub(crate) fn discover_antigravity_acp_commands_in(
     if let Some(cached) = cached_antigravity_acp_commands_in(binary, config_dir) {
         return Some(cached);
     }
+    let cache_key = antigravity_command_cache_key(binary, config_dir);
+    if let Some(cached) = wait_for_inflight_antigravity_acp_commands(
+        binary,
+        config_dir,
+        &cache_key,
+        ANTIGRAVITY_COMMAND_PROBE_TIMEOUT,
+    ) {
+        return Some(cached);
+    }
     let cwd = crate::acp_session::catalog_working_directory().ok()?;
     let agent =
         crate::driver::acp::catalog_agent_in(ProviderKind::Antigravity, binary, &cwd, config_dir)
             .ok()?;
-    let cache_key = antigravity_command_cache_key(binary, config_dir);
     discover_antigravity_acp_commands_with_agent(
         agent,
         cwd,
@@ -1477,11 +1543,12 @@ fn discover_antigravity_models(
     binary: &Path,
     config_dir: Option<&Path>,
 ) -> Result<Vec<ProviderModel>, String> {
+    let cache_key = antigravity_command_cache_key(binary, config_dir);
+    let _flight = AntigravityModelProbeGuard::enter(cache_key.clone());
     let cwd = crate::acp_session::catalog_working_directory().map_err(|error| error.to_string())?;
     let agent =
         crate::driver::acp::catalog_agent_in(ProviderKind::Antigravity, binary, &cwd, config_dir)
             .map_err(|error| error.to_string())?;
-    let cache_key = antigravity_command_cache_key(binary, config_dir);
     discover_antigravity_models_with_agent(
         agent,
         cwd,
@@ -3201,6 +3268,35 @@ Authentication:
             cached_antigravity_acp_commands_in(&fake_binary, Some(&dir_b)),
             Some(cmd_b)
         );
+    }
+
+    #[test]
+    fn antigravity_command_probe_reuses_inflight_model_discovery_commands() {
+        let fake_binary = std::env::temp_dir().join(format!(
+            "waku-agy-inflight-reuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let key = antigravity_command_cache_key(&fake_binary, None);
+        let expected = vec![SlashCommand {
+            name: "boost".into(),
+            description: "Boost response quality".into(),
+            scope: CommandScope::Builtin,
+            argument_hint: Some("<task>".into()),
+            template: None,
+        }];
+
+        let flight_guard = AntigravityModelProbeGuard::enter(key.clone());
+        let expected_for_thread = expected.clone();
+        let publisher = std::thread::spawn(move || {
+            let _guard = flight_guard;
+            std::thread::sleep(Duration::from_millis(40));
+            store_antigravity_acp_commands(&key, expected_for_thread);
+        });
+
+        let discovered = discover_antigravity_acp_commands_in(&fake_binary, None)
+            .expect("command discovery must wait for in-flight model probe commands");
+        publisher.join().unwrap();
+        assert_eq!(discovered, expected);
     }
 
     #[test]

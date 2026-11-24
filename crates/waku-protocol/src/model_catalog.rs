@@ -58,8 +58,8 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         ProviderKind::Cursor => {
             vec![ProviderModel::new("auto", tr!("model_option.auto")).default()]
         }
-        ProviderKind::Antigravity
-        | ProviderKind::DeepSeek
+        ProviderKind::Antigravity => antigravity_fallback_models(),
+        ProviderKind::DeepSeek
         | ProviderKind::Droid
         | ProviderKind::Fx
         | ProviderKind::Grok
@@ -259,6 +259,43 @@ pub fn cursor_suffix_service_tier(suffix: &str, tiers: &[ProviderModelOption]) -
         .then(|| "fast".to_owned())
 }
 
+/// Curated fallback catalog mirroring `agy 1.5.16`'s model families and
+/// per-family `thought_level` options before ACP discovery completes.
+fn antigravity_fallback_models() -> Vec<ProviderModel> {
+    const EXTENDED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+    const STANDARD_EFFORTS: &[&str] = &["low", "medium", "high"];
+    let specs: &[(&str, &str, bool, Option<(&[&str], &str)>)] = &[
+        ("gemini-4-neon", "Gemini 4 Neon", true, Some((EXTENDED_EFFORTS, "high"))),
+        ("gemini-4-carbon", "Gemini 4 Carbon", false, Some((STANDARD_EFFORTS, "high"))),
+        ("gemini-4-argon", "Gemini 4 Argon", false, Some((STANDARD_EFFORTS, "high"))),
+        ("gemini-4-hydrogen", "Gemini 4 Hydrogen", false, Some((EXTENDED_EFFORTS, "high"))),
+        ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)", false, None),
+        ("gemini-pro-orchestrator", "Orchestrator (Carbon)", false, None),
+        ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)", false, None),
+        ("gemini-3.8-flash", "Gemini 3.8 Flash", false, Some((STANDARD_EFFORTS, "medium"))),
+        ("claude-opus-5-5", "Claude Opus 5.5", false, Some((STANDARD_EFFORTS, "medium"))),
+        ("claude-sonnet-5-5", "Claude Sonnet 5.5", false, Some((STANDARD_EFFORTS, "medium"))),
+        ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", false, None),
+    ];
+    specs
+        .iter()
+        .map(|&(id, name, is_default, reasoning)| {
+            let mut model = ProviderModel::new(id, name);
+            if is_default {
+                model = model.default();
+            }
+            if let Some((levels, default_level)) = reasoning {
+                let options: Vec<_> = levels
+                    .iter()
+                    .map(|level| ProviderModelOption::new(*level, reasoning_effort_label(level)))
+                    .collect();
+                model = model.reasoning(options, default_level);
+            }
+            model
+        })
+        .collect()
+}
+
 fn claude_reasoning_model(id: &str, name: &str) -> ProviderModel {
     ProviderModel::new(id, name).reasoning(
         reasoning_options(["low", "medium", "high", "xhigh", "max"]),
@@ -321,6 +358,53 @@ mod tests {
         // A fabricated fallback would offer a model the CLI rejects, so
         // discovery is authoritative and the pre-discovery picker is empty.
         assert!(fallback_models(ProviderKind::Grok).is_empty());
+    }
+
+    #[test]
+    fn antigravity_fallback_catalog_matches_agy_families_and_thought_levels() {
+        let models = fallback_models(ProviderKind::Antigravity);
+        assert_eq!(models.len(), 11);
+        let default = models
+            .iter()
+            .find(|model| model.is_default)
+            .expect("default Antigravity model missing");
+        assert_eq!(default.id, "gemini-4-neon");
+        assert_eq!(
+            default
+                .reasoning_efforts
+                .iter()
+                .map(|opt| opt.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(default.default_reasoning_effort.as_deref(), Some("high"));
+
+        let carbon = models.iter().find(|m| m.id == "gemini-4-carbon").unwrap();
+        assert_eq!(
+            carbon
+                .reasoning_efforts
+                .iter()
+                .map(|opt| opt.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(carbon.default_reasoning_effort.as_deref(), Some("high"));
+
+        let claude = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        assert_eq!(claude.default_reasoning_effort.as_deref(), Some("medium"));
+
+        for no_thinking in [
+            "gemini-pro-orchestrator-neon",
+            "gemini-pro-orchestrator",
+            "gemini-pro-orchestrator-argon",
+            "gpt-oss-120b-medium",
+        ] {
+            let model = models
+                .iter()
+                .find(|m| m.id == no_thinking)
+                .unwrap_or_else(|| panic!("missing model {no_thinking}"));
+            assert!(model.reasoning_efforts.is_empty());
+        }
     }
 
     #[test]

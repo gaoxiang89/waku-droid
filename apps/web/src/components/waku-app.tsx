@@ -873,6 +873,7 @@ export function WakuApp() {
     )
     return {
       ...createSession(projectId, preferences.lastProvider, false),
+      account_id: preferences.lastAccountId ?? null,
       model: preferences.lastModel,
       reasoning_effort: preferences.lastReasoningEffort,
       service_tier: preferences.lastServiceTier,

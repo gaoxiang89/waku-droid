@@ -4,4 +4,4 @@
  * Live lifecycle status of one swarm member, derived from `members.json` and
  * the member's `transcript.jsonl` tail.
  */
-export type AntigravitySwarmMemberStatus = "working" | "waiting" | "killed" | "failed";
+export type AntigravitySwarmMemberStatus = "working" | "waiting" | "stopped" | "killed" | "failed";
