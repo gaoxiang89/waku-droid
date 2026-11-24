@@ -14,6 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.54]
+
+- Expand Antigravity support with slash commands (`/boost`, `/swarm`, `/plan`, `/usage`, `/quota`, `/credits`, `/model`, `/effort`), Swarm Board and Hive honeycomb visualization with timeline replay, branch fork and turn rewind, multi-account profiles, live quota and token/cost usage history, Windows native session listing, and `agy` 1.5 error reporting
+- Improve Factory Droid integration with sessionless model discovery, local slash commands (`/model`, `/reasoning`, `/effort`, `/autonomy`, `/new`, `/clear`), autonomy badges, refined tool activity and spec approval handling, and capability-gated rollback and fork actions across desktop, web, and mobile
+- Harden ACP and Swarm lifecycle reliability with bounded initialize/cancel timeouts, `@`-mention path confinement, preserved failed tool-call states, and improved Swarm detection and persistence
+- Retire exited PTY runtimes cleanly on shell exit, preserve panel layouts across host disconnects while surfacing remote terminal failures, and symlink the release `waku` CLI shim into `~/.local/bin` on Unix
+
 ## [0.1.53]
 
 - Open workspaces from a terminal with the new `waku` command: `waku .`, `waku <path>`, and `waku --host ssh:<alias>` / `wsl:<distro> <path>` focus a running window (or launch Waku) and open the folder locally or on a remote host. The Windows installer adds `bin\` to the user `PATH` by default, Linux installs link `waku` onto `PATH`, and `waku-daemon bridge` stages a remote `waku` shim for connected SSH and WSL hosts
