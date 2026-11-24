@@ -1384,8 +1384,15 @@ where
                         responder.respond(cancelled_elicitation_response())?;
                         return Ok(Handled::Yes);
                     };
-                    let questions =
-                        elicitation_user_input_questions(&request.message, &form.requested_schema);
+                    // A required property Waku cannot render could never be
+                    // answered, so a partial form would send the agent an
+                    // incomplete `accept`. Decline it instead.
+                    let questions = if elicitation_has_unrenderable_required(&form.requested_schema)
+                    {
+                        Vec::new()
+                    } else {
+                        elicitation_user_input_questions(&request.message, &form.requested_schema)
+                    };
                     if questions.is_empty() {
                         responder.respond(cancelled_elicitation_response())?;
                         return Ok(Handled::Yes);
@@ -2087,8 +2094,24 @@ where
                                     let _ = responder.respond(response);
                                 }
                                 PendingAcpUserInput::Elicitation { request, responder } => {
-                                    let _ = responder
-                                        .respond(elicitation_accept_response(&request, &answers));
+                                    if let Some(error) = elicitation_answer_error(&request, &answers)
+                                    {
+                                        // Ask again with the reason rather than send
+                                        // the agent a value its schema rejects.
+                                        let questions = elicitation_retry_questions(&request, &error);
+                                        pending_user_inputs.lock().insert(
+                                            request_id.clone(),
+                                            PendingAcpUserInput::Elicitation { request, responder },
+                                        );
+                                        let _ = events.send(DriverEvent::UserInputRequested {
+                                            request_id,
+                                            questions,
+                                        });
+                                    } else {
+                                        let _ = responder.respond(elicitation_accept_response(
+                                            &request, &answers,
+                                        ));
+                                    }
                                 }
                                 PendingAcpUserInput::Permission { request, responder } => {
                                     let _ = responder
@@ -5803,14 +5826,15 @@ fn elicitation_content_value(
                 "true" | "yes" | "1"
             ))
         }
-        ElicitationPropertySchema::Integer(_) => match first.parse::<i64>() {
-            Ok(value) => ElicitationContentValue::Integer(value),
-            Err(_) => ElicitationContentValue::String(first.to_owned()),
-        },
-        ElicitationPropertySchema::Number(_) => match first.parse::<f64>() {
-            Ok(value) => ElicitationContentValue::Number(value),
-            Err(_) => ElicitationContentValue::String(first.to_owned()),
-        },
+        // A value that does not parse is left out: sending a string for a
+        // numeric property would break the schema the agent declared.
+        // `elicitation_answer_error` asks again before this point.
+        ElicitationPropertySchema::Integer(_) => {
+            ElicitationContentValue::Integer(first.parse::<i64>().ok()?)
+        }
+        ElicitationPropertySchema::Number(_) => ElicitationContentValue::Number(
+            first.parse::<f64>().ok().filter(|value| value.is_finite())?,
+        ),
         ElicitationPropertySchema::Other(_) | &_ => return None,
     })
 }
@@ -6122,6 +6146,90 @@ fn handle_session_update(
         && !state.produced_content
         && kind == Some("agent_message_chunk")
         && update
+/// Whether a property the agent requires is one Waku cannot render.
+fn elicitation_has_unrenderable_required(
+    schema: &agent_client_protocol::schema::v1::ElicitationSchema,
+) -> bool {
+    schema.required.iter().flatten().any(|name| {
+        matches!(
+            schema.properties.get(name),
+            Some(ElicitationPropertySchema::Other(_))
+        )
+    })
+}
+
+fn range_error<T: PartialOrd + std::fmt::Display>(
+    value: T,
+    minimum: Option<T>,
+    maximum: Option<T>,
+) -> Option<String> {
+    match (minimum, maximum) {
+        (Some(min), Some(max)) if value < min || value > max => {
+            Some(tr!("user_input.out_of_range", min = min, max = max))
+        }
+        (Some(min), None) if value < min => Some(tr!("user_input.at_least", min = min)),
+        (None, Some(max)) if value > max => Some(tr!("user_input.at_most", max = max)),
+        _ => None,
+    }
+}
+
+/// The first submitted numeric answer the schema rejects, as the question id
+/// and a user-facing reason. Choice, boolean, and free-text answers cannot be
+/// invalid; the form only offers valid choices.
+fn elicitation_answer_error(
+    request: &CreateElicitationRequest,
+    submitted: &[UserInputAnswer],
+) -> Option<(String, String)> {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    for (name, property) in ordered_elicitation_properties(&form.requested_schema) {
+        let text = submitted
+            .iter()
+            .find(|answer| answer.question_id == name)
+            .and_then(|answer| {
+                answer
+                    .answers
+                    .iter()
+                    .map(|answer| answer.trim())
+                    .find(|answer| !answer.is_empty())
+            });
+        let Some(text) = text else { continue };
+        let error = match property {
+            ElicitationPropertySchema::Integer(schema) => match text.parse::<i64>() {
+                Ok(value) => range_error(value, schema.minimum, schema.maximum),
+                Err(_) => Some(tr!("user_input.invalid_integer")),
+            },
+            ElicitationPropertySchema::Number(schema) => {
+                match text.parse::<f64>().ok().filter(|value| value.is_finite()) {
+                    Some(value) => range_error(value, schema.minimum, schema.maximum),
+                    None => Some(tr!("user_input.invalid_number")),
+                }
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            return Some((name.to_owned(), error));
+        }
+    }
+    None
+}
+
+/// The form again, with the rejected question's text led by the reason.
+fn elicitation_retry_questions(
+    request: &CreateElicitationRequest,
+    error: &(String, String),
+) -> Vec<UserInputQuestion> {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return Vec::new();
+    };
+    let mut questions = elicitation_user_input_questions(&request.message, &form.requested_schema);
+    if let Some(question) = questions.iter_mut().find(|question| question.id == error.0) {
+        question.question = format!("{}\n\n{}", error.1, question.question);
+    }
+    questions
+}
+
             .pointer("/content/text")
             .and_then(Value::as_str)
             .is_some_and(fx_context_notice)
@@ -7449,6 +7557,71 @@ mod tests {
         assert!(omitted["content"].get("limit").is_none());
     }
 
+    #[test]
+    fn elicitation_numbers_are_validated_and_asked_again_instead_of_sent_as_strings() {
+        use agent_client_protocol::schema::v1::{
+            ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
+            IntegerPropertySchema, SessionId,
+        };
+
+        let schema = ElicitationSchema::new().property(
+            "limit",
+            IntegerPropertySchema::new()
+                .title("Limit")
+                .minimum(1)
+                .maximum(10),
+            true,
+        );
+        let request = CreateElicitationRequest::new(
+            ElicitationFormMode::new(
+                ElicitationSessionScope::new(SessionId::new("session-1")),
+                schema,
+            ),
+            "Pick a limit",
+        );
+        let answer = |text: &str| {
+            vec![UserInputAnswer {
+                question_id: "limit".into(),
+                answers: vec![text.into()],
+            }]
+        };
+
+        assert!(elicitation_answer_error(&request, &answer("5")).is_none());
+        for rejected in ["abc", "2.5", "0", "11"] {
+            let error = elicitation_answer_error(&request, &answer(rejected))
+                .unwrap_or_else(|| panic!("{rejected} should be rejected"));
+            assert_eq!(error.0, "limit");
+            let retry = elicitation_retry_questions(&request, &error);
+            assert!(retry[0].question.starts_with(&error.1));
+            assert!(retry[0].question.contains("Pick a limit"));
+        }
+        // Defence in depth: an unparsable value is never sent as a string.
+        let value = serde_json::to_value(elicitation_accept_response(&request, &answer("abc")))
+            .expect("elicitation response");
+        assert!(value["content"].get("limit").is_none());
+    }
+
+    #[test]
+    fn elicitation_with_an_unrenderable_required_property_is_declined() {
+        use agent_client_protocol::schema::v1::ElicitationSchema;
+
+        let schema: ElicitationSchema = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "blob": {"type": "object"},
+                "note": {"type": "string"}
+            },
+            "required": ["blob"]
+        }))
+        .expect("schema");
+        assert!(elicitation_has_unrenderable_required(&schema));
+        let optional: ElicitationSchema = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {"blob": {"type": "object"}, "note": {"type": "string"}}
+        }))
+        .expect("schema");
+        assert!(!elicitation_has_unrenderable_required(&optional));
+    }
     #[test]
     fn grok_question_response_keeps_native_labels_and_annotates_custom_text() {
         let params = json!({

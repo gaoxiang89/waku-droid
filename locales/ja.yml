@@ -1526,3 +1526,8 @@ commands.new_session_description: 新しいセッションを開始
 commands.autonomy_switched: "自律レベルを %{level} に設定しました"
 commands.autonomy_current: "現在の自律レベル: %{level}（選択可能: %{options}）"
 commands.autonomy_invalid: "無効な自律レベル \"%{level}\"（選択可能: %{options}）"
+user_input.invalid_integer: 整数を入力してください。
+user_input.invalid_number: 数値を入力してください。
+user_input.out_of_range: "%{min} から %{max} の間の値を入力してください。"
+user_input.at_least: "%{min} 以上の値を入力してください。"
+user_input.at_most: "%{max} 以下の値を入力してください。"

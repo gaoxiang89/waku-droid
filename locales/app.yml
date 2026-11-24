@@ -2998,3 +2998,13 @@ commands.autonomy_current:
   en: "Autonomy level: %{level} (available: %{options})"
 commands.autonomy_invalid:
   en: "Unknown autonomy level \"%{level}\" (available: %{options})"
+user_input.invalid_integer:
+  en: Enter a whole number.
+user_input.invalid_number:
+  en: Enter a number.
+user_input.out_of_range:
+  en: "Enter a value between %{min} and %{max}."
+user_input.at_least:
+  en: "Enter a value of at least %{min}."
+user_input.at_most:
+  en: "Enter a value of at most %{max}."

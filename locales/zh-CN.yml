@@ -1473,3 +1473,8 @@ commands.new_session_description: 开始新会话
 commands.autonomy_switched: "自治级别已设为 %{level}"
 commands.autonomy_current: "当前自治级别：%{level}（可选：%{options}）"
 commands.autonomy_invalid: "无效的自治级别 \"%{level}\"（可选：%{options}）"
+user_input.invalid_integer: 请输入整数。
+user_input.invalid_number: 请输入数字。
+user_input.out_of_range: "请输入 %{min} 到 %{max} 之间的值。"
+user_input.at_least: "请输入不小于 %{min} 的值。"
+user_input.at_most: "请输入不大于 %{max} 的值。"

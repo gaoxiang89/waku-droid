@@ -321,7 +321,17 @@ impl Waku {
                 let is_selected = selected.iter().any(|answer| answer == &option.label);
                 let question_id = question.id.clone();
                 let key_question_id = question.id.clone();
+            // Arrow keys move between the choices of one question.
+            let option_focuses = (0..question.options.len())
+                .map(|index| {
+                    self.transcript_control_focus(
+                        format!("user-input-{request_id}-{}-option-{index}", question.id),
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>();
                 let click_label = option.label.clone();
+                let option_focuses = option_focuses.clone();
                 let key_label = option.label.clone();
                 let focus = self.transcript_control_focus(
                     format!("user-input-{request_id}-{}-option-{index}", question.id),
@@ -436,16 +446,34 @@ impl Waku {
                                 cx,
                             );
                         }))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                this.select_user_input_option(
-                                    key_question_id.clone(),
-                                    key_label.clone(),
-                                    cx,
-                                );
+                        .on_key_down(cx.listener(
+                            move |this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.modifiers.modified() {
+                                    return;
+                                }
+                                let last = option_focuses.len().saturating_sub(1);
+                                let target = match event.keystroke.key.as_str() {
+                                    "enter" | "space" => {
+                                        this.select_user_input_option(
+                                            key_question_id.clone(),
+                                            key_label.clone(),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                        return;
+                                    }
+                                    "down" | "right" => (index + 1).min(last),
+                                    "up" | "left" => index.saturating_sub(1),
+                                    "home" => 0,
+                                    "end" => last,
+                                    _ => return,
+                                };
+                                if let Some(focus) = option_focuses.get(target) {
+                                    window.focus(focus, cx);
+                                }
                                 cx.stop_propagation();
-                            }
-                        })),
+                            },
+                        )),
                 );
             }
             let custom = question.accepts_custom.then(|| {
@@ -595,6 +623,14 @@ impl Waku {
                     div()
                         .id("user-input-fields")
                         .max_h(px(420.0))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    // Same as the Cancel button, so the form is never keyboard-only
+                    // dismissible through Tab order alone.
+                    if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                        this.cancel_turn(cx);
+                        cx.stop_propagation();
+                    }
+                }))
                         .overflow_y_scroll()
                         .child(fields),
                 )
