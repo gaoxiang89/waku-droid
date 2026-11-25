@@ -72,6 +72,7 @@ interface RuntimeEntry extends MobileRuntime {
    * query is evicted. Never fall back to the snapshot captured on attach. */
   session: AgentSession;
   lastDriverError: string | null;
+  userInputRevision: number;
   unsubscribe: () => void;
   /** Buffered runtime events awaiting the next commit. */
   pending: SequencedEvent[];
@@ -333,6 +334,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       starting,
       running: sessionIsRunning(session),
       lastDriverError: null,
+      userInputRevision: 0,
       unsubscribe: () => {},
       pending: [],
       flushTimer: null,
@@ -416,6 +418,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         setPermissions((values) => ({ ...values, [session.id]: result.permission ?? undefined }));
       }
       if (result.userInput !== undefined) {
+        entry.userInputRevision += 1;
         setUserInputs((values) => ({ ...values, [session.id]: result.userInput ?? undefined }));
       }
       if (result.error) setErrors((values) => ({ ...values, [session.id]: result.error }));
@@ -835,13 +838,16 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const client = daemon.client;
     const runtime = entries.current.get(sessionId);
     if (!client || !runtime) throw new Error('This task has no live agent runtime');
+    const revision = runtime.userInputRevision;
     await client.request(
       { type: 'respondUserInput', requestId, answers },
       sessionId,
       runtime.runtimeId,
     );
-    setUserInputs((values) => ({ ...values, [sessionId]: undefined }));
-    markWorking(sessionId);
+    if (entries.current.get(sessionId) === runtime && runtime.userInputRevision === revision) {
+      setUserInputs((values) => ({ ...values, [sessionId]: undefined }));
+      markWorking(sessionId);
+    }
   }, [daemon.client, markWorking]);
 
   /** Change model traits / access mode. Applied live via

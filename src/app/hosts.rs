@@ -51,9 +51,28 @@ impl Waku {
         &self,
         session: &AgentSession,
     ) -> Option<&ProviderProbe> {
-        self.provider_probes_for_host(&self.hosts.ownership.session(session.id))
+        self.provider_probe_for_account(
+            &self.hosts.ownership.session(session.id),
+            session.provider,
+            session.account_id.as_deref(),
+        )
+    }
+
+    pub(super) fn provider_probe_for_account(
+        &self,
+        key: &HostKey,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+    ) -> Option<&ProviderProbe> {
+        if *key == HostKey::Local
+            && let Some(probe) = account_id
+                .and_then(|id| self.local_account_probes.get(&provider)?.get(id))
+        {
+            return Some(probe);
+        }
+        self.provider_probes_for_host(key)
             .iter()
-            .find(|probe| probe.provider == session.provider)
+            .find(|probe| probe.provider == provider)
     }
 
     pub(super) fn pending_model_discoveries(&self) -> &HashSet<ProviderKind> {

@@ -124,6 +124,16 @@ export function parseGoalSubmission(
   }
 }
 
+export function isCodexUsageSubmission(
+  provider: ProviderKind,
+  prompt: string,
+  commands: SlashCommand[],
+): boolean {
+  return provider === 'codex'
+    && prompt.trim() === '/usage'
+    && !commandIsOverridden('usage', '', commands)
+}
+
 export type AntigravityLocalCommand =
   | { kind: 'usage' }
   | { kind: 'modelPicker' }

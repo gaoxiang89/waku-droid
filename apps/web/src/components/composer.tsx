@@ -61,6 +61,7 @@ import {
   composerAutocompleteRows,
   detectComposerTrigger,
   expandedComposerSubmission,
+  isCodexUsageSubmission,
   isFastModeToggleSubmission,
   isResumeSubmission,
   mergeComposerCommands,
@@ -392,7 +393,15 @@ export function Composer({
     return executeResumeCommand(submittedPrompt)
       || executeFastModeToggle(submittedPrompt)
       || executeGoalCommand(submittedPrompt)
+      || executeCodexUsageCommand(submittedPrompt)
       || executeAntigravityCommand(submittedPrompt, fromAutocomplete)
+  }
+
+  function executeCodexUsageCommand(submittedPrompt: string): boolean {
+    if (!isCodexUsageSubmission(session.provider, submittedPrompt, availableCommands)) return false
+    clearComposerDraft()
+    setLocalUsagePanelSignal((value) => value + 1)
+    return true
   }
 
   function applyModelSelection(
@@ -2020,6 +2029,7 @@ function UsageMeter({
   const { locale, t } = useI18n()
   const { client, config } = useDaemon()
   const settings = useDaemonSettings()
+  const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const usageShortcut = usePrimaryShortcut('⌘U', 'Ctrl+U')
   const context = session.context_usage
@@ -2054,8 +2064,14 @@ function UsageMeter({
 
   useEffect(() => {
     if (!forceOpenSignal) return
+    if (session.provider === 'codex' && config?.address) {
+      void queryClient.invalidateQueries({
+        queryKey: daemonKeys.planUsage(config.address, session.provider, accountId),
+        exact: true,
+      })
+    }
     setOpen(true)
-  }, [forceOpenSignal])
+  }, [accountId, config?.address, forceOpenSignal, queryClient, session.provider])
 
   const error = plan.error ? errorMessage(plan.error) : null
   const tooltip = error

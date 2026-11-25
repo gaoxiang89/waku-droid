@@ -1355,9 +1355,10 @@ pub struct Waku {
         ProviderKind,
         Option<ProviderProbe>,
     )>,
-    provider_probe_tx: Sender<(u64, ProviderProbe)>,
-    provider_probe_events: Receiver<(u64, ProviderProbe)>,
-    provider_model_discoveries: HashSet<ProviderKind>,
+    provider_probe_tx: Sender<(u64, Option<String>, ProviderProbe)>,
+    provider_probe_events: Receiver<(u64, Option<String>, ProviderProbe)>,
+    local_account_probes: HashMap<ProviderKind, HashMap<String, ProviderProbe>>,
+    provider_model_discoveries: HashMap<ProviderKind, Option<String>>,
     provider_model_discoveries_pending: HashSet<ProviderKind>,
     /// CLI version per provider, probed off-thread. Missing key means the
     /// probe has not answered yet; `None` means it ran and found nothing.
@@ -3507,7 +3508,8 @@ impl Waku {
                 host_catalog_events,
                 provider_probe_tx,
                 provider_probe_events,
-                provider_model_discoveries: HashSet::new(),
+                local_account_probes: HashMap::new(),
+                provider_model_discoveries: HashMap::new(),
                 provider_model_discoveries_pending: HashSet::new(),
                 provider_versions: HashMap::new(),
                 provider_version_tx,

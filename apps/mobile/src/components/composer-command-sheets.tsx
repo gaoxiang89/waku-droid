@@ -10,6 +10,7 @@ import {
   type ThreadGoal,
 } from '@waku/client';
 import {
+  isCodexUsageSubmission,
   isFastModeToggleSubmission,
   isResumeSubmission,
   parseAntigravityLocalCommand,
@@ -152,6 +153,8 @@ export function useComposerLocalCommands({
 
     if (isResumeSubmission(prompt)) {
       setResumeOpen(true);
+    } else if (isCodexUsageSubmission(provider, prompt, commands)) {
+      setUsageOpen(true);
     } else if (isFastModeToggleSubmission(provider, prompt, commands)) {
       const tier = toggledFastServiceTier(serviceTier, model?.service_tiers ?? []);
       if (!tier) throw new Error('Fast mode is unavailable for this model');
@@ -399,6 +402,7 @@ function PlanUsageSheet({
     queryFn: () => fetchPlanUsage(daemon.client!, provider, settings.data!, providerVersion, accountId),
     enabled: daemon.phase === 'connected' && Boolean(daemon.client && settings.data),
     staleTime: 30_000,
+    refetchOnMount: provider === 'codex' ? 'always' : true,
   });
 
   return (

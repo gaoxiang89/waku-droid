@@ -3,6 +3,7 @@ import type { ProviderModel, ReportedCommand, SlashCommand } from './generated'
 import {
   antigravityLocalCommandExecutesOnAccept,
   mergeComposerCommands,
+  isCodexUsageSubmission,
   parseAntigravityLocalCommand,
   resolveProviderEffort,
   resolveProviderModel,
@@ -104,6 +105,17 @@ describe('mergeComposerCommands', () => {
       },
     ])
   })
+})
+
+test('Codex /usage only intercepts bare commands without an override', () => {
+  const builtin: SlashCommand = {
+    name: 'usage', scope: 'Builtin', description: '', argument_hint: null, template: null,
+  }
+  expect(isCodexUsageSubmission('codex', '/usage', [])).toBe(true)
+  expect(isCodexUsageSubmission('codex', '  /usage  ', [builtin])).toBe(true)
+  expect(isCodexUsageSubmission('claude', '/usage', [builtin])).toBe(false)
+  expect(isCodexUsageSubmission('codex', '/usage details', [builtin])).toBe(false)
+  expect(isCodexUsageSubmission('codex', '/usage', [builtin, { ...builtin, scope: 'User' }])).toBe(false)
 })
 
 describe('parseAntigravityLocalCommand', () => {

@@ -1081,7 +1081,8 @@ impl Waku {
             self.validated_account_id_for_host(&host_key, provider, session.account_id.as_deref())
         });
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
-        let base_model_name = self.model_display_name(provider, selected_model);
+        let base_model_name =
+            self.model_display_name(provider, session_account_id.as_deref(), selected_model);
         let selected_model_name = if let Some(account) =
             self.account_for_host(&host_key, provider, session_account_id.as_deref())
         {
@@ -1227,12 +1228,24 @@ impl Waku {
                 &disabled_providers,
                 &host_accounts,
                 &active_accounts,
+                (host_key == waku_client::hosts::HostKey::Local)
+                    .then_some(&self.local_account_probes),
                 selected_tab,
                 &normalized_query,
             )
         } else {
             Vec::new()
         });
+        let discovery_error = match selected_tab {
+            ModelPickerTab::Provider(provider) => self
+                .provider_probe_for_account(
+                    &host_key,
+                    provider,
+                    active_accounts.get(&provider).and_then(Option::as_deref),
+                )
+                .and_then(|probe| probe.discovery_error.clone()),
+            ModelPickerTab::Favorites => None,
+        };
         let highlight = self
             .model_picker_highlight
             .filter(|index| *index < available_models.len());
@@ -1566,12 +1579,7 @@ impl Waku {
                             if pending_discoveries.contains(&provider)
                     ) {
                         tr!("models.loading")
-                    } else if let ModelPickerTab::Provider(provider) = selected_tab
-                        && let Some(error) = probes
-                            .iter()
-                            .find(|probe| probe.provider == provider)
-                            .and_then(|probe| probe.discovery_error.as_deref())
-                    {
+                    } else if let Some(error) = discovery_error.as_deref() {
                         tr!("models.discovery_failed", error = error)
                     } else {
                         tr!("models.none_reported")
@@ -1862,8 +1870,10 @@ impl Waku {
         }
         self.model_picker_account.insert(provider, validated);
         self.model_picker_highlight = None;
-        if provider == ProviderKind::Antigravity {
-            self.provider_model_discoveries_pending.remove(&provider);
+        if provider == ProviderKind::Antigravity
+            || (host_key == waku_client::hosts::HostKey::Local
+                && provider.supports_multiple_accounts())
+        {
             self.refresh_provider_model_discovery(provider);
         }
         self.reveal_selected_picker_model();
@@ -1933,6 +1943,7 @@ impl Waku {
             &disabled,
             &accounts,
             &self.model_picker_account,
+            (host_key == waku_client::hosts::HostKey::Local).then_some(&self.local_account_probes),
             self.model_picker_tab,
             "",
         )
@@ -2771,6 +2782,7 @@ impl Waku {
         self.execute_resume_composer_command(prompt, cx)
             || self.execute_fast_mode_toggle(prompt, cx)
             || self.execute_goal_composer_command(prompt, cx)
+            || self.execute_codex_usage_command(prompt, cx)
             || self.execute_antigravity_local_command(prompt, from_autocomplete, cx)
             || self.execute_droid_local_command(prompt, from_autocomplete, cx)
     }
@@ -2803,7 +2815,13 @@ impl Waku {
         let models = self
             .selected_session()
             .and_then(|session| self.provider_probe_for_session(session))
-            .or_else(|| self.provider_probe(provider))
+            .or_else(|| {
+                self.provider_probe_for_account(
+                    &self.selected_host_key(),
+                    provider,
+                    account_id.as_deref(),
+                )
+            })
             .map(|probe| probe.models.clone())
             .unwrap_or_default();
         if let Some((model_id, model_name)) = resolve_provider_model(&models, &query) {
@@ -2841,7 +2859,11 @@ impl Waku {
                     session.reasoning_effort.as_deref(),
                 ),
                 None => {
-                    let probe = self.provider_probe(provider);
+                    let probe = self.provider_probe_for_account(
+                        &self.selected_host_key(),
+                        provider,
+                        self.state.last_account_id.as_deref(),
+                    );
                     let model = probe.and_then(|probe| {
                         self.state
                             .last_model
@@ -2908,13 +2930,19 @@ impl Waku {
     ) {
         let efforts = match self.selected_session() {
             Some(session) => self.model_metadata_for_session(session),
-            None => self.provider_probe(provider).and_then(|probe| {
-                self.state
-                    .last_model
-                    .as_deref()
-                    .and_then(|id| probe.model(id))
-                    .or_else(|| probe.preferred_model())
-            }),
+            None => self
+                .provider_probe_for_account(
+                    &self.selected_host_key(),
+                    provider,
+                    self.state.last_account_id.as_deref(),
+                )
+                .and_then(|probe| {
+                    self.state
+                        .last_model
+                        .as_deref()
+                        .and_then(|id| probe.model(id))
+                        .or_else(|| probe.preferred_model())
+                }),
         }
         .map(|model| model.reasoning_efforts.clone())
         .unwrap_or_default();
@@ -2947,6 +2975,38 @@ impl Waku {
             ));
             cx.notify();
         }
+    }
+
+    fn execute_codex_usage_command(&mut self, prompt: &str, cx: &mut Context<Self>) -> bool {
+        let (provider, session_account_id) = match self.selected_session() {
+            Some(session) => (session.provider, session.account_id.as_deref()),
+            None => (self.state.last_provider, self.state.last_account_id.as_deref()),
+        };
+        if !crate::composer_complete::is_codex_usage_submission(
+            provider,
+            prompt,
+            &self.slash_command_index,
+        ) {
+            return false;
+        }
+        let host = self.selected_host_key();
+        let account_id = self.validated_account_id_for_host(&host, provider, session_account_id);
+        self.open_composer_usage(host, provider, account_id, cx);
+        true
+    }
+
+    fn open_composer_usage(
+        &mut self,
+        host: waku_client::hosts::HostKey,
+        provider: ProviderKind,
+        account_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.usage_settings_host = host.clone();
+        self.usage_view = UsageViewMode::Daily;
+        self.refresh_plan_usage_now(&host, provider, account_id, cx);
+        self.open_settings_page(SettingsPage::Usage, cx);
     }
 
     /// Bridge Antigravity's CLI-local commands (`/usage`, `/quota`, `/credits`,
@@ -2994,11 +3054,7 @@ impl Waku {
 
         match command {
             AntigravityLocalCommand::Usage => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
-                self.usage_settings_host = host.clone();
-                self.usage_view = UsageViewMode::Daily;
-                self.refresh_plan_usage_now(&host, ProviderKind::Antigravity, account_id, cx);
-                self.open_settings_page(SettingsPage::Usage, cx);
+                self.open_composer_usage(host, ProviderKind::Antigravity, account_id, cx);
             }
             AntigravityLocalCommand::ModelPicker => {
                 self.execute_provider_model_picker(can_choose_model, cx);
@@ -5003,6 +5059,7 @@ pub(super) fn visible_picker_models(
         disabled_providers,
         &[],
         &HashMap::new(),
+        None,
         selected_tab,
         normalized_query,
     )
@@ -5011,12 +5068,14 @@ pub(super) fn visible_picker_models(
     .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn visible_picker_entries(
     probes: &[ProviderProbe],
     favorites: &[FavoriteModel],
     disabled_providers: &[ProviderKind],
     accounts: &[waku_client::ProviderAccount],
     active_accounts: &HashMap<ProviderKind, Option<String>>,
+    account_probes: Option<&HashMap<ProviderKind, HashMap<String, ProviderProbe>>>,
     selected_tab: ModelPickerTab,
     normalized_query: &str,
 ) -> Vec<PickerModelEntry> {
@@ -5073,7 +5132,14 @@ pub(super) fn visible_picker_entries(
         };
 
         for (account_id, account_label) in account_targets {
-            for model in &probe.models {
+            let account_probe = account_id
+                .as_deref()
+                .and_then(|id| account_probes?.get(&kind)?.get(id))
+                .unwrap_or(probe);
+            if !account_probe.installed {
+                continue;
+            }
+            for model in &account_probe.models {
                 if searching {
                     let searchable = format!(
                         "{} {} {} {} {}",

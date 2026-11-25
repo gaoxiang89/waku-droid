@@ -1720,19 +1720,19 @@ impl Waku {
     fn local_provider_discovery_scope(
         &self,
         provider: ProviderKind,
+        account_id: Option<&str>,
     ) -> (Option<String>, Option<String>) {
-        let account_id = self.active_local_provider_account_id(provider);
         let binary_override = self.effective_binary_override_for_host(
             &waku_client::hosts::HostKey::Local,
             provider,
-            account_id.as_deref(),
+            account_id,
         );
         let config_dir = (provider == ProviderKind::Antigravity)
             .then(|| {
                 self.effective_config_dir_for_host(
                     &waku_client::hosts::HostKey::Local,
                     provider,
-                    account_id.as_deref(),
+                    account_id,
                 )
             })
             .flatten();
@@ -1740,9 +1740,10 @@ impl Waku {
     }
 
     fn request_local_provider_model_discovery(&mut self, provider: ProviderKind) {
+        let account_id = self.active_local_provider_account_id(provider);
         if self.state.disabled_providers.contains(&provider)
             || !provider.supports_model_discovery()
-            || self.provider_model_discoveries.contains(&provider)
+            || self.provider_model_discoveries.get(&provider) == Some(&account_id)
         {
             return;
         }
@@ -1755,13 +1756,27 @@ impl Waku {
         else {
             return;
         };
-        self.provider_model_discoveries.insert(provider);
+        let fallback = match account_id.as_deref() {
+            Some(id) => self
+                .local_account_probes
+                .get(&provider)
+                .and_then(|probes| probes.get(id))
+                .cloned()
+                .unwrap_or(ProviderProbe {
+                    installed: false,
+                    path: None,
+                    ..probe
+                }),
+            None => probe,
+        };
+        self.provider_model_discoveries.insert(provider, account_id.clone());
         self.provider_model_discoveries_pending.insert(provider);
         let generation = self.provider_probe_state.begin_discovery(provider);
         let provider_probe_tx = self.provider_probe_tx.clone();
         let event_wake = self.event_wake_tx.clone();
         let daemon = self.daemon.client();
-        let (binary_override, config_dir) = self.local_provider_discovery_scope(provider);
+        let (binary_override, config_dir) =
+            self.local_provider_discovery_scope(provider, account_id.as_deref());
         if std::thread::Builder::new()
             .name(format!("waku-{}-model-discovery", provider.id()))
             .spawn(move || {
@@ -1776,15 +1791,46 @@ impl Waku {
                         config_dir,
                     },
                 ) {
-                    Ok(waku_client::ResponsePayload::ProviderProbe { probe, .. }) => probe,
-                    _ => probe,
+                    Ok(waku_client::ResponsePayload::ProviderProbe { mut probe, .. }) => {
+                        if account_id.is_some() && !probe.installed {
+                            probe.discovery_error = Some(tr!(
+                                "errors.provider_not_found",
+                                provider = provider.display_name()
+                            ));
+                        }
+                        probe
+                    }
+                    Err(error) if account_id.is_some() => ProviderProbe {
+                        discovery_error: Some(error.to_string()),
+                        ..fallback
+                    },
+                    _ => fallback,
                 };
-                if provider_probe_tx.send((generation, discovered)).is_ok() {
+                if provider_probe_tx
+                    .send((generation, account_id, discovered))
+                    .is_ok()
+                {
                     signal_event_pump(&event_wake);
                 }
             })
             .is_err()
         {
+            self.provider_model_discoveries.remove(&provider);
+            self.provider_model_discoveries_pending.remove(&provider);
+        }
+    }
+
+    pub(super) fn invalidate_local_account_probe(&mut self, provider: ProviderKind, account_id: &str) {
+        if let Some(probes) = self.local_account_probes.get_mut(&provider) {
+            probes.remove(account_id);
+        }
+        if self
+            .provider_model_discoveries
+            .get(&provider)
+            .and_then(Option::as_deref)
+            == Some(account_id)
+        {
+            self.provider_probe_state.begin_discovery(provider);
             self.provider_model_discoveries.remove(&provider);
             self.provider_model_discoveries_pending.remove(&provider);
         }
@@ -1804,7 +1850,10 @@ impl Waku {
             self.refresh_host_catalog(key, Some(provider), true);
             return;
         }
-        if self.provider_model_discoveries_pending.contains(&provider) {
+        let account_id = self.active_local_provider_account_id(provider);
+        if self.provider_model_discoveries_pending.contains(&provider)
+            && self.provider_model_discoveries.get(&provider) == Some(&account_id)
+        {
             return;
         }
         self.provider_model_discoveries.remove(&provider);
@@ -1968,6 +2017,7 @@ impl Waku {
         // clearing the per-launch guards lets each one's catalog discovery and
         // version probe run again as its detection lands below.
         for provider in providers {
+            self.local_account_probes.remove(&provider);
             self.provider_model_discoveries.remove(&provider);
             self.provider_model_discoveries_pending.remove(&provider);
             self.provider_version_probes_pending.remove(&provider);
@@ -2085,11 +2135,16 @@ impl Waku {
         })
     }
 
-    pub(super) fn model_display_name(&self, provider: ProviderKind, model: Option<&str>) -> String {
+    pub(super) fn model_display_name(
+        &self,
+        provider: ProviderKind,
+        account_id: Option<&str>,
+        model: Option<&str>,
+    ) -> String {
         let Some(model) = model else {
             return provider.short_name().to_owned();
         };
-        self.provider_probe(provider)
+        self.provider_probe_for_account(&self.selected_host_key(), provider, account_id)
             .and_then(|probe| probe.model(model))
             .map(|candidate| candidate.name.clone())
             .unwrap_or_else(|| model.to_owned())
@@ -4593,7 +4648,7 @@ impl Waku {
 
     pub(super) fn drain_provider_probe_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((generation, probe)) = self.provider_probe_events.try_recv() {
+        while let Ok((generation, account_id, probe)) = self.provider_probe_events.try_recv() {
             if !self
                 .provider_probe_state
                 .accept_discovery(generation, probe.provider)
@@ -4602,7 +4657,12 @@ impl Waku {
             }
             self.provider_model_discoveries_pending
                 .remove(&probe.provider);
-            if let Some(existing) = self
+            if let Some(account_id) = account_id {
+                self.local_account_probes
+                    .entry(probe.provider)
+                    .or_default()
+                    .insert(account_id, probe);
+            } else if let Some(existing) = self
                 .probes
                 .iter_mut()
                 .find(|existing| existing.provider == probe.provider)

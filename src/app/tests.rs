@@ -2227,6 +2227,7 @@ fn model_picker_entries_expand_accounts_in_search_and_filter_provider_tab_by_acc
         &[],
         &accounts,
         &no_active,
+        None,
         ModelPickerTab::Provider(ProviderKind::Claude),
         "",
     );
@@ -2243,6 +2244,7 @@ fn model_picker_entries_expand_accounts_in_search_and_filter_provider_tab_by_acc
         &[],
         &accounts,
         &work_active,
+        None,
         ModelPickerTab::Provider(ProviderKind::Claude),
         "",
     );
@@ -2258,12 +2260,37 @@ fn model_picker_entries_expand_accounts_in_search_and_filter_provider_tab_by_acc
         &[],
         &accounts,
         &no_active,
+        None,
         ModelPickerTab::Favorites,
         "claude work",
     );
     assert_eq!(search_entries.len(), 1);
     assert_eq!(search_entries[0].provider, ProviderKind::Claude);
     assert_eq!(search_entries[0].account_id.as_deref(), Some("work"));
+
+    let account_probes = std::collections::HashMap::from([(
+        ProviderKind::Claude,
+        std::collections::HashMap::from([(
+            "work".into(),
+            ProviderProbe {
+                installed: false,
+                path: None,
+                ..probes[0].clone()
+            },
+        )]),
+    )]);
+    let all_entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &work_active,
+        Some(&account_probes),
+        ModelPickerTab::Provider(ProviderKind::Claude),
+        "sonnet",
+    );
+    assert_eq!(all_entries.len(), 1);
+    assert_eq!(all_entries[0].account_id, None);
 }
 
 #[test]

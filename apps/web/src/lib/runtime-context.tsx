@@ -58,6 +58,7 @@ interface RuntimeSummary {
 
 interface RuntimeEntry extends RuntimeSummary {
   lastDriverError: string | null
+  userInputRevision: number
   unsubscribe: () => void
 }
 
@@ -447,6 +448,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         supportsSteer: false,
         starting: true,
         lastDriverError: null,
+        userInputRevision: 0,
         unsubscribe: () => {},
       }
       entries.current.set(session.id, entry)
@@ -529,6 +531,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }))
         }
         if (result.userInput !== undefined) {
+          entry.userInputRevision += 1
           setUserInputs((previous) => ({
             ...previous,
             [session.id]: result.userInput ?? undefined,
@@ -1148,12 +1151,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (!client) throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
       const runtime = entries.current.get(sessionId)
       if (!runtime) throw new Error(translate(localeRef.current, 'errors.no_live_runtime'))
+      const revision = runtime.userInputRevision
       await client.request(
         { type: 'respondUserInput', requestId, answers },
         sessionId,
         runtime.runtimeId,
       )
-      setUserInputs((current) => ({ ...current, [sessionId]: undefined }))
+      if (entries.current.get(sessionId) === runtime && runtime.userInputRevision === revision) {
+        setUserInputs((current) => ({ ...current, [sessionId]: undefined }))
+      }
       const key = config && daemonKeys.session(config.address, sessionId)
       if (key) {
         const session = queryClient.getQueryData<AgentSession>(key)

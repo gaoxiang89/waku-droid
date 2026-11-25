@@ -240,6 +240,13 @@ fn assemble_slash_commands_with_home(
             }
         }
         ProviderKind::Codex => {
+            commands.push(SlashCommand {
+                name: "usage".to_owned(),
+                description: crate::i18n::translate("commands.usage_description"),
+                scope: CommandScope::Builtin,
+                argument_hint: None,
+                template: None,
+            });
             scan_skill_files(provider, &project_root.join(".codex/skills"), &mut commands);
             if let Some(config_dir) = codex_config_dir.as_deref() {
                 scan_command_files(

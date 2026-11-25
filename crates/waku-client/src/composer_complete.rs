@@ -99,6 +99,17 @@ pub fn is_resume_submission(prompt: &str) -> bool {
     prompt.trim() == "/resume"
 }
 
+/// Whether to open the Codex account's usage view from the composer.
+pub fn is_codex_usage_submission(
+    provider: ProviderKind,
+    prompt: &str,
+    commands: &[SlashCommand],
+) -> bool {
+    provider == ProviderKind::Codex
+        && prompt.trim() == "/usage"
+        && !command_is_overridden("usage", "", commands)
+}
+
 /// Whether the submitted text resolves to Codex's native fast-mode command,
 /// which Waku bridges to the provider's service-tier control. Checking the
 /// resolved entry preserves project/user command precedence when one of them
@@ -681,6 +692,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn codex_usage_respects_provider_arguments_and_overrides() {
+        let builtin = command("usage", CommandScope::Builtin);
+        assert!(is_codex_usage_submission(
+            ProviderKind::Codex,
+            "/usage",
+            &[]
+        ));
+        assert!(is_codex_usage_submission(
+            ProviderKind::Codex,
+            "  /usage  ",
+            std::slice::from_ref(&builtin),
+        ));
+        assert!(!is_codex_usage_submission(
+            ProviderKind::Claude,
+            "/usage",
+            &[]
+        ));
+        assert!(!is_codex_usage_submission(
+            ProviderKind::Codex,
+            "/usage details",
+            &[]
+        ));
+        assert!(!is_codex_usage_submission(
+            ProviderKind::Codex,
+            "/usage",
+            &[builtin, command("usage", CommandScope::User)],
+        ));
     }
 
     fn command(name: &str, scope: CommandScope) -> SlashCommand {

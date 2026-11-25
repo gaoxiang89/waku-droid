@@ -2921,16 +2921,18 @@ impl Waku {
             }
         };
 
+        if local {
+            self.invalidate_local_account_probe(kind, &updated_id);
+        }
         let usage_key = (host_key.clone(), kind, Some(updated_id));
         self.plan_usage_unconfigured.remove(&usage_key);
         self.plan_usage_stale.insert(usage_key);
         self.cancel_provider_account_form(cx);
         self.invalidate_composer_sources(cx);
         self.invalidate_skills_catalog_for_host(&host_key, cx);
-        if kind == ProviderKind::Antigravity && host_key == self.selected_host_key() {
-            if local {
-                self.provider_model_discoveries_pending.remove(&kind);
-            }
+        if (local && kind.supports_model_discovery() || kind == ProviderKind::Antigravity)
+            && host_key == self.selected_host_key()
+        {
             self.refresh_provider_model_discovery(kind);
         }
         self.maybe_refresh_plan_usage(cx);
@@ -2964,6 +2966,7 @@ impl Waku {
             self.state
                 .provider_accounts
                 .retain(|account| !(account.provider == kind && account.id == account_id));
+            self.invalidate_local_account_probe(kind, &account_id);
         } else if !self.mutate_remote_provider_accounts(&host_key, |accounts| {
             accounts.retain(|account| !(account.provider == kind && account.id == account_id));
         }) {
@@ -3022,10 +3025,9 @@ impl Waku {
         }
         self.invalidate_composer_sources(cx);
         self.invalidate_skills_catalog_for_host(&host_key, cx);
-        if kind == ProviderKind::Antigravity && host_key == self.selected_host_key() {
-            if local {
-                self.provider_model_discoveries_pending.remove(&kind);
-            }
+        if (local && kind.supports_model_discovery() || kind == ProviderKind::Antigravity)
+            && host_key == self.selected_host_key()
+        {
             self.refresh_provider_model_discovery(kind);
         }
         self.maybe_refresh_plan_usage(cx);
