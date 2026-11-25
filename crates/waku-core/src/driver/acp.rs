@@ -2209,7 +2209,8 @@ where
                         request_id,
                         option_id,
                     } => {
-                        if let Some(pending) = pending_permissions.lock().remove(&request_id) {
+                        let pending = pending_permissions.lock().remove(&request_id);
+                        if let Some(pending) = pending {
                             match pending {
                                 PendingPermission::Protocol(responder) => {
                                     let _ = responder.respond(RequestPermissionResponse::new(
@@ -2279,7 +2280,8 @@ where
                         request_id,
                         answers,
                     } => {
-                        if let Some(pending) = pending_user_inputs.lock().remove(&request_id) {
+                        let pending = pending_user_inputs.lock().remove(&request_id);
+                        if let Some(pending) = pending {
                             match pending {
                                 PendingAcpUserInput::Json {
                                     kind,
@@ -7908,6 +7910,120 @@ mod tests {
         let value = serde_json::to_value(elicitation_accept_response(&request, &answer("abc")))
             .expect("elicitation response");
         assert!(value["content"].get("limit").is_none());
+    }
+
+    #[test]
+    fn elicitation_retries_through_the_driver_and_returns_a_valid_answer() {
+        use agent_client_protocol::schema::v1::{
+            ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, InitializeResponse,
+            IntegerPropertySchema, NewSessionResponse, SessionId,
+        };
+
+        let session_id = SessionId::new("elicitation-test");
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |_: InitializeRequest, responder, _| {
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let session_id = session_id.clone();
+                    async move |_: NewSessionRequest, responder, _| {
+                        responder.respond(NewSessionResponse::new(session_id.clone()))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_: PromptRequest, responder, cx| {
+                    let schema = ElicitationSchema::new().property(
+                        "limit",
+                        IntegerPropertySchema::new().minimum(1).maximum(10),
+                        true,
+                    );
+                    let request = CreateElicitationRequest::new(
+                        ElicitationFormMode::new(
+                            ElicitationSessionScope::new(session_id.clone()),
+                            schema,
+                        ),
+                        "Pick a limit",
+                    );
+                    cx.send_request(request)
+                        .on_receiving_result(async move |result| {
+                            let response = serde_json::to_value(result?)?;
+                            assert_eq!(response["content"]["limit"], 5);
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+        let handle = std::thread::spawn(move || {
+            smol::block_on(run_sdk_connection_with(
+                agent,
+                ProviderKind::Fx,
+                std::env::temp_dir(),
+                Vec::new(),
+                RuntimeMode::Ask,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                cmd_rx,
+                events,
+                AcpTimeouts::default(),
+            ))
+        });
+        let wait_event = |matches: fn(&DriverEvent) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = event_rx.recv_deadline(deadline).expect("driver event");
+                assert!(!matches!(event, DriverEvent::Error(_)), "{event:?}");
+                if matches(&event) {
+                    return event;
+                }
+            }
+        };
+        wait_event(|event| matches!(event, DriverEvent::Connected { .. }));
+        cmd_tx.try_send(CommandMessage::Prompt("start".into())).unwrap();
+        let next_question = || {
+            let DriverEvent::UserInputRequested { request_id, questions } =
+                wait_event(|event| matches!(event, DriverEvent::UserInputRequested { .. }))
+            else {
+                unreachable!();
+            };
+            (request_id, questions)
+        };
+        let answer = |request_id, text: &str| {
+            cmd_tx
+                .try_send(CommandMessage::RespondUserInput {
+                    request_id,
+                    answers: vec![UserInputAnswer {
+                        question_id: "limit".into(),
+                        answers: vec![text.into()],
+                    }],
+                })
+                .unwrap();
+        };
+        let (request_id, questions) = next_question();
+        answer(request_id.clone(), "11");
+        let (retry_id, retry_questions) = next_question();
+        assert_eq!(retry_id, request_id);
+        assert_ne!(retry_questions[0].question, questions[0].question);
+        answer(retry_id, "5");
+        wait_event(|event| matches!(event, DriverEvent::TurnFinished { success: true, .. }));
+        cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

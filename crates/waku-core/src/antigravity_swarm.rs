@@ -527,20 +527,23 @@ pub(crate) fn read_swarm_snapshot_in_roots(
     }
 
     let board_fingerprint = format!("{}|{}", located.swarm_id, board_stamp);
+    // Member status can change when a transcript error ages past the settle
+    // delay, without any file writes. Members are already in display order.
+    let member_statuses = members
+        .iter()
+        .map(|member| format!("{}:{:?}", member.name, member.status))
+        .collect::<Vec<_>>()
+        .join(",");
     let roster_fingerprint = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         located.swarm_id,
         located.members_stamp,
         board_stamp,
-        transcript_stamps.join(",")
+        transcript_stamps.join(","),
+        member_statuses,
     );
     let fingerprint = format!(
-        "{}|{}|{}|{}|{}|{}",
-        located.swarm_id,
-        located.members_stamp,
-        board_stamp,
-        view_stamp,
-        transcript_stamps.join(","),
+        "{roster_fingerprint}|{view_stamp}|{}",
         system_attention.len()
     );
 
@@ -2065,6 +2068,40 @@ mod tests {
         let (mentions, all) = extract_mentions("No partial @swarm-ui-extra match", &names);
         assert!(mentions.is_empty());
         assert!(!all);
+    }
+
+    #[test]
+    fn status_changes_invalidate_roster_without_transcript_writes() {
+        let root = temp_root();
+        let coordinator = "coordinator";
+        let worker = "worker";
+        write_file(
+            &swarm_dir(&root, coordinator).join("members.json"),
+            &serde_json::json!({
+                "members": { "worker": { "conversation_id": worker } }
+            })
+            .to_string(),
+        );
+        let transcript = transcript_path(&root, worker);
+        write_file(&transcript, "{\"type\":\"GENERIC\",\"status\":\"ERROR\"}\n");
+        let (_, mtime) = file_stamp_and_mtime(&fs::metadata(&transcript).unwrap());
+        let mtime = mtime.unwrap();
+        let before = read_swarm_snapshot_in_roots(std::slice::from_ref(&root), coordinator, mtime)
+            .unwrap()
+            .unwrap();
+        let after = read_swarm_snapshot_in_roots(
+            std::slice::from_ref(&root),
+            coordinator,
+            mtime + STEP_ERROR_SETTLE_MS,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(before.members[0].status, AntigravitySwarmMemberStatus::Working);
+        assert_eq!(after.members[0].status, AntigravitySwarmMemberStatus::Failed);
+        assert_eq!(before.board_fingerprint, after.board_fingerprint);
+        assert_ne!(before.roster_fingerprint, after.roster_fingerprint);
+        assert_ne!(before.fingerprint, after.fingerprint);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
