@@ -143,6 +143,34 @@ begin
   Result := Lowercase(Result);
 end;
 
+function IsWakuInstallDir(Dir: string): Boolean;
+begin
+  Result := FileExists(AddBackslash(Dir) + 'waku.exe');
+end;
+
+procedure InitializeWizard;
+var
+  TargetDir: string;
+begin
+  if not IsWakuInstallDir(WizardDirValue) then
+    Exit;
+
+  { Waku's updater passes its own folder in /DIR. Honor an existing Narel
+    location if it is independent, otherwise use the Narel default. }
+  TargetDir := WizardForm.PrevAppDir;
+  if (TargetDir = '') or IsWakuInstallDir(TargetDir) then
+    TargetDir := ExpandConstant('{autopf}\Narel');
+  Log('Redirecting installation from Waku directory to ' + TargetDir);
+  WizardForm.DirEdit.Text := TargetDir;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): string;
+begin
+  Result := '';
+  if IsWakuInstallDir(WizardDirValue) then
+    Result := 'Choose a separate folder for Narel. This folder contains a Waku installation.';
+end;
+
 function UserPathUsesExpandString(HasExisting: Boolean; ExistingPaths: string): Boolean;
 var
   ValueType: DWORD;

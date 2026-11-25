@@ -14,6 +14,10 @@ later without a UAC prompt. By default the installer also checks **Add Narel
 CLI (`narel`) to user PATH**. That adds `<install-dir>\bin` to your user `PATH` (and remembers
 your choice across silent updates).
 
+When an older Waku copy runs Narel Setup through its updater, Setup uses an
+existing separate Narel installation or the default Narel folder. Waku keeps
+its own installation and can still be uninstalled separately.
+
 ### Portable
 
 `narel-<version>-<target>.zip` is the same build without an installer. Unpack it
