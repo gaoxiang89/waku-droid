@@ -92,7 +92,7 @@ settings.providers: プロバイダー
 settings.usage: 使用状況
 settings.daemon: デーモン
 settings.computer_use: コンピュータ操作
-settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー 分析 テレメトリ 匿名 共有 アップデート 自動 バージョン 数学 数式 math latex
+settings.general_keywords: 一般 ローカル プロジェクト 会話 プライバシー アップデート 自動 バージョン 数学 数式 math latex
 settings.appearance_keywords: 外観 テーマ システム ライト ダーク 言語 英語 中国語 簡体字 日本語 フォント サイズ 文字 エディタ
 settings.providers_keywords: プロバイダー エージェント モデル CLI バージョン インストール 検出 antigravity agy gemini claude codex cursor opencode amp grok pi kimi droid factory
 settings.skills: スキル
@@ -209,8 +209,6 @@ settings.about: このアプリについて
 settings.about_provenance: egoist/waku のコミュニティフォーク、GPL-3.0
 settings.about_local_daemon: このコンピューターのデーモン
 settings.about_host_daemon: "%{host} のデーモン"
-settings.share_anonymous_usage_data: 匿名の使用状況データを共有
-settings.share_anonymous_usage_data_description: 機能の利用状況と信頼性に関するデータを共有して、Narel の改善にご協力ください。プロンプト、回答、プロジェクト名、ファイルパスなどの個人データは一切含まれません
 
 providers.coding_agents: コーディングエージェント
 providers.description: Narel はこのコンピュータにインストールされたエージェントの CLI を使用します。各エージェントの CLI をインストールするかログインしてから、更新してください

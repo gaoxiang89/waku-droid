@@ -1694,7 +1694,6 @@ impl Waku {
                 .projects
                 .insert(project_id, host.clone());
             self.state.projects.push(project);
-            self.analytics.track(crate::analytics::Event::ProjectAdded);
             project_id
         };
         let provider = summary.provider();

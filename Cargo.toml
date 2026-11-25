@@ -79,13 +79,11 @@ ratex-types = "=0.1.14"
 ratex-svg = { version = "=0.1.14", features = ["embed-fonts"] }
 regex = "1"
 rust-i18n = "4"
-rust-umami = "0.1.1"
 smol = "2"
 ropey = "=2.0.0-beta.1"
 futures-lite = "2"
 futures = "0.3"
 nucleo-matcher = "0.3.1"
-tokio = { version = "1", features = ["rt"] }
 
 # `test-support` has to stay test-only. It compiles a loop into gpui's
 # `flush_effects` that draws every dirty window right there, so with the

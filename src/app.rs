@@ -1292,7 +1292,6 @@ pub struct Waku {
     /// the currently visible task stays intact during daemon latency.
     pending_session_activation: Option<PendingSessionActivation>,
     pending_host_session: Option<Uuid>,
-    analytics: crate::analytics::Analytics,
     state: PersistedState,
     hosts: waku_client::hosts::HostRegistry,
     /// Cached before rendering so path labels can abbreviate the home prefix
@@ -2521,23 +2520,6 @@ impl Waku {
         window.set_rem_size(px(waku_client::persistence::sanitized_ui_font_size(
             state.ui_font_size,
         )));
-        let analytics = crate::analytics::Analytics::new(
-            state.language.locale(),
-            state.analytics_id,
-            state.analytics_enabled,
-        );
-        analytics.track(crate::analytics::Event::AppLaunched {
-            task_count: state
-                .sessions
-                .iter()
-                .filter(|session| session.has_started())
-                .count(),
-            project_count: state
-                .projects
-                .iter()
-                .filter(|project| !project.is_projectless())
-                .count(),
-        });
 
         let composer = cx.new(|cx| ComposerInput::new(window, cx).padding_x(px(14.0), cx));
         let command_palette_search = cx.new(|cx| {
@@ -3476,7 +3458,6 @@ impl Waku {
                 session_hydrations: HashSet::new(),
                 pending_session_activation: None,
                 pending_host_session,
-                analytics,
                 state,
                 hosts,
                 home_directory,

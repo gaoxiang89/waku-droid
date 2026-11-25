@@ -847,17 +847,12 @@ impl Waku {
                         );
                     }
                 }
-                self.finish_active_turn_with_analytics(
+                self.finish_session_turn(
                     session_id,
                     if success {
                         TurnStatus::Completed
                     } else {
                         TurnStatus::Failed
-                    },
-                    if success {
-                        crate::analytics::TurnOutcome::Completed
-                    } else {
-                        crate::analytics::TurnOutcome::Failed
                     },
                 );
                 // The settled turn keeps its average in `stream_stats`; the
@@ -980,11 +975,7 @@ impl Waku {
                 };
                 let finished_turn = should_finish_turn
                     && self
-                        .finish_active_turn_with_analytics(
-                            session_id,
-                            TurnStatus::Failed,
-                            crate::analytics::TurnOutcome::ProcessExited,
-                        )
+                        .finish_session_turn(session_id, TurnStatus::Failed)
                         .is_some();
                 if finished_turn {
                     self.token_rate_meters.remove(&session_id);

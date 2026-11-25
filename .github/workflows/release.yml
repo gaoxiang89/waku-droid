@@ -189,8 +189,6 @@ jobs:
         env:
           WAKU_REMOTE_DAEMONS_DIR: ${{ github.workspace }}/target/remote-daemons
           WAKU_REQUIRE_REMOTE_DAEMONS: "1"
-          WAKU_ANALYTICS_ENDPOINT: ${{ secrets.WAKU_ANALYTICS_ENDPOINT }}
-          WAKU_ANALYTICS_WEBSITE_ID: ${{ secrets.WAKU_ANALYTICS_WEBSITE_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: bun scripts/bundle-windows.ts

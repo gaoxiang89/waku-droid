@@ -181,7 +181,7 @@ settings.daemon:
 settings.computer_use:
   en: Computer Use
 settings.general_keywords:
-  en: general local projects conversations privacy analytics telemetry anonymous sharing updates automatic sparkle version math latex formula expression
+  en: general local projects conversations privacy updates automatic sparkle version math latex formula expression
 settings.appearance_keywords:
   en: appearance theme system light dark language english chinese simplified font size text editor
 settings.providers_keywords:
@@ -411,10 +411,6 @@ settings.about_local_daemon:
   en: Daemon on this computer
 settings.about_host_daemon:
   en: Daemon on %{host}
-settings.share_anonymous_usage_data:
-  en: Share anonymous usage data
-settings.share_anonymous_usage_data_description:
-  en: Help improve Narel by sharing feature usage and reliability data. Prompts, responses, project names, file paths, and other personal data are never included
 
 providers.coding_agents:
   en: Coding agents

@@ -471,7 +471,6 @@ describe('provider accounts execution config & keys', () => {
     const settings: DaemonSettings = {
       computer_use_enabled: false,
       computer_use_allowed_apps: [],
-      analytics_enabled: true,
       disabled_providers: [],
       default_workspace_mode: 'local',
       notifications_enabled: true,

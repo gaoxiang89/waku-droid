@@ -57,7 +57,7 @@ export const SETTINGS_PAGES: Array<{
   keywords: string
   keywordsKey: string
 }> = [
-  { id: 'general', label: 'General', labelKey: 'settings.general', icon: 'settings', keywords: 'general local projects conversations privacy analytics telemetry anonymous sharing', keywordsKey: 'settings.general_keywords' },
+  { id: 'general', label: 'General', labelKey: 'settings.general', icon: 'settings', keywords: 'general local projects conversations privacy', keywordsKey: 'settings.general_keywords' },
   { id: 'appearance', label: 'Appearance', labelKey: 'settings.appearance', icon: 'appearance', keywords: 'appearance theme system light dark language', keywordsKey: 'settings.appearance_keywords' },
   { id: 'providers', label: 'Providers', labelKey: 'settings.providers', icon: 'bot', keywords: 'providers agents models cli version install detect antigravity agy gemini claude codex cursor opencode amp grok pi omp oh my pi kimi droid factory', keywordsKey: 'settings.providers_keywords' },
   { id: 'skills', label: 'Skills', labelKey: 'settings.skills', icon: 'package', keywords: 'skills library agent disable enable delete shared', keywordsKey: 'settings.skills_keywords' },
@@ -173,7 +173,6 @@ export function SettingsView({
 
 function GeneralSettings() {
   const { t } = useI18n()
-  const [analytics, setAnalytics] = useStoredBoolean('waku.analytics-enabled', true)
   return (
     <div>
       <SettingsCard>
@@ -181,13 +180,6 @@ function GeneralSettings() {
           title={t('settings.local_by_default')}
           description={t('settings.local_by_default_web_description')}
         />
-      </SettingsCard>
-      <SettingsCard row>
-        <SettingText
-          title={t('settings.share_anonymous_usage_data')}
-          description={t('settings.share_anonymous_usage_data_description')}
-        />
-        <Toggle checked={analytics} label={t('settings.share_anonymous_usage_data')} onChange={setAnalytics} />
       </SettingsCard>
     </div>
   )
@@ -847,15 +839,6 @@ function DetailRow({
       )}
     </div>
   )
-}
-
-function useStoredBoolean(key: string, fallback: boolean) {
-  const [value, setValue] = useState(() => typeof window === 'undefined' ? fallback : window.localStorage.getItem(key) !== 'false')
-  const update = (next: boolean) => {
-    setValue(next)
-    window.localStorage.setItem(key, String(next))
-  }
-  return [value, update] as const
 }
 
 function errorMessage(error: unknown) {
