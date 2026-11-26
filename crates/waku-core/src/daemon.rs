@@ -1,9 +1,10 @@
 //! Provider backend and driver-event wire translation for `waku-daemon`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::{
     Backend, Command, EventSink, Request, ResponsePayload, WireDriverEvent, WorkspaceOperation,
@@ -17,8 +18,10 @@ use uuid::Uuid;
 use crate::attachments::AttachmentStore;
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    AgentSession, Checkpoint, CheckpointStatus, DriverEvent, Project, ProviderKind, ProviderProbe,
-    ProviderResumeCursor, SessionStatus,
+    ActivityItem, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, Message,
+    MessageAttachment, MessageRole, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
+    ReasoningBlock, RuntimeEventCursor, SessionStatus, TranscriptBlock, TurnStatus, unix_time,
+    unix_time_millis,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -42,11 +45,31 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
     state.trim_idle_transcripts(pinned, RESIDENT_TRANSCRIPT_WINDOW);
 }
 
+const MAX_RETIRED_QUEUED_IDS_PER_SESSION: usize = 256;
+const OFFLINE_REDUCTION_EVENTS_FLUSH_THRESHOLD: usize = 1500;
+
+#[derive(Clone, Debug)]
+struct PendingSteerMeta {
+    prompt: String,
+    message_id: Option<Uuid>,
+    display_content: Option<String>,
+    attachments: Vec<MessageAttachment>,
+}
+
 struct LiveSessionRuntime {
     runtime_id: Uuid,
     provider: ProviderKind,
     account_id: Option<String>,
     driver: DriverHandle,
+    busy: Arc<AtomicBool>,
+    last_active_at: Arc<Mutex<Instant>>,
+    pending_steers: Arc<Mutex<VecDeque<PendingSteerMeta>>>,
+}
+
+impl LiveSessionRuntime {
+    fn touch(&self) {
+        *self.last_active_at.lock() = Instant::now();
+    }
 }
 
 struct ValidatedClientConfigDir {
@@ -69,16 +92,42 @@ fn default_remote_cli_bin_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+#[derive(Default)]
+struct RetiredQueuedMessageIds {
+    per_session: HashMap<Uuid, VecDeque<Uuid>>,
+}
+
+impl RetiredQueuedMessageIds {
+    fn contains(&self, session_id: Uuid, message_id: Uuid) -> bool {
+        self.per_session
+            .get(&session_id)
+            .is_some_and(|ids| ids.contains(&message_id))
+    }
+
+    fn insert(&mut self, session_id: Uuid, message_id: Uuid) -> bool {
+        let ids = self.per_session.entry(session_id).or_default();
+        if ids.contains(&message_id) {
+            return false;
+        }
+        ids.push_back(message_id);
+        while ids.len() > MAX_RETIRED_QUEUED_IDS_PER_SESSION {
+            ids.pop_front();
+        }
+        true
+    }
+}
+
 pub struct WakuBackend {
-    sessions: Mutex<HashMap<Uuid, LiveSessionRuntime>>,
+    sessions: Arc<Mutex<HashMap<Uuid, LiveSessionRuntime>>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, PathBuf, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
     settings: DaemonSettingsStore,
-    task_store: StateStore,
-    task_state: Mutex<PersistedState>,
+    task_store: Arc<StateStore>,
+    task_state: Arc<Mutex<PersistedState>>,
     removed_session_ids: Mutex<HashSet<Uuid>>,
     removed_project_ids: Mutex<HashSet<Uuid>>,
+    retired_queued_message_ids: Mutex<RetiredQueuedMessageIds>,
     composer_drafts: ComposerDraftStore,
     attachments: AttachmentStore,
     usage_scan_cache: Mutex<crate::usage_history::ScanCache>,
@@ -90,7 +139,7 @@ pub struct WakuBackend {
 
 impl WakuBackend {
     fn remove_project(&self, project_id: Uuid) -> anyhow::Result<()> {
-        let session_ids = {
+        let (session_ids, deleted_project_paths) = {
             let mut state = self.task_state.lock();
             anyhow::ensure!(
                 !state
@@ -149,9 +198,18 @@ impl WakuBackend {
                     .context("workspace deletion failed and its drafts could not be restored")?;
                 return Err(error.into());
             }
+            let mut deleted_paths = deleted_projects
+                .iter()
+                .map(|project| project.path.clone())
+                .collect::<Vec<_>>();
+            for session in &deleted_sessions {
+                if let Some(path) = session.workspace.path() {
+                    deleted_paths.push(path.to_owned());
+                }
+            }
             projects.insert(project_id);
             sessions.extend(session_ids.iter().copied());
-            session_ids
+            (session_ids, deleted_paths)
         };
         let mut runtimes = self.sessions.lock();
         let removed = session_ids
@@ -160,6 +218,35 @@ impl WakuBackend {
             .collect::<Vec<_>>();
         drop(runtimes);
         drop(removed);
+
+        if !deleted_project_paths.is_empty() {
+            let canonical_roots = deleted_project_paths
+                .iter()
+                .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                .collect::<Vec<_>>();
+            let mut removed_terminals = Vec::new();
+            let mut terminals = self.terminals.lock();
+            let matching_ids = terminals
+                .iter()
+                .filter_map(|(&id, (_, cwd, _))| {
+                    let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
+                    let matches = deleted_project_paths
+                        .iter()
+                        .any(|root| cwd == root || cwd.starts_with(root))
+                        || canonical_roots
+                            .iter()
+                            .any(|root| canonical_cwd == *root || canonical_cwd.starts_with(root));
+                    matches.then_some(id)
+                })
+                .collect::<Vec<_>>();
+            for id in matching_ids {
+                if let Some((_, _, terminal)) = terminals.remove(&id) {
+                    removed_terminals.push(terminal);
+                }
+            }
+            drop(terminals);
+            drop(removed_terminals);
+        }
         Ok(())
     }
 
@@ -183,15 +270,16 @@ impl WakuBackend {
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_owned();
         Ok(Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
             settings,
-            task_store,
-            task_state: Mutex::new(task_state),
+            task_store: Arc::new(task_store),
+            task_state: Arc::new(Mutex::new(task_state)),
             removed_session_ids: Mutex::new(removed_session_ids),
             removed_project_ids: Mutex::new(removed_project_ids),
+            retired_queued_message_ids: Mutex::new(RetiredQueuedMessageIds::default()),
             composer_drafts,
             attachments,
             usage_scan_cache: Mutex::new(HashMap::new()),
@@ -231,6 +319,9 @@ impl WakuBackend {
                 provider,
                 account_id,
                 driver,
+                busy: Arc::new(AtomicBool::new(false)),
+                last_active_at: Arc::new(Mutex::new(Instant::now())),
+                pending_steers: Arc::new(Mutex::new(VecDeque::new())),
             },
         );
     }
@@ -895,15 +986,16 @@ impl Backend for WakuBackend {
                     (2..=4000).contains(&cols) && (1..=2000).contains(&rows),
                     "terminal dimensions out of range"
                 );
-                // A retried create must never replace a live shell.
+                // A retried create must never replace a live shell, while an
+                // exited terminal record may be replaced even across cwd/runtime changes.
                 {
                     let mut terminals = self.terminals.lock();
                     if let Some((owner, directory, existing)) = terminals.get(&session_id) {
-                        anyhow::ensure!(
-                            *owner == runtime_id && *directory == cwd,
-                            "terminal identity already exists"
-                        );
                         if !existing.exited() {
+                            anyhow::ensure!(
+                                *owner == runtime_id && *directory == cwd,
+                                "terminal identity already exists"
+                            );
                             return Ok(ResponsePayload::Ack);
                         }
                         terminals.remove(&session_id);
@@ -1036,11 +1128,72 @@ impl Backend for WakuBackend {
                     event_sender,
                 )?;
                 let supports_steer = handle.supports_steer();
+                let busy = Arc::new(AtomicBool::new(false));
+                let last_active_at = Arc::new(Mutex::new(Instant::now()));
+                let pending_steers = Arc::new(Mutex::new(VecDeque::<PendingSteerMeta>::new()));
+                let forward_sessions = Arc::downgrade(&self.sessions);
+                let forward_task_state = Arc::downgrade(&self.task_state);
+                let forward_task_store = Arc::downgrade(&self.task_store);
+                let forward_busy = busy.clone();
+                let forward_last_active = last_active_at.clone();
+                let forward_pending_steers = pending_steers.clone();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
-                        while let Ok(event) = event_receiver.recv() {
-                            let wire = event_to_wire(event).unwrap_or_else(|error| {
+                        let mut turn_event_count: usize = 0;
+                        let mut saw_process_exited = false;
+                        while let Ok(mut event) = event_receiver.recv() {
+                            *forward_last_active.lock() = Instant::now();
+                            match &mut event {
+                                DriverEvent::TurnStarted => {
+                                    forward_busy.store(true, Ordering::Release);
+                                    turn_event_count = 0;
+                                }
+                                DriverEvent::TurnFinished { .. } => {
+                                    forward_busy.store(false, Ordering::Release);
+                                }
+                                DriverEvent::ProcessExited => {
+                                    forward_busy.store(false, Ordering::Release);
+                                    saw_process_exited = true;
+                                }
+                                DriverEvent::SteerAccepted {
+                                    message,
+                                    message_id,
+                                    display_content,
+                                    attachments,
+                                } => {
+                                    let mut steers = forward_pending_steers.lock();
+                                    let matched = steers
+                                        .iter()
+                                        .position(|meta| meta.prompt == *message)
+                                        .and_then(|index| steers.remove(index))
+                                        .or_else(|| steers.pop_front());
+                                    if let Some(meta) = matched {
+                                        *message_id = meta.message_id;
+                                        *display_content = meta.display_content;
+                                        *attachments = meta.attachments;
+                                    }
+                                }
+                                DriverEvent::SteerRejected { message, .. } => {
+                                    let mut steers = forward_pending_steers.lock();
+                                    let matched = steers
+                                        .iter()
+                                        .position(|meta| meta.prompt == *message)
+                                        .or_else(|| (!steers.is_empty()).then_some(0));
+                                    if let Some(index) = matched {
+                                        steers.remove(index);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            turn_event_count = turn_event_count.saturating_add(1);
+                            let is_turn_settle = matches!(
+                                &event,
+                                DriverEvent::TurnFinished { .. }
+                                    | DriverEvent::TurnParked
+                                    | DriverEvent::ProcessExited
+                            );
+                            let wire = event_to_wire(event.clone()).unwrap_or_else(|error| {
                                 WireDriverEvent::new(
                                     "error",
                                     Value::String(format!(
@@ -1048,10 +1201,77 @@ impl Backend for WakuBackend {
                                     )),
                                 )
                             });
-                            if events.send(wire).is_err() {
+                            let Some(cursor) = events.send_sequenced(wire) else {
+                                break;
+                            };
+                            if let (Some(task_state), Some(task_store), Some(sessions)) = (
+                                forward_task_state.upgrade(),
+                                forward_task_store.upgrade(),
+                                forward_sessions.upgrade(),
+                            ) {
+                                let should_notify = reduce_and_maybe_persist_daemon_event(
+                                    &task_state,
+                                    &task_store,
+                                    &sessions,
+                                    session_id,
+                                    &event,
+                                    Some(cursor),
+                                    is_turn_settle,
+                                    events.subscriber_count(),
+                                    turn_event_count,
+                                );
+                                if should_notify {
+                                    events.notify_task_state_changed();
+                                }
+                            }
+                            if matches!(event, DriverEvent::TurnFinished { .. }) {
+                                turn_event_count = 0;
+                            }
+                            if saw_process_exited {
                                 break;
                             }
                         }
+                        let still_owned = forward_sessions.upgrade().is_some_and(|sessions| {
+                            sessions
+                                .lock()
+                                .get(&session_id)
+                                .is_some_and(|live| live.runtime_id == runtime_id)
+                        });
+                        if !saw_process_exited
+                            && still_owned
+                            && let (Some(task_state), Some(task_store), Some(sessions)) = (
+                                forward_task_state.upgrade(),
+                                forward_task_store.upgrade(),
+                                forward_sessions.upgrade(),
+                            )
+                        {
+                            forward_busy.store(false, Ordering::Release);
+                            if reduce_and_maybe_persist_daemon_event(
+                                &task_state,
+                                &task_store,
+                                &sessions,
+                                session_id,
+                                &DriverEvent::ProcessExited,
+                                None,
+                                true,
+                                events.subscriber_count(),
+                                turn_event_count,
+                            ) {
+                                events.notify_task_state_changed();
+                            }
+                        }
+                        if let Some(sessions) = forward_sessions.upgrade() {
+                            let removed = {
+                                let mut sessions = sessions.lock();
+                                sessions
+                                    .get(&session_id)
+                                    .is_some_and(|live| live.runtime_id == runtime_id)
+                                    .then(|| sessions.remove(&session_id))
+                                    .flatten()
+                            };
+                            drop(removed);
+                        }
+                        events.end_session_runtime();
                     })
                     .context("could not start daemon event forwarding thread")?;
                 let mut sessions = self.sessions.lock();
@@ -1066,6 +1286,9 @@ impl Backend for WakuBackend {
                         provider,
                         account_id,
                         driver: handle,
+                        busy,
+                        last_active_at,
+                        pending_steers,
                     },
                 );
                 Ok(ResponsePayload::Started { supports_steer })
@@ -1082,8 +1305,35 @@ impl Backend for WakuBackend {
                 drop(removed);
                 Ok(ResponsePayload::Ack)
             }
+            Command::ClaimQueuedMessage { message_id } => {
+                let mut retired = self.retired_queued_message_ids.lock();
+                if retired.contains(session_id, message_id) {
+                    return Ok(ResponsePayload::QueuedMessageClaimed { claimed: false });
+                }
+                retired.insert(session_id, message_id);
+                drop(retired);
+
+                let mut state = self.task_state.lock();
+                if let Some(index) = state
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == session_id)
+                {
+                    let _ = self.task_store.hydrate(&mut state.sessions[index]);
+                    let before = state.sessions[index].queued_messages.len();
+                    state.sessions[index]
+                        .queued_messages
+                        .retain(|message| message.id != message_id);
+                    if state.sessions[index].queued_messages.len() != before {
+                        state.sessions[index].updated_at = unix_time();
+                        state.mark_session_dirty(session_id);
+                        self.task_store.save(&mut state)?;
+                    }
+                }
+                Ok(ResponsePayload::QueuedMessageClaimed { claimed: true })
+            }
             command => {
-                let driver = {
+                let (driver, busy, pending_steers) = {
                     let sessions = self.sessions.lock();
                     let live = sessions
                         .get(&session_id)
@@ -1094,8 +1344,30 @@ impl Backend for WakuBackend {
                             live.runtime_id
                         );
                     }
-                    live.driver.clone()
+                    live.touch();
+                    (
+                        live.driver.clone(),
+                        live.busy.clone(),
+                        live.pending_steers.clone(),
+                    )
                 };
+                if matches!(&command, Command::Prompt { .. }) {
+                    busy.store(true, Ordering::Release);
+                }
+                if let Command::Steer {
+                    prompt,
+                    message_id,
+                    display_content,
+                    attachments,
+                } = &command
+                {
+                    pending_steers.lock().push_back(PendingSteerMeta {
+                        prompt: prompt.clone(),
+                        message_id: Some(message_id.unwrap_or_else(Uuid::new_v4)),
+                        display_content: display_content.clone(),
+                        attachments: attachments.clone(),
+                    });
+                }
                 if let Some(event) = prompt_submission_wire_event(&command)? {
                     // Publish the submission into the runtime's event stream
                     // before the provider can start the turn. Every attached
@@ -1104,20 +1376,107 @@ impl Backend for WakuBackend {
                     // the only record of the prompt — a follower that only
                     // knew the provider's `turnStarted` used to persist a
                     // projection without it, erasing the message for everyone.
-                    events.send(event)?;
+                    if let Some(cursor) = events.send_sequenced(event.clone())
+                        && let Ok(decoded) = event_from_wire(event)
+                    {
+                        reduce_and_maybe_persist_daemon_event(
+                            &self.task_state,
+                            &self.task_store,
+                            &self.sessions,
+                            session_id,
+                            &decoded,
+                            Some(cursor),
+                            false,
+                            events.subscriber_count(),
+                            0,
+                        );
+                    }
                 }
-                handle_driver_command(&driver, command)
+                let resolved_event = match &command {
+                    Command::Respond { request_id, .. } => Some(DriverEvent::PermissionResolved {
+                        request_id: request_id.clone(),
+                    }),
+                    Command::RespondUserInput { request_id, .. } => {
+                        Some(DriverEvent::UserInputResolved {
+                            request_id: request_id.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                let outcome = handle_driver_command(&driver, command)?;
+                if let Some(resolved_event) = resolved_event
+                    && let Ok(wire) = event_to_wire(resolved_event.clone())
+                    && let Some(cursor) = events.send_sequenced(wire)
+                {
+                    reduce_and_maybe_persist_daemon_event(
+                        &self.task_state,
+                        &self.task_store,
+                        &self.sessions,
+                        session_id,
+                        &resolved_event,
+                        Some(cursor),
+                        false,
+                        events.subscriber_count(),
+                        0,
+                    );
+                }
+                Ok(outcome)
             }
         }
     }
 
     fn has_live_work(&self) -> bool {
-        !self.sessions.lock().is_empty()
+        self.sessions
+            .lock()
+            .values()
+            .any(|live| live.busy.load(Ordering::Acquire))
+            || self
+                .task_state
+                .lock()
+                .sessions
+                .iter()
+                .any(AgentSession::is_busy)
             || self
                 .terminals
                 .lock()
                 .values()
                 .any(|(_, _, terminal)| !terminal.exited())
+    }
+
+    fn reap_idle_runtimes(&self, max_idle: Duration) -> Vec<(Uuid, Uuid)> {
+        let busy_sessions = self
+            .task_state
+            .lock()
+            .sessions
+            .iter()
+            .filter(|session| session.is_busy())
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        let mut removed = Vec::new();
+        let mut reaped_ids = Vec::new();
+        {
+            let mut sessions = self.sessions.lock();
+            let candidates = sessions
+                .iter()
+                .filter_map(|(&session_id, live)| {
+                    if live.busy.load(Ordering::Acquire)
+                        || busy_sessions.contains(&session_id)
+                        || live.last_active_at.lock().elapsed() < max_idle
+                    {
+                        return None;
+                    }
+                    Some((session_id, live.runtime_id))
+                })
+                .collect::<Vec<_>>();
+            for (session_id, runtime_id) in candidates {
+                if let Some(live) = sessions.remove(&session_id) {
+                    removed.push(live);
+                    reaped_ids.push((session_id, runtime_id));
+                }
+            }
+        }
+        drop(removed);
+        reaped_ids
     }
 
     fn is_runtime_live(&self, session_id: Uuid, runtime_id: Uuid) -> bool {
@@ -1137,6 +1496,37 @@ impl Backend for WakuBackend {
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
+
+        let mut state = self.task_state.lock();
+        let mut settled_any = false;
+        let busy_ids = state
+            .sessions
+            .iter()
+            .filter(|session| session.is_busy())
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        for session_id in busy_ids {
+            if let Some(index) = state
+                .sessions
+                .iter()
+                .position(|session| session.id == session_id)
+            {
+                let _ = self.task_store.hydrate(&mut state.sessions[index]);
+                if settle_daemon_session(
+                    &mut state.sessions[index],
+                    TurnStatus::Failed,
+                    Some("The daemon exited before the turn finished."),
+                ) {
+                    state.sessions[index].state_version =
+                        state.sessions[index].state_version.saturating_add(1);
+                    state.mark_session_dirty(session_id);
+                    settled_any = true;
+                }
+            }
+        }
+        if settled_any {
+            let _ = self.task_store.save(&mut state);
+        }
     }
 }
 
@@ -1165,6 +1555,9 @@ fn session_projection_precedes(
     incoming: &AgentSession,
     active_runtime_id: Option<Uuid>,
 ) -> bool {
+    if incoming.state_version != existing.state_version {
+        return incoming.state_version < existing.state_version;
+    }
     let existing_cursor = existing.runtime_event_cursor;
     let incoming_cursor = incoming.runtime_event_cursor;
     if let Some(active_runtime_id) = active_runtime_id {
@@ -1208,7 +1601,11 @@ fn merge_skeleton_session_metadata(existing: &mut AgentSession, incoming: AgentS
     }
 }
 
-fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSession) {
+fn merge_stale_session_metadata_with_retired(
+    existing: &mut AgentSession,
+    incoming: AgentSession,
+    retired: Option<&RetiredQueuedMessageIds>,
+) {
     if incoming.updated_at >= existing.updated_at {
         existing.title = incoming.title;
         existing.pinned = incoming.pinned;
@@ -1237,6 +1634,9 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
     for queued in incoming.queued_messages {
+        if retired.is_some_and(|ids| ids.contains(existing.id, queued.id)) {
+            continue;
+        }
         if !existing
             .queued_messages
             .iter()
@@ -1245,6 +1645,11 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
             existing.queued_messages.push(queued);
         }
     }
+}
+
+#[cfg(test)]
+fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSession) {
+    merge_stale_session_metadata_with_retired(existing, incoming, None);
 }
 
 /// Ending checkpoints are produced and stored by the daemon. A second client
@@ -1490,6 +1895,8 @@ impl WakuBackend {
         }
         rewound.truncate_after_turn(retained_turn_count);
         rewound.status = SessionStatus::Idle;
+        rewound.runtime_event_cursor = None;
+        rewound.updated_at = unix_time().max(source.updated_at);
 
         let pinned = self.sessions.lock().keys().copied().collect();
         let mut state = self.task_state.lock();
@@ -1498,6 +1905,7 @@ impl WakuBackend {
             .iter_mut()
             .find(|session| session.id == session_id)
             .ok_or_else(|| anyhow!("the task was removed while it was being rewound"))?;
+        rewound.state_version = existing.state_version.max(source.state_version).saturating_add(1);
         *existing = rewound.clone();
         state.mark_session_dirty(session_id);
         self.task_store
@@ -1920,7 +2328,9 @@ impl WakuBackend {
             })
             .collect::<Vec<_>>();
         drop(removed_session_ids);
+        let mut retired = self.retired_queued_message_ids.lock();
         let mut saved_ids = Vec::with_capacity(sessions.len());
+        let mut dirty_ids = Vec::with_capacity(sessions.len());
         for mut session in sessions {
             if let Some(existing) = state
                 .sessions
@@ -1928,23 +2338,52 @@ impl WakuBackend {
                 .find(|existing| existing.id == session.id)
             {
                 if !session.detail_loaded {
-                    merge_skeleton_session_metadata(existing, session);
+                    if session.state_version >= existing.state_version {
+                        merge_skeleton_session_metadata(existing, session);
+                        dirty_ids.push(existing.id);
+                    }
+                } else if session.state_version < existing.state_version {
+                    // Reject stale projections built before a server-side rewind
+                    // or offline turn reduction; still echo back `existing` so
+                    // the client can catch up.
                 } else if session_projection_precedes(
                     existing,
                     &session,
                     active_runtimes.get(&session.id).copied(),
                 ) {
-                    merge_stale_session_metadata(existing, session);
+                    merge_stale_session_metadata_with_retired(existing, session, Some(&retired));
+                    dirty_ids.push(existing.id);
                 } else {
+                    if existing.detail_loaded {
+                        for prior in &existing.queued_messages {
+                            if !session
+                                .queued_messages
+                                .iter()
+                                .any(|candidate| candidate.id == prior.id)
+                            {
+                                retired.insert(existing.id, prior.id);
+                            }
+                        }
+                    }
+                    session
+                        .queued_messages
+                        .retain(|queued| !retired.contains(session.id, queued.id));
+                    session.state_version = existing.state_version.max(session.state_version);
                     preserve_daemon_checkpoints(existing, &mut session);
                     *existing = session;
+                    dirty_ids.push(existing.id);
                 }
                 saved_ids.push(existing.id);
             } else if session.detail_loaded {
+                session
+                    .queued_messages
+                    .retain(|queued| !retired.contains(session.id, queued.id));
+                dirty_ids.push(session.id);
                 saved_ids.push(session.id);
                 state.sessions.push(session);
             }
         }
+        drop(retired);
         let used_project_ids = state
             .sessions
             .iter()
@@ -1953,7 +2392,7 @@ impl WakuBackend {
         state
             .projects
             .retain(|project| !project.is_projectless() || used_project_ids.contains(&project.id));
-        for session_id in &saved_ids {
+        for session_id in &dirty_ids {
             state.mark_session_dirty(*session_id);
         }
         self.task_store.save(&mut state)?;
@@ -2467,7 +2906,7 @@ fn handle_driver_command(
 ) -> anyhow::Result<ResponsePayload> {
     match command {
         Command::Prompt { prompt, .. } => driver.prompt(prompt),
-        Command::Steer { prompt } => driver.steer(prompt),
+        Command::Steer { prompt, .. } => driver.steer(prompt),
         Command::Cancel => driver.cancel(),
         Command::CancelComputerUse => driver.cancel_computer_use(),
         Command::RefreshBackgroundWork => driver.refresh_background_work(),
@@ -2527,6 +2966,7 @@ fn handle_driver_command(
         }
         Command::AttachSession
         | Command::Start { .. }
+        | Command::ClaimQueuedMessage { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }
@@ -2569,6 +3009,480 @@ fn handle_driver_command(
         }
     }
     Ok(ResponsePayload::Ack)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reduce_and_maybe_persist_daemon_event(
+    task_state: &Mutex<PersistedState>,
+    task_store: &StateStore,
+    live_sessions: &Mutex<HashMap<Uuid, LiveSessionRuntime>>,
+    session_id: Uuid,
+    event: &DriverEvent,
+    cursor: Option<RuntimeEventCursor>,
+    flush_to_store: bool,
+    subscriber_count: usize,
+    turn_event_count: usize,
+) -> bool {
+    let pinned: HashSet<Uuid> = live_sessions.lock().keys().copied().collect();
+    let mut state = task_state.lock();
+    let Some(index) = state
+        .sessions
+        .iter()
+        .position(|session| session.id == session_id)
+    else {
+        return false;
+    };
+    if !state.sessions[index].detail_loaded && task_store.hydrate(&mut state.sessions[index]).is_err()
+    {
+        return false;
+    }
+    let (changed, settled) = reduce_daemon_driver_event(&mut state.sessions[index], event, cursor);
+    let bump_version = settled
+        && (matches!(event, DriverEvent::ProcessExited)
+            || subscriber_count == 0
+            || turn_event_count >= OFFLINE_REDUCTION_EVENTS_FLUSH_THRESHOLD);
+    if bump_version {
+        state.sessions[index].state_version = state.sessions[index].state_version.saturating_add(1);
+    }
+    if changed {
+        state.mark_session_dirty(session_id);
+    }
+    if flush_to_store && (changed || bump_version) {
+        if let Err(error) = task_store.save(&mut state) {
+            eprintln!("waku-daemon could not flush session {session_id} to store: {error}");
+        } else {
+            trim_resident_transcripts(&mut state, &pinned);
+        }
+    }
+    bump_version
+}
+
+fn reduce_daemon_driver_event(
+    session: &mut AgentSession,
+    event: &DriverEvent,
+    cursor: Option<RuntimeEventCursor>,
+) -> (bool, bool) {
+    if let Some(cursor) = cursor {
+        session.runtime_event_cursor = Some(cursor);
+    }
+    let mut changed = cursor.is_some();
+    let mut settled = false;
+    match event {
+        DriverEvent::Connected { provider_cursor } => {
+            session.provider_cursor = provider_cursor.clone();
+            if let Some(crate::model::ProviderResumeCursor::Claude {
+                resume_at: Some(resume_at),
+                ..
+            }) = session.provider_cursor.as_ref()
+            {
+                session.mark_active_turn_provider_resume_at(resume_at.clone());
+            }
+            if session.status == SessionStatus::Connecting {
+                session.status = SessionStatus::Working;
+            }
+            changed = true;
+        }
+        DriverEvent::AgentPresetSelected(preset) => {
+            session.agent_preset = preset.clone();
+            changed = true;
+        }
+        DriverEvent::AutoTitleUpdated(title) => {
+            session.auto_title = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            changed = true;
+        }
+        DriverEvent::AvailableCommands(commands) => {
+            session.available_commands = commands.clone();
+            changed = true;
+        }
+        DriverEvent::PromptSubmitted {
+            message,
+            turn_id,
+            message_id,
+            handoff,
+        } => {
+            changed |=
+                session.adopt_submitted_prompt(message, *turn_id, *message_id, handoff.as_ref());
+        }
+        DriverEvent::SteerAccepted {
+            message,
+            message_id,
+            display_content,
+            attachments,
+        } => {
+            let duplicate = message_id.is_some_and(|id| {
+                session.messages.iter().any(|candidate| candidate.id == id)
+            });
+            if !duplicate {
+                let mut pushed = match session.active_turn_id() {
+                    Some(turn_id) => Message::new_for_turn(MessageRole::User, message, turn_id),
+                    None => Message::new(MessageRole::User, message),
+                }
+                .with_presentation(display_content.clone(), attachments.clone());
+                if let Some(id) = message_id {
+                    pushed.id = *id;
+                }
+                session.messages.push(pushed);
+                changed = true;
+            }
+        }
+        DriverEvent::TurnStarted => {
+            if session.active_turn_id().is_some() {
+                session.mark_active_turn_provider_started();
+                session.status = SessionStatus::Working;
+                changed = true;
+            } else if matches!(
+                session.provider,
+                ProviderKind::Codex
+                    | ProviderKind::Claude
+                    | ProviderKind::OpenCode
+                    | ProviderKind::Antigravity
+            ) && !session.is_busy()
+            {
+                session.begin_provider_turn();
+                session.mark_active_turn_provider_started();
+                session.status = SessionStatus::Working;
+                changed = true;
+            }
+        }
+        DriverEvent::TurnParked => {
+            if session.active_turn_id().is_some() {
+                finish_daemon_streaming_messages(session);
+                complete_daemon_activities(session);
+                session.status = SessionStatus::Background;
+                changed = true;
+            }
+        }
+        DriverEvent::TextDelta(delta) => {
+            if session.is_busy() && !delta.is_empty() {
+                complete_daemon_reasoning(session);
+                if let Some(last) = session
+                    .messages
+                    .last_mut()
+                    .filter(|message| message.role == MessageRole::Assistant && message.streaming)
+                {
+                    last.content.push_str(delta);
+                } else {
+                    let mut message = match session.active_turn_id() {
+                        Some(turn_id) => Message::new_for_turn(MessageRole::Assistant, delta, turn_id),
+                        None => Message::new(MessageRole::Assistant, delta),
+                    };
+                    message.streaming = true;
+                    session.messages.push(message);
+                }
+                changed = true;
+            }
+        }
+        DriverEvent::ReasoningDelta(delta) => {
+            if session.is_busy() && (!delta.trim().is_empty() || has_open_daemon_reasoning(session)) {
+                finish_daemon_streaming_messages(session);
+                append_daemon_reasoning(session, delta);
+                changed = true;
+            }
+        }
+        DriverEvent::Activity {
+            id,
+            kind,
+            title,
+            detail,
+            complete,
+        } => {
+            if session.is_busy() {
+                finish_daemon_streaming_messages(session);
+                complete_daemon_reasoning(session);
+                let item =
+                    ActivityItem::new(id.clone(), *kind, title.clone(), detail.clone(), *complete);
+                upsert_daemon_activity(session, item);
+                changed = true;
+            }
+        }
+        DriverEvent::RichActivity(item) => {
+            if session.is_busy() {
+                finish_daemon_streaming_messages(session);
+                complete_daemon_reasoning(session);
+                upsert_daemon_activity(session, item.clone());
+                changed = true;
+            }
+        }
+        DriverEvent::Permission { .. } | DriverEvent::UserInputRequested { .. } => {
+            if session.is_busy() {
+                session.status = SessionStatus::Waiting;
+                changed = true;
+            }
+        }
+        DriverEvent::PermissionResolved { .. } | DriverEvent::UserInputResolved { .. } => {
+            if session.status == SessionStatus::Waiting {
+                session.status = SessionStatus::Working;
+                changed = true;
+            }
+        }
+        DriverEvent::UsageUpdated {
+            context_tokens,
+            context_window,
+        } => {
+            let usage = session
+                .context_usage
+                .get_or_insert_with(crate::model::ContextUsage::default);
+            if let Some(tokens) = context_tokens {
+                usage.tokens = *tokens;
+            }
+            if let Some(window) = context_window {
+                usage.window = Some(*window);
+            }
+            changed = true;
+        }
+        DriverEvent::GoalUpdated(goal) => {
+            if let Some(goal) = goal
+                && session.messages.is_empty()
+            {
+                session.set_title_from_prompt(&goal.objective);
+            }
+            session.thread_goal = goal.clone();
+            changed = true;
+        }
+        DriverEvent::TurnFinished { success, summary } => {
+            let turn_status = if *success {
+                TurnStatus::Completed
+            } else {
+                TurnStatus::Failed
+            };
+            if settle_daemon_session(session, turn_status, summary.as_deref()) {
+                changed = true;
+                settled = true;
+            }
+        }
+        DriverEvent::Error(error) => {
+            if session.active_turn_is_unconfirmed_pursuit() {
+                if let Some(turn_id) = session.active_turn_id() {
+                    session.unwind_unstarted_turn(turn_id);
+                    if session.is_busy() {
+                        session.status = SessionStatus::Idle;
+                    }
+                    changed = true;
+                }
+            } else if let Some(turn_id) = session.active_turn_id()
+                && session.status != SessionStatus::Working
+            {
+                let has_assistant = session.messages.iter().any(|message| {
+                    message.turn_id == Some(turn_id) && message.role == MessageRole::Assistant
+                });
+                session.status = SessionStatus::Failed;
+                if !has_assistant {
+                    session
+                        .messages
+                        .push(Message::new_for_turn(MessageRole::Assistant, error, turn_id));
+                }
+                changed = true;
+            }
+        }
+        DriverEvent::ProcessExited => {
+            if settle_daemon_session(
+                session,
+                TurnStatus::Failed,
+                Some("The agent exited before responding."),
+            ) {
+                changed = true;
+                settled = true;
+            } else if session.is_busy() {
+                session.status = SessionStatus::Failed;
+                changed = true;
+                settled = true;
+            }
+        }
+        DriverEvent::RuntimeEventCursorAdvanced(_)
+        | DriverEvent::BackgroundWork(_)
+        | DriverEvent::ComputerUseUpdated(_)
+        | DriverEvent::SteerRejected { .. }
+        | DriverEvent::PlanUsageUpdated(_) => {}
+    }
+    if changed {
+        session.updated_at = unix_time();
+    }
+    (changed, settled)
+}
+
+fn settle_daemon_session(
+    session: &mut AgentSession,
+    status: TurnStatus,
+    fallback: Option<&str>,
+) -> bool {
+    finish_daemon_streaming_messages(session);
+    complete_daemon_activities(session);
+    let Some(turn_id) = session.active_turn_id() else {
+        return false;
+    };
+    let has_assistant = session
+        .messages
+        .iter()
+        .any(|message| message.turn_id == Some(turn_id) && message.role == MessageRole::Assistant);
+    if !has_assistant {
+        let content = fallback.unwrap_or(if status == TurnStatus::Completed {
+            "The turn completed without a text response."
+        } else {
+            "The turn stopped before a response."
+        });
+        session
+            .messages
+            .push(Message::new_for_turn(MessageRole::Assistant, content, turn_id));
+    }
+    session.finish_active_turn(status);
+    session.status = if status == TurnStatus::Completed {
+        SessionStatus::Idle
+    } else {
+        SessionStatus::Failed
+    };
+    true
+}
+
+fn finish_daemon_streaming_messages(session: &mut AgentSession) {
+    for message in &mut session.messages {
+        if message.role == MessageRole::Assistant {
+            message.streaming = false;
+        }
+    }
+}
+
+fn has_open_daemon_reasoning(session: &AgentSession) -> bool {
+    session
+        .transcript_blocks
+        .iter()
+        .rev()
+        .flat_map(|block| block.activities.iter().rev())
+        .find(|activity| activity.kind == crate::model::ActivityKind::Reasoning)
+        .is_some_and(|activity| !activity.complete)
+}
+
+fn complete_daemon_reasoning(session: &mut AgentSession) {
+    for block in session.transcript_blocks.iter_mut().rev() {
+        if let Some(activity) = block
+            .activities
+            .iter_mut()
+            .rev()
+            .find(|activity| activity.kind == crate::model::ActivityKind::Reasoning)
+        {
+            activity.complete = true;
+            return;
+        }
+    }
+}
+
+fn complete_daemon_activities(session: &mut AgentSession) {
+    for block in &mut session.transcript_blocks {
+        for activity in &mut block.activities {
+            activity.complete = true;
+        }
+    }
+}
+
+fn append_daemon_reasoning(session: &mut AgentSession, delta: &str) {
+    let now_ms = unix_time_millis();
+    for block in session.transcript_blocks.iter_mut().rev() {
+        if let Some(activity) = block
+            .activities
+            .iter_mut()
+            .rev()
+            .find(|activity| activity.kind == crate::model::ActivityKind::Reasoning)
+        {
+            if !activity.complete {
+                let reasoning = activity.reasoning.get_or_insert_with(|| ReasoningBlock {
+                    content: String::new(),
+                    started_at_ms: now_ms,
+                    finished_at_ms: now_ms,
+                });
+                reasoning.content.push_str(delta);
+                reasoning.finished_at_ms = now_ms;
+                return;
+            }
+            break;
+        }
+    }
+    let mut activity = ActivityItem::new(
+        None,
+        crate::model::ActivityKind::Reasoning,
+        "Reasoning",
+        None,
+        false,
+    );
+    activity.reasoning = Some(ReasoningBlock {
+        content: delta.to_owned(),
+        started_at_ms: now_ms,
+        finished_at_ms: now_ms,
+    });
+    push_daemon_activity(session, activity);
+}
+
+fn upsert_daemon_activity(session: &mut AgentSession, incoming: ActivityItem) {
+    for block in session.transcript_blocks.iter_mut().rev() {
+        let matching = block.activities.iter_mut().rev().find(|activity| {
+            if let Some(source_id) = incoming.source_id.as_deref() {
+                activity.source_id.as_deref() == Some(source_id)
+            } else {
+                activity.title == incoming.title && !activity.complete
+            }
+        });
+        if let Some(existing) = matching {
+            let preserved_id = existing.id;
+            let tool_name = incoming.tool_name.or_else(|| existing.tool_name.clone());
+            let mcp_server = incoming.mcp_server.or_else(|| existing.mcp_server.clone());
+            let detail = incoming.detail.or_else(|| existing.detail.clone());
+            let arguments = incoming.arguments.or_else(|| existing.arguments.clone());
+            let output = incoming.output.or_else(|| existing.output.clone());
+            let image_urls = if incoming.image_urls.is_empty() {
+                std::mem::take(&mut existing.image_urls)
+            } else {
+                incoming.image_urls
+            };
+            let file_changes = if incoming.file_changes.is_empty() {
+                std::mem::take(&mut existing.file_changes)
+            } else {
+                incoming.file_changes
+            };
+            let display_target = incoming
+                .display_target
+                .or_else(|| existing.display_target.clone());
+            let display_description = incoming
+                .display_description
+                .or_else(|| existing.display_description.clone());
+            let reasoning = incoming.reasoning.or_else(|| existing.reasoning.clone());
+            *existing = ActivityItem {
+                id: preserved_id,
+                tool_name,
+                mcp_server,
+                detail,
+                arguments,
+                output,
+                image_urls,
+                file_changes,
+                display_target,
+                display_description,
+                reasoning,
+                ..incoming
+            };
+            return;
+        }
+    }
+    push_daemon_activity(session, incoming);
+}
+
+fn push_daemon_activity(session: &mut AgentSession, activity: ActivityItem) {
+    let after_message = session.messages.len();
+    let turn_id = session.active_turn_id();
+    if let Some(last) = session
+        .transcript_blocks
+        .last_mut()
+        .filter(|block| block.after_message == after_message && block.turn_id == turn_id)
+    {
+        last.activities.push(activity);
+        return;
+    }
+    session.transcript_blocks.push(TranscriptBlock {
+        after_message,
+        turn_id,
+        activities: vec![activity],
+    });
 }
 
 fn ensure_shell_environment() {
@@ -3551,6 +4465,288 @@ mod tests {
             catalog.skills.iter().any(|skill| skill.name == skill_name),
             "isolated Antigravity skill {skill_name} missing from catalog"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claim_queued_message_allows_single_winner_and_blocks_stale_resurrection() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-claim-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+        let state = PersistedState::fresh(dir.clone());
+        let project = state.projects[0].clone();
+        let mut session = state.sessions[0].clone();
+        let queued = crate::model::QueuedMessage::new("Run follow-up");
+        let queued_id = queued.id;
+        session.queued_messages.push(queued.clone());
+        let saved_with_queue = backend
+            .save_task_state(vec![project.clone()], vec![session.clone()])
+            .unwrap();
+        assert_eq!(saved_with_queue[0].queued_messages.len(), 1);
+
+        let first = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: session.id,
+                    runtime_id: Uuid::nil(),
+                    command: Command::ClaimQueuedMessage {
+                        message_id: queued_id,
+                    },
+                },
+                EventSink::test_sink(session.id, Uuid::nil()),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            ResponsePayload::QueuedMessageClaimed { claimed: true }
+        ));
+
+        let second = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: session.id,
+                    runtime_id: Uuid::nil(),
+                    command: Command::ClaimQueuedMessage {
+                        message_id: queued_id,
+                    },
+                },
+                EventSink::test_sink(session.id, Uuid::nil()),
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            ResponsePayload::QueuedMessageClaimed { claimed: false }
+        ));
+
+        // A stale client with an older snapshot re-saving the retired queue item cannot resurrect it.
+        let resurrected = backend
+            .save_task_state(vec![project], vec![session])
+            .unwrap();
+        assert!(
+            resurrected[0].queued_messages.is_empty(),
+            "retired queued message was resurrected by stale SaveTaskState"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_task_state_rejects_stale_lower_state_version_overwrite() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-ver-{}", Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let git = |args: &[&str]| {
+            let status = crate::command_env::plain_command("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            assert!(
+                status.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&status.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.name", "Waku Test"]);
+        git(&["config", "user.email", "test@waku.example"]);
+        std::fs::write(workspace.join("note.txt"), "initial\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+        let state = PersistedState::fresh(workspace.clone());
+        let project = state.projects[0].clone();
+        let mut session = state.sessions[0].clone();
+        session.begin_turn("Turn 1");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        session.begin_turn("Turn 2");
+        session.finish_active_turn(crate::model::TurnStatus::Completed);
+        let stale_snapshot = session.clone();
+
+        crate::checkpoint::capture_ref(
+            &workspace,
+            &crate::checkpoint::turn_start_ref(session.id, 2),
+        )
+        .unwrap();
+        backend
+            .save_task_state(vec![project.clone()], vec![session])
+            .unwrap();
+        // Rewind to before turn 2, truncating turn 2 and bumping server state_version.
+        let rewound = backend
+            .rewind_session_to_message(stale_snapshot.id, 2)
+            .unwrap()
+            .0;
+        assert!(rewound.state_version > stale_snapshot.state_version);
+        assert_eq!(rewound.turns.len(), 1);
+
+        // Stale save carrying state_version 0 and 2 turns must NOT overwrite turn truncation.
+        let merged = backend
+            .save_task_state(vec![project], vec![stale_snapshot])
+            .unwrap();
+        assert_eq!(merged[0].state_version, rewound.state_version);
+        assert_eq!(merged[0].turns.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_live_work_ignores_idle_resident_driver_and_reap_evicts_it() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-reap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        backend.insert_test_session(
+            session_id,
+            runtime_id,
+            ProviderKind::Codex,
+            None,
+            DriverHandle::from_control(Arc::new(RecordingDriverControl {
+                fork_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                rollback_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        );
+        assert!(!backend.has_live_work());
+        // With max_idle = 0, an unbusy idle resident driver is reaped.
+        let reaped = backend.reap_idle_runtimes(Duration::ZERO);
+        assert_eq!(reaped, vec![(session_id, runtime_id)]);
+        assert!(!backend.is_runtime_live(session_id, runtime_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_terminal_respawns_exited_terminal_with_changed_cwd_or_runtime() {
+        let dir = std::env::temp_dir().join(format!("waku-daemon-term-t2-{}", Uuid::new_v4()));
+        let cwd1 = dir.join("one");
+        let cwd2 = dir.join("two");
+        std::fs::create_dir_all(&cwd1).unwrap();
+        std::fs::create_dir_all(&cwd2).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+        let term_id = Uuid::new_v4();
+        let rt1 = Uuid::new_v4();
+        let rt2 = Uuid::new_v4();
+
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: term_id,
+                    runtime_id: rt1,
+                    command: Command::OpenTerminal {
+                        cwd: cwd1.clone(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                },
+                EventSink::test_sink(term_id, rt1),
+            )
+            .unwrap();
+        // Live terminal with different cwd is rejected.
+        assert!(
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: term_id,
+                        runtime_id: rt2,
+                        command: Command::OpenTerminal {
+                            cwd: cwd2.clone(),
+                            cols: 80,
+                            rows: 24,
+                        },
+                    },
+                    EventSink::test_sink(term_id, rt2),
+                )
+                .is_err()
+        );
+        // Exit the shell and verify respawn succeeds with changed cwd and runtime_id.
+        let exit_cmd = if cfg!(windows) {
+            b"exit 0\r\n".as_slice()
+        } else {
+            b"exit 0\r".as_slice()
+        };
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: term_id,
+                    runtime_id: rt1,
+                    command: Command::WriteTerminal {
+                        data: exit_cmd.to_vec(),
+                    },
+                },
+                EventSink::test_sink(term_id, rt1),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let ResponsePayload::Terminals { terminals } = backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command: Command::ListTerminals,
+                    },
+                    EventSink::test_sink(Uuid::nil(), Uuid::nil()),
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            if terminals
+                .iter()
+                .find(|t| t.session_id == term_id)
+                .is_some_and(|t| t.exited)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: term_id,
+                    runtime_id: rt2,
+                    command: Command::OpenTerminal {
+                        cwd: cwd2,
+                        cols: 80,
+                        rows: 24,
+                    },
+                },
+                EventSink::test_sink(term_id, rt2),
+            )
+            .expect("exited terminal should allow respawn with changed cwd and runtime_id");
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: term_id,
+                    runtime_id: rt2,
+                    command: Command::CloseTerminal,
+                },
+                EventSink::test_sink(term_id, rt2),
+            )
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

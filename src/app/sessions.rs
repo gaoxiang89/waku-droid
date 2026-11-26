@@ -150,6 +150,12 @@ impl Waku {
             .filter(|session| session.project_id == project_id)
             .map(|session| session.id)
             .collect::<Vec<_>>();
+        let project_path = self
+            .state
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.path.clone());
         if !self.hide_project(project_id, window, cx) {
             return;
         }
@@ -211,6 +217,15 @@ impl Waku {
                         }
                         this.composer_drafts
                             .remove(crate::persistence::ComposerDraftKey::NewSession(project_id));
+                        if let Some(project_path) = project_path {
+                            let scope = PanelScope {
+                                host: host.clone(),
+                                workspace: project_path,
+                            };
+                            this.remove_workspace_terminal_layouts(&scope);
+                            this.right_panel_workspace_states.remove(&scope);
+                            this.bottom_panel_workspace_states.remove(&scope);
+                        }
                         this.state
                             .projects
                             .retain(|project| project.id != project_id);
@@ -365,6 +380,14 @@ impl Waku {
                             waku.reset_transcript_rows(waku.transcript_row_count());
                             waku.refresh_composer_sources(cx);
                             waku.refresh_selected_antigravity_swarm_if_relevant(cx);
+                            if waku
+                                .state
+                                .sessions
+                                .iter()
+                                .any(|s| s.id == session_id && (s.status.is_busy() || s.has_started()))
+                            {
+                                waku.start_runtime_attachment(session_id, cx);
+                            }
                         }
                     }
                     Err(error) => {

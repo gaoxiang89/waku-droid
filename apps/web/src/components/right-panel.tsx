@@ -1434,10 +1434,15 @@ function TerminalPanel({
   const [core, setCore] = useState<GhosttyCore | null>(null)
   const ready = useRef(false)
   const queuedOutput = useRef<Uint8Array[]>([])
+  const offsetRef = useRef(0)
+  const resyncInFlight = useRef(false)
+  const sizeRef = useRef({ cols: 80, rows: 24 })
+  const prevCwdRef = useRef<string | undefined>(undefined)
   const titleScanner = useRef(new TerminalTitleScanner())
   const [error, setError] = useState<string | null>(null)
   const [exited, setExited] = useState(false)
   const cwd = session && project ? sessionCwd(session, project) : undefined
+  const mountedTerminal = Boolean(core && cwd)
 
   useEffect(() => {
     let disposed = false
@@ -1454,18 +1459,72 @@ function TerminalPanel({
   }, [])
 
   useEffect(() => {
+    if (!mountedTerminal) {
+      ready.current = false
+      queuedOutput.current = []
+    }
+  }, [mountedTerminal])
+
+  useEffect(() => {
     if (!client || phase !== 'connected' || !cwd) return
     let disposed = false
+    const cwdChanged = prevCwdRef.current !== undefined && prevCwdRef.current !== cwd
+    prevCwdRef.current = cwd
+    if (cwdChanged) {
+      offsetRef.current = 0
+      queuedOutput.current = []
+    }
+    setError(null)
+    setExited(false)
     titleScanner.current = new TerminalTitleScanner()
+
+    const writeBytes = (bytes: Uint8Array) => {
+      if (!bytes.length) return
+      const title = titleScanner.current.feed(bytes)
+      if (title) onTitle(title)
+      if (ready.current) write(bytes)
+      else queuedOutput.current.push(bytes)
+    }
+
+    const requestSnapshot = () => {
+      if (disposed || resyncInFlight.current) return
+      resyncInFlight.current = true
+      const after = offsetRef.current > 0 ? offsetRef.current : null
+      void client
+        .request({ type: 'attachTerminal', after }, terminalId, terminalId)
+        .then((response) => {
+          if (disposed || response.type !== 'terminalOutput') return
+          const { snapshot } = response
+          const bytes = snapshot.data ? decodeBase64(snapshot.data) : new Uint8Array()
+          if (snapshot.reset) {
+            titleScanner.current = new TerminalTitleScanner()
+            writeBytes(new TextEncoder().encode('\x1bc'))
+          }
+          offsetRef.current = snapshot.offset
+          if (bytes.length) writeBytes(bytes)
+          if (snapshot.exited) setExited(true)
+        })
+        .catch(() => {})
+        .finally(() => {
+          resyncInFlight.current = false
+        })
+    }
+
     const unsubscribe = client.subscribe(terminalId, terminalId, (event) => {
       if (event.event.kind === 'terminalOutput') {
-        const payload = event.event.payload as { data?: string }
+        const payload = event.event.payload as { data?: string; offset?: number }
         if (!payload.data) return
         const bytes = decodeBase64(payload.data)
-        const title = titleScanner.current.feed(bytes)
-        if (title) onTitle(title)
-        if (ready.current) write(bytes)
-        else queuedOutput.current.push(bytes)
+        const end = typeof payload.offset === 'number' ? payload.offset : offsetRef.current + bytes.length
+        if (end <= offsetRef.current) return
+        const start = Math.max(0, end - bytes.length)
+        if (start > offsetRef.current) {
+          requestSnapshot()
+          return
+        }
+        const slice = bytes.subarray(offsetRef.current - start)
+        offsetRef.current = end
+        writeBytes(slice)
       } else if (event.event.kind === 'terminalExited') {
         setExited(true)
       } else if (event.event.kind === 'terminalError') {
@@ -1473,22 +1532,53 @@ function TerminalPanel({
       }
     })
 
-    void client.request(
-      { type: 'openTerminal', cwd, cols: 80, rows: 24 },
-      terminalId,
-      terminalId,
-    ).catch((cause) => {
+    const connectTerminal = async () => {
+      if (cwdChanged) {
+        await client.request({ type: 'closeTerminal' }, terminalId, terminalId).catch(() => {})
+        if (disposed) return
+      }
+      await client.request(
+        {
+          type: 'openTerminal',
+          cwd,
+          cols: sizeRef.current.cols,
+          rows: sizeRef.current.rows,
+        },
+        terminalId,
+        terminalId,
+      )
+      if (disposed) return
+      void client
+        .notify(
+          {
+            type: 'resizeTerminal',
+            cols: sizeRef.current.cols,
+            rows: sizeRef.current.rows,
+          },
+          terminalId,
+          terminalId,
+        )
+        .catch(() => {})
+      requestSnapshot()
+    }
+
+    void connectTerminal().catch((cause) => {
       if (!disposed) setError(errorMessage(cause))
     })
 
     return () => {
       disposed = true
-      ready.current = false
-      queuedOutput.current = []
       unsubscribe()
-      void client.notify({ type: 'closeTerminal' }, terminalId, terminalId).catch(() => {})
     }
   }, [client, cwd, phase, terminalId, write])
+
+  useEffect(() => {
+    return () => {
+      if (client?.connected) {
+        void client.notify({ type: 'closeTerminal' }, terminalId, terminalId).catch(() => {})
+      }
+    }
+  }, [client, terminalId])
 
   if (!cwd) return <PanelMessage title={t('files.no_project_open')} detail={t('terminal.no_workspace_description')} />
   return (
@@ -1516,9 +1606,11 @@ function TerminalPanel({
             focus()
           }}
           onResize={(cols, rows) => {
+            const clamped = { cols: clampU16(cols), rows: clampU16(rows) }
+            sizeRef.current = clamped
             if (!client || phase !== 'connected') return
             void client.notify(
-              { type: 'resizeTerminal', cols: clampU16(cols), rows: clampU16(rows) },
+              { type: 'resizeTerminal', cols: clamped.cols, rows: clamped.rows },
               terminalId,
               terminalId,
             ).catch(() => {})

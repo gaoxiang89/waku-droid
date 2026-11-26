@@ -277,13 +277,12 @@ Remote state lives in `~/.cache/narel[-dev]/server/` on Unix and
 ## Current limitations
 
 - Features that act on the desktop filesystem stay disabled for remote
-  tasks: "Open in" apps and revealing remote attachments. Settings pages
-  currently manage the local host.
-- Terminal output produced while a connection is down is not replayed; the
-  shell itself keeps running on the host.
-- The Connections page has no password field yet; password authentication
-  needs the credential entry created by other means. Prefer ssh-agent or a
-  key.
+  tasks: "Open in" apps and revealing remote attachments.
+- Settings pages (Providers, Skills, Usage) let you switch between the local
+  host and connected remote hosts; global appearance settings stay local.
+- Terminal output produced while a connection is down is replayed from the
+  daemon's in-memory scrollback ring buffer (older output beyond the ring
+  capacity is dropped while the shell keeps running on the host).
 - Hosts can be Linux, macOS, or Windows on x86_64 or aarch64, but a Windows
   host needs a `narel-daemon-windows-<arch>.exe` for that architecture. The
   Windows x64 package carries one; the current release workflow does not

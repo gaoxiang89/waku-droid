@@ -256,7 +256,27 @@ impl DriverControl for RemoteDriverControl {
     }
 
     fn steer(&self, prompt: String) {
-        self.notify(waku_client::Command::Steer { prompt });
+        self.notify(waku_client::Command::Steer {
+            prompt,
+            message_id: None,
+            display_content: None,
+            attachments: Vec::new(),
+        });
+    }
+
+    fn steer_submission(
+        &self,
+        prompt: String,
+        message_id: Option<uuid::Uuid>,
+        display_content: Option<String>,
+        attachments: Vec<crate::model::MessageAttachment>,
+    ) {
+        self.notify(waku_client::Command::Steer {
+            prompt,
+            message_id,
+            display_content,
+            attachments,
+        });
     }
 
     fn cancel(&self) {

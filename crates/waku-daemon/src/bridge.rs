@@ -356,21 +356,9 @@ fn run_parsed(
                 }
             };
             match reused {
-                Some((state, stream)) => {
-                    if let Some(resident_path) = shared_resident_state.as_ref()
-                        && resident_path != &local_state_path
-                    {
-                        let _ = write_state(resident_path, &state);
-                    }
-                    (state, stream)
-                }
+                Some((state, stream)) => (state, stream),
                 None => {
                     let state = start_daemon(&executable, &state_dir, &fingerprint)?;
-                    if let Some(resident_path) = shared_resident_state.as_ref()
-                        && resident_path != &local_state_path
-                    {
-                        let _ = write_state(resident_path, &state);
-                    }
                     let stream = TcpStream::connect(&state.address).with_context(|| {
                         format!("could not reach narel-daemon at {}", state.address)
                     })?;
@@ -474,7 +462,7 @@ fn reusable_daemon(
     let Some(state) = reusable_daemon_checked(state_dir, fingerprint, replace_incompatible)? else {
         return Ok(None);
     };
-    let address = state.address.parse()?;
+    let address = loopback_connect_address(&state.address)?;
     let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
         .context("resident daemon is unreachable; leaving its sessions intact")?;
     Ok(Some((state, stream)))
@@ -513,14 +501,20 @@ fn reusable_daemon_checked(
         return Ok(None);
     }
     if state.fingerprint != fingerprint {
-        let client = waku_client::DaemonClient::connect(&state.address, state.token.clone())?;
-        let result = client.request(
+        let connect_addr = loopback_connect_address(&state.address)?.to_string();
+        let client = waku_client::DaemonClient::connect(&connect_addr, state.token.clone())?;
+        let terminals_result = client.request(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             waku_protocol::Command::ListTerminals,
         );
+        let task_state_result = client.request(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            waku_protocol::Command::LoadTaskState,
+        );
         client.disconnect();
-        match result? {
+        match terminals_result? {
             waku_protocol::ResponsePayload::Terminals { terminals }
                 if terminals.iter().any(|t| !t.exited) =>
             {
@@ -528,6 +522,15 @@ fn reusable_daemon_checked(
             }
             waku_protocol::ResponsePayload::Terminals { .. } => {}
             _ => bail!("could not verify terminal sessions before daemon upgrade"),
+        }
+        match task_state_result? {
+            waku_protocol::ResponsePayload::TaskState { sessions, .. }
+                if sessions.iter().any(|session| session.is_busy()) =>
+            {
+                return Ok(Some(state));
+            }
+            waku_protocol::ResponsePayload::TaskState { .. } => {}
+            _ => bail!("could not verify task sessions before daemon upgrade"),
         }
         platform::terminate(state.pid);
         return Ok(None);
@@ -966,6 +969,7 @@ mod tests {
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
             fingerprint: "abcd".into(),
+            allowed_origins: None,
         };
         write_state(&state_path, &state).unwrap();
         let loaded: BridgeState =
@@ -1212,6 +1216,7 @@ mod tests {
             token: "resident-token".to_string(),
             fingerprint: "test-fp".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            allowed_origins: None,
         };
         write_state(&resident_path, &state).unwrap();
 
@@ -1244,6 +1249,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("protocol"), "unexpected error: {err}");
+
+        // Reusing a resident daemon never overwrites `resident_path` with bridge-normalized state.
+        write_state(
+            &resident_path,
+            &BridgeState {
+                protocol_version: PROTOCOL_VERSION,
+                address: format!("0.0.0.0:{port}"),
+                token: "resident-token".to_string(),
+                fingerprint: "resident-fp".to_string(),
+                pid: std::process::id(),
+                allowed_origins: Some(vec!["http://localhost:3001".into()]),
+            },
+        )
+        .unwrap();
+        let before = fs::read(&resident_path).unwrap();
+        reusable_resident_daemon_with(&resident_path, &state_dir, false, |_| true)
+            .unwrap()
+            .expect("resident daemon reuse should succeed");
+        let after = fs::read(&resident_path).unwrap();
+        assert_eq!(before, after, "bridge must never overwrite resident-daemon.json");
 
         drop(listener);
         let _ = fs::remove_dir_all(&root);

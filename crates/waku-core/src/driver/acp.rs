@@ -2224,7 +2224,7 @@ where
                                 if had_unsolicited {
                                     unsolicited_turn.lock().take_active();
                                 }
-                                let _ = events.send(DriverEvent::SteerAccepted { message: text });
+                                let _ = events.send(DriverEvent::steer_accepted(text));
                             }
                             Err(error) => {
                                 let _ = events.send(DriverEvent::SteerRejected {

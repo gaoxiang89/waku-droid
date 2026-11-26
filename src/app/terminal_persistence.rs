@@ -43,6 +43,27 @@ fn layout_path() -> PathBuf {
     StateStore::default_path().with_file_name("terminal-layouts.json")
 }
 
+fn cwd_within_workspace(cwd: &Path, workspace: &Path) -> bool {
+    if cwd == workspace {
+        return true;
+    }
+    let Some(cwd_str) = cwd.to_str() else {
+        return false;
+    };
+    let Some(ws_str) = workspace.to_str() else {
+        return false;
+    };
+    let Some(cwd_parsed) = waku_protocol::lexical_path::parse(cwd_str).map(|p| p.normalized())
+    else {
+        return false;
+    };
+    let Some(ws_parsed) = waku_protocol::lexical_path::parse(ws_str).map(|p| p.normalized())
+    else {
+        return false;
+    };
+    cwd_parsed.strip_prefix(&ws_parsed).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +125,30 @@ mod tests {
             }
             .valid(0)
         );
+    }
+
+    #[test]
+    fn cwd_within_workspace_matches_root_and_subdirectories_without_prefix_bleed() {
+        assert!(cwd_within_workspace(
+            Path::new("/work/repo"),
+            Path::new("/work/repo")
+        ));
+        assert!(cwd_within_workspace(
+            Path::new("/work/repo/apps/web"),
+            Path::new("/work/repo")
+        ));
+        assert!(!cwd_within_workspace(
+            Path::new("/work/repo-other"),
+            Path::new("/work/repo")
+        ));
+        assert!(cwd_within_workspace(
+            Path::new(r"C:\work\repo\sub"),
+            Path::new(r"c:/work/repo")
+        ));
+        assert!(!cwd_within_workspace(
+            Path::new(r"C:\work\repo2"),
+            Path::new(r"C:\work\repo")
+        ));
     }
 }
 
@@ -231,7 +276,7 @@ impl Waku {
                             .map(|p| p.read(cx).persistent_id)
                             .collect::<HashSet<_>>();
                         for terminal in terminals {
-                            if terminal.cwd != scope.workspace
+                            if !cwd_within_workspace(&terminal.cwd, &scope.workspace)
                                 || terminal.exited
                                 || !known.insert(terminal.session_id)
                             {

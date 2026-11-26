@@ -226,9 +226,24 @@ pub(super) fn merge_remote_session_catalog(
             local.model = remote.model;
             local.created_at = remote.created_at;
             local.last_reply_at = remote.last_reply_at;
-            if !has_local_runtime(local.id) {
+            if remote.state_version > local.state_version {
+                local.state_version = remote.state_version;
                 local.status = remote.status;
                 local.updated_at = remote.updated_at;
+                if remote.detail_loaded {
+                    local.queued_messages = remote.queued_messages;
+                } else {
+                    local.queued_messages.clear();
+                }
+                local.detail_loaded = false;
+            } else {
+                if remote.detail_loaded && (!local.detail_loaded || !has_local_runtime(local.id)) {
+                    local.queued_messages = remote.queued_messages;
+                }
+                if !has_local_runtime(local.id) {
+                    local.status = remote.status;
+                    local.updated_at = remote.updated_at;
+                }
             }
         } else {
             local.push(remote);
@@ -1352,6 +1367,12 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         let runtime_ids = self.runtimes.keys().copied().collect::<HashSet<_>>();
+        let previous_versions = self
+            .state
+            .sessions
+            .iter()
+            .map(|session| (session.id, session.state_version))
+            .collect::<HashMap<_, _>>();
         let removed = merge_host_task_state(
             &mut self.state,
             &mut self.hosts.ownership,
@@ -1359,6 +1380,17 @@ impl Waku {
             snapshot,
             |id| runtime_ids.contains(&id),
         );
+        let stale_bumped = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| {
+                previous_versions
+                    .get(&session.id)
+                    .is_some_and(|prev| session.state_version > *prev)
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
         // A remote snapshot replaces session payloads wholesale.
         self.invalidate_activity_details();
         for session_id in &removed {
@@ -1376,6 +1408,16 @@ impl Waku {
             self.composer_drafts
                 .remove(crate::persistence::ComposerDraftKey::Session(*session_id));
         }
+        for &session_id in &stale_bumped {
+            self.runtime_attach_pending.remove(&session_id);
+            self.runtime_attach_misses.remove(&session_id);
+            self.runtimes.remove(&session_id);
+            self.clear_user_input_fields(session_id);
+            self.submission_preparations.remove(&session_id);
+            if self.state.selected_session == Some(session_id) {
+                self.ensure_session_loaded(session_id, cx);
+            }
+        }
         self.composer_drafts
             .new_sessions
             .retain(|id, _| !self.state.deleted_project_ids.contains(id));
@@ -1385,8 +1427,10 @@ impl Waku {
             .sessions
             .iter()
             .filter(|session| {
-                session.status.is_busy()
-                    || (self.state.selected_session == Some(session.id) && session.has_started())
+                !stale_bumped.contains(&session.id)
+                    && (session.status.is_busy()
+                        || (self.state.selected_session == Some(session.id)
+                            && session.has_started()))
             })
             .map(|session| session.id)
             .collect::<Vec<_>>();
@@ -3649,8 +3693,15 @@ impl Waku {
             session.provider,
             &submission.prompt,
         );
+        let display_content = submission.display_content.clone();
+        let attachments = submission.attachments.clone();
         if let Some(runtime) = self.runtimes.get_mut(&session.id) {
-            runtime.driver.steer(provider_prompt);
+            runtime.driver.steer_submission(
+                provider_prompt,
+                Some(Uuid::new_v4()),
+                display_content,
+                attachments,
+            );
             runtime.pending_steers.push_back(submission);
         } else {
             self.enqueue_follow_up_submission(session.id, submission, cx);
@@ -3861,17 +3912,74 @@ impl Waku {
         message_id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        let Some(message) = self.state.session_mut(session_id).and_then(|session| {
-            let index = session
-                .queued_messages
-                .iter()
-                .position(|message| message.id == message_id)?;
-            Some(session.queued_messages.remove(index))
-        }) else {
+        if self.pending_queue_claims.contains(&session_id) {
+            return;
+        }
+        let Some(message) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| {
+                session
+                    .queued_messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+                    .cloned()
+            })
+        else {
             return;
         };
-        self.save();
-        self.steer_composer_submission(ComposerSubmission::from_queued_message(message), cx);
+        let owner = self.hosts.for_session(session_id);
+        let host_key = owner.key.clone();
+        let host_generation = owner.generation;
+        let daemon = owner.daemon.clone();
+        self.pending_queue_claims.insert(session_id);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    daemon.client().request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::ClaimQueuedMessage { message_id },
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_queue_claims.remove(&session_id);
+                if !this
+                    .hosts
+                    .get(&host_key)
+                    .is_some_and(|host| host.generation == host_generation)
+                {
+                    return;
+                }
+                match result {
+                    Ok(waku_client::ResponsePayload::QueuedMessageClaimed { claimed }) => {
+                        if let Some(session) = this.state.session_mut(session_id) {
+                            session
+                                .queued_messages
+                                .retain(|candidate| candidate.id != message.id);
+                        }
+                        if claimed {
+                            this.save();
+                            this.steer_composer_submission(
+                                ComposerSubmission::from_queued_message(message),
+                                cx,
+                            );
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        this.show_toast(error.to_string());
+                    }
+                    _ => {}
+                }
+            });
+        })
+        .detach();
     }
 
     /// Activate the same action as the oldest queued row's Steer control.
@@ -3892,38 +4000,96 @@ impl Waku {
     /// Start the next queued follow-up as a fresh turn. Only called once a
     /// settled turn has been fully closed, so the session is Idle.
     fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
-        if self.response_fork_preparations.contains_key(&session_id) {
-            return;
-        }
-        let Some(session) = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return;
-        };
-        if session.is_busy()
-            || session.queued_messages.is_empty()
-            || self.ending_checkpoint_pending(session_id)
-            // Messages parked behind a goal-initiated provider start stay
-            // queued until that runtime installs.
-            || self.goal_runtime_starts.contains(&session_id)
+        if self.response_fork_preparations.contains_key(&session_id)
+            || self.pending_queue_claims.contains(&session_id)
         {
             return;
         }
         let Some(message) = self
             .state
-            .session_mut(session_id)
-            .map(|session| session.queued_messages.remove(0))
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| {
+                if session.is_busy()
+                    || session.queued_messages.is_empty()
+                    || self.ending_checkpoint_pending(session_id)
+                    // Messages parked behind a goal-initiated provider start stay
+                    // queued until that runtime installs.
+                    || self.goal_runtime_starts.contains(&session_id)
+                {
+                    None
+                } else {
+                    session.queued_messages.first().cloned()
+                }
+            })
         else {
             return;
         };
-        self.submit_submission_for_session(
-            session_id,
-            ComposerSubmission::from_queued_message(message),
-            cx,
-        );
+        let owner = self.hosts.for_session(session_id);
+        let host_key = owner.key.clone();
+        let host_generation = owner.generation;
+        let daemon = owner.daemon.clone();
+        self.pending_queue_claims.insert(session_id);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    daemon.client().request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::ClaimQueuedMessage {
+                            message_id: message.id,
+                        },
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_queue_claims.remove(&session_id);
+                if !this
+                    .hosts
+                    .get(&host_key)
+                    .is_some_and(|host| host.generation == host_generation)
+                {
+                    return;
+                }
+                if this.response_fork_preparations.contains_key(&session_id) {
+                    return;
+                }
+                match result {
+                    Ok(waku_client::ResponsePayload::QueuedMessageClaimed { claimed }) => {
+                        if let Some(session) = this.state.session_mut(session_id) {
+                            session
+                                .queued_messages
+                                .retain(|candidate| candidate.id != message.id);
+                        }
+                        if claimed
+                            && !this.ending_checkpoint_pending(session_id)
+                            && !this.goal_runtime_starts.contains(&session_id)
+                            && this
+                                .state
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .is_some_and(|session| !session.is_busy())
+                        {
+                            this.submit_submission_for_session(
+                                session_id,
+                                ComposerSubmission::from_queued_message(message),
+                                cx,
+                            );
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("could not claim queued message for {session_id}: {error}");
+                    }
+                    _ => {}
+                }
+            });
+        })
+        .detach();
     }
 
     fn submit_submission_for_session(

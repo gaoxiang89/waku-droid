@@ -30,6 +30,7 @@ interface DaemonContextValue {
   config: ConnectionConfig | null
   phase: ConnectionPhase
   error: string | null
+  connections: number
   connect: (config: ConnectionConfig) => Promise<void>
   reconnect: () => Promise<void>
   disconnect: () => void
@@ -37,6 +38,8 @@ interface DaemonContextValue {
 }
 
 const DaemonContext = createContext<DaemonContextValue | null>(null)
+const INITIAL_RECONNECT_DELAY_MS = 500
+const MAX_RECONNECT_DELAY_MS = 15_000
 
 export function DaemonProvider({ children }: { children: ReactNode }) {
   const { locale } = useI18n()
@@ -45,8 +48,12 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<ConnectionConfig | null>(null)
   const [phase, setPhase] = useState<ConnectionPhase>('booting')
   const [error, setError] = useState<string | null>(null)
+  const [connections, setConnections] = useState(0)
   const generation = useRef(0)
   const bootstrapped = useRef(false)
+  const manualConnectInFlight = useRef(false)
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
 
   const open = useCallback(
     async (candidate: ConnectionConfig) => {
@@ -75,6 +82,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
         }
         storeConnection(normalized)
         setPhase('connected')
+        setConnections((count) => count + 1)
       } catch (cause) {
         if (generation.current !== attempt) return
         const message = cause instanceof Error ? cause.message : String(cause)
@@ -100,37 +108,93 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    if (!client || phase !== 'connected') return
+    if (!client) return
     const unsubscribeTaskState = client.subscribeTaskState(() => {
       if (!config) return
       void queryClient.invalidateQueries({
         queryKey: ['daemon', config.address, 'task-state'],
       })
     })
-    const timer = window.setInterval(() => {
-      if (!client.connected) {
+    let reconnectTimer: number | undefined
+    let disposed = false
+    let attempt = 0
+    const activeGeneration = generation.current
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimer !== undefined) return
+      if (generation.current !== activeGeneration || manualConnectInFlight.current) return
+      const delay = Math.min(INITIAL_RECONNECT_DELAY_MS * 2 ** attempt, MAX_RECONNECT_DELAY_MS)
+      attempt += 1
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined
+        if (disposed || generation.current !== activeGeneration) return
+        if (manualConnectInFlight.current || client.connected) return
+        void client
+          .connect()
+          .then(() => {
+            if (disposed || generation.current !== activeGeneration) return
+            attempt = 0
+            setError(null)
+            setPhase('connected')
+            setConnections((count) => count + 1)
+            void queryClient.invalidateQueries()
+          })
+          .catch((cause) => {
+            if (disposed || generation.current !== activeGeneration) return
+            setError(cause instanceof Error ? cause.message : translate(locale, 'web.daemon_connection_closed'))
+            setPhase('error')
+            scheduleReconnect()
+          })
+      }, delay)
+    }
+
+    const unsubscribeConnectionState = client.subscribeConnectionState((state) => {
+      if (disposed || generation.current !== activeGeneration) return
+      if (state === 'connected') {
+        attempt = 0
+        if (reconnectTimer !== undefined) {
+          window.clearTimeout(reconnectTimer)
+          reconnectTimer = undefined
+        }
+        return
+      }
+      if (state === 'disconnected' && !manualConnectInFlight.current && config) {
         setError(translate(locale, 'web.daemon_connection_closed'))
         setPhase('error')
+        scheduleReconnect()
       }
-    }, 1_000)
-    return () => {
-      unsubscribeTaskState()
-      window.clearInterval(timer)
+    })
+
+    if (!client.connected && phaseRef.current === 'error' && config) {
+      scheduleReconnect()
     }
-  }, [client, config, locale, phase, queryClient])
+
+    return () => {
+      disposed = true
+      unsubscribeTaskState()
+      unsubscribeConnectionState()
+      if (reconnectTimer !== undefined) {
+        window.clearTimeout(reconnectTimer)
+      }
+    }
+  }, [client, config, locale, queryClient])
 
   const reconnect = useCallback(async () => {
     if (!client || !config) throw new Error(translate(locale, 'web.daemon_not_configured'))
+    manualConnectInFlight.current = true
     setPhase('connecting')
     setError(null)
     try {
       await client.connect()
       setPhase('connected')
+      setConnections((count) => count + 1)
       void queryClient.invalidateQueries()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
       setPhase('error')
       throw cause
+    } finally {
+      manualConnectInFlight.current = false
     }
   }, [client, config, locale, queryClient])
 
@@ -139,6 +203,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     client?.disconnect()
     setPhase('disconnected')
     setError(null)
+    setConnections(0)
     queryClient.clear()
   }, [client, queryClient])
 
@@ -156,6 +221,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     config,
     phase,
     error,
+    connections,
     connect: open,
     reconnect,
     disconnect,

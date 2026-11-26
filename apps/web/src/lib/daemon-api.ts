@@ -697,6 +697,7 @@ export function createSession(
     transcript_blocks: [],
     turns: [],
     queued_messages: [],
+    state_version: 0,
   }
 }
 

@@ -73,6 +73,10 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
                 "options": options,
             }),
         ),
+        DriverEvent::PermissionResolved { request_id } => (
+            "permissionResolved",
+            json!({ "requestId": request_id }),
+        ),
         DriverEvent::UserInputRequested {
             request_id,
             questions,
@@ -82,6 +86,10 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
                 "requestId": request_id,
                 "questions": questions,
             }),
+        ),
+        DriverEvent::UserInputResolved { request_id } => (
+            "userInputResolved",
+            json!({ "requestId": request_id }),
         ),
         DriverEvent::ComputerUseUpdated(state) => (
             "computerUseUpdated",
@@ -105,7 +113,24 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             }
             ("promptSubmitted", payload)
         }
-        DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
+        DriverEvent::SteerAccepted {
+            message,
+            message_id,
+            display_content,
+            attachments,
+        } => {
+            let mut payload = json!({ "message": message });
+            if let Some(message_id) = message_id {
+                payload["messageId"] = serde_json::to_value(message_id)?;
+            }
+            if let Some(display_content) = display_content {
+                payload["displayContent"] = serde_json::to_value(display_content)?;
+            }
+            if !attachments.is_empty() {
+                payload["attachments"] = serde_json::to_value(attachments)?;
+            }
+            ("steerAccepted", payload)
+        }
         DriverEvent::SteerRejected { message, reason } => (
             "steerRejected",
             json!({ "message": message, "reason": reason }),
@@ -166,11 +191,23 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 options: permission.options,
             }
         }
+        "permissionResolved" => {
+            let resolved: ResolvedRequestWire = serde_json::from_value(payload)?;
+            DriverEvent::PermissionResolved {
+                request_id: resolved.request_id,
+            }
+        }
         "userInputRequested" => {
             let request: UserInputWire = serde_json::from_value(payload)?;
             DriverEvent::UserInputRequested {
                 request_id: request.request_id,
                 questions: request.questions,
+            }
+        }
+        "userInputResolved" => {
+            let resolved: ResolvedRequestWire = serde_json::from_value(payload)?;
+            DriverEvent::UserInputResolved {
+                request_id: resolved.request_id,
             }
         }
         "computerUseUpdated" => {
@@ -195,6 +232,9 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
             let steer: AcceptedSteerWire = serde_json::from_value(payload)?;
             DriverEvent::SteerAccepted {
                 message: steer.message,
+                message_id: steer.message_id,
+                display_content: steer.display_content,
+                attachments: steer.attachments,
             }
         }
         "steerRejected" => {
@@ -272,8 +312,21 @@ struct ComputerUseWire {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvedRequestWire {
+    request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AcceptedSteerWire {
     message: String,
+    #[serde(default)]
+    message_id: Option<Uuid>,
+    #[serde(default)]
+    display_content: Option<String>,
+    #[serde(default)]
+    attachments: Vec<crate::model::MessageAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -619,8 +672,23 @@ mod tests {
             (
                 DriverEvent::SteerAccepted {
                     message: "focus on tests".into(),
+                    message_id: Some(Uuid::from_u128(11)),
+                    display_content: Some("focus".into()),
+                    attachments: Vec::new(),
                 },
                 "steerAccepted",
+            ),
+            (
+                DriverEvent::PermissionResolved {
+                    request_id: "perm-1".into(),
+                },
+                "permissionResolved",
+            ),
+            (
+                DriverEvent::UserInputResolved {
+                    request_id: "input-1".into(),
+                },
+                "userInputResolved",
             ),
             (
                 DriverEvent::SteerRejected {
@@ -818,8 +886,31 @@ mod tests {
                     assert_eq!(actual.image_url, expected.image_url);
                 }
                 (
-                    DriverEvent::SteerAccepted { message: expected },
-                    DriverEvent::SteerAccepted { message: actual },
+                    DriverEvent::SteerAccepted {
+                        message: expected,
+                        message_id: emid,
+                        display_content: edc,
+                        attachments: eatt,
+                    },
+                    DriverEvent::SteerAccepted {
+                        message: actual,
+                        message_id: amid,
+                        display_content: adc,
+                        attachments: aatt,
+                    },
+                ) => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(amid, emid);
+                    assert_eq!(adc, edc);
+                    assert_eq!(aatt.len(), eatt.len());
+                }
+                (
+                    DriverEvent::PermissionResolved { request_id: expected },
+                    DriverEvent::PermissionResolved { request_id: actual },
+                ) => assert_eq!(actual, expected),
+                (
+                    DriverEvent::UserInputResolved { request_id: expected },
+                    DriverEvent::UserInputResolved { request_id: actual },
                 ) => assert_eq!(actual, expected),
                 (
                     DriverEvent::SteerRejected {

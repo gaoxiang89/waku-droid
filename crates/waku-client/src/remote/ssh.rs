@@ -16,6 +16,10 @@ use super::process_util::hide_console_window;
 
 const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const ASKPASS_CONNECTION_ENV: &str = "WAKU_SSH_ASKPASS_CONNECTION_ID";
+pub const ASKPASS_AUTH_ENV: &str = "WAKU_SSH_ASKPASS_AUTH";
+pub const ASKPASS_TARGET_ENV: &str = "WAKU_SSH_ASKPASS_TARGET";
+pub const ASKPASS_PROXY_JUMP_ENV: &str = "WAKU_SSH_ASKPASS_PROXY_JUMP";
+pub const ASKPASS_IDENTITY_ENV: &str = "WAKU_SSH_ASKPASS_IDENTITY";
 pub const ASKPASS_DIAGNOSTIC_PREFIX: &str = "[waku-ssh-askpass]";
 const WINDOWS_AUTH_HINT: &str = "Hint: if your key uses a passphrase, save it in Connections or start the Windows ssh-agent service.";
 
@@ -160,6 +164,56 @@ fn build_command_with_options(
         command.env("SSH_ASKPASS", executable);
         command.env("SSH_ASKPASS_REQUIRE", "force");
         command.env(ASKPASS_CONNECTION_ENV, &connection.id);
+        match target {
+            SshTarget::ConfigHost { host, auth_method } => {
+                command.env(
+                    ASKPASS_AUTH_ENV,
+                    match auth_method {
+                        SshAuthMethod::Password => "password",
+                        SshAuthMethod::Key => "key",
+                        SshAuthMethod::Agent => "agent",
+                    },
+                );
+                command.env(ASKPASS_TARGET_ENV, host.trim());
+                command.env_remove(ASKPASS_PROXY_JUMP_ENV);
+                command.env_remove(ASKPASS_IDENTITY_ENV);
+            }
+            SshTarget::Direct {
+                hostname,
+                identity_file,
+                auth_method,
+                proxy_jump,
+                ..
+            } => {
+                command.env(
+                    ASKPASS_AUTH_ENV,
+                    match auth_method {
+                        SshAuthMethod::Password => "password",
+                        SshAuthMethod::Key => "key",
+                        SshAuthMethod::Agent => "agent",
+                    },
+                );
+                command.env(ASKPASS_TARGET_ENV, hostname.trim());
+                if let Some(jump) = proxy_jump
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|jump| !jump.is_empty())
+                {
+                    command.env(ASKPASS_PROXY_JUMP_ENV, jump);
+                } else {
+                    command.env_remove(ASKPASS_PROXY_JUMP_ENV);
+                }
+                if let Some(identity) = identity_file
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                {
+                    command.env(ASKPASS_IDENTITY_ENV, identity);
+                } else {
+                    command.env_remove(ASKPASS_IDENTITY_ENV);
+                }
+            }
+        }
         if std::env::var_os("DISPLAY").is_none_or(|v| v.is_empty()) {
             command.env("DISPLAY", "waku:0");
         }
@@ -590,6 +644,69 @@ fn append_windows_auth_hint_if_needed(
     format!("{}\n{WINDOWS_AUTH_HINT}", detail.trim_end())
 }
 
+fn askpass_prompt_allowed(
+    prompt: &str,
+    auth: Option<&str>,
+    target: Option<&str>,
+    proxy_jump: Option<&str>,
+    identity: Option<&str>,
+) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let is_passphrase_prompt = lower.contains("passphrase");
+    match auth {
+        Some("key") => {
+            if !is_passphrase_prompt {
+                return false;
+            }
+            if let Some(identity) = identity.map(str::trim).filter(|value| !value.is_empty()) {
+                let key_name = std::path::Path::new(identity)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(identity);
+                if lower.contains("for key") && !prompt.contains(identity) && !prompt.contains(key_name) {
+                    return false;
+                }
+            }
+            true
+        }
+        Some("password") => {
+            if is_passphrase_prompt {
+                return false;
+            }
+            if let Some(jump_spec) = proxy_jump.map(str::trim).filter(|value| !value.is_empty()) {
+                let target_host = normalize_ssh_host(target.unwrap_or(""));
+                for jump in jump_spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let jump_host = normalize_ssh_host(jump);
+                    if !jump_host.is_empty()
+                        && !jump_host.eq_ignore_ascii_case(&target_host)
+                        && lower.contains(&jump_host.to_ascii_lowercase())
+                        && (target_host.is_empty()
+                            || !lower.contains(&target_host.to_ascii_lowercase()))
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn normalize_ssh_host(spec: &str) -> String {
+    let host_port = spec.trim().rsplit('@').next().unwrap_or("").trim();
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        if let Some((host, _)) = stripped.split_once(']') {
+            return host.to_owned();
+        }
+    }
+    host_port
+        .split(':')
+        .next()
+        .unwrap_or(host_port)
+        .to_owned()
+}
+
 /// Askpass entry point. When ssh launches Waku as `SSH_ASKPASS`, print the
 /// stored password, flush stdout, and return an exit status so `main` exits
 /// before any UI or daemon initialization. A failed lookup must exit non-zero
@@ -597,6 +714,21 @@ fn append_windows_auth_hint_if_needed(
 pub fn handle_askpass() -> Option<i32> {
     let connection_id = std::env::var_os(ASKPASS_CONNECTION_ENV)?;
     let connection_id = connection_id.to_string_lossy();
+    let prompt = std::env::args().nth(1).unwrap_or_default();
+    let auth = std::env::var(ASKPASS_AUTH_ENV).ok();
+    let target = std::env::var(ASKPASS_TARGET_ENV).ok();
+    let proxy_jump = std::env::var(ASKPASS_PROXY_JUMP_ENV).ok();
+    let identity = std::env::var(ASKPASS_IDENTITY_ENV).ok();
+    if !askpass_prompt_allowed(
+        &prompt,
+        auth.as_deref(),
+        target.as_deref(),
+        proxy_jump.as_deref(),
+        identity.as_deref(),
+    ) {
+        eprintln!("{ASKPASS_DIAGNOSTIC_PREFIX} refused credential for non-matching prompt");
+        return Some(1);
+    }
     match super::credentials::get_ssh_password(&connection_id) {
         Ok(password) => {
             let mut stdout = std::io::stdout();
@@ -1007,5 +1139,61 @@ mod tests {
         let non_windows =
             append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Agent, false, false);
         assert_eq!(non_windows, denied);
+    }
+
+    #[test]
+    fn askpass_prompt_allowed_isolates_jump_host_and_passphrase_prompts() {
+        // Password auth must never leak target password to passphrase or ProxyJump host prompts.
+        assert!(!askpass_prompt_allowed(
+            "Enter passphrase for key '/home/me/.ssh/id_ed25519': ",
+            Some("password"),
+            Some("alice@target.internal"),
+            Some("bastion@jump.internal"),
+            None,
+        ));
+        assert!(!askpass_prompt_allowed(
+            "bastion@jump.internal's password:",
+            Some("password"),
+            Some("alice@target.internal"),
+            Some("bastion@jump.internal"),
+            None,
+        ));
+        assert!(!askpass_prompt_allowed(
+            "bastion2@jump2.internal's password:",
+            Some("password"),
+            Some("alice@target.internal"),
+            Some("bastion1@jump1.internal,bastion2@jump2.internal:2222"),
+            None,
+        ));
+        assert!(askpass_prompt_allowed(
+            "alice@target.internal's password:",
+            Some("password"),
+            Some("alice@target.internal"),
+            Some("bastion@jump.internal"),
+            None,
+        ));
+
+        // Key auth must only answer passphrase prompts matching the configured identity.
+        assert!(!askpass_prompt_allowed(
+            "alice@target.internal's password:",
+            Some("key"),
+            Some("alice@target.internal"),
+            None,
+            Some("/home/me/.ssh/id_work"),
+        ));
+        assert!(!askpass_prompt_allowed(
+            "Enter passphrase for key '/home/me/.ssh/id_other': ",
+            Some("key"),
+            Some("alice@target.internal"),
+            None,
+            Some("/home/me/.ssh/id_work"),
+        ));
+        assert!(askpass_prompt_allowed(
+            "Enter passphrase for key '/home/me/.ssh/id_work': ",
+            Some("key"),
+            Some("alice@target.internal"),
+            None,
+            Some("/home/me/.ssh/id_work"),
+        ));
     }
 }

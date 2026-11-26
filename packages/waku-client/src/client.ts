@@ -424,6 +424,10 @@ export class WakuClient {
     }
     if (message.type === "event") {
       const key = subscriptionKey(message.sessionId, message.runtimeId);
+      const listeners = this.subscriptions.get(key);
+      if (!listeners?.size && message.event.kind === "terminalOutput") {
+        return;
+      }
       const previous = this.sequences.get(key);
       if (
         previous?.epoch === message.epoch &&
@@ -435,7 +439,6 @@ export class WakuClient {
         epoch: message.epoch,
         sequence: message.sequence,
       });
-      const listeners = this.subscriptions.get(key);
       if (listeners?.size) {
         for (const listener of listeners) listener(message);
       } else {

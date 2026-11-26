@@ -2253,7 +2253,7 @@ fn handle_codex_message(
                 reason: error.to_owned(),
             });
         } else {
-            let _ = events.send(DriverEvent::SteerAccepted { message });
+            let _ = events.send(DriverEvent::steer_accepted(message));
         }
         return;
     }
@@ -3919,7 +3919,7 @@ mod tests {
 
         assert!(pending_steers.lock().is_empty());
         match event_rx.try_recv().unwrap() {
-            DriverEvent::SteerAccepted { message } => {
+            DriverEvent::SteerAccepted { message, .. } => {
                 assert_eq!(message, "Focus on the failing tests first");
             }
             other => panic!("expected an accepted steer, got {other:?}"),

@@ -50,6 +50,8 @@ export const sessions = sqliteTable(
     updatedAt: integer("updated_at").notNull(),
     /** Completion of the most recent assistant turn, unix seconds. */
     lastReplyAt: integer("last_reply_at"),
+    /** Monotonic server-authoritative revision bumped on destructive mutations like rewind. */
+    stateVersion: integer("state_version").notNull().default(0),
   },
   (table) => [
     index("sessions_by_project").on(table.projectId, table.updatedAt),

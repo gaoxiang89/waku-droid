@@ -85,6 +85,7 @@ interface RuntimeEntry extends MobileRuntime {
 }
 
 interface PendingSubmission {
+  messageId?: string;
   providerPrompt: string;
   displayContent: string;
   attachments: MessageAttachment[];
@@ -301,8 +302,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   /** After a settled turn is persisted, submit the oldest queued message as
    * the next turn. Guarded per session so one settle drains one message. */
   const drainQueue = useCallback(async (sessionId: string) => {
+    const client = daemon.client;
     const profileId = daemon.activeProfile?.id;
-    if (!profileId || drainingQueues.current.has(sessionId)) return;
+    if (!client || !profileId || drainingQueues.current.has(sessionId)) return;
     const latest = queryClient.getQueryData<AgentSession>(
       daemonKeys.session(profileId, sessionId),
     );
@@ -311,14 +313,23 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     if (!next) return;
     drainingQueues.current.add(sessionId);
     try {
+      const claim = await client.request(
+        { type: 'claimQueuedMessage', messageId: next.id },
+        sessionId,
+        entries.current.get(sessionId)?.runtimeId,
+      );
+      const refreshed = queryClient.getQueryData<AgentSession>(
+        daemonKeys.session(profileId, sessionId),
+      ) ?? latest;
       const dequeued = {
-        ...latest,
-        queued_messages: latest.queued_messages?.slice(1),
+        ...refreshed,
+        queued_messages: (refreshed.queued_messages ?? []).filter((item) => item.id !== next.id),
       };
       cacheSession(dequeued);
-      const persisted = await persistOrdered(dequeued);
+      if (claim.type !== 'queuedMessageClaimed' || !claim.claimed) return;
+      if (dequeued.status !== 'idle') return;
       await sendPromptRef.current?.(
-        persisted,
+        dequeued,
         next.display_content ?? next.content,
         next.attachments ?? [],
         next.content,
@@ -328,7 +339,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     } finally {
       drainingQueues.current.delete(sessionId);
     }
-  }, [cacheSession, daemon.activeProfile?.id, persistOrdered, queryClient]);
+  }, [cacheSession, daemon.activeProfile?.id, daemon.client, queryClient]);
 
   const subscribe = useCallback((
     session: AgentSession,
@@ -395,26 +406,50 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         );
       }
       if (event.event.kind === 'steerAccepted') {
-        const payload = event.event.payload as { message?: string };
+        const payload = event.event.payload as {
+          message?: string;
+          messageId?: string | null;
+          displayContent?: string | null;
+          attachments?: MessageAttachment[];
+        };
         // The provider folded a steer into the live turn. Ours is pending
         // here; another client's is not, and its message belongs in this
         // transcript just the same — the desktop mirrors it too.
-        const pending = pendingSteers.current.get(session.id)?.shift();
+        const queue = pendingSteers.current.get(session.id);
+        const matchIndex = queue
+          ? queue.findIndex((item) =>
+              (payload.messageId && item.messageId === payload.messageId) ||
+              item.providerPrompt === payload.message,
+            )
+          : -1;
+        const pending = queue
+          ? (matchIndex >= 0 ? queue.splice(matchIndex, 1)[0] : queue.shift())
+          : undefined;
         const content = payload.message ?? pending?.providerPrompt;
-        if (content) {
+        const messageId = payload.messageId ?? pending?.messageId ?? clock.randomUUID();
+        if (
+          content &&
+          !state.current.messages.some((candidate) => candidate.id === messageId)
+        ) {
+          const displayContent = payload.displayContent ?? (
+            pending && (
+              pending.attachments.length || pending.providerPrompt !== pending.displayContent
+            ) ? pending.displayContent : null
+          );
+          const attachments = payload.attachments?.length
+            ? payload.attachments
+            : (pending?.attachments ?? []);
           state.current = {
             ...state.current,
             messages: [
               ...state.current.messages,
               {
-                id: clock.randomUUID(),
+                id: messageId,
                 turn_id: state.current.turns.at(-1)?.id ?? null,
                 role: 'user',
                 content,
-                display_content: pending && (
-                  pending.attachments.length || pending.providerPrompt !== pending.displayContent
-                ) ? pending.displayContent : null,
-                attachments: pending?.attachments ?? [],
+                display_content: displayContent,
+                attachments,
                 created_at: clock.nowSeconds(),
                 streaming: false,
               },
@@ -422,7 +457,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           };
         }
       } else if (event.event.kind === 'steerRejected') {
-        const pending = pendingSteers.current.get(session.id)?.shift();
+        const payload = event.event.payload as { message?: string };
+        const queue = pendingSteers.current.get(session.id);
+        const matchIndex = queue
+          ? queue.findIndex((item) => item.providerPrompt === payload?.message)
+          : -1;
+        const pending = queue
+          ? (matchIndex >= 0 ? queue.splice(matchIndex, 1)[0] : queue.shift())
+          : undefined;
         if (pending) {
           state.current = queueSubmission(
             state.current,
@@ -443,10 +485,21 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       state.mutated = true;
       if (result.permission !== undefined) {
         setPermissions((values) => ({ ...values, [session.id]: result.permission ?? undefined }));
+      } else if (result.resolvedPermissionId) {
+        const resolvedId = result.resolvedPermissionId;
+        setPermissions((values) => (
+          values[session.id]?.requestId === resolvedId ? removeKey(values, session.id) : values
+        ));
       }
       if (result.userInput !== undefined) {
         entry.userInputRevision += 1;
         setUserInputs((values) => ({ ...values, [session.id]: result.userInput ?? undefined }));
+      } else if (result.resolvedUserInputId) {
+        const resolvedId = result.resolvedUserInputId;
+        entry.userInputRevision += 1;
+        setUserInputs((values) => (
+          values[session.id]?.requestId === resolvedId ? removeKey(values, session.id) : values
+        ));
       }
       if (result.error) setErrors((values) => ({ ...values, [session.id]: result.error }));
       if (result.settled) state.settled = true;
@@ -758,10 +811,31 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       await sendPrompt(session, prompt, attachments, providerPrompt);
       return;
     }
+    const messageId = clock.randomUUID();
+    const displayContent = attachments.length || providerPrompt !== prompt ? prompt : null;
     const pending = pendingSteers.current.get(session.id) ?? [];
-    pending.push({ providerPrompt, displayContent: prompt, attachments });
+    pending.push({ messageId, providerPrompt, displayContent: prompt, attachments });
     pendingSteers.current.set(session.id, pending);
-    await client.request({ type: 'steer', prompt: providerPrompt }, session.id, runtime.runtimeId);
+    try {
+      await client.request(
+        {
+          type: 'steer',
+          prompt: providerPrompt,
+          messageId,
+          displayContent,
+          attachments,
+        },
+        session.id,
+        runtime.runtimeId,
+      );
+    } catch (cause) {
+      const queue = pendingSteers.current.get(session.id);
+      if (queue) {
+        const index = queue.findIndex((item) => item.messageId === messageId);
+        if (index >= 0) queue.splice(index, 1);
+      }
+      throw cause;
+    }
   }, [daemon.client, daemon.phase, sendPrompt]);
 
   const createTask = useCallback(async (
@@ -1105,16 +1179,50 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const client = daemon.client;
     const profileId = daemon.activeProfile?.id;
     if (!client || !profileId) return;
-    return client.subscribeTaskState(() => {
+    const invalidateSessions = (taskState?: TaskState) => {
+      const bumped = new Set<string>();
+      if (taskState) {
+        for (const remote of taskState.sessions) {
+          const cached = queryClient.getQueryData<AgentSession>(
+            daemonKeys.session(profileId, remote.id),
+          );
+          if (cached && (remote.state_version ?? 0) > (cached.state_version ?? 0)) {
+            bumped.add(remote.id);
+            removeRuntime(remote.id);
+          }
+        }
+      }
       void queryClient.invalidateQueries({
         queryKey: ['daemon', profileId, 'session'],
         predicate: (query) => {
           const sessionId = query.queryKey[3];
-          return typeof sessionId === 'string' && !entries.current.has(sessionId);
+          return (
+            typeof sessionId === 'string' &&
+            (bumped.has(sessionId) || !entries.current.has(sessionId))
+          );
         },
       });
+    };
+    const unsubscribeTaskState = client.subscribeTaskState(() => {
+      invalidateSessions();
     });
-  }, [daemon.activeProfile?.id, daemon.client, queryClient]);
+    const unsubscribeCache = queryClient.getQueryCache().subscribe((event) => {
+      if (event.type !== 'updated' || event.action.type !== 'success') return;
+      const key = event.query.queryKey;
+      if (
+        key.length === 3 &&
+        key[0] === 'daemon' &&
+        key[1] === profileId &&
+        key[2] === 'task-state'
+      ) {
+        invalidateSessions(event.query.state.data as TaskState | undefined);
+      }
+    });
+    return () => {
+      unsubscribeTaskState();
+      unsubscribeCache();
+    };
+  }, [daemon.activeProfile?.id, daemon.client, queryClient, removeRuntime]);
 
   useEffect(() => {
     setRuntimes({});

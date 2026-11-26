@@ -66,6 +66,7 @@ fn main() -> anyhow::Result<()> {
                 pid: ready.pid,
                 protocol_version: PROTOCOL_VERSION,
                 fingerprint: bridge::own_fingerprint()?,
+                allowed_origins: Some(arguments.allowed_origins.clone()),
             },
         )?;
     }
@@ -243,27 +244,77 @@ fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(
                 None => default_open_state_dir()?,
             };
             let state_file = state_dir.join(bridge::STATE_FILE);
+            let resident_state = waku_client::resident_daemon_state_path();
             let cwd = std::env::current_dir().ok();
             let resolved_path = path.map(|raw| resolve_open_cli_path(&raw, cwd.as_deref()));
-            let mut result = waku_client::request_open_workspace_as(
-                &state_file,
-                resolved_path.clone(),
-                None,
-                waku_protocol::ClientKind::RemoteCli,
-            );
-            if !explicit_state_dir
-                && matches!(
-                    &result,
-                    Err(error)
-                        if error
-                            .downcast_ref::<waku_client::DaemonUnavailableError>()
-                            .is_some()
-                )
+            let is_remote_scope = std::env::var(waku_protocol::OPEN_SCOPE_ENV)
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .trim()
+                        .eq_ignore_ascii_case(waku_protocol::OPEN_SCOPE_REMOTE)
+                });
+            let primary_kind = if is_remote_scope {
+                waku_protocol::ClientKind::RemoteCli
+            } else {
+                waku_protocol::ClientKind::Cli
+            };
+            let mut result = if !is_remote_scope && !explicit_state_dir && resident_state != state_file {
+                let first = waku_client::request_open_workspace_as(
+                    &resident_state,
+                    resolved_path.clone(),
+                    None,
+                    waku_protocol::ClientKind::Cli,
+                );
+                match first {
+                    Ok(outcome) if outcome.delivered => Ok(outcome),
+                    _ => waku_client::request_open_workspace_as(
+                        &state_file,
+                        resolved_path.clone(),
+                        None,
+                        waku_protocol::ClientKind::Cli,
+                    ),
+                }
+            } else {
+                let first = waku_client::request_open_workspace_as(
+                    &state_file,
+                    resolved_path.clone(),
+                    None,
+                    primary_kind,
+                );
+                if !explicit_state_dir
+                    && resident_state != state_file
+                    && matches!(
+                        &first,
+                        Ok(outcome) if !outcome.delivered
+                    ) || matches!(
+                        &first,
+                        Err(error)
+                            if !explicit_state_dir
+                                && resident_state != state_file
+                                && error
+                                    .downcast_ref::<waku_client::DaemonUnavailableError>()
+                                    .is_some()
+                    )
+                {
+                    waku_client::request_open_workspace_as(
+                        &resident_state,
+                        resolved_path.clone(),
+                        None,
+                        primary_kind,
+                    )
+                } else {
+                    first
+                }
+            };
+            if !is_remote_scope
+                && state_file != resident_state
+                && matches!(&result, Ok(outcome) if !outcome.delivered)
             {
-                let fallback_state = waku_client::resident_daemon_state_path();
-                if fallback_state != state_file {
+                let has_resident = resident_state.is_file();
+                if !has_resident {
                     result = waku_client::request_open_workspace_as(
-                        &fallback_state,
+                        &state_file,
                         resolved_path,
                         None,
                         waku_protocol::ClientKind::RemoteCli,

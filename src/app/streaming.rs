@@ -611,12 +611,50 @@ impl Waku {
                     }
                 }
             }
+            DriverEvent::PermissionResolved { request_id } => {
+                if runtime
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    runtime.pending_permission = None;
+                    if runtime.pending_user_input.is_none()
+                        && let Some(session) = self.state.session_mut(session_id)
+                        && session.status == SessionStatus::Waiting
+                    {
+                        session.status = SessionStatus::Working;
+                    }
+                    self.reconcile_session_notifications(session_id);
+                }
+            }
+            DriverEvent::UserInputResolved { request_id } => {
+                if runtime
+                    .pending_user_input
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id)
+                {
+                    runtime.pending_user_input = None;
+                    self.clear_user_input_fields(session_id);
+                    if runtime.pending_permission.is_none()
+                        && let Some(session) = self.state.session_mut(session_id)
+                        && session.status == SessionStatus::Waiting
+                    {
+                        session.status = SessionStatus::Working;
+                    }
+                    self.reconcile_session_notifications(session_id);
+                }
+            }
             DriverEvent::ComputerUseUpdated(state) => {
                 if self.accepts_turn_output(session_id) {
                     Self::upsert_computer_use_preview(session_id, runtime, state, cx);
                 }
             }
-            DriverEvent::SteerAccepted { message } => {
+            DriverEvent::SteerAccepted {
+                message,
+                message_id,
+                display_content,
+                attachments,
+            } => {
                 let submission = runtime
                     .pending_steers
                     .iter()
@@ -627,16 +665,32 @@ impl Waku {
                     // steer. Preserve its attachment presentation metadata.
                     .or_else(|| runtime.pending_steers.pop_front())
                     .unwrap_or_else(|| ComposerSubmission::plain(message.clone()));
+                let display_content = display_content.or(submission.display_content);
+                let attachments = if attachments.is_empty() {
+                    submission.attachments
+                } else {
+                    attachments
+                };
                 // The provider folded the message into the live turn. Append
                 // it to the same turn so the transcript mirrors the provider
                 // conversation (no new turn boundary).
                 if let Some(session) = self.state.session_mut(session_id) {
-                    session.push_user_message_with_presentation(
-                        message,
-                        submission.display_content,
-                        submission.attachments,
-                    );
-                    session.updated_at = unix_time();
+                    let duplicate = message_id.is_some_and(|id| {
+                        session.messages.iter().any(|existing| existing.id == id)
+                    });
+                    if !duplicate {
+                        session.push_user_message_with_presentation(
+                            message,
+                            display_content,
+                            attachments,
+                        );
+                        if let Some(id) = message_id
+                            && let Some(last) = session.messages.last_mut()
+                        {
+                            last.id = id;
+                        }
+                        session.updated_at = unix_time();
+                    }
                 }
             }
             DriverEvent::SteerRejected { message, reason } => {

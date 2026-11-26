@@ -519,13 +519,28 @@ fn home_relative_path(text: &str) -> Option<&str> {
         .filter(|rest| !rest.is_empty())
 }
 
-/// Home directory of a POSIX daemon host, derived from a registered
-/// projectless root on that host.
-fn daemon_posix_home() -> Option<PathBuf> {
-    crate::projectless::workspace_roots()
+/// Home directory of a POSIX daemon host, derived from registered
+/// projectless roots on that host whose home prefixes `workspace` (or, for the
+/// local host, the first POSIX root / local home).
+fn daemon_posix_home_for_host(workspace: &str, is_remote: bool) -> Option<PathBuf> {
+    let homes = crate::projectless::workspace_roots()
         .into_iter()
-        .find(|root| root.to_string_lossy().starts_with('/'))
-        .and_then(|root| root.parent().and_then(Path::parent).map(Path::to_path_buf))
+        .filter(|root| root.to_string_lossy().starts_with('/'))
+        .filter_map(|root| root.parent().and_then(Path::parent).map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    if let Some(matched) = homes.iter().find(|home| {
+        let home_str = home.to_string_lossy();
+        let home_norm = normalized_posix_path(&home_str);
+        normalized_posix_path(workspace) == home_norm
+            || posix_workspace_relative_file_path(&home_norm, &normalized_posix_path(workspace))
+                .is_some()
+    }) {
+        return Some(matched.clone());
+    }
+    if is_remote {
+        return None;
+    }
+    homes.into_iter().next()
 }
 
 fn posix_workspace_relative_file_path(workspace: &str, target: &str) -> Option<String> {
@@ -538,7 +553,11 @@ fn posix_workspace_relative_file_path(workspace: &str, target: &str) -> Option<S
     (!relative.is_empty()).then(|| relative.to_owned())
 }
 
-fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkRoute {
+fn posix_transcript_link_route(
+    target: &str,
+    workspace: &str,
+    is_remote: bool,
+) -> TranscriptLinkRoute {
     let trimmed = crate::md::parser::strip_file_location(target.trim());
     let path = if trimmed
         .get(..5)
@@ -563,9 +582,9 @@ fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkR
         }
         // `~/x` names the daemon user's home. Joining it under the workspace
         // would open a nonexistent `<workspace>/~/x`; expand it against the
-        // home derived from a registered projectless root instead.
+        // home derived from a matching registered projectless root instead.
         if let Some(rest) = home_relative_path(&relative) {
-            return match daemon_posix_home() {
+            return match daemon_posix_home_for_host(workspace, is_remote) {
                 Some(home) => {
                     let home = home.to_string_lossy().trim_end_matches('/').to_owned();
                     let path = normalized_posix_path(&format!("{home}/{rest}"));
@@ -575,7 +594,7 @@ fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkR
                     }
                 }
                 // The daemon's home is unknown; admit it rather than open a
-                // bogus workspace-relative path.
+                // bogus workspace-relative path or leak local `$HOME`.
                 None => TranscriptLinkRoute::Finder(PathBuf::from(relative)),
             };
         }
@@ -588,9 +607,23 @@ fn posix_transcript_link_route(target: &str, workspace: &str) -> TranscriptLinkR
     }
 }
 
+fn transcript_link_route_for_host(
+    target: &str,
+    workspace: Option<&Path>,
+    is_remote: bool,
+) -> TranscriptLinkRoute {
+    if let Some(workspace) = workspace.and_then(posix_workspace) {
+        return posix_transcript_link_route(target, workspace, is_remote);
+    }
+    if let Some(workspace) = workspace.and_then(windows_workspace) {
+        return windows_transcript_link_route(target, workspace);
+    }
+    transcript_link_route(target, workspace)
+}
+
 fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLinkRoute {
     if let Some(workspace) = workspace.and_then(posix_workspace) {
-        return posix_transcript_link_route(target, workspace);
+        return posix_transcript_link_route(target, workspace, false);
     }
     if let Some(workspace) = workspace.and_then(windows_workspace) {
         return windows_transcript_link_route(target, workspace);
@@ -2238,6 +2271,12 @@ mod tests {
             TranscriptLinkRoute::Finder(dirs::home_dir().unwrap().join(".zshrc"))
         );
 
+        // Remote POSIX workspaces must never fall back to local desktop $HOME.
+        assert_eq!(
+            transcript_link_route_for_host("~/.zshrc", Some(Path::new("/home/remote/proj")), true),
+            TranscriptLinkRoute::Finder(PathBuf::from("~/.zshrc"))
+        );
+
         // Expanded rows are keyed by the daemon's own absolute paths.
         assert_eq!(
             ancestor_directories(Path::new("/home/me/proj/"), "docs/api/guide.md"),
@@ -3332,7 +3371,8 @@ impl Waku {
     pub(super) fn open_transcript_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         let location =
             crate::md::parser::parse_file_location(target.trim().trim_matches(['"', '\'', '`'])).1;
-        match transcript_link_route(target, self.selected_workspace_path()) {
+        let is_remote = self.selected_daemon().is_remote();
+        match transcript_link_route_for_host(target, self.selected_workspace_path(), is_remote) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
                 // Reveal the independent tree and expand every parent, then
                 // open the file in the neighboring work panel.
@@ -4424,12 +4464,12 @@ impl Waku {
             self.right_panel_terminal_groups.remove(&terminal_id);
             return;
         };
-        let matches_project = self
+        let missing_group = self
             .right_panel_terminal_groups
             .get(&terminal_id)
             .and_then(SplitGroup::first_pane)
-            .is_some_and(|terminal| terminal.read(cx).working_directory() == working_directory);
-        if !matches_project {
+            .is_none();
+        if missing_group {
             let mut group =
                 SplitGroup::single(self.new_right_panel_terminal(&working_directory, cx));
             if let Some(first) = group.first_pane() {

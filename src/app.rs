@@ -1662,6 +1662,7 @@ pub struct Waku {
     /// being collected; it then reuses the runtime after the event drain has
     /// re-inserted it.
     pending_queue_drains: Vec<Uuid>,
+    pending_queue_claims: HashSet<Uuid>,
     stream_state_dirty: bool,
     last_stream_save: Instant,
     /// User expansion overrides keyed by persisted transcript block index.
@@ -3652,6 +3653,7 @@ impl Waku {
                 escape_stop_confirmation: EscapeStopConfirmation::default(),
                 response_fork_preparations: HashMap::new(),
                 pending_queue_drains: Vec::new(),
+                pending_queue_claims: HashSet::new(),
                 stream_state_dirty: false,
                 last_stream_save: Instant::now(),
                 activities_expanded: HashMap::new(),

@@ -806,7 +806,18 @@ impl Waku {
             self.remove_bottom_panel_session_state(*id, true);
             self.background_work.remove(id);
             self.task_switcher.remove(*id);
+            self.session_navigation.remove(*id);
         }
+        if self
+            .pending_session_activation
+            .is_some_and(|pending| sessions.contains(&pending.session_id))
+        {
+            self.pending_session_activation = None;
+        }
+        self.right_panel_workspace_states
+            .retain(|scope, _| &scope.host != key);
+        self.bottom_panel_workspace_states
+            .retain(|scope, _| &scope.host != key);
         self.state
             .sessions
             .retain(|session| !sessions.contains(&session.id));
@@ -860,6 +871,8 @@ impl Waku {
             .borrow_mut()
             .retain(|(owner, _, _), _| owner != key);
         self.pending_queue_drains
+            .retain(|id| !sessions.contains(id));
+        self.pending_queue_claims
             .retain(|id| !sessions.contains(id));
         self.drop_pending_open_requests_for_host(key);
         self.collapsed_hosts.remove(key);

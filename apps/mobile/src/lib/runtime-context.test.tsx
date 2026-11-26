@@ -103,6 +103,8 @@ function fixture(options: {
           return { type: 'started', supportsSteer: true };
         case 'saveTaskState':
           return { type: 'taskStateSaved', sessions: command.sessions };
+        case 'claimQueuedMessage':
+          return { type: 'queuedMessageClaimed', claimed: true };
         default:
           return { type: 'ack' };
       }
@@ -156,11 +158,88 @@ describe('mobile runtime history', () => {
     f.queryClient.setQueryData(f.key, f.history);
     await f.runtime.attachSession(f.history);
     await f.runtime.steerPrompt(f.history, '/review changes', [], 'Review changes carefully');
-    expect(f.commands.find((command) => command.type === 'steer'))
-      .toEqual({ type: 'steer', prompt: 'Review changes carefully' });
-    f.emit('steerAccepted', { message: 'Review changes carefully' });
+    const steerCommand = f.commands.find((command) => command.type === 'steer');
+    expect(steerCommand).toMatchObject({
+      type: 'steer',
+      prompt: 'Review changes carefully',
+      displayContent: '/review changes',
+      attachments: [],
+    });
+    if (steerCommand?.type !== 'steer') throw new Error('Missing steer command');
+    expect(typeof steerCommand.messageId).toBe('string');
+    f.emit('steerAccepted', {
+      message: 'Review changes carefully',
+      messageId: steerCommand.messageId ?? null,
+      displayContent: '/review changes',
+      attachments: [],
+    });
     expect(f.current().messages.at(-1))
-      .toMatchObject({ content: 'Review changes carefully', display_content: '/review changes' });
+      .toMatchObject({
+        id: steerCommand.messageId,
+        content: 'Review changes carefully',
+        display_content: '/review changes',
+      });
+  });
+
+  test('adopts cross-client steerAccepted metadata and clears resolved approvals by requestId', async () => {
+    const f = fixture();
+    f.queryClient.setQueryData(f.key, f.history);
+    await f.runtime.attachSession(f.history);
+
+    f.emit('permission', {
+      requestId: 'perm-1',
+      title: 'Run command',
+      detail: 'git status',
+      options: [{ id: 'once', label: 'Allow once', kind: 'allowOnce' }],
+    });
+    expect(f.current().status).toBe('waiting');
+    f.emit('permissionResolved', { requestId: 'perm-1' });
+    expect(f.current().status).toBe('working');
+
+    f.emit('steerAccepted', {
+      message: 'Resolved prompt @src/app.ts',
+      messageId: 'remote-steer-1',
+      displayContent: 'Check @src/app.ts',
+      attachments: [{ id: 'att-1', kind: 'file', name: 'app.ts', path: '/repo/src/app.ts', mention: 'src/app.ts', mime_type: null, size_bytes: null, is_image: false, blob_reference: null }],
+    });
+    // Duplicate replay with same messageId is ignored.
+    f.emit('steerAccepted', {
+      message: 'Resolved prompt @src/app.ts',
+      messageId: 'remote-steer-1',
+    });
+    const steerMessages = f.current().messages.filter((m) => m.id === 'remote-steer-1');
+    expect(steerMessages).toHaveLength(1);
+    expect(steerMessages[0]).toMatchObject({
+      id: 'remote-steer-1',
+      content: 'Resolved prompt @src/app.ts',
+      display_content: 'Check @src/app.ts',
+    });
+  });
+
+  test('skips queued follow-up on TurnFinished when another client already claimed it', async () => {
+    const f = fixture({
+      request: async (command) => {
+        if (command.type === 'claimQueuedMessage') {
+          return { type: 'queuedMessageClaimed', claimed: false };
+        }
+      },
+    });
+    f.queryClient.setQueryData(f.key, {
+      ...f.history,
+      queued_messages: [{
+        id: 'queued-1',
+        content: 'Follow up',
+        display_content: null,
+        attachments: [],
+        created_at: 100,
+      }],
+    });
+    await f.runtime.attachSession(f.history);
+    f.emit('turnFinished', { success: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(f.commands.some((command) => command.type === 'claimQueuedMessage' && command.messageId === 'queued-1')).toBe(true);
+    expect(f.commands.some((command) => command.type === 'prompt')).toBe(false);
+    expect(f.current().queued_messages).toEqual([]);
   });
 
   test('queues expanded command content without starting another provider turn', async () => {

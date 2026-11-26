@@ -7,8 +7,8 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 use uuid::Uuid;
 use waku_protocol::computer_use::ComputerToolRequest;
 use waku_protocol::model::{
-    BackgroundWorkKey, DriverEvent, GoalOperation, ProviderResumeCursor, RuntimeMode,
-    SubmittedHandoff, UserInputAnswer,
+    BackgroundWorkKey, DriverEvent, GoalOperation, MessageAttachment, ProviderResumeCursor,
+    RuntimeMode, SubmittedHandoff, UserInputAnswer,
 };
 
 /// A prompt for the provider and what the daemon republishes alongside it to
@@ -67,6 +67,17 @@ impl DriverHandle {
 
     pub fn steer(&self, prompt: String) {
         self.inner.steer(prompt);
+    }
+
+    pub fn steer_submission(
+        &self,
+        prompt: String,
+        message_id: Option<Uuid>,
+        display_content: Option<String>,
+        attachments: Vec<MessageAttachment>,
+    ) {
+        self.inner
+            .steer_submission(prompt, message_id, display_content, attachments);
     }
 
     pub fn cancel(&self) {
@@ -130,6 +141,15 @@ pub trait DriverControl: Send + Sync {
         false
     }
     fn steer(&self, _prompt: String) {}
+    fn steer_submission(
+        &self,
+        prompt: String,
+        _message_id: Option<Uuid>,
+        _display_content: Option<String>,
+        _attachments: Vec<MessageAttachment>,
+    ) {
+        self.steer(prompt);
+    }
     fn cancel(&self);
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}

@@ -76,6 +76,8 @@ pub struct BridgeState {
     pub pid: u32,
     pub protocol_version: u32,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 /// 64-bit FNV-1a over a binary's bytes, rendered as 16 hex digits.

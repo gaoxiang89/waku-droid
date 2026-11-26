@@ -146,7 +146,7 @@ function SurfaceBody({
 }) {
   const root = project ? sessionCwd(session, project) : null;
   if (surface === "terminal") {
-    return <TerminalSurface root={root} />;
+    return <TerminalSurface root={root} sessionId={session.id} />;
   }
   if (surface === "files") {
     return <FilesSurface root={root} />;
@@ -193,7 +193,36 @@ function SurfaceHeader({
   );
 }
 
-function TerminalSurface({ root }: { root: string | null }) {
+const mobileTerminalIds = new Map<string, { id: string; root: string }>();
+
+function terminalIdForSession(sessionId: string, root: string, previous?: string): string {
+  const existing = mobileTerminalIds.get(sessionId);
+  if (existing && existing.root === root && (!previous || existing.id === previous)) {
+    return existing.id;
+  }
+  const nextId = Crypto.randomUUID();
+  mobileTerminalIds.set(sessionId, { id: nextId, root });
+  return nextId;
+}
+
+function decodeTerminalBase64(data: string): Uint8Array {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function encodeTerminalBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(binary);
+}
+
+function TerminalSurface({ root, sessionId }: { root: string | null; sessionId: string }) {
   const theme = useTheme();
 
   if (!root) {
@@ -219,19 +248,32 @@ function TerminalSurface({ root }: { root: string | null }) {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.surface }]}>
-      <TerminalSession root={root} />
+      <TerminalSession key={sessionId} root={root} sessionId={sessionId} />
     </View>
   );
 }
 
-function TerminalSession({ root }: { root: string }) {
+function TerminalSession({ root, sessionId }: { root: string; sessionId: string }) {
   const daemon = useDaemon();
   const theme = useTheme();
   const colorScheme = useColorScheme();
   const terminal = useRef<TerminalViewRef>(null);
-  const terminalId = useRef(Crypto.randomUUID()).current;
+  const previousRecord = useRef<{ sessionId: string; id: string; root: string } | undefined>(
+    (() => {
+      const existing = mobileTerminalIds.get(sessionId);
+      return existing ? { sessionId, ...existing } : undefined;
+    })(),
+  );
+  const terminalId = terminalIdForSession(sessionId, root);
+  const offsetRef = useRef(0);
+  const resyncInFlight = useRef(false);
+  const sizeRef = useRef({ cols: 80, rows: 24 });
   const [error, setError] = useState<string | null>(null);
   const [exited, setExited] = useState(false);
+
+  useEffect(() => {
+    offsetRef.current = 0;
+  }, [terminalId]);
 
   useEffect(() => {
     const client = daemon.client;
@@ -239,13 +281,60 @@ function TerminalSession({ root }: { root: string }) {
     let disposed = false;
     setError(null);
     setExited(false);
+    const stale = previousRecord.current;
+    previousRecord.current = { sessionId, id: terminalId, root };
+
+    const writeDecodedBytes = (bytes: Uint8Array) => {
+      if (!bytes.length) return;
+      void terminal.current?.write(encodeTerminalBase64(bytes)).catch((cause) => {
+        if (!disposed) setError(errorMessage(cause));
+      });
+    };
+
+    const requestSnapshot = () => {
+      if (disposed || resyncInFlight.current) return;
+      resyncInFlight.current = true;
+      const after = offsetRef.current > 0 ? offsetRef.current : null;
+      void client
+        .request({ type: "attachTerminal", after }, terminalId, terminalId)
+        .then((response) => {
+          if (disposed || response.type !== "terminalOutput") return;
+          const { snapshot } = response;
+          const bytes = snapshot.data ? decodeTerminalBase64(snapshot.data) : new Uint8Array();
+          if (snapshot.reset) {
+            writeDecodedBytes(new TextEncoder().encode("\x1bc"));
+          }
+          offsetRef.current = snapshot.offset;
+          if (bytes.length) writeDecodedBytes(bytes);
+          if (snapshot.exited) {
+            setExited(true);
+            void terminal.current?.finish(0).catch(() => {});
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          resyncInFlight.current = false;
+        });
+    };
+
     const unsubscribe = client.subscribe(terminalId, terminalId, (event) => {
       if (event.event.kind === "terminalOutput") {
-        const payload = event.event.payload as { data?: unknown };
+        const payload = event.event.payload as { data?: unknown; offset?: unknown };
         if (typeof payload.data !== "string") return;
-        void terminal.current?.write(payload.data).catch((cause) => {
-          if (!disposed) setError(errorMessage(cause));
-        });
+        const bytes = decodeTerminalBase64(payload.data);
+        const end =
+          typeof payload.offset === "number"
+            ? payload.offset
+            : offsetRef.current + bytes.length;
+        if (end <= offsetRef.current) return;
+        const start = Math.max(0, end - bytes.length);
+        if (start > offsetRef.current) {
+          requestSnapshot();
+          return;
+        }
+        const slice = bytes.subarray(offsetRef.current - start);
+        offsetRef.current = end;
+        writeDecodedBytes(slice);
       } else if (event.event.kind === "terminalExited") {
         setExited(true);
         void terminal.current?.finish(0).catch(() => {});
@@ -258,22 +347,43 @@ function TerminalSession({ root }: { root: string }) {
       }
     });
 
-    void client
-      .request(
-        { type: "openTerminal", cwd: root, cols: 80, rows: 24 },
+    const connectTerminal = async () => {
+      if (stale && stale.sessionId === sessionId && stale.id !== terminalId) {
+        await client.request({ type: "closeTerminal" }, stale.id, stale.id).catch(() => {});
+        if (disposed) return;
+      }
+      await client.request(
+        {
+          type: "openTerminal",
+          cwd: root,
+          cols: sizeRef.current.cols,
+          rows: sizeRef.current.rows,
+        },
         terminalId,
         terminalId,
-      )
-      .catch((cause) => {
-        if (!disposed) setError(errorMessage(cause));
-      });
+      );
+      if (disposed) return;
+      void client
+        .notify(
+          {
+            type: "resizeTerminal",
+            cols: sizeRef.current.cols,
+            rows: sizeRef.current.rows,
+          },
+          terminalId,
+          terminalId,
+        )
+        .catch(() => {});
+      requestSnapshot();
+    };
+
+    void connectTerminal().catch((cause) => {
+      if (!disposed) setError(errorMessage(cause));
+    });
 
     return () => {
       disposed = true;
       unsubscribe();
-      void client
-        .notify({ type: "closeTerminal" }, terminalId, terminalId)
-        .catch(() => {});
     };
   }, [daemon.client, daemon.phase, root, terminalId]);
 
@@ -308,14 +418,19 @@ function TerminalSession({ root }: { root: string }) {
             .catch(reportTransportError);
         }}
         onResize={({ nativeEvent }) => {
+          const clamped = {
+            cols: clampU16(nativeEvent.cols),
+            rows: clampU16(nativeEvent.rows),
+          };
+          sizeRef.current = clamped;
           const client = daemon.client;
           if (!client || daemon.phase !== "connected") return;
           void client
             .notify(
               {
                 type: "resizeTerminal",
-                cols: clampU16(nativeEvent.cols),
-                rows: clampU16(nativeEvent.rows),
+                cols: clamped.cols,
+                rows: clamped.rows,
               },
               terminalId,
               terminalId,

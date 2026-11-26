@@ -48,7 +48,7 @@ updated_at: number,
  * Activity time of the newest turn. Set as soon as the user submits it,
  * then refreshed when the turn settles, whatever its outcome.
  */
-last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
+last_reply_at?: number | null, state_version?: number, provider_cursor: ProviderResumeCursor | null,
 /**
  * Resume cursors for agents this task used before the user switched away.
  * A cursor already names its provider, so returning to one of these agents

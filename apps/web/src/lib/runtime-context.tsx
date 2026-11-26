@@ -156,12 +156,13 @@ interface RuntimeContextValue {
 const RuntimeContext = createContext<RuntimeContextValue | null>(null)
 
 export function RuntimeProvider({ children }: { children: ReactNode }) {
-  const { client, config, phase } = useDaemon()
+  const { client, config, phase, connections } = useDaemon()
   const { locale } = useI18n()
   const localeRef = useRef(locale)
   localeRef.current = locale
   const queryClient = useQueryClient()
   const entries = useRef(new Map<string, RuntimeEntry>())
+  const revalidatedConnections = useRef(0)
   const attachRequests = useRef(new Map<string, Promise<boolean>>())
   const persistenceTails = useRef(new Map<string, Promise<AgentSession>>())
   const checkpointCaptures = useRef(new Map<string, Promise<AgentSession>>())
@@ -172,6 +173,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     new Map<
       string,
       Array<{
+        messageId: string
         providerPrompt: string
         displayContent: string
         attachments: MessageAttachment[]
@@ -424,15 +426,27 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             daemonKeys.session(config.address, saved.id),
           ) ?? saved
           const nextQueued = latest.queued_messages?.[0]
-          if (!nextQueued) return
+          if (!nextQueued || !client) return
+          const claim = await client.request(
+            { type: 'claimQueuedMessage', messageId: nextQueued.id },
+            latest.id,
+            entries.current.get(latest.id)?.runtimeId,
+          )
+          const currentLatest = queryClient.getQueryData<AgentSession>(
+            daemonKeys.session(config.address, saved.id),
+          ) ?? latest
+          const remaining = (currentLatest.queued_messages ?? []).filter(
+            (item) => item.id !== nextQueued.id,
+          )
           const dequeued = {
-            ...latest,
-            queued_messages: latest.queued_messages?.slice(1),
+            ...currentLatest,
+            queued_messages: remaining,
           }
           cacheSession(dequeued)
-          const persisted = await persistOrdered(dequeued)
+          if (claim.type !== 'queuedMessageClaimed' || !claim.claimed) return
+          if (dequeued.status !== 'idle') return
           await sendPromptRef.current?.(
-            persisted,
+            dequeued,
             nextQueued.display_content ?? nextQueued.content,
             nextQueued.attachments ?? [],
             nextQueued.content,
@@ -445,7 +459,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }
         })
     },
-    [config, queryClient, cacheSession, persistOrdered, finalizeSettledTurn],
+    [client, config, queryClient, cacheSession, finalizeSettledTurn],
   )
 
   const subscribe = useCallback(
@@ -487,24 +501,47 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }
         }
         if (event.event.kind === 'steerAccepted') {
-          const payload = event.event.payload as { message?: string }
-          const pending = pendingSteers.current.get(session.id)?.shift()
-          if (pending) {
+          const payload = event.event.payload as {
+            message?: string
+            messageId?: string | null
+            displayContent?: string | null
+            attachments?: MessageAttachment[]
+          }
+          const queue = pendingSteers.current.get(session.id)
+          const matchIndex = queue
+            ? queue.findIndex((item) =>
+                (payload.messageId && item.messageId === payload.messageId) ||
+                item.providerPrompt === payload.message,
+              )
+            : -1
+          const pending = queue
+            ? (matchIndex >= 0 ? queue.splice(matchIndex, 1)[0] : queue.shift())
+            : undefined
+          const content = payload.message ?? pending?.providerPrompt
+          const messageId = payload.messageId ?? pending?.messageId ?? crypto.randomUUID()
+          if (
+            content &&
+            !current.messages.some((candidate) => candidate.id === messageId)
+          ) {
+            const displayContent =
+              payload.displayContent ??
+              (pending && (pending.attachments.length || pending.providerPrompt !== pending.displayContent)
+                ? pending.displayContent
+                : null)
+            const attachments =
+              payload.attachments?.length ? payload.attachments : (pending?.attachments ?? [])
             const turnId = current.turns.at(-1)?.id ?? null
             current = {
               ...current,
               messages: [
                 ...current.messages,
                 {
-                  id: crypto.randomUUID(),
+                  id: messageId,
                   turn_id: turnId,
                   role: 'user',
-                  content: payload.message ?? pending.providerPrompt,
-                  display_content:
-                    pending.attachments.length || pending.providerPrompt !== pending.displayContent
-                      ? pending.displayContent
-                      : null,
-                  attachments: pending.attachments,
+                  content,
+                  display_content: displayContent,
+                  attachments,
                   created_at: Math.floor(Date.now() / 1_000),
                   streaming: false,
                 },
@@ -512,7 +549,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             }
           }
         } else if (event.event.kind === 'steerRejected') {
-          const pending = pendingSteers.current.get(session.id)?.shift()
+          const payload = event.event.payload as { message?: string }
+          const queue = pendingSteers.current.get(session.id)
+          const matchIndex = queue
+            ? queue.findIndex((item) => item.providerPrompt === payload?.message)
+            : -1
+          const pending = queue
+            ? (matchIndex >= 0 ? queue.splice(matchIndex, 1)[0] : queue.shift())
+            : undefined
           if (pending) {
             current = queueSubmission(
               current,
@@ -533,6 +577,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             ...previous,
             [session.id]: result.permission ?? undefined,
           }))
+        } else if (result.resolvedPermissionId) {
+          const resolvedId = result.resolvedPermissionId
+          setPermissions((previous) => (
+            previous[session.id]?.requestId === resolvedId
+              ? removeRecordKey(previous, session.id)
+              : previous
+          ))
         }
         if (event.event.kind === 'turnFinished') entry.userInputRevision += 1
         if (result.userInput !== undefined) {
@@ -541,6 +592,14 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             ...previous,
             [session.id]: result.userInput ?? undefined,
           }))
+        } else if (result.resolvedUserInputId) {
+          const resolvedId = result.resolvedUserInputId
+          entry.userInputRevision += 1
+          setUserInputs((previous) => (
+            previous[session.id]?.requestId === resolvedId
+              ? removeRecordKey(previous, session.id)
+              : previous
+          ))
         }
         if (result.error) toast.error(result.error)
         if (result.settled) {
@@ -1072,10 +1131,32 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         await sendPrompt(session, prompt, attachments, providerPrompt)
         return
       }
+      const messageId = crypto.randomUUID()
+      const displayContent =
+        attachments.length || providerPrompt !== prompt ? prompt : null
       const pending = pendingSteers.current.get(session.id) ?? []
-      pending.push({ providerPrompt, displayContent: prompt, attachments })
+      pending.push({ messageId, providerPrompt, displayContent: prompt, attachments })
       pendingSteers.current.set(session.id, pending)
-      await client.request({ type: 'steer', prompt: providerPrompt }, session.id, runtime.runtimeId)
+      try {
+        await client.request(
+          {
+            type: 'steer',
+            prompt: providerPrompt,
+            messageId,
+            displayContent,
+            attachments,
+          },
+          session.id,
+          runtime.runtimeId,
+        )
+      } catch (error) {
+        const queue = pendingSteers.current.get(session.id)
+        if (queue) {
+          const index = queue.findIndex((item) => item.messageId === messageId)
+          if (index >= 0) queue.splice(index, 1)
+        }
+        throw error
+      }
     },
     [client, phase, sendPrompt],
   )
@@ -1331,7 +1412,94 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   )
 
   useEffect(() => {
+    if (!client || !config || phase !== 'connected') return
+    if (connections <= 1 || revalidatedConnections.current === connections) return
+    revalidatedConnections.current = connections
+    for (const [sessionId, entry] of entries.current) {
+      void attachDaemonSession(client, sessionId)
+        .then((attached) => {
+          if (entries.current.get(sessionId) !== entry) return
+          if (attached?.runtimeId === entry.runtimeId) {
+            void queryClient.invalidateQueries({
+              queryKey: daemonKeys.session(config.address, sessionId),
+            })
+            return
+          }
+          removeRuntime(sessionId)
+          if (attached) {
+            const current = queryClient.getQueryData<AgentSession>(
+              daemonKeys.session(config.address, sessionId),
+            )
+            if (current) {
+              const next = subscribe(current, attached.runtimeId)
+              if (entries.current.get(sessionId) === next) {
+                next.supportsSteer = attached.supportsSteer
+                next.starting = false
+                setRuntimes((previous) => ({
+                  ...previous,
+                  [sessionId]: publicRuntime(next),
+                }))
+              }
+            }
+          }
+          void queryClient.invalidateQueries({
+            queryKey: daemonKeys.session(config.address, sessionId),
+          })
+        })
+        .catch(() => {})
+    }
+  }, [client, config, connections, phase, queryClient, removeRuntime, subscribe])
+
+  useEffect(() => {
+    if (!client || !config || phase !== 'connected') return
+    const invalidateSessions = (taskState?: TaskState) => {
+      const bumped = new Set<string>()
+      if (taskState) {
+        for (const remote of taskState.sessions) {
+          const cached = queryClient.getQueryData<AgentSession>(
+            daemonKeys.session(config.address, remote.id),
+          )
+          if (cached && (remote.state_version ?? 0) > (cached.state_version ?? 0)) {
+            bumped.add(remote.id)
+            removeRuntime(remote.id)
+          }
+        }
+      }
+      void queryClient.invalidateQueries({
+        queryKey: ['daemon', config.address, 'session'],
+        predicate: (query) => {
+          const sessionId = query.queryKey[3]
+          return (
+            typeof sessionId === 'string' &&
+            (bumped.has(sessionId) || !entries.current.has(sessionId))
+          )
+        },
+      })
+    }
+    const unsubscribeTaskState = client.subscribeTaskState(() => {
+      invalidateSessions()
+    })
+    const unsubscribeCache = queryClient.getQueryCache().subscribe((event) => {
+      if (event.type !== 'updated' || event.action.type !== 'success') return
+      const key = event.query.queryKey
+      if (
+        key.length === 3 &&
+        key[0] === 'daemon' &&
+        key[1] === config.address &&
+        key[2] === 'task-state'
+      ) {
+        invalidateSessions(event.query.state.data as TaskState | undefined)
+      }
+    })
+    return () => {
+      unsubscribeTaskState()
+      unsubscribeCache()
+    }
+  }, [client, config, phase, queryClient, removeRuntime])
+
+  useEffect(() => {
     const current = entries.current
+    revalidatedConnections.current = 0
     for (const timer of projectionPersistTimers.current.values()) {
       window.clearTimeout(timer)
     }
@@ -1453,6 +1621,7 @@ export function mergeSessionSummary(previous: AgentSession, next: AgentSession):
     account_cursors: next.account_cursors,
     context_usage: next.context_usage,
     runtime_event_cursor: next.runtime_event_cursor,
+    state_version: Math.max(previous.state_version ?? 0, next.state_version ?? 0),
   }
 }
 

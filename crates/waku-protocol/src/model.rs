@@ -1144,6 +1144,8 @@ pub struct AgentSession {
     /// then refreshed when the turn settles, whatever its outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reply_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub state_version: u64,
     #[serde(default)]
     pub provider_cursor: Option<ProviderResumeCursor>,
     /// Resume cursors for agents this task used before the user switched away.
@@ -1211,6 +1213,10 @@ fn is_detail_loaded(detail_loaded: &bool) -> bool {
     *detail_loaded
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl AgentSession {
     pub const DEFAULT_TITLE: &'static str = "New task";
 
@@ -1236,6 +1242,7 @@ impl AgentSession {
             created_at: now,
             updated_at: now,
             last_reply_at: None,
+            state_version: 0,
             detail_loaded: true,
             provider_cursor: None,
             provider_cursors: Vec::new(),
@@ -1278,6 +1285,7 @@ impl AgentSession {
             created_at: self.created_at,
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,
+            state_version: self.state_version,
             provider_cursor: None,
             provider_cursors: Vec::new(),
             account_cursors: Vec::new(),
@@ -2395,6 +2403,9 @@ pub enum DriverEvent {
         detail: String,
         options: Vec<PermissionOption>,
     },
+    PermissionResolved {
+        request_id: String,
+    },
     /// Structured questions the provider needs answered before it can
     /// continue the active turn. Unlike a permission, this is never
     /// auto-approved: the content itself has to come from the user.
@@ -2402,10 +2413,16 @@ pub enum DriverEvent {
         request_id: String,
         questions: Vec<UserInputQuestion>,
     },
+    UserInputResolved {
+        request_id: String,
+    },
     ComputerUseUpdated(crate::computer_use::ComputerUseState),
     /// The provider accepted a steering message into the running turn.
     SteerAccepted {
         message: String,
+        message_id: Option<Uuid>,
+        display_content: Option<String>,
+        attachments: Vec<MessageAttachment>,
     },
     /// The provider could not steer the running turn (for example it ended
     /// before the request arrived). The app decides the fallback.
@@ -2435,6 +2452,17 @@ pub enum DriverEvent {
     },
     Error(String),
     ProcessExited,
+}
+
+impl DriverEvent {
+    pub fn steer_accepted(message: impl Into<String>) -> Self {
+        Self::SteerAccepted {
+            message: message.into(),
+            message_id: None,
+            display_content: None,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, TS)]

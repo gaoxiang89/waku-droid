@@ -331,7 +331,7 @@ impl AmpDriver {
                             match written {
                                 Ok(()) => {
                                     let _ = writer_events
-                                        .send(DriverEvent::SteerAccepted { message: text });
+                                        .send(DriverEvent::steer_accepted(text));
                                 }
                                 Err(error) => {
                                     let _ = writer_events.send(DriverEvent::SteerRejected {
@@ -838,7 +838,7 @@ mod tests {
                             .into(),
                     );
                 }
-                DriverEvent::SteerAccepted { message } => {
+                DriverEvent::SteerAccepted { message, .. } => {
                     assert!(message.contains("BANANA"));
                     steer_accepted = true;
                 }

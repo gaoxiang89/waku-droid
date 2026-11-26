@@ -257,6 +257,43 @@ describe("WakuClient", () => {
     expect(received).toEqual([1, 2]);
   });
 
+  test("ignores unsubscribed terminalOutput without buffering into pendingEvents", async () => {
+    const { client, sockets } = fixture();
+    const socket = await connect(client, sockets);
+
+    socket.receive({
+      type: "event",
+      sessionId: "term-1",
+      runtimeId: "term-1",
+      epoch: "epoch",
+      sequence: 1,
+      event: { kind: "terminalOutput", payload: { offset: 5, data: "aGVsbG8=" } },
+    });
+    socket.receive({
+      type: "event",
+      sessionId: "term-1",
+      runtimeId: "term-1",
+      epoch: "epoch",
+      sequence: 2,
+      event: { kind: "terminalOutput", payload: { offset: 11, data: "d29ybGQ=" } },
+    });
+
+    const received: number[] = [];
+    client.subscribe("term-1", "term-1", (event) => received.push(event.sequence));
+    expect(received).toEqual([]);
+
+    // Replaying sequence 1 after subscribing is not rejected by an unsubscribed sequence watermark.
+    socket.receive({
+      type: "event",
+      sessionId: "term-1",
+      runtimeId: "term-1",
+      epoch: "epoch",
+      sequence: 1,
+      event: { kind: "terminalOutput", payload: { offset: 5, data: "aGVsbG8=" } },
+    });
+    expect(received).toEqual([1]);
+  });
+
   test("notifies connected apps when another client changes task state", async () => {
     const { client, sockets } = fixture();
     const socket = await connect(client, sockets);

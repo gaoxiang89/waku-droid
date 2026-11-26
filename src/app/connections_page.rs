@@ -1054,7 +1054,11 @@ impl Waku {
                     .local_password_overrides
                     .insert(connection.id.clone(), true);
             }
-        } else if matches!(target.auth_method(), SshAuthMethod::Agent)
+        } else if (matches!(target.auth_method(), SshAuthMethod::Agent)
+            || (matches!(target.auth_method(), SshAuthMethod::Key)
+                && editing_target
+                    .as_ref()
+                    .is_some_and(|(_, existing)| existing.auth_method() != SshAuthMethod::Key)))
             && self.connections.saved_passwords.contains(&connection.id)
         {
             if let Err(error) =
@@ -1082,7 +1086,13 @@ impl Waku {
                 .local_upserted_ids
                 .insert(connection.id.clone());
         }
-        self.connections.file.upsert(connection);
+        self.connections.file.upsert(connection.clone());
+        if let Some(host) = self
+            .hosts
+            .get(&waku_client::hosts::HostKey::Connection(connection.id.clone()))
+        {
+            host.daemon.update_connection(connection);
+        }
         if self.connections.startup_loaded {
             self.save_connections();
         }

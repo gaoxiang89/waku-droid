@@ -198,6 +198,50 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
 }
 
 #[test]
+fn remote_task_catalog_invalidates_detail_when_state_version_advances() {
+    let project_id = Uuid::new_v4();
+    let mut local = AgentSession::new(project_id, ProviderKind::Codex);
+    local.detail_loaded = true;
+    local.state_version = 1;
+    local.begin_turn("Stale turn");
+    local.finish_active_turn(TurnStatus::Completed);
+    let local_id = local.id;
+
+    let mut rewound = local.list_projection();
+    rewound.state_version = 2;
+    rewound.status = SessionStatus::Idle;
+    rewound.updated_at += 20;
+
+    let mut catalog = vec![local];
+    merge_remote_session_catalog(&mut catalog, vec![rewound], |_| true);
+    let updated = catalog.iter().find(|s| s.id == local_id).unwrap();
+    assert_eq!(updated.state_version, 2);
+    assert!(!updated.detail_loaded);
+}
+
+#[test]
+fn remote_task_catalog_list_projection_never_wipes_hydrated_queued_messages() {
+    let project_id = Uuid::new_v4();
+    let mut local = AgentSession::new(project_id, ProviderKind::Codex);
+    local.detail_loaded = true;
+    local.state_version = 1;
+    local
+        .queued_messages
+        .push(waku_protocol::model::QueuedMessage::new("Follow up"));
+    let local_id = local.id;
+
+    let remote_projection = local.list_projection();
+    assert!(!remote_projection.detail_loaded);
+    assert!(remote_projection.queued_messages.is_empty());
+
+    let mut catalog = vec![local];
+    merge_remote_session_catalog(&mut catalog, vec![remote_projection], |_| false);
+    let updated = catalog.iter().find(|s| s.id == local_id).unwrap();
+    assert_eq!(updated.queued_messages.len(), 1);
+    assert_eq!(updated.queued_messages[0].content, "Follow up");
+}
+
+#[test]
 fn composer_only_offers_stop_after_submission_preparation() {
     assert_eq!(
         composer_submit_action(Some(SessionStatus::Idle), false),

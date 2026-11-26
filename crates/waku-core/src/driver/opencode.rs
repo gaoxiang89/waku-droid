@@ -1051,10 +1051,10 @@ fn handle_command(worker: &mut Worker, message: DriverCommand, state: &mut Strea
                     });
                     // The inbox event is authoritative; this 2xx is only the
                     // fallback for a response Waku never sees.
-                    let _ = events.send(DriverEvent::SteerAccepted { message: text });
+                    let _ = events.send(DriverEvent::steer_accepted(text));
                 }
                 Ok(None) => {
-                    let _ = events.send(DriverEvent::SteerAccepted { message: text });
+                    let _ = events.send(DriverEvent::steer_accepted(text));
                 }
                 Err(error) => {
                     let _ = events.send(DriverEvent::SteerRejected {

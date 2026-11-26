@@ -207,6 +207,12 @@ impl DaemonProcess {
             && crate::pid::is_daemon_process(record.pid)
         {
             if record.protocol_version != PROTOCOL_VERSION {
+                if crate::pid::has_child_processes(record.pid) {
+                    bail!(
+                        "a resident daemon (pid {}) uses another protocol and still has active sessions; stop them before replacing it",
+                        record.pid
+                    );
+                }
                 if let Ok(address) = desktop_client_address(&record.address)
                     && matches!(
                         crate::client::shutdown_daemon_at(&address, &record.token),
@@ -244,15 +250,11 @@ impl DaemonProcess {
                 && let Ok(address) = desktop_client_address(&record.address)
                 && let Ok(client) = connect_desktop_client(&address, record.token.clone(), Vec::new())
             {
-                let needs_exposure_rebind = settings.enabled
-                    && (record.token != token || record.address != settings.bind_address());
+                let needs_exposure_rebind =
+                    record_needs_exposure_rebind(&record, &settings, &token);
                 if needs_exposure_rebind {
-                    let has_live_terminals = matches!(
-                        client.request(Uuid::nil(), Uuid::nil(), Command::ListTerminals),
-                        Ok(ResponsePayload::Terminals { terminals })
-                            if terminals.iter().any(|terminal| !terminal.exited)
-                    );
-                    if !has_live_terminals {
+                    let has_live_work = daemon_has_live_work(&client).unwrap_or(true);
+                    if !has_live_work {
                         client.shutdown();
                         if wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
                             let _ = std::fs::remove_file(state_file);
@@ -519,6 +521,34 @@ pub(crate) fn desktop_client_address(address: &str) -> anyhow::Result<String> {
         address.ip()
     };
     Ok(std::net::SocketAddr::new(ip, address.port()).to_string())
+}
+
+fn address_is_loopback(address: &str) -> bool {
+    let Ok(parsed) = address.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    match parsed.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn daemon_has_live_work(client: &DaemonClient) -> anyhow::Result<bool> {
+    if let ResponsePayload::Terminals { terminals } =
+        client.request(Uuid::nil(), Uuid::nil(), Command::ListTerminals)?
+        && terminals.iter().any(|terminal| !terminal.exited)
+    {
+        return Ok(true);
+    }
+    if let ResponsePayload::TaskState { sessions, .. } =
+        client.request(Uuid::nil(), Uuid::nil(), Command::LoadTaskState)?
+        && sessions.iter().any(|session| session.is_busy())
+    {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -793,6 +823,24 @@ impl DaemonSupervisor {
         self.inner.connection.lock().clone()
     }
 
+    /// Updates the stored remote connection configuration (for example after
+    /// editing SSH credentials or ProxyJump in Settings) so subsequent bridge
+    /// reconnects use the edited parameters.
+    pub fn update_connection(&self, connection: Connection) {
+        *self.inner.connection.lock() = Some(connection.clone());
+        let mut target = self.inner.target.lock();
+        if let DaemonTarget::Remote {
+            endpoint: RemoteEndpoint::Bridged {
+                connection: target_connection,
+                ..
+            },
+            ..
+        } = &mut *target
+        {
+            *target_connection = connection;
+        }
+    }
+
     /// Whether the transport to a remote daemon is down while the supervisor
     /// retries. Lock-free, so a frame may read it.
     pub fn is_disconnected(&self) -> bool {
@@ -907,16 +955,18 @@ impl DaemonSupervisor {
                 queue_settings_refresh(&self.inner);
                 Ok(())
             }
-            Err(error) => {
+            Err(ReplaceError::BeforeStop(error)) => Err(error),
+            Err(ReplaceError::AfterStop(error)) => {
                 let restore = replace_local_daemon(&self.inner, &executable, &previous);
-                if restore.is_ok() {
-                    queue_settings_refresh(&self.inner);
-                    Err(error)
-                } else {
-                    Err(error.context(format!(
+                match restore {
+                    Ok(()) => {
+                        queue_settings_refresh(&self.inner);
+                        Err(error)
+                    }
+                    Err(restore_error) => Err(error.context(format!(
                         "the previous daemon configuration also failed to restart: {:#}",
-                        restore.unwrap_err()
-                    )))
+                        restore_error.into_inner()
+                    ))),
                 }
             }
         }
@@ -1183,11 +1233,32 @@ fn monitor_daemon(
     }
 }
 
+enum ReplaceError {
+    BeforeStop(anyhow::Error),
+    AfterStop(anyhow::Error),
+}
+
+impl std::fmt::Display for ReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeStop(error) | Self::AfterStop(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl ReplaceError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::BeforeStop(error) | Self::AfterStop(error) => error,
+        }
+    }
+}
+
 fn replace_local_daemon(
     inner: &SupervisorInner,
     executable: &Path,
     exposure: &DaemonExposureSettings,
-) -> anyhow::Result<()> {
+) -> Result<(), ReplaceError> {
     let client = inner.target.lock().client();
     if client.is_disconnected() {
         let mut target = inner.target.lock();
@@ -1196,22 +1267,28 @@ fn replace_local_daemon(
             _ => false,
         };
         if running {
-            bail!("resident daemon is unreachable; leaving its sessions intact");
+            return Err(ReplaceError::BeforeStop(anyhow::anyhow!(
+                "resident daemon is unreachable; leaving its sessions intact"
+            )));
         }
     }
     if !client.is_disconnected() {
-        if let ResponsePayload::Terminals { terminals } =
-            client.request(Uuid::nil(), Uuid::nil(), Command::ListTerminals)?
-        {
-            if terminals.iter().any(|terminal| !terminal.exited) {
-                bail!("daemon restart deferred while terminal sessions are running");
+        match daemon_has_live_work(&client) {
+            Ok(true) => {
+                return Err(ReplaceError::BeforeStop(anyhow::anyhow!(
+                    "daemon restart deferred while tasks or terminals are running"
+                )));
             }
+            Ok(false) => {}
+            Err(error) => return Err(ReplaceError::BeforeStop(error)),
         }
     }
     let previous = {
         let mut target = inner.target.lock();
         if matches!(&*target, DaemonTarget::Remote { .. }) {
-            bail!("the connected daemon is managed outside Waku Desktop");
+            return Err(ReplaceError::BeforeStop(anyhow::anyhow!(
+                "the connected daemon is managed outside Waku Desktop"
+            )));
         }
         target.take_local()
     };
@@ -1220,7 +1297,8 @@ fn replace_local_daemon(
     if let Some(mut previous) = previous {
         previous.stop();
     }
-    let replacement = DaemonProcess::spawn_configured(executable, exposure.clone())?;
+    let replacement = DaemonProcess::spawn_configured(executable, exposure.clone())
+        .map_err(ReplaceError::AfterStop)?;
     let client = replacement.client();
     *inner.target.lock() = DaemonTarget::Local(replacement);
     inner
@@ -1259,6 +1337,20 @@ fn wait_for_port_release(address: &str, timeout: Duration) {
 #[cfg(not(windows))]
 fn resident_daemon_tainted(_pid: u32) -> bool {
     false
+}
+
+fn record_needs_exposure_rebind(
+    record: &waku_protocol::bridge::BridgeState,
+    settings: &DaemonExposureSettings,
+    token: &str,
+) -> bool {
+    if settings.enabled {
+        record.token != token
+            || record.address != settings.bind_address()
+            || record.allowed_origins.as_deref() != Some(settings.allowed_origins.as_slice())
+    } else {
+        !address_is_loopback(&record.address)
+    }
 }
 
 #[cfg(windows)]
@@ -1704,5 +1796,35 @@ mod tests {
         drop(direct);
         drop(local);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn resident_exposure_rebind_handles_disabled_non_loopback_and_allowed_origins() {
+        let mut settings = DaemonExposureSettings {
+            enabled: false,
+            port: 9999,
+            allowed_origins: vec!["http://localhost:3001".into()],
+            token: "tok-1".into(),
+        };
+        let exposed = waku_protocol::bridge::BridgeState {
+            address: "0.0.0.0:9999".into(),
+            token: "tok-1".into(),
+            pid: 100,
+            protocol_version: PROTOCOL_VERSION,
+            fingerprint: "fp".into(),
+            allowed_origins: Some(vec!["http://localhost:3001".into()]),
+        };
+        assert!(record_needs_exposure_rebind(&exposed, &settings, "tok-1"));
+
+        let loopback = waku_protocol::bridge::BridgeState {
+            address: "127.0.0.1:4242".into(),
+            ..exposed.clone()
+        };
+        assert!(!record_needs_exposure_rebind(&loopback, &settings, "tok-1"));
+
+        settings.enabled = true;
+        assert!(!record_needs_exposure_rebind(&exposed, &settings, "tok-1"));
+        settings.allowed_origins.push("https://app.example".into());
+        assert!(record_needs_exposure_rebind(&exposed, &settings, "tok-1"));
     }
 }

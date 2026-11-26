@@ -8,8 +8,9 @@ use uuid::Uuid;
 use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
-    AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, SubmittedHandoff, UserInputAnswer,
+    AgentSession, GoalOperation, MessageAttachment, Project, ProviderKind, ProviderProbe,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, SubmittedHandoff,
+    UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -124,6 +125,15 @@ pub enum Command {
     },
     Steer {
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<MessageAttachment>,
+    },
+    ClaimQueuedMessage {
+        message_id: Uuid,
     },
     Cancel,
     CancelComputerUse,
@@ -522,6 +532,9 @@ pub enum ResponsePayload {
     SessionRewound {
         session: AgentSession,
         cleanup_warning: Option<String>,
+    },
+    QueuedMessageClaimed {
+        claimed: bool,
     },
     Workspace {
         result: WorkspaceResult,

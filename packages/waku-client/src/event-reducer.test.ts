@@ -353,4 +353,34 @@ describe('user input form', () => {
       { questionId: 'limit', answers: ['12'] },
     ])
   })
+
+  test('resolves permission and user-input waiting states when another client responds', () => {
+    const base = runningSession()
+    const current = reduceRuntimeEvent(base, event('permission', {
+      requestId: 'perm-1',
+      title: 'Run shell',
+      detail: 'ls',
+      options: [{ id: 'allow', label: 'Allow', kind: 'allowOnce' }],
+    }), clock)
+    expect(current.session.status).toBe('waiting')
+    expect(current.permission?.requestId).toBe('perm-1')
+
+    const permResolved = reduceRuntimeEvent(current.session, event('permissionResolved', {
+      requestId: 'perm-1',
+    }), clock)
+    expect(permResolved.session.status).toBe('working')
+    expect(permResolved.resolvedPermissionId).toBe('perm-1')
+
+    const asked = reduceRuntimeEvent(permResolved.session, event('userInputRequested', {
+      requestId: 'ask-1',
+      questions: [{ id: 'q1', header: 'Q1', question: 'Pick?', options: [{ label: 'Yes' }] }],
+    }), clock)
+    expect(asked.session.status).toBe('waiting')
+
+    const inputResolved = reduceRuntimeEvent(asked.session, event('userInputResolved', {
+      requestId: 'ask-1',
+    }), clock)
+    expect(inputResolved.session.status).toBe('working')
+    expect(inputResolved.resolvedUserInputId).toBe('ask-1')
+  })
 })

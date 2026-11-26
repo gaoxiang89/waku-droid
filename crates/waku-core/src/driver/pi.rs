@@ -702,7 +702,7 @@ impl PiDriver {
                             match result {
                                 Ok(_) => {
                                     let _ = writer_events
-                                        .send(DriverEvent::SteerAccepted { message: prompt });
+                                        .send(DriverEvent::steer_accepted(prompt));
                                 }
                                 Err(error) => {
                                     let _ = writer_events.send(DriverEvent::SteerRejected {

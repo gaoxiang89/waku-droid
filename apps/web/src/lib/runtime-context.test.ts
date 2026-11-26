@@ -34,5 +34,9 @@ describe('mergeSessionSummary', () => {
     expect(merged.account_id).toBe('acct-work')
     expect(merged.status).toBe('working')
     expect(merged.messages).toEqual(previous.messages)
+    expect(merged.state_version).toBe(0)
+
+    const bumped = mergeSessionSummary(previous, { ...summary, state_version: 7 })
+    expect(bumped.state_version).toBe(7)
   })
 })

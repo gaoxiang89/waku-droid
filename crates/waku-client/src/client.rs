@@ -1055,6 +1055,7 @@ mod tests {
                 pid: 0,
                 protocol_version: PROTOCOL_VERSION,
                 fingerprint: "fp".into(),
+                allowed_origins: None,
             })
             .unwrap(),
         )

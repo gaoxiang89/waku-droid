@@ -69,7 +69,9 @@ function resolvedUserInputAnswers(
 export interface RuntimeEventResult {
   session: AgentSession
   permission?: PendingPermission | null
+  resolvedPermissionId?: string
   userInput?: PendingUserInput | null
+  resolvedUserInputId?: string
   settled: boolean
   removeRuntime: boolean
   error?: string
@@ -247,6 +249,24 @@ export function reduceRuntimeEvent(
       if (!questions.length) break
       result.userInput = { requestId: value.requestId, questions }
       session.status = 'waiting'
+      break
+    }
+    case 'permissionResolved': {
+      const value = asRecord(payload)
+      if (!value || typeof value.requestId !== 'string') break
+      result.resolvedPermissionId = value.requestId
+      if (session.status === 'waiting') {
+        session.status = 'working'
+      }
+      break
+    }
+    case 'userInputResolved': {
+      const value = asRecord(payload)
+      if (!value || typeof value.requestId !== 'string') break
+      result.resolvedUserInputId = value.requestId
+      if (session.status === 'waiting') {
+        session.status = 'working'
+      }
       break
     }
     case 'usageUpdated': {

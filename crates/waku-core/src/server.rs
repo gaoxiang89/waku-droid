@@ -90,9 +90,15 @@ pub trait Backend: Send + Sync + 'static {
     fn shutdown(&self) {}
 
     /// Whether the backend still owns work that must outlive its clients,
-    /// such as a provider runtime or terminal. Idle exit waits for none.
+    /// such as a busy provider turn or live terminal. Idle exit waits for none.
     fn has_live_work(&self) -> bool {
         false
+    }
+
+    /// Reap idle resident provider runtimes when no clients are connected.
+    /// Returns the `(session_id, runtime_id)` pairs that were reaped.
+    fn reap_idle_runtimes(&self, _max_idle: Duration) -> Vec<(Uuid, Uuid)> {
+        Vec::new()
     }
 
     /// Whether `session_id` still owns a live runtime matching `runtime_id`.
@@ -129,6 +135,21 @@ impl EventSink {
         Ok(())
     }
 
+    pub fn send_sequenced(
+        &self,
+        event: WireDriverEvent,
+    ) -> Option<crate::model::RuntimeEventCursor> {
+        self.hub.emit(self.session_id, self.runtime, event, true)
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.hub.subscriber_count()
+    }
+
+    pub fn notify_task_state_changed(&self) {
+        self.hub.broadcast_task_state_changed_all();
+    }
+
     /// Broadcast a live-only event without retaining it in the replay journal.
     /// PTY output uses its own byte-bounded recovery buffer and snapshot
     /// protocol; duplicating it in the general event journal wastes memory.
@@ -140,6 +161,19 @@ impl EventSink {
                 .terminal_runtime_ended(self.session_id, self.runtime);
         }
         Ok(())
+    }
+
+    /// End the active session runtime in the Hub and retire its mailbox after
+    /// the provider process exits, while keeping the replay journal intact for
+    /// reconnecting clients.
+    pub fn end_session_runtime(&self) {
+        self.hub
+            .session_runtime_ended(self.session_id, self.runtime);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink(session_id: Uuid, runtime_id: Uuid) -> Self {
+        Arc::new(Hub::default()).event_sink(session_id, runtime_id)
     }
 }
 
@@ -207,6 +241,8 @@ struct HubState {
     cached_response_bytes: usize,
     catalog_projects: HashMap<Uuid, ProjectCatalogEntry>,
     catalog_sessions: HashMap<Uuid, SessionCatalogEntry>,
+    managed_terminals: HashSet<Uuid>,
+    terminal_subscribers: HashMap<Uuid, HashSet<u64>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,10 +270,13 @@ struct SessionCatalogEntry {
     archived: bool,
     project_id: Uuid,
     provider: ProviderKind,
+    account_id: Option<String>,
     model: Option<String>,
     status: SessionStatus,
     created_at: u64,
     last_reply_at: Option<u64>,
+    state_version: u64,
+    queued_messages: Vec<(Uuid, String, Option<String>, usize, u64)>,
 }
 
 impl From<&AgentSession> for SessionCatalogEntry {
@@ -249,10 +288,25 @@ impl From<&AgentSession> for SessionCatalogEntry {
             archived: session.archived,
             project_id: session.project_id,
             provider: session.provider,
+            account_id: session.account_id.clone(),
             model: session.model.clone(),
             status: session.status,
             created_at: session.created_at,
             last_reply_at: session.last_reply_at,
+            state_version: session.state_version,
+            queued_messages: session
+                .queued_messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.id,
+                        message.content.clone(),
+                        message.display_content.clone(),
+                        message.attachments.len(),
+                        message.created_at,
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -288,7 +342,7 @@ struct RuntimeMailbox {
 
 enum RuntimeMailboxMessage {
     Request(DispatchedRequest),
-    TerminalExited(ActiveRuntime),
+    RuntimeEnded(ActiveRuntime),
 }
 
 struct RequestDispatcher {
@@ -377,16 +431,7 @@ impl Hub {
         clear_session_replay(&mut state, session_id);
     }
 
-    fn terminal_runtime_ended(&self, session_id: Uuid, runtime: ActiveRuntime) {
-        {
-            let mut state = self.state.lock();
-            if state.active_runtimes.get(&session_id) != Some(&runtime) {
-                return;
-            }
-            state.active_runtimes.remove(&session_id);
-            clear_session_replay(&mut state, session_id);
-        }
-
+    fn wake_runtime_ended(&self, session_id: Uuid, runtime: ActiveRuntime) {
         // The mailbox registry lock is also held while dispatching requests.
         // An unbounded control message wakes a worker blocked in `recv`; its
         // normal empty-queue retirement path then atomically drains queued
@@ -399,8 +444,61 @@ impl Hub {
             .get(&session_id)
             .map(|mailbox| mailbox.sender.clone());
         if let Some(sender) = sender {
-            let _ = sender.send(RuntimeMailboxMessage::TerminalExited(runtime));
+            let _ = sender.send(RuntimeMailboxMessage::RuntimeEnded(runtime));
         }
+    }
+
+    fn terminal_runtime_ended(&self, session_id: Uuid, runtime: ActiveRuntime) {
+        {
+            let mut state = self.state.lock();
+            if state.active_runtimes.get(&session_id) != Some(&runtime) {
+                return;
+            }
+            state.active_runtimes.remove(&session_id);
+            clear_session_replay(&mut state, session_id);
+        }
+        self.wake_runtime_ended(session_id, runtime);
+    }
+
+    fn session_runtime_ended(&self, session_id: Uuid, runtime: ActiveRuntime) {
+        {
+            let mut state = self.state.lock();
+            if state.active_runtimes.get(&session_id) != Some(&runtime) {
+                return;
+            }
+            state.active_runtimes.remove(&session_id);
+        }
+        self.wake_runtime_ended(session_id, runtime);
+    }
+
+    fn end_reaped_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
+        let ended = {
+            let mut state = self.state.lock();
+            let Some(active) = state.active_runtimes.get(&session_id).copied() else {
+                return;
+            };
+            if active.runtime_id != runtime_id {
+                return;
+            }
+            state.active_runtimes.remove(&session_id);
+            active
+        };
+        self.wake_runtime_ended(session_id, ended);
+    }
+
+    fn register_terminal_subscriber(&self, session_id: Uuid, subscriber_id: u64) {
+        let mut state = self.state.lock();
+        state.managed_terminals.insert(session_id);
+        state
+            .terminal_subscribers
+            .entry(session_id)
+            .or_default()
+            .insert(subscriber_id);
+    }
+
+    fn clear_terminal_subscribers(&self, session_id: Uuid) {
+        let mut state = self.state.lock();
+        state.terminal_subscribers.remove(&session_id);
     }
 
     /// Arms `runtime_id` before a start so events emitted during `handle`
@@ -478,10 +576,10 @@ impl Hub {
         runtime: ActiveRuntime,
         event: WireDriverEvent,
         replayable: bool,
-    ) {
+    ) -> Option<crate::model::RuntimeEventCursor> {
         let mut state = self.state.lock();
         if state.active_runtimes.get(&session_id) != Some(&runtime) {
-            return;
+            return None;
         }
         let runtime_id = runtime.runtime_id;
         let sequence = state
@@ -489,6 +587,11 @@ impl Hub {
             .entry((session_id, runtime_id))
             .or_default();
         *sequence = sequence.saturating_add(1);
+        let cursor = crate::model::RuntimeEventCursor {
+            runtime_id,
+            epoch: self.epoch,
+            sequence: *sequence,
+        };
         let event = SequencedEvent {
             session_id,
             runtime_id,
@@ -504,6 +607,7 @@ impl Hub {
             }
         }
         Self::broadcast(&mut state, &ServerMessage::Event(event), None);
+        Some(cursor)
     }
 
     fn subscribe(&self, resume_from: &[ReplayCursor], subscriber: Subscriber) -> u64 {
@@ -543,7 +647,11 @@ impl Hub {
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
-        self.state.lock().subscribers.remove(&subscriber_id);
+        let mut state = self.state.lock();
+        state.subscribers.remove(&subscriber_id);
+        for subscribers in state.terminal_subscribers.values_mut() {
+            subscribers.remove(&subscriber_id);
+        }
     }
 
     /// Sends `message` to every subscriber except `skip`, dropping any whose
@@ -552,16 +660,37 @@ impl Hub {
     /// subscriber's connection observes the kick, closes, and reconnects with
     /// replay cursors, so no event stream is lost permanently.
     fn broadcast(state: &mut HubState, message: &ServerMessage, skip: Option<u64>) {
-        let is_ephemeral_terminal_output = matches!(
-            message,
+        let terminal_event_session = match message {
             ServerMessage::Event(SequencedEvent {
+                session_id,
                 event: WireDriverEvent { kind, .. },
                 ..
-            }) if kind == "terminalOutput"
-        );
+            }) if matches!(
+                kind.as_str(),
+                "terminalOutput" | "terminalExited" | "terminalError"
+            ) =>
+            {
+                Some((*session_id, kind == "terminalOutput"))
+            }
+            _ => None,
+        };
+        let is_ephemeral_terminal_output =
+            matches!(terminal_event_session, Some((_, true)));
+        let scoped_terminal_subscribers = terminal_event_session.and_then(|(session_id, _)| {
+            state
+                .managed_terminals
+                .contains(&session_id)
+                .then(|| state.terminal_subscribers.get(&session_id))
+        });
         let mut overwhelmed = Vec::new();
         for (&subscriber_id, subscriber) in &state.subscribers {
             if Some(subscriber_id) == skip {
+                continue;
+            }
+            if let Some(allowed) = scoped_terminal_subscribers
+                && subscriber.client_kind != ClientKind::Other
+                && !allowed.is_some_and(|subscribers| subscribers.contains(&subscriber_id))
+            {
                 continue;
             }
             if is_ephemeral_terminal_output
@@ -585,8 +714,24 @@ impl Hub {
         }
         for (subscriber_id, kicked) in overwhelmed {
             state.subscribers.remove(&subscriber_id);
+            for subscribers in state.terminal_subscribers.values_mut() {
+                subscribers.remove(&subscriber_id);
+            }
             let _ = kicked.send(());
         }
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.state.lock().subscribers.len()
+    }
+
+    fn broadcast_task_state_changed_all(&self) {
+        let mut state = self.state.lock();
+        state.task_state_revision = state.task_state_revision.saturating_add(1);
+        let message = ServerMessage::TaskStateChanged {
+            revision: state.task_state_revision,
+        };
+        Self::broadcast(&mut state, &message, None);
     }
 
     fn task_state_changed(&self, source_subscriber_id: u64) {
@@ -682,10 +827,14 @@ impl Hub {
                 if desktop_pid.is_none() && target_kind == ClientKind::Desktop {
                     desktop_pid = subscriber.client_pid;
                 }
+                break;
             }
         }
         for (subscriber_id, kicked) in overwhelmed {
             state.subscribers.remove(&subscriber_id);
+            for subscribers in state.terminal_subscribers.values_mut() {
+                subscribers.remove(&subscriber_id);
+            }
             let _ = kicked.send(());
         }
         (delivered, desktop_pid)
@@ -805,7 +954,7 @@ impl RequestDispatcher {
                     Err(error) => {
                         dispatched = match error.0 {
                             RuntimeMailboxMessage::Request(request) => request,
-                            RuntimeMailboxMessage::TerminalExited(_) => unreachable!(),
+                            RuntimeMailboxMessage::RuntimeEnded(_) => unreachable!(),
                         };
                         mailboxes.remove(&session_id);
                         continue;
@@ -861,6 +1010,15 @@ impl RequestDispatcher {
     }
 }
 
+fn is_loopback_addr(address: std::net::SocketAddr) -> bool {
+    match address.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 pub fn serve(
     listener: TcpListener,
     token: String,
@@ -868,25 +1026,44 @@ pub fn serve(
     shutdown: Arc<AtomicBool>,
     options: ServerOptions,
 ) -> anyhow::Result<()> {
+    const IDLE_RUNTIME_REAP_AFTER: Duration = Duration::from_secs(5 * 60);
+    const IDLE_RUNTIME_REAP_POLL: Duration = Duration::from_secs(30);
+
     listener
         .set_nonblocking(true)
         .context("could not configure Waku daemon listener")?;
     let hub = Arc::new(Hub::default());
     let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
     let options = Arc::new(options);
-    let active_connections = Arc::new(AtomicUsize::new(0));
+    let loopback_connections = Arc::new(AtomicUsize::new(0));
+    let remote_connections = Arc::new(AtomicUsize::new(0));
     let mut idle_since = Instant::now();
+    let mut last_reap = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
+        let total_connections =
+            loopback_connections.load(Ordering::Acquire) + remote_connections.load(Ordering::Acquire);
+        if total_connections == 0 && last_reap.elapsed() >= IDLE_RUNTIME_REAP_POLL {
+            last_reap = Instant::now();
+            for (session_id, runtime_id) in backend.reap_idle_runtimes(IDLE_RUNTIME_REAP_AFTER) {
+                hub.end_reaped_runtime(session_id, runtime_id);
+            }
+        }
         if let Some(idle_exit) = options.idle_exit {
-            if active_connections.load(Ordering::Acquire) > 0 || backend.has_live_work() {
+            if total_connections > 0 || backend.has_live_work() {
                 idle_since = Instant::now();
             } else if idle_since.elapsed() >= idle_exit {
                 break;
             }
         }
         match listener.accept() {
-            Ok((stream, _)) => {
-                if active_connections
+            Ok((stream, peer_addr)) => {
+                let peer_is_loopback = is_loopback_addr(peer_addr);
+                let quota = if peer_is_loopback {
+                    &loopback_connections
+                } else {
+                    &remote_connections
+                };
+                if quota
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                         (active < MAX_CONNECTIONS).then_some(active + 1)
                     })
@@ -894,7 +1071,7 @@ pub fn serve(
                 {
                     continue;
                 }
-                let connection_permit = ConnectionPermit(active_connections.clone());
+                let connection_permit = ConnectionPermit(quota.clone());
                 let token = token.clone();
                 let dispatcher = dispatcher.clone();
                 let hub = hub.clone();
@@ -904,9 +1081,15 @@ pub fn serve(
                     .name("waku-daemon-connection".into())
                     .spawn(move || {
                         let _connection_permit = connection_permit;
-                        if let Err(error) =
-                            handle_connection(stream, &token, dispatcher, hub, shutdown, &options)
-                        {
+                        if let Err(error) = handle_connection(
+                            stream,
+                            peer_is_loopback,
+                            &token,
+                            dispatcher,
+                            hub,
+                            shutdown,
+                            &options,
+                        ) {
                             eprintln!("waku-daemon connection ended: {error:#}");
                         }
                     })
@@ -925,6 +1108,7 @@ pub fn serve(
 
 fn handle_connection(
     stream: TcpStream,
+    peer_is_loopback: bool,
     expected_token: &str,
     dispatcher: Arc<RequestDispatcher>,
     hub: Arc<Hub>,
@@ -1039,16 +1223,20 @@ fn handle_connection(
                             dispatcher.dispatch(request, outgoing.clone(), subscriber_id);
                         }
                         Ok(ClientMessage::Shutdown) => {
-                            if options.allow_shutdown {
+                            if options.allow_shutdown && peer_is_loopback {
                                 write_json(&mut socket, &ServerMessage::ShuttingDown)?;
                                 shutdown.store(true, Ordering::Release);
                                 break;
                             }
+                            let message = if options.allow_shutdown {
+                                "remote clients cannot shut down the daemon"
+                            } else {
+                                "daemon shutdown is managed by its service owner"
+                            };
                             write_json(
                                 &mut socket,
                                 &ServerMessage::Rejected {
-                                    message: "daemon shutdown is managed by its service owner"
-                                        .into(),
+                                    message: message.into(),
                                 },
                             )?;
                         }
@@ -1156,6 +1344,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::Start { .. }
             | Command::Prompt { .. }
             | Command::Steer { .. }
+            | Command::ClaimQueuedMessage { .. }
             | Command::Cancel
             | Command::CancelComputerUse
             | Command::RefreshBackgroundWork
@@ -1201,7 +1390,7 @@ fn run_runtime_mailbox(
         };
         let dispatched = match message {
             RuntimeMailboxMessage::Request(request) => request,
-            RuntimeMailboxMessage::TerminalExited(ended) => {
+            RuntimeMailboxMessage::RuntimeEnded(ended) => {
                 if active_runtime == Some(ended) {
                     active_runtime = None;
                     terminal_retired = true;
@@ -1227,9 +1416,22 @@ fn run_runtime_mailbox(
         );
         let closes_runtime = matches!(
             &dispatched.request.command,
-            Command::CloseSession | Command::CloseTerminal | Command::RemoveSession
+            Command::CloseSession
+                | Command::CloseTerminal
+                | Command::RemoveSession
+                | Command::RewindSessionToMessage { .. }
         );
         let removes_session = matches!(&dispatched.request.command, Command::RemoveSession);
+        let rewinds_session = matches!(
+            &dispatched.request.command,
+            Command::RewindSessionToMessage { .. }
+        );
+        let non_rearming_command = matches!(
+            &dispatched.request.command,
+            Command::ForkSessionFromResponse { .. }
+                | Command::Rollback { .. }
+                | Command::Fork { .. }
+        );
         let terminal_command = matches!(
             &dispatched.request.command,
             Command::AttachTerminal { .. }
@@ -1278,13 +1480,27 @@ fn run_runtime_mailbox(
             } else if closes_runtime {
                 let closes_active =
                     active_runtime.is_some_and(|active| active.runtime_id == runtime_id);
-                if (removes_session || closes_active)
+                if (removes_session || rewinds_session || closes_active)
                     && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
                 {
-                    hub.end_runtime(session_id, (!removes_session).then_some(runtime_id));
+                    hub.end_runtime(
+                        session_id,
+                        (!removes_session && !rewinds_session).then_some(runtime_id),
+                    );
+                    active_runtime = None;
+                } else if let Some(existing) = active_runtime
+                    && !backend.is_runtime_live(session_id, existing.runtime_id)
+                {
+                    hub.end_runtime(session_id, Some(existing.runtime_id));
                     active_runtime = None;
                 }
+            } else if let Some(existing) = active_runtime
+                && !backend.is_runtime_live(session_id, existing.runtime_id)
+            {
+                hub.end_runtime(session_id, Some(existing.runtime_id));
+                active_runtime = None;
             } else if active_runtime.is_none()
+                && !non_rearming_command
                 && !(terminal_retired && terminal_command)
                 && !(terminal_command
                     && matches!(
@@ -1306,6 +1522,7 @@ fn run_runtime_mailbox(
                     } if snapshot.exited
                 )
                 && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
+                && backend.is_runtime_live(session_id, runtime_id)
             {
                 // A replaced mailbox can rediscover a backend runtime that
                 // outlived its worker. A terminal Ack is not liveness evidence:
@@ -1387,6 +1604,9 @@ fn handle_request(
         Command::Start { .. } | Command::OpenTerminal { .. }
     );
     let attaches_terminal = matches!(&request.command, Command::AttachTerminal { .. });
+    let opens_terminal = matches!(&request.command, Command::OpenTerminal { .. });
+    let closes_terminal = matches!(&request.command, Command::CloseTerminal);
+    let claims_queued = matches!(&request.command, Command::ClaimQueuedMessage { .. });
     let (outcome, executed, runtime) = if !notification
         && let Some(cached) = hub.cached_response(request_id)
     {
@@ -1436,6 +1656,11 @@ fn handle_request(
         }
         (outcome, true, runtime)
     };
+    if (opens_terminal || attaches_terminal) && matches!(&outcome, ResponseOutcome::Ok { .. }) {
+        hub.register_terminal_subscriber(session_id, source_subscriber_id);
+    } else if executed && closes_terminal && matches!(&outcome, ResponseOutcome::Ok { .. }) {
+        hub.clear_terminal_subscribers(session_id);
+    }
     if executed
         && attaches_terminal
         && matches!(
@@ -1468,6 +1693,14 @@ fn handle_request(
                 },
             ) => hub.task_state_saved(source_subscriber_id, projects, sessions),
             (TaskCatalogAction::Changed, ResponseOutcome::Ok { .. }) => {
+                hub.task_state_changed(source_subscriber_id);
+            }
+            (
+                _,
+                ResponseOutcome::Ok {
+                    payload: ResponsePayload::QueuedMessageClaimed { claimed: true },
+                },
+            ) if claims_queued => {
                 hub.task_state_changed(source_subscriber_id);
             }
             _ => {}
@@ -1876,10 +2109,6 @@ mod tests {
                 }
                 _ => Ok(ResponsePayload::Ack),
             }
-        }
-
-        fn is_runtime_live(&self, session_id: Uuid, runtime_id: Uuid) -> bool {
-            self.runtimes.lock().get(&session_id) == Some(&runtime_id)
         }
     }
 
@@ -4736,6 +4965,7 @@ mod tests {
                 pid: std::process::id(),
                 protocol_version: PROTOCOL_VERSION,
                 fingerprint: "test".into(),
+                allowed_origins: None,
             })
             .unwrap(),
         )
@@ -5011,5 +5241,297 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_loopback_addr_handles_ipv4_ipv6_and_mapped_addresses() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        assert!(is_loopback_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080
+        )));
+        assert!(is_loopback_addr(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            8080
+        )));
+        assert!(is_loopback_addr(SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            8080
+        )));
+        assert!(!is_loopback_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            8080
+        )));
+        assert!(!is_loopback_addr(SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped()),
+            8080
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_output_is_scoped_away_from_unattached_web_clients() {
+        let root = std::env::temp_dir().join(format!("waku-term-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let backend = Arc::new(
+            crate::daemon::WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                crate::persistence::StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap(),
+        );
+        let server = std::thread::spawn(move || {
+            serve(listener, "secret".into(), backend, stop, ServerOptions::default()).unwrap();
+        });
+
+        let desktop = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Desktop,
+            Some(100),
+        )
+        .unwrap();
+        let web = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Web,
+            None,
+        )
+        .unwrap();
+        let term_id = Uuid::new_v4();
+        let desktop_rx = desktop.subscribe(term_id, term_id);
+        let web_rx = web.subscribe(term_id, term_id);
+
+        desktop
+            .request(
+                term_id,
+                term_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        let marker = format!("waku-scope-{}", &term_id.to_string()[..8]);
+        desktop
+            .request(
+                term_id,
+                term_id,
+                Command::WriteTerminal {
+                    data: format!("printf '%s\\n' '{marker}'\r").into_bytes(),
+                },
+            )
+            .unwrap();
+        wait_for_terminal_marker(&desktop_rx, marker.as_bytes(), Duration::from_secs(10));
+        assert!(
+            web_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "unattached Web client should not receive terminalOutput from Desktop terminal"
+        );
+
+        desktop.request(term_id, term_id, Command::CloseTerminal).unwrap();
+        desktop.disconnect();
+        web.disconnect();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broadcast_open_workspace_delivers_only_to_latest_matching_desktop() {
+        let hub = Arc::new(Hub::default());
+        let (tx1, rx1) = unbounded();
+        let (tx2, rx2) = unbounded();
+        let (tx_cli, _rx_cli) = unbounded();
+        hub.subscribe(
+            &[],
+            Subscriber::with_identity(tx1, ClientKind::RemoteDesktop, None).0,
+        );
+        hub.subscribe(
+            &[],
+            Subscriber::with_identity(tx2, ClientKind::RemoteDesktop, None).0,
+        );
+        let cli_id = hub.subscribe(
+            &[],
+            Subscriber::with_identity(tx_cli, ClientKind::RemoteCli, None).0,
+        );
+
+        let (delivered, _) =
+            hub.broadcast_open_workspace(cli_id, Some("/srv/repo".into()), None);
+        assert!(delivered);
+        assert!(matches!(
+            rx2.recv_timeout(Duration::from_millis(200)),
+            Ok(ServerMessage::OpenWorkspace { .. })
+        ));
+        assert!(
+            rx1.recv_timeout(Duration::from_millis(100)).is_err(),
+            "older RemoteDesktop subscriber should not receive duplicate OpenWorkspace"
+        );
+    }
+
+    #[test]
+    fn respond_and_respond_user_input_emit_resolved_events() {
+        use waku_protocol::model::{DriverEvent, ProviderKind};
+        struct DummyControl;
+        impl crate::driver::DriverControl for DummyControl {
+            fn prompt(&self, _prompt: String) {}
+            fn cancel(&self) {}
+            fn respond(&self, _request_id: String, _option_id: String) {}
+            fn rollback(&self, _turns: usize) -> anyhow::Result<Option<crate::model::ProviderResumeCursor>> {
+                Ok(None)
+            }
+            fn fork(&self, _turns_to_remove: usize) -> anyhow::Result<crate::model::ProviderResumeCursor> {
+                unreachable!()
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("waku-daemon-resolve-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = crate::daemon::WakuBackend::new(
+            crate::settings::DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+            crate::persistence::StateStore::daemon(dir.join("state.db")),
+        )
+        .unwrap();
+        let hub = Arc::new(Hub::default());
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        backend.insert_test_session(
+            session_id,
+            runtime_id,
+            ProviderKind::Codex,
+            None,
+            crate::driver::DriverHandle::from_control(Arc::new(DummyControl)),
+        );
+        let _ = DriverEvent::PermissionResolved {
+            request_id: String::new(),
+        };
+        hub.begin_runtime(session_id, runtime_id);
+        let (tx, rx) = unbounded();
+        hub.subscribe(&[], Subscriber::new(tx).0);
+
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::Respond {
+                        request_id: "perm-99".into(),
+                        option_id: "allowOnce".into(),
+                    },
+                },
+                hub.event_sink(session_id, runtime_id),
+            )
+            .unwrap();
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::RespondUserInput {
+                        request_id: "ask-42".into(),
+                        answers: vec![],
+                    },
+                },
+                hub.event_sink(session_id, runtime_id),
+            )
+            .unwrap();
+
+        let kinds: Vec<String> = rx
+            .try_iter()
+            .filter_map(|msg| match msg {
+                ServerMessage::Event(ev) => Some(ev.event.kind),
+                _ => None,
+            })
+            .collect();
+        assert!(kinds.contains(&"permissionResolved".to_string()), "{kinds:?}");
+        assert!(kinds.contains(&"userInputResolved".to_string()), "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_rearming_commands_do_not_pin_mailbox_worker_or_rearm_idle_hub_runtime() {
+        let dir = std::env::temp_dir().join(format!("waku-mailbox-rearm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = Arc::new(
+            crate::daemon::WakuBackend::new(
+                crate::settings::DaemonSettingsStore::open(dir.join("settings.json")).unwrap(),
+                crate::persistence::StateStore::daemon(dir.join("state.db")),
+            )
+            .unwrap(),
+        );
+        struct DummyControl;
+        impl crate::driver::DriverControl for DummyControl {
+            fn prompt(&self, _prompt: String) {}
+            fn steer(&self, _prompt: String) {}
+            fn cancel(&self) {}
+            fn respond(&self, _request_id: String, _option_id: String) {}
+            fn respond_user_input(
+                &self,
+                _request_id: String,
+                _answers: Vec<crate::model::UserInputAnswer>,
+            ) {
+            }
+            fn apply_options(&self, _options: crate::driver::SessionOptions) -> bool {
+                false
+            }
+            fn rollback(
+                &self,
+                _turns: usize,
+            ) -> anyhow::Result<Option<crate::model::ProviderResumeCursor>> {
+                Ok(None)
+            }
+            fn fork(&self, _turns_to_remove: usize) -> anyhow::Result<crate::model::ProviderResumeCursor> {
+                Ok(crate::model::ProviderResumeCursor::Codex {
+                    thread_id: "forked".into(),
+                })
+            }
+        }
+        let hub = Arc::new(Hub::default());
+        let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        backend.insert_test_session(
+            session_id,
+            runtime_id,
+            ProviderKind::Codex,
+            None,
+            crate::driver::DriverHandle::from_control(Arc::new(DummyControl)),
+        );
+        let (tx, _rx) = unbounded();
+        let subscriber_id = hub.subscribe(&[], Subscriber::new(tx).0);
+        let (resp_tx, resp_rx) = unbounded();
+        dispatcher.dispatch(
+            Request {
+                request_id: Uuid::new_v4(),
+                session_id,
+                runtime_id,
+                command: Command::Rollback { turns: 0 },
+            },
+            resp_tx,
+            subscriber_id,
+        );
+        let response = resp_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            response,
+            ServerMessage::Response {
+                outcome: ResponseOutcome::Ok { .. },
+                ..
+            }
+        ));
+        // Mailbox must retire without re-arming the Hub when it wasn't active.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dispatcher.runtime_mailboxes.lock().contains_key(&session_id) {
+            assert!(Instant::now() < deadline, "mailbox worker leaked on Rollback");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!hub.state.lock().active_runtimes.contains_key(&session_id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

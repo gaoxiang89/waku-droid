@@ -874,7 +874,7 @@ fn write_steer_message(
     let written = write_line(stdin, &user_message_payload(&text));
     match &written {
         Ok(()) => {
-            let _ = events.send(DriverEvent::SteerAccepted { message: text });
+            let _ = events.send(DriverEvent::steer_accepted(text));
         }
         Err(error) => {
             let _ = events.send(DriverEvent::SteerRejected {
@@ -2519,7 +2519,7 @@ mod tests {
                             .into(),
                     );
                 }
-                DriverEvent::SteerAccepted { message } => {
+                DriverEvent::SteerAccepted { message, .. } => {
                     assert!(message.contains("BANANA"));
                     steer_accepted = true;
                 }
@@ -3705,7 +3705,7 @@ mod tests {
         assert!(!sink.is_empty());
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(DriverEvent::SteerAccepted { message }) if message == "after wake"
+            Ok(DriverEvent::SteerAccepted { message, .. }) if message == "after wake"
         ));
     }
 

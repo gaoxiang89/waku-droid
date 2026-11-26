@@ -25,6 +25,12 @@ pub fn terminate_daemon(pid: u32) -> bool {
     imp::terminate_daemon(pid)
 }
 
+/// Whether `pid` currently owns any live child processes (such as terminals or
+/// agent CLIs). Used before replacing an incompatible local resident daemon.
+pub fn has_child_processes(pid: u32) -> bool {
+    imp::has_child_processes(pid)
+}
+
 #[cfg(any(unix, windows))]
 fn matches_daemon_stem(stem: &str) -> bool {
     stem.eq_ignore_ascii_case("narel-daemon") || stem.eq_ignore_ascii_case("narel-debug-daemon")
@@ -104,6 +110,27 @@ mod imp {
             return false;
         }
         terminate(pid)
+    }
+
+    pub fn has_child_processes(pid: u32) -> bool {
+        if pid == 0 || !is_alive(pid) {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-ax", "-o", "ppid="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .any(|ppid| ppid == pid)
     }
 }
 
@@ -208,6 +235,40 @@ mod imp {
             .and_then(|stem| stem.to_str())
             .is_some_and(super::matches_daemon_stem)
     }
+
+    pub fn has_child_processes(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+
+        if pid == 0 || !is_alive(pid) {
+            return false;
+        }
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+                return false;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut found = false;
+            if Process32FirstW(snapshot, &raw mut entry) != 0 {
+                loop {
+                    if entry.th32ParentProcessID == pid && entry.th32ProcessID != pid {
+                        found = true;
+                        break;
+                    }
+                    if Process32NextW(snapshot, &raw mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+            found
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -225,6 +286,10 @@ mod imp {
     }
 
     pub fn terminate_daemon(_pid: u32) -> bool {
+        false
+    }
+
+    pub fn has_child_processes(_pid: u32) -> bool {
         false
     }
 }
