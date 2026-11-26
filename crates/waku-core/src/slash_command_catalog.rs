@@ -54,29 +54,26 @@ pub(crate) fn discover(
 
 fn discover_antigravity(
     binary: &Path,
-    project_root: &Path,
+    _project_root: &Path,
     config_dir: Option<&Path>,
 ) -> Option<Vec<SlashCommand>> {
     discover_antigravity_with(
         config_dir,
         || crate::model_catalog::discover_antigravity_acp_commands_in(binary, config_dir),
-        || discover_antigravity_skills(binary, project_root, config_dir),
+        || None,
     )
 }
 
 fn discover_antigravity_with(
-    config_dir: Option<&Path>,
+    _config_dir: Option<&Path>,
     probe_acp: impl FnOnce() -> Option<Vec<SlashCommand>>,
-    probe_cli_skills: impl FnOnce() -> Option<Vec<SlashCommand>>,
+    _probe_cli_skills: impl FnOnce() -> Option<Vec<SlashCommand>>,
 ) -> Option<Vec<SlashCommand>> {
     let acp_commands = probe_acp();
-    // Root `agy -p "/skills"` lacks `--gemini-dir` and reads the default profile's
-    // user skills; isolated accounts rely on `composer_complete` directory scans.
-    let skills = if config_dir.is_none() {
-        probe_cli_skills()
-    } else {
-        None
-    };
+    // Do not invoke headless `agy -p "/skills"` automatically in the
+    // background. `composer_complete` scans Antigravity skill directories from
+    // disk directly, while `agy acp` and bridged commands cover the rest.
+    let skills = None;
     let bridged = antigravity_bridged_cli_commands();
     let merged = merge_antigravity_catalog(
         acp_commands.unwrap_or_default(),
@@ -86,21 +83,7 @@ fn discover_antigravity_with(
     (!merged.is_empty()).then_some(merged)
 }
 
-fn discover_antigravity_skills(
-    binary: &Path,
-    project_root: &Path,
-    config_dir: Option<&Path>,
-) -> Option<Vec<SlashCommand>> {
-    let value = capture_json_in(
-        binary,
-        &["-p", "/skills", "--output-format", "json"],
-        project_root,
-        Some(ProviderKind::Antigravity),
-        config_dir,
-    )?;
-    Some(parse_antigravity_skills(&value))
-}
-
+#[cfg(test)]
 fn parse_antigravity_skills(value: &Value) -> Vec<SlashCommand> {
     value
         .pointer("/command/data/skills")
@@ -1232,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_isolated_account_skips_cli_skills_probe() {
+    fn antigravity_discovery_never_auto_probes_cli_skills() {
         let dir = std::path::PathBuf::from("/tmp/waku-agy-isolated");
         let mut cli_probed = false;
         let isolated = discover_antigravity_with(
@@ -1258,9 +1241,12 @@ mod tests {
                 Some(vec![command("swarm", Some("Swarm"), CommandScope::Skill, None, None).unwrap()])
             },
         )
-        .expect("default account discovery still runs `/skills`");
-        assert!(default_cli_probed);
-        assert!(default_catalog.iter().any(|cmd| cmd.name == "swarm"));
+        .expect("default account discovery still returns bridged commands without `agy -p /skills`");
+        assert!(
+            !default_cli_probed,
+            "default account must not auto-invoke `agy -p /skills`"
+        );
+        assert!(default_catalog.iter().any(|cmd| cmd.name == "usage"));
     }
 
     #[test]

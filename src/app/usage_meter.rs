@@ -24,6 +24,13 @@ pub(super) const PLAN_USAGE_PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::Antigravity,
 ];
 
+/// Providers whose plan usage probe invokes a headless CLI (`agy -p`) and
+/// must therefore only run on explicit user action (never background timers,
+/// panel opens, or settings navigation).
+pub(super) fn plan_usage_is_manual_only(provider: ProviderKind) -> bool {
+    matches!(provider, ProviderKind::Antigravity)
+}
+
 /// Refresh cadences for the plan snapshots. Quota moves only when turns run,
 /// so idle refreshes stay rare; a settled turn or a just-opened panel asks
 /// sooner. Providers that spawn a probe process (Grok, Antigravity) keep a
@@ -98,7 +105,9 @@ impl Waku {
     ) -> Vec<(ProviderKind, Option<String>)> {
         PLAN_USAGE_PROVIDERS
             .into_iter()
-            .filter(|provider| self.provider_enabled_on(host, *provider))
+            .filter(|provider| {
+                !plan_usage_is_manual_only(*provider) && self.provider_enabled_on(host, *provider)
+            })
             .flat_map(|provider| {
                 let account_ids = if provider.supports_multiple_accounts() {
                     self.provider_accounts_for_kind(host, provider)
@@ -129,15 +138,16 @@ impl Waku {
         };
         let host_generation = owner.generation;
         let daemon = owner.daemon.clone();
-        let mut targets = self.enabled_plan_usage_targets_for_host(host);
-        if let Some(target) = explicit_target
-            && !targets.contains(&target)
-        {
-            targets.push(target);
-        }
-        if *host == self.selected_host_key() {
+        let is_explicit = explicit_target.is_some();
+        let mut targets = if let Some(target) = explicit_target {
+            vec![target]
+        } else {
+            self.enabled_plan_usage_targets_for_host(host)
+        };
+        if *host == self.selected_host_key() && !is_explicit {
             if let Some(session) = self.selected_session()
                 && PLAN_USAGE_PROVIDERS.contains(&session.provider)
+                && !plan_usage_is_manual_only(session.provider)
             {
                 let account_id = self.validated_account_id_for_host(
                     host,
@@ -150,6 +160,7 @@ impl Waku {
                 }
             }
             if PLAN_USAGE_PROVIDERS.contains(&self.state.last_provider)
+                && !plan_usage_is_manual_only(self.state.last_provider)
                 && self.provider_enabled_on(host, self.state.last_provider)
             {
                 let account_id = self.validated_account_id_for_host(
@@ -364,19 +375,43 @@ impl Waku {
         let account_label = self
             .account_for_host(&host, provider, account_id.as_deref())
             .map(|account| SharedString::from(account.label.clone()));
-        let key: PlanUsageKey = (host, provider, account_id);
+        let key: PlanUsageKey = (host.clone(), provider, account_id.clone());
         let context = session.context_usage;
         let theme = Theme::current(cx);
         let plan = self.plan_usage.get(&key).cloned();
         let error = self.plan_usage_error.get(&key).cloned();
-        // Fetchable but nothing cached yet: the panel shows a skeleton
-        // whether the fetch is already in flight or lands on the next tick.
-        let plan_loading = plan.is_none()
-            && error.is_none()
-            && !self.plan_usage_unconfigured.contains(&key)
-            && PLAN_USAGE_PROVIDERS.contains(&provider);
+        let plan_pending = self.plan_usage_pending.contains(&key);
+        let manual_only = plan_usage_is_manual_only(provider);
+        // Fetchable but nothing cached yet: automatic providers show a skeleton
+        // while the fetch lands; manual-only providers only show a skeleton
+        // once the user has explicitly triggered a check.
+        let plan_loading = if manual_only {
+            plan.is_none() && error.is_none() && plan_pending
+        } else {
+            plan.is_none()
+                && error.is_none()
+                && !self.plan_usage_unconfigured.contains(&key)
+                && PLAN_USAGE_PROVIDERS.contains(&provider)
+        };
 
         let weak = cx.entity().downgrade();
+        let refresh_weak = weak.clone();
+        let refresh_host = host;
+        let refresh_account_id = account_id;
+        let manual_refresh: Option<(bool, std::rc::Rc<dyn Fn(&mut App)>)> = manual_only.then(|| {
+            let action: std::rc::Rc<dyn Fn(&mut App)> = std::rc::Rc::new(move |cx| {
+                let _ = refresh_weak.update(cx, |this, cx| {
+                    this.refresh_plan_usage_now(
+                        &refresh_host,
+                        provider,
+                        refresh_account_id.clone(),
+                        cx,
+                    );
+                    cx.notify();
+                });
+            });
+            (plan_pending, action)
+        });
         let handle = self.menu_handle_with(USAGE_METER_MENU_ID, cx, move |open, window, cx| {
             if open {
                 let mut card_focus = None;
@@ -387,7 +422,10 @@ impl Waku {
                     if let Some((provider, raw_account_id)) = this
                         .selected_session()
                         .map(|session| (session.provider, session.account_id.clone()))
-                        .filter(|(provider, _)| PLAN_USAGE_PROVIDERS.contains(provider))
+                        .filter(|(provider, _)| {
+                            PLAN_USAGE_PROVIDERS.contains(provider)
+                                && !plan_usage_is_manual_only(*provider)
+                        })
                     {
                         let account_id = this.validated_account_id_for_host(
                             &selected_host,
@@ -475,6 +513,7 @@ impl Waku {
                     plan.clone(),
                     error.as_deref(),
                     plan_loading,
+                    manual_refresh.clone(),
                     cx,
                 )
             },
@@ -576,6 +615,7 @@ fn usage_panel(
     plan: Option<PlanUsage>,
     error: Option<&str>,
     plan_loading: bool,
+    manual_refresh: Option<(bool, std::rc::Rc<dyn Fn(&mut App)>)>,
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::current(cx);
@@ -633,9 +673,46 @@ fn usage_panel(
             )
             .child(meter_bar(&theme, percent.unwrap_or(0.0))),
     );
-    if plan.is_some() || error.is_some() || plan_loading {
+    if plan.is_some() || error.is_some() || plan_loading || manual_refresh.is_some() {
         panel = panel.child(div().h(px(1.0)).flex_none().bg(theme.border));
     }
+
+    let refresh_icon_button = |id: &'static str, pending: bool, on_refresh: std::rc::Rc<dyn Fn(&mut App)>| {
+        let on_click = on_refresh.clone();
+        let glyph: AnyElement = if pending {
+            motion::spin(icon("icons/loader-circle.svg", 11.0, theme.text_tertiary))
+        } else {
+            icon("icons/rotate-cw.svg", 11.0, theme.text_tertiary).into_any_element()
+        };
+        div()
+            .id(id)
+            .tab_index(0)
+            .size(px(20.0))
+            .flex_none()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus_visible(|style| style.border_color(theme.accent))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .hover(|element| element.bg(theme.overlay))
+            .tooltip(Tooltip::text(tr!("usage.check_manually")))
+            .on_click(move |_, _, cx| {
+                on_click(cx);
+                cx.stop_propagation();
+            })
+            .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    on_refresh(cx);
+                    cx.stop_propagation();
+                }
+            })
+            .child(glyph)
+    };
 
     if let Some(plan) = plan {
         let base_header = match &plan.plan_label {
@@ -660,8 +737,8 @@ fn usage_panel(
                 .text_color(theme.text_tertiary)
                 .child(SharedString::from(header)),
         );
-        panel = panel.child(match usage_url {
-            Some(url) => header_row
+        panel = panel.child(match (usage_url, manual_refresh) {
+            (Some(url), _) => header_row
                 .id("plan-usage-link")
                 .tab_index(0)
                 .rounded(px(4.0))
@@ -683,7 +760,14 @@ fn usage_panel(
                 })
                 .child(icon("icons/arrow-right.svg", 10.0, theme.text_tertiary))
                 .into_any_element(),
-            None => header_row.into_any_element(),
+            (None, Some((pending, on_refresh))) => header_row
+                .child(refresh_icon_button(
+                    "plan-usage-manual-refresh",
+                    pending,
+                    on_refresh,
+                ))
+                .into_any_element(),
+            (None, None) => header_row.into_any_element(),
         });
         for window in &plan.windows {
             panel = panel.child(
@@ -739,15 +823,84 @@ fn usage_panel(
                 .gap(px(4.0))
                 .child(
                     div()
-                        .text_size(sp(12.5))
-                        .text_color(theme.text_tertiary)
-                        .child(SharedString::from(error_header)),
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(SharedString::from(error_header)),
+                        )
+                        .children(manual_refresh.map(|(pending, on_refresh)| {
+                            refresh_icon_button("plan-usage-error-refresh", pending, on_refresh)
+                        })),
                 )
                 .child(
                     div()
                         .text_size(sp(12.5))
                         .text_color(theme.text_secondary)
                         .child(SharedString::from(tr!("usage.unavailable", error = error))),
+                ),
+        );
+    } else if let Some((_, on_refresh)) = manual_refresh {
+        let header = match account_label {
+            Some(account) => format!("{} · {account}", tr!("usage.plan_limits")),
+            None => tr!("usage.plan_limits"),
+        };
+        let on_click = on_refresh.clone();
+        panel = panel.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(sp(12.5))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(header)),
+                )
+                .child(
+                    div()
+                        .text_size(sp(12.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("usage.manual_probe_hint")),
+                )
+                .child(
+                    div()
+                        .id("plan-usage-check-manually")
+                        .tab_index(0)
+                        .self_start()
+                        .h(px(26.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .focus_visible(|style| style.border_color(theme.accent))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_default()
+                        .hover(|element| element.bg(theme.overlay))
+                        .text_size(sp(12.0))
+                        .text_color(theme.text)
+                        .on_click(move |_, _, cx| {
+                            on_click(cx);
+                            cx.stop_propagation();
+                        })
+                        .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                            if !event.keystroke.modifiers.modified()
+                                && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                on_refresh(cx);
+                                cx.stop_propagation();
+                            }
+                        })
+                        .child(icon("icons/rotate-cw.svg", 11.0, theme.text_secondary))
+                        .child(tr!("usage.check_manually")),
                 ),
         );
     }
@@ -855,6 +1008,9 @@ mod tests {
     #[test]
     fn plan_usage_providers_include_antigravity() {
         assert!(PLAN_USAGE_PROVIDERS.contains(&ProviderKind::Antigravity));
+        assert!(plan_usage_is_manual_only(ProviderKind::Antigravity));
+        assert!(!plan_usage_is_manual_only(ProviderKind::Claude));
+        assert!(!plan_usage_is_manual_only(ProviderKind::Codex));
     }
 
     #[test]

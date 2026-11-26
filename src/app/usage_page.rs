@@ -243,7 +243,7 @@ impl Waku {
             .child(self.render_usage_header(range, pending, &theme, cx));
 
         if self.usage_view == UsageViewMode::Daily
-            && let Some(plan_section) = self.render_plan_usage_section(&host, &theme)
+            && let Some(plan_section) = self.render_plan_usage_section(&host, &theme, cx)
         {
             page = page.child(plan_section);
         }
@@ -507,6 +507,7 @@ impl Waku {
         &self,
         host: &waku_client::hosts::HostKey,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> Option<Div> {
         let mut entries: Vec<(ProviderKind, Option<String>)> = Vec::new();
         for provider in super::usage_meter::PLAN_USAGE_PROVIDERS {
@@ -560,10 +561,12 @@ impl Waku {
 
         let now = unix_time() as i64;
         let mut cards = div().flex().flex_wrap().gap(px(12.0));
-        for (provider, account_id) in entries {
+        for (card_index, (provider, account_id)) in entries.into_iter().enumerate() {
             let key: PlanUsageKey = (host.clone(), provider, account_id.clone());
             let plan = self.plan_usage.get(&key);
             let error = self.plan_usage_error.get(&key);
+            let pending = self.plan_usage_pending.contains(&key);
+            let manual_only = super::usage_meter::plan_usage_is_manual_only(provider);
             let account_label = self
                 .account_for_host(host, provider, account_id.as_deref())
                 .map(|account| account.label.as_str());
@@ -575,6 +578,41 @@ impl Waku {
                 (None, Some(account)) => format!("{} · {account}", provider.display_name()),
                 (None, None) => provider.display_name().to_owned(),
             };
+
+            let header_refresh = manual_only.then(|| {
+                let refresh_host = host.clone();
+                let refresh_account_id = account_id.clone();
+                let glyph: AnyElement = if pending {
+                    motion::spin(icon("icons/loader-circle.svg", 11.0, theme.text_tertiary))
+                } else {
+                    icon("icons/rotate-cw.svg", 11.0, theme.text_tertiary).into_any_element()
+                };
+                div()
+                    .id(("plan-usage-card-refresh", card_index))
+                    .tab_index(0)
+                    .size(px(22.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_default()
+                    .hover(|element| element.bg(theme.overlay))
+                    .tooltip(Tooltip::text(tr!("usage.check_manually")))
+                    .on_activation(cx, move |this, _, cx| {
+                        this.refresh_plan_usage_now(
+                            &refresh_host,
+                            provider,
+                            refresh_account_id.clone(),
+                            cx,
+                        );
+                        cx.notify();
+                    })
+                    .child(glyph)
+            });
 
             let mut card = div()
                 .min_w(px(260.0))
@@ -606,7 +644,8 @@ impl Waku {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from(title)),
-                        ),
+                        )
+                        .children(header_refresh),
                 );
 
             if let Some(plan) = plan {
@@ -660,6 +699,46 @@ impl Waku {
                         .text_color(theme.text_secondary)
                         .child(SharedString::from(tr!("usage.unavailable", error = error))),
                 );
+            } else if manual_only && !pending {
+                let refresh_host = host.clone();
+                let refresh_account_id = account_id.clone();
+                card = card
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("usage.manual_probe_hint")),
+                    )
+                    .child(
+                        div()
+                            .id(("plan-usage-card-check", card_index))
+                            .tab_index(0)
+                            .self_start()
+                            .h(px(26.0))
+                            .px(px(10.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .focus_visible(|style| style.border_color(theme.accent))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .cursor_default()
+                            .hover(|element| element.bg(theme.overlay))
+                            .text_size(sp(12.0))
+                            .text_color(theme.text)
+                            .on_activation(cx, move |this, _, cx| {
+                                this.refresh_plan_usage_now(
+                                    &refresh_host,
+                                    provider,
+                                    refresh_account_id.clone(),
+                                    cx,
+                                );
+                                cx.notify();
+                            })
+                            .child(icon("icons/rotate-cw.svg", 11.0, theme.text_secondary))
+                            .child(tr!("usage.check_manually")),
+                    );
             } else {
                 card = card.child(super::usage_meter::plan_skeleton(theme));
             }

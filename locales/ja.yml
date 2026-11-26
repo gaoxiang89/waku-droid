@@ -1329,6 +1329,8 @@ usage.plan_limits: プランの使用量上限
 usage.plan_limits_named: プランの使用量上限 · %{plan}
 usage.open_account_settings: アカウントの使用状況設定を開く
 usage.unavailable: 利用不可 — %{error}
+usage.check_manually: 使用量を確認
+usage.manual_probe_hint: バックグラウンドでの CLI 呼び出しを避けるため、手動で確認します。
 usage.usage_limit: 使用量の上限
 usage.hour_limit: "%{count} 時間の上限"
 usage.day_limit: "%{count} 日間の上限"

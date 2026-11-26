@@ -135,6 +135,21 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
 /// Stdout and stderr are drained concurrently on reader threads so a verbose
 /// child cannot deadlock on full pipe buffers while waiting for exit.
 pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    output_with_timeout_or_abort(command, timeout, &[])
+}
+
+/// Like [`output_with_timeout`], but terminates the child early with
+/// [`io::ErrorKind::PermissionDenied`] if any substring in `abort_on_stderr`
+/// appears on stderr (used to stop non-interactive probes that fall back to an
+/// interactive login prompt).
+pub(crate) fn output_with_timeout_or_abort(
+    command: &mut Command,
+    timeout: Duration,
+    abort_on_stderr: &[&'static str],
+) -> io::Result<Output> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -144,6 +159,7 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
 
     let mut child = spawn(command)?;
     let mut job = ChildJobGuard::adopt(&child);
+    let aborted = Arc::new(AtomicBool::new(false));
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -157,9 +173,11 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
             return Err(error);
         }
     };
+    let stderr_aborted = Arc::clone(&aborted);
+    let stderr_needles: Vec<&'static str> = abort_on_stderr.to_vec();
     let stderr_reader = match std::thread::Builder::new()
         .name("waku-cmd-stderr".into())
-        .spawn(move || read_pipe_to_end(stderr_pipe))
+        .spawn(move || read_pipe_with_abort(stderr_pipe, &stderr_needles, &stderr_aborted))
     {
         Ok(handle) => handle,
         Err(error) => {
@@ -169,12 +187,18 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
         }
     };
 
-    let status = wait_for_child_with_job(&mut child, timeout, &mut job)?;
+    let status = wait_for_child_with_job(&mut child, timeout, &mut job, Some(&aborted))?;
     // Tear down any stray descendants in the Windows job after the direct
     // child has exited so pipe readers cannot hang indefinitely.
     job.terminate();
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    if aborted.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "child process requested interactive authentication",
+        ));
+    }
     Ok(Output {
         status,
         stdout,
@@ -186,6 +210,38 @@ fn read_pipe_to_end<R: io::Read>(pipe: Option<R>) -> Vec<u8> {
     let mut buffer = Vec::new();
     if let Some(mut pipe) = pipe {
         let _ = io::Read::read_to_end(&mut pipe, &mut buffer);
+    }
+    buffer
+}
+
+fn read_pipe_with_abort<R: io::Read>(
+    pipe: Option<R>,
+    needles: &[&'static str],
+    aborted: &std::sync::atomic::AtomicBool,
+) -> Vec<u8> {
+    if needles.is_empty() {
+        return read_pipe_to_end(pipe);
+    }
+    let mut buffer = Vec::new();
+    let Some(mut pipe) = pipe else {
+        return buffer;
+    };
+    let mut chunk = [0u8; 4096];
+    let mut matched = false;
+    loop {
+        match io::Read::read(&mut pipe, &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                if !matched {
+                    let text = String::from_utf8_lossy(&buffer);
+                    if needles.iter().any(|needle| text.contains(needle)) {
+                        matched = true;
+                        aborted.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
     }
     buffer
 }
@@ -1085,16 +1141,24 @@ fn os_string_from_bytes(bytes: &[u8]) -> Option<OsString> {
 
 fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
     let mut job = ChildJobGuard::adopt(child);
-    wait_for_child_with_job(child, timeout, &mut job)
+    wait_for_child_with_job(child, timeout, &mut job, None)
 }
 
 fn wait_for_child_with_job(
     child: &mut Child,
     timeout: Duration,
     job: &mut ChildJobGuard,
+    aborted: Option<&std::sync::atomic::AtomicBool>,
 ) -> io::Result<ExitStatus> {
     let started_at = Instant::now();
     loop {
+        if aborted.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_child_with_job(child, job);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "child process requested interactive authentication",
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if started_at.elapsed() < timeout => {
@@ -1936,5 +2000,41 @@ mod tests {
         assert_eq!(applied, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_with_timeout_or_abort_terminates_on_auth_prompt_stderr() {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut command = plain_command("cmd.exe");
+            command.args([
+                "/C",
+                "echo Authentication required. Please visit the URL to log in: 1>&2 && ping -n 10 127.0.0.1 > NUL",
+            ]);
+            command
+        };
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut command = plain_command("/bin/sh");
+            command.args([
+                "-c",
+                "echo 'Authentication required. Please visit the URL to log in:' >&2; sleep 10",
+            ]);
+            command
+        };
+
+        let started = Instant::now();
+        let error = output_with_timeout_or_abort(
+            &mut cmd,
+            Duration::from_secs(10),
+            &["Authentication required."],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "should abort promptly instead of waiting full timeout: {:?}",
+            started.elapsed()
+        );
     }
 }

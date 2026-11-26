@@ -23,6 +23,7 @@ import {
   PLAN_USAGE_PROVIDERS,
   PlanUsageLanes,
   UsageSkeleton as PlanUsageSkeleton,
+  isManualOnlyPlanUsage,
 } from '@/components/plan-usage'
 import { UsageTrendChart, type UsageMetric } from '@/components/usage-chart'
 import { ProviderIcon, providerMeta, WakuIcon } from '@/components/waku-icon'
@@ -233,7 +234,8 @@ function PlanUsageSection() {
           target.accountId,
         ),
       enabled:
-        phase === 'connected'
+        !isManualOnlyPlanUsage(target.provider)
+        && phase === 'connected'
         && Boolean(client && config && settings.data && target.installed),
       staleTime: 30_000,
     })),
@@ -243,20 +245,31 @@ function PlanUsageSection() {
     .map((target, index) => ({
       target,
       query: queries[index]!,
+      manualOnly: isManualOnlyPlanUsage(target.provider),
     }))
-    .filter(({ query }) => query.isPending || Boolean(query.error) || Boolean(query.data))
+    .filter(({ query, manualOnly }) =>
+      manualOnly || query.isPending || Boolean(query.error) || Boolean(query.data),
+    )
 
   if (!cards.length) return null
 
   return (
     <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-      {cards.map(({ target, query }) => (
+      {cards.map(({ target, query, manualOnly }) => (
         <PlanUsageCard
           key={target.key}
           locale={locale}
+          manualOnly={manualOnly}
           plan={query.data ?? null}
           error={query.error}
-          pending={query.isPending}
+          pending={manualOnly ? query.isFetching : query.isPending}
+          onRefresh={
+            manualOnly && phase === 'connected' && client && config && settings.data && target.installed
+              ? () => {
+                  void query.refetch()
+                }
+              : undefined
+          }
           target={target}
         />
       ))}
@@ -270,12 +283,16 @@ function PlanUsageCard({
   pending,
   error,
   locale,
+  manualOnly,
+  onRefresh,
 }: {
   target: PlanUsageTarget
   plan: PlanUsage | null
   pending: boolean
   error: unknown
   locale: AppLocale
+  manualOnly: boolean
+  onRefresh?: () => void
 }) {
   const { t } = useI18n()
   const meta = providerMeta(target.provider)
@@ -297,6 +314,17 @@ function PlanUsageCard({
           <span className="shrink-0 truncate text-[11px] text-[var(--text-tertiary)]">
             {plan.planLabel}
           </span>
+        )}
+        {manualOnly && onRefresh && (
+          <button
+            aria-label={t('usage.check_manually')}
+            className="grid size-5 shrink-0 place-items-center rounded text-[var(--text-tertiary)] outline-none hover:bg-accent hover:text-[var(--text-secondary)] focus-visible:ring-1 focus-visible:ring-ring"
+            title={t('usage.check_manually')}
+            type="button"
+            onClick={onRefresh}
+          >
+            <WakuIcon className={cn('size-2.5', pending && 'motion-safe:animate-spin')} name={pending ? 'loaderCircle' : 'rotateCw'} />
+          </button>
         )}
         {usageUrl && (
           <a
@@ -332,6 +360,22 @@ function PlanUsageCard({
             {t('usage.no_activity_window')}
           </div>
         )
+      ) : manualOnly ? (
+        <div className="flex flex-col items-start gap-2">
+          <div className="text-[11px] text-[var(--text-secondary)]">
+            {t('usage.manual_probe_hint')}
+          </div>
+          {onRefresh && (
+            <button
+              className="inline-flex h-6 items-center gap-1.5 rounded-[6px] border px-2.5 text-[11px] text-[var(--text)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+              type="button"
+              onClick={onRefresh}
+            >
+              <WakuIcon className="size-2.5 text-[var(--text-secondary)]" name="rotateCw" />
+              <span>{t('usage.check_manually')}</span>
+            </button>
+          )}
+        </div>
       ) : null}
     </div>
   )

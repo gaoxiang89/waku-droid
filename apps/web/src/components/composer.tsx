@@ -36,6 +36,7 @@ import {
   PlanUsageLanes,
   UsageLane,
   UsageSkeleton,
+  isManualOnlyPlanUsage,
 } from '@/components/plan-usage'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
@@ -2098,6 +2099,7 @@ function UsageMeter({
     ? context.tokens * 100 / context.window
     : null
   const supportsPlanUsage = PLAN_USAGE_PROVIDERS.includes(session.provider)
+  const manualOnly = isManualOnlyPlanUsage(session.provider)
   const accountId = validatedAccountId(settings.data, session.provider, session.account_id)
   const accountLabel = resolveProviderAccount(
     settings.data,
@@ -2113,9 +2115,14 @@ function UsageMeter({
       providerVersion,
       accountId,
     ),
-    enabled: open && Boolean(client && config && settings.data && supportsPlanUsage),
+    enabled: !manualOnly && open && Boolean(client && config && settings.data && supportsPlanUsage),
     staleTime: 30_000,
   })
+  const canManualFetch = manualOnly && Boolean(client && config && settings.data && supportsPlanUsage)
+  const triggerManualRefresh = () => {
+    if (!canManualFetch) return
+    void plan.refetch()
+  }
 
   useEffect(() => {
     if (!openSignal) return
@@ -2125,14 +2132,18 @@ function UsageMeter({
 
   useEffect(() => {
     if (!forceOpenSignal) return
-    if (session.provider === 'codex' && config?.address) {
+    if (manualOnly) {
+      if (client && config && settings.data && supportsPlanUsage) {
+        void plan.refetch()
+      }
+    } else if (session.provider === 'codex' && config?.address) {
       void queryClient.invalidateQueries({
         queryKey: daemonKeys.planUsage(config.address, session.provider, accountId),
         exact: true,
       })
     }
     setOpen(true)
-  }, [accountId, config?.address, forceOpenSignal, queryClient, session.provider])
+  }, [accountId, client, config, forceOpenSignal, manualOnly, plan.refetch, queryClient, session.provider, settings.data, supportsPlanUsage])
 
   const error = plan.error ? errorMessage(plan.error) : null
   const tooltip = error
@@ -2175,21 +2186,61 @@ function UsageMeter({
                 ? `${formatTokens(context.tokens)} / ${formatTokens(context.window)} (${contextPercent.toFixed(0)}%)`
                 : formatTokens(context?.tokens ?? 0)}
             />
-            {(plan.data || plan.isFetching || error) && <div className="h-px bg-border" />}
+            {(plan.data || plan.isFetching || error || manualOnly) && <div className="h-px bg-border" />}
             {plan.data && (
-              <PlanUsageLanes
-                accountLabel={accountLabel}
-                locale={locale}
-                plan={plan.data}
-                provider={session.provider}
-                t={t}
-              />
+              <>
+                <PlanUsageLanes
+                  accountLabel={accountLabel}
+                  locale={locale}
+                  plan={plan.data}
+                  provider={session.provider}
+                  t={t}
+                />
+                {canManualFetch && (
+                  <button
+                    className="inline-flex h-6 self-start items-center gap-1.5 rounded-[6px] border px-2.5 text-[11px] text-[var(--text)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+                    type="button"
+                    onClick={triggerManualRefresh}
+                  >
+                    <WakuIcon className={cn('size-2.5 text-[var(--text-secondary)]', plan.isFetching && 'motion-safe:animate-spin')} name={plan.isFetching ? 'loaderCircle' : 'rotateCw'} />
+                    <span>{t('usage.check_manually')}</span>
+                  </button>
+                )}
+              </>
             )}
-            {plan.isFetching && supportsPlanUsage && <UsageSkeleton t={t} />}
-            {error && (
-              <div className="space-y-1 text-[11px]">
+            {plan.isFetching && !plan.data && supportsPlanUsage && <UsageSkeleton t={t} />}
+            {error && !plan.data && (
+              <div className="space-y-1.5 text-[11px]">
                 <div className="text-[var(--text-tertiary)]">{t('usage.plan_limits')}</div>
                 <div className="break-words text-[var(--text-secondary)]">{t('usage.unavailable', { error })}</div>
+                {canManualFetch && (
+                  <button
+                    className="inline-flex h-6 items-center gap-1.5 rounded-[6px] border px-2.5 text-[11px] text-[var(--text)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+                    type="button"
+                    onClick={triggerManualRefresh}
+                  >
+                    <WakuIcon className="size-2.5 text-[var(--text-secondary)]" name="rotateCw" />
+                    <span>{t('usage.check_manually')}</span>
+                  </button>
+                )}
+              </div>
+            )}
+            {manualOnly && !plan.data && !plan.isFetching && !error && (
+              <div className="space-y-2 text-[11px]">
+                <div className="text-[var(--text-tertiary)]">
+                  {accountLabel ? `${t('usage.plan_limits')} · ${accountLabel}` : t('usage.plan_limits')}
+                </div>
+                <div className="text-[var(--text-secondary)]">{t('usage.manual_probe_hint')}</div>
+                {canManualFetch && (
+                  <button
+                    className="inline-flex h-6 items-center gap-1.5 rounded-[6px] border px-2.5 text-[11px] text-[var(--text)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+                    type="button"
+                    onClick={triggerManualRefresh}
+                  >
+                    <WakuIcon className="size-2.5 text-[var(--text-secondary)]" name="rotateCw" />
+                    <span>{t('usage.check_manually')}</span>
+                  </button>
+                )}
               </div>
             )}
           </Popover.Popup>

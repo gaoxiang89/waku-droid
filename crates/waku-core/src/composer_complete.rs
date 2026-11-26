@@ -385,8 +385,9 @@ fn assemble_slash_commands_with_home(
             }
         }
         // Antigravity reads `.gemini/skills` first, then the shared skill
-        // trees. Its user-level skills live under the CLI profile (or custom
-        // account config dir when isolated).
+        // trees. Its user-level, builtin, and plugin skills live under the CLI
+        // profile (or custom account config dir when isolated) and are scanned
+        // directly from disk so composer completion never invokes `agy -p`.
         ProviderKind::Antigravity => {
             scan_skill_files(
                 provider,
@@ -401,11 +402,28 @@ fn assemble_slash_commands_with_home(
                     scan_skill_files(provider, &nested, &mut commands);
                 }
                 scan_skill_files(provider, &data_root.join("skills"), &mut commands);
+                scan_skill_files(provider, &data_root.join("builtin/skills"), &mut commands);
+                scan_antigravity_plugin_skills(
+                    provider,
+                    &data_root.join("config/plugins"),
+                    &mut commands,
+                );
             } else if let Some(home) = home.as_deref() {
+                scan_skill_files(provider, &home.join(".gemini/skills"), &mut commands);
                 scan_skill_files(provider, &home.join(".gemini/config/skills"), &mut commands);
                 scan_skill_files(
                     provider,
                     &home.join(".gemini/antigravity-cli/skills"),
+                    &mut commands,
+                );
+                scan_skill_files(
+                    provider,
+                    &home.join(".gemini/antigravity-cli/builtin/skills"),
+                    &mut commands,
+                );
+                scan_antigravity_plugin_skills(
+                    provider,
+                    &home.join(".gemini/config/plugins"),
                     &mut commands,
                 );
             }
@@ -625,6 +643,34 @@ fn antigravity_account_data_root(config_dir: &Path) -> PathBuf {
         return parent.to_path_buf();
     }
     config_dir.to_path_buf()
+}
+
+/// Scan `<plugins_root>/<plugin>/skills` for Antigravity plugin-provided skills
+/// without invoking `agy -p "/skills"`.
+fn scan_antigravity_plugin_skills(
+    provider: ProviderKind,
+    plugins_root: &Path,
+    commands: &mut Vec<SlashCommand>,
+) {
+    let Ok(entries) = std::fs::read_dir(plugins_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if commands.len() >= COMMAND_SCAN_CAP {
+            return;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        scan_skill_files(provider, &path.join("skills"), commands);
+    }
 }
 
 /// Collect skills — one directory per skill with a `SKILL.md` — as provider
@@ -1829,6 +1875,26 @@ mod tests {
         )
         .unwrap();
 
+        std::fs::create_dir_all(account_dir.join("builtin/skills/builtin-guide")).unwrap();
+        std::fs::create_dir_all(account_dir.join("builtin/skills/hidden-monitor")).unwrap();
+        std::fs::create_dir_all(account_dir.join("config/plugins/my-plugin/skills/plug-skill"))
+            .unwrap();
+        std::fs::write(
+            account_dir.join("builtin/skills/builtin-guide/SKILL.md"),
+            "---\nname: antigravity-guide\ndescription: Builtin guide\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            account_dir.join("builtin/skills/hidden-monitor/SKILL.md"),
+            "---\nname: swarm_monitor\ndescription: Hidden\ndisable-slash-command: true\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            account_dir.join("config/plugins/my-plugin/skills/plug-skill/SKILL.md"),
+            "---\nname: plug-skill\ndescription: Plugin skill\n---\nBody",
+        )
+        .unwrap();
+
         for cfg_dir in [&account_dir, &sidecar_dir] {
             let commands = assemble_slash_commands(
                 ProviderKind::Antigravity,
@@ -1841,6 +1907,8 @@ mod tests {
                 "proj-agent-skill",
                 "work-skill",
                 "work-config-skill",
+                "antigravity-guide",
+                "plug-skill",
             ] {
                 assert!(
                     commands
@@ -1853,6 +1921,10 @@ mod tests {
             assert!(
                 !commands.iter().any(|command| command.name == "hidden-skill"),
                 "disable-slash-command: true must omit skill from slash autocomplete"
+            );
+            assert!(
+                !commands.iter().any(|command| command.name == "swarm_monitor"),
+                "disable-slash-command builtin skill must stay hidden"
             );
         }
 

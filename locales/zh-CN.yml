@@ -1277,6 +1277,8 @@ usage.plan_limits: 套餐用量限额
 usage.plan_limits_named: 套餐用量限额 · %{plan}
 usage.open_account_settings: 打开账户用量设置
 usage.unavailable: 不可用 — %{error}
+usage.check_manually: 查询额度
+usage.manual_probe_hint: 按需手动查询，不自动在后台调用 CLI。
 usage.usage_limit: 用量限额
 usage.hour_limit: "%{count} 小时限额"
 usage.day_limit: "%{count} 天限额"

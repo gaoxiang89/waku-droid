@@ -12,6 +12,10 @@ export const PLAN_USAGE_PROVIDERS: AgentSession['provider'][] = [
   'antigravity',
 ]
 
+export function isManualOnlyPlanUsage(provider: AgentSession['provider']): boolean {
+  return provider === 'antigravity'
+}
+
 export function PlanUsageLanes({
   plan,
   provider,

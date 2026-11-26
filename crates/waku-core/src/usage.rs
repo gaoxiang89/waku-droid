@@ -564,6 +564,12 @@ fn parse_grok_billing(billing: &Value) -> anyhow::Result<PlanUsage> {
 
 const ANTIGRAVITY_USAGE_TIMEOUT: Duration = Duration::from_secs(15);
 const ANTIGRAVITY_CREDITS_TIMEOUT: Duration = Duration::from_secs(6);
+const ANTIGRAVITY_OAUTH_TOKEN_FILE: &str = "antigravity-oauth-token";
+const ANTIGRAVITY_INTERACTIVE_AUTH_MARKERS: &[&str] = &[
+    "Authentication required.",
+    "Please visit the URL to log in",
+    "Waiting for authentication",
+];
 
 /// Fetch Antigravity's plan usage via zero-quota print mode
 /// (`agy -p "/usage" --output-format json`, plus best-effort `"/credits"`).
@@ -580,34 +586,248 @@ pub fn fetch_antigravity_plan_usage_in(
     binary: &Path,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<PlanUsage> {
+    let mut uses_adc = env_var_is_true("AGY_ADC_AUTH");
     if let Some(dir) = config_dir {
         let env = crate::command_env::antigravity_account_env(dir);
         let uses_api_key = env
             .iter()
             .any(|(key, val)| key == "GEMINI_API_KEY" && !val.trim().is_empty());
-        let uses_adc = env
+        let account_uses_adc = env
             .iter()
             .any(|(key, val)| key == "AGY_ADC_AUTH" && val.trim().eq_ignore_ascii_case("true"));
         // Root `agy -p "/usage"` has no `--gemini-dir` flag and falls back to
         // the default OS keyring OAuth account when only `GEMINI_API_KEY` is set.
-        if uses_api_key && !uses_adc {
+        if uses_api_key && !account_uses_adc {
             return Err(anyhow!(
                 "Antigravity plan quota is unavailable for GEMINI_API_KEY profiles (usage probes only support OAuth accounts)."
             ));
         }
+        uses_adc |= account_uses_adc;
     }
-    let usage =
-        run_antigravity_print_command(binary, "/usage", ANTIGRAVITY_USAGE_TIMEOUT, config_dir)?;
-    let credits =
-        run_antigravity_print_command(binary, "/credits", ANTIGRAVITY_CREDITS_TIMEOUT, config_dir)
-            .ok();
+    let force_file_storage = antigravity_forces_file_token_storage();
+    // `agy -p "/usage"` automatically launches interactive browser OAuth when
+    // silent auth fails. Pre-check stored credentials so background usage
+    // probes never pop open a browser window on unauthenticated machines.
+    ensure_antigravity_auth_available(uses_adc, force_file_storage)?;
+    let usage = run_antigravity_print_command(
+        binary,
+        "/usage",
+        ANTIGRAVITY_USAGE_TIMEOUT,
+        config_dir,
+        force_file_storage,
+    )?;
+    let credits = run_antigravity_print_command(
+        binary,
+        "/credits",
+        ANTIGRAVITY_CREDITS_TIMEOUT,
+        config_dir,
+        force_file_storage,
+    )
+    .ok();
     parse_antigravity_plan_usage(&usage, credits.as_ref())
 }
 
+fn env_var_non_empty(name: &str) -> bool {
+    crate::command_env::env_var_os(name)
+        .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+}
+
+fn env_var_is_true(name: &str) -> bool {
+    crate::command_env::env_var_os(name)
+        .is_some_and(|value| value.to_string_lossy().trim().eq_ignore_ascii_case("true"))
+}
+
+fn env_var_enables_flag(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let trimmed = value.to_string_lossy();
+    let trimmed = trimmed.trim();
+    !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+}
+
+fn antigravity_forces_file_token_storage() -> bool {
+    let force_file_env = crate::command_env::env_var_os("AGY_CLI_FORCE_FILE_TOKEN_STORAGE");
+    let has_ssh = env_var_non_empty("SSH_CONNECTION")
+        || env_var_non_empty("SSH_CLIENT")
+        || env_var_non_empty("SSH_TTY");
+    #[cfg(target_os = "linux")]
+    let linux_without_keyring = is_wsl_environment() || !env_var_non_empty("DBUS_SESSION_BUS_ADDRESS");
+    #[cfg(not(target_os = "linux"))]
+    let linux_without_keyring = false;
+    antigravity_forces_file_token_storage_from(
+        force_file_env.as_deref(),
+        has_ssh,
+        linux_without_keyring,
+    )
+}
+
+fn antigravity_forces_file_token_storage_from(
+    force_file_env: Option<&std::ffi::OsStr>,
+    has_ssh: bool,
+    linux_without_keyring: bool,
+) -> bool {
+    env_var_enables_flag(force_file_env) || has_ssh || linux_without_keyring
+}
+
+#[cfg(target_os = "linux")]
+fn is_wsl_environment() -> bool {
+    if env_var_non_empty("WSL_DISTRO_NAME") || env_var_non_empty("WSL_INTEROP") {
+        return true;
+    }
+    std::fs::read_to_string("/proc/version")
+        .map(|version| version.to_ascii_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+fn antigravity_oauth_token_path() -> Option<PathBuf> {
+    if let Some(app_data) = crate::command_env::env_var_os("ANTIGRAVITY_APP_DATA_DIR") {
+        let trimmed = app_data.to_string_lossy().trim().to_owned();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join(ANTIGRAVITY_OAUTH_TOKEN_FILE));
+        }
+    }
+    Some(
+        dirs::home_dir()?
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join(ANTIGRAVITY_OAUTH_TOKEN_FILE),
+    )
+}
+
+fn is_valid_antigravity_token_file(path: &Path) -> bool {
+    const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_TOKEN_FILE_BYTES {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if let Some(token) = object.get("token") {
+        if let Some(token_obj) = token.as_object() {
+            return !token_obj.is_empty();
+        }
+        if let Some(token_str) = token.as_str() {
+            return !token_str.trim().is_empty();
+        }
+    }
+    ["refresh_token", "access_token"].iter().any(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|val| !val.trim().is_empty())
+    })
+}
+
+fn has_antigravity_file_token() -> bool {
+    antigravity_oauth_token_path()
+        .as_deref()
+        .is_some_and(is_valid_antigravity_token_file)
+}
+
+/// Non-interactive existence check for Antigravity's OS keyring item
+/// (`service = "gemini"`, `user = "antigravity"`, Windows target
+/// `"gemini:antigravity"`). Never reads or logs the secret payload and never
+/// triggers an interactive Keychain / browser prompt.
+fn has_antigravity_keyring_token() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+        };
+
+        let target: Vec<u16> = std::ffi::OsStr::new("gemini:antigravity")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
+        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
+        if ok != 0 {
+            if !cred.is_null() {
+                unsafe { CredFree(cred.cast()) };
+            }
+            return true;
+        }
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Omit `-w` so `security` only checks metadata existence and never
+        // prompts to unlock or authorize access to the password blob.
+        let check = |args: &[&str]| {
+            Command::new("/usr/bin/security")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        check(&["find-generic-password", "-s", "gemini", "-a", "antigravity"])
+            || check(&["find-generic-password", "-s", "gemini:antigravity"])
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        // On non-WSL Linux desktops with D-Bus Secret Service, avoid probing
+        // the keyring directly since some desktop keyrings prompt to unlock.
+        true
+    }
+}
+
+fn ensure_antigravity_auth_available(
+    uses_adc: bool,
+    force_file_storage: bool,
+) -> anyhow::Result<()> {
+    ensure_antigravity_auth_available_with(
+        uses_adc,
+        force_file_storage,
+        has_antigravity_file_token,
+        has_antigravity_keyring_token,
+    )
+}
+
+fn ensure_antigravity_auth_available_with(
+    uses_adc: bool,
+    force_file_storage: bool,
+    has_file_token: impl FnOnce() -> bool,
+    has_keyring_token: impl FnOnce() -> bool,
+) -> anyhow::Result<()> {
+    if uses_adc {
+        return Ok(());
+    }
+    if has_file_token() {
+        return Ok(());
+    }
+    if !force_file_storage && has_keyring_token() {
+        return Ok(());
+    }
+    Err(anyhow!(tr!("usage_error.antigravity_no_usage_data")))
+}
+
+#[cfg(test)]
 fn antigravity_print_command(
     binary: &Path,
     prompt: &str,
     config_dir: Option<&Path>,
+) -> std::process::Command {
+    antigravity_print_command_with_storage(binary, prompt, config_dir, false)
+}
+
+fn antigravity_print_command_with_storage(
+    binary: &Path,
+    prompt: &str,
+    config_dir: Option<&Path>,
+    force_file_storage: bool,
 ) -> std::process::Command {
     let mut command = crate::command_env::command(binary);
     crate::command_env::apply_provider_config_dir(
@@ -615,6 +835,13 @@ fn antigravity_print_command(
         crate::model::ProviderKind::Antigravity,
         config_dir,
     );
+    // When `agy` is already using file-based token storage, setting
+    // `SSH_CONNECTION` does not change credential lookup, yet tells `agy`'s
+    // OAuth helper to skip launching a desktop browser if a stored token turns
+    // out to be revoked/invalid.
+    if force_file_storage && !env_var_non_empty("SSH_CONNECTION") {
+        command.env("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 22");
+    }
     if let Some(settings_path) = crate::command_env::antigravity_settings_arg(config_dir) {
         command.arg("--settings").arg(settings_path);
     }
@@ -630,14 +857,21 @@ fn run_antigravity_print_command(
     prompt: &str,
     timeout: Duration,
     config_dir: Option<&Path>,
+    force_file_storage: bool,
 ) -> anyhow::Result<Value> {
-    let mut command = antigravity_print_command(binary, prompt, config_dir);
-    let output = crate::command_env::output_with_timeout(&mut command, timeout).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::TimedOut {
-            anyhow!(tr!("usage_error.antigravity_usage_timeout"))
-        } else {
-            anyhow::Error::new(error).context(tr!("usage_error.start_antigravity_probe"))
+    let mut command =
+        antigravity_print_command_with_storage(binary, prompt, config_dir, force_file_storage);
+    let output = crate::command_env::output_with_timeout_or_abort(
+        &mut command,
+        timeout,
+        ANTIGRAVITY_INTERACTIVE_AUTH_MARKERS,
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            anyhow!(tr!("usage_error.antigravity_no_usage_data"))
         }
+        std::io::ErrorKind::TimedOut => anyhow!(tr!("usage_error.antigravity_usage_timeout")),
+        _ => anyhow::Error::new(error).context(tr!("usage_error.start_antigravity_probe")),
     })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) {
@@ -653,6 +887,12 @@ fn run_antigravity_print_command(
     }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if ANTIGRAVITY_INTERACTIVE_AUTH_MARKERS
+            .iter()
+            .any(|marker| stderr.contains(marker))
+        {
+            return Err(anyhow!(tr!("usage_error.antigravity_no_usage_data")));
+        }
         let detail = stderr
             .lines()
             .rev()
@@ -2211,6 +2451,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_auth_precheck_blocks_missing_credentials_without_spawning_browser() {
+        // Forced file storage must NOT fall back to OS keyring when the file is missing.
+        assert!(
+            ensure_antigravity_auth_available_with(false, true, || false, || true).is_err()
+        );
+        // Forced file storage succeeds when the token file is present.
+        assert!(
+            ensure_antigravity_auth_available_with(false, true, || true, || false).is_ok()
+        );
+        // Non-forced mode accepts either file token or OS keyring token.
+        assert!(
+            ensure_antigravity_auth_available_with(false, false, || false, || true).is_ok()
+        );
+        assert!(
+            ensure_antigravity_auth_available_with(false, false, || true, || false).is_ok()
+        );
+        assert!(
+            ensure_antigravity_auth_available_with(false, false, || false, || false).is_err()
+        );
+        // Vertex ADC mode is non-interactive and bypasses OAuth token lookup.
+        assert!(
+            ensure_antigravity_auth_available_with(true, true, || false, || false).is_ok()
+        );
+
+        assert!(antigravity_forces_file_token_storage_from(
+            Some(std::ffi::OsStr::new("1")),
+            false,
+            false
+        ));
+        assert!(!antigravity_forces_file_token_storage_from(
+            Some(std::ffi::OsStr::new("0")),
+            false,
+            false
+        ));
+        assert!(!antigravity_forces_file_token_storage_from(
+            Some(std::ffi::OsStr::new("false")),
+            false,
+            false
+        ));
+        assert!(antigravity_forces_file_token_storage_from(
+            None, true, false
+        ));
+        assert!(antigravity_forces_file_token_storage_from(
+            None, false, true
+        ));
+    }
+
+    #[test]
+    fn antigravity_token_file_validation_rejects_empty_and_malformed_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-agy-token-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join(ANTIGRAVITY_OAUTH_TOKEN_FILE);
+
+        assert!(!is_valid_antigravity_token_file(&token_path));
+
+        std::fs::write(&token_path, "").unwrap();
+        assert!(!is_valid_antigravity_token_file(&token_path));
+
+        std::fs::write(&token_path, "{}").unwrap();
+        assert!(!is_valid_antigravity_token_file(&token_path));
+
+        std::fs::write(&token_path, r#"{"token":{}}"#).unwrap();
+        assert!(!is_valid_antigravity_token_file(&token_path));
+
+        std::fs::write(
+            &token_path,
+            r#"{"token":{"access_token":"x","refresh_token":"y"},"auth_method":"consumer","id_token_email":"user@example.com"}"#,
+        )
+        .unwrap();
+        assert!(is_valid_antigravity_token_file(&token_path));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_print_command_injects_ssh_connection_only_when_file_storage_forced() {
+        let forced =
+            antigravity_print_command_with_storage(Path::new("agy"), "/usage", None, true);
+        if !env_var_non_empty("SSH_CONNECTION") {
+            assert!(forced.get_envs().any(|(key, value)| {
+                key == "SSH_CONNECTION" && value.is_some()
+            }));
+        }
+
+        let keyring_mode =
+            antigravity_print_command_with_storage(Path::new("agy"), "/usage", None, false);
+        assert!(!keyring_mode.get_envs().any(|(key, value)| {
+            key == "SSH_CONNECTION"
+                && value.and_then(|v| v.to_str()) == Some("127.0.0.1 1 127.0.0.1 22")
+        }));
     }
 
     #[test]

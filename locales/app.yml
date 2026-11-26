@@ -2609,6 +2609,10 @@ usage.open_account_settings:
   en: Open the account's usage settings
 usage.unavailable:
   en: Unavailable — %{error}
+usage.check_manually:
+  en: Check usage
+usage.manual_probe_hint:
+  en: Checked on demand to avoid background CLI probes.
 usage.usage_limit:
   en: Usage limit
 usage.hour_limit:
