@@ -37,7 +37,12 @@ fn main() {
 
     match waku::cli::try_deliver_to_running_desktop(&request) {
         Ok(waku::cli::DeliveryResult::Delivered(_)) => return,
-        Ok(waku::cli::DeliveryResult::NotRunning) => {}
+        Ok(waku::cli::DeliveryResult::NotRunning) => {
+            if waku::cli::is_remote_open_scope() && request.host.is_none() {
+                eprintln!("narel: No Narel desktop app is currently connected to this host.");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("narel: {error}");
             std::process::exit(1);

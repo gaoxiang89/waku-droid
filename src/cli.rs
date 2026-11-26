@@ -234,6 +234,21 @@ pub fn allow_set_foreground_window(pid: Option<u32>) {
 #[cfg(not(target_os = "windows"))]
 pub fn allow_set_foreground_window(_pid: Option<u32>) {}
 
+pub fn is_remote_open_scope() -> bool {
+    std::env::var(waku_client::OPEN_SCOPE_ENV)
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(waku_client::OPEN_SCOPE_REMOTE))
+}
+
+fn remote_bridge_state_path() -> Option<PathBuf> {
+    let server_subdir = if cfg!(debug_assertions) {
+        ".cache/narel-dev/server"
+    } else {
+        ".cache/narel/server"
+    };
+    Some(dirs::home_dir()?.join(server_subdir).join("daemon.json"))
+}
+
 /// Attempt to deliver `request` to a running Waku desktop via its daemon.
 ///
 /// - Returns `Ok(DeliveryResult::Delivered(_))` when a live desktop received it.
@@ -245,10 +260,13 @@ pub fn allow_set_foreground_window(_pid: Option<u32>) {}
 pub fn try_deliver_to_running_desktop(
     request: &StartupOpenRequest,
 ) -> anyhow::Result<DeliveryResult> {
+    let remote_scope = is_remote_open_scope() && request.host.is_none();
     // AllowSetForegroundWindow must run *before* sending the RPC so the
     // desktop's immediate SetForegroundWindow upon daemon broadcast is not
     // blocked by Windows' foreground lock.
-    allow_set_foreground_window(None);
+    if !remote_scope {
+        allow_set_foreground_window(None);
+    }
 
     let env_address = std::env::var(waku_client::DAEMON_ADDRESS_ENV)
         .ok()
@@ -259,11 +277,16 @@ pub fn try_deliver_to_running_desktop(
 
     let outcome = match (env_address, env_token) {
         (Some(address), Some(token)) => {
+            let client_kind = if remote_scope {
+                waku_client::ClientKind::RemoteCli
+            } else {
+                waku_client::ClientKind::Cli
+            };
             let client = match waku_client::DaemonClient::connect_with_identity(
                 address.trim(),
                 token,
                 Vec::new(),
-                waku_client::ClientKind::Cli,
+                client_kind,
                 None,
             ) {
                 Ok(client) => client,
@@ -272,6 +295,42 @@ pub fn try_deliver_to_running_desktop(
             let result = client.open_workspace(request.path.clone(), request.host.clone());
             client.disconnect();
             result
+        }
+        _ if remote_scope => {
+            let resident_state = waku_client::resident_daemon_state_path();
+            if let Some(bridge_state) = remote_bridge_state_path() {
+                let first = waku_client::request_open_workspace_as(
+                    &bridge_state,
+                    request.path.clone(),
+                    request.host.clone(),
+                    waku_client::ClientKind::RemoteCli,
+                );
+                if bridge_state != resident_state
+                    && matches!(
+                        &first,
+                        Err(error)
+                            if error
+                                .downcast_ref::<waku_client::DaemonUnavailableError>()
+                                .is_some()
+                    )
+                {
+                    waku_client::request_open_workspace_as(
+                        &resident_state,
+                        request.path.clone(),
+                        request.host.clone(),
+                        waku_client::ClientKind::RemoteCli,
+                    )
+                } else {
+                    first
+                }
+            } else {
+                waku_client::request_open_workspace_as(
+                    &resident_state,
+                    request.path.clone(),
+                    request.host.clone(),
+                    waku_client::ClientKind::RemoteCli,
+                )
+            }
         }
         _ => waku_client::request_open_workspace(
             &waku_client::resident_daemon_state_path(),
@@ -282,7 +341,7 @@ pub fn try_deliver_to_running_desktop(
 
     match outcome {
         Ok(outcome) if outcome.delivered => {
-            if outcome.desktop_pid.is_some() {
+            if !remote_scope && outcome.desktop_pid.is_some() {
                 allow_set_foreground_window(outcome.desktop_pid);
             }
             Ok(DeliveryResult::Delivered(outcome))

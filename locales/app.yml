@@ -2817,6 +2817,10 @@ notifications.input:
 
 terminal.end_session:
   en: End terminal session
+terminal.restart_session:
+  en: Restart terminal session
+terminal.restart_hint:
+  en: Press Enter to restart terminal
 terminal.restore_sessions:
   en: Restore workspace terminals
 terminal.reconnecting:

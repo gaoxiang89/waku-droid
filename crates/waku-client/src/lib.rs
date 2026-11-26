@@ -18,7 +18,7 @@ mod workspace_client;
 
 pub use client::{
     DaemonClient, DaemonRpcError, DaemonUnavailableError, OpenWorkspaceOutcome,
-    OpenWorkspaceRequest, request_open_workspace,
+    OpenWorkspaceRequest, request_open_workspace, request_open_workspace_as,
 };
 pub use process::{
     DEFAULT_EXPOSED_DAEMON_PORT, DaemonExposureSettings, DaemonIdentity, DaemonProcess,

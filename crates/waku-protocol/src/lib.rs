@@ -55,9 +55,10 @@ mod protocol;
 pub use driver_wire::{decode_enum, encode_enum, event_from_wire, event_to_wire};
 pub use protocol::{
     APP_EXECUTABLE_ENV, ClientKind, ClientMessage, Command, DAEMON_ADDRESS_ENV, DAEMON_TOKEN_ENV,
-    DaemonReady, MAX_WIRE_MESSAGE_BYTES, PROTOCOL_VERSION, ReplayCursor, Request, ResponseOutcome,
-    ResponsePayload, RpcError, SequencedEvent, ServerMessage, TerminalInfo, TerminalOutput,
-    WireComputerToolRequest, WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
+    DaemonReady, MAX_WIRE_MESSAGE_BYTES, OPEN_SCOPE_ENV, OPEN_SCOPE_REMOTE, PROTOCOL_VERSION,
+    ReplayCursor, Request, ResponseOutcome, ResponsePayload, RpcError, SequencedEvent,
+    ServerMessage, TerminalInfo, TerminalOutput, WireComputerToolRequest, WireDriverEvent,
+    WireDriverStartOptions, WireSessionOptions,
 };
 pub use settings::{DaemonSettings, ProviderAccount};
 pub use workspace::{WorkspaceOperation, WorkspaceResult};

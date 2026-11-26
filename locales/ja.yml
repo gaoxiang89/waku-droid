@@ -1435,6 +1435,8 @@ notifications.approval: 承認が必要です
 notifications.input: 回答が必要です
 
 terminal.end_session: ターミナルセッションを終了
+terminal.restart_session: ターミナルセッションを再起動
+terminal.restart_hint: Enter キーでターミナルを再起動
 terminal.restore_sessions: ワークスペースのターミナルを復元
 terminal.reconnecting: 接続が切断されました。再接続中
 

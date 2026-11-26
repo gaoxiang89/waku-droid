@@ -249,7 +249,7 @@ fn write_shim_if_changed(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
+fn parse_bridge_args(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(PathBuf, bool, bool)> {
     let mut state_dir = None;
     let mut replace_incompatible = false;
     let mut arguments = arguments.into_iter();
@@ -266,6 +266,7 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
             unknown => bail!("unknown bridge argument {unknown:?}"),
         }
     }
+    let explicit_state_dir = state_dir.is_some();
     let executable = std::env::current_exe().context("could not locate narel-daemon")?;
     let state_dir = match state_dir {
         Some(directory) => directory,
@@ -274,6 +275,43 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow!("narel-daemon has no parent directory"))?
             .to_owned(),
     };
+    Ok((state_dir, explicit_state_dir, replace_incompatible))
+}
+
+fn default_shared_resident_state_path() -> Option<PathBuf> {
+    if cfg!(debug_assertions)
+        || std::env::var_os(waku_core::persistence::DATA_DIRECTORY_ENV)
+            .is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    Some(waku_client::resident_daemon_state_path())
+}
+
+pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
+    let (state_dir, explicit_state_dir, replace_incompatible) = parse_bridge_args(arguments)?;
+    let shared_resident_state = if explicit_state_dir {
+        None
+    } else {
+        default_shared_resident_state_path()
+    };
+    run_parsed(state_dir, replace_incompatible, shared_resident_state)
+}
+
+pub fn run_with_resident_state(
+    arguments: impl IntoIterator<Item = String>,
+    shared_resident_state: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let (state_dir, _explicit_state_dir, replace_incompatible) = parse_bridge_args(arguments)?;
+    run_parsed(state_dir, replace_incompatible, shared_resident_state)
+}
+
+fn run_parsed(
+    state_dir: PathBuf,
+    replace_incompatible: bool,
+    shared_resident_state: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let executable = std::env::current_exe().context("could not locate narel-daemon")?;
     fs::create_dir_all(&state_dir)
         .with_context(|| format!("could not create {}", state_dir.display()))?;
     if let Err(error) = prepare_cli_shim(&state_dir, &executable) {
@@ -283,30 +321,61 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
         .with_context(|| format!("could not fingerprint {}", executable.display()))?;
 
     let (state, stream) = {
-        let _lock = platform::lock(&state_dir.join(LOCK_FILE))?;
-        let reused = match reusable_daemon(&state_dir, &fingerprint, replace_incompatible) {
-            Ok(reused) => reused,
-            Err(error) => {
-                // The desktop cannot speak to that daemon, so describe it here
-                // and let the user decide whether to end its sessions.
-                if let Some(Blocked(daemon)) = error.downcast_ref::<Blocked>() {
-                    let line = serde_json::to_string(&BridgeBlocked {
-                        incompatible_daemon: daemon.clone(),
-                    })?;
-                    let mut stdout = io::stdout().lock();
-                    writeln!(stdout, "{line}")?;
-                    stdout.flush()?;
+        let local_state_path = state_dir.join(STATE_FILE);
+        let _resident_lock = match shared_resident_state.as_ref() {
+            Some(resident_path) if resident_path != &local_state_path => {
+                if let Some(parent) = resident_path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("could not create {}", parent.display()))?;
                 }
-                return Err(error);
+                Some(platform::lock(&resident_path.with_extension("lock"))?)
             }
+            _ => None,
         };
-        match reused {
-            Some(reused) => reused,
-            None => {
-                let state = start_daemon(&executable, &state_dir, &fingerprint)?;
-                let stream = TcpStream::connect(&state.address)
-                    .with_context(|| format!("could not reach narel-daemon at {}", state.address))?;
-                (state, stream)
+        let _lock = platform::lock(&state_dir.join(LOCK_FILE))?;
+        let resident_reused = match shared_resident_state.as_ref() {
+            Some(resident_path) if resident_path != &local_state_path => {
+                match reusable_resident_daemon(resident_path, &state_dir, replace_incompatible) {
+                    Ok(reused) => reused,
+                    Err(error) => {
+                        emit_blocked_if_any(&error)?;
+                        return Err(error);
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(reused) = resident_reused {
+            reused
+        } else {
+            let reused = match reusable_daemon(&state_dir, &fingerprint, replace_incompatible) {
+                Ok(reused) => reused,
+                Err(error) => {
+                    emit_blocked_if_any(&error)?;
+                    return Err(error);
+                }
+            };
+            match reused {
+                Some((state, stream)) => {
+                    if let Some(resident_path) = shared_resident_state.as_ref()
+                        && resident_path != &local_state_path
+                    {
+                        let _ = write_state(resident_path, &state);
+                    }
+                    (state, stream)
+                }
+                None => {
+                    let state = start_daemon(&executable, &state_dir, &fingerprint)?;
+                    if let Some(resident_path) = shared_resident_state.as_ref()
+                        && resident_path != &local_state_path
+                    {
+                        let _ = write_state(resident_path, &state);
+                    }
+                    let stream = TcpStream::connect(&state.address).with_context(|| {
+                        format!("could not reach narel-daemon at {}", state.address)
+                    })?;
+                    (state, stream)
+                }
             }
         }
     };
@@ -321,6 +390,78 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     stdout.flush()?;
     drop(stdout);
     relay(stream)
+}
+
+fn emit_blocked_if_any(error: &anyhow::Error) -> anyhow::Result<()> {
+    // The desktop cannot speak to that daemon, so describe it here
+    // and let the user decide whether to end its sessions.
+    if let Some(Blocked(daemon)) = error.downcast_ref::<Blocked>() {
+        let line = serde_json::to_string(&BridgeBlocked {
+            incompatible_daemon: daemon.clone(),
+        })?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{line}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn loopback_connect_address(address: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let parsed = address.parse::<std::net::SocketAddr>()?;
+    let ip = if parsed.ip().is_unspecified() {
+        if parsed.is_ipv4() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+    } else {
+        parsed.ip()
+    };
+    Ok(std::net::SocketAddr::new(ip, parsed.port()))
+}
+
+fn reusable_resident_daemon(
+    resident_path: &Path,
+    state_dir: &Path,
+    replace_incompatible: bool,
+) -> anyhow::Result<Option<(BridgeState, TcpStream)>> {
+    reusable_resident_daemon_with(
+        resident_path,
+        state_dir,
+        replace_incompatible,
+        waku_client::pid::is_daemon_process,
+    )
+}
+
+fn reusable_resident_daemon_with(
+    resident_path: &Path,
+    state_dir: &Path,
+    replace_incompatible: bool,
+    is_daemon_pid: impl FnOnce(u32) -> bool,
+) -> anyhow::Result<Option<(BridgeState, TcpStream)>> {
+    let Ok(text) = fs::read_to_string(resident_path) else {
+        return Ok(None);
+    };
+    let Ok(state) = serde_json::from_str::<BridgeState>(&text) else {
+        return Ok(None);
+    };
+    if !is_daemon_pid(state.pid) {
+        return Ok(None);
+    }
+    if state.protocol_version != PROTOCOL_VERSION {
+        if !replace_incompatible {
+            return Err(Blocked(describe_daemon(&state)).into());
+        }
+        end_daemon_and_sessions(state.pid);
+        let _ = fs::remove_file(resident_path);
+        let _ = fs::remove_file(state_dir.join(STATE_FILE));
+        return Ok(None);
+    }
+    let address = loopback_connect_address(&state.address)?;
+    let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+        .context("resident daemon is unreachable; leaving its sessions intact")?;
+    let _ = write_state(&state_dir.join(STATE_FILE), &state);
+    Ok(Some((state, stream)))
 }
 
 /// The running daemon from this build, already connected. The probe socket
@@ -500,6 +641,24 @@ fn read_live_state(state_dir: &Path) -> Option<BridgeState> {
     Some(state)
 }
 
+fn installed_app_executable() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(local_app_data).join("Programs/Narel/narel.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let candidate = PathBuf::from("/Applications/Narel.app/Contents/MacOS/Narel");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn start_daemon(
     executable: &Path,
     state_dir: &Path,
@@ -532,6 +691,7 @@ fn start_daemon(
         OsStr::new("127.0.0.1:0"),
         OsStr::new("--state-file"),
         state_path.as_os_str(),
+        OsStr::new("--allow-shutdown"),
         OsStr::new("--idle-exit-secs"),
         OsStr::new(&idle_secs),
     ];
@@ -543,6 +703,14 @@ fn start_daemon(
         OsStr::new(waku_protocol::DAEMON_TOKEN_ENV),
         OsString::from(&token),
     )];
+    if std::env::var_os(waku_protocol::APP_EXECUTABLE_ENV).is_none_or(|value| value.is_empty())
+        && let Some(app_exe) = installed_app_executable()
+    {
+        owned_envs.push((
+            OsStr::new(waku_protocol::APP_EXECUTABLE_ENV),
+            app_exe.into_os_string(),
+        ));
+    }
     // A debug build would otherwise use the checkout path it was compiled
     // in, which on WSL is often the Windows host's own data via /mnt/c.
     if cfg!(debug_assertions)
@@ -996,6 +1164,89 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_args_and_loopback_address_normalize_unspecified_hosts() {
+        let (dir, explicit_state_dir, replace) = parse_bridge_args([
+            "--state-dir".to_string(),
+            "/tmp/waku-bridge".to_string(),
+            "--replace-incompatible".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/waku-bridge"));
+        assert!(explicit_state_dir);
+        assert!(replace);
+
+        let (_default_dir, explicit_default, replace_default) = parse_bridge_args([]).unwrap();
+        assert!(!explicit_default);
+        assert!(!replace_default);
+
+        assert_eq!(
+            loopback_connect_address("0.0.0.0:7700").unwrap(),
+            "127.0.0.1:7700".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            loopback_connect_address("[::]:7700").unwrap(),
+            "[::1]:7700".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            loopback_connect_address("127.0.0.1:7701").unwrap(),
+            "127.0.0.1:7701".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn reusable_resident_daemon_reuses_and_mirrors_state() {
+        let root = std::env::temp_dir()
+            .join(format!("narel-resident-reuse-test-{}", uuid::Uuid::new_v4()));
+        let state_dir = root.join("bridge");
+        let resident_path = root.join("resident-daemon.json");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = BridgeState {
+            pid: std::process::id(),
+            address: format!("0.0.0.0:{port}"),
+            token: "resident-token".to_string(),
+            fingerprint: "test-fp".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_state(&resident_path, &state).unwrap();
+
+        // Real PID check rejects non-daemon processes cleanly.
+        assert!(reusable_resident_daemon(&resident_path, &state_dir, false)
+            .unwrap()
+            .is_none());
+
+        // When the resident PID is verified as a daemon, bridge connects over loopback
+        // and mirrors the state into `state_dir/daemon.json` for CLI lookups.
+        let (reused, _stream) =
+            reusable_resident_daemon_with(&resident_path, &state_dir, false, |_| true)
+                .unwrap()
+                .expect("expected live resident daemon reuse");
+        assert_eq!(reused.token, "resident-token");
+        assert_eq!(reused.address, format!("0.0.0.0:{port}"));
+
+        let mirrored: BridgeState =
+            serde_json::from_str(&fs::read_to_string(state_dir.join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(mirrored.token, state.token);
+        assert_eq!(mirrored.pid, state.pid);
+
+        // Incompatible protocol is rejected cleanly unless `replace_incompatible` is set.
+        let old = BridgeState {
+            protocol_version: PROTOCOL_VERSION + 1,
+            ..state
+        };
+        write_state(&resident_path, &old).unwrap();
+        let err = reusable_resident_daemon_with(&resident_path, &state_dir, false, |_| true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protocol"), "unexpected error: {err}");
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

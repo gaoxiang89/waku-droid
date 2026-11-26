@@ -237,6 +237,7 @@ fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(
             Ok(())
         }
         OpenAction::Open { state_dir, path } => {
+            let explicit_state_dir = state_dir.is_some();
             let state_dir = match state_dir {
                 Some(dir) => dir,
                 None => default_open_state_dir()?,
@@ -244,7 +245,32 @@ fn run_open_cli(arguments: impl IntoIterator<Item = String>) -> anyhow::Result<(
             let state_file = state_dir.join(bridge::STATE_FILE);
             let cwd = std::env::current_dir().ok();
             let resolved_path = path.map(|raw| resolve_open_cli_path(&raw, cwd.as_deref()));
-            match waku_client::request_open_workspace(&state_file, resolved_path, None) {
+            let mut result = waku_client::request_open_workspace_as(
+                &state_file,
+                resolved_path.clone(),
+                None,
+                waku_protocol::ClientKind::RemoteCli,
+            );
+            if !explicit_state_dir
+                && matches!(
+                    &result,
+                    Err(error)
+                        if error
+                            .downcast_ref::<waku_client::DaemonUnavailableError>()
+                            .is_some()
+                )
+            {
+                let fallback_state = waku_client::resident_daemon_state_path();
+                if fallback_state != state_file {
+                    result = waku_client::request_open_workspace_as(
+                        &fallback_state,
+                        resolved_path,
+                        None,
+                        waku_protocol::ClientKind::RemoteCli,
+                    );
+                }
+            }
+            match result {
                 Ok(outcome) if outcome.delivered => Ok(()),
                 Ok(_) => {
                     eprintln!("{NO_DESKTOP_CONNECTED_MESSAGE}");

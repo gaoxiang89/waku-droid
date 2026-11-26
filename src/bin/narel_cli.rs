@@ -35,7 +35,12 @@ fn main() {
 
     match cli::try_deliver_to_running_desktop(&request) {
         Ok(cli::DeliveryResult::Delivered(_)) => return,
-        Ok(cli::DeliveryResult::NotRunning) => {}
+        Ok(cli::DeliveryResult::NotRunning) => {
+            if cli::is_remote_open_scope() && request.host.is_none() {
+                eprintln!("narel: No Narel desktop app is currently connected to this host.");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("narel: {error}");
             std::process::exit(1);

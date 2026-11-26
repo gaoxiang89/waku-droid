@@ -24,6 +24,8 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "WAKU_APP_EXECUTABLE";
+pub const OPEN_SCOPE_ENV: &str = "WAKU_OPEN_SCOPE";
+pub const OPEN_SCOPE_REMOTE: &str = "remote";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -31,9 +33,11 @@ pub enum ClientKind {
     #[default]
     Other,
     Desktop,
+    RemoteDesktop,
     Web,
     Mobile,
     Cli,
+    RemoteCli,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]

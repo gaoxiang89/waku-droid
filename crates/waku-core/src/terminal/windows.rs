@@ -50,6 +50,17 @@ impl DaemonTerminal {
         events: EventSink,
         cli_bin_dir: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
+        Self::open_with_scope(cwd, cols, rows, events, cli_bin_dir, false)
+    }
+
+    pub fn open_with_scope(
+        cwd: &std::path::Path,
+        cols: u16,
+        rows: u16,
+        events: EventSink,
+        cli_bin_dir: Option<&std::path::Path>,
+        remote_scope: bool,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             cwd.is_dir(),
             "terminal working directory does not exist: {}",
@@ -64,6 +75,12 @@ impl DaemonTerminal {
         command.cwd(cwd);
         let mut env_path: Option<std::ffi::OsString> = None;
         for (name, value) in crate::command_env::shell_environment() {
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case(crate::OPEN_SCOPE_ENV)
+            {
+                continue;
+            }
             if name.to_string_lossy().eq_ignore_ascii_case("PATH") {
                 env_path = Some(value);
                 continue;
@@ -76,6 +93,11 @@ impl DaemonTerminal {
             command.env("PATH", merged);
         } else if let Some(path) = env_path {
             command.env("PATH", path);
+        }
+        if remote_scope {
+            command.env(crate::OPEN_SCOPE_ENV, crate::OPEN_SCOPE_REMOTE);
+        } else {
+            command.env_remove(crate::OPEN_SCOPE_ENV);
         }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -107,6 +129,10 @@ impl DaemonTerminal {
         let watcher_input = input;
         let writer_events = output.clone();
         let writer_master = master.clone();
+        let writer_stopped = stopped.clone();
+        let writer_child = terminal.child.clone();
+        let writer_master_err = master.clone();
+        let writer_exit_reported = exit_reported.clone();
         std::thread::Builder::new()
             .name("waku-terminal-input".into())
             .spawn(move || {
@@ -118,10 +144,22 @@ impl DaemonTerminal {
                         None => Ok(()),
                     },
                     |error| {
-                        let _ = writer_events.send_ephemeral(WireDriverEvent::new(
-                            "terminalError",
-                            serde_json::Value::String(error.to_string()),
-                        ));
+                        let stopped_now = writer_stopped.load(Ordering::Acquire);
+                        let child_exited = !stopped_now
+                            && writer_child.lock().try_wait().ok().flatten().is_some();
+                        match classify_input_write_error(stopped_now, &error, child_exited) {
+                            InputWriteErrorAction::Ignore => {}
+                            InputWriteErrorAction::Exit => {
+                                close_master(&writer_master_err);
+                                report_exit(&writer_events, &writer_exit_reported);
+                            }
+                            InputWriteErrorAction::Error => {
+                                let _ = writer_events.send_ephemeral(WireDriverEvent::new(
+                                    "terminalError",
+                                    serde_json::Value::String(error.to_string()),
+                                ));
+                            }
+                        }
                     },
                 );
             })
@@ -216,6 +254,30 @@ impl Drop for DaemonTerminal {
         if let Some(master) = self.master.take() {
             close_master(&master);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputWriteErrorAction {
+    Ignore,
+    Exit,
+    Error,
+}
+
+fn classify_input_write_error(
+    stopped: bool,
+    error: &std::io::Error,
+    child_exited: bool,
+) -> InputWriteErrorAction {
+    if stopped {
+        return InputWriteErrorAction::Ignore;
+    }
+    let pipe_closed = error.kind() == std::io::ErrorKind::BrokenPipe
+        || matches!(error.raw_os_error(), Some(109 | 232));
+    if pipe_closed || child_exited {
+        InputWriteErrorAction::Exit
+    } else {
+        InputWriteErrorAction::Error
     }
 }
 
@@ -343,6 +405,35 @@ mod tests {
         );
         assert_eq!(fatal, Some(std::io::ErrorKind::BrokenPipe));
         assert_eq!(writes, 1);
+    }
+
+    #[test]
+    fn broken_pipe_and_closing_pipe_classify_as_exit() {
+        let broken = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
+        assert_eq!(
+            classify_input_write_error(false, &broken, false),
+            InputWriteErrorAction::Exit
+        );
+
+        let no_data = std::io::Error::from_raw_os_error(232);
+        assert_eq!(
+            classify_input_write_error(false, &no_data, false),
+            InputWriteErrorAction::Exit
+        );
+
+        let other = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            classify_input_write_error(false, &other, false),
+            InputWriteErrorAction::Error
+        );
+        assert_eq!(
+            classify_input_write_error(false, &other, true),
+            InputWriteErrorAction::Exit
+        );
+        assert_eq!(
+            classify_input_write_error(true, &broken, false),
+            InputWriteErrorAction::Ignore
+        );
     }
 
     struct FailWrite<'a> {

@@ -148,6 +148,20 @@ fn connect_desktop_client(
     )
 }
 
+fn connect_remote_desktop_client(
+    address: &str,
+    token: String,
+    resume_from: Vec<ReplayCursor>,
+) -> anyhow::Result<DaemonClient> {
+    DaemonClient::connect_with_identity(
+        address,
+        token,
+        resume_from,
+        ClientKind::RemoteDesktop,
+        None,
+    )
+}
+
 pub struct DaemonProcess {
     client: Mutex<DaemonClient>,
     /// Loopback address and bearer token for re-dialing this daemon after a
@@ -164,13 +178,20 @@ impl DaemonProcess {
         Self::spawn_configured(executable, DaemonExposureSettings::default())
     }
 
-    fn spawn_configured(
+    pub fn spawn_configured(
         executable: &Path,
         settings: DaemonExposureSettings,
     ) -> anyhow::Result<Self> {
+        Self::spawn_configured_at(executable, settings, &resident_daemon_state_path())
+    }
+
+    pub fn spawn_configured_at(
+        executable: &Path,
+        settings: DaemonExposureSettings,
+        state_file: &Path,
+    ) -> anyhow::Result<Self> {
         let settings = settings.validate()?;
         let token = settings.token.clone();
-        let state_file = resident_daemon_state_path();
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -181,15 +202,14 @@ impl DaemonProcess {
             .write(true)
             .open(state_file.with_extension("lock"))?;
         launch_lock.lock().context("lock resident daemon startup")?;
-        if let Ok(bytes) = std::fs::read(&state_file)
+        if let Ok(bytes) = std::fs::read(state_file)
             && let Ok(record) = serde_json::from_slice::<waku_protocol::bridge::BridgeState>(&bytes)
             && crate::pid::is_daemon_process(record.pid)
         {
-            if record.protocol_version != PROTOCOL_VERSION || record.token != token {
-                if record.token == token
-                    && let Ok(address) = desktop_client_address(&record.address)
+            if record.protocol_version != PROTOCOL_VERSION {
+                if let Ok(address) = desktop_client_address(&record.address)
                     && matches!(
-                        crate::client::shutdown_daemon_at(&address, &token),
+                        crate::client::shutdown_daemon_at(&address, &record.token),
                         crate::client::ShutdownProbeOutcome::ShuttingDown
                     )
                 {
@@ -202,7 +222,7 @@ impl DaemonProcess {
                             record.pid
                         );
                     }
-                    let _ = std::fs::remove_file(&state_file);
+                    let _ = std::fs::remove_file(state_file);
                 } else {
                     bail!(
                         "a resident daemon is still running with different protocol or credentials; end its sessions before replacing it"
@@ -210,7 +230,7 @@ impl DaemonProcess {
                 }
             } else if resident_daemon_tainted(record.pid) {
                 if let Ok(address) = desktop_client_address(&record.address)
-                    && let Ok(client) = DaemonClient::connect(&address, token.clone())
+                    && let Ok(client) = DaemonClient::connect(&address, record.token.clone())
                 {
                     client.shutdown();
                     if !wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
@@ -218,19 +238,50 @@ impl DaemonProcess {
                             "a sandboxed resident daemon is still exiting; try again once it releases its port"
                         );
                     }
-                    let _ = std::fs::remove_file(&state_file);
+                    let _ = std::fs::remove_file(state_file);
                 }
-            } else if let Ok(address) = desktop_client_address(&record.address)
-                && let Ok(client) = connect_desktop_client(&address, token.clone(), Vec::new())
+            } else if !record.token.trim().is_empty()
+                && let Ok(address) = desktop_client_address(&record.address)
+                && let Ok(client) = connect_desktop_client(&address, record.token.clone(), Vec::new())
             {
-                return Ok(Self {
-                    client: Mutex::new(client),
-                    address,
-                    token,
-                    child: None,
-                    state_file,
-                    pid: record.pid,
-                });
+                let needs_exposure_rebind = settings.enabled
+                    && (record.token != token || record.address != settings.bind_address());
+                if needs_exposure_rebind {
+                    let has_live_terminals = matches!(
+                        client.request(Uuid::nil(), Uuid::nil(), Command::ListTerminals),
+                        Ok(ResponsePayload::Terminals { terminals })
+                            if terminals.iter().any(|terminal| !terminal.exited)
+                    );
+                    if !has_live_terminals {
+                        client.shutdown();
+                        if wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
+                            let _ = std::fs::remove_file(state_file);
+                        } else {
+                            bail!(
+                                "a resident daemon (pid {}) is still exiting; try again in a moment",
+                                record.pid
+                            );
+                        }
+                    } else {
+                        return Ok(Self {
+                            client: Mutex::new(client),
+                            address,
+                            token: record.token,
+                            child: None,
+                            state_file: state_file.to_path_buf(),
+                            pid: record.pid,
+                        });
+                    }
+                } else {
+                    return Ok(Self {
+                        client: Mutex::new(client),
+                        address,
+                        token: record.token,
+                        child: None,
+                        state_file: state_file.to_path_buf(),
+                        pid: record.pid,
+                    });
+                }
             } else {
                 bail!("resident daemon is running but unreachable; leaving its sessions intact");
             }
@@ -238,7 +289,7 @@ impl DaemonProcess {
         if let Some(parent) = state_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match Self::spawn_child_process(executable, &settings, &token, &state_file) {
+        match Self::spawn_child_process(executable, &settings, &token, state_file) {
             Ok(process) => Ok(process),
             Err(first_error) if settings.enabled => {
                 // If `resident-daemon.json` was lost while an orphaned daemon
@@ -252,7 +303,7 @@ impl DaemonProcess {
                     )
                 {
                     wait_for_port_release(&settings.bind_address(), SHUTDOWN_TIMEOUT);
-                    return Self::spawn_child_process(executable, &settings, &token, &state_file);
+                    return Self::spawn_child_process(executable, &settings, &token, state_file);
                 }
                 Err(first_error)
             }
@@ -544,7 +595,7 @@ impl RemoteEndpoint {
                 session,
             } => {
                 let session = Arc::new(BridgeSession::reconnect(connection, session.target())?);
-                let client = connect_desktop_client(
+                let client = connect_remote_desktop_client(
                     session.address(),
                     session.token().to_owned(),
                     resume_from,
@@ -697,9 +748,12 @@ impl DaemonSupervisor {
                 detail => error.context(detail),
             },
         };
-        let client =
-            connect_desktop_client(session.address(), session.token().to_owned(), Vec::new())
-                .map_err(bridge_error)?;
+        let client = connect_remote_desktop_client(
+            session.address(),
+            session.token().to_owned(),
+            Vec::new(),
+        )
+        .map_err(bridge_error)?;
         let settings = read_settings(&client).map_err(bridge_error)?;
         Self::remote(
             client,

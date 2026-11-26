@@ -61,18 +61,31 @@ mod platform {
             events: EventSink,
             cli_bin_dir: Option<&std::path::Path>,
         ) -> anyhow::Result<Self> {
+            Self::open_with_scope(cwd, cols, rows, events, cli_bin_dir, false)
+        }
+
+        pub fn open_with_scope(
+            cwd: &std::path::Path,
+            cols: u16,
+            rows: u16,
+            events: EventSink,
+            cli_bin_dir: Option<&std::path::Path>,
+            remote_scope: bool,
+        ) -> anyhow::Result<Self> {
             let shell = crate::command_env::default_terminal_shell();
             let shell_args = crate::command_env::default_terminal_shell_args(&shell);
-            Self::open_with_shell_and_cli_bin_dir(
+            Self::open_with_shell_and_scope(
                 cwd,
                 cols,
                 rows,
                 events,
                 Shell::new(shell.to_string_lossy().into_owned(), shell_args),
                 cli_bin_dir,
+                remote_scope,
             )
         }
 
+        #[allow(dead_code)]
         pub(crate) fn open_with_shell(
             cwd: &std::path::Path,
             cols: u16,
@@ -80,9 +93,10 @@ mod platform {
             events: EventSink,
             shell: Shell,
         ) -> anyhow::Result<Self> {
-            Self::open_with_shell_and_cli_bin_dir(cwd, cols, rows, events, shell, None)
+            Self::open_with_shell_and_scope(cwd, cols, rows, events, shell, None, false)
         }
 
+        #[allow(dead_code)]
         pub(crate) fn open_with_shell_and_cli_bin_dir(
             cwd: &std::path::Path,
             cols: u16,
@@ -90,6 +104,18 @@ mod platform {
             events: EventSink,
             shell: Shell,
             cli_bin_dir: Option<&std::path::Path>,
+        ) -> anyhow::Result<Self> {
+            Self::open_with_shell_and_scope(cwd, cols, rows, events, shell, cli_bin_dir, false)
+        }
+
+        pub(crate) fn open_with_shell_and_scope(
+            cwd: &std::path::Path,
+            cols: u16,
+            rows: u16,
+            events: EventSink,
+            shell: Shell,
+            cli_bin_dir: Option<&std::path::Path>,
+            remote_scope: bool,
         ) -> anyhow::Result<Self> {
             let events = crate::terminal_state::TerminalEvents::new(events, cols, rows);
             if !cwd.is_dir() {
@@ -107,6 +133,9 @@ mod platform {
             };
             let mut env_path: Option<std::ffi::OsString> = None;
             for (name, value) in crate::command_env::shell_environment() {
+                if name == crate::OPEN_SCOPE_ENV {
+                    continue;
+                }
                 if name == "PATH" {
                     env_path = Some(value);
                     continue;
@@ -126,6 +155,14 @@ mod platform {
                 options
                     .env
                     .insert("PATH".into(), path.to_string_lossy().into_owned());
+            }
+            if remote_scope {
+                options.env.insert(
+                    crate::OPEN_SCOPE_ENV.into(),
+                    crate::OPEN_SCOPE_REMOTE.into(),
+                );
+            } else {
+                options.env.remove(crate::OPEN_SCOPE_ENV);
             }
             options.env.insert("TERM".into(), "xterm-256color".into());
             options.env.insert("COLORTERM".into(), "truecolor".into());

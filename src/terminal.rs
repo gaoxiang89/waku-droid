@@ -442,8 +442,10 @@ struct RemoteTerminal {
     daemon: waku_client::DaemonSupervisor,
     session_id: uuid::Uuid,
     runtime_id: uuid::Uuid,
-    working_directory: PathBuf,
-    closed: AtomicBool,
+    initial_cwd: PathBuf,
+    fallback_cwd: Option<PathBuf>,
+    current_cwd: Mutex<PathBuf>,
+    closed: Arc<AtomicBool>,
 }
 
 impl RemoteTerminal {
@@ -476,13 +478,78 @@ impl RemoteTerminal {
         );
     }
 
+    fn open_on_daemon(
+        &self,
+        client: &mut waku_client::DaemonClient,
+        events: &mut Receiver<waku_client::SequencedEvent>,
+        cols: u16,
+        rows: u16,
+        ui_events: &Sender<TerminalUiEvent>,
+    ) -> Result<()> {
+        let current = self.current_cwd.lock().clone();
+        let mut candidates = vec![current.clone()];
+        if !candidates.contains(&self.initial_cwd) {
+            candidates.push(self.initial_cwd.clone());
+        }
+        if let Some(fallback) = &self.fallback_cwd
+            && !candidates.contains(fallback)
+        {
+            candidates.push(fallback.clone());
+        }
+        let mut candidate_index = 0;
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                anyhow::bail!("terminal closed before open");
+            }
+            if client.is_disconnected() {
+                client.unsubscribe(self.session_id, self.runtime_id);
+                let Some(replacement) = self.await_replacement(client) else {
+                    anyhow::bail!("daemon supervisor closed before terminal could open");
+                };
+                *client = replacement;
+                *events = client.subscribe(self.session_id, self.runtime_id);
+                continue;
+            }
+            let cwd = &candidates[candidate_index];
+            match client.request(
+                self.session_id,
+                self.runtime_id,
+                waku_client::Command::OpenTerminal {
+                    cwd: cwd.clone(),
+                    cols,
+                    rows,
+                },
+            ) {
+                Ok(_) => {
+                    if *cwd != current {
+                        *self.current_cwd.lock() = cwd.clone();
+                        let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd.clone()));
+                    }
+                    return Ok(());
+                }
+                Err(_) if client.is_disconnected() => continue,
+                Err(error)
+                    if candidate_index + 1 < candidates.len()
+                        && error
+                            .to_string()
+                            .contains("terminal working directory does not exist") =>
+                {
+                    candidate_index += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Open the PTY on the daemon host and start feeding its output into
     /// `term`. Blocking: call it off the UI thread.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         daemon: waku_client::DaemonSupervisor,
         id: uuid::Uuid,
         create: bool,
         working_directory: &Path,
+        fallback_cwd: Option<PathBuf>,
         size: WindowSize,
         term: Arc<FairMutex<Term<TerminalEventProxy>>>,
         dirty: Arc<AtomicBool>,
@@ -490,36 +557,38 @@ impl RemoteTerminal {
         wake: smol::channel::Sender<()>,
         sender_slot: Arc<OnceLock<PtyInput>>,
         replaying: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
         let remote = Arc::new(Self {
             daemon,
             session_id: id,
             runtime_id: id,
-            working_directory: working_directory.to_path_buf(),
-            closed: AtomicBool::new(false),
+            initial_cwd: working_directory.to_path_buf(),
+            fallback_cwd,
+            current_cwd: Mutex::new(working_directory.to_path_buf()),
+            closed,
         });
-        let client = remote.daemon.client();
+        let mut client = remote.daemon.client();
         // Subscribe before opening so the shell's first prompt is not lost.
-        let events = client.subscribe(remote.session_id, remote.runtime_id);
+        let mut events = client.subscribe(remote.session_id, remote.runtime_id);
         let opened = if create {
-            client.request(
-                remote.session_id,
-                remote.runtime_id,
-                waku_client::Command::OpenTerminal {
-                    cwd: working_directory.to_path_buf(),
-                    cols: size.num_cols,
-                    rows: size.num_lines,
-                },
+            remote.open_on_daemon(
+                &mut client,
+                &mut events,
+                size.num_cols,
+                size.num_lines,
+                &ui_events,
             )
         } else {
-            Ok(waku_client::ResponsePayload::Ack)
+            Ok(())
         };
         if let Err(error) = opened {
             client.unsubscribe(remote.session_id, remote.runtime_id);
+            let shown_cwd = remote.current_cwd.lock().clone();
             return Err(error).with_context(|| {
                 format!(
                     "open terminal in {} on the daemon host",
-                    working_directory.display()
+                    shown_cwd.display()
                 )
             });
         }
@@ -544,6 +613,7 @@ impl RemoteTerminal {
         Ok(remote)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pump(
         &self,
         mut client: waku_client::DaemonClient,
@@ -561,9 +631,11 @@ impl RemoteTerminal {
         let mut alerts = OscAlertScanner::default();
         let mut offset = 0;
         let mut needs_snapshot = !create;
-        // A restored pane restarts a dead shell at most once; a replacement
-        // that dies immediately stays exited instead of respawn-looping.
+        // A restored or reconnected pane restarts a dead/vanished shell at
+        // most once per recovery cycle; a replacement that dies immediately
+        // stays exited instead of respawn-looping.
         let mut respawned = false;
+        let mut reconnected = false;
         let exited = |ui_events: &Sender<TerminalUiEvent>| {
             let _ = ui_events.send(TerminalUiEvent::Exited);
             dirty.store(true, Ordering::Release);
@@ -603,6 +675,7 @@ impl RemoteTerminal {
                             &snapshot.data,
                             |_| {},
                             |cwd| {
+                                *self.current_cwd.lock() = cwd.clone();
                                 let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
                             },
                         );
@@ -617,26 +690,25 @@ impl RemoteTerminal {
                             });
                         }
                         drop(grid);
-                        if snapshot.reset && size_changed {
+                        if (snapshot.reset && size_changed) || reconnected {
                             self.resize(desired.0 as u16, desired.1 as u16);
                         }
                         offset = snapshot.offset;
                         needs_snapshot = false;
+                        reconnected = false;
                         dirty.store(true, Ordering::Release);
                         let _ = wake.try_send(());
                         if snapshot.exited {
                             if initial_attach && !respawned {
                                 respawned = true;
-                                match client.request(
-                                    self.session_id,
-                                    self.runtime_id,
-                                    waku_client::Command::OpenTerminal {
-                                        cwd: self.working_directory.clone(),
-                                        cols: desired.0 as u16,
-                                        rows: desired.1 as u16,
-                                    },
+                                match self.open_on_daemon(
+                                    &mut client,
+                                    &mut events,
+                                    desired.0 as u16,
+                                    desired.1 as u16,
+                                    &ui_events,
                                 ) {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         // The dead terminal's terminalExited was
                                         // queued before its snapshot reported
                                         // `exited`; drain it so it cannot kill the
@@ -645,13 +717,16 @@ impl RemoteTerminal {
                                         while events.try_recv().is_ok() {}
                                         offset = 0;
                                         needs_snapshot = true;
+                                        reconnected = false;
                                         continue;
                                     }
                                     Err(error) => {
-                                        failed(
-                                            &ui_events,
-                                            format!("could not restart remote terminal: {error:#}"),
-                                        );
+                                        if !self.closed.load(Ordering::Acquire) {
+                                            failed(
+                                                &ui_events,
+                                                format!("could not restart remote terminal: {error:#}"),
+                                            );
+                                        }
                                         return;
                                     }
                                 }
@@ -659,6 +734,7 @@ impl RemoteTerminal {
                             exited(&ui_events);
                             return;
                         }
+                        respawned = false;
                     }
                     Err(error) if client.is_disconnected() => {
                         let Some(replacement) = self.await_replacement(&client) else {
@@ -677,37 +753,36 @@ impl RemoteTerminal {
                         continue;
                     }
                     Err(error)
-                        if !create
-                            && offset == 0
-                            && !respawned
-                            && error.to_string().contains("no longer available") =>
+                        if !respawned && error.to_string().contains("no longer available") =>
                     {
                         let (cols, rows) = {
                             let term = term.lock();
                             (term.columns() as u16, term.screen_lines() as u16)
                         };
                         respawned = true;
-                        match client.request(
-                            self.session_id,
-                            self.runtime_id,
-                            waku_client::Command::OpenTerminal {
-                                cwd: self.working_directory.clone(),
-                                cols,
-                                rows,
-                            },
+                        match self.open_on_daemon(
+                            &mut client,
+                            &mut events,
+                            cols,
+                            rows,
+                            &ui_events,
                         ) {
-                            Ok(_) => {
+                            Ok(()) => {
                                 // Same as above: the record vanished, so any
                                 // queued events belonged to the old terminal.
                                 while events.try_recv().is_ok() {}
+                                offset = 0;
                                 needs_snapshot = true;
+                                reconnected = false;
                                 continue;
                             }
                             Err(error) => {
-                                failed(
-                                    &ui_events,
-                                    format!("could not restart remote terminal: {error:#}"),
-                                );
+                                if !self.closed.load(Ordering::Acquire) {
+                                    failed(
+                                        &ui_events,
+                                        format!("could not restart remote terminal: {error:#}"),
+                                    );
+                                }
                                 return;
                             }
                         }
@@ -764,6 +839,7 @@ impl RemoteTerminal {
                                 let _ = ui_events.send(TerminalUiEvent::Alert(Some(alert)));
                             },
                             |cwd| {
+                                *self.current_cwd.lock() = cwd.clone();
                                 let _ = ui_events.send(TerminalUiEvent::WorkingDirectory(cwd));
                             },
                         );
@@ -789,7 +865,9 @@ impl RemoteTerminal {
                 },
                 // The transport dropped. The daemon keeps the PTY, so follow
                 // the supervisor to its replacement connection and recover
-                // bytes missed since our last terminal-owned offset.
+                // bytes missed since our last terminal-owned offset. If the
+                // daemon itself restarted, `AttachTerminal` will observe
+                // "no longer available" and respawn in place.
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     if self.closed.load(Ordering::Acquire) {
@@ -806,26 +884,8 @@ impl RemoteTerminal {
                     };
                     client = replacement;
                     events = client.subscribe(self.session_id, self.runtime_id);
-                    // A daemon that restarted has lost the PTY; a resize is
-                    // the cheapest request that proves it still exists.
-                    let (cols, rows) = {
-                        let term = term.lock();
-                        (term.columns() as u16, term.screen_lines() as u16)
-                    };
-                    let alive = client.request(
-                        self.session_id,
-                        self.runtime_id,
-                        waku_client::Command::ResizeTerminal { cols, rows },
-                    );
-                    if let Err(error) = alive {
-                        self.closed.store(true, Ordering::Release);
-                        failed(
-                            &ui_events,
-                            format!("could not restore remote terminal after reconnect: {error:#}"),
-                        );
-                        return;
-                    }
                     needs_snapshot = true;
+                    reconnected = true;
                 }
             }
         }
@@ -1036,13 +1096,16 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         working_directory: &Path,
+        fallback_cwd: Option<PathBuf>,
         columns: usize,
         rows: usize,
         launcher: TerminalLauncher,
         reply_colors: TerminalReplyColors,
         identity: (uuid::Uuid, bool),
+        remote_closed: Arc<AtomicBool>,
         wake: smol::channel::Sender<()>,
     ) -> Result<Self> {
         let columns = columns.max(TERMINAL_MIN_COLUMNS);
@@ -1089,6 +1152,7 @@ impl TerminalSession {
                 identity.0,
                 identity.1,
                 working_directory,
+                fallback_cwd,
                 window_size,
                 term.clone(),
                 dirty.clone(),
@@ -1096,6 +1160,7 @@ impl TerminalSession {
                 wake,
                 sender_slot,
                 proxy.replaying.clone(),
+                remote_closed,
             )?;
             let sender = PtyInput::Remote(remote);
             return Ok(Self {
@@ -1985,6 +2050,8 @@ pub struct TerminalView {
     pub(crate) persistent_id: uuid::Uuid,
     session: Option<TerminalSession>,
     launcher: TerminalLauncher,
+    remote_closed: Arc<AtomicBool>,
+    fallback_cwd: Option<PathBuf>,
     error: Option<String>,
     focus_handle: FocusHandle,
     working_directory: PathBuf,
@@ -2036,8 +2103,15 @@ pub struct TerminalView {
     _subscriptions: Vec<Subscription>,
 }
 
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        self.remote_closed.store(true, Ordering::Release);
+    }
+}
+
 impl TerminalView {
     pub(crate) fn terminate(&mut self, cx: &mut Context<Self>) {
+        self.remote_closed.store(true, Ordering::Release);
         if let TerminalLauncher::Daemon(daemon) = &self.launcher {
             let daemon = daemon.clone();
             let id = self.persistent_id;
@@ -2074,6 +2148,7 @@ impl TerminalView {
     }
 
     pub(crate) fn close_daemon_session(&self) {
+        self.remote_closed.store(true, Ordering::Release);
         if let Some(session) = &self.session {
             session.sender.shutdown();
         }
@@ -2085,33 +2160,73 @@ impl TerminalView {
             );
         }
     }
+
+    pub(crate) fn restart(&mut self, cx: &mut Context<Self>) {
+        self.remote_closed.store(true, Ordering::Release);
+        if let Some(session) = self.session.take() {
+            session.sender.shutdown();
+        }
+        self.remote_closed = Arc::new(AtomicBool::new(false));
+        self.error = None;
+        self.exited = false;
+        self.reconnecting = false;
+        self.needs_attention = false;
+        self.spawn_session(true, cx);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
     pub fn new(
         working_directory: PathBuf,
         launcher: TerminalLauncher,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_identity(working_directory, launcher, uuid::Uuid::new_v4(), true, cx)
+        Self::new_with_fallback(working_directory, None, launcher, cx)
     }
 
+    pub(crate) fn new_with_fallback(
+        working_directory: PathBuf,
+        fallback_cwd: Option<PathBuf>,
+        launcher: TerminalLauncher,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_identity(
+            working_directory,
+            fallback_cwd,
+            launcher,
+            uuid::Uuid::new_v4(),
+            true,
+            cx,
+        )
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn restore(
         working_directory: PathBuf,
         launcher: TerminalLauncher,
         id: uuid::Uuid,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_identity(working_directory, launcher, id, false, cx)
+        Self::restore_with_fallback(working_directory, None, launcher, id, cx)
     }
 
-    fn with_identity(
+    pub(crate) fn restore_with_fallback(
         working_directory: PathBuf,
+        fallback_cwd: Option<PathBuf>,
         launcher: TerminalLauncher,
-        persistent_id: uuid::Uuid,
-        create: bool,
+        id: uuid::Uuid,
         cx: &mut Context<Self>,
     ) -> Self {
-        let terminal_cwd = working_directory.clone();
-        let session_launcher = launcher.clone();
+        Self::with_identity(working_directory, fallback_cwd, launcher, id, false, cx)
+    }
+
+    fn spawn_session(&mut self, create: bool, cx: &mut Context<Self>) {
+        let terminal_cwd = self.working_directory.clone();
+        let fallback_cwd = self.fallback_cwd.clone();
+        let session_launcher = self.launcher.clone();
         let reply_colors = TerminalReplyColors::new(Theme::current(cx));
+        let persistent_id = self.persistent_id;
+        let remote_closed = self.remote_closed.clone();
         cx.spawn(async move |this, cx| {
             let (initial_columns, initial_rows) = this
                 .read_with(cx, |this, _| this.estimated_grid_size())
@@ -2123,11 +2238,13 @@ impl TerminalView {
                 .spawn(async move {
                     TerminalSession::new(
                         &terminal_cwd,
+                        fallback_cwd,
                         initial_columns,
                         initial_rows,
                         session_launcher,
                         reply_colors,
                         (persistent_id, create),
+                        remote_closed,
                         wake_tx,
                     )
                 })
@@ -2136,7 +2253,10 @@ impl TerminalView {
                 .update(cx, |this, cx| {
                     match started {
                         Ok(session) => this.session = Some(session),
-                        Err(error) => this.error = Some(error.to_string()),
+                        Err(error) => {
+                            this.error = Some(error.to_string());
+                            this.exited = true;
+                        }
                     }
                     cx.notify();
                     this.session.is_some()
@@ -2164,15 +2284,26 @@ impl TerminalView {
             }
         })
         .detach();
+    }
 
+    fn with_identity(
+        working_directory: PathBuf,
+        fallback_cwd: Option<PathBuf>,
+        launcher: TerminalLauncher,
+        persistent_id: uuid::Uuid,
+        create: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let context_menu = ContextMenuHandle::new(cx);
         let cursor_blink = cx.new(|_| TerminalCursorBlink::new());
         let subscriptions = vec![cx.observe(&cursor_blink, |_, _, cx| cx.notify())];
 
-        Self {
+        let mut view = Self {
             persistent_id,
             session: None,
             launcher,
+            remote_closed: Arc::new(AtomicBool::new(false)),
+            fallback_cwd,
             error: None,
             focus_handle: cx.focus_handle(),
             title: tr!("right_panel.terminal"),
@@ -2201,7 +2332,9 @@ impl TerminalView {
             bottom_panel_tabs: false,
             can_split: false,
             _subscriptions: subscriptions,
-        }
+        };
+        view.spawn_session(create, cx);
+        view
     }
 
     /// An entity with no session and no subscriptions, for tests outside
@@ -2211,6 +2344,8 @@ impl TerminalView {
         cx.new(|cx| Self {
             session: None,
             launcher: TerminalLauncher::Local,
+            remote_closed: Arc::new(AtomicBool::new(false)),
+            fallback_cwd: None,
             persistent_id: uuid::Uuid::new_v4(),
             error: None,
             focus_handle: cx.focus_handle(),
@@ -2349,6 +2484,12 @@ impl TerminalView {
         // asked for all keys as escape codes receives CSI u for text. Event
         // reporting alone does not turn text keys into key events.
         if self.composition.is_some() {
+            return;
+        }
+        if self.error.is_some() && !keystroke.modifiers.modified() && keystroke.key == "enter" {
+            self.restart(cx);
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
         let all_keys_as_escapes = self
@@ -3333,22 +3474,36 @@ impl Render for TerminalView {
                         }])),
                 );
             }
+        } else if let Some(error) = &self.error {
+            screen = screen.child(
+                div()
+                    .p(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(sp(12.5))
+                            .line_height(sp(17.0))
+                            .text_color(theme.danger)
+                            .child(error.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .line_height(sp(16.0))
+                            .text_color(theme.text_tertiary)
+                            .child(tr!("terminal.restart_hint")),
+                    ),
+            );
         } else {
             screen = screen.child(
                 div()
                     .p(px(12.0))
                     .text_size(sp(12.5))
                     .line_height(sp(17.0))
-                    .text_color(if self.error.is_some() {
-                        theme.danger
-                    } else {
-                        theme.text_tertiary
-                    })
-                    .child(
-                        self.error
-                            .clone()
-                            .unwrap_or_else(|| tr!("terminal.starting")),
-                    ),
+                    .text_color(theme.text_tertiary)
+                    .child(tr!("terminal.starting")),
             );
         }
 
@@ -3384,6 +3539,10 @@ impl Render for TerminalView {
                 let has_session = context_terminal.read(cx).session.is_some();
                 let can_split = context_terminal.read(cx).can_split;
                 let bottom_panel_tabs = context_terminal.read(cx).bottom_panel_tabs;
+                let can_restart = {
+                    let view = context_terminal.read(cx);
+                    view.exited || view.error.is_some()
+                };
 
                 let copy_terminal = context_terminal.clone();
                 let context_selection_terminal = context_terminal.clone();
@@ -3443,6 +3602,12 @@ impl Render for TerminalView {
                 }
                 let end_terminal = context_terminal.clone();
                 items.push(MenuItem::Separator);
+                if can_restart {
+                    let restart_terminal = context_terminal.clone();
+                    items.push(MenuItem::new(tr!("terminal.restart_session"), move |_, cx| {
+                        restart_terminal.update(cx, |terminal, cx| terminal.restart(cx));
+                    }));
+                }
                 items.push(MenuItem::new(tr!("terminal.end_session"), move |_, cx| {
                     end_terminal.update(cx, |terminal, cx| terminal.terminate(cx));
                 }));
@@ -5167,6 +5332,8 @@ mod tests {
                     url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
                 }),
                 launcher: TerminalLauncher::Local,
+                remote_closed: Arc::new(AtomicBool::new(false)),
+                fallback_cwd: None,
                 persistent_id: uuid::Uuid::new_v4(),
                 error: None,
                 focus_handle: cx.focus_handle(),
@@ -5334,6 +5501,8 @@ mod tests {
                     url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
                 }),
                 launcher: TerminalLauncher::Local,
+                remote_closed: Arc::new(AtomicBool::new(false)),
+                fallback_cwd: None,
                 persistent_id: uuid::Uuid::new_v4(),
                 error: None,
                 focus_handle: cx.focus_handle(),
@@ -6631,5 +6800,248 @@ mod tests {
         assert_eq!(snapshot.batched_runs[1].start_col, 2);
         assert_eq!(snapshot.batched_runs[1].text.as_ref(), "a");
         assert!(!snapshot.block_rects.is_empty());
+    }
+
+    #[test]
+    fn remote_terminal_respawns_after_daemon_restart_and_falls_back_missing_cwd() {
+        let root =
+            std::env::temp_dir().join(format!("waku-remote-term-recover-{}", uuid::Uuid::new_v4()));
+        let workspace_dir = root.join("workspace");
+        let missing_subdir = workspace_dir.join("deleted-worktree");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let opened_cwds = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let alive_terminals = Arc::new(Mutex::new(HashSet::<uuid::Uuid>::new()));
+
+        let spawn_server = |opened_cwds: Arc<Mutex<Vec<PathBuf>>>,
+                            alive_terminals: Arc<Mutex<HashSet<uuid::Uuid>>>| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_server = stop.clone();
+            let handle = std::thread::spawn(move || {
+                let _ = listener.set_nonblocking(true);
+                let mut workers = Vec::new();
+                while !stop_server.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let opened_cwds = opened_cwds.clone();
+                            let alive_terminals = alive_terminals.clone();
+                            let stop_conn = stop_server.clone();
+                            workers.push(std::thread::spawn(move || {
+                                let _ = stream.set_nonblocking(false);
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                                let mut ws = tungstenite::accept(stream).unwrap();
+                                let _ = ws.read().unwrap();
+                                let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(50)));
+                                ws.send(tungstenite::Message::Text(
+                                    serde_json::to_string(&waku_protocol::ServerMessage::Hello {
+                                        protocol_version: waku_protocol::PROTOCOL_VERSION,
+                                        daemon_version: "test".into(),
+                                    })
+                                    .unwrap()
+                                    .into(),
+                                ))
+                                .unwrap();
+                                while !stop_conn.load(Ordering::Acquire) {
+                                    match ws.read() {
+                                        Ok(tungstenite::Message::Text(text)) => {
+                                            let Ok(waku_protocol::ClientMessage::Request(request)) =
+                                                serde_json::from_str(text.as_ref())
+                                            else {
+                                                continue;
+                                            };
+                                            let outcome = match request.command {
+                                                waku_client::Command::GetSettings => {
+                                                    waku_protocol::ResponseOutcome::Ok {
+                                                        payload:
+                                                            waku_protocol::ResponsePayload::Settings {
+                                                                settings: Default::default(),
+                                                            },
+                                                    }
+                                                }
+                                                waku_client::Command::OpenTerminal {
+                                                    cwd, ..
+                                                } => {
+                                                    if cwd.is_dir() {
+                                                        opened_cwds.lock().push(cwd);
+                                                        alive_terminals
+                                                            .lock()
+                                                            .insert(request.session_id);
+                                                        waku_protocol::ResponseOutcome::Ok {
+                                                            payload:
+                                                                waku_protocol::ResponsePayload::Ack,
+                                                        }
+                                                    } else {
+                                                        waku_protocol::ResponseOutcome::Error {
+                                                            error: waku_protocol::RpcError {
+                                                                message: format!(
+                                                                    "terminal working directory does not exist: {}",
+                                                                    cwd.display()
+                                                                ),
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                                waku_client::Command::AttachTerminal { .. } => {
+                                                    if alive_terminals
+                                                        .lock()
+                                                        .contains(&request.session_id)
+                                                    {
+                                                        waku_protocol::ResponseOutcome::Ok {
+                                                            payload: waku_protocol::ResponsePayload::TerminalOutput {
+                                                                snapshot: waku_protocol::TerminalOutput {
+                                                                    offset: 0,
+                                                                    reset: true,
+                                                                    rows: 24,
+                                                                    cols: 80,
+                                                                    exited: false,
+                                                                    data: Vec::new(),
+                                                                },
+                                                            },
+                                                        }
+                                                    } else {
+                                                        waku_protocol::ResponseOutcome::Error {
+                                                            error: waku_protocol::RpcError {
+                                                                message: "terminal session is no longer available; start a new terminal".into(),
+                                                            },
+                                                        }
+                                                    }
+                                                }
+                                                _ => waku_protocol::ResponseOutcome::Ok {
+                                                    payload: waku_protocol::ResponsePayload::Ack,
+                                                },
+                                            };
+                                            if !request.request_id.is_nil() {
+                                                let _ = ws.send(tungstenite::Message::Text(
+                                                    serde_json::to_string(
+                                                        &waku_protocol::ServerMessage::Response {
+                                                            request_id: request.request_id,
+                                                            outcome,
+                                                        },
+                                                    )
+                                                    .unwrap()
+                                                    .into(),
+                                                ));
+                                            }
+                                        }
+                                        Ok(tungstenite::Message::Close(_)) => break,
+                                        Err(tungstenite::Error::Io(ref err))
+                                            if matches!(
+                                                err.kind(),
+                                                std::io::ErrorKind::WouldBlock
+                                                    | std::io::ErrorKind::TimedOut
+                                            ) || (cfg!(windows) && err.raw_os_error() == Some(997)) =>
+                                        {
+                                            std::thread::sleep(Duration::from_millis(5));
+                                        }
+                                        Err(_) => break,
+                                        _ => {}
+                                    }
+                                }
+                            }));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
+            (address, stop, handle)
+        };
+
+        let (address, stop_server, server) =
+            spawn_server(opened_cwds.clone(), alive_terminals.clone());
+        let supervisor = waku_client::DaemonSupervisor::connect(&address, "tok".into()).unwrap();
+
+        let dirty = Arc::new(AtomicBool::new(false));
+        let (ui_tx, ui_rx) = unbounded();
+        let (wake_tx, _wake_rx) = smol::channel::bounded(8);
+        let sender_slot = Arc::new(OnceLock::new());
+        let replaying = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let window_size = WindowSize {
+            num_lines: 24,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 18,
+        };
+        let proxy = TerminalEventProxy {
+            replaying: replaying.clone(),
+            dirty: dirty.clone(),
+            sender: sender_slot.clone(),
+            ui_events: ui_tx.clone(),
+            wake: Some(wake_tx.clone()),
+            window_size: Arc::new(Mutex::new(window_size)),
+            reply_colors: TerminalReplyColors::new(Theme::dark()),
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TerminalDimensions {
+                columns: 80,
+                rows: 24,
+            },
+            proxy,
+        )));
+
+        let id = uuid::Uuid::new_v4();
+        let remote = RemoteTerminal::open(
+            supervisor.clone(),
+            id,
+            true,
+            &missing_subdir,
+            Some(workspace_dir.clone()),
+            window_size,
+            term,
+            dirty,
+            ui_tx,
+            wake_tx,
+            sender_slot,
+            replaying,
+            closed.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(opened_cwds.lock().as_slice(), &[workspace_dir.clone()]);
+        assert!(matches!(
+            ui_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(TerminalUiEvent::WorkingDirectory(path)) if path == workspace_dir
+        ));
+
+        // Simulate a daemon restart: wipe server-side PTY state and drop the
+        // client socket so DaemonSupervisor reconnects to the same listener.
+        alive_terminals.lock().clear();
+        supervisor.client().disconnect();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while opened_cwds.lock().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote terminal did not respawn after daemon restart"
+            );
+            while let Ok(event) = ui_rx.try_recv() {
+                if let TerminalUiEvent::Failed(message) = event {
+                    panic!("unexpected terminal failure: {message}");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert_eq!(
+            opened_cwds.lock().as_slice(),
+            &[workspace_dir.clone(), workspace_dir.clone()]
+        );
+
+        closed.store(true, Ordering::Release);
+        remote.detach();
+        supervisor.client().disconnect();
+        drop(supervisor);
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

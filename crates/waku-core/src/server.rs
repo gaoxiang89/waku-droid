@@ -111,9 +111,19 @@ pub struct EventSink {
     session_id: Uuid,
     runtime: ActiveRuntime,
     hub: Arc<Hub>,
+    client_kind: ClientKind,
 }
 
 impl EventSink {
+    pub fn with_client_kind(mut self, client_kind: ClientKind) -> Self {
+        self.client_kind = client_kind;
+        self
+    }
+
+    pub fn client_kind(&self) -> ClientKind {
+        self.client_kind
+    }
+
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
         self.hub.emit(self.session_id, self.runtime, event, true);
         Ok(())
@@ -326,7 +336,17 @@ impl Hub {
             session_id,
             runtime,
             hub: self.clone(),
+            client_kind: ClientKind::Other,
         }
+    }
+
+    fn subscriber_client_kind(&self, subscriber_id: u64) -> ClientKind {
+        self.state
+            .lock()
+            .subscribers
+            .get(&subscriber_id)
+            .map(|subscriber| subscriber.client_kind)
+            .unwrap_or(ClientKind::Other)
     }
 
     fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) -> ActiveRuntime {
@@ -623,16 +643,25 @@ impl Hub {
 
     fn broadcast_open_workspace(
         &self,
+        source_subscriber_id: u64,
         path: Option<String>,
         host: Option<String>,
     ) -> (bool, Option<u32>) {
         let mut state = self.state.lock();
+        let target_kind = match state
+            .subscribers
+            .get(&source_subscriber_id)
+            .map(|subscriber| subscriber.client_kind)
+        {
+            Some(ClientKind::RemoteCli) => ClientKind::RemoteDesktop,
+            _ => ClientKind::Desktop,
+        };
         let message = ServerMessage::OpenWorkspace { path, host };
         let mut desktop_ids: Vec<u64> = state
             .subscribers
             .iter()
             .filter_map(|(&id, subscriber)| {
-                (subscriber.client_kind == ClientKind::Desktop).then_some(id)
+                (subscriber.client_kind == target_kind).then_some(id)
             })
             .collect();
         // Prefer the most recently connected desktop's PID deterministically.
@@ -650,7 +679,7 @@ impl Hub {
                 overwhelmed.push((subscriber_id, subscriber.kicked.clone()));
             } else {
                 delivered = true;
-                if desktop_pid.is_none() {
+                if desktop_pid.is_none() && target_kind == ClientKind::Desktop {
                     desktop_pid = subscriber.client_pid;
                 }
             }
@@ -1057,7 +1086,11 @@ fn handle_connection(
                     _ => {}
                 }
             }
-            Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {}
+            Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {
+                if is_windows_io_pending(&error) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
             Err(error) => return Err(error).context("Waku daemon WebSocket failed"),
         }
@@ -1364,10 +1397,14 @@ fn handle_request(
         )
     } else {
         let start_arm = starts_runtime.then(|| hub.arm_starting_runtime(session_id, runtime_id));
-        let events = hub.event_sink(session_id, runtime_id);
+        let events = hub
+            .event_sink(session_id, runtime_id)
+            .with_client_kind(hub.subscriber_client_kind(source_subscriber_id));
         let runtime = events.runtime;
         let handled_result = match request.command {
-            Command::OpenWorkspace { path, host } => handle_open_workspace(&hub, path, host),
+            Command::OpenWorkspace { path, host } => {
+                handle_open_workspace(&hub, source_subscriber_id, path, host)
+            }
             _ => backend.handle(request, events),
         };
         let outcome = match handled_result {
@@ -1451,6 +1488,7 @@ fn handle_request(
 
 fn handle_open_workspace(
     hub: &Hub,
+    source_subscriber_id: u64,
     path: Option<String>,
     host: Option<String>,
 ) -> anyhow::Result<ResponsePayload> {
@@ -1464,7 +1502,8 @@ fn handle_open_workspace(
         (Some(_), path) => path,
         (None, None) => None,
     };
-    let (delivered, desktop_pid) = hub.broadcast_open_workspace(resolved_path.clone(), host);
+    let (delivered, desktop_pid) =
+        hub.broadcast_open_workspace(source_subscriber_id, resolved_path.clone(), host);
     Ok(ResponsePayload::WorkspaceOpened {
         delivered,
         desktop_pid,
@@ -1519,6 +1558,10 @@ fn retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
         ) {
             return true;
         }
+        #[cfg(windows)]
+        if error.raw_os_error() == Some(997) {
+            return true;
+        }
         #[cfg(unix)]
         if error.raw_os_error() == Some(libc::EAGAIN)
             || error.raw_os_error() == Some(libc::EWOULDBLOCK)
@@ -1527,6 +1570,23 @@ fn retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
         }
     }
     error.source().is_some_and(retryable_error)
+}
+
+fn is_windows_io_pending(error: &(dyn std::error::Error + 'static)) -> bool {
+    #[cfg(windows)]
+    {
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && io_error.raw_os_error() == Some(997)
+        {
+            return true;
+        }
+        error.source().is_some_and(is_windows_io_pending)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn read_client_message(socket: &mut WebSocket<TcpStream>) -> anyhow::Result<ClientMessage> {
@@ -4705,6 +4765,250 @@ mod tests {
         cli.shutdown();
         desktop.disconnect();
         web.disconnect();
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_io_pending_is_retryable() {
+        let error = io::Error::from_raw_os_error(997);
+        assert!(retryable_io(&error));
+        assert!(is_windows_io_pending(&error));
+
+        let non_retryable = io::Error::from_raw_os_error(10054);
+        assert!(!retryable_io(&non_retryable));
+        assert!(!is_windows_io_pending(&non_retryable));
+    }
+
+    #[test]
+    fn open_workspace_routes_between_local_and_remote_scopes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(TestBackend::default()),
+                stop,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+
+        let desktop = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Desktop,
+            Some(1111),
+        )
+        .unwrap();
+        let desktop_rx = desktop.subscribe_open_workspace();
+
+        let remote_desktop = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::RemoteDesktop,
+            None,
+        )
+        .unwrap();
+        let remote_rx = remote_desktop.subscribe_open_workspace();
+
+        let local_cli = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Cli,
+            Some(2222),
+        )
+        .unwrap();
+        let remote_cli = DaemonClient::connect_with_identity(
+            &address.to_string(),
+            "secret".into(),
+            Vec::new(),
+            ClientKind::RemoteCli,
+            None,
+        )
+        .unwrap();
+
+        let local_outcome = local_cli.open_workspace(None, None).unwrap();
+        assert!(local_outcome.delivered);
+        assert_eq!(local_outcome.desktop_pid, Some(1111));
+        assert!(desktop_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(remote_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        let remote_outcome = remote_cli.open_workspace(None, None).unwrap();
+        assert!(remote_outcome.delivered);
+        assert_eq!(remote_outcome.desktop_pid, None);
+        assert!(remote_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(desktop_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        // When no local desktop is connected, local CLI reports delivered=false even if RemoteDesktop is connected.
+        desktop.disconnect();
+        std::thread::sleep(Duration::from_millis(80));
+        let undelivered = local_cli.open_workspace(None, None).unwrap();
+        assert!(!undelivered.delivered);
+        assert_eq!(undelivered.desktop_pid, None);
+
+        remote_cli.shutdown();
+        local_cli.disconnect();
+        remote_desktop.disconnect();
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn open_terminal_isolates_remote_desktop_and_local_desktop_env() {
+        use crate::daemon::WakuBackend;
+        use crate::persistence::StateStore;
+        use crate::settings::DaemonSettingsStore;
+
+        let root = std::env::temp_dir().join(format!("waku-term-scope-{}", Uuid::new_v4()));
+        let cli_bin = root.join("shim-bin");
+        std::fs::create_dir_all(&cli_bin).unwrap();
+        let backend = WakuBackend::new(
+            DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+            StateStore::daemon(root.join("app.db")),
+        )
+        .unwrap()
+        .with_cli_bin_dir(Some(cli_bin.clone()));
+        #[cfg(unix)]
+        let backend = backend.with_terminal_shell(alacritty_terminal::tty::Shell::new(
+            "/bin/sh".into(),
+            vec![],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(backend),
+                stop,
+                ServerOptions::default(),
+            )
+            .unwrap()
+        });
+
+        let desktop = DaemonClient::connect_with_identity(
+            &address,
+            "secret".into(),
+            Vec::new(),
+            ClientKind::Desktop,
+            Some(1234),
+        )
+        .unwrap();
+        let remote_desktop = DaemonClient::connect_with_identity(
+            &address,
+            "secret".into(),
+            Vec::new(),
+            ClientKind::RemoteDesktop,
+            None,
+        )
+        .unwrap();
+
+        let local_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let local_events = desktop.subscribe(local_id, local_id);
+        let remote_events = remote_desktop.subscribe(remote_id, remote_id);
+
+        desktop
+            .request(
+                local_id,
+                local_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 240,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+        remote_desktop
+            .request(
+                remote_id,
+                remote_id,
+                Command::OpenTerminal {
+                    cwd: root.clone(),
+                    cols: 240,
+                    rows: 24,
+                },
+            )
+            .unwrap();
+
+        let (probe_cmd, local_marker, remote_marker) = if cfg!(windows) {
+            (
+                "cmd /d /c \"echo path=[%PATH%] & if defined WAKU_OPEN_SCOPE (echo scope=[%WAKU_OPEN_SCOPE%]) else (echo local^_only)\"\r",
+                b"local_only".as_slice(),
+                b"scope=[remote]".as_slice(),
+            )
+        } else {
+            (
+                "printf 'path=[%s] scope=[%s]\\n' \"$PATH\" \"$WAKU_OPEN_SCOPE\"\r",
+                b"scope=[]".as_slice(),
+                b"scope=[remote]".as_slice(),
+            )
+        };
+        desktop
+            .request(
+                local_id,
+                local_id,
+                Command::WriteTerminal {
+                    data: probe_cmd.as_bytes().to_vec(),
+                },
+            )
+            .unwrap();
+        remote_desktop
+            .request(
+                remote_id,
+                remote_id,
+                Command::WriteTerminal {
+                    data: probe_cmd.as_bytes().to_vec(),
+                },
+            )
+            .unwrap();
+
+        wait_for_terminal_marker(&local_events, local_marker, Duration::from_secs(30));
+        let local_snap = desktop
+            .request(local_id, local_id, Command::AttachTerminal { after: None })
+            .unwrap();
+        let ResponsePayload::TerminalOutput { snapshot: local_snap } = local_snap else {
+            panic!("missing local snapshot");
+        };
+        let local_text = String::from_utf8_lossy(&local_snap.data);
+        assert!(
+            !local_text.contains(cli_bin.to_string_lossy().as_ref()),
+            "local terminal unexpectedly got cli_bin_dir: {local_text}"
+        );
+
+        wait_for_terminal_marker(&remote_events, remote_marker, Duration::from_secs(30));
+        let remote_snap = remote_desktop
+            .request(remote_id, remote_id, Command::AttachTerminal { after: None })
+            .unwrap();
+        let ResponsePayload::TerminalOutput {
+            snapshot: remote_snap,
+        } = remote_snap
+        else {
+            panic!("missing remote snapshot");
+        };
+        let remote_text = String::from_utf8_lossy(&remote_snap.data);
+        assert!(
+            remote_text.contains(cli_bin.to_string_lossy().as_ref()),
+            "remote terminal missing cli_bin_dir: {remote_text}"
+        );
+
+        desktop.request(local_id, local_id, Command::CloseTerminal).unwrap();
+        remote_desktop
+            .request(remote_id, remote_id, Command::CloseTerminal)
+            .unwrap();
+        desktop.disconnect();
+        remote_desktop.disconnect();
+        shutdown.store(true, Ordering::Release);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }

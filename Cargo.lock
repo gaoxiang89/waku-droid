@@ -8400,6 +8400,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tar",
+ "tungstenite",
  "unicode-linebreak",
  "unicode-segmentation",
  "url",

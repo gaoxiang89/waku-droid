@@ -59,6 +59,16 @@ fn normalized_account_id(account_id: Option<&str>) -> Option<&str> {
     account_id.map(str::trim).filter(|id| !id.is_empty())
 }
 
+fn default_remote_cli_bin_dir() -> Option<PathBuf> {
+    let server_subdir = if cfg!(debug_assertions) {
+        ".cache/narel-dev/server"
+    } else {
+        ".cache/narel/server"
+    };
+    let dir = dirs::home_dir()?.join(server_subdir).join("bin");
+    dir.is_dir().then_some(dir)
+}
+
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, LiveSessionRuntime>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, PathBuf, crate::terminal::DaemonTerminal)>>,
@@ -225,6 +235,19 @@ impl WakuBackend {
         );
     }
 
+    fn terminal_scope_for_client(&self, client_kind: crate::ClientKind) -> (Option<PathBuf>, bool) {
+        match client_kind {
+            crate::ClientKind::Desktop => (None, false),
+            crate::ClientKind::RemoteDesktop => (
+                self.cli_bin_dir
+                    .clone()
+                    .or_else(default_remote_cli_bin_dir),
+                true,
+            ),
+            _ => (self.cli_bin_dir.clone(), false),
+        }
+    }
+
     fn open_terminal(
         &self,
         cwd: &Path,
@@ -232,24 +255,27 @@ impl WakuBackend {
         rows: u16,
         events: EventSink,
     ) -> anyhow::Result<crate::terminal::DaemonTerminal> {
+        let (cli_bin_dir, remote_scope) = self.terminal_scope_for_client(events.client_kind());
         #[cfg(all(test, unix))]
         if let Some(shell) = &self.terminal_shell {
-            return crate::terminal::DaemonTerminal::open_with_shell_and_cli_bin_dir(
+            return crate::terminal::DaemonTerminal::open_with_shell_and_scope(
                 cwd,
                 cols,
                 rows,
                 events,
                 shell.clone(),
-                self.cli_bin_dir.as_deref(),
+                cli_bin_dir.as_deref(),
+                remote_scope,
             );
         }
         ensure_shell_environment();
-        crate::terminal::DaemonTerminal::open_with_cli_bin_dir(
+        crate::terminal::DaemonTerminal::open_with_scope(
             cwd,
             cols,
             rows,
             events,
-            self.cli_bin_dir.as_deref(),
+            cli_bin_dir.as_deref(),
+            remote_scope,
         )
     }
 

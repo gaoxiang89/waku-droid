@@ -396,6 +396,15 @@ pub fn request_open_workspace(
     path: Option<String>,
     host: Option<String>,
 ) -> anyhow::Result<OpenWorkspaceOutcome> {
+    request_open_workspace_as(state_file, path, host, ClientKind::Cli)
+}
+
+pub fn request_open_workspace_as(
+    state_file: &Path,
+    path: Option<String>,
+    host: Option<String>,
+    client_kind: ClientKind,
+) -> anyhow::Result<OpenWorkspaceOutcome> {
     let bytes = std::fs::read(state_file).map_err(|error| {
         anyhow::Error::new(DaemonUnavailableError(format!(
             "could not read daemon state file {}: {error}",
@@ -423,12 +432,13 @@ pub fn request_open_workspace(
     }
     let address = crate::process::desktop_client_address(&state.address)
         .unwrap_or_else(|_| state.address.clone());
+    let client_pid = (client_kind != ClientKind::RemoteCli).then(std::process::id);
     let client = DaemonClient::connect_with_identity(
         &address,
         state.token,
         Vec::new(),
-        ClientKind::Cli,
-        Some(std::process::id()),
+        client_kind,
+        client_pid,
     )
     .map_err(|error| anyhow::Error::new(DaemonUnavailableError(format!("{error:#}"))))?;
     let outcome = client.open_workspace(path, host);
@@ -704,7 +714,11 @@ fn run_client(
                     _ => {}
                 }
             }
-            Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {}
+            Err(tungstenite::Error::Io(error)) if retryable_io(&error) => {
+                if is_windows_io_pending(&error) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                 close_reason = "the daemon connection was closed".into();
                 break;
@@ -770,6 +784,10 @@ fn retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
         ) {
             return true;
         }
+        #[cfg(windows)]
+        if error.raw_os_error() == Some(997) {
+            return true;
+        }
         #[cfg(unix)]
         if error.raw_os_error() == Some(libc::EAGAIN)
             || error.raw_os_error() == Some(libc::EWOULDBLOCK)
@@ -778,6 +796,23 @@ fn retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
         }
     }
     error.source().is_some_and(retryable_error)
+}
+
+fn is_windows_io_pending(error: &(dyn std::error::Error + 'static)) -> bool {
+    #[cfg(windows)]
+    {
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && io_error.raw_os_error() == Some(997)
+        {
+            return true;
+        }
+        error.source().is_some_and(is_windows_io_pending)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn write_json<S: io::Read + io::Write, T: serde::Serialize>(
@@ -1028,5 +1063,17 @@ mod tests {
         assert!(err.downcast_ref::<DaemonUnavailableError>().is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_io_pending_is_retryable() {
+        let error = io::Error::from_raw_os_error(997);
+        assert!(retryable_io(&error));
+        assert!(is_windows_io_pending(&error));
+
+        let non_retryable = io::Error::from_raw_os_error(10054);
+        assert!(!retryable_io(&non_retryable));
+        assert!(!is_windows_io_pending(&non_retryable));
     }
 }

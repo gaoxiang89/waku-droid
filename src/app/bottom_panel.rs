@@ -807,12 +807,22 @@ impl Waku {
         // the wrong machine, so remote windows run the shell on the daemon
         // host.
         let launcher = crate::terminal::TerminalLauncher::Daemon(self.selected_daemon().clone());
+        let fallback_cwd = self.selected_workspace_path().map(Path::to_path_buf);
         let terminal = cx.new(|cx| {
             match id {
-                Some(id) => {
-                    TerminalView::restore(working_directory.to_path_buf(), launcher, id, cx)
-                }
-                None => TerminalView::new(working_directory.to_path_buf(), launcher, cx),
+                Some(id) => TerminalView::restore_with_fallback(
+                    working_directory.to_path_buf(),
+                    fallback_cwd,
+                    launcher,
+                    id,
+                    cx,
+                ),
+                None => TerminalView::new_with_fallback(
+                    working_directory.to_path_buf(),
+                    fallback_cwd,
+                    launcher,
+                    cx,
+                ),
             }
             .with_bottom_panel_tabs()
         });
