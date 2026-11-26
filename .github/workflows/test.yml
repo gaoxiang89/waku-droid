@@ -67,7 +67,7 @@ jobs:
       - name: Check examples
         run: cargo check --locked --package waku-client --example remote_connect
 
-      - name: Verify in-process Cua SDK and REPL lifecycle
+      - name: Verify Computer Use stays disabled and the REPL lifecycle
         run: |
           cargo build --locked --package waku --bin narel_js_repl --package waku-computer-use --bin narel_computer_use
           bun scripts/cua-driver.ts bundle target/debug target/debug/resources debug

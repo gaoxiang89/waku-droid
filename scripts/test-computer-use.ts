@@ -1,32 +1,50 @@
-// Protocol/SDK smoke test. No app discovery, screenshots, input, or TCC prompts.
+// Prohibition/lifecycle smoke test. No app discovery, screenshots, input, or
+// TCC prompts.
 // Usage: bun scripts/test-computer-use.ts <narel_js_repl> <computer-use-helper>
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createInterface } from "node:readline";
 
+type ToolContent = { type: string; text?: string; data?: string };
+type ToolResult = { isError?: boolean; content: ToolContent[] };
+type JsonRpcResponse = { id?: number; result?: unknown; error?: { message?: string } };
+
+function isJsonRpcResponse(value: unknown): value is JsonRpcResponse {
+  return typeof value === "object" && value !== null && "id" in value;
+}
+
+function isToolResult(value: unknown): value is ToolResult {
+  if (typeof value !== "object" || value === null || !("content" in value))
+    return false;
+  if (!Array.isArray(value.content)) return false;
+  const items: unknown[] = value.content;
+  return items.every(
+    (item) => typeof item === "object" && item !== null && "type" in item,
+  );
+}
+
+function toolText(result: ToolResult): string {
+  const text = result.content[0]?.text;
+  if (typeof text !== "string")
+    throw new Error(`Missing tool text: ${JSON.stringify(result)}`);
+  return text;
+}
+
 const suffix = process.platform === "win32" ? ".exe" : "";
-const expectCursor = process.argv.includes("--expect-cursor");
 const [
   repl = `target/debug/narel_js_repl${suffix}`,
   helper = `target/debug/narel_computer_use${suffix}`,
-] = process.argv.slice(2).filter((argument) => argument !== "--expect-cursor");
+] = process.argv.slice(2);
 assert(repl && helper, "Pass the REPL executable and native helper executable");
-const nativeTools: string[] = JSON.parse(
-  execFileSync(resolve(helper), ["list-tools"], {
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer: 8 * 1024 * 1024,
-  }),
-)
-  .tools.map((tool: { name: string }) => tool.name)
-  .filter((name: string) => name !== "bring_to_front");
-const directory = await mkdtemp(join(tmpdir(), "waku-cua-test-"));
+const directory = await mkdtemp(join(tmpdir(), "narel-cua-test-"));
 const child = spawn(resolve(repl), [], {
   env: {
     ...process.env,
+    // Point at a real helper so the refusal comes from the build policy, not
+    // from a missing executable.
     WAKU_COMPUTER_USE_SERVER: resolve(helper),
     WAKU_COMPUTER_USE_PROCESS_DIRECTORY: directory,
   },
@@ -36,14 +54,16 @@ const child = spawn(resolve(repl), [], {
 let nextId = 0;
 const pending = new Map<
   number,
-  { resolve(value: any): void; reject(error: Error): void }
+  { resolve(value: unknown): void; reject(error: Error): void }
 >();
 createInterface({ input: child.stdout }).on("line", (line) => {
-  const message = JSON.parse(line);
+  const message: unknown = JSON.parse(line);
+  if (!isJsonRpcResponse(message) || typeof message.id !== "number") return;
   const request = pending.get(message.id);
   if (!request) return;
   pending.delete(message.id);
-  if (message.error) request.reject(new Error(message.error.message));
+  if (message.error)
+    request.reject(new Error(message.error.message ?? "REPL request failed"));
   else request.resolve(message.result);
 });
 child.stderr.on("data", (chunk) => process.stderr.write(chunk));
@@ -54,113 +74,92 @@ child.on("exit", (code) => {
   for (const request of pending.values())
     request.reject(new Error(`REPL exited: ${code}`));
 });
-function request(method: string, params: object): Promise<any> {
+function request(method: string, params: object): Promise<unknown> {
   const id = ++nextId;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`Timed out: ${method}`));
-    }, 30_000);
-    pending.set(id, {
-      resolve: (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      reject: (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    });
-    child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
-    );
+  const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+  const timer = setTimeout(() => {
+    pending.delete(id);
+    reject(new Error(`Timed out: ${method}`));
+  }, 30_000);
+  pending.set(id, {
+    resolve: (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    },
+    reject: (error) => {
+      clearTimeout(timer);
+      reject(error);
+    },
   });
+  child.stdin.write(
+    JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+  );
+  return promise;
 }
-async function js(code: string): Promise<any> {
+async function js(code: string): Promise<ToolResult> {
   const result = await request("tools/call", {
     name: "js",
     arguments: { code },
   });
+  assert.ok(isToolResult(result), `Unexpected tool result: ${JSON.stringify(result)}`);
   assert.notEqual(result.isError, true, JSON.stringify(result));
   return result;
+}
+// Every build prohibits Computer Use, so setup must reject even when the
+// packaged helper is configured.
+const attemptSetup = `
+  var setupError = null;
+  try { await setupComputerUseRuntime({ globals: globalThis }); }
+  catch (error) { setupError = String((error && error.message) || error); }
+  jsRepl.write(JSON.stringify({ setupError, hasSetup: typeof setupComputerUseRuntime, cuaAfter: typeof cua }));
+`;
+function assertRefused(result: ToolResult) {
+  const output: unknown = JSON.parse(toolText(result));
+  assert.ok(typeof output === "object" && output !== null);
+  const { setupError, hasSetup, cuaAfter } = output as {
+    setupError?: unknown;
+    hasSetup?: unknown;
+    cuaAfter?: unknown;
+  };
+  assert.equal(hasSetup, "function");
+  assert.match(typeof setupError === "string" ? setupError : "", /not available/i);
+  assert.equal(cuaAfter, "undefined");
+}
+function waitForExit(timeoutMs: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, timeoutMs);
+  child.once("exit", () => {
+    clearTimeout(timer);
+    resolve();
+  });
+  return promise;
 }
 try {
   await request("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
-    clientInfo: { name: "waku-cua-test", version: "1" },
+    clientInfo: { name: "narel-cua-test", version: "1" },
   });
   const initial = await js("jsRepl.write(typeof cua)");
-  assert.equal(initial.content[0].text, "undefined");
-  const result = await js(`
-    await setupComputerUseRuntime({ globals: globalThis });
-    var tools = ${JSON.stringify(nativeTools)};
-    var directTools = tools.every(name =>
-      Object.hasOwn(cua, name) && typeof cua[name] === "function");
-    var hasDiscoveryApi = "list_tools" in cua || "call_tool" in cua;
-    var config = await cua.get_config();
-    // Missing required IDs are rejected before any window capture.
-    var refused = await cua.get_window_state({});
-    var hasBringToFront = "bring_to_front" in cua;
-    var cursor = null;
-    if (${expectCursor}) {
-      await cua.start_session({ session: "waku-cursor-smoke" });
-      cursor = await cua.get_agent_cursor_state({ session: "waku-cursor-smoke" });
-      await cua.end_session({ session: "waku-cursor-smoke" });
-    }
-    var savedGetConfig = cua.get_config;
-    var nextConfig = await savedGetConfig({});
-    var sameRuntime = await setupComputerUseRuntime({ globals: globalThis }) === cua;
-    var invalidArguments = false;
-    try { await cua.get_config([]); } catch (error) { invalidArguments = error instanceof TypeError; }
-    jsRepl.write(JSON.stringify({ platform: cua.platform, tools,
-      directTools, hasDiscoveryApi, sameRuntime, frozen: Object.isFrozen(cua), invalidArguments, config, refused, hasBringToFront, cursor, nextConfig }));
-  `);
-  const output = JSON.parse(result.content[0].text);
-  assert(output.tools.includes("list_apps"));
-  assert(output.tools.includes("get_window_state"));
-  assert(output.tools.includes("click"));
-  assert.equal(output.directTools, true);
-  assert.equal(output.hasDiscoveryApi, false);
-  assert.equal(output.sameRuntime, true);
-  assert.equal(output.frozen, true);
-  assert.equal(output.invalidArguments, true);
-  assert.notEqual(output.config.isError, true);
-  assert.equal(output.refused.isError, true);
-  assert(Array.isArray(output.refused.content));
-  assert.equal(output.hasBringToFront, false);
-  if (expectCursor) {
-    assert.notEqual(output.cursor.isError, true, JSON.stringify(output.cursor));
-    assert.equal(output.cursor.structuredContent.enabled, true);
-  }
-  assert.notEqual(output.nextConfig.isError, true);
-  assert(output.nextConfig.structuredContent);
+  assert.equal(toolText(initial), "undefined");
+  assertRefused(await js(attemptSetup));
   const image = await js(
     'await jsRepl.emitImage({ type: "image", mimeType: "image/png", data: "cG5n" })',
   );
   assert(
     image.content.some(
-      (item: any) => item.type === "image" && item.data === "cG5n",
+      (item) => item.type === "image" && item.data === "cG5n",
     ),
   );
   await request("tools/call", { name: "js_reset", arguments: {} });
-  assert.equal(
-    (await js("jsRepl.write(typeof cua)")).content[0].text,
-    "undefined",
-  );
-  const resetConfig = await js(
-    "await setupComputerUseRuntime({ globals: globalThis }); jsRepl.write(JSON.stringify(await cua.get_config()))",
-  );
-  assert.notEqual(JSON.parse(resetConfig.content[0].text).isError, true);
+  assert.equal(toolText(await js("jsRepl.write(typeof cua)")), "undefined");
+  assertRefused(await js(attemptSetup));
   console.log(
-    `Cua SDK smoke passed (${output.platform}, ${output.tools.length} direct native methods; refusal, images, reset and reconnect${expectCursor ? ", native cursor enabled" : ""}).`,
+    `Cua prohibition smoke passed (${process.platform}): setup refused with WAKU_COMPUTER_USE_SERVER set; images and reset still work.`,
   );
 } finally {
   child.stdin.end();
-  await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, 2_000)),
-  ]);
+  await waitForExit(2_000);
   if (child.exitCode === null) child.kill();
   await rm(directory, { recursive: true, force: true });
 }

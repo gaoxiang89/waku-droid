@@ -103,22 +103,19 @@ bundled skill. Bump the version, all platform checksums, and
 the ABI bindings together. Include `resources/computer-use/CUA-LICENSE`.
 
 The portable host can run `list-tools` as a diagnostic without capturing or
-operating the desktop. The protocol smoke test uses only tool discovery,
-configuration reads, a request missing required arguments, a synthetic image,
-and REPL reset/reconnect:
+operating the desktop. Because every build prohibits Computer Use, the smoke
+test verifies the refusal instead of driving the SDK: `setupComputerUseRuntime`
+must reject even when `WAKU_COMPUTER_USE_SERVER` points at the packaged helper,
+`cua` must stay undefined, and the REPL's image and reset lifecycle must keep
+working:
 
 ```sh
 cargo build -p waku --bin narel_js_repl -p waku-computer-use --bin narel_computer_use
-bun scripts/cua-driver.ts bundle target/debug target/debug/resources debug
 bun scripts/test-computer-use.ts
 ```
 
-To test the signed macOS host, pass its packaged REPL and helper executable
-paths to `scripts/test-computer-use.ts`. Add `--expect-cursor` to check native
-cursor availability in a graphical session without moving or clicking anything.
-The CI matrix runs the portable SDK
-smoke test on all three operating systems. UI automation tests are separate
-and should only run when requested.
+The CI matrix runs this prohibition smoke test on all three operating systems.
+UI automation tests are separate and should only run when requested.
 
 References: [in-process SDK guide](https://cua.ai/docs/how-to-guides/driver/use-sdk-in-process),
 [native ABI](https://github.com/trycua/cua/blob/1b50c02e2d34734f64d2d22f54eb76cc97b4a663/libs/cua-driver/rust/include/cua_driver_abi.h),
