@@ -14,6 +14,16 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.56]
+
+- Import an existing Waku installation on first launch: missing files under `~/.waku` and `%LOCALAPPDATA%\Waku` are copied into Narel while originals stay untouched, `app.db` is snapshotted through SQLite, Narel files are never overwritten, and Waku's SSH credential entry is read as a fallback without being deleted
+- Let Waku and Narel coexist on Windows: Narel Setup detects a Waku installation in the target folder (including a silent update's `/DIR`) and installs into an independent `Narel` or `Narel-N` folder instead of overwriting Waku
+- Bridge `/usage` for Codex from the composer to the account usage view, and keep model discovery, discovery errors, account probes, and usage history scoped to the host and account that produced them; changing accounts refreshes that account's models
+- Remove anonymous usage analytics entirely — no telemetry client, no "Share anonymous usage data" setting, and no analytics credentials embedded in release builds
+- Stop ACP permission and elicitation prompts from deadlocking on the permission lock before replying, and send invalid elicitation answers back to the agent for correction
+- Refresh the Antigravity swarm roster when a member's derived status changes without any transcript write (for example an error aging into failed), serialize stopped members for protocol 13 peers, and read completion markers from the whole append-only board
+- Keep large activity detail sections off the UI thread, scope command catalogs, plan usage, and resume de-duplication to the producing host/account/config, and fix multi-byte MCP tool-name parsing
+
 ## [0.1.55]
 
 - Rebrand executables, app identifiers, installers, and user data/cache paths from Waku to Narel across desktop (`narel`), CLI (`bin/narel`), daemon (`narel-daemon`), JS REPL (`narel_js_repl`), Computer Use helper (`narel_computer_use`), updater (`narel-updater`), `~/.narel`, and `~/.cache/narel`, dropping legacy `waku` executable aliases and install directories so existing Waku installations can be uninstalled cleanly without affecting Narel
