@@ -12,6 +12,7 @@ import type {
   ProviderSessionSummary,
   ReviewDiffSource,
 } from '@waku/client'
+import { validatedAccountId } from '@waku/client'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -32,6 +33,7 @@ import { Transcript } from '@/components/transcript'
 import { WakuIcon } from '@/components/waku-icon'
 import {
   useComposerDrafts,
+  useDaemonSettings,
   useSession,
   useSessionTurnRefs,
   useTaskState,
@@ -51,7 +53,7 @@ import {
   persistProject,
   removeSession,
   selectableProjects,
-  sameProviderSession,
+  sessionOwnsProviderSession,
   sessionCwd,
   type TaskState,
 } from '@/lib/daemon-api'
@@ -94,6 +96,7 @@ interface RetainedPanelSession {
 type Translator = (key: string, params?: Record<string, string | number>) => string
 
 export function WakuApp() {
+  const settings = useDaemonSettings()
   const { t } = useI18n()
   const navigate = useNavigate({ from: '/' })
   const search = useSearch({ from: '/' })
@@ -641,21 +644,19 @@ export function WakuApp() {
     void navigate({ search: { session: sessionId } })
   }
 
-  async function resumeProviderSession(summary: ProviderSessionSummary) {
+  async function resumeProviderSession(summary: ProviderSessionSummary, accountId: string | null = null) {
     if (!client || !config || !taskState.data) {
       throw new Error(t('errors.daemon_disconnected'))
     }
     const existing = taskState.data.sessions.find((session) =>
-      session.provider_cursor
-        ? sameProviderSession(session.provider_cursor, summary.cursor)
-        : false)
+      sessionOwnsProviderSession(session, summary.cursor, accountId))
     if (existing) {
       pendingPaletteFocusSession.current = existing.id
       selectSession(existing.id)
       return
     }
 
-    const history = await loadProviderSessionHistory(client, summary)
+    const history = await loadProviderSessionHistory(client, summary, accountId)
     const existingProject = taskState.data.projects.find((project) => project.path === summary.cwd)
     const project = existingProject ?? createProject(summary.cwd)
     const session = createResumedSession(
@@ -663,6 +664,7 @@ export function WakuApp() {
       summary,
       history,
       activeSession?.runtime_mode ?? 'fullAccess',
+      accountId,
     )
     const saved = await saveSession(session, existingProject ? undefined : project)
     pendingPaletteFocusSession.current = saved.id
@@ -873,7 +875,7 @@ export function WakuApp() {
     )
     return {
       ...createSession(projectId, preferences.lastProvider, false),
-      account_id: preferences.lastAccountId ?? null,
+      account_id: validatedAccountId(settings.data, preferences.lastProvider, preferences.lastAccountId),
       model: preferences.lastModel,
       reasoning_effort: preferences.lastReasoningEffort,
       service_tier: preferences.lastServiceTier,
@@ -970,6 +972,7 @@ export function WakuApp() {
       canChooseModel={Boolean(activeSession && !['connecting', 'working', 'waiting', 'background'].includes(activeSession.status))}
       canToggleUsage={Boolean(activeSession)}
       currentProvider={activeSession?.provider ?? 'codex'}
+      currentAccountId={activeSession?.account_id ?? null}
       initialView={paletteInitialView}
       open={paletteOpen}
       rightPanelVisible={rightPanelVisible}

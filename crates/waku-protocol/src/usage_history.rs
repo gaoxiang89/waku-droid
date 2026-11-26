@@ -179,12 +179,29 @@ pub struct ProviderDay {
     pub total_tokens: u64,
 }
 
+/// Decodes a per-provider breakdown indexed by [`UsageProvider::index`].
+/// Payloads written before Antigravity joined carry two entries; missing
+/// providers decode as zero and entries for providers this build does not
+/// know are dropped, so neither an older nor a newer array length is fatal.
+fn deserialize_provider_days<'de, D>(deserializer: D) -> Result<[ProviderDay; 3], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let days = Vec::<ProviderDay>::deserialize(deserializer)?;
+    let mut by_provider = [ProviderDay::default(); 3];
+    for (slot, day) in by_provider.iter_mut().zip(days) {
+        *slot = day;
+    }
+    Ok(by_provider)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DaySlice {
     pub day: NaiveDate,
     pub cost_usd: f64,
     pub total_tokens: u64,
+    #[serde(deserialize_with = "deserialize_provider_days")]
     pub by_provider: [ProviderDay; 3],
 }
 
@@ -203,6 +220,7 @@ pub struct MonthSlice {
     pub first_day: NaiveDate,
     pub cost_usd: f64,
     pub total_tokens: u64,
+    #[serde(deserialize_with = "deserialize_provider_days")]
     pub by_provider: [ProviderDay; 3],
     pub sessions: u64,
     pub active_days: u32,
@@ -215,6 +233,7 @@ pub struct ProjectSlice {
     pub path: String,
     pub cost_usd: f64,
     pub total_tokens: u64,
+    #[serde(deserialize_with = "deserialize_provider_days")]
     pub by_provider: [ProviderDay; 3],
     pub sessions: u64,
     pub cost_share: f64,
@@ -260,5 +279,85 @@ impl UsageHistory {
             .binary_search_by_key(&first_day, |slice| slice.first_day)
             .ok()
             .map(|index| &self.months[index])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day_json(by_provider: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "day": "2026-01-02",
+            "costUsd": 3.0,
+            "totalTokens": 30,
+            "byProvider": by_provider,
+        })
+    }
+
+    #[test]
+    fn legacy_two_provider_breakdowns_decode_with_zero_antigravity() {
+        let legacy = day_json(serde_json::json!([
+            { "costUsd": 1.0, "totalTokens": 10 },
+            { "costUsd": 2.0, "totalTokens": 20 },
+        ]));
+        let day: DaySlice = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            day.by_provider[UsageProvider::Claude.index()].total_tokens,
+            10
+        );
+        assert_eq!(
+            day.by_provider[UsageProvider::Codex.index()].total_tokens,
+            20
+        );
+        assert_eq!(
+            day.by_provider[UsageProvider::Antigravity.index()].total_tokens,
+            0
+        );
+
+        let month: MonthSlice = serde_json::from_value(serde_json::json!({
+            "firstDay": "2026-01-01",
+            "costUsd": 1.0,
+            "totalTokens": 10,
+            "byProvider": [{ "costUsd": 1.0, "totalTokens": 10 }],
+            "sessions": 1,
+            "activeDays": 1,
+            "topModels": [],
+        }))
+        .unwrap();
+        assert_eq!(month.by_provider[0].total_tokens, 10);
+        assert_eq!(month.by_provider[1].total_tokens, 0);
+
+        let project: ProjectSlice = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/p",
+            "costUsd": 0.0,
+            "totalTokens": 0,
+            "byProvider": [],
+            "sessions": 0,
+            "costShare": 0.0,
+            "lastDay": null,
+            "topModels": [],
+        }))
+        .unwrap();
+        assert!(project.by_provider.iter().all(|day| day.total_tokens == 0));
+    }
+
+    #[test]
+    fn provider_breakdowns_serialize_three_entries_and_tolerate_extra_ones() {
+        let current = day_json(serde_json::json!([
+            { "costUsd": 1.0, "totalTokens": 10 },
+            { "costUsd": 2.0, "totalTokens": 20 },
+            { "costUsd": 3.0, "totalTokens": 30 },
+            { "costUsd": 4.0, "totalTokens": 40 },
+        ]));
+        let day: DaySlice = serde_json::from_value(current).unwrap();
+        assert_eq!(
+            day.by_provider[UsageProvider::Antigravity.index()].total_tokens,
+            30
+        );
+        let json = serde_json::to_value(&day).unwrap();
+        assert_eq!(json["byProvider"].as_array().unwrap().len(), 3);
+        let round_trip: DaySlice = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.by_provider[2].total_tokens, 30);
     }
 }

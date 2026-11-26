@@ -302,8 +302,7 @@ mod tests {
         ActivityFileChange, ActivityFileChangeStatus, ActivityItem, BackgroundWorkEvent,
         BackgroundWorkItem, BackgroundWorkKey, BackgroundWorkKind, BackgroundWorkStatus,
         ProviderKind, ProviderResumeCursor, ReasoningBlock, ReportedCommand, RuntimeEventCursor,
-        RuntimeMode, ThreadGoal, ThreadGoalStatus, TurnHandoff, UserInputOption,
-        UserInputQuestion,
+        RuntimeMode, ThreadGoal, ThreadGoalStatus, TurnHandoff, UserInputOption, UserInputQuestion,
     };
     use crate::usage::{PlanUsage, PlanWindow};
 
@@ -311,7 +310,10 @@ mod tests {
     fn encode_and_decode_enum_round_trip_and_reject_unknown_values() {
         let provider = encode_enum(ProviderKind::Claude).unwrap();
         assert_eq!(provider, "claude");
-        assert_eq!(decode_enum::<ProviderKind>(&provider).unwrap(), ProviderKind::Claude);
+        assert_eq!(
+            decode_enum::<ProviderKind>(&provider).unwrap(),
+            ProviderKind::Claude
+        );
 
         let mode = encode_enum(RuntimeMode::AutoAcceptEdits).unwrap();
         assert_eq!(mode, "autoAcceptEdits");
@@ -469,7 +471,10 @@ mod tests {
                 DriverEvent::AgentPresetSelected(Some("code".into())),
                 "agentPresetSelected",
             ),
-            (DriverEvent::AgentPresetSelected(None), "agentPresetSelected"),
+            (
+                DriverEvent::AgentPresetSelected(None),
+                "agentPresetSelected",
+            ),
             (
                 DriverEvent::AutoTitleUpdated(Some("Deduplicate codecs".into())),
                 "autoTitleUpdated",
@@ -518,7 +523,10 @@ mod tests {
                 },
                 "activity",
             ),
-            (DriverEvent::RichActivity(rich_activity.clone()), "richActivity"),
+            (
+                DriverEvent::RichActivity(rich_activity.clone()),
+                "richActivity",
+            ),
             (
                 DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(work_item.clone())),
                 "backgroundWork",

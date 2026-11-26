@@ -2424,10 +2424,7 @@ impl Waku {
     }
 }
 
-fn default_resume_provider(
-    last_provider: ProviderKind,
-    disabled: &[ProviderKind],
-) -> ProviderKind {
+fn default_resume_provider(last_provider: ProviderKind, disabled: &[ProviderKind]) -> ProviderKind {
     if !disabled.contains(&last_provider) {
         return last_provider;
     }

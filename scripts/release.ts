@@ -260,7 +260,7 @@ const releaseDirectory = resolve(
   process.env.CARGO_TARGET_DIR ?? "target",
   "release",
 );
-const releaseExecutable = join(releaseDirectory, packageName);
+const releaseExecutable = join(releaseDirectory, "narel");
 const releaseJsReplExecutable = join(
   releaseDirectory,
   jsReplExecutableName,
@@ -282,7 +282,7 @@ const bundledComputerUseSkill = join(
   contentsDirectory,
   "Resources",
   "skills",
-  "waku-computer-use",
+  "narel-computer-use",
   "SKILL.md",
 );
 const bundledPiComputerUseExtension = join(

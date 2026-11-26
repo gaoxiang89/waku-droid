@@ -5,6 +5,8 @@
 use anyhow::{Context as _, bail};
 
 const KEYRING_SERVICE: &str = "sh.narel.ssh";
+const LEGACY_KEYRING_SERVICE: &str = "sh.waku.ssh";
+const LEGACY_DISABLED_SERVICE: &str = "sh.narel.ssh.legacy-disabled";
 
 fn entry(connection_id: &str) -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, connection_id)
@@ -25,16 +27,40 @@ pub fn set_ssh_password(connection_id: &str, password: &str) -> anyhow::Result<(
 }
 
 pub fn get_ssh_password(connection_id: &str) -> anyhow::Result<String> {
-    entry(connection_id)?
-        .get_password()
-        .context("could not read the SSH password")
+    password_with_legacy_fallback(entry(connection_id)?.get_password(), || {
+        // Do not mask a locked/unavailable new keychain with an older password.
+        // Clear in Narel must not remove Waku's credential or revive it later.
+        match keyring::Entry::new(LEGACY_DISABLED_SERVICE, connection_id)?.get_password() {
+            Ok(_) => Err(keyring::Error::NoEntry),
+            Err(keyring::Error::NoEntry) => {
+                keyring::Entry::new(LEGACY_KEYRING_SERVICE, connection_id)?.get_password()
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .context("could not read the SSH password")
+}
+
+fn password_with_legacy_fallback(
+    current: Result<String, keyring::Error>,
+    legacy: impl FnOnce() -> Result<String, keyring::Error>,
+) -> Result<String, keyring::Error> {
+    match current {
+        Err(keyring::Error::NoEntry) => legacy(),
+        result => result,
+    }
 }
 
 pub fn has_ssh_password(connection_id: &str) -> bool {
-    entry(connection_id).is_ok_and(|entry| entry.get_password().is_ok())
+    get_ssh_password(connection_id).is_ok()
 }
 
 pub fn delete_ssh_password(connection_id: &str) -> anyhow::Result<()> {
+    // Write the opt-out before deleting: a failed write must not silently
+    // reactivate Waku's password. Waku's entry is deliberately left untouched.
+    keyring::Entry::new(LEGACY_DISABLED_SERVICE, connection_id)?
+        .set_password("1")
+        .context("could not disable the legacy SSH password")?;
     match entry(connection_id)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(error).context("could not remove the SSH password"),
@@ -50,7 +76,24 @@ mod tests {
     impl Drop for TestCredentialCleanup {
         fn drop(&mut self) {
             let _ = delete_ssh_password(&self.0);
+            if let Ok(entry) = keyring::Entry::new(LEGACY_DISABLED_SERVICE, &self.0) {
+                let _ = entry.delete_credential();
+            }
         }
+    }
+
+    #[test]
+    fn current_password_wins_and_only_absent_entries_fall_back() {
+        assert_eq!(
+            password_with_legacy_fallback(Ok("new".into()), || panic!("must not read legacy"))
+                .unwrap(),
+            "new"
+        );
+        assert_eq!(
+            password_with_legacy_fallback(Err(keyring::Error::NoEntry), || Ok("old".into()))
+                .unwrap(),
+            "old"
+        );
     }
 
     #[test]

@@ -289,7 +289,10 @@ pub fn try_deliver_to_running_desktop(
         }
         Ok(_) => Ok(DeliveryResult::NotRunning),
         Err(error) => {
-            if error.downcast_ref::<waku_client::DaemonRpcError>().is_some() {
+            if error
+                .downcast_ref::<waku_client::DaemonRpcError>()
+                .is_some()
+            {
                 Err(error)
             } else {
                 // DaemonUnavailableError or a transport drop while the daemon
@@ -436,7 +439,10 @@ mod tests {
                 host: None,
             })
         );
-        assert_eq!(parse_args(strings(&["-h"]), false).unwrap(), CliAction::Help);
+        assert_eq!(
+            parse_args(strings(&["-h"]), false).unwrap(),
+            CliAction::Help
+        );
         assert_eq!(
             parse_args(strings(&["--help"]), false).unwrap(),
             CliAction::Help
@@ -526,7 +532,10 @@ mod tests {
             },
             Some(cwd),
         );
-        assert_eq!(local_dot.path.as_deref(), Some(cwd.to_string_lossy().as_ref()));
+        assert_eq!(
+            local_dot.path.as_deref(),
+            Some(cwd.to_string_lossy().as_ref())
+        );
         assert_eq!(local_dot.host, None);
 
         let local_rel = prepare_request(
@@ -620,10 +629,12 @@ mod tests {
         let resolved = resolve_gui_executable_from(cli).expect("gui executable resolves");
         assert!(resolved.is_file());
         assert_eq!(resolved.parent(), expected.parent());
-        assert!(resolved
-            .file_name()
-            .unwrap()
-            .eq_ignore_ascii_case(expected.file_name().unwrap()));
+        assert!(
+            resolved
+                .file_name()
+                .unwrap()
+                .eq_ignore_ascii_case(expected.file_name().unwrap())
+        );
     }
 
     #[test]

@@ -236,7 +236,7 @@ export function ModelPicker({
                     } else if (event.key === 'Enter') {
                       event.preventDefault()
                       choose(highlight ?? (selectedIndex >= 0 ? selectedIndex : 0))
-                    } else if (event.key === 'Tab' && !query) {
+                    } else if (event.key === 'Tab' && !query && tabAccounts.length === 0) {
                       event.preventDefault()
                       const tabs: PickerTab[] = ['favorites', ...usable.map(({ id }) => id)]
                       const current = tabs.indexOf(tab)

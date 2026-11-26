@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   providerProbeConfigKey,
   resolveProviderExecutionConfig,
-  validatedAccountId,
+  resolveProviderAccount,
   type AgentSession,
   type DaemonSettings,
   type GoalOperation,
@@ -14,6 +14,7 @@ import {
   type SequencedEvent,
   type UserInputAnswer,
 } from '@waku/client';
+import { planComposerHandoff } from '@waku/client/composer-autocomplete';
 import { reduceRuntimeEvent } from '@waku/client/event-reducer';
 import { writeProviderProbeCache } from '@waku/client/provider-probe-cache';
 import * as Crypto from 'expo-crypto';
@@ -68,6 +69,9 @@ export interface MobileRuntime {
 }
 
 interface RuntimeEntry extends MobileRuntime {
+  launchProvider: ProviderKind;
+  launchAccountId: string | null;
+  launchConfigKey: string | null | undefined;
   /** Latest full projection, retained while subscribed even if the screen's
    * query is evicted. Never fall back to the snapshot captured on attach. */
   session: AgentSession;
@@ -165,6 +169,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const cacheGenerations = useRef(new Map<string, number>());
   const pendingSteers = useRef(new Map<string, PendingSubmission[]>());
   const drainingQueues = useRef(new Set<string>());
+  const operationTails = useRef(new Map<string, Promise<unknown>>());
+  const launching = useRef(new Map<string, number>());
+  const runExclusive = useCallback(<T,>(sessionId: string, operation: () => Promise<T>): Promise<T> => {
+    const previous = operationTails.current.get(sessionId) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    operationTails.current.set(sessionId, next);
+    void next.finally(() => {
+      if (operationTails.current.get(sessionId) === next) operationTails.current.delete(sessionId);
+    }).catch(() => {});
+    return next;
+  }, []);
   const sendPromptRef = useRef<
     ((
       session: AgentSession,
@@ -320,6 +335,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     runtimeId: string,
     supportsSteer = false,
     starting = true,
+    launchSettings?: DaemonSettings,
   ): RuntimeEntry => {
     const client = daemon.client;
     const profileId = daemon.activeProfile?.id;
@@ -327,7 +343,12 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const existing = entries.current.get(session.id);
     if (existing) return existing;
 
+    const settings = launchSettings ?? queryClient.getQueryData<DaemonSettings>(daemonKeys.settings(profileId));
+    const config = settings ? resolveProviderExecutionConfig(settings, session.provider, session.account_id) : null;
     const entry: RuntimeEntry = {
+      launchProvider: session.provider,
+      launchAccountId: session.account_id ?? null,
+      launchConfigKey: config ? providerProbeConfigKey(config.binaryOverride, config.configDir) : undefined,
       session,
       runtimeId,
       supportsSteer,
@@ -359,11 +380,17 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         entry.lastDriverError = event.event.payload;
       } else if (event.event.kind === 'planUsageUpdated') {
         const cachedSettings = queryClient.getQueryData<DaemonSettings>(daemonKeys.settings(profileId));
-        const accountId = cachedSettings
-          ? validatedAccountId(cachedSettings, state.current.provider, state.current.account_id)
-          : (state.current.account_id ?? null);
-        queryClient.setQueryData<PlanUsage>(
-          daemonKeys.planUsage(profileId, state.current.provider, accountId),
+        const config = cachedSettings
+          ? resolveProviderExecutionConfig(cachedSettings, entry.launchProvider, entry.launchAccountId)
+          : null;
+        // Never relabel a deleted/edited named runtime as Default. A quota
+        // sample belongs to the exact execution identity that launched it.
+        const stillExists = !entry.launchAccountId || !cachedSettings
+          || Boolean(resolveProviderAccount(cachedSettings, entry.launchProvider, entry.launchAccountId));
+        const sameConfig = !config || entry.launchConfigKey === undefined
+          || entry.launchConfigKey === providerProbeConfigKey(config.binaryOverride, config.configDir);
+        if (stillExists && sameConfig) queryClient.setQueryData<PlanUsage>(
+          daemonKeys.planUsage(profileId, entry.launchProvider, entry.launchAccountId),
           event.event.payload as PlanUsage,
         );
       }
@@ -540,7 +567,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     return request;
   }, [daemon.activeProfile?.id, daemon.client, daemon.phase, loadFullSession, queryClient, subscribe]);
 
-  const sendPrompt = useCallback(async (
+  const performSendPrompt = useCallback(async (
     inputSession: AgentSession,
     rawPrompt: string,
     attachments: MessageAttachment[] = [],
@@ -553,7 +580,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
     const prompt = rawPrompt.trim();
     if (!prompt && attachments.length === 0) return inputSession;
-    const providerPrompt = providerPromptOverride === undefined
+    let providerPrompt = providerPromptOverride === undefined
       ? providerPromptForSubmission(prompt, attachments)
       : providerPromptOverride.trim();
     // The screen can hand over a task-list skeleton while hydration is
@@ -568,7 +595,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
     if (!entries.current.has(current.id)) await attachSession(current);
     let runtime = entries.current.get(current.id);
-    let startup: { binary: string; cwd: string; configDir: string | null } | null = null;
+    let startup: { binary: string; cwd: string; configDir: string | null; settings: DaemonSettings } | null = null;
     if (!runtime) {
       const state = await loadTaskState(client);
       const project = state.projects.find((item) => item.id === current.project_id);
@@ -589,6 +616,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         current.provider,
         current.account_id,
       );
+      if (current.account_id && resolved.accountId !== current.account_id) {
+        throw new Error('This provider account is no longer available; select an account before continuing');
+      }
       const configDir = resolved.configDir;
       const probeCacheKey = providerProbeConfigKey(resolved.binaryOverride, configDir);
       const probe = await probeProvider(client, current.provider, settings, {
@@ -609,10 +639,20 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           resolved.accountId,
         );
       }
-      startup = { binary: probe.path, cwd: sessionCwd(current, project), configDir };
+      startup = { binary: probe.path, cwd: sessionCwd(current, project), configDir, settings };
     }
 
-    current = beginTurn(current, prompt, clock, attachments, providerPrompt);
+    // Preparation may have overlapped a live event or a cache refresh.
+    current = entries.current.get(current.id)?.session
+      ?? queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, current.id)) ?? current;
+    if (sessionBusy(current)) {
+      const queued = queueSubmission(current, prompt, clock, attachments, providerPrompt);
+      cacheSession(queued);
+      return persistOrdered(queued);
+    }
+    const handoff = planComposerHandoff(current, providerPrompt, clock.randomUUID);
+    providerPrompt = handoff?.providerPrompt ?? providerPrompt;
+    current = beginTurn(current, prompt, clock, attachments, providerPrompt, handoff?.handoff);
     // The ids beginTurn gave the turn and its user message ride along with
     // the prompt, so every other client attached to the runtime mirrors the
     // same rows instead of minting its own.
@@ -622,7 +662,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     try {
       if (!runtime) {
         const runtimeId = Crypto.randomUUID();
-        runtime = subscribe(current, runtimeId);
+        runtime = subscribe(current, runtimeId, false, true, startup!.settings);
         const response = await client.request({
           type: 'start',
           options: {
@@ -653,6 +693,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           prompt: providerPrompt,
           turnId: submitted.turnId,
           messageId: submitted.messageId,
+          ...(handoff ? { handoff: handoff.handoff } : {}),
         },
         current.id,
         runtime.runtimeId,
@@ -677,6 +718,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       throw cause;
     }
   }, [attachSession, cacheSession, daemon.activeProfile?.id, daemon.client, daemon.phase, loadFullSession, persistOrdered, queryClient, removeRuntime, subscribe]);
+
+  const sendPrompt = useCallback((
+    session: AgentSession, prompt: string, attachments: MessageAttachment[] = [], providerPromptOverride?: string,
+  ) => {
+    launching.current.set(session.id, (launching.current.get(session.id) ?? 0) + 1);
+    return runExclusive(session.id, () => performSendPrompt(session, prompt, attachments, providerPromptOverride))
+      .finally(() => {
+        const remaining = (launching.current.get(session.id) ?? 1) - 1;
+        if (remaining) launching.current.set(session.id, remaining);
+        else launching.current.delete(session.id);
+      });
+  }, [performSendPrompt, runExclusive]);
 
   useEffect(() => {
     sendPromptRef.current = sendPrompt;
@@ -739,7 +792,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   /** Local /goal commands use the native provider operation without adding
    * a user prompt. A fresh task still needs a subscribed provider runtime;
    * its goalUpdated/turnStarted events supply the authoritative state. */
-  const sendGoalOperation = useCallback(async (inputSession: AgentSession, operation: GoalOperation) => {
+  const performGoalOperation = useCallback(async (inputSession: AgentSession, operation: GoalOperation) => {
     const client = daemon.client;
     if (!client || daemon.phase !== 'connected') throw new Error('Waku daemon is disconnected');
     let current = await loadFullSession(inputSession.id);
@@ -756,6 +809,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         current.provider,
         current.account_id,
       );
+      if (current.account_id && resolved.accountId !== current.account_id) {
+        throw new Error('This provider account is no longer available; select an account before continuing');
+      }
       const configDir = resolved.configDir;
       const probe = await probeProvider(client, current.provider, settings, {
         accountId: resolved.accountId,
@@ -769,7 +825,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       cacheSession(current);
       current = await persistOrdered(current);
       const runtimeId = Crypto.randomUUID();
-      runtime = subscribe(current, runtimeId);
+      runtime = subscribe(current, runtimeId, false, true, settings);
       try {
         const response = await client.request({
           type: 'start',
@@ -799,6 +855,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
     await client.request({ type: 'goal', operation }, current.id, runtime.runtimeId);
   }, [attachSession, cacheSession, daemon.client, daemon.phase, loadFullSession, persistOrdered, removeRuntime, subscribe]);
+
+  const sendGoalOperation = useCallback((session: AgentSession, operation: GoalOperation) => {
+    launching.current.set(session.id, (launching.current.get(session.id) ?? 0) + 1);
+    return runExclusive(session.id, () => performGoalOperation(session, operation)).finally(() => {
+      const remaining = (launching.current.get(session.id) ?? 1) - 1;
+      if (remaining) launching.current.set(session.id, remaining);
+      else launching.current.delete(session.id);
+    });
+  }, [performGoalOperation, runExclusive]);
 
   const cancel = useCallback(async (sessionId: string) => {
     const client = daemon.client;
@@ -862,7 +927,21 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     if (!client || !profileId || daemon.phase !== 'connected') {
       throw new Error('Waku daemon is disconnected');
     }
-    const current = await loadFullSession(sessionId);
+    const hydrated = await loadFullSession(sessionId);
+    const assertIdentityChangeAllowed = (current: AgentSession) => {
+      const changed = (changes.provider !== undefined && changes.provider !== current.provider)
+        || (changes.accountId !== undefined && (changes.accountId ?? null) !== (current.account_id ?? null));
+      const runtime = entries.current.get(sessionId);
+      if (changed && (sessionBusy(current) || runtime?.starting || runtime?.running || launching.current.has(sessionId))) {
+        throw new Error('Stop the current turn before switching agents or accounts');
+      }
+    };
+    assertIdentityChangeAllowed(queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, sessionId))
+      ?? entries.current.get(sessionId)?.session ?? hydrated);
+    return runExclusive(sessionId, async () => {
+    const current = queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, sessionId))
+      ?? entries.current.get(sessionId)?.session ?? hydrated;
+    assertIdentityChangeAllowed(current);
     const next = applySessionOptions(current, changes, clock);
     cacheSession(next);
     try {
@@ -890,16 +969,30 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           },
         }, sessionId, runtime.runtimeId);
         if (response.type !== 'optionsApplied' || !response.applied) {
+          const latest = entries.current.get(sessionId)?.session
+            ?? queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, sessionId)) ?? next;
+          if (sessionBusy(latest) || runtime.running || runtime.starting) {
+            throw new Error('This agent cannot change these options during a turn');
+          }
           await client.request({ type: 'closeSession' }, sessionId, runtime.runtimeId);
           removeRuntime(sessionId);
         }
       }
-      await persistOrdered(next);
+      await persistOrdered(queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, sessionId))
+        ?? entries.current.get(sessionId)?.session ?? next);
     } catch (cause) {
-      cacheSession(current);
+      const latest = entries.current.get(sessionId)?.session
+        ?? queryClient.getQueryData<AgentSession>(daemonKeys.session(profileId, sessionId)) ?? current;
+      cacheSession({ ...current, ...latest, model: current.model,
+        reasoning_effort: current.reasoning_effort, service_tier: current.service_tier,
+        context_window: current.context_window, runtime_mode: current.runtime_mode,
+        provider: current.provider, account_id: current.account_id,
+        provider_cursor: current.provider_cursor, provider_cursors: current.provider_cursors,
+        account_cursors: current.account_cursors });
       throw cause;
     }
-  }, [cacheSession, daemon.activeProfile?.id, daemon.client, daemon.phase, loadFullSession, persistOrdered, removeRuntime]);
+    });
+  }, [cacheSession, daemon.activeProfile?.id, daemon.client, daemon.phase, loadFullSession, persistOrdered, queryClient, removeRuntime, runExclusive]);
 
   const renameSession = useCallback(async (sessionId: string, title: string) => {
     const current = await loadFullSession(sessionId);

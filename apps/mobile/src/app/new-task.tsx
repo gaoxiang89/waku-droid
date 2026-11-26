@@ -157,12 +157,11 @@ export default function NewTaskScreen() {
   // Restore the last-used composition (provider/model traits via the shared
   // composer preferences, plus mobile extras) once per daemon.
   const [restoredAddress, setRestoredAddress] = useState<string | null>(null);
-  const restoredFor = useRef<string | null>(null);
   const preferencesRef = useRef<ComposerPreferences | null>(null);
   useEffect(() => {
     const address = daemon.activeProfile?.address;
-    if (!address || restoredFor.current === address) return;
-    restoredFor.current = address;
+    if (!address) return;
+    let cancelled = false;
     preferencesRef.current = null;
     setRestoredAddress(null);
     void (async () => {
@@ -170,6 +169,7 @@ export default function NewTaskScreen() {
         loadComposerPreferences(address),
         loadNewTaskExtras(address),
       ]);
+      if (cancelled) return;
       setRuntimeMode(extras.runtimeMode);
       setIsolated(extras.isolated);
       if (extras.projectId) setProjectId(extras.projectId);
@@ -181,7 +181,10 @@ export default function NewTaskScreen() {
       setContextWindow(prefs.lastContextWindow);
       preferencesRef.current = prefs;
       setRestoredAddress(address);
-    })();
+    })().catch((cause) => {
+      if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+    });
+    return () => { cancelled = true; };
   }, [daemon.activeProfile?.address]);
 
   // Unlike the web SPA, this screen unmounts between visits, so every choice
@@ -279,7 +282,9 @@ export default function NewTaskScreen() {
       });
       preferencesRef.current = preferences;
     }
-    const remembered = preferences && selection.model
+    const sameAgent = provider === selection.provider
+      && (activeAccountId ?? null) === (selection.accountId ?? null);
+    const remembered = sameAgent && preferences && selection.model
       ? rememberedModelTraits(preferences, selection.provider, selection.model)
       : undefined;
     setProvider(selection.provider);

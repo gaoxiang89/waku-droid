@@ -277,7 +277,10 @@ mod tests {
             events,
             move || {
                 let _ = entered_tx.send(());
-                let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
                 Ok(Some("Stale title after drop".into()))
             },
         );

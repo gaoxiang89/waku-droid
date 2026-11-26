@@ -2059,7 +2059,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
 
     // An empty query keeps every page in sidebar order, so the arrows cycle
     // the full navigation even before anything is typed.
-    let mut all_pages = vec![
+    let all_pages = vec![
         SettingsPage::General,
         SettingsPage::Appearance,
         SettingsPage::Providers,
@@ -2068,37 +2068,28 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::Daemon,
         SettingsPage::Connections,
     ];
-    if cfg!(debug_assertions) {
-        all_pages.push(SettingsPage::ComputerUse);
-    }
     assert_eq!(pages(""), all_pages);
 
     assert_eq!(pages("theme"), vec![SettingsPage::Appearance]);
     assert_eq!(pages("skill"), vec![SettingsPage::Skills]);
 
     // A keyword shared across pages keeps them all reachable.
-    let mut codex_pages = vec![
+    let codex_pages = vec![
         SettingsPage::Providers,
         SettingsPage::Skills,
         SettingsPage::Usage,
     ];
-    if cfg!(debug_assertions) {
-        codex_pages.push(SettingsPage::ComputerUse);
-    }
     assert_eq!(pages("codex"), codex_pages);
 
     assert_eq!(pages("no such setting"), vec![]);
 }
 
 #[test]
-fn computer_use_navigation_is_debug_only() {
+fn computer_use_navigation_is_hidden() {
     use super::SettingsPage;
 
     assert!(SettingsPage::General.is_visible_in_navigation());
-    assert_eq!(
-        SettingsPage::ComputerUse.is_visible_in_navigation(),
-        cfg!(debug_assertions)
-    );
+    assert!(!SettingsPage::ComputerUse.is_visible_in_navigation());
 }
 
 #[test]
@@ -3004,13 +2995,8 @@ fn live_activity_upsert_preserves_specific_kind_and_meaningful_title_against_gen
     assert_eq!(activity.output.as_deref(), Some("exit status 1"));
 
     // Blank / whitespace-only titles must also never overwrite a meaningful title.
-    let empty_title_update = ActivityItem::new(
-        Some("call-1".into()),
-        ActivityKind::Tool,
-        "   ",
-        None,
-        true,
-    );
+    let empty_title_update =
+        ActivityItem::new(Some("call-1".into()), ActivityKind::Tool, "   ", None, true);
     assert_eq!(
         upsert_session_activity(&mut session, empty_title_update, true),
         None
@@ -3122,6 +3108,230 @@ fn droid_model_effort_and_autonomy_resolution_helpers_work() {
 }
 
 #[test]
+fn account_command_invalidation_covers_background_workspaces_and_inflight_requests() {
+    use super::autocomplete::invalidate_account_command_catalog;
+    use crate::query::{Query, QueryCache};
+    use waku_client::hosts::HostKey;
+
+    let mut cache = QueryCache::new(8);
+    let key = |path: &str, provider, account: &str| {
+        (
+            HostKey::Local,
+            provider,
+            std::path::PathBuf::from(path),
+            None,
+            Some(account.to_owned()),
+        )
+    };
+    let project = key("/project", ProviderKind::Codex, "work");
+    let worktree = key("/project/.worktrees/feature", ProviderKind::Codex, "work");
+    let other_account = key("/background", ProviderKind::Codex, "personal");
+    let unrelated = key("/background", ProviderKind::Claude, "work");
+    for key in [&project, &other_account, &unrelated] {
+        let Query::Missing(token) = cache.read(key) else {
+            panic!("expected miss")
+        };
+        assert!(cache.fulfill(token, Vec::new()));
+    }
+    let Query::Missing(stale) = cache.read(&worktree) else {
+        panic!("expected miss")
+    };
+    invalidate_account_command_catalog(&mut cache, &HostKey::Local, ProviderKind::Codex);
+    assert!(cache.peek(&project).is_none());
+    assert!(cache.peek(&other_account).is_none());
+    assert!(cache.peek(&unrelated).is_some());
+    let Query::Missing(current) = cache.read(&worktree) else {
+        panic!("expected fresh miss")
+    };
+    assert!(!cache.fulfill(stale, Vec::new()));
+    assert!(cache.fulfill(current, Vec::new()));
+}
+
+#[test]
+fn cold_slash_template_handoff_is_planned_after_expansion() {
+    use super::runtime::prepared_prompt_with_handoff;
+    use crate::composer_complete::{CommandScope, SlashCommand, resolved_submission};
+
+    let mut session = AgentSession::new(uuid::Uuid::new_v4(), ProviderKind::Codex);
+    session.begin_turn("Keep the public API stable");
+    session.turns.last_mut().unwrap().status = TurnStatus::Completed;
+    session.status = SessionStatus::Idle;
+    session.switch_agent(ProviderKind::Codex, Some("work".into()));
+    let turn_id = session.begin_turn("/review changes");
+    let mut native = session.clone();
+    assert_eq!(
+        prepared_prompt_with_handoff(&mut native, "/review changes", &[]),
+        "/review changes"
+    );
+    assert!(native.turns.last().unwrap().handoff.is_none());
+
+    let commands = [SlashCommand {
+        name: "review".into(),
+        description: String::new(),
+        scope: CommandScope::Project,
+        argument_hint: None,
+        template: Some("Review $ARGUMENTS carefully".into()),
+    }];
+    let expanded = resolved_submission(ProviderKind::Codex, "/review changes", &commands).unwrap();
+    let sent = prepared_prompt_with_handoff(&mut session, &expanded, &[]);
+    assert!(sent.contains("Keep the public API stable"));
+    assert!(sent.ends_with("Review changes carefully"));
+    assert!(session.turns.last().unwrap().handoff.is_some());
+    let current_messages = session
+        .messages
+        .iter()
+        .filter(|message| message.turn_id == Some(turn_id))
+        .collect::<Vec<_>>();
+    assert_eq!(current_messages[0].role, MessageRole::System);
+    assert_eq!(current_messages[1].content, "/review changes");
+}
+
+#[test]
+fn droid_new_session_replaces_same_provider_draft_model_effort_and_autonomy() {
+    use super::composer::apply_droid_draft_snapshot;
+    use crate::model::RuntimeMode;
+
+    let mut draft = AgentSession::new(uuid::Uuid::new_v4(), ProviderKind::Droid);
+    draft.model = Some("stale-model".into());
+    draft.reasoning_effort = Some("high".into());
+    draft.runtime_mode = RuntimeMode::FullAccess;
+    assert!(apply_droid_draft_snapshot(
+        &mut draft,
+        None,
+        Some((
+            Some("source-model".into()),
+            Some("low".into()),
+            None,
+            None,
+            RuntimeMode::Ask,
+        ))
+    ));
+    assert_eq!(draft.model.as_deref(), Some("source-model"));
+    assert_eq!(draft.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(draft.runtime_mode, RuntimeMode::Ask);
+    draft.begin_turn("already started");
+    assert!(!apply_droid_draft_snapshot(
+        &mut draft,
+        None,
+        Some((None, None, None, None, RuntimeMode::FullAccess,))
+    ));
+    assert_eq!(draft.runtime_mode, RuntimeMode::Ask);
+}
+
+#[test]
+fn named_accounts_probe_their_own_config_dir_and_failures_do_not_hide_the_cli() {
+    use super::runtime::{account_model_discovery_config_dir, account_model_discovery_update};
+    use crate::model::{ProviderModel, ProviderProbe};
+
+    for (provider, dir) in [
+        (ProviderKind::Claude, "/home/a/.claude-work"),
+        (ProviderKind::Codex, "/home/a/.codex-work"),
+        (
+            ProviderKind::Antigravity,
+            "/home/a/.gemini/antigravity-work",
+        ),
+    ] {
+        assert_eq!(
+            account_model_discovery_config_dir(provider, Some(dir)).as_deref(),
+            Some(dir),
+            "{provider:?}"
+        );
+    }
+    assert_eq!(
+        account_model_discovery_config_dir(ProviderKind::Claude, Some("  ")),
+        None
+    );
+    assert_eq!(
+        account_model_discovery_config_dir(ProviderKind::Pi, Some("/tmp/pi")),
+        None
+    );
+
+    let global = ProviderProbe {
+        provider: ProviderKind::Claude,
+        installed: true,
+        path: Some("/bin/claude".into()),
+        models: vec![ProviderModel::new("default-only", "Default")],
+        agent_presets: Vec::new(),
+        discovery_error: None,
+    };
+    let failed = account_model_discovery_update(&global, None, Err("rpc failed".into()));
+    assert!(!failed.completed);
+    assert!(
+        failed.probe.installed,
+        "a failed probe must not mark the CLI missing"
+    );
+    assert!(
+        failed.probe.models.is_empty(),
+        "no previous catalog, and not the default account's models"
+    );
+    assert_eq!(failed.probe.discovery_error.as_deref(), Some("rpc failed"));
+
+    let mut previous = global.clone();
+    previous.models = vec![ProviderModel::new("work-model", "Work")];
+    let failed = account_model_discovery_update(&global, Some(&previous), Err("rpc failed".into()));
+    assert!(!failed.completed);
+    assert!(failed.probe.installed);
+    assert_eq!(failed.probe.models[0].id, "work-model");
+    assert_eq!(failed.probe.discovery_error.as_deref(), Some("rpc failed"));
+
+    let mut missing = global.clone();
+    missing.installed = false;
+    missing.models.clear();
+    let reported = account_model_discovery_update(&global, None, Ok(missing));
+    assert!(reported.completed);
+    assert!(!reported.probe.installed);
+}
+
+#[test]
+fn local_unprobed_named_account_does_not_inherit_default_search_models() {
+    use super::composer::visible_picker_entries;
+    use crate::model::{ProviderModel, ProviderProbe};
+    use std::collections::HashMap;
+
+    let probes = [ProviderProbe {
+        provider: ProviderKind::Claude,
+        installed: true,
+        path: Some("/bin/claude".into()),
+        models: vec![ProviderModel::new(
+            "default-private-model",
+            "Default private model",
+        )],
+        agent_presets: Vec::new(),
+        discovery_error: None,
+    }];
+    let accounts = [waku_client::ProviderAccount {
+        id: "work".into(),
+        provider: ProviderKind::Claude,
+        label: "Work".into(),
+        config_dir: "/work-config".into(),
+        binary_override: None,
+    }];
+    let entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &HashMap::new(),
+        Some(&HashMap::new()),
+        super::ModelPickerTab::Favorites,
+        "private",
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].account_id, None);
+    let entries = visible_picker_entries(
+        &probes,
+        &[],
+        &[],
+        &accounts,
+        &HashMap::new(),
+        Some(&HashMap::new()),
+        super::ModelPickerTab::Favorites,
+        "work",
+    );
+    assert!(entries.is_empty());
+}
+
+#[test]
 fn background_queued_command_resolution_uses_target_session_catalog() {
     use super::runtime::session_slash_commands_from_cache;
     use crate::composer_complete::{CommandScope, SlashCommand, resolved_submission};
@@ -3185,21 +3395,72 @@ fn background_queued_command_resolution_uses_target_session_catalog() {
         Some("Review src/main.rs using Droid checklist")
     );
 
-    // A freshly materialized worktree whose own path is not cached yet falls
-    // back to its project root's cached catalog without stranding a Loading
-    // slot for the worktree key.
+    // An actual worktree cache miss must discover that branch's templates,
+    // not expand the parent branch's /review or strand a Loading slot.
     let (wt_commands, wt_hit) = session_slash_commands_from_cache(
         &mut cache,
         &droid_worktree_key,
         Some(&droid_project_key),
         &[],
     );
-    assert!(wt_hit);
+    assert!(!wt_hit);
     assert_eq!(
         resolved_submission(ProviderKind::Droid, "/review diff", &wt_commands).as_deref(),
-        Some("Review diff using Droid checklist")
+        None
     );
     assert!(cache.peek(&droid_worktree_key).is_none());
+
+    // While this worktree is still loading, the parent project's ready catalog
+    // must not expand /review.
+    let Query::Missing(worktree_token) = cache.read(&droid_worktree_key) else {
+        panic!("worktree catalog should be unclaimed");
+    };
+    let (loading_commands, loading_hit) = session_slash_commands_from_cache(
+        &mut cache,
+        &droid_worktree_key,
+        Some(&droid_project_key),
+        &[],
+    );
+    assert!(!loading_hit);
+    assert!(resolved_submission(ProviderKind::Droid, "/review diff", &loading_commands).is_none());
+
+    // This branch deleted /review. A ready empty catalog must not resurrect
+    // the parent template, including after the parent entry is written again.
+    assert!(cache.fulfill(worktree_token, Vec::new()));
+    let (deleted_commands, deleted_hit) = session_slash_commands_from_cache(
+        &mut cache,
+        &droid_worktree_key,
+        Some(&droid_project_key),
+        &[],
+    );
+    assert!(deleted_hit);
+    assert!(
+        resolved_submission(ProviderKind::Droid, "/review diff", &deleted_commands).is_none(),
+        "a deleted worktree command must not fall back to the parent template"
+    );
+    if let Query::Missing(token) = cache.read(&droid_project_key) {
+        assert!(cache.fulfill(
+            token,
+            vec![SlashCommand {
+                name: "review".into(),
+                description: "Parent review arrived late".into(),
+                scope: CommandScope::Project,
+                argument_hint: None,
+                template: Some("PARENT TEMPLATE $ARGUMENTS".into()),
+            }],
+        ));
+    }
+    let (after_parent, after_hit) = session_slash_commands_from_cache(
+        &mut cache,
+        &droid_worktree_key,
+        Some(&droid_project_key),
+        &[],
+    );
+    assert!(after_hit);
+    assert!(
+        resolved_submission(ProviderKind::Droid, "/review diff", &after_parent).is_none(),
+        "a late parent result must not replace the worktree catalog"
+    );
 
     // A cache miss merges only that session's reported commands and does not
     // strand a Loading slot in the QueryCache.

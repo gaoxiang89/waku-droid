@@ -901,7 +901,10 @@ const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
 const MAX_STDERR_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_STDERR_ERROR_CONTEXT_LINES: usize = 6;
 
-fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> std::io::Result<Option<String>> {
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     let mut saw_any = false;
     loop {
@@ -1623,7 +1626,7 @@ fn handle_claude_system(
         let output_tail_item = (subtype == "task_started"
             && item.key.kind == BackgroundWorkKind::Process
             && item.status.is_live())
-            .then(|| item.clone());
+        .then(|| item.clone());
         let stop_output_tail = !item.status.is_live();
         // Remember what the task is called: `task_started` names it, and a
         // `task_updated` patch is an explicit rename. Later activity lines
@@ -3712,8 +3715,14 @@ mod tests {
         let bg_stop = Arc::new(AtomicBool::new(false));
         let fg_stop = Arc::new(AtomicBool::new(false));
         state.live_tasks.insert("bg-1".into());
-        state.task_output_tails.0.insert("bg-1".into(), bg_stop.clone());
-        state.task_output_tails.0.insert("fg-1".into(), fg_stop.clone());
+        state
+            .task_output_tails
+            .0
+            .insert("bg-1".into(), bg_stop.clone());
+        state
+            .task_output_tails
+            .0
+            .insert("fg-1".into(), fg_stop.clone());
 
         // `background_tasks_changed` drops `bg-1` without a `task_notification`,
         // while foreground `fg-1` stays untouched until the turn settles.

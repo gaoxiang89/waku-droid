@@ -8,6 +8,7 @@ import {
   type ProviderSessionSummary,
   type RuntimeMode,
   type SequencedEvent,
+  type SubmittedHandoff,
 } from '@waku/client';
 
 export interface MobileRuntimeClock {
@@ -32,6 +33,7 @@ export function beginTurn(
   clock: MobileRuntimeClock,
   attachments: MessageAttachment[] = [],
   providerPromptOverride?: string,
+  handoff?: SubmittedHandoff | null,
 ): AgentSession {
   const now = clock.nowSeconds();
   const turnId = clock.randomUUID();
@@ -50,6 +52,15 @@ export function beginTurn(
     last_reply_at: now,
     messages: [
       ...session.messages,
+      ...(handoff ? [{
+        id: handoff.noticeId,
+        turn_id: turnId,
+        role: 'system' as const,
+        content: handoff.notice,
+        display_content: null,
+        created_at: now,
+        streaming: false,
+      }] : []),
       {
         id: clock.randomUUID(),
         turn_id: turnId,
@@ -74,6 +85,7 @@ export function beginTurn(
         completed_at: null,
         checkpoint: null,
         provider: session.provider,
+        ...(handoff ? { handoff: handoff.record } : {}),
         ...(session.account_id ? { account_id: session.account_id } : {}),
         // Without a cursor for this agent the provider opens a new native
         // conversation, which native rollback and fork counts start from.

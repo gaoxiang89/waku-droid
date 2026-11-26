@@ -604,19 +604,14 @@ impl Waku {
                     .to_string()
             })
             .unwrap_or_default();
-        let lane_color = self
-            .visible_git_graph
-            .as_ref()
-            .and_then(|(_, snapshot)| {
-                let pos = snapshot
-                    .commits
-                    .iter()
-                    .position(|candidate| candidate.hash == commit.hash)?;
-                let row = snapshot.rows.get(pos)?;
-                row.lanes
-                    .get(row.node_lane as usize)
-                    .map(|lane| lane.color)
-            });
+        let lane_color = self.visible_git_graph.as_ref().and_then(|(_, snapshot)| {
+            let pos = snapshot
+                .commits
+                .iter()
+                .position(|candidate| candidate.hash == commit.hash)?;
+            let row = snapshot.rows.get(pos)?;
+            row.lanes.get(row.node_lane as usize).map(|lane| lane.color)
+        });
         let ref_chips = (!commit.refs.is_empty()).then(|| {
             let weak = cx.entity().downgrade();
             let grouped = super::git_graph::group_commit_refs(&commit.refs);
@@ -624,8 +619,7 @@ impl Waku {
                 .into_iter()
                 .enumerate()
                 .map(|(position, display_ref)| {
-                    let handle =
-                        self.menu_handle(format!("git-graph-detail-ref-{position}"), cx);
+                    let handle = self.menu_handle(format!("git-graph-detail-ref-{position}"), cx);
                     let weak = weak.clone();
                     let menu_ref = display_ref.clone();
                     let menu_hash = commit.hash.clone();
@@ -636,11 +630,7 @@ impl Waku {
                         SharedString::from(format!("git-graph-detail-ref-menu-{position}")),
                         &handle,
                         move |_| {
-                            Waku::git_graph_display_ref_menu(
-                                weak.clone(),
-                                &menu_ref,
-                                &menu_hash,
-                            )
+                            Waku::git_graph_display_ref_menu(weak.clone(), &menu_ref, &menu_hash)
                         },
                     )
                 })
@@ -1819,9 +1809,7 @@ impl Waku {
                 items.push(MenuItem::Submenu {
                     label: remote.name.clone().into(),
                     value: None,
-                    items: Rc::new(move |_| {
-                        Self::git_graph_ref_menu(weak.clone(), &remote, &hash)
-                    }),
+                    items: Rc::new(move |_| Self::git_graph_ref_menu(weak.clone(), &remote, &hash)),
                 });
             }
         }

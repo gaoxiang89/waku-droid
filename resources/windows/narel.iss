@@ -151,6 +151,7 @@ end;
 procedure InitializeWizard;
 var
   TargetDir: string;
+  Suffix: Integer;
 begin
   if not IsWakuInstallDir(WizardDirValue) then
     Exit;
@@ -160,6 +161,14 @@ begin
   TargetDir := WizardForm.PrevAppDir;
   if (TargetDir = '') or IsWakuInstallDir(TargetDir) then
     TargetDir := ExpandConstant('{autopf}\Narel');
+  { Even the default can contain a portable Waku installation. Silent updates
+    cannot ask for another directory, so select a non-Waku sibling instead. }
+  Suffix := 2;
+  while IsWakuInstallDir(TargetDir) do
+  begin
+    TargetDir := ExpandConstant('{autopf}\Narel-') + IntToStr(Suffix);
+    Suffix := Suffix + 1;
+  end;
   Log('Redirecting installation from Waku directory to ' + TargetDir);
   WizardForm.DirEdit.Text := TargetDir;
 end;

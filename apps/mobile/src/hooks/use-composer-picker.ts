@@ -6,7 +6,7 @@ import {
   type ReportedCommand,
   type SlashCommand,
 } from '@waku/client';
-import { mergeComposerCommands, type ComposerAutocompleteRow, type ComposerTriggerKind } from '@waku/client/composer-autocomplete';
+import { filterSupportedComposerCommands, mergeComposerCommands, type ComposerAutocompleteRow, type ComposerTriggerKind } from '@waku/client/composer-autocomplete';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Keyboard, type TextInputProps } from 'react-native';
 
@@ -55,7 +55,7 @@ export function useComposerPicker({ text, onChangeText, provider, accountId = nu
   };
   const catalog = useQuery({ ...commandOptions, enabled: enabled && visible && Boolean(settings.data) && kind === 'command' });
   const discovered = catalog.data ?? NO_COMMANDS;
-  const commands = useMemo(() => mergeComposerCommands(discovered, reported), [discovered, reported]);
+  const commands = useMemo(() => filterSupportedComposerCommands(provider, mergeComposerCommands(discovered, reported)), [provider, discovered, reported]);
   const files = useQuery({
     queryKey: daemonKeys.composerFiles(profileId, root),
     queryFn: () => listComposerFiles(daemon.client!, root!),
@@ -123,7 +123,7 @@ export function useComposerPicker({ text, onChangeText, provider, accountId = nu
           exec.configDir,
         ),
       });
-      return mergeComposerCommands(discoveredCommands, reported);
+      return filterSupportedComposerCommands(provider, mergeComposerCommands(discoveredCommands, reported));
     },
     inputProps: {
       inputRef: setInputRef,

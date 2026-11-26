@@ -180,9 +180,9 @@ pub fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= MAX_SESSION_ID_LEN
-        && session_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+        && session_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
 }
 
 /// Reads the Antigravity swarm snapshot for `session_id` (whether `session_id`
@@ -389,11 +389,28 @@ pub(crate) fn read_swarm_snapshot_in_roots(
     let board_path = dir.join("board.jsonl");
     let (board_stamp, board_text, board_skipped_prefix) =
         read_tail_bounded(&board_path, MAX_BOARD_TAIL_BYTES);
-    let parsed_board = parse_board(
+    let mut parsed_board = parse_board(
         &board_text.unwrap_or_default(),
         &member_names,
         board_skipped_prefix,
     );
+    // Completion is durable state, not a property of the display tail. Index
+    // complete rows from the append-only board, retaining only roster markers.
+    let markers = read_board_markers(&board_path, &member_names);
+    for (name, seq) in markers.done_seq {
+        parsed_board
+            .done_seq
+            .entry(name)
+            .and_modify(|old| *old = (*old).max(seq))
+            .or_insert(seq);
+    }
+    for (name, seq) in markers.brief_seq {
+        parsed_board
+            .brief_seq
+            .entry(name)
+            .and_modify(|old| *old = (*old).max(seq))
+            .or_insert(seq);
+    }
 
     let (plan_stamp, plan) = read_plan(&dir);
 
@@ -417,15 +434,12 @@ pub(crate) fn read_swarm_snapshot_in_roots(
         let status = derive_member_status(raw, &summary);
         let posts = parsed_board.posts_by_agent.get(name).copied().unwrap_or(0);
         let unread = parsed_board.head_seq.saturating_sub(raw.last_read_seq);
-        let has_posted_done = parsed_board
-            .done_seq
-            .get(name)
-            .is_some_and(|done| {
-                parsed_board
-                    .brief_seq
-                    .get(name)
-                    .is_none_or(|brief| *done >= *brief)
-            });
+        let has_posted_done = parsed_board.done_seq.get(name).is_some_and(|done| {
+            parsed_board
+                .brief_seq
+                .get(name)
+                .is_none_or(|brief| *done >= *brief)
+        });
         let task = plan
             .as_ref()
             .and_then(|raw_plan| raw_plan.tasks.get(name))
@@ -590,8 +604,12 @@ fn locate_swarm_with_cap(
     for root in roots {
         let members_path = swarm_dir(root, session_id).join("members.json");
         if let Some((stamp, roster)) = read_roster(&members_path) {
-            let current_member = member_name_for_conversation(&roster, session_id)
-                .or_else(|| roster.members.contains_key("coordinator").then(|| "coordinator".to_owned()));
+            let current_member = member_name_for_conversation(&roster, session_id).or_else(|| {
+                roster
+                    .members
+                    .contains_key("coordinator")
+                    .then(|| "coordinator".to_owned())
+            });
             return Some(LocatedSwarm {
                 app_data: root.clone(),
                 swarm_id: session_id.to_owned(),
@@ -627,6 +645,7 @@ fn locate_swarm_with_cap(
             });
             continue;
         };
+        let mut swarm_stamps = Vec::new();
         let mut candidates: Vec<(Option<SystemTime>, u64, String, PathBuf)> = entries
             .flatten()
             .filter_map(|entry| {
@@ -636,7 +655,16 @@ fn locate_swarm_with_cap(
                     return None;
                 }
                 let members_path = swarm_dir(root, candidate_id).join("members.json");
-                let (modified, len) = file_mtime_and_len(&members_path)?;
+                let stamp = file_mtime_and_len(&members_path);
+                // Missing members.json files matter too: a swarm can be
+                // created inside an existing brain directory without changing
+                // the brain root's mtime.
+                if swarm_stamps.len() < max_scan_dirs {
+                    swarm_stamps.push((members_path.clone(), stamp));
+                } else {
+                    was_capped = true;
+                }
+                let (modified, len) = stamp?;
                 Some((modified, len, candidate_id.to_owned(), members_path))
             })
             .collect();
@@ -644,11 +672,6 @@ fn locate_swarm_with_cap(
         if candidates.len() > max_scan_dirs {
             was_capped = true;
         }
-        let swarm_stamps: Vec<(PathBuf, Option<(Option<SystemTime>, u64)>)> = candidates
-            .iter()
-            .take(max_scan_dirs)
-            .map(|(modified, len, _, path)| (path.clone(), Some((*modified, *len))))
-            .collect();
         negative_root_stamps.push(NegativeRootStamp {
             brain_dir,
             brain_mtime,
@@ -752,6 +775,121 @@ fn read_tail_bounded(path: &Path, max_bytes: u64) -> (String, Option<String>, bo
     (stamp, Some(text), skipped_prefix)
 }
 
+#[derive(Clone, Default)]
+struct BoardMarkers {
+    done_seq: HashMap<String, u64>,
+    brief_seq: HashMap<String, u64>,
+    head_seq: u64,
+}
+
+#[derive(Clone, Default)]
+struct BoardMarkerIndex {
+    stamp: String,
+    len: u64,
+    offset: u64,
+    roster: Vec<String>,
+    markers: BoardMarkers,
+}
+
+/// The first read scans to the captured EOF using fixed-size chunks; subsequent
+/// reads index only appended complete rows. Neither the board nor old messages
+/// are retained. A torn row is retried on the next poll, and an oversized row
+/// is skipped without allocating its full contents.
+fn read_board_markers(path: &Path, roster: &[String]) -> BoardMarkers {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, BoardMarkerIndex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut file) = fs::File::open(path) else {
+        cache.lock().remove(path);
+        return BoardMarkers::default();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return BoardMarkers::default();
+    };
+    if !metadata.is_file() {
+        return BoardMarkers::default();
+    }
+    let (stamp, _) = file_stamp_and_mtime(&metadata);
+    let mut index = cache.lock().get(path).cloned().unwrap_or_default();
+    if index.roster != roster
+        || metadata.len() < index.len
+        || (metadata.len() == index.len && index.stamp != stamp)
+    {
+        index = BoardMarkerIndex::default();
+    }
+    if index.stamp == stamp && index.roster == roster {
+        return index.markers;
+    }
+    if file.seek(SeekFrom::Start(index.offset)).is_err() {
+        return BoardMarkers::default();
+    }
+    let mut reader = file.take(metadata.len().saturating_sub(index.offset));
+    let mut chunk = [0u8; 64 * 1024];
+    let mut row = Vec::new();
+    let mut oversized = false;
+    let mut position = index.offset;
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(_) => return BoardMarkers::default(),
+        };
+        for &byte in &chunk[..count] {
+            position += 1;
+            if byte == b'\n' {
+                if !oversized && let Ok(raw) = serde_json::from_slice::<RawBoardLine>(&row) {
+                    let seq = if raw.seq > 0 {
+                        raw.seq
+                    } else {
+                        index.markers.head_seq.saturating_add(1)
+                    };
+                    index.markers.head_seq = index.markers.head_seq.max(seq);
+                    if !raw.control.as_ref().is_some_and(Value::is_object) {
+                        if roster.contains(&raw.agent) && is_done_post(&raw.text) {
+                            index
+                                .markers
+                                .done_seq
+                                .entry(raw.agent.clone())
+                                .and_modify(|old| *old = (*old).max(seq))
+                                .or_insert(seq);
+                        }
+                        if raw.kind.as_deref() == Some("brief") {
+                            let (mentions, all) = extract_mentions(&raw.text, roster);
+                            for name in if all { roster.to_vec() } else { mentions } {
+                                index
+                                    .markers
+                                    .brief_seq
+                                    .entry(name)
+                                    .and_modify(|old| *old = (*old).max(seq))
+                                    .or_insert(seq);
+                            }
+                        }
+                    }
+                }
+                index.offset = position;
+                row.clear();
+                oversized = false;
+            } else if !oversized {
+                if row.len() < MAX_BOARD_TAIL_BYTES as usize {
+                    row.push(byte);
+                } else {
+                    row.clear();
+                    oversized = true;
+                }
+            }
+        }
+    }
+    index.stamp = stamp;
+    index.len = metadata.len();
+    index.roster = roster.to_vec();
+    let markers = index.markers.clone();
+    let mut cache = cache.lock();
+    if cache.len() >= MAX_WORKER_SWARM_CACHE && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), index);
+    markers
+}
+
 struct ParsedBoard {
     head_seq: u64,
     total_messages: u64,
@@ -785,14 +923,11 @@ fn parse_board(text: &str, roster_names: &[String], skipped_prefix: bool) -> Par
         let seq = if raw.seq > 0 {
             raw.seq
         } else {
-            (parsed.len() as u64) + 1
+            head_seq.saturating_add(1)
         };
         head_seq = head_seq.max(seq);
 
-        let is_control = raw
-            .control
-            .as_ref()
-            .is_some_and(|value| value.is_object());
+        let is_control = raw.control.as_ref().is_some_and(|value| value.is_object());
         if is_control {
             continue;
         }
@@ -845,9 +980,9 @@ fn parse_board(text: &str, roster_names: &[String], skipped_prefix: bool) -> Par
         }
 
         let message_screenshots = extract_screenshots(&raw.text, seq, &raw.agent);
-        if screenshots.len() < MAX_SCREENSHOTS {
-            let remaining = MAX_SCREENSHOTS - screenshots.len();
-            screenshots.extend(message_screenshots.iter().take(remaining).cloned());
+        screenshots.extend(message_screenshots.iter().cloned());
+        if screenshots.len() > MAX_SCREENSHOTS {
+            screenshots.drain(..screenshots.len() - MAX_SCREENSHOTS);
         }
 
         parsed.push(AntigravitySwarmMessage {
@@ -984,9 +1119,7 @@ fn extract_screenshots(text: &str, seq: u64, agent: &str) -> Vec<AntigravitySwar
 fn is_done_post(text: &str) -> bool {
     let mut rest = text.trim_start();
     while let Some(after_at) = rest.strip_prefix('@') {
-        let token_len = after_at
-            .find(char::is_whitespace)
-            .unwrap_or(after_at.len());
+        let token_len = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
         if token_len == 0 {
             break;
         }
@@ -1072,7 +1205,9 @@ fn inferred_role_worker(name: &str) -> Option<&'static str> {
         if name == role {
             return Some(role);
         }
-        if let Some(suffix) = name.strip_prefix(role).and_then(|rest| rest.strip_prefix('-'))
+        if let Some(suffix) = name
+            .strip_prefix(role)
+            .and_then(|rest| rest.strip_prefix('-'))
             && !suffix.is_empty()
             && suffix.chars().all(|character| character.is_ascii_digit())
         {
@@ -1083,9 +1218,7 @@ fn inferred_role_worker(name: &str) -> Option<&'static str> {
 }
 
 fn is_role_worker(name: &str, normalized_role: &str) -> bool {
-    (!normalized_role.is_empty()
-        && normalized_role != "worker"
-        && normalized_role != "coordinator")
+    (!normalized_role.is_empty() && normalized_role != "worker" && normalized_role != "coordinator")
         || inferred_role_worker(name).is_some()
 }
 
@@ -1111,7 +1244,11 @@ fn pick_narrator(roster: &RawRoster) -> Option<String> {
         let Some(rank) = narrator_rank(name, &member.role) else {
             continue;
         };
-        let slot = if member.is_killed() { &mut dead } else { &mut live };
+        let slot = if member.is_killed() {
+            &mut dead
+        } else {
+            &mut live
+        };
         if slot.as_ref().is_none_or(|(best, _)| rank > *best) {
             *slot = Some((rank, name.clone()));
         }
@@ -1119,7 +1256,10 @@ fn pick_narrator(roster: &RawRoster) -> Option<String> {
     live.or(dead).map(|(_, name)| name)
 }
 
-fn derive_member_status(raw: &RawMember, summary: &TranscriptSummary) -> AntigravitySwarmMemberStatus {
+fn derive_member_status(
+    raw: &RawMember,
+    summary: &TranscriptSummary,
+) -> AntigravitySwarmMemberStatus {
     if raw.is_killed() {
         return AntigravitySwarmMemberStatus::Killed;
     }
@@ -1273,15 +1413,13 @@ fn summarize_transcript_text(
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        if tool_calls.iter().any(|call| {
-            call.get("name").and_then(Value::as_str) == Some("swarm_wait")
-        }) {
+        if tool_calls
+            .iter()
+            .any(|call| call.get("name").and_then(Value::as_str) == Some("swarm_wait"))
+        {
             break;
         }
-        let labeled_tool = tool_calls
-            .iter()
-            .rev()
-            .find_map(describe_tool_call);
+        let labeled_tool = tool_calls.iter().rev().find_map(describe_tool_call);
         if let Some(label) = labeled_tool {
             activity = Some(label);
             activity_kind = Some("tool".to_owned());
@@ -1811,7 +1949,7 @@ fn read_overview(
             .map(|reel| {
                 reel.frames
                     .into_iter()
-                    .take(MAX_SCREENSHOTS)
+                    .rev()
                     .filter_map(|frame| {
                         let path = frame.path.trim().to_owned();
                         if path.is_empty() {
@@ -1831,6 +1969,10 @@ fn read_overview(
                             agent,
                         })
                     })
+                    .take(MAX_SCREENSHOTS)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
                     .collect()
             })
             .unwrap_or_default();
@@ -1887,11 +2029,11 @@ fn read_overview(
                 let owners: Vec<String> = thread
                     .tasks
                     .iter()
-                    .take(16)
                     .map(|owner| one_line(owner, 48))
                     .filter(|owner| !owner.is_empty())
                     .collect();
                 let state = derive_thread_state(&owners, members);
+                let owners = owners.into_iter().take(16).collect();
                 AntigravitySwarmWorkstream {
                     id: if thread.id.trim().is_empty() {
                         format!("t-{index}")
@@ -1922,10 +2064,7 @@ fn read_overview(
         return (plan_stamp.to_owned(), Some(overview));
     }
 
-    (
-        fallback_view_stamp.unwrap_or_else(|| "-".to_owned()),
-        None,
-    )
+    (fallback_view_stamp.unwrap_or_else(|| "-".to_owned()), None)
 }
 
 fn derive_thread_state(owners: &[String], members: &[AntigravitySwarmMember]) -> String {
@@ -2051,6 +2190,185 @@ mod tests {
     }
 
     #[test]
+    fn durable_done_and_brief_markers_survive_two_mib_tail_aging_and_cold_reads() {
+        use std::io::Write as _;
+        let root = temp_root();
+        let dir = swarm_dir(&root, "durable");
+        write_file(
+            &dir.join("members.json"),
+            r#"{"members":{"worker":{"conversation_id":"worker","wake_mode":"mentions"}}}"#,
+        );
+        write_file(
+            &dir.join("plan.json"),
+            r#"{"threads":[{"id":"t","title":"Task","tasks":["worker"]}]}"#,
+        );
+        let board_path = dir.join("board.jsonl");
+        write_file(
+            &board_path,
+            "{\"seq\":1,\"agent\":\"worker\",\"text\":\"[done] finished\"}\n",
+        );
+        let read = || {
+            read_swarm_snapshot_in_roots(&[root.clone()], "durable", now_unix_ms())
+                .unwrap()
+                .unwrap()
+        };
+        assert!(read().members[0].has_posted_done);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&board_path)
+            .unwrap();
+        let padding = "x".repeat(1024);
+        for seq in 2..2300 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"seq":seq,"agent":"coordinator","text":padding})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let aged = read();
+        assert!(fs::metadata(&board_path).unwrap().len() > MAX_BOARD_TAIL_BYTES);
+        assert!(!aged.messages.iter().any(|m| m.seq == 1));
+        assert!(aged.members[0].has_posted_done);
+        assert_eq!(aged.overview.unwrap().workstreams[0].state, "done");
+
+        // A fresh board path has no in-memory index. The durable result must
+        // still be correct, not merely remember a marker seen before aging.
+        let cold_dir = swarm_dir(&root, "cold");
+        write_file(
+            &cold_dir.join("members.json"),
+            r#"{"members":{"worker":{"conversation_id":"worker","wake_mode":"mentions"}}}"#,
+        );
+        fs::copy(&board_path, cold_dir.join("board.jsonl")).unwrap();
+        let cold = read_swarm_snapshot_in_roots(&[root.clone()], "cold", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        assert!(cold.members[0].has_posted_done);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&board_path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"seq":2300,"agent":"coordinator","text":"@worker next task","kind":"brief"})).unwrap();
+        for seq in 2301..4600 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"seq":seq,"agent":"coordinator","text":padding})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let reassigned = read();
+        assert!(!reassigned.messages.iter().any(|m| m.seq == 2300));
+        assert!(!reassigned.members[0].has_posted_done);
+        assert_ne!(reassigned.overview.unwrap().workstreams[0].state, "done");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seventeenth_owner_controls_thread_state_before_display_cap() {
+        let root = temp_root();
+        let dir = swarm_dir(&root, "owners");
+        let mut roster = serde_json::Map::new();
+        let mut owners = Vec::new();
+        let mut board = String::new();
+        for i in 0..16 {
+            let name = format!("worker-{i}");
+            roster.insert(
+                name.clone(),
+                serde_json::json!({"conversation_id":name,"wake_mode":"mentions"}),
+            );
+            owners.push(name.clone());
+            board.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"seq":i+1,"agent":name,"text":"[done] finished"})
+            ));
+        }
+        roster.insert(
+            "active".into(),
+            serde_json::json!({"conversation_id":"active","wake_mode":"working"}),
+        );
+        roster.insert(
+            "failed".into(),
+            serde_json::json!({"conversation_id":"failed","wake_mode":"mentions"}),
+        );
+        write_file(
+            &transcript_path(&root, "failed"),
+            "{\"step_index\":0,\"type\":\"ERROR_MESSAGE\",\"status\":\"ERROR\",\"error\":\"quota exceeded\"}\n",
+        );
+        let threads: Vec<_> = ["active", "failed", "unknown"]
+            .into_iter()
+            .map(|last| {
+                let mut tasks = owners.clone();
+                tasks.push(last.to_owned());
+                serde_json::json!({"id":last,"title":last,"tasks":tasks})
+            })
+            .collect();
+        write_file(
+            &dir.join("members.json"),
+            &serde_json::json!({"members":roster}).to_string(),
+        );
+        write_file(&dir.join("board.jsonl"), &board);
+        write_file(
+            &dir.join("plan.json"),
+            &serde_json::json!({"threads":threads}).to_string(),
+        );
+        let snapshot = read_swarm_snapshot_in_roots(
+            &[root.clone()],
+            "owners",
+            now_unix_ms() + STEP_ERROR_SETTLE_MS + 1,
+        )
+        .unwrap()
+        .unwrap();
+        let streams = snapshot.overview.unwrap().workstreams;
+        assert!(streams.iter().all(|ws| ws.owners.len() == 16));
+        assert_eq!(streams[0].state, "active");
+        assert_eq!(streams[1].state, "failed");
+        assert_eq!(streams[2].state, "queued");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fallback_sequences_include_hidden_control_rows_and_reel_keeps_latest() {
+        let board = concat!(
+            "{\"agent\":\"a\",\"text\":\"first\"}\n",
+            "{\"agent\":\"system\",\"control\":{\"type\":\"nudge\"}}\n",
+            "{\"agent\":\"a\",\"text\":\"third\"}\n",
+            "{\"seq\":20,\"agent\":\"system\",\"control\":{}}\n",
+            "{\"agent\":\"a\",\"text\":\"last\"}\n"
+        );
+        let parsed = parse_board(board, &[], false);
+        assert_eq!(
+            parsed.messages.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            [1, 3, 21]
+        );
+        let board = (1..=80).map(|seq| format!("{}\n",
+            serde_json::json!({"seq":seq,"agent":"a","text":format!("Screenshot: /tmp/{seq}.png | Frame {seq}")})))
+            .collect::<String>();
+        let parsed = parse_board(&board, &[], false);
+        assert_eq!(parsed.screenshots.len(), MAX_SCREENSHOTS);
+        assert_eq!(parsed.screenshots[0].seq, Some(17));
+        assert_eq!(parsed.screenshots.last().unwrap().seq, Some(80));
+    }
+
+    #[test]
+    fn negative_cache_notices_new_swarm_in_preexisting_brain_directory() {
+        let root = temp_root();
+        let dir = swarm_dir(&root, "existing");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(locate_swarm(&[root.clone()], "worker-new").is_none());
+        assert!(is_negative_swarm_cached(&[root.clone()], "worker-new"));
+        write_file(
+            &dir.join("members.json"),
+            r#"{"members":{"worker":{"conversation_id":"worker-new"}}}"#,
+        );
+        assert!(locate_swarm(&[root.clone()], "worker-new").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn extracts_mentions_including_copy_prefixes_and_word_boundaries() {
         let names = vec![
             "coordinator".to_owned(),
@@ -2096,8 +2414,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(before.members[0].status, AntigravitySwarmMemberStatus::Working);
-        assert_eq!(after.members[0].status, AntigravitySwarmMemberStatus::Failed);
+        assert_eq!(
+            before.members[0].status,
+            AntigravitySwarmMemberStatus::Working
+        );
+        assert_eq!(
+            after.members[0].status,
+            AntigravitySwarmMemberStatus::Failed
+        );
         assert_eq!(before.board_fingerprint, after.board_fingerprint);
         assert_ne!(before.roster_fingerprint, after.roster_fingerprint);
         assert_ne!(before.fingerprint, after.fingerprint);
@@ -2244,21 +2568,36 @@ mod tests {
             .iter()
             .map(|member| (member.name.as_str(), member))
             .collect();
-        assert_eq!(by_name["coordinator"].status, AntigravitySwarmMemberStatus::Waiting);
-        assert_eq!(by_name["alpha"].status, AntigravitySwarmMemberStatus::Working);
+        assert_eq!(
+            by_name["coordinator"].status,
+            AntigravitySwarmMemberStatus::Waiting
+        );
+        assert_eq!(
+            by_name["alpha"].status,
+            AntigravitySwarmMemberStatus::Working
+        );
         assert_eq!(
             by_name["alpha"].activity.as_deref(),
             Some("Unit test execution")
         );
         assert_eq!(by_name["alpha"].unread, 1);
-        assert_eq!(by_name["beta"].status, AntigravitySwarmMemberStatus::Waiting);
+        assert_eq!(
+            by_name["beta"].status,
+            AntigravitySwarmMemberStatus::Waiting
+        );
         assert_eq!(by_name["beta"].activity, None);
-        assert_eq!(by_name["gamma"].status, AntigravitySwarmMemberStatus::Failed);
+        assert_eq!(
+            by_name["gamma"].status,
+            AntigravitySwarmMemberStatus::Failed
+        );
         assert_eq!(
             by_name["gamma"].failure.as_ref().map(|f| f.kind),
             Some(AntigravitySwarmFailureKind::Quota)
         );
-        assert_eq!(by_name["old-worker"].status, AntigravitySwarmMemberStatus::Killed);
+        assert_eq!(
+            by_name["old-worker"].status,
+            AntigravitySwarmMemberStatus::Killed
+        );
 
         // Overview attention is ranked decision > fyi.
         let overview = snapshot.overview.as_ref().expect("overview parsed");
@@ -2270,7 +2609,10 @@ mod tests {
         // System attention includes gamma's quota failure.
         assert_eq!(snapshot.system_attention.len(), 1);
         assert_eq!(snapshot.system_attention[0].kind, "quota");
-        assert_eq!(snapshot.system_attention[0].member.as_deref(), Some("gamma"));
+        assert_eq!(
+            snapshot.system_attention[0].member.as_deref(),
+            Some("gamma")
+        );
 
         // Querying by worker conversation ID resolves the same swarm and identifies `alpha`.
         let worker_view = read_swarm_snapshot_in_roots(&[root.clone()], worker_active, now_ms)
@@ -2306,10 +2648,7 @@ mod tests {
         assert!(snapshot.messages_truncated);
         assert_eq!(snapshot.messages.len(), MAX_BOARD_MESSAGES);
         assert_eq!(snapshot.messages[0].seq, 26);
-        assert_eq!(
-            snapshot.head_seq,
-            MAX_BOARD_MESSAGES as u64 + 25
-        );
+        assert_eq!(snapshot.head_seq, MAX_BOARD_MESSAGES as u64 + 25);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2646,7 +2985,10 @@ mod tests {
         // Control message seq 4 is filtered from messages, while head_seq advances.
         assert_eq!(snapshot.head_seq, 4);
         assert_eq!(snapshot.messages.len(), 3);
-        assert_eq!(snapshot.channels, vec!["main", "design", "infra", "z-extra"]);
+        assert_eq!(
+            snapshot.channels,
+            vec!["main", "design", "infra", "z-extra"]
+        );
         assert!(snapshot.board_fingerprint.is_some());
         assert!(snapshot.roster_fingerprint.is_some());
 
@@ -2657,20 +2999,35 @@ mod tests {
         assert_eq!(shot_msg.screenshots[0].path, "/tmp/brain/shot-1.png");
         assert_eq!(shot_msg.screenshots[0].caption, "Added split header");
         assert_eq!(shot_msg.screenshots[0].seq, Some(3));
-        assert_eq!(shot_msg.screenshots[0].agent.as_deref(), Some("worker-done"));
+        assert_eq!(
+            shot_msg.screenshots[0].agent.as_deref(),
+            Some("worker-done")
+        );
 
         let by_name: HashMap<&str, &AntigravitySwarmMember> = snapshot
             .members
             .iter()
             .map(|member| (member.name.as_str(), member))
             .collect();
-        assert_eq!(by_name["worker-stopped"].status, AntigravitySwarmMemberStatus::Stopped);
-        assert_eq!(by_name["worker-done"].status, AntigravitySwarmMemberStatus::Waiting);
+        assert_eq!(
+            by_name["worker-stopped"].status,
+            AntigravitySwarmMemberStatus::Stopped
+        );
+        assert_eq!(
+            by_name["worker-done"].status,
+            AntigravitySwarmMemberStatus::Waiting
+        );
         assert!(by_name["worker-done"].has_posted_done);
-        assert_eq!(by_name["worker-done"].task.as_deref(), Some("Parse board screenshots"));
+        assert_eq!(
+            by_name["worker-done"].task.as_deref(),
+            Some("Parse board screenshots")
+        );
         assert!(!by_name["worker-reassigned"].has_posted_done);
 
-        let overview = snapshot.overview.as_ref().expect("plan.json overview populated");
+        let overview = snapshot
+            .overview
+            .as_ref()
+            .expect("plan.json overview populated");
         assert_eq!(overview.source.as_deref(), Some("plan"));
         assert_eq!(overview.headline, "Ship native Swarm Overview");
         assert_eq!(
@@ -2736,7 +3093,10 @@ mod tests {
             .expect("snapshot exists");
         let overview = snapshot.overview.as_ref().expect("overview present");
         assert_eq!(overview.source.as_deref(), Some("view"));
-        assert_eq!(overview.goal_line.as_deref(), Some("Align cards across themes."));
+        assert_eq!(
+            overview.goal_line.as_deref(),
+            Some("Align cards across themes.")
+        );
         assert_eq!(overview.attention[0].member.as_deref(), Some("coordinator"));
         assert_eq!(overview.attention[1].member.as_deref(), Some("alpha"));
         assert_eq!(overview.screenshots.len(), 1);
@@ -2796,11 +3156,15 @@ mod tests {
             r#"{"title":"Other","members":{"coordinator":{"conversation_id":"coord-existing-1","role":"coordinator"}}}"#,
         );
 
-        assert!(locate_swarm_with_cap(&[root.clone()], &plain_session, MAX_BRAIN_SCAN_DIRS).is_none());
+        assert!(
+            locate_swarm_with_cap(&[root.clone()], &plain_session, MAX_BRAIN_SCAN_DIRS).is_none()
+        );
         assert!(is_negative_swarm_cached(&[root.clone()], &plain_session));
 
         // While nothing changed, subsequent polls hit the negative cache without rescanning.
-        assert!(locate_swarm_with_cap(&[root.clone()], &plain_session, MAX_BRAIN_SCAN_DIRS).is_none());
+        assert!(
+            locate_swarm_with_cap(&[root.clone()], &plain_session, MAX_BRAIN_SCAN_DIRS).is_none()
+        );
 
         // Updating an existing swarm's `members.json` invalidates the negative cache immediately.
         std::thread::sleep(Duration::from_millis(20));

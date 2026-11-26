@@ -187,10 +187,7 @@ struct PiProcessHandle {
 }
 
 impl PiProcessHandle {
-    fn new(
-        pid: u32,
-        #[cfg(windows)] job: Option<crate::process_tree::KillOnCloseJob>,
-    ) -> Self {
+    fn new(pid: u32, #[cfg(windows)] job: Option<crate::process_tree::KillOnCloseJob>) -> Self {
         Self {
             state: Mutex::new(PiProcessState {
                 pid,
@@ -379,6 +376,7 @@ impl PiDriver {
         if let Some(model) = model.as_deref() {
             parse_model_slug(model)?;
         }
+        let computer_use_enabled = crate::computer_use::resolve_enabled(computer_use_enabled);
 
         let computer_use = (computer_use_enabled && flavor.supports_waku_computer_use())
             .then(|| computer_use_runtime::ComputerUseRuntime::start(events.clone()))
@@ -1147,7 +1145,8 @@ fn pi_stderr_error_line(raw: &str) -> Option<String> {
         || lower.starts_with("hint:")
         || lower.starts_with("deprecationwarning:")
         || lower.starts_with("experimentalwarning:")
-        || ((lower.starts_with("(node:") || lower.starts_with("(bun:")) && lower.contains("warning"))
+        || ((lower.starts_with("(node:") || lower.starts_with("(bun:"))
+            && lower.contains("warning"))
     {
         return None;
     }
@@ -1492,10 +1491,10 @@ fn fork_pi_session(
         return clone_ohmypi_session(binary, cwd, session_file).map_err(ForkError::Recoverable);
     }
 
-    let request = pi_fork_request(flavor, messages, turns_to_remove)
-        .map_err(ForkError::Recoverable)?;
-    let fork = send_request(stdin, pending, next_request_id, request)
-        .map_err(ForkError::Recoverable)?;
+    let request =
+        pi_fork_request(flavor, messages, turns_to_remove).map_err(ForkError::Recoverable)?;
+    let fork =
+        send_request(stdin, pending, next_request_id, request).map_err(ForkError::Recoverable)?;
     if fork.pointer("/data/cancelled").and_then(Value::as_bool) == Some(true) {
         return Err(ForkError::Recoverable(format!(
             "{name} session fork was cancelled"
@@ -1516,9 +1515,7 @@ fn fork_pi_session(
         let session_file = flavor
             .session_file_from_cursor(original_cursor)
             .ok_or_else(|| {
-                ForkError::SessionDesynced(format!(
-                    "{name}'s original session file is unavailable"
-                ))
+                ForkError::SessionDesynced(format!("{name}'s original session file is unavailable"))
             })?;
         let switched = send_request(
             stdin,
@@ -3002,7 +2999,9 @@ mod tests {
             vec![
                 Ok(json!({"success": true, "data": {"messages": [{"entryId": "e1"}]}})),
                 Ok(json!({"success": true, "data": {"cancelled": false}})),
-                Ok(json!({"success": true, "data": {"sessionId": "fork-1", "sessionFile": "/tmp/fork.jsonl"}})),
+                Ok(
+                    json!({"success": true, "data": {"sessionId": "fork-1", "sessionFile": "/tmp/fork.jsonl"}}),
+                ),
                 Err("switch_session failed".to_owned()),
             ],
         );
@@ -3027,9 +3026,13 @@ mod tests {
             vec![
                 Ok(json!({"success": true, "data": {"messages": [{"entryId": "e1"}]}})),
                 Ok(json!({"success": true, "data": {"cancelled": false}})),
-                Ok(json!({"success": true, "data": {"sessionId": "fork-2", "sessionFile": "/tmp/fork2.jsonl"}})),
+                Ok(
+                    json!({"success": true, "data": {"sessionId": "fork-2", "sessionFile": "/tmp/fork2.jsonl"}}),
+                ),
                 Ok(json!({"success": true, "data": {"cancelled": false}})),
-                Ok(json!({"success": true, "data": {"sessionId": "wrong-id", "sessionFile": "/tmp/wrong.jsonl"}})),
+                Ok(
+                    json!({"success": true, "data": {"sessionId": "wrong-id", "sessionFile": "/tmp/wrong.jsonl"}}),
+                ),
             ],
         );
         let err = fork_pi_session(

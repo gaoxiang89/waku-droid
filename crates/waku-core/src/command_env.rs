@@ -416,14 +416,21 @@ pub fn antigravity_account_env(config_dir: &Path) -> Vec<(String, String)> {
         if let Ok(file) = std::fs::File::open(&env_file) {
             use std::io::Read as _;
             let mut buf = Vec::with_capacity(limit);
-            if file.take(MAX_ANTIGRAVITY_ENV_FILE_BYTES).read_to_end(&mut buf).is_ok() {
+            if file
+                .take(MAX_ANTIGRAVITY_ENV_FILE_BYTES)
+                .read_to_end(&mut buf)
+                .is_ok()
+            {
                 let text = String::from_utf8_lossy(&buf);
                 for raw_line in text.lines() {
                     let line = raw_line.trim();
                     if line.is_empty() || line.starts_with('#') {
                         continue;
                     }
-                    let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+                    let line = line
+                        .strip_prefix("export ")
+                        .map(str::trim_start)
+                        .unwrap_or(line);
                     let Some((raw_key, raw_val)) = line.split_once('=') else {
                         continue;
                     };
@@ -1909,10 +1916,19 @@ mod tests {
         );
 
         let mut cmd = plain_command("echo");
-        apply_provider_config_dir(&mut cmd, crate::model::ProviderKind::Antigravity, Some(&dir));
+        apply_provider_config_dir(
+            &mut cmd,
+            crate::model::ProviderKind::Antigravity,
+            Some(&dir),
+        );
         let mut applied: Vec<(String, String)> = cmd
             .get_envs()
-            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
             .collect();
         applied.sort();
         let mut expected = env.clone();

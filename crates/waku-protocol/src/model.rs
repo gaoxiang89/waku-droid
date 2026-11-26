@@ -2942,8 +2942,8 @@ fn parse_prefixed_mcp_tool_name(name: &str) -> Option<(&str, &str)> {
     {
         return Some((server, tool));
     }
-    if name.len() > 4
-        && name[..4].eq_ignore_ascii_case("mcp:")
+    if let Some(prefix) = name.get(..4)
+        && prefix.eq_ignore_ascii_case("mcp:")
         && let Some((server, tool)) = name[4..].split_once('/')
     {
         let server = server.trim();
@@ -4091,6 +4091,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multibyte_tool_names_never_panic_and_keep_mcp_prefix_parsing() {
+        for name in [
+            "文件",
+            "文件读取",
+            "读",
+            "é",
+            "mcé",
+            "mc文件",
+            "m文件/x",
+            "📁",
+            "📁/tool",
+            "ab📁",
+            "abc📁/tool",
+            "工具/子工具",
+            "文",
+            "文件-a-📁-mixed-tool-name-that-exceeds-four-bytes",
+        ] {
+            let item = ActivityItem::new(None, ActivityKind::Tool, "Tool", None, true)
+                .with_tool_name(Some(name));
+            assert_eq!(item.tool_name.as_deref(), Some(name), "{name}");
+            assert_eq!(item.mcp_server, None, "{name}");
+            assert_eq!(parse_prefixed_mcp_tool_name(name), None, "{name}");
+            let stored = item.tool_name.as_deref().unwrap();
+            assert!(
+                name.starts_with(stored),
+                "{name} stored {stored}, which is not a prefix"
+            );
+        }
+
+        let item = ActivityItem::new(None, ActivityKind::Tool, "Tool", None, true)
+            .with_tool_name(Some("mcp:文件服务/读取"));
+        assert_eq!(item.mcp_server.as_deref(), Some("文件服务"));
+        assert_eq!(item.tool_name.as_deref(), Some("读取"));
+        assert_eq!(
+            parse_prefixed_mcp_tool_name("Mcp: 服务 / 📁 "),
+            Some(("服务", "📁"))
+        );
+        assert_eq!(
+            parse_prefixed_mcp_tool_name("mcp__文件__读取"),
+            Some(("文件", "读取"))
+        );
+        assert_eq!(parse_prefixed_mcp_tool_name("mcp:"), None);
+        assert_eq!(parse_prefixed_mcp_tool_name("mcp:/tool"), None);
+    }
+
+    #[test]
     fn legacy_plan_access_mode_loads_as_supervised() {
         let mode: RuntimeMode = serde_json::from_str(r#""plan""#).unwrap();
 
@@ -4807,11 +4853,7 @@ mod tests {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
         }
-        for provider in [
-            ProviderKind::Fx,
-            ProviderKind::Kimi,
-            ProviderKind::Droid,
-        ] {
+        for provider in [ProviderKind::Fx, ProviderKind::Kimi, ProviderKind::Droid] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
         }
@@ -5918,15 +5960,16 @@ mod tests {
         );
 
         let execute_prefers_description =
-            ActivityItem::new(None, ActivityKind::Command, "Run tests", None, true)
-                .with_arguments(Some(
+            ActivityItem::new(None, ActivityKind::Command, "Run tests", None, true).with_arguments(
+                Some(
                     serde_json::json!({
                         "command": "cargo test",
                         "description": "Explicit description",
                         "summary": "Fallback summary"
                     })
                     .to_string(),
-                ));
+                ),
+            );
         assert_eq!(
             execute_prefers_description.display_description.as_deref(),
             Some("Explicit description")
@@ -5944,14 +5987,18 @@ mod tests {
 
         let folder_only =
             ActivityItem::new(None, ActivityKind::FileSearch, "Find files", None, true)
-                .with_arguments(Some(serde_json::json!({ "folder": "crates/waku-core" }).to_string()));
+                .with_arguments(Some(
+                    serde_json::json!({ "folder": "crates/waku-core" }).to_string(),
+                ));
         assert_eq!(
             folder_only.display_target.as_deref(),
             Some("crates/waku-core")
         );
 
         let list = ActivityItem::new(None, ActivityKind::FileList, "List src", None, true)
-            .with_arguments(Some(serde_json::json!({ "directory_path": "src/app" }).to_string()));
+            .with_arguments(Some(
+                serde_json::json!({ "directory_path": "src/app" }).to_string(),
+            ));
         assert_eq!(list.display_target.as_deref(), Some("src/app"));
 
         let fetch = ActivityItem::new(None, ActivityKind::Search, "Fetch docs", None, true)
@@ -5963,15 +6010,27 @@ mod tests {
             Some("https://docs.factory.ai/droid")
         );
 
-        assert_eq!(ActivityKind::from_tool_name("ExitSpecMode"), ActivityKind::Plan);
-        assert_eq!(ActivityKind::from_tool_name("FetchUrl"), ActivityKind::Search);
+        assert_eq!(
+            ActivityKind::from_tool_name("ExitSpecMode"),
+            ActivityKind::Plan
+        );
+        assert_eq!(
+            ActivityKind::from_tool_name("FetchUrl"),
+            ActivityKind::Search
+        );
         assert!(
             !is_generic_activity_title(ActivityKind::Plan, "Approve Spec"),
             "Approve Spec must stay a specific title rather than collapsing to generic Plan updated"
         );
 
-        let droid_mcp = ActivityItem::new(None, ActivityKind::Tool, "github: search_issues", None, true)
-            .with_tool_name(Some("MCP:github/search_issues"));
+        let droid_mcp = ActivityItem::new(
+            None,
+            ActivityKind::Tool,
+            "github: search_issues",
+            None,
+            true,
+        )
+        .with_tool_name(Some("MCP:github/search_issues"));
         assert_eq!(droid_mcp.mcp_server.as_deref(), Some("github"));
         assert_eq!(droid_mcp.tool_name.as_deref(), Some("search_issues"));
     }

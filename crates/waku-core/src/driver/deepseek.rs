@@ -1876,7 +1876,9 @@ mod tests {
         F: Fn(&str, &Value) -> anyhow::Result<Value>,
     {
         fn rpc(&self, method: &str, payload: Value) -> anyhow::Result<Value> {
-            self.rpc_calls.lock().push((method.to_owned(), payload.clone()));
+            self.rpc_calls
+                .lock()
+                .push((method.to_owned(), payload.clone()));
             (self.rpc_handler)(method, &payload)
         }
 

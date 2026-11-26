@@ -1001,8 +1001,14 @@ mod tests {
                 &mut state,
             );
 
-            assert!(!refresh_title, "failed stop reason `{reason}` should not trigger title refresh");
-            assert!(!*turn.lock(), "stop reason `{reason}` must clear turn_active");
+            assert!(
+                !refresh_title,
+                "failed stop reason `{reason}` should not trigger title refresh"
+            );
+            assert!(
+                !*turn.lock(),
+                "stop reason `{reason}` must clear turn_active"
+            );
             let seen = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             assert_eq!(seen.len(), 1);
             assert!(
@@ -1106,7 +1112,10 @@ mod tests {
 
         driver.cancel();
         assert!(handle.was_cancelled());
-        assert!(matches!(command_rx.try_recv(), Ok(CommandMessage::Shutdown)));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(CommandMessage::Shutdown)
+        ));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let exited = loop {
@@ -1121,7 +1130,10 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         };
         handle.mark_exited();
-        assert!(exited, "AmpDriver::cancel should terminate the child promptly");
+        assert!(
+            exited,
+            "AmpDriver::cancel should terminate the child promptly"
+        );
         // Calling terminate after mark_exited must be a safe no-op.
         handle.terminate();
     }

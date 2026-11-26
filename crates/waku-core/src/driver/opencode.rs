@@ -455,6 +455,7 @@ impl OpenCodeDriver {
             provider_cursor,
             config_dir: _,
         } = options;
+        let computer_use_enabled = crate::computer_use::resolve_enabled(computer_use_enabled);
 
         let (resumed, cursor_directory) = match provider_cursor {
             Some(ProviderResumeCursor::OpenCode {
@@ -476,12 +477,8 @@ impl OpenCodeDriver {
         // by exact string equality, so a trailing slash, verbatim prefix, or
         // mismatched symlink silently yields zero sessions — and a directory
         // the service cannot resolve answers HTTP 500 with an empty body.
-        let directory = resolve_session_directory(
-            &cwd,
-            resumed
-                .as_ref()
-                .and(cursor_directory.as_deref()),
-        )?;
+        let directory =
+            resolve_session_directory(&cwd, resumed.as_ref().and(cursor_directory.as_deref()))?;
 
         let service = opencode_service::shared(&binary)?;
         let endpoint = service.endpoint();
@@ -772,7 +769,10 @@ fn resolve_session_directory(
     cwd: &std::path::Path,
     cursor_directory: Option<&str>,
 ) -> anyhow::Result<String> {
-    if let Some(directory) = cursor_directory.map(str::trim).filter(|dir| !dir.is_empty()) {
+    if let Some(directory) = cursor_directory
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    {
         let candidate = std::path::Path::new(directory);
         if candidate.is_absolute() && candidate.is_dir() {
             return Ok(opencode_api::strip_windows_verbatim_prefix(directory));

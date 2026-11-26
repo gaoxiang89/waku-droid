@@ -355,7 +355,11 @@ impl Waku {
                     this.confirm_remote_folder(window, cx);
                     cx.stop_propagation();
                 } else if !event.keystroke.modifiers.modified()
-                    && !this.remote_folder_path_input.read(cx).focus().is_focused(window)
+                    && !this
+                        .remote_folder_path_input
+                        .read(cx)
+                        .focus()
+                        .is_focused(window)
                     && let Some(picker) = this.remote_folder_picker.as_ref()
                     && !picker.row_focuses.is_empty()
                 {
@@ -552,7 +556,10 @@ fn split_remote_prefix(path: &str, separator: char) -> (&str, &str) {
                 .nth(1)
                 .map(|(index, _)| 2 + index)
                 .unwrap_or(path.len());
-            return (&path[..share_end], path[share_end..].trim_start_matches('\\'));
+            return (
+                &path[..share_end],
+                path[share_end..].trim_start_matches('\\'),
+            );
         }
         if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
             return (&path[..2], path[2..].trim_start_matches(['\\', '/']));

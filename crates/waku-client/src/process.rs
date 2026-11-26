@@ -697,12 +697,9 @@ impl DaemonSupervisor {
                 detail => error.context(detail),
             },
         };
-        let client = connect_desktop_client(
-            session.address(),
-            session.token().to_owned(),
-            Vec::new(),
-        )
-        .map_err(bridge_error)?;
+        let client =
+            connect_desktop_client(session.address(), session.token().to_owned(), Vec::new())
+                .map_err(bridge_error)?;
         let settings = read_settings(&client).map_err(bridge_error)?;
         Self::remote(
             client,

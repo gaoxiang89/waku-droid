@@ -4360,7 +4360,7 @@ impl Waku {
     /// Whether any GPUI overlay that could float above the right panel is
     /// open. The native webview always draws over GPUI, so while this holds
     /// the live page swaps for a frozen snapshot.
-    fn any_overlay_open(&self, cx: &App) -> bool {
+    pub(super) fn any_overlay_open(&self, cx: &App) -> bool {
         self.menus.borrow().values().any(ContextMenuHandle::is_open)
             || self.selected_runtime().is_some_and(|runtime| {
                 runtime.computer_use_previews.iter().any(|preview| {

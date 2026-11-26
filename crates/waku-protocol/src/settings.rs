@@ -168,7 +168,10 @@ mod tests {
         assert_eq!(settings.account(ProviderKind::Claude, None), None);
         assert_eq!(settings.account(ProviderKind::Claude, Some("")), None);
         assert_eq!(settings.account(ProviderKind::Claude, Some("   ")), None);
-        assert_eq!(settings.account(ProviderKind::Claude, Some("missing")), None);
+        assert_eq!(
+            settings.account(ProviderKind::Claude, Some("missing")),
+            None
+        );
         assert_eq!(settings.account(ProviderKind::Grok, Some("work")), None);
 
         let claude_ids: Vec<&str> = settings
@@ -205,7 +208,10 @@ mod tests {
             Some("/usr/local/bin/claude")
         );
         // Provider without any override yields None.
-        assert_eq!(settings.effective_binary_override(ProviderKind::Grok, None), None);
+        assert_eq!(
+            settings.effective_binary_override(ProviderKind::Grok, None),
+            None
+        );
     }
 
     #[test]
@@ -224,7 +230,10 @@ mod tests {
             settings.effective_config_dir(ProviderKind::Claude, Some("blank-dir")),
             None
         );
-        assert_eq!(settings.effective_config_dir(ProviderKind::Claude, None), None);
+        assert_eq!(
+            settings.effective_config_dir(ProviderKind::Claude, None),
+            None
+        );
         assert_eq!(
             settings.effective_config_dir(ProviderKind::Claude, Some("missing")),
             None

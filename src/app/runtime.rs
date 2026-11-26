@@ -305,13 +305,13 @@ fn merge_host_task_state(
 /// Resolve a session's merged slash-command catalog from the discovery cache
 /// without reading the currently selected tab's `slash_command_index`.
 ///
-/// Falls back to the project root's cache entry when a freshly materialized
-/// worktree has not been scanned yet, and never leaves a `Loading` slot behind
-/// on a miss. Returns `(commands, had_discovered_cache_hit)`.
+/// A project-root entry is not evidence about a worktree's branch-local
+/// templates. Never leave a `Loading` slot behind on a miss. Returns
+/// `(commands, had_discovered_cache_hit)`.
 pub(super) fn session_slash_commands_from_cache(
     cache: &mut QueryCache<SlashCommandCacheKey, Vec<SlashCommand>>,
     primary_key: &SlashCommandCacheKey,
-    fallback_project_key: Option<&SlashCommandCacheKey>,
+    _fallback_project_key: Option<&SlashCommandCacheKey>,
     reported: &[crate::model::ReportedCommand],
 ) -> (Vec<SlashCommand>, bool) {
     let mut lookup = |key: &SlashCommandCacheKey| match cache.read(key) {
@@ -328,19 +328,38 @@ pub(super) fn session_slash_commands_from_cache(
             true,
         );
     }
-    if let Some(fallback_key) = fallback_project_key
-        && fallback_key != primary_key
-        && let Some(discovered) = lookup(fallback_key)
-    {
-        return (
-            crate::composer_complete::merge_reported_commands(&discovered, reported),
-            true,
-        );
-    }
     (
         crate::composer_complete::merge_reported_commands(&[], reported),
         false,
     )
+}
+
+/// Plan only after template expansion, so a cold slash template receives the
+/// same cross-account recap as prose. Native slash commands still travel alone.
+pub(super) fn prepared_prompt_with_handoff(
+    session: &mut AgentSession,
+    prompt: &str,
+    accounts: &[waku_client::ProviderAccount],
+) -> String {
+    if prompt.trim_start().starts_with('/') {
+        return prompt.to_owned();
+    }
+    let Some(plan) = super::handoff::plan_with_accounts(session, prompt, accounts) else {
+        return prompt.to_owned();
+    };
+    let Some(turn) = session.turns.last_mut() else {
+        return prompt.to_owned();
+    };
+    turn.handoff = Some(plan.record);
+    let turn_id = turn.id;
+    let notice = Message::new_for_turn(MessageRole::System, plan.notice, turn_id);
+    let index = session
+        .messages
+        .iter()
+        .position(|message| message.turn_id == Some(turn_id))
+        .unwrap_or(session.messages.len());
+    session.messages.insert(index, notice);
+    super::handoff::compose_prompt(&plan.preamble, prompt)
 }
 
 /// Perform every blocking operation between accepting a submission and
@@ -771,12 +790,10 @@ fn perform_provider_rewind(
         }
         // Unreachable through the UI, which hides rewinding for providers that
         // answer `supports_conversation_rollback` with false.
-        ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => {
-            Err(anyhow::anyhow!(tr!(
-                "errors.provider_turn_branching_unsupported",
-                provider = provider.display_name()
-            )))
-        }
+        ProviderKind::Droid | ProviderKind::Fx | ProviderKind::Kimi => Err(anyhow::anyhow!(tr!(
+            "errors.provider_turn_branching_unsupported",
+            provider = provider.display_name()
+        ))),
     }
 }
 
@@ -1342,6 +1359,8 @@ impl Waku {
             snapshot,
             |id| runtime_ids.contains(&id),
         );
+        // A remote snapshot replaces session payloads wholesale.
+        self.invalidate_activity_details();
         for session_id in &removed {
             self.runtime_attach_pending.remove(session_id);
             self.runtime_attach_misses.remove(session_id);
@@ -1727,15 +1746,15 @@ impl Waku {
             provider,
             account_id,
         );
-        let config_dir = (provider == ProviderKind::Antigravity)
-            .then(|| {
-                self.effective_config_dir_for_host(
-                    &waku_client::hosts::HostKey::Local,
-                    provider,
-                    account_id,
-                )
-            })
-            .flatten();
+        let config_dir = account_model_discovery_config_dir(
+            provider,
+            self.effective_config_dir_for_host(
+                &waku_client::hosts::HostKey::Local,
+                provider,
+                account_id,
+            )
+            .as_deref(),
+        );
         (binary_override, config_dir)
     }
 
@@ -1756,20 +1775,15 @@ impl Waku {
         else {
             return;
         };
-        let fallback = match account_id.as_deref() {
-            Some(id) => self
-                .local_account_probes
+        let global = probe;
+        let previous = account_id.as_deref().and_then(|id| {
+            self.local_account_probes
                 .get(&provider)
                 .and_then(|probes| probes.get(id))
                 .cloned()
-                .unwrap_or(ProviderProbe {
-                    installed: false,
-                    path: None,
-                    ..probe
-                }),
-            None => probe,
-        };
-        self.provider_model_discoveries.insert(provider, account_id.clone());
+        });
+        self.provider_model_discoveries
+            .insert(provider, account_id.clone());
         self.provider_model_discoveries_pending.insert(provider);
         let generation = self.provider_probe_state.begin_discovery(provider);
         let provider_probe_tx = self.provider_probe_tx.clone();
@@ -1780,7 +1794,8 @@ impl Waku {
         if std::thread::Builder::new()
             .name(format!("waku-{}-model-discovery", provider.id()))
             .spawn(move || {
-                let discovered = match daemon.request(
+                let named_account = account_id.is_some();
+                let result = match daemon.request(
                     Uuid::nil(),
                     Uuid::nil(),
                     waku_client::Command::ProbeProvider {
@@ -1792,22 +1807,28 @@ impl Waku {
                     },
                 ) {
                     Ok(waku_client::ResponsePayload::ProviderProbe { mut probe, .. }) => {
-                        if account_id.is_some() && !probe.installed {
+                        if named_account && !probe.installed && probe.discovery_error.is_none() {
                             probe.discovery_error = Some(tr!(
                                 "errors.provider_not_found",
                                 provider = provider.display_name()
                             ));
                         }
-                        probe
+                        Ok(probe)
                     }
-                    Err(error) if account_id.is_some() => ProviderProbe {
-                        discovery_error: Some(error.to_string()),
-                        ..fallback
-                    },
-                    _ => fallback,
+                    Err(error) if named_account => Err(error.to_string()),
+                    _ if named_account => Err("model discovery failed".to_owned()),
+                    _ => Ok(global.clone()),
+                };
+                let update = if named_account {
+                    account_model_discovery_update(&global, previous.as_ref(), result)
+                } else {
+                    AccountDiscoveryUpdate {
+                        probe: result.unwrap_or(global),
+                        completed: true,
+                    }
                 };
                 if provider_probe_tx
-                    .send((generation, account_id, discovered))
+                    .send((generation, account_id, update.probe, update.completed))
                     .is_ok()
                 {
                     signal_event_pump(&event_wake);
@@ -1820,7 +1841,11 @@ impl Waku {
         }
     }
 
-    pub(super) fn invalidate_local_account_probe(&mut self, provider: ProviderKind, account_id: &str) {
+    pub(super) fn invalidate_local_account_probe(
+        &mut self,
+        provider: ProviderKind,
+        account_id: &str,
+    ) {
         if let Some(probes) = self.local_account_probes.get_mut(&provider) {
             probes.remove(account_id);
         }
@@ -3015,7 +3040,12 @@ impl Waku {
             cleanup_error,
         } = prepared;
         let retained_turn_count = turn_count.saturating_sub(1);
-        if !self.state.sessions.iter().any(|session| session.id == session_id) {
+        if !self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
             return;
         }
         if selected {
@@ -3675,11 +3705,8 @@ impl Waku {
             session.provider,
             session.account_id.as_deref(),
         );
-        let binary_override = self.effective_binary_override_for_host(
-            &host,
-            session.provider,
-            account_id.as_deref(),
-        );
+        let binary_override =
+            self.effective_binary_override_for_host(&host, session.provider, account_id.as_deref());
         Some((
             host,
             session.provider,
@@ -3978,10 +4005,8 @@ impl Waku {
         } else {
             Vec::new()
         };
-        let (resolved_prompt, had_cached_commands) =
-            self.resolve_provider_submission_for_session(session_id, session_provider, &prompt, None);
+        let (_, had_cached_commands) = self.slash_commands_for_session(session_id);
         let session_host = self.hosts.ownership.session(session_id);
-        let host_accounts = self.provider_accounts_for(&session_host).to_vec();
         let command_discovery = (prompt.trim_start().starts_with('/')
             && (!had_cached_commands || matches!(workspace, SessionWorkspace::NewWorktree { .. })))
         .then(|| {
@@ -4007,28 +4032,13 @@ impl Waku {
         });
         let transcript_anchor = if let Some(session) = self.state.session_mut(session_id) {
             session.set_title_from_prompt(&human_prompt);
-            // A task may change agents or accounts between turns. The incoming
-            // agent has no memory of the outgoing one's conversation, so the
-            // earlier turns travel with the prompt as a preamble the driver
-            // prepends once, plus a transcript notice that says so on the
-            // record.
-            let handoff = (!resolved_prompt.trim_start().starts_with('/'))
-                .then(|| super::handoff::plan_with_accounts(session, &prompt, &host_accounts))
-                .flatten();
-            let turn_id = match handoff {
-                Some(handoff) => session.begin_turn_with_handoff(
-                    &prompt,
-                    submission.display_content.clone(),
-                    submission.attachments.clone(),
-                    Some((handoff.notice, handoff.record)),
-                    Some(handoff.preamble),
-                ),
-                None => session.begin_turn_with_presentation(
-                    &prompt,
-                    submission.display_content.clone(),
-                    submission.attachments.clone(),
-                ),
-            };
+            // The row appears immediately, but handoff planning waits for
+            // asynchronous branch-local template expansion below.
+            let turn_id = session.begin_turn_with_presentation(
+                &prompt,
+                submission.display_content.clone(),
+                submission.attachments.clone(),
+            );
             session.status = SessionStatus::Connecting;
             session.updated_at = unix_time();
             selected.then_some(TranscriptAnchor {
@@ -4087,34 +4097,34 @@ impl Waku {
                         &preparation_prompt,
                         next_turn_count,
                     );
-                    let discovered_commands =
-                        match (&prepared, command_discovery, discovery_client) {
-                            (
-                                Ok(prepared),
-                                Some((provider, binary_override, config_dir)),
-                                Some(client),
-                            ) => {
-                                let root = prepared
-                                    .workspace
-                                    .path()
-                                    .unwrap_or(&project_root_fallback)
-                                    .to_path_buf();
-                                match client.request(
-                                    waku_client::WorkspaceOperation::DiscoverSlashCommands {
-                                        provider,
-                                        project_root: root,
-                                        binary_override,
-                                        config_dir,
-                                    },
-                                ) {
-                                    Ok(waku_client::WorkspaceResult::SlashCommands {
-                                        commands,
-                                    }) => Some(commands),
-                                    Ok(_) | Err(_) => None,
+                    let discovered_commands = match (&prepared, command_discovery, discovery_client)
+                    {
+                        (
+                            Ok(prepared),
+                            Some((provider, binary_override, config_dir)),
+                            Some(client),
+                        ) => {
+                            let root = prepared
+                                .workspace
+                                .path()
+                                .unwrap_or(&project_root_fallback)
+                                .to_path_buf();
+                            match client.request(
+                                waku_client::WorkspaceOperation::DiscoverSlashCommands {
+                                    provider,
+                                    project_root: root,
+                                    binary_override,
+                                    config_dir,
+                                },
+                            ) {
+                                Ok(waku_client::WorkspaceResult::SlashCommands { commands }) => {
+                                    Some(commands)
                                 }
+                                Ok(_) | Err(_) => None,
                             }
-                            _ => None,
-                        };
+                        }
+                        _ => None,
+                    };
                     (prepared, discovered_commands)
                 })
                 .await;
@@ -4223,17 +4233,10 @@ impl Waku {
             self.reload_clean_right_panel_file_editors(cx);
             self.ensure_right_panel_terminals(cx);
         }
-        if let Some(commands) = discovered_commands.as_ref()
-            && let Some(key) = self
-                .state
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .and_then(|session| self.slash_command_cache_key_for_session(session))
-            && let Query::Missing(token) = self.slash_commands.read(&key)
-        {
-            self.slash_commands.fulfill(token, commands.clone());
-        }
+        // Submission discovery belongs to the scope captured when preparation
+        // started. Do not mint a fresh cache token here: an account edit may
+        // have invalidated that scope while its request was in flight.
+        // Autocomplete owns independently generation-guarded cache refreshes.
         let driver = match prepared_driver {
             None => self
                 .runtimes
@@ -4276,28 +4279,16 @@ impl Waku {
         // while templates expand and skills adopt provider-native syntax.
         // Claude's commands pass through untouched; its CLI owns expansion.
         let prompt = submission.prompt;
-        // A handoff preamble belongs to exactly one prompt: it describes the
-        // conversation as it stood when this turn began. Take it so a retry or
-        // the next turn cannot send it twice. Busy sessions reject new turns,
-        // so the turn created at accept time is still the last one here.
-        let handoff_preamble = self
-            .state
-            .session_mut(session_id)
-            .and_then(|session| session.turns.last_mut())
-            .and_then(|turn| turn.handoff_preamble.take());
         let (mut driver_prompt, _) = self.resolve_provider_submission_for_session(
             session_id,
             provider,
             &prompt,
             discovered_commands.as_deref(),
         );
-        if let Some(preamble) = handoff_preamble {
-            // A provider-native command owns the head of its message, so it
-            // travels alone; the incoming agent still resumes its own
-            // conversation, it simply misses this one turn's recap.
-            if !driver_prompt.trim_start().starts_with('/') {
-                driver_prompt = super::handoff::compose_prompt(&preamble, &driver_prompt);
-            }
+        let session_host = self.hosts.ownership.session(session_id);
+        let host_accounts = self.provider_accounts_for(&session_host).to_vec();
+        if let Some(session) = self.state.session_mut(session_id) {
+            driver_prompt = prepared_prompt_with_handoff(session, &driver_prompt, &host_accounts);
         }
         // The turn and its user message landed at accept time. Their ids go
         // with the prompt so every other client attached to the runtime
@@ -4648,7 +4639,9 @@ impl Waku {
 
     pub(super) fn drain_provider_probe_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((generation, account_id, probe)) = self.provider_probe_events.try_recv() {
+        while let Ok((generation, account_id, probe, completed)) =
+            self.provider_probe_events.try_recv()
+        {
             if !self
                 .provider_probe_state
                 .accept_discovery(generation, probe.provider)
@@ -4658,10 +4651,26 @@ impl Waku {
             self.provider_model_discoveries_pending
                 .remove(&probe.provider);
             if let Some(account_id) = account_id {
-                self.local_account_probes
-                    .entry(probe.provider)
-                    .or_default()
-                    .insert(account_id, probe);
+                if completed {
+                    self.local_account_probes
+                        .entry(probe.provider)
+                        .or_default()
+                        .insert(account_id, probe);
+                } else {
+                    let provider = probe.provider;
+                    let probes = self.local_account_probes.entry(provider).or_default();
+                    match probes.get_mut(&account_id) {
+                        Some(existing) => {
+                            existing.discovery_error = probe.discovery_error;
+                        }
+                        None if probe.installed => {
+                            probes.insert(account_id, probe);
+                        }
+                        None => {}
+                    }
+                    // A transport failure is not a finished catalog lookup.
+                    self.provider_model_discoveries.remove(&provider);
+                }
             } else if let Some(existing) = self
                 .probes
                 .iter_mut()
@@ -4793,6 +4802,12 @@ impl Waku {
             && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)
         {
             self.save();
+        }
+        if changed {
+            // Incoming activity/session state may have replaced an expanded
+            // activity's payload; the next frame re-validates the prepared
+            // detail snapshots before trusting them.
+            self.invalidate_activity_details();
         }
         changed || selected_changed
     }
@@ -5141,6 +5156,68 @@ mod response_fork_title_tests {
     }
 }
 
+/// Config directory sent with model discovery. Named Claude, Codex, and
+/// Antigravity accounts each probe their own directory; the default account
+/// and providers without profiles pass none.
+pub(super) fn account_model_discovery_config_dir(
+    provider: ProviderKind,
+    account_config_dir: Option<&str>,
+) -> Option<String> {
+    if !provider.supports_multiple_accounts() {
+        return None;
+    }
+    account_config_dir
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(super) struct AccountDiscoveryUpdate {
+    pub probe: ProviderProbe,
+    /// `false` for a transport failure. That attempt must not stay in
+    /// `provider_model_discoveries`, or a later probe is suppressed.
+    pub completed: bool,
+}
+
+/// Apply one named-account model probe. A transport error keeps the previous
+/// catalog when there is one, records `discovery_error`, and leaves
+/// `installed` alone. `installed: false` is only kept when the probe itself
+/// reported the CLI missing. With no previous catalog, the global install bit
+/// is kept and the default account's models are not copied in.
+pub(super) fn account_model_discovery_update(
+    global: &ProviderProbe,
+    previous: Option<&ProviderProbe>,
+    result: Result<ProviderProbe, String>,
+) -> AccountDiscoveryUpdate {
+    match result {
+        Ok(probe) => AccountDiscoveryUpdate {
+            probe,
+            completed: true,
+        },
+        Err(error) => {
+            let mut probe = previous.cloned().unwrap_or(ProviderProbe {
+                provider: global.provider,
+                installed: global.installed,
+                path: global.path.clone(),
+                models: Vec::new(),
+                agent_presets: Vec::new(),
+                discovery_error: None,
+            });
+            if previous.is_none() {
+                probe.models.clear();
+                probe.agent_presets.clear();
+                probe.installed = global.installed;
+                probe.path = global.path.clone();
+            }
+            probe.discovery_error = Some(error);
+            AccountDiscoveryUpdate {
+                probe,
+                completed: false,
+            }
+        }
+    }
+}
+
 fn resolve_active_local_provider_account_id<'a>(
     supports_multiple_accounts: bool,
     picker_account: Option<Option<&'a str>>,
@@ -5207,13 +5284,9 @@ mod version_tests {
 
     #[test]
     fn antigravity_cursor_rewind_closes_live_runtime_and_preserves_prepared_drivers() {
-        assert!(super::should_close_runtime_after_rewind(
-            false, true, false
-        ));
+        assert!(super::should_close_runtime_after_rewind(false, true, false));
         assert!(super::should_close_runtime_after_rewind(true, false, false));
-        assert!(!super::should_close_runtime_after_rewind(
-            false, true, true
-        ));
+        assert!(!super::should_close_runtime_after_rewind(false, true, true));
         assert!(!super::should_close_runtime_after_rewind(
             false, false, false
         ));

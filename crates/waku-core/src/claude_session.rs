@@ -1232,8 +1232,7 @@ mod tests {
 
     #[test]
     fn active_chain_and_fork_terminate_on_cyclic_parent_uuids() {
-        let root =
-            std::env::temp_dir().join(format!("waku-claude-cycle-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("waku-claude-cycle-{}", Uuid::new_v4()));
         let project = root.join("projects").join("-tmp-project");
         fs::create_dir_all(&project).unwrap();
         let source = project.join(format!("{SESSION}.jsonl"));
@@ -1251,7 +1250,11 @@ mod tests {
         }
 
         let chain = active_chain(&entries);
-        assert_eq!(chain.len(), 3, "cycle must terminate after visiting each node once");
+        assert_eq!(
+            chain.len(),
+            3,
+            "cycle must terminate after visiting each node once"
+        );
 
         let fork = fork_session_at_in(&root.join("projects"), SESSION, ASSISTANT_ONE, "Cycle fork")
             .expect("fork must not hang on cyclic progress parentUuid");
@@ -1295,8 +1298,7 @@ mod tests {
 
     #[test]
     fn fork_truncates_active_chain_without_copying_abandoned_sibling_branches() {
-        let root =
-            std::env::temp_dir().join(format!("waku-claude-branch-fork-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("waku-claude-branch-fork-{}", Uuid::new_v4()));
         let project = root.join("projects").join("-tmp-project");
         fs::create_dir_all(&project).unwrap();
         let source = project.join(format!("{SESSION}.jsonl"));
@@ -1320,8 +1322,13 @@ mod tests {
             file.write_all(b"\n").unwrap();
         }
 
-        let fork = fork_session_at_in(&root.join("projects"), SESSION, ASSISTANT_TWO, "Active branch")
-            .expect("fork succeeds");
+        let fork = fork_session_at_in(
+            &root.join("projects"),
+            SESSION,
+            ASSISTANT_TWO,
+            "Active branch",
+        )
+        .expect("fork succeeds");
         let fork_path = project.join(format!("{}.jsonl", fork.session_id));
         let forked_entries = read_entries(&fork_path).unwrap();
         let forked_transcript = transcript_entries(&forked_entries);

@@ -1507,6 +1507,7 @@ commands.effort_switched: "推理强度已设为 %{effort}"
 commands.effort_current: "当前推理强度：%{effort}（可选：%{options}）"
 commands.effort_unsupported: 当前模型不支持调整推理强度
 commands.effort_invalid: "无效的推理强度 \"%{effort}\"（可选：%{options}）"
+commands.desktop_only: 此命令仅在桌面应用中可用
 commands.autonomy_description: 查看或设置自治级别
 commands.new_session_description: 开始新会话
 commands.autonomy_switched: "自治级别已设为 %{level}"

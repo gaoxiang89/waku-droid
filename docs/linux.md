@@ -2,41 +2,48 @@
 
 ## Install
 
+This fork currently publishes **Windows x86_64 desktop packages only**. Linux
+remote daemons are bundled for SSH/WSL, but are not Linux desktop archives.
+Upstream `waku.sh` / `releases.waku.sh` serve Waku, not Narel; do not use them
+to install this fork.
+
+Build a Linux desktop bundle locally (see [Building from source](#building-from-source)),
+then install it from the checkout:
+
 ```sh
-curl -fsSL https://waku.sh/install.sh | sh
+WAKU_BUNDLE_PATH=target/release/narel-<version>-<target>.tar.gz \
+  sh website/public/install.sh
 ```
 
-The script needs no root. It unpacks the release tarball into
+The script needs no root. It unpacks the local tarball into
 `~/.local/narel.app` and installs the desktop entry into
 `~/.local/share/applications`, so **Narel appears in your applications menu** —
 you can also launch it from a terminal via the `narel` command. Run the script again to
-upgrade manually; the installed app also keeps itself current.
+upgrade manually after producing a new local bundle.
 
 Narel expects:
 
-- **glibc 2.35 or newer** — Ubuntu 22.04, Debian 12, Fedora 36, and anything
-  more recent. Releases are built on Ubuntu 22.04, so older distributions must
-  build from source.
+- **A compatible glibc** for the machine on which you build the bundle.
+  See the source-build prerequisites for supported distributions.
 - **A working Vulkan or OpenGL driver.** Narel renders through wgpu, which tries
   Vulkan first and falls back to GL. Software rasterizers (lavapipe, llvmpipe)
   are accepted, so it can run in a VM, but see the note below.
 - **x86_64 or aarch64.** Other architectures build from source.
 - `xdg-desktop-portal` for native file dialogs.
-- `curl` or `wget` for installation and update downloads.
-
-Set `WAKU_VERSION` to install a specific version rather than the latest.
+Local bundle installation does not require `curl` or `wget`. Without
+`WAKU_BUNDLE_PATH`, the script exits with source-build instructions; advanced
+users may explicitly set `WAKU_RELEASES_URL` to their own Narel release server.
 
 ## Installing manually
 
-The script is a convenience, not a requirement. Download
-`narel-<version>-<target>.tar.gz` from
-[releases.waku.sh](https://releases.waku.sh) or the
-[GitHub release](https://github.com/egoist/waku/releases), then unpack it
-wherever you like:
+The script is a convenience, not a requirement. After building
+`target/release/narel-<version>-<target>.tar.gz` locally, unpack it wherever
+you like:
 
 ```sh
 mkdir -p ~/.local/narel.app
-tar -xzf narel-<version>-<target>.tar.gz --strip-components=1 -C ~/.local/narel.app
+tar -xzf target/release/narel-<version>-<target>.tar.gz --strip-components=1 -C ~/.local/narel.app
+mkdir -p ~/.local/bin
 ln -sf ~/.local/narel.app/bin/narel ~/.local/bin/narel   # optional
 ```
 
@@ -68,7 +75,8 @@ sed -i "s|^Icon=sh.narel$|Icon=$HOME/.local/narel.app/share/icons/hicolor/256x25
 ## Command line
 
 `install.sh` links `~/.local/narel.app/bin/narel` to `~/.local/bin/narel` (for a
-manual install, copy or link it into a directory on your `PATH`). On Linux,
+manual install, symlink it into a directory on your `PATH`; do not copy the
+executable away from its sibling helpers/resources). On Linux,
 `bin/narel` handles CLI arguments directly:
 
 ```sh
@@ -85,40 +93,30 @@ workspaces from inside a connected SSH host, see
 
 ## Updating
 
-Tarball installs under the user's home directory update themselves. Narel
-checks once per launch by default; an available release appears in the sidebar
-footer. Clicking it validates the staged installation, quits through Narel's
-normal draft/state saves, swaps the complete prefix, and relaunches. If the new
-build exits before opening its window, the helper restores and relaunches the
-previous version.
+There is no published Narel Linux desktop update feed for this fork. Do not
+use upstream Waku appcasts as Narel feeds. Build a fresh bundle and rerun the
+local install command to upgrade; keep the installed app closed while replacing
+it. You can disable automatic checks in **Settings → General → Automatic
+updates**. System-wide or package-manager-owned builds should be upgraded
+through their original installation method.
 
-Every archive is verified with the same Ed25519 release key used by the macOS
-and Windows updaters. The architecture-specific feeds are:
-
-- `https://releases.waku.sh/appcast-linux-x86_64.xml`
-- `https://releases.waku.sh/appcast-linux-aarch64.xml`
-
-Use **Check for Updates** for an explicit check, or disable launch checks in
-**Settings → General → Automatic updates**. System-wide installs such as
-`/usr/local`, builds without the managed-install marker, root sessions, and
-package-manager-owned builds do not modify themselves; upgrade those through
-their original installation method. Re-running `install.sh` remains a safe
-manual fallback for the default `~/.local/narel.app` install.
+Release builds import missing legacy Waku files once without deleting the
+originals; see [upgrade behavior](migration.md) for retry and coexistence rules.
 
 ## Uninstalling
 
 ```sh
-curl -fsSL https://waku.sh/install.sh | sh -s -- --uninstall
+sh website/public/install.sh --uninstall
 ```
 
 This removes `~/.local/narel.app`, the symlink, and the desktop entry. Projects
-and settings stay in `~/.narel`; delete that directory to remove them too.
+and settings remain in `~/.narel` and the platform data directory (normally
+`~/.local/share/Narel`). Legacy Waku data is also left untouched.
 
 ## Building from source
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for build prerequisites, then
-install Bun for the SDK artifact assembler, then produce the same archive
-this page installs with:
+install Bun for the SDK artifact assembler, then produce a local archive:
 
 ```sh
 ./scripts/bundle-linux.sh
@@ -133,10 +131,9 @@ WAKU_BUNDLE_PATH=target/release/narel-<version>-<target>.tar.gz \
 
 ## Computer Use
 
-Debug builds expose Computer Use through the bundled Cua Driver SDK. X11 and
-AT-SPI use the current desktop session; native Wayland support is experimental
-and depends on compositor integrations. See [Computer Use](computer-use.md)
-for capability checks, packaged helper files, and limitations.
+Computer Use is prohibited. No build starts the bundled Cua Driver SDK, so
+Narel does not inject pointer or keyboard input into the desktop session.
+See [Computer Use](computer-use.md).
 
 ## Running in a virtual machine
 

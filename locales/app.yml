@@ -3066,6 +3066,8 @@ commands.effort_unsupported:
   en: This model does not support reasoning effort selection
 commands.effort_invalid:
   en: "Unknown reasoning effort \"%{effort}\" (available: %{options})"
+commands.desktop_only:
+  en: This command is only available in the desktop app
 commands.autonomy_description:
   en: Show or set autonomy level
 commands.new_session_description:

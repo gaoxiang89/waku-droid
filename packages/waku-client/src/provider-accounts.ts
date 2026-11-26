@@ -125,6 +125,10 @@ function quotePosixShellArg(value: string): string {
 }
 
 function quotePowershellArg(value: string): string {
+  if (value === '~') return '$HOME'
+  if (/^~[\\/]/u.test(value)) {
+    return `(Join-Path $HOME '${value.slice(2).replaceAll("'", "''")}')`
+  }
   return `'${value.replaceAll("'", "''")}'`
 }
 

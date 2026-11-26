@@ -64,7 +64,9 @@ impl Waku {
             return;
         }
         let key: PlanUsageKey = (host.clone(), provider, account_id.clone());
-        self.plan_usage_checked_at.remove(&key);
+        if !self.plan_usage_pending.contains(&key) {
+            self.plan_usage_checked_at.remove(&key);
+        }
         self.plan_usage_error.remove(&key);
         self.plan_usage_unconfigured.remove(&key);
         self.plan_usage_stale.insert(key);
@@ -81,7 +83,9 @@ impl Waku {
     ) {
         for (provider, account_id) in self.enabled_plan_usage_targets_for_host(host) {
             let key: PlanUsageKey = (host.clone(), provider, account_id);
-            self.plan_usage_checked_at.remove(&key);
+            if !self.plan_usage_pending.contains(&key) {
+                self.plan_usage_checked_at.remove(&key);
+            }
             self.plan_usage_unconfigured.remove(&key);
             self.plan_usage_stale.insert(key);
         }
@@ -181,9 +185,12 @@ impl Waku {
             {
                 continue;
             }
-            self.plan_usage_pending.insert(key);
+            self.plan_usage_pending.insert(key.clone());
+            // Also serves as this request's generation. Account edits remove
+            // it, and a replacement fetch installs a different timestamp.
+            let requested_at = Instant::now();
+            self.plan_usage_checked_at.insert(key.clone(), requested_at);
             let tx = self.plan_usage_tx.clone();
-            let event_wake = self.event_wake_tx.clone();
             let claude_version = if *host == waku_client::hosts::HostKey::Local {
                 self.provider_versions
                     .get(&ProviderKind::Claude)
@@ -198,24 +205,48 @@ impl Waku {
                 self.effective_config_dir_for_host(host, provider, account_id.as_deref());
             let daemon = daemon.clone();
             let request_host = host.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    let result = match daemon.client().request(
-                        Uuid::nil(),
-                        Uuid::nil(),
-                        waku_client::Command::FetchPlanUsage {
-                            provider,
-                            binary_override,
-                            cli_version: claude_version,
-                            config_dir,
-                        },
-                    ) {
-                        Ok(waku_client::ResponsePayload::PlanUsage { usage }) => Ok(usage),
-                        Ok(_) => Err(anyhow::anyhow!(
-                            "the daemon returned an invalid plan usage response"
-                        )),
-                        Err(error) => Err(error),
-                    };
+            let requested_config_dir = config_dir.clone();
+            cx.spawn(async move |waku, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match daemon.client().request(
+                            Uuid::nil(),
+                            Uuid::nil(),
+                            waku_client::Command::FetchPlanUsage {
+                                provider,
+                                binary_override,
+                                cli_version: claude_version,
+                                config_dir,
+                            },
+                        ) {
+                            Ok(waku_client::ResponsePayload::PlanUsage { usage }) => Ok(usage),
+                            Ok(_) => Err(anyhow::anyhow!(
+                                "the daemon returned an invalid plan usage response"
+                            )),
+                            Err(error) => Err(error),
+                        }
+                    })
+                    .await;
+                let _ = waku.update(cx, |waku, cx| {
+                    if !waku
+                        .hosts
+                        .get(&request_host)
+                        .is_some_and(|owner| owner.generation == host_generation)
+                        || waku.plan_usage_checked_at.get(&key) != Some(&requested_at)
+                    {
+                        return;
+                    }
+                    if waku.effective_config_dir_for_host(
+                        &request_host,
+                        provider,
+                        account_id.as_deref(),
+                    ) != requested_config_dir
+                    {
+                        waku.plan_usage_pending.remove(&key);
+                        waku.plan_usage_checked_at.remove(&key);
+                        return;
+                    }
                     if tx
                         .send((
                             request_host,
@@ -226,10 +257,15 @@ impl Waku {
                         ))
                         .is_ok()
                     {
-                        signal_event_pump(&event_wake);
+                        // Apply in this same update; no account edit can slip
+                        // between identity validation and event consumption.
+                        if waku.drain_plan_usage_events() {
+                            cx.notify();
+                        }
                     }
-                })
-                .detach();
+                });
+            })
+            .detach();
         }
     }
 

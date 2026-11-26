@@ -888,7 +888,13 @@ fn deploy_ssh(
     let upload_timeout = install_deadline.saturating_duration_since(std::time::Instant::now());
     let uploaded = match upload_rx.recv_timeout(upload_timeout) {
         Ok(result) => result,
-        Err(_) => return Err(failure(&mut child, &mut job, "timed out uploading narel-daemon")),
+        Err(_) => {
+            return Err(failure(
+                &mut child,
+                &mut job,
+                "timed out uploading narel-daemon",
+            ));
+        }
     };
     match uploaded {
         Ok(copied) if copied == artifact.size => {}
@@ -1104,7 +1110,8 @@ mod tests {
             false,
         );
         assert!(
-            ps_command.starts_with("$ProgressPreference='SilentlyContinue'; & ([scriptblock]::Create(")
+            ps_command
+                .starts_with("$ProgressPreference='SilentlyContinue'; & ([scriptblock]::Create(")
         );
         assert!(ps_command.len() < 8191);
     }
@@ -1579,10 +1586,8 @@ mod tests {
 
     #[test]
     fn file_fingerprint_hashes_empty_small_and_multichunk_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "waku-fingerprint-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("waku-fingerprint-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let empty = dir.join("empty.bin");
         let small = dir.join("small.bin");

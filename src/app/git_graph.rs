@@ -29,7 +29,12 @@ const LANE_HUES: [f32; 8] = [212.0, 28.0, 152.0, 272.0, 188.0, 334.0, 46.0, 8.0]
 
 actions!(
     waku_git_graph,
-    [GitGraphTop, GitGraphBottom, GitGraphNextMatch, GitGraphPrevMatch]
+    [
+        GitGraphTop,
+        GitGraphBottom,
+        GitGraphNextMatch,
+        GitGraphPrevMatch
+    ]
 );
 
 pub(super) fn init(cx: &mut App) {
@@ -429,10 +434,7 @@ impl Waku {
             && Arc::ptr_eq(&cache.snapshot, snapshot)
             && cache.query == query
         {
-            return Some((
-                Rc::clone(&cache.matched),
-                Rc::clone(&cache.match_indices),
-            ));
+            return Some((Rc::clone(&cache.matched), Rc::clone(&cache.match_indices)));
         }
         let mut matched = Vec::with_capacity(git_graph_row_count(snapshot));
         let mut match_indices = Vec::new();
@@ -530,7 +532,8 @@ impl Waku {
     }
 
     fn clear_git_graph_search(&mut self, cx: &mut Context<Self>) {
-        self.git_graph_search.update(cx, |input, cx| input.clear(cx));
+        self.git_graph_search
+            .update(cx, |input, cx| input.clear(cx));
         cx.notify();
     }
 
@@ -698,11 +701,7 @@ impl Waku {
             }
             _ => None,
         };
-        column = column.child(self.render_git_graph_toolbar(
-            ready_snapshot.as_ref(),
-            &theme,
-            cx,
-        ));
+        column = column.child(self.render_git_graph_toolbar(ready_snapshot.as_ref(), &theme, cx));
 
         column = match view {
             GitGraphView::NoProject => column.child(self.render_right_panel_empty_message(
@@ -762,7 +761,8 @@ impl Waku {
         } else {
             None
         };
-        let refs_jump = snapshot.map(|snapshot| self.render_git_graph_refs_jump(snapshot, theme, cx));
+        let refs_jump =
+            snapshot.map(|snapshot| self.render_git_graph_refs_jump(snapshot, theme, cx));
 
         div()
             .flex_none()
@@ -936,17 +936,22 @@ impl Waku {
             });
         let weak = cx.entity().downgrade();
         let theme_copy = *theme;
-        popover(trigger, &handle, MenuAlign::BelowRight, move |handle, _, cx| {
-            render_refs_jump_popover(
-                handle,
-                &branches,
-                &tags,
-                &remotes,
-                &theme_copy,
-                weak.clone(),
-                cx,
-            )
-        })
+        popover(
+            trigger,
+            &handle,
+            MenuAlign::BelowRight,
+            move |handle, _, cx| {
+                render_refs_jump_popover(
+                    handle,
+                    &branches,
+                    &tags,
+                    &remotes,
+                    &theme_copy,
+                    weak.clone(),
+                    cx,
+                )
+            },
+        )
     }
 
     fn render_git_graph_ready(
@@ -990,8 +995,11 @@ impl Waku {
                 GitGraphRowKey::Commit(hash) => Some(hash),
                 GitGraphRowKey::Uncommitted => None,
             });
-        let layout =
-            compute_graph_layout(panel_width, snapshot.lane_count, self.git_graph_column_ratio);
+        let layout = compute_graph_layout(
+            panel_width,
+            snapshot.lane_count,
+            self.git_graph_column_ratio,
+        );
         let context = GitGraphRowContext {
             matches: self.git_graph_row_matches(&snapshot, cx),
             cursor,
@@ -1082,12 +1090,7 @@ impl Waku {
                         cx.stop_propagation();
                         return;
                     }
-                    this.begin_panel_resize(
-                        PanelResizeTarget::GitGraphColumn,
-                        event,
-                        window,
-                        cx,
-                    );
+                    this.begin_panel_resize(PanelResizeTarget::GitGraphColumn, event, window, cx);
                 }),
             );
 
@@ -1192,11 +1195,8 @@ impl Waku {
                 .head_row
                 .is_some_and(|head_row| Some(head_row as usize) == commit_index);
         let is_merge = commit.is_some_and(|commit| commit.parents.len() > 1);
-        let node_color = row.and_then(|row| {
-            row.lanes
-                .get(row.node_lane as usize)
-                .map(|lane| lane.color)
-        });
+        let node_color =
+            row.and_then(|row| row.lanes.get(row.node_lane as usize).map(|lane| lane.color));
 
         let label = match commit {
             Some(commit) => commit.subject.clone(),
@@ -1237,12 +1237,7 @@ impl Waku {
                 let menu_ref = display_ref.clone();
                 let menu_hash = hash.clone().unwrap_or_default();
                 context_menu(
-                    git_ref_chip(
-                        display_ref,
-                        node_color,
-                        Some(max_chip_label_width),
-                        &theme,
-                    ),
+                    git_ref_chip(display_ref, node_color, Some(max_chip_label_width), &theme),
                     SharedString::from(format!("git-graph-ref-menu-{index}-{position}")),
                     &handle,
                     move |_| Waku::git_graph_display_ref_menu(weak.clone(), &menu_ref, &menu_hash),
@@ -1776,9 +1771,7 @@ fn responsive_ref_budget(panel_width: f32) -> (usize, f32) {
     }
 }
 
-pub(super) fn group_commit_refs(
-    refs: &[waku_client::git::GitGraphRef],
-) -> Vec<DisplayGitRef> {
+pub(super) fn group_commit_refs(refs: &[waku_client::git::GitGraphRef]) -> Vec<DisplayGitRef> {
     if refs.is_empty() {
         return Vec::new();
     }
@@ -2243,7 +2236,12 @@ fn paint_commit_row(
             if let Ok(path) = outer.build() {
                 window.paint_path(path, color);
             }
-            fill_circle(window, point(x, mid), (radius - px(0.4)).max(px(2.5)), color);
+            fill_circle(
+                window,
+                point(x, mid),
+                (radius - px(0.4)).max(px(2.5)),
+                color,
+            );
         } else if is_merge {
             fill_circle(window, point(x, mid), radius + px(0.4), color);
             let inner_radius = (radius - stroke + px(0.2)).max(px(1.8));

@@ -740,10 +740,7 @@ mod tests {
 
     #[test]
     fn grok_computer_use_falls_back_to_copy_when_symlink_fails() {
-        let root = std::env::temp_dir().join(format!(
-            "waku-grok-cu-copy-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("waku-grok-cu-copy-{}", uuid::Uuid::new_v4()));
         let source_home = root.join("source-grok");
         let process_dir = root.join("process");
         let skill_path = root.join("SKILL.md");
@@ -767,17 +764,12 @@ mod tests {
             process_directory: process_dir.clone(),
         };
         let auth_path = resolve_grok_auth_path_from(None, &source_home);
-        let config = build_grok_computer_use_config_in(
-            base,
-            &source_home,
-            auth_path,
-            |_, _| {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "simulated Windows without Developer Mode",
-                ))
-            },
-        )
+        let config = build_grok_computer_use_config_in(base, &source_home, auth_path, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated Windows without Developer Mode",
+            ))
+        })
         .unwrap();
 
         let HeadlessComputerUseConfig::Grok {

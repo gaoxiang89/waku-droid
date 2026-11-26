@@ -969,17 +969,12 @@ mod tests {
         }
         session.switch_agent(ProviderKind::Claude, Some("work".into()));
 
-        let plan = plan_with_accounts_and_default_label(
-            &session,
-            "continue on work",
-            &accounts,
-            "默认",
-        )
-        .expect("switching accounts within Claude hands over prior turn");
+        let plan =
+            plan_with_accounts_and_default_label(&session, "continue on work", &accounts, "默认")
+                .expect("switching accounts within Claude hands over prior turn");
 
         assert!(
-            plan.preamble
-                .contains("### Turn 1 — Claude Code (Default)"),
+            plan.preamble.contains("### Turn 1 — Claude Code (Default)"),
             "model preamble header must remain English: {}",
             plan.preamble
         );

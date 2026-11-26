@@ -37,6 +37,11 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
     let arguments = Arguments::parse(raw_arguments)?;
+    // Finish migration before advertising readiness or opening settings/SQLite.
+    waku_protocol::identity::import_legacy_user_data()
+        .context("could not import Waku files; originals are unchanged")?;
+    waku_core::persistence::import_legacy_database()
+        .context("could not import Waku history; originals are unchanged")?;
     let token =
         std::env::var(DAEMON_TOKEN_ENV).context("Waku daemon authentication token is missing")?;
     // The bearer capability belongs only to this server process. Remove it

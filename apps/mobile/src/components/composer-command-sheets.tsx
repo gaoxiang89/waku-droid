@@ -13,6 +13,7 @@ import {
   isCodexUsageSubmission,
   isFastModeToggleSubmission,
   isResumeSubmission,
+  isUnsupportedDroidComposerSubmission,
   parseAntigravityLocalCommand,
   parseGoalSubmission,
   resolveProviderEffort,
@@ -95,6 +96,9 @@ export function useComposerLocalCommands({
 
   async function execute(prompt: string, commands: SlashCommand[]): Promise<boolean> {
     if (!provider) return false;
+    if (isUnsupportedDroidComposerSubmission(provider, prompt, commands)) {
+      throw new Error('This Droid CLI command is unavailable here. Use the model/access controls or create a new task.');
+    }
     const antigravity = parseAntigravityLocalCommand(provider, prompt, commands);
     if (antigravity) {
       switch (antigravity.kind) {
@@ -411,15 +415,18 @@ function PlanUsageSheet({
       title={`${providerLabel(provider)}${accountLabel ? ` · ${accountLabel}` : ''} usage`}
       visible
     >
-      {usage.isPending || settings.isPending ? (
-        <ActivityIndicator style={styles.loading} color={theme.textTertiary} />
-      ) : usage.error ? (
+      {settings.error || usage.error ? (
         <>
           <Text style={[styles.note, { color: theme.danger }]}>
-            {usage.error instanceof Error ? usage.error.message : String(usage.error)}
+            {String(settings.error ?? usage.error)}
           </Text>
-          <SheetRow label="Retry" onPress={() => void usage.refetch()} />
+          <SheetRow label="Retry" onPress={() => {
+            if (settings.error) void settings.refetch();
+            else void usage.refetch();
+          }} />
         </>
+      ) : usage.isPending || settings.isPending ? (
+        <ActivityIndicator style={styles.loading} color={theme.textTertiary} />
       ) : !usage.data ? (
         <Text style={[styles.note, { color: theme.textTertiary }]}>
           No plan usage reported for this account.

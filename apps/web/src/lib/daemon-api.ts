@@ -31,6 +31,7 @@ import {
   WorkspaceOperation,
   WorkspaceResult,
 } from '@waku/client'
+import { normalizeUsageHistory } from './usage-history'
 
 export type TaskState = Extract<ResponsePayload, { type: 'taskState' }>
 export type DaemonDirectory = Extract<WorkspaceResult, { type: 'directory' }>
@@ -264,7 +265,7 @@ export async function loadUsageHistory(
     }),
     'usageHistory',
   )
-  return response.history
+  return normalizeUsageHistory(response.history)
 }
 
 export async function fetchPlanUsage(
@@ -704,6 +705,7 @@ export function createResumedSession(
   summary: ProviderSessionSummary,
   history: ProviderSessionHistory,
   runtimeMode: RuntimeMode = 'fullAccess',
+  accountId: string | null = null,
 ): AgentSession {
   const now = unixTime()
   const createdAt = summary.created_at || now
@@ -712,13 +714,14 @@ export function createResumedSession(
   return {
     ...createSession(projectId, summary.cursor.provider, false),
     auto_title: summary.title,
+    account_id: accountId,
     runtime_mode: runtimeMode,
     provider_cursor: summary.cursor,
     created_at: createdAt,
     updated_at: updatedAt,
     last_reply_at: hasHistory ? updatedAt : null,
     messages: history.messages,
-    turns: history.turns,
+    turns: history.turns.map((turn) => ({ ...turn, provider: summary.cursor.provider, account_id: accountId })),
   }
 }
 
@@ -734,6 +737,18 @@ export function sameProviderSession(
 ): boolean {
   return left.provider === right.provider
     && providerSessionNativeId(left) === providerSessionNativeId(right)
+}
+
+export function sessionOwnsProviderSession(
+  session: AgentSession,
+  cursor: ProviderResumeCursor,
+  accountId: string | null,
+): boolean {
+  if ((session.account_id ?? null) === accountId && session.provider_cursor
+    && sameProviderSession(session.provider_cursor, cursor)) return true
+  return accountId
+    ? (session.account_cursors ?? []).some((entry) => entry.accountId === accountId && sameProviderSession(entry.cursor, cursor))
+    : (session.provider_cursors ?? []).some((entry) => sameProviderSession(entry, cursor))
 }
 
 export function beginTurn(

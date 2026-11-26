@@ -1175,13 +1175,14 @@ mod tests {
         assert_eq!(turn_count, 5);
 
         // Legacy openCode2 tag remains accepted as an alias.
-        let legacy_opencode: ProviderSessionForkRequest = serde_json::from_value(serde_json::json!({
-            "provider": "openCode2",
-            "binary": "/usr/local/bin/opencode",
-            "session_id": "oc-legacy",
-            "turn_count": 2
-        }))
-        .unwrap();
+        let legacy_opencode: ProviderSessionForkRequest =
+            serde_json::from_value(serde_json::json!({
+                "provider": "openCode2",
+                "binary": "/usr/local/bin/opencode",
+                "session_id": "oc-legacy",
+                "turn_count": 2
+            }))
+            .unwrap();
         assert!(matches!(
             legacy_opencode,
             ProviderSessionForkRequest::OpenCode { session_id, turn_count: 2, .. }

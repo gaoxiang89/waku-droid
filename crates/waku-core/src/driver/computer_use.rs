@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use uuid::Uuid;
 
 use crate::computer_use;
@@ -43,6 +43,9 @@ pub(super) struct ComputerUseRuntime {
 
 impl ComputerUseRuntime {
     pub(super) fn start(events: DriverEventSender) -> anyhow::Result<Self> {
+        if !computer_use::is_available() {
+            bail!("Narel Computer Use is not available in this build");
+        }
         let server_path = computer_use::mcp_server_command()?;
         let repl_path = computer_use::js_repl_server_path()?;
         let skill_path = computer_use::skill_root_path()?
@@ -452,7 +455,8 @@ mod tests {
         });
 
         let (events, _rx) = crate::driver::test_event_channel();
-        let mut monitor = Some(ComputerUsePreviewMonitor::start(directory.clone(), events).unwrap());
+        let mut monitor =
+            Some(ComputerUsePreviewMonitor::start(directory.clone(), events).unwrap());
         let started = Instant::now();
         shutdown_process_directory_with_timeout(
             &directory,
@@ -495,6 +499,9 @@ mod tests {
             elapsed >= Duration::from_millis(60) && elapsed < Duration::from_secs(1),
             "wait must honor bounded timeout, elapsed={elapsed:?}"
         );
-        assert!(!directory.exists(), "directory must still be removed after timeout");
+        assert!(
+            !directory.exists(),
+            "directory must still be removed after timeout"
+        );
     }
 }

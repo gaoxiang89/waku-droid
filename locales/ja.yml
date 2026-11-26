@@ -1560,6 +1560,7 @@ commands.effort_switched: "推論の深さを %{effort} に設定しました"
 commands.effort_current: "現在の推論の深さ: %{effort}（選択可能: %{options}）"
 commands.effort_unsupported: このモデルは推論の深さの変更に対応していません
 commands.effort_invalid: "無効な推論の深さ \"%{effort}\"（選択可能: %{options}）"
+commands.desktop_only: このコマンドはデスクトップアプリでのみ使用できます
 commands.autonomy_description: 自律レベルを表示または設定
 commands.new_session_description: 新しいセッションを開始
 commands.autonomy_switched: "自律レベルを %{level} に設定しました"

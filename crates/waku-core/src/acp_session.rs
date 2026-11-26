@@ -369,13 +369,10 @@ async fn drain_trailing_replay(
         if now >= quiet_deadline {
             break;
         }
-        let saw_more = smol::future::or(
-            async { update_rx.recv().await.is_ok() },
-            async {
-                smol::Timer::at(quiet_deadline).await;
-                false
-            },
-        )
+        let saw_more = smol::future::or(async { update_rx.recv().await.is_ok() }, async {
+            smol::Timer::at(quiet_deadline).await;
+            false
+        })
         .await;
         if !saw_more {
             break;
@@ -539,9 +536,7 @@ fn upsert_replay_activity(
             let existing_is_meaningful = !existing_title.is_empty()
                 && !existing_title.eq_ignore_ascii_case("tool")
                 && existing_title != tr!("activity.tool");
-            if !incoming_title.is_empty()
-                && !(incoming_is_generic_tool && existing_is_meaningful)
-            {
+            if !incoming_title.is_empty() && !(incoming_is_generic_tool && existing_is_meaningful) {
                 activity.title = item.title;
             }
             if item.tool_name.is_some() {

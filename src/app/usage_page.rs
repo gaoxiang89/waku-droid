@@ -373,11 +373,12 @@ impl Waku {
                     px(6.0),
                 )
                 .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_usage_view(view, cx);
-                        cx.stop_propagation();
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_usage_view(view, cx);
+                    cx.stop_propagation();
+                }))
+                .on_key_down(cx.listener(
+                    move |this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.modifiers.modified() {
                             return;
                         }
@@ -391,7 +392,8 @@ impl Waku {
                             this.set_usage_view(next, cx);
                             cx.stop_propagation();
                         }
-                    })),
+                    },
+                )),
             );
         }
 
@@ -590,7 +592,11 @@ impl Waku {
                         .flex()
                         .items_center()
                         .gap(px(7.0))
-                        .child(provider_mark(provider, 14.0, provider_color(theme, provider)))
+                        .child(provider_mark(
+                            provider,
+                            14.0,
+                            provider_color(theme, provider),
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -629,9 +635,9 @@ impl Waku {
                                             .flex_none()
                                             .text_size(sp(12.0))
                                             .text_color(theme.text_tertiary)
-                                            .child(SharedString::from(
-                                                crate::usage::reset_label(resets_at, now),
-                                            ))
+                                            .child(SharedString::from(crate::usage::reset_label(
+                                                resets_at, now,
+                                            )))
                                     }))
                                     .child(
                                         div()
@@ -876,14 +882,15 @@ impl Waku {
                     px(6.0),
                 )
                 .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.usage_metric != option {
-                            this.usage_metric = option;
-                            cx.notify();
-                        }
-                        cx.stop_propagation();
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.usage_metric != option {
+                        this.usage_metric = option;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+                .on_key_down(cx.listener(
+                    move |this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.modifiers.modified() {
                             return;
                         }
@@ -900,7 +907,8 @@ impl Waku {
                             }
                             cx.stop_propagation();
                         }
-                    })),
+                    },
+                )),
             );
         }
 
@@ -1303,14 +1311,15 @@ impl Waku {
                     px(6.0),
                 )
                 .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.usage_breakdown != option {
-                            this.usage_breakdown = option;
-                            cx.notify();
-                        }
-                        cx.stop_propagation();
-                    }))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.usage_breakdown != option {
+                        this.usage_breakdown = option;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+                .on_key_down(cx.listener(
+                    move |this, event: &KeyDownEvent, _, cx| {
                         if event.keystroke.modifiers.modified() {
                             return;
                         }
@@ -1327,7 +1336,8 @@ impl Waku {
                             }
                             cx.stop_propagation();
                         }
-                    })),
+                    },
+                )),
             );
         }
 

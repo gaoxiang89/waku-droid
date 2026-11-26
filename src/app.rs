@@ -242,9 +242,9 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    /// Computer Use is still experimental, so only development builds expose
-    /// its navigation entry points. Keeping this decision on the page itself
-    /// makes the Settings sidebar and command palette use the same gate.
+    /// Computer Use is prohibited, so its navigation entry stays hidden.
+    /// Keeping this decision on the page itself makes the Settings sidebar
+    /// and command palette use the same gate.
     fn is_visible_in_navigation(self) -> bool {
         self != Self::ComputerUse || crate::computer_use::is_available()
     }
@@ -1355,8 +1355,8 @@ pub struct Waku {
         ProviderKind,
         Option<ProviderProbe>,
     )>,
-    provider_probe_tx: Sender<(u64, Option<String>, ProviderProbe)>,
-    provider_probe_events: Receiver<(u64, Option<String>, ProviderProbe)>,
+    provider_probe_tx: Sender<(u64, Option<String>, ProviderProbe, bool)>,
+    provider_probe_events: Receiver<(u64, Option<String>, ProviderProbe, bool)>,
     local_account_probes: HashMap<ProviderKind, HashMap<String, ProviderProbe>>,
     provider_model_discoveries: HashMap<ProviderKind, Option<String>>,
     provider_model_discoveries_pending: HashSet<ProviderKind>,
@@ -1991,6 +1991,9 @@ pub struct Waku {
     user_message_viewports: RefCell<HashMap<Uuid, UserMessageScrollViewport>>,
     /// Parsed markdown for reasoning activities, keyed by stable activity id.
     activity_markdown: RefCell<HashMap<Uuid, MarkdownView>>,
+    /// Advanced by the incoming-state owner, never by animation pulses.
+    activity_detail_revision: u64,
+    activity_details: RefCell<HashMap<Uuid, transcript_view::ActivityDetailsEntry>>,
     /// Byte offsets live reasoning peeks render from, slid forward as the
     /// thought grows; see `live_reasoning_window_start`.
     reasoning_window_starts: RefCell<HashMap<Uuid, usize>>,
@@ -3023,7 +3026,7 @@ impl Waku {
                         }) {
                             this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
                         } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
+                            this.submission_with_attachments_for_steer(prompt, cx)
                         {
                             this.steer_composer_submission(submission, cx);
                         }
@@ -3831,6 +3834,8 @@ impl Waku {
                 message_markdown: RefCell::new(HashMap::new()),
                 user_message_viewports: RefCell::new(HashMap::new()),
                 activity_markdown: RefCell::new(HashMap::new()),
+                activity_detail_revision: 0,
+                activity_details: RefCell::new(HashMap::new()),
                 reasoning_window_starts: RefCell::new(HashMap::new()),
                 activity_scroll_viewports: RefCell::new(HashMap::new()),
                 activity_diffs: RefCell::new(HashMap::new()),

@@ -5,8 +5,7 @@ fork's Windows package.
 
 ## Install
 
-Download `Narel-<version>-x86_64-Setup.exe` (or the `aarch64` installer on an
-Arm device) from the
+Download `Narel-<version>-x86_64-Setup.exe` from the
 [latest fork release](https://github.com/gaoxiang89/waku-droid/releases/latest)
 and run it. It installs per-user into `%LOCALAPPDATA%\Programs\Narel`, so it never
 asks for administrator rights — which is also what lets Narel update itself
@@ -17,6 +16,8 @@ your choice across silent updates).
 When an older Waku copy runs Narel Setup through its updater, Setup uses an
 existing separate Narel installation or the default Narel folder. Waku keeps
 its own installation and can still be uninstalled separately.
+If even the default Narel folder contains Waku, Setup selects a separate
+`Narel-2` (or next available non-Waku sibling) instead.
 
 ### Portable
 
@@ -38,11 +39,11 @@ Narel expects:
 - **A Direct3D 11 driver at feature level 11_0 or newer.** GPUI renders
   through DirectX and falls back to the Microsoft Basic Render Driver, so it
   can run in a VM — see Troubleshooting if the window comes up black.
-- **x86_64 or aarch64.**
+- **x86_64**, or Windows on ARM with x64 emulation. This fork publishes only
+  the x86_64 desktop package; there is no native aarch64 installer or feed.
 
 Nothing else: Narel links the C runtime statically, so there is no Visual C++
-redistributable to install first. That matters most on Arm devices, which
-rarely have the arm64 redistributable already.
+redistributable to install first.
 
 SmartScreen may warn about an unrecognized publisher on first launch when the
 release was not code-signed. Choose **More info → Run anyway**.
@@ -82,10 +83,9 @@ is replaced in place, and reopens. Turn the check off in **Settings → General
 → Automatic updates** — **Check for Updates…** in the app menu still works
 either way.
 
-One appcast per architecture:
+The published Windows x86_64 feed (also used under x64 emulation on ARM):
 
 - `https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-windows-x86_64.xml`
-- `https://github.com/gaoxiang89/waku-droid/releases/latest/download/appcast-windows-aarch64.xml`
 
 Every installer carries an EdDSA signature, and Narel refuses one that does not
 verify against the public key built into it — so a compromised mirror or a
@@ -101,6 +101,15 @@ tampered download cannot install anything. The preference itself lives in
 | Settings | `%USERPROFILE%\.narel\app.json` |
 
 Unpacking a new release over the old directory leaves all of it untouched.
+
+On the first release-build launch, Narel imports missing Waku configuration
+from `%USERPROFILE%\.waku` and data from `%LOCALAPPDATA%\Waku`. It never
+overwrites existing Narel files or removes Waku's originals. The daemon takes
+a consistent SQLite snapshot, including committed WAL history; a failed import
+stops startup and can be retried. SSH passwords remain available through a
+read-only fallback to Waku's credential-store entries. Clearing one in Narel
+disables that fallback without deleting Waku's password.
+See [upgrade behavior](migration.md) before running both products in parallel.
 
 ## Agent CLIs
 
@@ -149,10 +158,9 @@ Differences worth knowing:
 
 ## Computer Use
 
-Debug builds expose Computer Use for supported providers through the bundled
-Cua Driver SDK. It operates within the current interactive Windows desktop;
-elevated apps and secure desktops retain Windows restrictions. See
-[Computer Use](computer-use.md) for the runtime, packaging, and validation.
+Computer Use is prohibited. No build starts the bundled Cua Driver SDK, so
+Narel does not inject pointer or keyboard input into the Windows desktop.
+See [Computer Use](computer-use.md).
 
 ## What is not available yet
 

@@ -1,3 +1,4 @@
+import { validatedAccountId } from '@waku/client'
 import type { AgentSession, ProviderKind, ProviderSessionSummary, SessionMessageMatch } from '@waku/client'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -8,7 +9,7 @@ import {
   displayTitle,
   listProviderSessions,
   providerSessionNativeId,
-  sameProviderSession,
+  sessionOwnsProviderSession,
   searchSessionMessages,
   type TaskState,
 } from '@/lib/daemon-api'
@@ -50,7 +51,7 @@ export interface CommandPaletteActions {
   toggleRightPanel: () => void
   openSettings: (page: SettingsPageId) => void
   selectTask: (sessionId: string) => void
-  resumeProviderSession: (summary: ProviderSessionSummary) => Promise<void>
+  resumeProviderSession: (summary: ProviderSessionSummary, accountId: string | null) => Promise<void>
 }
 
 export function CommandPalette({
@@ -62,6 +63,7 @@ export function CommandPalette({
   canChooseModel,
   canToggleUsage,
   currentProvider,
+  currentAccountId,
   initialView = 'commands',
   actions,
   onOpenChange,
@@ -74,6 +76,7 @@ export function CommandPalette({
   canChooseModel: boolean
   canToggleUsage: boolean
   currentProvider: ProviderKind
+  currentAccountId: string | null
   initialView?: CommandPaletteView
   actions: CommandPaletteActions
   onOpenChange: (open: boolean) => void
@@ -83,6 +86,8 @@ export function CommandPalette({
   const settings = useDaemonSettings()
   const [view, setView] = useState<CommandPaletteView>(initialView)
   const [resumeProvider, setResumeProvider] = useState<ProviderKind>(currentProvider)
+  const [requestedAccountId, setRequestedAccountId] = useState<string | null>(currentAccountId)
+  const resumeAccountId = validatedAccountId(settings.data, resumeProvider, requestedAccountId)
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<SessionMessageMatch[]>([])
   const [matchesQuery, setMatchesQuery] = useState<string | null>(null)
@@ -115,6 +120,7 @@ export function CommandPalette({
       : null
     setView(initialView)
     setResumeProvider(currentProvider)
+    setRequestedAccountId(currentAccountId)
     setQuery('')
     setMatches([])
     setMatchesQuery(null)
@@ -127,7 +133,7 @@ export function CommandPalette({
     setSelected(0)
     messageSearchCache.current.clear()
     requestAnimationFrame(() => input.current?.focus())
-  }, [currentProvider, initialView, open])
+  }, [currentProvider, currentAccountId, initialView, open])
 
   useEffect(() => {
     if (!open || view !== 'commands' || !client || !query.trim()) {
@@ -174,7 +180,7 @@ export function CommandPalette({
   }, [client, open, query, view])
 
   useEffect(() => {
-    if (!open || view !== 'resume') return
+    if (!open || view !== 'resume' || !settings.data) return
     if (!client) {
       setProviderSessions([])
       setProviderSessionsPending(false)
@@ -185,7 +191,7 @@ export function CommandPalette({
     setProviderSessions([])
     setProviderSessionsPending(true)
     setProviderSessionError(null)
-    void listProviderSessions(client, resumeProvider)
+    void listProviderSessions(client, resumeProvider, 250, resumeAccountId)
       .then((sessions) => {
         if (!current) return
         setProviderSessions(sessions)
@@ -200,10 +206,11 @@ export function CommandPalette({
     return () => {
       current = false
     }
-  }, [client, open, resumeProvider, view])
+  }, [client, open, resumeProvider, resumeAccountId, settings.data, view])
 
   function openResumeView() {
     setResumeProvider(currentProvider)
+    setRequestedAccountId(currentAccountId)
     setView('resume')
     setQuery('')
     setPreviousItems([])
@@ -223,6 +230,7 @@ export function CommandPalette({
 
   function selectResumeProvider(provider: ProviderKind) {
     setResumeProvider(provider)
+    setRequestedAccountId(null)
     setView('resume')
     setQuery('')
     setProviderSessions([])
@@ -240,7 +248,7 @@ export function CommandPalette({
     setProviderSessionImport(`${summary.cursor.provider}:${identity}`)
     setProviderSessionError(null)
     try {
-      await actions.resumeProviderSession(summary)
+      await actions.resumeProviderSession(summary, resumeAccountId)
       restorePreviousFocus()
       onOpenChange(false)
     } catch (error) {
@@ -259,6 +267,7 @@ export function CommandPalette({
         taskState,
         query,
         sessions: providerSessions,
+        accountId: resumeAccountId,
         importing: providerSessionImport,
         resume: (summary) => resumeProviderSession(summary),
       })
@@ -409,6 +418,19 @@ export function CommandPalette({
             <div className="ml-3 flex h-8 shrink-0 items-center gap-2 px-2.5 text-[12px] text-[var(--text-secondary)]">
               <ProviderIcon className="size-3.5" provider={resumeProvider} />
               <span>{providerMeta(resumeProvider).name}</span>
+              {(settings.data?.provider_accounts ?? []).some((account) => account.provider === resumeProvider) && (
+                <select
+                  aria-label={t('providers.accounts')}
+                  className="max-w-[160px] rounded border bg-background px-2 py-1 outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  value={resumeAccountId ?? ''}
+                  onChange={(event) => setRequestedAccountId(event.target.value || null)}
+                >
+                  <option value="">{t('providers.default_account')}</option>
+                  {(settings.data?.provider_accounts ?? []).filter((account) => account.provider === resumeProvider).map((account) => (
+                    <option key={account.id} value={account.id}>{account.label}</option>
+                  ))}
+                </select>
+              )}
             </div>
           ) : (
             <button
@@ -726,12 +748,14 @@ function buildResumeItems({
   taskState,
   query,
   sessions,
+  accountId,
   importing,
   resume,
 }: {
   taskState: TaskState
   query: string
   sessions: ProviderSessionSummary[]
+  accountId: string | null
   importing: string | null
   resume: (summary: ProviderSessionSummary) => Promise<void>
 }): PaletteItem[] {
@@ -739,9 +763,7 @@ function buildResumeItems({
   const now = Math.floor(Date.now() / 1_000)
   return sessions
     .filter((summary) => !taskState.sessions.some((session) =>
-      session.provider_cursor
-        ? sameProviderSession(session.provider_cursor, summary.cursor)
-        : false))
+      sessionOwnsProviderSession(session, summary.cursor, accountId)))
     .map((summary, order) => {
       const provider = providerMeta(summary.cursor.provider)
       const nativeId = providerSessionNativeId(summary.cursor)

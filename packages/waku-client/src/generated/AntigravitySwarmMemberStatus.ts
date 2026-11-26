@@ -3,5 +3,12 @@
 /**
  * Live lifecycle status of one swarm member, derived from `members.json` and
  * the member's `transcript.jsonl` tail.
+ *
+ * `Stopped` is not serialized as the status string `"stopped"`. Protocol 13
+ * peers shipped before that variant reject unknown statuses and drop the
+ * whole snapshot. The wire form is `"waiting"` plus `"stopped": true`, which
+ * those peers ignore. This build folds either shape back into `Stopped`.
+ * An unrecognized status string decodes as `Waiting` so a newer variant
+ * cannot reject a stored snapshot.
  */
 export type AntigravitySwarmMemberStatus = "working" | "waiting" | "stopped" | "killed" | "failed";

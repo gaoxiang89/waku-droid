@@ -1355,6 +1355,27 @@ fn markdown_capped<'a>(
     max_blocks: usize,
 ) -> Option<AnyElement> {
     let blocks = view.blocks().collect::<Vec<_>>();
+    markdown_block_refs(view, ctx, &blocks, max_blocks)
+}
+
+/// Render an immutable, already parsed tile. Activity detail preparation runs
+/// off-thread; frames visit only the tiles selected by the nested virtual list.
+/// Each tile owns a separate flatten cache and selection row identity.
+pub fn markdown_blocks<'a>(
+    view: &'a MarkdownView,
+    blocks: &[Block],
+    ctx: &Ctx<'a>,
+) -> Option<AnyElement> {
+    let blocks = blocks.iter().collect::<Vec<_>>();
+    markdown_block_refs(view, ctx, &blocks, usize::MAX)
+}
+
+fn markdown_block_refs<'a>(
+    view: &'a MarkdownView,
+    ctx: &Ctx<'a>,
+    blocks: &[&Block],
+    max_blocks: usize,
+) -> Option<AnyElement> {
     let Some((&last, leading)) = blocks.split_last() else {
         if ctx.animate_streaming && view.streaming.get() {
             let mut veil = view.veil.borrow_mut();

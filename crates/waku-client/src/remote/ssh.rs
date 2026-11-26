@@ -17,8 +17,7 @@ use super::process_util::hide_console_window;
 const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 pub const ASKPASS_CONNECTION_ENV: &str = "WAKU_SSH_ASKPASS_CONNECTION_ID";
 pub const ASKPASS_DIAGNOSTIC_PREFIX: &str = "[waku-ssh-askpass]";
-const WINDOWS_AUTH_HINT: &str =
-    "Hint: if your key uses a passphrase, save it in Connections or start the Windows ssh-agent service.";
+const WINDOWS_AUTH_HINT: &str = "Hint: if your key uses a passphrase, save it in Connections or start the Windows ssh-agent service.";
 
 pub fn resolve_ssh_program() -> PathBuf {
     resolve_ssh_program_with(
@@ -134,8 +133,7 @@ fn build_command_with_options(
         bail!("an SSH command requires an SSH connection");
     };
     let mut args = base_args(target)?;
-    let key_passphrase_askpass =
-        use_askpass && matches!(target.auth_method(), SshAuthMethod::Key);
+    let key_passphrase_askpass = use_askpass && matches!(target.auth_method(), SshAuthMethod::Key);
     if key_passphrase_askpass {
         for arg in &mut args {
             if arg == "BatchMode=yes" {
@@ -192,7 +190,11 @@ fn append_target_args(args: &mut Vec<String>, target: &SshTarget) -> anyhow::Res
             if let Some(port) = port {
                 args.extend(["-p".to_owned(), port.to_string()]);
             }
-            if let Some(user) = user.as_deref().map(str::trim).filter(|user| !user.is_empty()) {
+            if let Some(user) = user
+                .as_deref()
+                .map(str::trim)
+                .filter(|user| !user.is_empty())
+            {
                 validate_option_value(user, "SSH user")?;
                 args.extend(["-l".to_owned(), user.to_owned()]);
             }
@@ -574,10 +576,7 @@ fn append_windows_auth_hint_if_needed(
     has_passphrase: bool,
     is_windows: bool,
 ) -> String {
-    if !is_windows
-        || !detail.contains("Permission denied")
-        || detail.contains(WINDOWS_AUTH_HINT)
-    {
+    if !is_windows || !detail.contains("Permission denied") || detail.contains(WINDOWS_AUTH_HINT) {
         return detail;
     }
     let missing_secret = match auth_method {
@@ -997,8 +996,12 @@ mod tests {
             append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Key, true, true);
         assert_eq!(key_with_pass, denied);
 
-        let with_password =
-            append_windows_auth_hint_if_needed(denied.clone(), SshAuthMethod::Password, false, true);
+        let with_password = append_windows_auth_hint_if_needed(
+            denied.clone(),
+            SshAuthMethod::Password,
+            false,
+            true,
+        );
         assert_eq!(with_password, denied);
 
         let non_windows =

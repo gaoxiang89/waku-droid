@@ -223,10 +223,9 @@ pub(crate) fn start_local_with_attachment_roots(
     attachment_roots: Vec<PathBuf>,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
-    // Computer Use is experimental, so release builds never start its helper
-    // whatever a client, a migrated state file, or an environment variable
-    // asks for. Every driver reads the clamped flag, which also means only
-    // debug builds register the REPL server's Cua bridge or attach the skill.
+    // Computer Use is prohibited. Every driver reads the clamped flag, so a
+    // client, a migrated state file, or an environment variable cannot
+    // register the REPL server's Cua bridge or attach the skill.
     options.computer_use_enabled =
         crate::computer_use::resolve_enabled(options.computer_use_enabled);
     let inner: Arc<dyn DriverControl> = match provider {

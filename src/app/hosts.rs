@@ -65,8 +65,8 @@ impl Waku {
         account_id: Option<&str>,
     ) -> Option<&ProviderProbe> {
         if *key == HostKey::Local
-            && let Some(probe) = account_id
-                .and_then(|id| self.local_account_probes.get(&provider)?.get(id))
+            && let Some(probe) =
+                account_id.and_then(|id| self.local_account_probes.get(&provider)?.get(id))
         {
             return Some(probe);
         }

@@ -1,4 +1,4 @@
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   abbreviateHomePath,
   defaultAccountExampleDir,
@@ -11,7 +11,7 @@ import {
   type ProviderAccount,
   type ProviderKind,
 } from '@waku/client'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { ControlMenu } from '@/components/control-menu'
 import { SkillsSettings } from '@/components/skills-settings'
@@ -25,7 +25,9 @@ import {
 } from '@/hooks/use-daemon-data'
 import { useCopyFeedback } from '@/hooks/use-copy-feedback'
 import {
+  browseDaemonDirectory,
   daemonKeys,
+  loadDaemonSettings,
   updateDaemonSettings,
 } from '@/lib/daemon-api'
 import { useDaemon } from '@/lib/daemon-context'
@@ -39,6 +41,7 @@ import {
   languageLabel,
   useI18n,
 } from '@/lib/i18n'
+import { createSettingsMutator } from '@/lib/settings-mutations'
 import { cn } from '@/lib/utils'
 
 export type SettingsPageId =
@@ -251,30 +254,34 @@ function ProvidersSettings() {
     ...Object.values(probes.states).map((state) => state.dataUpdatedAt),
   )
 
-  async function apply(next: DaemonSettings) {
-    if (!client || !config) return
-    try {
+  const apply = useMemo(() => createSettingsMutator(
+    async () => {
+      if (!client || !config) throw new Error('The daemon is disconnected')
+      return loadDaemonSettings(client)
+    },
+    async (next: DaemonSettings) => {
+      if (!client || !config) throw new Error('The daemon is disconnected')
       await updateDaemonSettings(client, next)
       queryClient.setQueryData(daemonKeys.settings(config.address), next)
-      await Promise.all([
+      // Do not wait for model/usage probes before acknowledging the saved draft.
+      void Promise.all([
         queryClient.invalidateQueries({ queryKey: daemonKeys.providers(config.address) }),
         queryClient.invalidateQueries({ queryKey: daemonKeys.composerSources(config.address) }),
         queryClient.invalidateQueries({ queryKey: daemonKeys.planUsageRoot(config.address) }),
         queryClient.invalidateQueries({ queryKey: daemonKeys.skills(config.address) }),
-      ])
-    } catch (error) {
-      toast.error(errorMessage(error))
-    }
-  }
+      ]).catch(() => {})
+    },
+  ), [client, config, queryClient])
 
   function applyProviderPath(provider: ProviderKind, value: string) {
-    if (!settings.data) return
-    const overrides = { ...(settings.data.provider_binary_overrides ?? {}) }
     const trimmed = value.trim()
-    if (trimmed) overrides[provider] = trimmed
-    else delete overrides[provider]
     setPaths((current) => ({ ...current, [provider]: trimmed }))
-    void apply({ ...settings.data, provider_binary_overrides: overrides })
+    void apply((current) => {
+      const overrides = { ...(current.provider_binary_overrides ?? {}) }
+      if (trimmed) overrides[provider] = trimmed
+      else delete overrides[provider]
+      return { ...current, provider_binary_overrides: overrides }
+    }).catch((error) => toast.error(errorMessage(error)))
   }
 
   function toggleExpandedProvider(provider: ProviderKind) {
@@ -367,10 +374,12 @@ function ProvidersSettings() {
                     label={t(disabled ? 'providers.enable' : 'providers.disable', { provider: provider.name })}
                     onChange={(enabled) => {
                       if (!settings.data) return
-                      const disabledProviders = enabled
-                        ? settings.data.disabled_providers.filter((kind) => kind !== provider.id)
-                        : [...new Set([...settings.data.disabled_providers, provider.id])]
-                      void apply({ ...settings.data, disabled_providers: disabledProviders })
+                      void apply((current) => {
+                        const disabledProviders = enabled
+                          ? current.disabled_providers.filter((kind) => kind !== provider.id)
+                          : [...new Set([...current.disabled_providers, provider.id])]
+                        return { ...current, disabled_providers: disabledProviders }
+                      })
                     }}
                   />
                 )}
@@ -433,9 +442,17 @@ function ProviderAccountsSection({
   providerId: ProviderKind
   providerName: string
   settings: DaemonSettings
-  onApply: (next: DaemonSettings) => Promise<void>
+  onApply: (mutate: (current: DaemonSettings) => DaemonSettings | Promise<DaemonSettings>) => Promise<DaemonSettings>
 }) {
   const { t } = useI18n()
+  const { client, config } = useDaemon()
+  const host = useQuery({
+    queryKey: daemonKeys.directory(config?.address ?? 'disconnected', null),
+    queryFn: () => browseDaemonDirectory(client!, null),
+    enabled: Boolean(client && config),
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+  const [saving, setSaving] = useState(false)
   const accounts = (settings.provider_accounts ?? []).filter(
     (account) => account.provider === providerId,
   )
@@ -461,61 +478,73 @@ function ProviderAccountsSection({
     })
   }
 
-  function saveDraft() {
-    if (!draft) return
+  async function saveDraft() {
+    if (!draft || saving) return
+    const submitted = draft
     const label = draft.label.trim()
     const configDir = draft.configDir.trim()
-    if (!label) {
-      setDraft({ ...draft, error: t('providers.account_error_empty_name') })
+    if (!label || !configDir) {
+      setDraft({ ...draft, error: t(!label ? 'providers.account_error_empty_name' : 'providers.account_error_empty_dir') })
       return
     }
-    if (!configDir) {
-      setDraft({ ...draft, error: t('providers.account_error_empty_dir') })
-      return
-    }
-    const dirKey = normalizeAccountConfigDirKey(configDir)
-    if (dirKey === normalizeAccountConfigDirKey(defaultDir)) {
-      setDraft({ ...draft, error: t('providers.account_error_default_dir', { path: defaultDir }) })
-      return
-    }
-    const duplicate = accounts.some(
-      (account) =>
-        account.id !== draft.editingId
-        && normalizeAccountConfigDirKey(account.configDir) === dirKey,
-    )
-    if (duplicate) {
-      setDraft({
-        ...draft,
-        error: t('providers.account_error_duplicate_dir', { provider: providerName }),
+    setSaving(true)
+    try {
+      const directory = host.data ?? await host.refetch().then((result) => {
+        if (!result.data) throw result.error ?? new Error('Cannot determine daemon home directory')
+        return result.data
       })
-      return
+      if (!directory) throw new Error('Cannot determine daemon home directory')
+      const windows = /^[a-z]:[\\/]|^\\\\/iu.test(directory.home)
+      const key = async (raw: string) => {
+        const trimmed = raw.trim()
+        const expanded = trimmed.replace(/^~(?=[\\/]|$)/u, directory.home)
+        if (expanded.includes('\0') || !(windows ? /^(?:[a-z]:[\\/]|\\\\)/iu : /^\//u).test(expanded)) {
+          throw new Error('Use an absolute directory or a path relative to the daemon home (~).')
+        }
+        // Canonicalize existing paths on the host. For a not-yet-created
+        // account directory, reject parent traversal and compare expanded paths.
+        try {
+          const response = await client!.request({ type: 'workspace', operation: { type: 'resolvePath', path: expanded } })
+          if (response.type === 'workspace' && response.result.type === 'resolvedPath') {
+            return normalizeAccountConfigDirKey(response.result.path, windows)
+          }
+        } catch {}
+        if (expanded.split(/[\\/]/u).includes('..')) throw new Error('Create the directory before using parent (..) path components.')
+        return normalizeAccountConfigDirKey(expanded.replaceAll(/([\\/])\.(?=[\\/]|$)/gu, '$1'), windows)
+      }
+      const dirKey = await key(configDir)
+      if (dirKey === await key(defaultDir)) throw new Error(t('providers.account_error_default_dir', { path: defaultDir }))
+      const id = submitted.editingId ?? crypto.randomUUID()
+      await onApply(async (current) => {
+        const existing = current.provider_accounts ?? []
+        for (const account of existing) {
+          if (account.provider === providerId && account.id !== id && await key(account.configDir) === dirKey) {
+            throw new Error(t('providers.account_error_duplicate_dir', { provider: providerName }))
+          }
+        }
+        if (submitted.editingId && !existing.some((account) => account.id === id)) {
+          throw new Error('This account was removed. Add a new account instead.')
+        }
+        const next = { id, provider: providerId, label, configDir, binaryOverride: null }
+        return { ...current, provider_accounts: submitted.editingId
+          ? existing.map((account) => account.id === id ? { ...account, label, configDir } : account)
+          : [...existing, next] }
+      })
+      setDraft((current) => current === submitted ? null : current)
+    } catch (error) {
+      setDraft((current) => current === submitted ? { ...current, error: errorMessage(error) } : current)
+    } finally {
+      setSaving(false)
     }
-    const existing = settings.provider_accounts ?? []
-    const nextAccounts = draft.editingId
-      ? existing.map((account) =>
-          account.id === draft.editingId
-            ? { ...account, label, configDir }
-            : account)
-      : [
-          ...existing,
-          {
-            id: crypto.randomUUID(),
-            provider: providerId,
-            label,
-            configDir,
-            binaryOverride: null,
-          },
-        ]
-    setDraft(null)
-    void onApply({ ...settings, provider_accounts: nextAccounts })
   }
 
   function removeAccount(accountId: string) {
-    if (draft?.editingId === accountId) setDraft(null)
-    const nextAccounts = (settings.provider_accounts ?? []).filter(
-      (account) => account.id !== accountId,
-    )
-    void onApply({ ...settings, provider_accounts: nextAccounts })
+    void onApply((current) => ({
+      ...current,
+      provider_accounts: (current.provider_accounts ?? []).filter((account) => account.id !== accountId),
+    })).then(() => {
+      setDraft((current) => current?.editingId === accountId ? null : current)
+    }).catch((error) => toast.error(errorMessage(error)))
   }
 
   return (
@@ -605,7 +634,7 @@ function ProviderAccountsSection({
             <Button size="sm" type="button" variant="outline" onClick={() => setDraft(null)}>
               {t('providers.account_cancel')}
             </Button>
-            <Button size="sm" type="button" onClick={saveDraft}>
+            <Button disabled={saving} size="sm" type="button" onClick={() => void saveDraft()}>
               {t('providers.account_save')}
             </Button>
           </div>

@@ -30,6 +30,16 @@ use crate::ui::menu::{ConfirmEntry, DismissMenu, SelectNextEntry, SelectPrevious
 use super::composer::next_picker_highlight;
 use super::*;
 
+/// Config-directory edits invalidate all workspaces and in-flight tokens for
+/// the host/provider, not just the foreground command index.
+pub(super) fn invalidate_account_command_catalog(
+    cache: &mut QueryCache<SlashCommandCacheKey, Vec<SlashCommand>>,
+    host_key: &waku_client::hosts::HostKey,
+    kind: ProviderKind,
+) {
+    cache.retain(|(host, provider, _, _, _)| host != host_key || *provider != kind);
+}
+
 /// Key context the composer card declares while the popup is open.
 const AUTOCOMPLETE_CONTEXT: &str = "ComposerAutocomplete > TextInput";
 const AUTOCOMPLETE_LOADING_CONTEXT: &str = "ComposerAutocompleteLoading > TextInput";

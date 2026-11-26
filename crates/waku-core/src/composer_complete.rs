@@ -133,7 +133,8 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
 /// `/skill:name` there.
 ///
 /// On top of provider sources, every provider reads Waku's user-defined layer
-/// (`.waku/commands` and `~/.config/waku/commands`).
+/// (`.narel/commands` and `~/.config/narel/commands`, with the legacy
+/// `.waku/commands` and `~/.config/waku/commands` still supported).
 pub fn discover_slash_commands(
     provider: ProviderKind,
     project_root: &Path,
@@ -455,9 +456,23 @@ fn assemble_slash_commands_with_home(
         true,
         &mut commands,
     );
+    // Sorting is stable: at equal scope, the new name takes precedence over
+    // the legacy location. Project commands still outrank every user command.
+    scan_command_files(
+        &project_root.join(".waku/commands"),
+        CommandScope::Project,
+        true,
+        &mut commands,
+    );
     if let Some(home) = home.as_deref() {
         scan_command_files(
             &home.join(".config/narel/commands"),
+            CommandScope::User,
+            true,
+            &mut commands,
+        );
+        scan_command_files(
+            &home.join(".config/waku/commands"),
             CommandScope::User,
             true,
             &mut commands,
@@ -1458,6 +1473,45 @@ mod tests {
         assert_eq!(command.description, "Reported by the CLI");
         assert_eq!(command.argument_hint.as_deref(), Some("[target]"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_waku_commands_remain_discoverable_with_narel_precedence() {
+        let root = std::env::temp_dir().join(format!("waku-command-migration-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        let home = root.join("home");
+        for directory in [
+            project.join(".narel/commands"), project.join(".waku/commands"),
+            home.join(".config/narel/commands"), home.join(".config/waku/commands"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for (path, body) in [
+            (project.join(".waku/commands/legacy-project.md"), "Legacy project"),
+            (home.join(".config/waku/commands/legacy-user.md"), "Legacy user"),
+            (project.join(".narel/commands/project-collision.md"), "New project"),
+            (project.join(".waku/commands/project-collision.md"), "Old project"),
+            (home.join(".config/narel/commands/user-collision.md"), "New user"),
+            (home.join(".config/waku/commands/user-collision.md"), "Old user"),
+            (project.join(".waku/commands/scope-collision.md"), "Legacy project wins"),
+            (home.join(".config/narel/commands/scope-collision.md"), "New user loses"),
+        ] {
+            std::fs::write(path, body).unwrap();
+        }
+        let commands = assemble_slash_commands_with_home(
+            ProviderKind::Grok, &project, None, Some(home), Vec::new(),
+        );
+        for (name, expected) in [
+            ("legacy-project", "Legacy project"), ("legacy-user", "Legacy user"),
+            ("project-collision", "New project"), ("user-collision", "New user"),
+            ("scope-collision", "Legacy project wins"),
+        ] {
+            assert_eq!(
+                resolved_submission(ProviderKind::Grok, &format!("/{name}"), &commands).as_deref(),
+                Some(expected), "{name}",
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

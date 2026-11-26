@@ -1071,9 +1071,7 @@ mod tests {
             Some("actual title")
         );
         assert_eq!(
-            strip_title_envelope(
-                "WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1 500\n[{\"role\":\"user\"..."
-            ),
+            strip_title_envelope("WAKU_ANTIGRAVITY_BRANCH_CONTEXT_V1 500\n[{\"role\":\"user\"..."),
             None
         );
         assert_eq!(
@@ -1139,8 +1137,7 @@ mod tests {
 
     #[test]
     fn empty_end_turn_polls_for_delayed_error_step() {
-        let root =
-            std::env::temp_dir().join(format!("waku-agy-delayed-err-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("waku-agy-delayed-err-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("conversations")).unwrap();
         let session_id = "delayed-err-session";
         let db_path = root.join("conversations").join(format!("{session_id}.db"));

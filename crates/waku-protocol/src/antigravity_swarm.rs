@@ -12,6 +12,13 @@ use ts_rs::TS;
 
 /// Live lifecycle status of one swarm member, derived from `members.json` and
 /// the member's `transcript.jsonl` tail.
+///
+/// `Stopped` is not serialized as the status string `"stopped"`. Protocol 13
+/// peers shipped before that variant reject unknown statuses and drop the
+/// whole snapshot. The wire form is `"waiting"` plus `"stopped": true`, which
+/// those peers ignore. This build folds either shape back into `Stopped`.
+/// An unrecognized status string decodes as `Waiting` so a newer variant
+/// cannot reject a stored snapshot.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum AntigravitySwarmMemberStatus {
@@ -21,6 +28,29 @@ pub enum AntigravitySwarmMemberStatus {
     Stopped,
     Killed,
     Failed,
+}
+
+fn wire_member_status(status: AntigravitySwarmMemberStatus) -> (&'static str, bool) {
+    match status {
+        AntigravitySwarmMemberStatus::Working => ("working", false),
+        AntigravitySwarmMemberStatus::Waiting => ("waiting", false),
+        AntigravitySwarmMemberStatus::Stopped => ("waiting", true),
+        AntigravitySwarmMemberStatus::Killed => ("killed", false),
+        AntigravitySwarmMemberStatus::Failed => ("failed", false),
+    }
+}
+
+fn decode_member_status(status: &str, stopped: bool) -> AntigravitySwarmMemberStatus {
+    if stopped || status.eq_ignore_ascii_case("stopped") {
+        return AntigravitySwarmMemberStatus::Stopped;
+    }
+    match status {
+        "working" => AntigravitySwarmMemberStatus::Working,
+        "killed" => AntigravitySwarmMemberStatus::Killed,
+        "failed" => AntigravitySwarmMemberStatus::Failed,
+        // `waiting` and any status this build does not know.
+        _ => AntigravitySwarmMemberStatus::Waiting,
+    }
 }
 
 /// Screenshot captured for a swarm board message or overview timeline.
@@ -53,8 +83,12 @@ pub struct AntigravitySwarmFailure {
 }
 
 /// One member in the swarm roster.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    from = "WireAntigravitySwarmMember",
+    into = "WireAntigravitySwarmMember"
+)]
 pub struct AntigravitySwarmMember {
     pub name: String,
     pub conversation_id: String,
@@ -83,6 +117,91 @@ pub struct AntigravitySwarmMember {
     pub has_posted_done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireAntigravitySwarmMember {
+    name: String,
+    conversation_id: String,
+    model: String,
+    role: String,
+    #[serde(default)]
+    is_role_worker: bool,
+    wake_mode: String,
+    status: String,
+    /// Sibling of `status` so a protocol 13 peer never has to parse `"stopped"`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stopped: bool,
+    killed: bool,
+    last_read_seq: u64,
+    unread: u64,
+    posts: u64,
+    steps: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<AntigravitySwarmFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript_mtime_ms: Option<u64>,
+    #[serde(default)]
+    has_posted_done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+}
+
+impl From<WireAntigravitySwarmMember> for AntigravitySwarmMember {
+    fn from(wire: WireAntigravitySwarmMember) -> Self {
+        Self {
+            name: wire.name,
+            conversation_id: wire.conversation_id,
+            model: wire.model,
+            role: wire.role,
+            is_role_worker: wire.is_role_worker,
+            wake_mode: wire.wake_mode,
+            status: decode_member_status(&wire.status, wire.stopped),
+            killed: wire.killed,
+            last_read_seq: wire.last_read_seq,
+            unread: wire.unread,
+            posts: wire.posts,
+            steps: wire.steps,
+            activity: wire.activity,
+            activity_kind: wire.activity_kind,
+            failure: wire.failure,
+            transcript_mtime_ms: wire.transcript_mtime_ms,
+            has_posted_done: wire.has_posted_done,
+            task: wire.task,
+        }
+    }
+}
+
+impl From<AntigravitySwarmMember> for WireAntigravitySwarmMember {
+    fn from(member: AntigravitySwarmMember) -> Self {
+        let (status, stopped) = wire_member_status(member.status);
+        Self {
+            name: member.name,
+            conversation_id: member.conversation_id,
+            model: member.model,
+            role: member.role,
+            is_role_worker: member.is_role_worker,
+            wake_mode: member.wake_mode,
+            status: status.to_owned(),
+            stopped,
+            killed: member.killed,
+            last_read_seq: member.last_read_seq,
+            unread: member.unread,
+            posts: member.posts,
+            steps: member.steps,
+            activity: member.activity,
+            activity_kind: member.activity_kind,
+            failure: member.failure,
+            transcript_mtime_ms: member.transcript_mtime_ms,
+            has_posted_done: member.has_posted_done,
+            task: member.task,
+        }
+    }
 }
 
 /// One message entry from `board.jsonl`.
@@ -408,7 +527,27 @@ mod tests {
         });
         let decoded: AntigravitySwarmSnapshot =
             serde_json::from_value(raw).expect("legacy payload should deserialize");
-        assert_eq!(decoded.members[0].status, AntigravitySwarmMemberStatus::Stopped);
+        assert_eq!(
+            decoded.members[0].status,
+            AntigravitySwarmMemberStatus::Stopped
+        );
+        let mut stopped = decoded.members[0].clone();
+        stopped.status = AntigravitySwarmMemberStatus::Stopped;
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["status"], "waiting");
+        assert_eq!(json["stopped"], true);
+        assert_ne!(json["status"], "stopped");
+        let round_trip: AntigravitySwarmMember = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.status, AntigravitySwarmMemberStatus::Stopped);
+        let mut unknown = serde_json::to_value(&decoded.members[0]).unwrap();
+        unknown["status"] = serde_json::Value::String("paused".into());
+        unknown.as_object_mut().unwrap().remove("stopped");
+        let unknown: AntigravitySwarmMember = serde_json::from_value(unknown).unwrap();
+        assert_eq!(
+            unknown.status,
+            AntigravitySwarmMemberStatus::Waiting,
+            "unknown swarm statuses fall back to waiting"
+        );
         assert!(!decoded.members[0].has_posted_done);
         assert_eq!(decoded.members[0].task, None);
         assert!(decoded.messages[0].channel_mentions.is_empty());

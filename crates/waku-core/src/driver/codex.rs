@@ -508,20 +508,20 @@ impl CodexComputerUseConfig {
     }
 }
 
-/// Register Waku's long-lived QuickJS MCP server and keep the raw native helper
-/// private behind its built-in `cua` object. Codex sees only the compact
-/// `js` / `js_reset` execution surface.
+/// Keep Codex's bundled computer-use plugin off. Narel's own helper is also
+/// prohibited, so this never registers the QuickJS MCP server.
 fn configure_computer_use_command(command: &mut Command, config: Option<&CodexComputerUseConfig>) {
+    command
+        .arg("-c")
+        .arg(DISABLE_EXTERNAL_COMPUTER_USE_PLUGIN)
+        .arg("-c")
+        .arg(DISABLE_EXTERNAL_COMPUTER_USE_MCP_COMMAND)
+        .arg("-c")
+        .arg(DISABLE_EXTERNAL_COMPUTER_USE_MCP)
+        .arg("-c")
+        .arg(DISABLE_EXTERNAL_COMPUTER_USE_SKILL);
     if let Some(config) = config {
         command
-            .arg("-c")
-            .arg(DISABLE_EXTERNAL_COMPUTER_USE_PLUGIN)
-            .arg("-c")
-            .arg(DISABLE_EXTERNAL_COMPUTER_USE_MCP_COMMAND)
-            .arg("-c")
-            .arg(DISABLE_EXTERNAL_COMPUTER_USE_MCP)
-            .arg("-c")
-            .arg(DISABLE_EXTERNAL_COMPUTER_USE_SKILL)
             .arg("-c")
             .arg(DISABLE_CODEX_NODE_REPL_COMMAND)
             .arg("-c")
@@ -573,6 +573,7 @@ impl CodexDriver {
             }
             None => None,
         };
+        let computer_use_enabled = computer_use::resolve_enabled(computer_use_enabled);
         let computer_use = computer_use_enabled
             .then(CodexComputerUseConfig::load)
             .transpose()?;
@@ -846,10 +847,8 @@ impl CodexDriver {
                             })
                         }
                         CommandMessage::Steer(text) => {
-                            let (thread_id, active_turn_id) = (
-                                writer_thread_id.current(),
-                                writer_turn_id.lock().clone(),
-                            );
+                            let (thread_id, active_turn_id) =
+                                (writer_thread_id.current(), writer_turn_id.lock().clone());
                             let (Some(thread_id), Some(expected_turn_id)) =
                                 (thread_id, active_turn_id)
                             else {
@@ -891,10 +890,9 @@ impl CodexDriver {
                             continue;
                         }
                         CommandMessage::Cancel => {
-                            let (Some(thread_id), Some(turn_id)) = (
-                                writer_thread_id.current(),
-                                writer_turn_id.lock().clone(),
-                            ) else {
+                            let (Some(thread_id), Some(turn_id)) =
+                                (writer_thread_id.current(), writer_turn_id.lock().clone())
+                            else {
                                 continue;
                             };
                             next_request_id += 1;
@@ -1254,9 +1252,7 @@ impl CodexDriver {
                 process_thread_id.mark_failed();
                 if !process_lifecycle.was_terminated() {
                     match status {
-                        Ok(status)
-                            if !status.success() && last_visible_stderr.lock().is_none() =>
-                        {
+                        Ok(status) if !status.success() && last_visible_stderr.lock().is_none() => {
                             let _ = events.send(DriverEvent::Error(tr!(
                                 "errors.provider_exited",
                                 provider = "Codex app-server",
@@ -1679,9 +1675,7 @@ fn generate_codex_title(
             let value = recv_message()?;
             if value.get("id").and_then(Value::as_u64) == Some(0) && value.get("method").is_none() {
                 if let Some(error) = value.pointer("/error/message").and_then(Value::as_str) {
-                    return Err(anyhow!(
-                        "Codex title generation initialize failed: {error}"
-                    ));
+                    return Err(anyhow!("Codex title generation initialize failed: {error}"));
                 }
                 break;
             }
@@ -3582,7 +3576,22 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(disabled_arguments.is_empty());
+        for argument in [
+            DISABLE_EXTERNAL_COMPUTER_USE_PLUGIN,
+            DISABLE_EXTERNAL_COMPUTER_USE_MCP_COMMAND,
+            DISABLE_EXTERNAL_COMPUTER_USE_MCP,
+            DISABLE_EXTERNAL_COMPUTER_USE_SKILL,
+        ] {
+            assert!(
+                disabled_arguments.iter().any(|item| item == argument),
+                "missing {argument}"
+            );
+        }
+        assert!(
+            !disabled_arguments.iter().any(
+                |argument| argument.contains("narel_js_repl") || argument.contains("node_repl")
+            )
+        );
         assert!(
             disabled
                 .get_envs()
@@ -4523,10 +4532,7 @@ mod tests {
         assert_eq!(markdown_link_destination("file:///etc/passwd"), None);
         assert_eq!(markdown_link_destination("data:text/html,<h1>x</h1>"), None);
         assert_eq!(markdown_link_destination("https://"), None);
-        assert_eq!(
-            markdown_link_destination("https://example.com/a\nb"),
-            None
-        );
+        assert_eq!(markdown_link_destination("https://example.com/a\nb"), None);
 
         let mut state = CodexStreamState::default();
         state.begin_turn();
@@ -4561,11 +4567,7 @@ mod tests {
             )
             .unwrap();
             let hang_bin = dir.join("hang.cmd");
-            fs::write(
-                &hang_bin,
-                "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n",
-            )
-            .unwrap();
+            fs::write(&hang_bin, "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n").unwrap();
             (err_bin, hang_bin)
         };
         #[cfg(unix)]
@@ -4586,8 +4588,8 @@ mod tests {
 
         let (_keep_alive, cancel_rx) = bounded(0);
         let started = Instant::now();
-        let err = generate_codex_title(&init_err_bin, &dir, None, "test prompt", &cancel_rx)
-            .unwrap_err();
+        let err =
+            generate_codex_title(&init_err_bin, &dir, None, "test prompt", &cancel_rx).unwrap_err();
         assert!(
             err.to_string().contains("init rejected"),
             "expected initialize error, got: {err}"

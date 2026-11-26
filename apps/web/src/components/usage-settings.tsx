@@ -28,7 +28,7 @@ import { UsageTrendChart, type UsageMetric } from '@/components/usage-chart'
 import { ProviderIcon, providerMeta, WakuIcon } from '@/components/waku-icon'
 import {
   useDaemonSettings,
-  useProviderProbes,
+  useProviderDetections,
   useUsageHistory,
 } from '@/hooks/use-daemon-data'
 import { daemonKeys, fetchPlanUsage } from '@/lib/daemon-api'
@@ -173,7 +173,7 @@ function PlanUsageSection() {
   const { locale, t } = useI18n()
   const { client, config, phase } = useDaemon()
   const settings = useDaemonSettings()
-  const probes = useProviderProbes(phase === 'connected')
+  const probes = useProviderDetections(phase === 'connected', PLAN_USAGE_PROVIDERS)
 
   const targets: PlanUsageTarget[] = settings.data
     ? PLAN_USAGE_PROVIDERS.flatMap((provider) => {

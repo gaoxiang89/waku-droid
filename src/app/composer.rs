@@ -4,6 +4,34 @@ use crate::ui::ActivationExt as _;
 use anyhow::Context as _;
 use base64::Engine as _;
 
+pub(super) type DroidDraftTraits = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    RuntimeMode,
+);
+
+pub(super) fn apply_droid_draft_snapshot(
+    session: &mut AgentSession,
+    account_id: Option<String>,
+    traits: Option<DroidDraftTraits>,
+) -> bool {
+    if session.has_started() {
+        return false;
+    }
+    session.provider = ProviderKind::Droid;
+    session.account_id = account_id;
+    if let Some((model, reasoning_effort, service_tier, context_window, runtime_mode)) = traits {
+        session.model = model;
+        session.reasoning_effort = reasoning_effort;
+        session.service_tier = service_tier;
+        session.context_window = context_window;
+        session.runtime_mode = runtime_mode;
+    }
+    true
+}
+
 const COMPUTER_USE_PREVIEW_WIDTH: f32 = 304.0;
 const COMPUTER_USE_PREVIEW_HEIGHT: f32 = 172.0;
 const COMPUTER_USE_PREVIEW_RADIUS: f32 = 12.0;
@@ -450,34 +478,32 @@ impl Waku {
                                 cx,
                             );
                         }))
-                        .on_key_down(cx.listener(
-                            move |this, event: &KeyDownEvent, window, cx| {
-                                if event.keystroke.modifiers.modified() {
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.modifiers.modified() {
+                                return;
+                            }
+                            let last = option_focuses.len().saturating_sub(1);
+                            let target = match event.keystroke.key.as_str() {
+                                "enter" | "space" => {
+                                    this.select_user_input_option(
+                                        key_question_id.clone(),
+                                        key_label.clone(),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
                                     return;
                                 }
-                                let last = option_focuses.len().saturating_sub(1);
-                                let target = match event.keystroke.key.as_str() {
-                                    "enter" | "space" => {
-                                        this.select_user_input_option(
-                                            key_question_id.clone(),
-                                            key_label.clone(),
-                                            cx,
-                                        );
-                                        cx.stop_propagation();
-                                        return;
-                                    }
-                                    "down" | "right" => (index + 1).min(last),
-                                    "up" | "left" => index.saturating_sub(1),
-                                    "home" => 0,
-                                    "end" => last,
-                                    _ => return,
-                                };
-                                if let Some(focus) = option_focuses.get(target) {
-                                    window.focus(focus, cx);
-                                }
-                                cx.stop_propagation();
-                            },
-                        )),
+                                "down" | "right" => (index + 1).min(last),
+                                "up" | "left" => index.saturating_sub(1),
+                                "home" => 0,
+                                "end" => last,
+                                _ => return,
+                            };
+                            if let Some(focus) = option_focuses.get(target) {
+                                window.focus(focus, cx);
+                            }
+                            cx.stop_propagation();
+                        })),
                 );
             }
             let custom = question.accepts_custom.then(|| {
@@ -2684,6 +2710,26 @@ impl Waku {
         prompt: &str,
         cx: &mut Context<Self>,
     ) -> Option<ComposerSubmission> {
+        self.submission_with_attachments_inner(prompt, false, cx)
+    }
+
+    pub(super) fn submission_with_attachments_for_steer(
+        &mut self,
+        prompt: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<ComposerSubmission> {
+        self.submission_with_attachments_inner(prompt, true, cx)
+    }
+
+    fn submission_with_attachments_inner(
+        &mut self,
+        prompt: &str,
+        steer: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<ComposerSubmission> {
+        if self.defer_uncached_local_command(prompt, false, steer, cx) {
+            return None;
+        }
         if self.execute_local_composer_command(prompt, cx) {
             return None;
         }
@@ -2779,12 +2825,171 @@ impl Waku {
         from_autocomplete: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.execute_resume_composer_command(prompt, cx)
+        self.defer_uncached_local_command(prompt, from_autocomplete, false, cx)
+            || self.execute_resume_composer_command(prompt, cx)
             || self.execute_fast_mode_toggle(prompt, cx)
             || self.execute_goal_composer_command(prompt, cx)
             || self.execute_codex_usage_command(prompt, cx)
             || self.execute_antigravity_local_command(prompt, from_autocomplete, cx)
             || self.execute_droid_local_command(prompt, from_autocomplete, cx)
+    }
+
+    /// Resolve the entire selected host/workspace/account catalog before a
+    /// client-local command can steal a project or user template's name.
+    /// This is a submission/accept path, never a render path.
+    fn defer_uncached_local_command(
+        &mut self,
+        prompt: &str,
+        from_autocomplete: bool,
+        steer: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::composer_complete::{
+            is_codex_usage_submission, parse_antigravity_local_command, parse_droid_local_command,
+        };
+        let (provider, raw_account_id, reported) = self
+            .selected_session()
+            .map(|session| {
+                (
+                    session.provider,
+                    session.account_id.clone(),
+                    session.available_commands.clone(),
+                )
+            })
+            .unwrap_or((
+                self.state.last_provider,
+                self.state.last_account_id.clone(),
+                Vec::new(),
+            ));
+        let codex_control = provider == ProviderKind::Codex
+            && matches!(
+                prompt.trim().split_whitespace().next(),
+                Some("/fast" | "/goal")
+            );
+        let candidate = is_codex_usage_submission(provider, prompt, &[])
+            || codex_control
+            || parse_antigravity_local_command(provider, prompt, &[]).is_some_and(|command| {
+                !from_autocomplete || command.executes_on_autocomplete_accept()
+            })
+            || parse_droid_local_command(provider, prompt, &[]).is_some_and(|command| {
+                !from_autocomplete || command.executes_on_autocomplete_accept()
+            });
+        if !candidate {
+            return false;
+        }
+        let Some(scope) = self.selected_panel_scope() else {
+            return false;
+        };
+        let account_id =
+            self.validated_account_id_for_host(&scope.host, provider, raw_account_id.as_deref());
+        let binary_override =
+            self.effective_binary_override_for_host(&scope.host, provider, account_id.as_deref());
+        let config_dir =
+            self.effective_config_dir_for_host(&scope.host, provider, account_id.as_deref());
+        let key = (
+            scope.host.clone(),
+            provider,
+            scope.workspace.clone(),
+            binary_override.clone(),
+            account_id,
+        );
+        let token = match self.slash_commands.read(&key) {
+            Query::Ready(commands) => {
+                self.slash_command_index = Rc::new(
+                    crate::composer_complete::merge_reported_commands(&commands, &reported),
+                );
+                self.slash_command_index_key = Some(key);
+                self.slash_command_index_loading = false;
+                return false;
+            }
+            Query::Missing(token) => token,
+            Query::Pending => {
+                // Take ownership from an autocomplete-only scan so completion
+                // resumes this exact action, guarded by this request's token.
+                self.slash_commands.invalidate(&key);
+                let Query::Missing(token) = self.slash_commands.read(&key) else {
+                    unreachable!("invalidated command catalog must be missing");
+                };
+                token
+            }
+        };
+        let prompt = prompt.to_owned();
+        if !from_autocomplete && self.composer.read(cx).content(cx).is_empty() {
+            // Keyboard submission has already cleared its field. Retain the
+            // editable draft and attachments until discovery succeeds.
+            self.composer
+                .update(cx, |input, cx| input.replace_range(0..0, &prompt, cx));
+        }
+        let expected_content = self.composer.read(cx).content(cx).to_owned();
+        let expected_session = self.state.selected_session;
+        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
+        let project_root = scope.workspace.clone();
+        self.slash_command_index_loading = true;
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match workspace.request(
+                        waku_client::WorkspaceOperation::DiscoverSlashCommands {
+                            provider,
+                            project_root,
+                            binary_override,
+                            config_dir,
+                        },
+                    ) {
+                        Ok(waku_client::WorkspaceResult::SlashCommands { commands }) => {
+                            Ok(commands)
+                        }
+                        Ok(_) => Err(anyhow::anyhow!(
+                            "the daemon returned an invalid command catalog"
+                        )),
+                        Err(error) => Err(error),
+                    }
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                let commands = match result {
+                    Ok(commands) => commands,
+                    Err(error) => {
+                        waku.slash_commands.abandon(token);
+                        waku.refresh_composer_sources(cx);
+                        waku.show_toast(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                if !waku.slash_commands.fulfill(token, commands) {
+                    return;
+                }
+                waku.refresh_composer_sources(cx);
+                if waku.state.selected_session != expected_session
+                    || waku.selected_panel_scope().as_ref() != Some(&scope)
+                    || waku.composer.read(cx).content(cx) != expected_content
+                {
+                    return;
+                }
+                if from_autocomplete {
+                    if !waku.execute_local_composer_command_on_accept(&prompt, cx) {
+                        let len = waku.composer.read(cx).content(cx).len();
+                        waku.composer
+                            .update(cx, |input, cx| input.replace_range(0..len, &prompt, cx));
+                    }
+                } else if let Some(submission) =
+                    waku.submission_with_attachments_inner(&prompt, steer, cx)
+                {
+                    waku.composer.update(cx, |input, cx| input.clear(cx));
+                    if steer {
+                        waku.steer_composer_submission(submission, cx);
+                    } else {
+                        waku.submit_composer_submission(submission, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+        true
     }
 
     fn execute_provider_model_picker(&mut self, can_choose_model: bool, cx: &mut Context<Self>) {
@@ -2980,7 +3185,10 @@ impl Waku {
     fn execute_codex_usage_command(&mut self, prompt: &str, cx: &mut Context<Self>) -> bool {
         let (provider, session_account_id) = match self.selected_session() {
             Some(session) => (session.provider, session.account_id.as_deref()),
-            None => (self.state.last_provider, self.state.last_account_id.as_deref()),
+            None => (
+                self.state.last_provider,
+                self.state.last_account_id.as_deref(),
+            ),
         };
         if !crate::composer_complete::is_codex_usage_submission(
             provider,
@@ -3221,26 +3429,7 @@ impl Waku {
                     Some((_, true)) | None => self.create_projectless_session(cx),
                 }
                 let switched_reused_draft = self.selected_session_mut().is_some_and(|session| {
-                    if session.has_started() || session.provider == ProviderKind::Droid {
-                        return false;
-                    }
-                    session.provider = ProviderKind::Droid;
-                    session.account_id = account_id.clone();
-                    if let Some((
-                        model,
-                        reasoning_effort,
-                        service_tier,
-                        context_window,
-                        runtime_mode,
-                    )) = inherited_traits
-                    {
-                        session.model = model;
-                        session.reasoning_effort = reasoning_effort;
-                        session.service_tier = service_tier;
-                        session.context_window = context_window;
-                        session.runtime_mode = runtime_mode;
-                    }
-                    true
+                    apply_droid_draft_snapshot(session, account_id.clone(), inherited_traits)
                 });
                 if switched_reused_draft {
                     self.refresh_composer_sources(cx);
@@ -5132,10 +5321,18 @@ pub(super) fn visible_picker_entries(
         };
 
         for (account_id, account_label) in account_targets {
-            let account_probe = account_id
-                .as_deref()
-                .and_then(|id| account_probes?.get(&kind)?.get(id))
-                .unwrap_or(probe);
+            let account_probe = match (account_id.as_deref(), account_probes) {
+                // A local named account has its own config/model inventory.
+                // An unprobed account must not inherit the Default label's
+                // catalog and advertise those models as verified for it.
+                (Some(id), Some(probes)) => {
+                    let Some(probe) = probes.get(&kind).and_then(|probes| probes.get(id)) else {
+                        continue;
+                    };
+                    probe
+                }
+                _ => probe,
+            };
             if !account_probe.installed {
                 continue;
             }

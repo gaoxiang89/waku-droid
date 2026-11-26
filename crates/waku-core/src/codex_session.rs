@@ -210,7 +210,10 @@ fn with_app_server_in<T>(
                 }),
             )?;
             client.receive_response(0)?;
-            write_json_line(client.stdin, &json!({"method": "initialized", "params": {}}))?;
+            write_json_line(
+                client.stdin,
+                &json!({"method": "initialized", "params": {}}),
+            )?;
             operation(&mut client)
         })()
     };
@@ -265,7 +268,9 @@ fn app_server_request_in(
     config_dir: Option<&Path>,
     request: Value,
 ) -> anyhow::Result<Value> {
-    with_app_server_in(binary, cwd, config_dir, |client| client.raw_request(request))
+    with_app_server_in(binary, cwd, config_dir, |client| {
+        client.raw_request(request)
+    })
 }
 
 /// Create the fork outside the source session's resident app-server. Returning
@@ -374,9 +379,7 @@ fn parse_session_summaries(response: &Value, limit: usize) -> Vec<ProviderSessio
 }
 
 fn thread_list_page_limit(limit: usize) -> usize {
-    limit
-        .saturating_mul(2)
-        .clamp(1, MAX_THREAD_LIST_PAGE_SIZE)
+    limit.saturating_mul(2).clamp(1, MAX_THREAD_LIST_PAGE_SIZE)
 }
 
 fn collect_paginated_session_summaries(
@@ -757,7 +760,10 @@ mod tests {
         assert_eq!(thread_list_page_limit(10), 20);
         assert_eq!(thread_list_page_limit(50), 100);
         assert_eq!(thread_list_page_limit(150), MAX_THREAD_LIST_PAGE_SIZE);
-        assert_eq!(thread_list_page_limit(usize::MAX), MAX_THREAD_LIST_PAGE_SIZE);
+        assert_eq!(
+            thread_list_page_limit(usize::MAX),
+            MAX_THREAD_LIST_PAGE_SIZE
+        );
 
         let mut observed_limit = None;
         let sessions = collect_paginated_session_summaries(150, |page_limit, _| {

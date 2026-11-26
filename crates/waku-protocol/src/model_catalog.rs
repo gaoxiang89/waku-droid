@@ -265,16 +265,66 @@ fn antigravity_fallback_models() -> Vec<ProviderModel> {
     const EXTENDED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
     const STANDARD_EFFORTS: &[&str] = &["low", "medium", "high"];
     let specs: &[(&str, &str, bool, Option<(&[&str], &str)>)] = &[
-        ("gemini-4-neon", "Gemini 4 Neon", true, Some((EXTENDED_EFFORTS, "high"))),
-        ("gemini-4-carbon", "Gemini 4 Carbon", false, Some((STANDARD_EFFORTS, "high"))),
-        ("gemini-4-argon", "Gemini 4 Argon", false, Some((STANDARD_EFFORTS, "high"))),
-        ("gemini-4-hydrogen", "Gemini 4 Hydrogen", false, Some((EXTENDED_EFFORTS, "high"))),
-        ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)", false, None),
-        ("gemini-pro-orchestrator", "Orchestrator (Carbon)", false, None),
-        ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)", false, None),
-        ("gemini-3.8-flash", "Gemini 3.8 Flash", false, Some((STANDARD_EFFORTS, "medium"))),
-        ("claude-opus-5-5", "Claude Opus 5.5", false, Some((STANDARD_EFFORTS, "medium"))),
-        ("claude-sonnet-5-5", "Claude Sonnet 5.5", false, Some((STANDARD_EFFORTS, "medium"))),
+        (
+            "gemini-4-neon",
+            "Gemini 4 Neon",
+            true,
+            Some((EXTENDED_EFFORTS, "high")),
+        ),
+        (
+            "gemini-4-carbon",
+            "Gemini 4 Carbon",
+            false,
+            Some((STANDARD_EFFORTS, "high")),
+        ),
+        (
+            "gemini-4-argon",
+            "Gemini 4 Argon",
+            false,
+            Some((STANDARD_EFFORTS, "high")),
+        ),
+        (
+            "gemini-4-hydrogen",
+            "Gemini 4 Hydrogen",
+            false,
+            Some((EXTENDED_EFFORTS, "high")),
+        ),
+        (
+            "gemini-pro-orchestrator-neon",
+            "Orchestrator (Neon)",
+            false,
+            None,
+        ),
+        (
+            "gemini-pro-orchestrator",
+            "Orchestrator (Carbon)",
+            false,
+            None,
+        ),
+        (
+            "gemini-pro-orchestrator-argon",
+            "Orchestrator (Argon)",
+            false,
+            None,
+        ),
+        (
+            "gemini-3.8-flash",
+            "Gemini 3.8 Flash",
+            false,
+            Some((STANDARD_EFFORTS, "medium")),
+        ),
+        (
+            "claude-opus-5-5",
+            "Claude Opus 5.5",
+            false,
+            Some((STANDARD_EFFORTS, "medium")),
+        ),
+        (
+            "claude-sonnet-5-5",
+            "Claude Sonnet 5.5",
+            false,
+            Some((STANDARD_EFFORTS, "medium")),
+        ),
         ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", false, None),
     ];
     specs

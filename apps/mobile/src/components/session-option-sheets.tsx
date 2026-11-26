@@ -44,10 +44,9 @@ import {
 } from '@/lib/model-traits';
 import { droidAutonomyLevel, providerLabel, runtimeModeLabel } from '@/lib/session-presentation';
 
-export interface ModelSelection {
+export interface ModelSelection extends ModelTraitSelection {
   accountId?: string | null;
   model: string | null;
-  reasoningEffort: string | null;
 }
 
 export function modelDisplayName(
@@ -111,6 +110,8 @@ export function ModelSheet({
       accountId: supportsMultipleAccounts(provider) ? activeAccountId : null,
       model: next.id,
       reasoningEffort: next.default_reasoning_effort ?? null,
+      serviceTier: next.default_service_tier ?? null,
+      contextWindow: next.default_context_window ?? null,
     });
     onDismiss();
   }
@@ -348,10 +349,11 @@ export function ModelPickerSheet({
   const slideStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: -pageWidth.value * progress.value }],
   }));
+  const firstProvider = providers[0] ?? null;
 
   useEffect(() => {
     if (!visible) return;
-    const initial = provider ?? providers[0] ?? null;
+    const initial = provider ?? firstProvider;
     setBrowsing(initial);
     setSearch('');
     setAccountByProvider(
@@ -360,7 +362,7 @@ export function ModelPickerSheet({
         : {},
     );
     progress.value = initial ? 1 : 0;
-  }, [initialSessionAccountId, progress, provider, providers, visible]);
+  }, [initialSessionAccountId, progress, provider, firstProvider, visible]);
 
   function slideTo(target: 0 | 1) {
     progress.value = reduceMotion

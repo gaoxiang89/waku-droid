@@ -33,9 +33,7 @@ pub(super) fn upsert_session_activity(
             let existing_is_meaningful = !existing_title.is_empty()
                 && !existing_title.eq_ignore_ascii_case("tool")
                 && existing_title != tr!("activity.tool");
-            if !incoming_title.is_empty()
-                && !(incoming_is_generic_tool && existing_is_meaningful)
-            {
+            if !incoming_title.is_empty() && !(incoming_is_generic_tool && existing_is_meaningful) {
                 activity.title = item.title;
             }
             if item.tool_name.is_some() {
@@ -238,7 +236,9 @@ impl Waku {
         {
             // The rows this activity's diff was built from are gone;
             // an expanded card rebuilds from the new ones.
-            self.activity_diffs.borrow_mut().remove(&invalidated_diff_id);
+            self.activity_diffs
+                .borrow_mut()
+                .remove(&invalidated_diff_id);
         }
         runtime.stream_phase = Some(StreamPhase::Activity);
     }
@@ -1290,23 +1290,13 @@ mod swarm_activity_tests {
         by_tool_name.tool_name = Some("swarm".to_owned());
         assert!(is_antigravity_swarm_activity(&by_tool_name));
 
-        let mut post = ActivityItem::new(
-            None,
-            ActivityKind::Tool,
-            "Post to swarm board",
-            None,
-            true,
-        );
+        let mut post =
+            ActivityItem::new(None, ActivityKind::Tool, "Post to swarm board", None, true);
         post.tool_name = Some("post_message".to_owned());
         assert!(is_antigravity_swarm_activity(&post));
 
-        let fallback_title = ActivityItem::new(
-            None,
-            ActivityKind::Tool,
-            "Run swarm_wait",
-            None,
-            false,
-        );
+        let fallback_title =
+            ActivityItem::new(None, ActivityKind::Tool, "Run swarm_wait", None, false);
         assert!(is_antigravity_swarm_activity(&fallback_title));
 
         let mut unrelated =

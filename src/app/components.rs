@@ -1310,29 +1310,10 @@ pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
         if in_fence || trimmed.is_empty() {
             continue;
         }
-        let line = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .or_else(|| trimmed.strip_prefix("+ "))
-            .unwrap_or(trimmed);
-        let parsed = if let Some(rest) = line
-            .strip_prefix("[x] ")
-            .or_else(|| line.strip_prefix("[X] "))
-        {
-            Some((PlanStepStatus::Completed, rest.trim()))
-        } else if let Some(rest) = line
-            .strip_prefix("[~] ")
-            .or_else(|| line.strip_prefix("[-] "))
-        {
-            Some((PlanStepStatus::InProgress, rest.trim()))
-        } else if let Some(rest) = line.strip_prefix("[ ] ") {
-            Some((PlanStepStatus::Pending, rest.trim()))
-        } else {
-            None
-        };
-        let Some((status, label)) = parsed else {
+        let Some((status, label)) = plan_step_from_line(trimmed) else {
             continue;
         };
+        let label = label.trim();
         if !label.is_empty() {
             steps.push(PlanStep {
                 status,
@@ -1341,6 +1322,47 @@ pub(super) fn activity_plan_steps(activity: &ActivityItem) -> Vec<PlanStep> {
         }
     }
     steps
+}
+
+fn plan_step_from_line(trimmed: &str) -> Option<(PlanStepStatus, &str)> {
+    let line = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
+    if let Some(rest) = line
+        .strip_prefix("[x] ")
+        .or_else(|| line.strip_prefix("[X] "))
+    {
+        Some((PlanStepStatus::Completed, rest))
+    } else if let Some(rest) = line
+        .strip_prefix("[~] ")
+        .or_else(|| line.strip_prefix("[-] "))
+    {
+        Some((PlanStepStatus::InProgress, rest))
+    } else {
+        line.strip_prefix("[ ] ")
+            .map(|rest| (PlanStepStatus::Pending, rest))
+    }
+}
+
+/// A plan may combine its checklist with headings, prose, or fenced examples.
+/// Only render the document when it says something the checklist cannot.
+fn plan_document_has_prose(source: &str) -> bool {
+    let mut in_fence = false;
+    for raw_line in source.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            return true;
+        }
+        if in_fence || trimmed.is_empty() {
+            continue;
+        }
+        if plan_step_from_line(trimmed).is_none() {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn is_spec_activity(activity: &ActivityItem) -> bool {
@@ -1352,11 +1374,7 @@ pub(super) fn is_spec_activity(activity: &ActivityItem) -> bool {
             .collect::<String>();
         matches!(normalized.as_str(), "exitspecmode" | "approvespec")
     };
-    matches_name(&activity.title)
-        || activity
-            .tool_name
-            .as_deref()
-            .is_some_and(matches_name)
+    matches_name(&activity.title) || activity.tool_name.as_deref().is_some_and(matches_name)
 }
 
 fn extract_spec_markdown(content: &str) -> Option<String> {
@@ -1365,7 +1383,8 @@ fn extract_spec_markdown(content: &str) -> Option<String> {
         return None;
     }
     if trimmed.starts_with('{')
-        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
     {
         let body = ["plan", "spec", "specification", "markdown"]
             .into_iter()
@@ -1386,8 +1405,7 @@ fn extract_spec_markdown(content: &str) -> Option<String> {
         });
     }
     if trimmed.starts_with('[')
-        && serde_json::from_str::<serde_json::Value>(trimmed)
-            .is_ok_and(|value| value.is_array())
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| value.is_array())
     {
         return None;
     }
@@ -1404,19 +1422,18 @@ pub(super) fn activity_section_markdown_body(
     has_plan_steps: bool,
 ) -> Option<String> {
     if activity.kind == ActivityKind::Plan {
-        if has_plan_steps
-            && matches!(
-                section_kind,
-                ActivityDisclosureSectionKind::Output | ActivityDisclosureSectionKind::Detail
-            )
-        {
-            return None;
-        }
+        // Tasks are a progress summary, not a replacement for the document.
+        // Mixed plans also contain headings, design prose and fenced examples.
         if matches!(
             section_kind,
             ActivityDisclosureSectionKind::Output | ActivityDisclosureSectionKind::Detail
-        ) || (section_kind == ActivityDisclosureSectionKind::Arguments && is_spec_activity(activity))
-        {
+        ) {
+            if has_plan_steps && !plan_document_has_prose(content) {
+                return None;
+            }
+            return extract_spec_markdown(content);
+        }
+        if section_kind == ActivityDisclosureSectionKind::Arguments && is_spec_activity(activity) {
             return extract_spec_markdown(content);
         }
         return None;
@@ -1963,6 +1980,18 @@ pub(super) struct ActivityDisclosureSection {
 pub(super) fn activity_disclosure_sections(
     activity: &ActivityItem,
 ) -> Vec<ActivityDisclosureSection> {
+    activity_disclosure_sections_with_options(
+        activity,
+        activity_shows_diff(activity),
+        !activity.image_urls.is_empty(),
+    )
+}
+
+pub(super) fn activity_disclosure_sections_with_options(
+    activity: &ActivityItem,
+    shows_diff: bool,
+    has_images: bool,
+) -> Vec<ActivityDisclosureSection> {
     let mut sections = Vec::new();
     for (kind, content) in [
         (
@@ -2005,7 +2034,7 @@ pub(super) fn activity_disclosure_sections(
                 kind: ActivityDisclosureSectionKind::Output,
                 content: output.to_owned(),
             });
-        } else if !activity.image_urls.is_empty() {
+        } else if has_images {
             sections.push(ActivityDisclosureSection {
                 kind: ActivityDisclosureSectionKind::Output,
                 content: String::new(),
@@ -2015,7 +2044,6 @@ pub(super) fn activity_disclosure_sections(
     }
     // An edit renders as a diff, which says everything the raw arguments would
     // and reads. What the tool replied is only worth the room when it failed.
-    let shows_diff = activity_shows_diff(activity);
     if let Some(arguments) = activity
         .arguments
         .as_deref()
@@ -2039,7 +2067,7 @@ pub(super) fn activity_disclosure_sections(
             kind: ActivityDisclosureSectionKind::Output,
             content: output.to_owned(),
         });
-    } else if !activity.image_urls.is_empty() {
+    } else if has_images {
         sections.push(ActivityDisclosureSection {
             kind: ActivityDisclosureSectionKind::Output,
             content: String::new(),
@@ -2843,7 +2871,9 @@ mod message_time_tests {
             None,
             true,
         )
-        .with_output(Some("# Architecture\n\n- Keep UI thread non-blocking".into()));
+        .with_output(Some(
+            "# Architecture\n\n- Keep UI thread non-blocking".into(),
+        ));
         assert!(is_spec_activity(&prose_plan));
         assert_eq!(
             activity_section_markdown_body(
@@ -2872,6 +2902,29 @@ mod message_time_tests {
                 true,
             ),
             None
+        );
+
+        // A mixed plan keeps the checklist and still exposes the prose,
+        // headings, and examples the checklist cannot carry.
+        let mixed_plan = ActivityItem::new(
+            Some("plan-3".into()),
+            crate::model::ActivityKind::Plan,
+            "TodoWrite",
+            None,
+            true,
+        )
+        .with_output(Some(
+            "## Plan\n\n- [ ] Next\n\nSummary: nearly done.".into(),
+        ));
+        assert!(!activity_plan_steps(&mixed_plan).is_empty());
+        assert_eq!(
+            activity_section_markdown_body(
+                &mixed_plan,
+                ActivityDisclosureSectionKind::Output,
+                mixed_plan.output.as_deref().unwrap(),
+                true,
+            ),
+            Some("## Plan\n\n- [ ] Next\n\nSummary: nearly done.".into())
         );
 
         // Droid ExitSpecMode tool payloads extract Markdown from JSON arguments,

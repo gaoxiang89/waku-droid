@@ -1767,11 +1767,12 @@ impl Waku {
                         px(6.0),
                     )
                     .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            on_select(this, key.clone(), cx);
-                            cx.stop_propagation();
-                        }))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        on_select(this, key.clone(), cx);
+                        cx.stop_propagation();
+                    }))
+                    .on_key_down(cx.listener(
+                        move |this, event: &KeyDownEvent, _, cx| {
                             if event.keystroke.modifiers.modified() {
                                 return;
                             }
@@ -1786,7 +1787,8 @@ impl Waku {
                                 on_select(this, next_host.key.clone(), cx);
                                 cx.stop_propagation();
                             }
-                        })),
+                        },
+                    )),
                 );
             }
             div().flex().child(tabs)
@@ -2925,8 +2927,19 @@ impl Waku {
             self.invalidate_local_account_probe(kind, &updated_id);
         }
         let usage_key = (host_key.clone(), kind, Some(updated_id));
+        self.plan_usage.remove(&usage_key);
+        self.plan_usage_error.remove(&usage_key);
+        self.plan_usage_pending.remove(&usage_key);
+        self.plan_usage_checked_at.remove(&usage_key);
         self.plan_usage_unconfigured.remove(&usage_key);
         self.plan_usage_stale.insert(usage_key);
+        // Account config changes affect every project/worktree on this host,
+        // including background tabs and their in-flight discovery tokens.
+        super::autocomplete::invalidate_account_command_catalog(
+            &mut self.slash_commands,
+            &host_key,
+            kind,
+        );
         self.cancel_provider_account_form(cx);
         self.invalidate_composer_sources(cx);
         self.invalidate_skills_catalog_for_host(&host_key, cx);
@@ -2994,6 +3007,11 @@ impl Waku {
         }
 
         let usage_key = (host_key.clone(), kind, Some(account_id.clone()));
+        super::autocomplete::invalidate_account_command_catalog(
+            &mut self.slash_commands,
+            &host_key,
+            kind,
+        );
         self.plan_usage.remove(&usage_key);
         self.plan_usage_error.remove(&usage_key);
         self.plan_usage_pending.remove(&usage_key);

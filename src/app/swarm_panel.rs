@@ -40,10 +40,7 @@ impl SwarmPanelTab {
     const ALL: [Self; 4] = [Self::Hive, Self::Board, Self::Members, Self::Overview];
 
     fn step(self, delta: isize) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|tab| *tab == self)
-            .unwrap_or(0) as isize;
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
         let next = (index + delta).rem_euclid(Self::ALL.len() as isize) as usize;
         Self::ALL[next]
     }
@@ -138,6 +135,16 @@ impl SwarmAutoSurfaceState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SwarmRequestIdentity {
+    host: HostKey,
+    host_generation: u64,
+    account: Option<String>,
+    config_dir: Option<String>,
+    native_id: String,
+    cursor: Option<ProviderResumeCursor>,
+}
+
 pub(super) struct SwarmPanelState {
     pub(super) active_tab: SwarmPanelTab,
     pub(super) member_filter: Option<String>,
@@ -147,7 +154,8 @@ pub(super) struct SwarmPanelState {
     pub(super) hive: super::swarm_hive::SwarmHiveState,
     /// Per-session cached swarm snapshot (`Some(None)` = probed and no swarm).
     pub(super) snapshots: HashMap<Uuid, Option<Arc<AntigravitySwarmSnapshot>>>,
-    snapshot_ag_ids: HashMap<Uuid, String>,
+    snapshot_identities: HashMap<Uuid, SwarmRequestIdentity>,
+    request_identities: HashMap<Uuid, SwarmRequestIdentity>,
     errors: HashMap<Uuid, String>,
     pending: HashSet<Uuid>,
     stale: HashSet<Uuid>,
@@ -224,7 +232,8 @@ impl SwarmPanelState {
             show_killed_members: false,
             hive: super::swarm_hive::SwarmHiveState::new(cx),
             snapshots: HashMap::new(),
-            snapshot_ag_ids: HashMap::new(),
+            snapshot_identities: HashMap::new(),
+            request_identities: HashMap::new(),
             errors: HashMap::new(),
             pending: HashSet::new(),
             stale: HashSet::new(),
@@ -285,7 +294,8 @@ impl SwarmPanelState {
     }
 
     fn prune_dynamic_focuses(&self, snapshot: &AntigravitySwarmSnapshot) {
-        let live_members: HashSet<&str> = snapshot.members.iter().map(|m| m.name.as_str()).collect();
+        let live_members: HashSet<&str> =
+            snapshot.members.iter().map(|m| m.name.as_str()).collect();
         self.filter_chip_focuses
             .borrow_mut()
             .retain(|key, _| key == "__all__" || live_members.contains(key.as_str()));
@@ -300,7 +310,8 @@ impl SwarmPanelState {
 
     pub(super) fn remove_session(&mut self, session_id: Uuid) {
         self.snapshots.remove(&session_id);
-        self.snapshot_ag_ids.remove(&session_id);
+        self.snapshot_identities.remove(&session_id);
+        self.request_identities.remove(&session_id);
         self.errors.remove(&session_id);
         self.pending.remove(&session_id);
         self.stale.remove(&session_id);
@@ -359,21 +370,27 @@ pub(super) fn antigravity_session_id(session: &AgentSession) -> Option<&str> {
         None => {}
     }
     if let Some(account_id) = session.account_id.as_deref().filter(|id| !id.is_empty()) {
-        session.account_cursors.iter().find_map(|entry| match &entry.cursor {
-            ProviderResumeCursor::Antigravity { session_id, .. }
-                if entry.account_id == account_id && !session_id.is_empty() =>
-            {
-                Some(session_id.as_str())
-            }
-            _ => None,
-        })
+        session
+            .account_cursors
+            .iter()
+            .find_map(|entry| match &entry.cursor {
+                ProviderResumeCursor::Antigravity { session_id, .. }
+                    if entry.account_id == account_id && !session_id.is_empty() =>
+                {
+                    Some(session_id.as_str())
+                }
+                _ => None,
+            })
     } else {
-        session.provider_cursors.iter().find_map(|cursor| match cursor {
-            ProviderResumeCursor::Antigravity { session_id, .. } if !session_id.is_empty() => {
-                Some(session_id.as_str())
-            }
-            _ => None,
-        })
+        session
+            .provider_cursors
+            .iter()
+            .find_map(|cursor| match cursor {
+                ProviderResumeCursor::Antigravity { session_id, .. } if !session_id.is_empty() => {
+                    Some(session_id.as_str())
+                }
+                _ => None,
+            })
     }
 }
 
@@ -447,8 +464,14 @@ fn filter_swarm_message_indices(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SwarmBoardListDiff {
     Unchanged,
-    TailAppend { old_len: usize, delta: usize },
-    Reset { new_len: usize, anchor_item_ix: Option<usize> },
+    TailAppend {
+        old_len: usize,
+        delta: usize,
+    },
+    Reset {
+        new_len: usize,
+        anchor_item_ix: Option<usize>,
+    },
 }
 
 fn compute_board_list_diff(
@@ -505,6 +528,7 @@ const MESSAGE_PREVIEW_LINES: usize = 4;
 const MESSAGE_PREVIEW_CHARS: usize = 320;
 
 pub(super) struct SwarmMessageMarkdown {
+    source: String,
     full: MarkdownView,
     /// Leading excerpt shown while a long post is collapsed.
     preview: Option<MarkdownView>,
@@ -520,7 +544,11 @@ impl SwarmMessageMarkdown {
             view.set_text(&excerpt, false);
             view
         });
-        Self { full, preview }
+        Self {
+            source: body.to_owned(),
+            full,
+            preview,
+        }
     }
 }
 
@@ -599,7 +627,9 @@ pub(super) fn localized_member_activity(activity: &str) -> String {
     }
 }
 
-pub(super) fn member_display_status(member: &AntigravitySwarmMember) -> AntigravitySwarmMemberStatus {
+pub(super) fn member_display_status(
+    member: &AntigravitySwarmMember,
+) -> AntigravitySwarmMemberStatus {
     if member.killed {
         AntigravitySwarmMemberStatus::Killed
     } else {
@@ -666,9 +696,7 @@ fn agent_color(name: &str, theme: &Theme) -> Hsla {
 fn strip_leading_mentions<'a>(text: &'a str, mentions: &[String], mentions_all: bool) -> &'a str {
     let mut rest = text.trim_start();
     while let Some(after_at) = rest.strip_prefix('@') {
-        let token_end = after_at
-            .find(char::is_whitespace)
-            .unwrap_or(after_at.len());
+        let token_end = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
         let name = after_at[..token_end].trim_end_matches([',', ':', ';']);
         let listed = !name.is_empty()
             && ((mentions_all && name == "all") || mentions.iter().any(|mention| mention == name));
@@ -735,10 +763,7 @@ pub(super) fn short_board_time(raw: &str) -> String {
     short_board_time_with_tz(raw, &Local)
 }
 
-fn format_overview_updated_at_with_tz<Tz: chrono::TimeZone>(
-    raw: &str,
-    tz: &Tz,
-) -> Option<String>
+fn format_overview_updated_at_with_tz<Tz: chrono::TimeZone>(raw: &str, tz: &Tz) -> Option<String>
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -752,7 +777,10 @@ fn format_overview_updated_at(raw: &str) -> Option<String> {
 fn overview_meta_label(as_of_seq: u64, updated_at: Option<&str>) -> Option<String> {
     let updated = updated_at.and_then(format_overview_updated_at);
     match (as_of_seq > 0, updated) {
-        (true, Some(time)) => Some(format!("{} · {time}", tr!("swarm.as_of_seq", seq = as_of_seq))),
+        (true, Some(time)) => Some(format!(
+            "{} · {time}",
+            tr!("swarm.as_of_seq", seq = as_of_seq)
+        )),
         (true, None) => Some(tr!("swarm.as_of_seq", seq = as_of_seq)),
         (false, Some(time)) => Some(time),
         (false, None) => None,
@@ -799,23 +827,31 @@ impl Waku {
         true
     }
 
-    pub(super) fn selected_antigravity_swarm_snapshot(&self) -> Option<Arc<AntigravitySwarmSnapshot>> {
-        let session = self.selected_session()?;
-        if session.provider != ProviderKind::Antigravity {
-            return None;
-        }
-        let ag_session_id = antigravity_session_id(session)?;
-        if self
-            .swarm_panel
-            .snapshot_ag_ids
-            .get(&session.id)
-            .is_some_and(|cached_id| cached_id != ag_session_id)
-        {
+    fn swarm_request_identity(&self, session_id: Uuid) -> Option<SwarmRequestIdentity> {
+        let session = self.state.sessions.iter().find(|s| s.id == session_id)?;
+        let native_id = antigravity_session_id(session)?.to_owned();
+        let host = self.hosts.ownership.session(session_id);
+        Some(SwarmRequestIdentity {
+            host_generation: self.hosts.get(&host)?.generation,
+            host,
+            account: session.account_id.clone(),
+            config_dir: self.effective_config_dir_for_session(session),
+            native_id,
+            cursor: session.provider_cursor.clone(),
+        })
+    }
+
+    pub(super) fn selected_antigravity_swarm_snapshot(
+        &self,
+    ) -> Option<Arc<AntigravitySwarmSnapshot>> {
+        let session_id = self.state.selected_session?;
+        let identity = self.swarm_request_identity(session_id)?;
+        if self.swarm_panel.snapshot_identities.get(&session_id) != Some(&identity) {
             return None;
         }
         self.swarm_panel
             .snapshots
-            .get(&session.id)
+            .get(&session_id)
             .and_then(|entry| entry.as_ref())
             .cloned()
     }
@@ -872,7 +908,9 @@ impl Waku {
                 return;
             }
         }
-        self.swarm_panel.last_activity_refresh_at.insert(session_id, now);
+        self.swarm_panel
+            .last_activity_refresh_at
+            .insert(session_id, now);
         self.request_antigravity_swarm_refresh(session_id, should_reveal, cx);
         if self.state.selected_session == Some(session_id) {
             self.sync_antigravity_swarm_polling(cx);
@@ -909,6 +947,7 @@ impl Waku {
         session_id: Uuid,
         cx: &mut Context<Self>,
     ) {
+        self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
         self.swarm_panel.member_filter = None;
         self.swarm_panel.channel_filter = None;
         self.swarm_panel.board_list_key = None;
@@ -943,7 +982,10 @@ impl Waku {
         self.request_antigravity_swarm_refresh(session_id, false, cx);
     }
 
-    pub(super) fn refresh_selected_antigravity_swarm_if_relevant(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_selected_antigravity_swarm_if_relevant(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -1041,32 +1083,25 @@ impl Waku {
         auto_reveal: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .filter(|session| session.provider == ProviderKind::Antigravity)
-        else {
+        let Some(identity) = self.swarm_request_identity(session_id) else {
             return;
         };
-        let Some(ag_session_id) = antigravity_session_id(session).map(str::to_owned) else {
-            return;
-        };
-        let config_dir = self.effective_config_dir_for_session(session);
-        if self
-            .swarm_panel
-            .snapshot_ag_ids
-            .get(&session_id)
-            .is_some_and(|cached_id| cached_id != &ag_session_id)
-        {
+        let ag_session_id = identity.native_id.clone();
+        let config_dir = identity.config_dir.clone();
+        if self.swarm_panel.request_identities.get(&session_id) != Some(&identity) {
+            self.swarm_panel.pending.remove(&session_id);
             self.swarm_panel.snapshots.remove(&session_id);
+            self.swarm_panel.snapshot_identities.remove(&session_id);
             self.swarm_panel.errors.remove(&session_id);
+            self.swarm_panel.auto_surface.remove_session(session_id);
             self.swarm_panel.board_list_key = None;
             self.swarm_panel.board_message_seqs.clear();
             self.swarm_panel.members_list_key = None;
             self.swarm_panel.hive.reset_for_session_change();
         }
+        self.swarm_panel
+            .request_identities
+            .insert(session_id, identity.clone());
 
         if auto_reveal {
             self.swarm_panel.auto_surface.queue_auto_reveal(session_id);
@@ -1089,10 +1124,8 @@ impl Waku {
             .session_generations
             .insert(session_id, generation);
 
-        let workspace = waku_client::WorkspaceClient::for_daemon(
-            self.daemon_for_session(session_id).clone(),
-        );
-        let ag_session_id_for_store = ag_session_id.clone();
+        let workspace =
+            waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
@@ -1111,8 +1144,15 @@ impl Waku {
                 .await;
 
             let _ = waku.update(cx, |this, cx| {
-                this.swarm_panel.pending.remove(&session_id);
                 if this.swarm_panel.session_generations.get(&session_id) != Some(&generation) {
+                    return;
+                }
+                this.swarm_panel.pending.remove(&session_id);
+                if this.swarm_request_identity(session_id).as_ref() != Some(&identity) {
+                    // An old host/account/cursor cannot populate even errors or
+                    // auto-reveal state. Refresh the new identity instead.
+                    this.swarm_panel.stale.remove(&session_id);
+                    this.request_antigravity_swarm_refresh(session_id, false, cx);
                     return;
                 }
                 let mut changed = notify_loading;
@@ -1134,8 +1174,8 @@ impl Waku {
                         if !was_known || previous_fp != next_fp {
                             this.swarm_panel.snapshots.insert(session_id, snapshot);
                             this.swarm_panel
-                                .snapshot_ag_ids
-                                .insert(session_id, ag_session_id_for_store);
+                                .snapshot_identities
+                                .insert(session_id, identity.clone());
                             changed = true;
                         }
                     }
@@ -1197,9 +1237,7 @@ impl Waku {
             .selected_workspace_path()
             .map(|workspace| md::image_path::ImageBase::directory(&workspace.to_string_lossy()))
             .unwrap_or_default();
-        let md::image_path::ImageTarget::Path(image_path) =
-            md::image_path::classify(&raw_path, &image_base)
-        else {
+        let Some(image_path) = swarm_screenshot_image_path(&raw_path, &image_base) else {
             self.show_toast_with_tone(tr!("attachments.preview_unavailable"), ToastTone::Alert);
             return;
         };
@@ -1207,6 +1245,14 @@ impl Waku {
             return;
         };
         let workspace = waku_client::WorkspaceClient::for_daemon(host.daemon.clone());
+        let host_key = self.selected_host_key();
+        let host_generation = host.generation;
+        let session_id = self.state.selected_session;
+        let workspace_path = self.selected_workspace_path().map(Path::to_path_buf);
+        let request_identity = session_id.and_then(|id| self.swarm_request_identity(id));
+        let previous_focus = window.focused(cx);
+        self.image_preview_generation = self.image_preview_generation.wrapping_add(1);
+        let preview_generation = self.image_preview_generation;
         let window_handle = window.window_handle();
         let display_name = if label.trim().is_empty() {
             screenshot_basename(&raw_path)
@@ -1222,10 +1268,9 @@ impl Waku {
                         match read_swarm_host_file(&workspace, &image_path.path) {
                             Ok(bytes) => (bytes, image_path.path),
                             Err(error) => match image_path.fallback {
-                                Some(fallback) => (
-                                    read_swarm_host_file(&workspace, &fallback)?,
-                                    fallback,
-                                ),
+                                Some(fallback) => {
+                                    (read_swarm_host_file(&workspace, &fallback)?, fallback)
+                                }
                                 None => return Err(error),
                             },
                         };
@@ -1239,21 +1284,38 @@ impl Waku {
                 .await;
 
             let _ = window_handle.update(cx, |_, window, cx| {
-                let _ = waku.update(cx, |this, cx| match loaded {
-                    Ok(image) => {
-                        this.open_image_preview(
-                            image,
-                            SharedString::from(display_name),
-                            window,
-                            cx,
-                        );
+                let _ = waku.update(cx, |this, cx| {
+                    if this.image_preview_generation != preview_generation
+                        || this.state.selected_session != session_id
+                        || this.selected_host_key() != host_key
+                        || this.hosts.get(&host_key).map(|host| host.generation)
+                            != Some(host_generation)
+                        || this.selected_workspace_path() != workspace_path.as_deref()
+                        || session_id.and_then(|id| this.swarm_request_identity(id))
+                            != request_identity
+                        || previous_focus
+                            .as_ref()
+                            .is_some_and(|focus| !focus.is_focused(window))
+                        || this.any_overlay_open(cx)
+                    {
+                        return;
                     }
-                    Err(_) => {
-                        this.show_toast_with_tone(
-                            tr!("attachments.preview_unavailable"),
-                            ToastTone::Alert,
-                        );
-                        cx.notify();
+                    match loaded {
+                        Ok(image) => {
+                            this.open_image_preview(
+                                image,
+                                SharedString::from(display_name),
+                                window,
+                                cx,
+                            );
+                        }
+                        Err(_) => {
+                            this.show_toast_with_tone(
+                                tr!("attachments.preview_unavailable"),
+                                ToastTone::Alert,
+                            );
+                            cx.notify();
+                        }
                     }
                 });
             });
@@ -1319,11 +1381,7 @@ impl Waku {
             .items_center()
             .justify_center()
             .cursor_default()
-            .focus_visible(|style| {
-                style
-                    .bg(theme.overlay)
-                    .border_color(theme.accent)
-            })
+            .focus_visible(|style| style.bg(theme.overlay).border_color(theme.accent))
             .when(active, |element| element.bg(theme.overlay_strong))
             .when(!active, |element| {
                 element.hover(|element| element.bg(theme.overlay))
@@ -1384,7 +1442,11 @@ impl Waku {
         let has_cursor = antigravity_session_id(session).is_some();
 
         let snapshot = self.selected_antigravity_swarm_snapshot();
-        let error = self.swarm_panel.errors.get(&session_id).cloned();
+        let current_identity = self.swarm_request_identity(session_id);
+        let error = (current_identity.as_ref()
+            == self.swarm_panel.request_identities.get(&session_id))
+        .then(|| self.swarm_panel.errors.get(&session_id).cloned())
+        .flatten();
         let is_refreshing = self.swarm_panel.pending.contains(&session_id);
         let loading = is_refreshing && snapshot.is_none();
 
@@ -1407,8 +1469,7 @@ impl Waku {
             .flex()
             .flex_col()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if !event.keystroke.modifiers.modified()
-                    && event.keystroke.key.as_str() == "escape"
+                if !event.keystroke.modifiers.modified() && event.keystroke.key.as_str() == "escape"
                 {
                     if this.swarm_panel.active_tab == SwarmPanelTab::Hive {
                         if this.swarm_panel.hive.selected_member.take().is_some() {
@@ -2020,8 +2081,11 @@ impl Waku {
                 SwarmPanelTab::Overview,
                 "swarm-tab-overview",
                 tr!("swarm.tab_overview"),
-                (overview_attention > 0)
-                    .then_some((overview_attention, true, Some("icons/alert.svg"))),
+                (overview_attention > 0).then_some((
+                    overview_attention,
+                    true,
+                    Some("icons/alert.svg"),
+                )),
             ),
         ];
 
@@ -2414,7 +2478,9 @@ impl Waku {
                 .relative()
                 // Painted before the posts, so the frame's selection registry
                 // holds exactly the text elements this frame put on screen.
-                .child(md::render::frame_reset(self.swarm_panel.board_selection.clone()))
+                .child(md::render::frame_reset(
+                    self.swarm_panel.board_selection.clone(),
+                ))
                 .child(
                     list(
                         self.swarm_panel.board_list_state.clone(),
@@ -2433,6 +2499,14 @@ impl Waku {
                                 let entry = cache
                                     .entry(seq)
                                     .or_insert_with(|| SwarmMessageMarkdown::new(message));
+                                let body = strip_leading_mentions(
+                                    &message.text,
+                                    &message.mentions,
+                                    message.mentions_all,
+                                );
+                                if entry.source != body {
+                                    *entry = SwarmMessageMarkdown::new(message);
+                                }
                                 let collapsible = entry.preview.is_some();
                                 let (view, row_key) = match entry.preview.as_ref() {
                                     Some(preview) if !is_expanded => {
@@ -2482,7 +2556,8 @@ impl Waku {
                             let mut channel_chips: Vec<(String, FocusHandle, bool)> = Vec::new();
                             if let Some(channel) = message.channel.as_deref() {
                                 let key = format!("msg-{seq}-ch-{channel}");
-                                let focus = channel_chip_focuses_from(&screenshot_focuses, &key, cx);
+                                let focus =
+                                    channel_chip_focuses_from(&screenshot_focuses, &key, cx);
                                 let active = active_channel_filter.as_deref() == Some(channel);
                                 channel_chips.push((channel.to_owned(), focus, active));
                             }
@@ -2491,7 +2566,8 @@ impl Waku {
                                     continue;
                                 }
                                 let key = format!("msg-{seq}-chm-{mentioned}");
-                                let focus = channel_chip_focuses_from(&screenshot_focuses, &key, cx);
+                                let focus =
+                                    channel_chip_focuses_from(&screenshot_focuses, &key, cx);
                                 let active =
                                     active_channel_filter.as_deref() == Some(mentioned.as_str());
                                 channel_chips.push((mentioned.clone(), focus, active));
@@ -2518,49 +2594,44 @@ impl Waku {
                 ))
                 .when(!following, |container| {
                     container.child(
-                        div()
-                            .absolute()
-                            .right(px(14.0))
-                            .bottom(px(12.0))
-                            .child(
-                                div()
-                                    .id("swarm-jump-latest")
-                                    .track_focus(&jump_focus)
-                                    .tab_index(0)
-                                    .tab_stop(true)
-                                    .h(px(26.0))
-                                    .px(px(10.0))
-                                    .rounded(px(13.0))
-                                    .border_1()
-                                    .border_color(theme.border_strong)
-                                    .bg(theme.raised)
-                                    .shadow_md()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.0))
-                                    .cursor_default()
-                                    .focus_visible(|style| style.border_color(theme.accent))
-                                    .hover(|style| style.bg(theme.overlay_strong))
-                                    .child(icon("icons/arrow-down.svg", 11.0, theme.text))
-                                    .child(
-                                        div()
-                                            .text_size(sp(11.5))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .child(tr!("swarm.jump_latest")),
-                                    )
-                                    .on_activation(cx, |this, _, cx| {
-                                        this.swarm_panel.follow_tail.set(true);
-                                        let count =
-                                            this.swarm_panel.filtered_message_indices.len();
-                                        if count > 0 {
-                                            this.swarm_panel
-                                                .board_list_state
-                                                .scroll_to_reveal_item(count - 1);
-                                        }
-                                        cx.notify();
-                                    }),
-                            ),
+                        div().absolute().right(px(14.0)).bottom(px(12.0)).child(
+                            div()
+                                .id("swarm-jump-latest")
+                                .track_focus(&jump_focus)
+                                .tab_index(0)
+                                .tab_stop(true)
+                                .h(px(26.0))
+                                .px(px(10.0))
+                                .rounded(px(13.0))
+                                .border_1()
+                                .border_color(theme.border_strong)
+                                .bg(theme.raised)
+                                .shadow_md()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .cursor_default()
+                                .focus_visible(|style| style.border_color(theme.accent))
+                                .hover(|style| style.bg(theme.overlay_strong))
+                                .child(icon("icons/arrow-down.svg", 11.0, theme.text))
+                                .child(
+                                    div()
+                                        .text_size(sp(11.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(tr!("swarm.jump_latest")),
+                                )
+                                .on_activation(cx, |this, _, cx| {
+                                    this.swarm_panel.follow_tail.set(true);
+                                    let count = this.swarm_panel.filtered_message_indices.len();
+                                    if count > 0 {
+                                        this.swarm_panel
+                                            .board_list_state
+                                            .scroll_to_reveal_item(count - 1);
+                                    }
+                                    cx.notify();
+                                }),
+                        ),
                     )
                 })
         };
@@ -2835,7 +2906,11 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
-        let killed_count = snapshot.members.iter().filter(|member| member.killed).count();
+        let killed_count = snapshot
+            .members
+            .iter()
+            .filter(|member| member.killed)
+            .count();
         let show_killed = self.swarm_panel.show_killed_members;
         let roster_fp = snapshot
             .roster_fingerprint
@@ -2853,8 +2928,8 @@ impl Waku {
             let items_changed = !same_mode || *self.swarm_panel.member_list_items != items;
             self.swarm_panel.members_list_key = Some(members_key);
             if items_changed {
-                let prev_top = same_mode
-                    .then(|| self.swarm_panel.members_list_state.logical_scroll_top());
+                let prev_top =
+                    same_mode.then(|| self.swarm_panel.members_list_state.logical_scroll_top());
                 let len = items.len();
                 self.swarm_panel.member_list_items = Rc::new(items);
                 self.swarm_panel.members_list_state.reset(len);
@@ -2968,33 +3043,31 @@ impl Waku {
                 .child(
                     list(
                         self.swarm_panel.members_list_state.clone(),
-                        move |row_index, _window, _cx| {
-                            match items_for_list.get(row_index) {
-                                Some(SwarmMemberListItem::Group { status, count }) => {
-                                    render_swarm_member_group_header(*status, *count, &theme_copy)
-                                        .into_any_element()
-                                }
-                                Some(SwarmMemberListItem::Member(member_index)) => {
-                                    let (Some(member), Some(Some(focus))) = (
-                                        snapshot_for_list.members.get(*member_index),
-                                        row_focuses.get(row_index).cloned(),
-                                    ) else {
-                                        return div().into_any_element();
-                                    };
-                                    render_swarm_member_row(
-                                        member,
-                                        snapshot_for_list.current_member.as_deref()
-                                            == Some(member.name.as_str()),
-                                        active_filter.as_deref() == Some(member.name.as_str()),
-                                        show_model,
-                                        focus,
-                                        waku.clone(),
-                                        &theme_copy,
-                                    )
+                        move |row_index, _window, _cx| match items_for_list.get(row_index) {
+                            Some(SwarmMemberListItem::Group { status, count }) => {
+                                render_swarm_member_group_header(*status, *count, &theme_copy)
                                     .into_any_element()
-                                }
-                                None => div().into_any_element(),
                             }
+                            Some(SwarmMemberListItem::Member(member_index)) => {
+                                let (Some(member), Some(Some(focus))) = (
+                                    snapshot_for_list.members.get(*member_index),
+                                    row_focuses.get(row_index).cloned(),
+                                ) else {
+                                    return div().into_any_element();
+                                };
+                                render_swarm_member_row(
+                                    member,
+                                    snapshot_for_list.current_member.as_deref()
+                                        == Some(member.name.as_str()),
+                                    active_filter.as_deref() == Some(member.name.as_str()),
+                                    show_model,
+                                    focus,
+                                    waku.clone(),
+                                    &theme_copy,
+                                )
+                                .into_any_element()
+                            }
+                            None => div().into_any_element(),
                         },
                     )
                     .size_full(),
@@ -3168,37 +3241,51 @@ fn render_swarm_system_attention_strip(
     if items.len() > 3 {
         let extra = items.len() - 3;
         strip = strip.child(
-            div()
-                .flex()
-                .child(
-                    div()
-                        .id("swarm-attention-more-badge")
-                        .track_focus(&more_focus)
-                        .tab_index(0)
-                        .tab_stop(true)
-                        .px(px(6.0))
-                        .py(px(1.5))
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(gpui::transparent_black())
-                        .bg(theme.overlay_strong)
-                        .cursor_default()
-                        .focus_visible(|style| style.border_color(theme.accent))
-                        .hover(|style| style.bg(theme.raised))
-                        .text_size(sp(11.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(tr!("swarm.more_attention", count = extra))
-                        .on_activation(cx, |this, window, cx| {
-                            this.swarm_panel.clear_board_selection();
-                            this.swarm_panel.active_tab = SwarmPanelTab::Overview;
-                            window.focus(&this.swarm_panel.tab_overview_focus, cx);
-                            cx.notify();
-                        }),
-                ),
+            div().flex().child(
+                div()
+                    .id("swarm-attention-more-badge")
+                    .track_focus(&more_focus)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .px(px(6.0))
+                    .py(px(1.5))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .bg(theme.overlay_strong)
+                    .cursor_default()
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .hover(|style| style.bg(theme.raised))
+                    .text_size(sp(11.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(tr!("swarm.more_attention", count = extra))
+                    .on_activation(cx, |this, window, cx| {
+                        this.swarm_panel.clear_board_selection();
+                        this.swarm_panel.active_tab = SwarmPanelTab::Overview;
+                        window.focus(&this.swarm_panel.tab_overview_focus, cx);
+                        cx.notify();
+                    }),
+            ),
         );
     }
     strip
+}
+
+/// Board screenshot fields are literal filesystem names, not Markdown URLs.
+/// Escape URL metacharacters before reusing host-native path resolution.
+fn swarm_screenshot_image_path(
+    raw: &str,
+    base: &md::image_path::ImageBase,
+) -> Option<md::image_path::ImagePath> {
+    let escaped = raw
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    match md::image_path::classify(&escaped, base) {
+        md::image_path::ImageTarget::Path(path) => Some(path),
+        _ => None,
+    }
 }
 
 fn screenshot_basename(path: &str) -> String {
@@ -3290,10 +3377,8 @@ fn render_swarm_screenshot_strip(
             (None, Some(seq)) => Some(format!("#{seq}")),
             (None, None) => None,
         };
-        let source = match md::image_path::classify(&shot.path, image_base) {
-            md::image_path::ImageTarget::Path(path) => image_loader.map(|load| load(&path)),
-            _ => None,
-        };
+        let source = swarm_screenshot_image_path(&shot.path, image_base)
+            .and_then(|path| image_loader.map(|load| load(&path)));
         let click_waku = waku.clone();
         let key_waku = waku.clone();
         let click_path = shot.path.clone();
@@ -3342,7 +3427,11 @@ fn render_swarm_screenshot_strip(
                 .items_center()
                 .justify_center()
                 .gap(px(4.0))
-                .child(icon("icons/file-types/image.svg", 16.0, theme.text_tertiary))
+                .child(icon(
+                    "icons/file-types/image.svg",
+                    16.0,
+                    theme.text_tertiary,
+                ))
                 .child(
                     div()
                         .max_w_full()
@@ -3481,8 +3570,8 @@ fn render_swarm_message_row(
     waku: gpui::WeakEntity<Waku>,
     theme: &Theme,
 ) -> Div {
-    let mentions_me = current_member
-        .is_some_and(|me| message.mentions.iter().any(|target| target == me));
+    let mentions_me =
+        current_member.is_some_and(|me| message.mentions.iter().any(|target| target == me));
     let is_from_me = current_member == Some(message.agent.as_str());
     let mut recipients = message
         .mentions
@@ -3577,7 +3666,11 @@ fn render_swarm_message_row(
             row.child(swarm_badge(tr!("swarm.you"), theme.accent, theme))
         })
         .when(message.kind.as_deref() == Some("brief"), |row| {
-            row.child(swarm_badge(tr!("swarm.brief_badge"), theme.text_secondary, theme))
+            row.child(swarm_badge(
+                tr!("swarm.brief_badge"),
+                theme.text_secondary,
+                theme,
+            ))
         });
 
     for (idx, (channel, focus, active)) in channel_chips.into_iter().enumerate() {
@@ -3587,7 +3680,9 @@ fn render_swarm_message_row(
         let ch_key = channel.clone();
         header = header.child(
             div()
-                .id(SharedString::from(format!("swarm-msg-{seq}-ch-{idx}-{channel}")))
+                .id(SharedString::from(format!(
+                    "swarm-msg-{seq}-ch-{idx}-{channel}"
+                )))
                 .track_focus(&focus)
                 .tab_index(0)
                 .tab_stop(true)
@@ -3628,8 +3723,7 @@ fn render_swarm_message_row(
                         && matches!(event.keystroke.key.as_str(), "enter" | "space")
                     {
                         let _ = key_waku.update(cx, |this, cx| {
-                            if this.swarm_panel.channel_filter.as_deref() == Some(ch_key.as_str())
-                            {
+                            if this.swarm_panel.channel_filter.as_deref() == Some(ch_key.as_str()) {
                                 this.swarm_panel.channel_filter = None;
                             } else {
                                 this.swarm_panel.channel_filter = Some(ch_key.clone());
@@ -3745,7 +3839,8 @@ fn render_swarm_member_row(
     let member_name_key = member.name.clone();
     let click_waku = waku.clone();
     let key_waku = waku;
-    let show_role = !member.role.is_empty() && member.role != "worker" && member.role != member.name;
+    let show_role =
+        !member.role.is_empty() && member.role != "worker" && member.role != member.name;
 
     let mut meta_parts = vec![
         tr!("swarm.steps_count", count = member.steps),
@@ -3767,7 +3862,10 @@ fn render_swarm_member_row(
 
     div().px(px(8.0)).py(px(1.0)).child(
         div()
-            .id(SharedString::from(format!("swarm-member-row-{}", member.name)))
+            .id(SharedString::from(format!(
+                "swarm-member-row-{}",
+                member.name
+            )))
             .track_focus(&focus)
             .tab_index(0)
             .tab_stop(true)
@@ -3998,17 +4096,13 @@ fn render_swarm_overview_attention(
     theme: &Theme,
     cx: &mut App,
 ) -> Div {
-    let mut section = div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .text_size(sp(11.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_secondary)
-                .child(heading.to_owned()),
-        );
+    let mut section = div().flex().flex_col().gap(px(6.0)).child(
+        div()
+            .text_size(sp(11.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.text_secondary)
+            .child(heading.to_owned()),
+    );
     for (idx, item) in items.iter().enumerate() {
         let color = match item.kind.as_str() {
             "failure" | "quota" | "error" => theme.danger,
@@ -4096,10 +4190,13 @@ fn render_swarm_overview_body(
     let mut column = div().flex().flex_col().gap(px(12.0));
     let is_plan_source = overview.source.as_deref() == Some("plan");
 
-    let phase_label = overview.phase.as_ref().map(|phase| match (phase.index, phase.total) {
-        (Some(index), Some(total)) => format!("{} ({index}/{total})", phase.label),
-        _ => phase.label.clone(),
-    });
+    let phase_label = overview
+        .phase
+        .as_ref()
+        .map(|phase| match (phase.index, phase.total) {
+            (Some(index), Some(total)) => format!("{} ({index}/{total})", phase.label),
+            _ => phase.label.clone(),
+        });
     let meta_label = overview_meta_label(overview.as_of_seq, overview.updated_at.as_deref());
     let has_goal_line = overview
         .goal_line
@@ -4148,42 +4245,45 @@ fn render_swarm_overview_body(
                         )
                     },
                 )
-                .when(is_plan_source || phase_label.is_some() || meta_label.is_some(), |card| {
-                    card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .flex_wrap()
-                            .gap(px(8.0))
-                            .when(is_plan_source, |row| {
-                                row.child(swarm_badge(
-                                    tr!("swarm.plan_overview"),
-                                    theme.accent,
-                                    theme,
-                                ))
-                            })
-                            .when_some(phase_label, |row, label| {
-                                row.child(
-                                    div()
-                                        .px(px(6.0))
-                                        .py(px(1.0))
-                                        .rounded(px(4.0))
-                                        .bg(theme.overlay)
-                                        .text_size(sp(11.0))
-                                        .text_color(theme.text_secondary)
-                                        .child(label),
-                                )
-                            })
-                            .when_some(meta_label, |row, label| {
-                                row.child(
-                                    div()
-                                        .text_size(sp(11.0))
-                                        .text_color(theme.text_tertiary)
-                                        .child(label),
-                                )
-                            }),
-                    )
-                }),
+                .when(
+                    is_plan_source || phase_label.is_some() || meta_label.is_some(),
+                    |card| {
+                        card.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .flex_wrap()
+                                .gap(px(8.0))
+                                .when(is_plan_source, |row| {
+                                    row.child(swarm_badge(
+                                        tr!("swarm.plan_overview"),
+                                        theme.accent,
+                                        theme,
+                                    ))
+                                })
+                                .when_some(phase_label, |row, label| {
+                                    row.child(
+                                        div()
+                                            .px(px(6.0))
+                                            .py(px(1.0))
+                                            .rounded(px(4.0))
+                                            .bg(theme.overlay)
+                                            .text_size(sp(11.0))
+                                            .text_color(theme.text_secondary)
+                                            .child(label),
+                                    )
+                                })
+                                .when_some(meta_label, |row, label| {
+                                    row.child(
+                                        div()
+                                            .text_size(sp(11.0))
+                                            .text_color(theme.text_tertiary)
+                                            .child(label),
+                                    )
+                                }),
+                        )
+                    },
+                ),
         );
     }
 
@@ -4204,17 +4304,13 @@ fn render_swarm_overview_body(
         } else {
             tr!("swarm.section_workstreams")
         };
-        let mut ws_section = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(sp(11.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_secondary)
-                    .child(heading),
-            );
+        let mut ws_section = div().flex().flex_col().gap(px(6.0)).child(
+            div()
+                .text_size(sp(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_secondary)
+                .child(heading),
+        );
         for (ws_idx, ws) in overview.workstreams.iter().enumerate() {
             let state_color = match ws.state.as_str() {
                 "active" => theme.success,
@@ -4320,17 +4416,13 @@ fn render_swarm_overview_body(
     }
 
     if !overview.milestones.is_empty() {
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .text_size(sp(11.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_secondary)
-                    .child(tr!("swarm.section_milestones")),
-            );
+        let mut section = div().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(sp(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_secondary)
+                .child(tr!("swarm.section_milestones")),
+        );
         for item in &overview.milestones {
             section = section.child(
                 div()
@@ -4353,17 +4445,13 @@ fn render_swarm_overview_body(
     }
 
     if !overview.risks.is_empty() {
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .text_size(sp(11.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_secondary)
-                    .child(tr!("swarm.section_risks")),
-            );
+        let mut section = div().flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(sp(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_secondary)
+                .child(tr!("swarm.section_risks")),
+        );
         for item in &overview.risks {
             section = section.child(
                 div()
@@ -4447,7 +4535,10 @@ mod tests {
         msg1.channel = None;
         let messages = vec![msg1, msg2, msg3];
 
-        assert_eq!(filter_swarm_message_indices(&messages, None, None), vec![0, 1, 2]);
+        assert_eq!(
+            filter_swarm_message_indices(&messages, None, None),
+            vec![0, 1, 2]
+        );
         assert_eq!(
             filter_swarm_message_indices(&messages, Some("alpha"), None),
             vec![0, 2]
@@ -4534,7 +4625,10 @@ mod tests {
             "@monitor ping @verifier"
         );
         assert_eq!(strip_leading_mentions("@all sync", &[], true), "sync");
-        assert_eq!(strip_leading_mentions("@verifier", &mentions, false), "@verifier");
+        assert_eq!(
+            strip_leading_mentions("@verifier", &mentions, false),
+            "@verifier"
+        );
     }
 
     #[test]
@@ -4551,7 +4645,11 @@ mod tests {
         assert_eq!(preview.chars().count(), MESSAGE_PREVIEW_CHARS + 1);
     }
 
-    fn member(name: &str, status: AntigravitySwarmMemberStatus, killed: bool) -> AntigravitySwarmMember {
+    fn member(
+        name: &str,
+        status: AntigravitySwarmMemberStatus,
+        killed: bool,
+    ) -> AntigravitySwarmMember {
         AntigravitySwarmMember {
             name: name.to_owned(),
             conversation_id: name.to_owned(),
@@ -4588,14 +4686,26 @@ mod tests {
         assert_eq!(
             swarm_member_list_items(&members, false),
             vec![
-                SwarmMemberListItem::Group { status: Failed, count: 1 },
+                SwarmMemberListItem::Group {
+                    status: Failed,
+                    count: 1
+                },
                 SwarmMemberListItem::Member(2),
-                SwarmMemberListItem::Group { status: Working, count: 2 },
+                SwarmMemberListItem::Group {
+                    status: Working,
+                    count: 2
+                },
                 SwarmMemberListItem::Member(1),
                 SwarmMemberListItem::Member(3),
-                SwarmMemberListItem::Group { status: Waiting, count: 1 },
+                SwarmMemberListItem::Group {
+                    status: Waiting,
+                    count: 1
+                },
                 SwarmMemberListItem::Member(0),
-                SwarmMemberListItem::Group { status: Stopped, count: 1 },
+                SwarmMemberListItem::Group {
+                    status: Stopped,
+                    count: 1
+                },
                 SwarmMemberListItem::Member(4),
             ]
         );
@@ -4603,7 +4713,10 @@ mod tests {
         assert_eq!(
             &with_killed[with_killed.len() - 2..],
             &[
-                SwarmMemberListItem::Group { status: Killed, count: 1 },
+                SwarmMemberListItem::Group {
+                    status: Killed,
+                    count: 1
+                },
                 SwarmMemberListItem::Member(5),
             ]
         );
@@ -4613,22 +4726,26 @@ mod tests {
     fn antigravity_session_id_scopes_to_provider_and_active_account() {
         let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Antigravity);
         session.account_id = Some("acct-b".to_owned());
-        session.account_cursors.push(waku_protocol::model::ParkedAccountCursor {
-            account_id: "acct-a".to_owned(),
-            cursor: ProviderResumeCursor::Antigravity {
-                session_id: "ag-a".to_owned(),
-                fork_context: None,
-            },
-        });
+        session
+            .account_cursors
+            .push(waku_protocol::model::ParkedAccountCursor {
+                account_id: "acct-a".to_owned(),
+                cursor: ProviderResumeCursor::Antigravity {
+                    session_id: "ag-a".to_owned(),
+                    fork_context: None,
+                },
+            });
         assert_eq!(antigravity_session_id(&session), None);
 
-        session.account_cursors.push(waku_protocol::model::ParkedAccountCursor {
-            account_id: "acct-b".to_owned(),
-            cursor: ProviderResumeCursor::Antigravity {
-                session_id: "ag-b".to_owned(),
-                fork_context: None,
-            },
-        });
+        session
+            .account_cursors
+            .push(waku_protocol::model::ParkedAccountCursor {
+                account_id: "acct-b".to_owned(),
+                cursor: ProviderResumeCursor::Antigravity {
+                    session_id: "ag-b".to_owned(),
+                    fork_context: None,
+                },
+            });
         assert_eq!(antigravity_session_id(&session), Some("ag-b"));
 
         session.switch_provider(ProviderKind::Codex);

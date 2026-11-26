@@ -95,8 +95,64 @@ enum CommandMessage {
     RecoverLostSession {
         failed_session_id: String,
         text: String,
+        /// The loop's cancel epoch when the failed prompt was sent. A Cancel
+        /// handled since then bumps the epoch, and the resend is dropped.
+        cancel_epoch: u64,
+        /// Whether the failed prompt was the last one in flight, so that
+        /// dropping the resend must finish the turn itself.
+        settled_last: bool,
     },
     Shutdown,
+}
+
+/// Lets a prompt callback request lost-session recovery, and tells it whether
+/// the user cancelled after the prompt was sent.
+#[derive(Clone)]
+struct LostSessionRecovery {
+    sender: smol::channel::Sender<CommandMessage>,
+    cancel_epoch: Arc<AtomicU64>,
+}
+
+/// Whether a lost Antigravity transcript may start a fresh session and resend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LostSessionRecoveryDecision {
+    /// The user already stopped this turn. Do not clear the cancel deadline,
+    /// create a session, or resend the prompt.
+    DropBecauseCancelled,
+    /// The transcript is gone and the turn was not cancelled.
+    Recover,
+}
+
+fn lost_session_recovery_decision(
+    current_epoch: u64,
+    sent_epoch: u64,
+) -> LostSessionRecoveryDecision {
+    if current_epoch == sent_epoch {
+        LostSessionRecoveryDecision::Recover
+    } else {
+        LostSessionRecoveryDecision::DropBecauseCancelled
+    }
+}
+
+#[cfg(test)]
+mod lost_session_recovery_tests {
+    use super::{LostSessionRecoveryDecision, lost_session_recovery_decision};
+
+    #[test]
+    fn a_stopped_turn_is_not_recovered_and_an_open_turn_still_is() {
+        assert_eq!(
+            lost_session_recovery_decision(1, 0),
+            LostSessionRecoveryDecision::DropBecauseCancelled
+        );
+        assert_eq!(
+            lost_session_recovery_decision(3, 3),
+            LostSessionRecoveryDecision::Recover
+        );
+        assert_eq!(
+            lost_session_recovery_decision(0, 0),
+            LostSessionRecoveryDecision::Recover
+        );
+    }
 }
 
 /// How long `apply_options` waits for the agent to accept a live access-mode
@@ -310,6 +366,7 @@ impl AcpDriver {
             }
             None => None,
         };
+        let computer_use_enabled = crate::computer_use::resolve_enabled(computer_use_enabled);
 
         let launch = launch_for(provider, reasoning_effort.as_deref(), config_dir.as_deref())?;
         let computer_use = computer_use_enabled
@@ -1021,12 +1078,7 @@ impl UnsolicitedTurnState {
         }
     }
 
-    fn schedule_settle(
-        &mut self,
-        now: Instant,
-        delay: Duration,
-        has_in_flight_work: bool,
-    ) -> bool {
+    fn schedule_settle(&mut self, now: Instant, delay: Duration, has_in_flight_work: bool) -> bool {
         if !self.active {
             return false;
         }
@@ -1264,7 +1316,8 @@ where
                         }
                     }
 
-                    let update_snapshot = is_antigravity_out_of_turn.then(|| notification.update.clone());
+                    let update_snapshot =
+                        is_antigravity_out_of_turn.then(|| notification.update.clone());
                     let (has_in_flight_tools, completed_tool_name) = {
                         let mut state = stream_state.lock();
                         handle_session_update(provider, notification, &events, &mut state)?;
@@ -1591,7 +1644,10 @@ where
                         .send_request(
                             InitializeRequest::new(ProtocolVersion::V1)
                                 .client_capabilities(client_capabilities)
-                                .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                                .client_info(Implementation::new(
+                                    "waku",
+                                    env!("CARGO_PKG_VERSION"),
+                                )),
                         )
                         .block_task(),
                     timeouts.request,
@@ -1673,8 +1729,8 @@ where
                     droid_autonomy_ready.store(true, Ordering::Release);
                 }
                 let native_session_id = session_id.to_string();
-                let antigravity_step_offset = Arc::new(AtomicI64::new(
-                    if provider == ProviderKind::Antigravity {
+                let antigravity_step_offset =
+                    Arc::new(AtomicI64::new(if provider == ProviderKind::Antigravity {
                         let sid = native_session_id.clone();
                         let cfg = config_dir.clone();
                         smol::unblock(move || {
@@ -1683,8 +1739,7 @@ where
                         .await
                     } else {
                         -1
-                    },
-                ));
+                    }));
                 let _ = events.send(DriverEvent::Connected {
                     provider_cursor: Some(connected_provider_cursor(
                         provider,
@@ -1736,6 +1791,10 @@ where
             // `commands`: a clone of the handle's sender would keep this loop
             // alive after the handle is dropped.
             let (recovery_tx, recovery_rx) = smol::channel::unbounded::<CommandMessage>();
+            let lost_session_recovery = LostSessionRecovery {
+                sender: recovery_tx,
+                cancel_epoch: Arc::new(AtomicU64::new(0)),
+            };
             let mut cancel_deadline: Option<Instant> = None;
 
             enum LoopEvent {
@@ -1890,7 +1949,27 @@ where
                     CommandMessage::RecoverLostSession {
                         failed_session_id,
                         text,
+                        cancel_epoch: sent_cancel_epoch,
+                        settled_last,
                     } => {
+                        if lost_session_recovery_decision(
+                            lost_session_recovery.cancel_epoch.load(Ordering::Acquire),
+                            sent_cancel_epoch,
+                        ) == LostSessionRecoveryDecision::DropBecauseCancelled
+                        {
+                            // The user cancelled between the prompt callback
+                            // queuing this recovery and the loop reaching it.
+                            // Resending would revive the cancelled turn on a
+                            // fresh session, so finish it as cancelled instead.
+                            if settled_last && prompt_requests.lock().is_empty() {
+                                stream_state.lock().tools.clear();
+                                let _ = events.send(DriverEvent::TurnFinished {
+                                    success: true,
+                                    summary: None,
+                                });
+                            }
+                            continue;
+                        }
                         cancel_deadline = None;
                         if failed_session_id != native_session_id {
                             // Another in-flight request (e.g. the primary Turn
@@ -2084,7 +2163,8 @@ where
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
-                            (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
+                            (provider == ProviderKind::Antigravity)
+                                .then(|| lost_session_recovery.clone()),
                             PromptKind::Turn,
                             Some(antigravity_step_offset.clone()),
                             (provider == ProviderKind::Antigravity)
@@ -2132,7 +2212,8 @@ where
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
-                            (provider == ProviderKind::Antigravity).then(|| recovery_tx.clone()),
+                            (provider == ProviderKind::Antigravity)
+                                .then(|| lost_session_recovery.clone()),
                             PromptKind::Steer,
                             Some(antigravity_step_offset.clone()),
                             (provider == ProviderKind::Antigravity)
@@ -2154,6 +2235,9 @@ where
                         }
                     }
                     CommandMessage::Cancel => {
+                        lost_session_recovery
+                            .cancel_epoch
+                            .fetch_add(1, Ordering::AcqRel);
                         let _ = connection
                             .send_notification(CancelNotification::new(session_id.clone()));
                         cancel_pending_permissions(&pending_permissions);
@@ -2190,8 +2274,7 @@ where
                                 cancel_deadline = None;
                             }
                         } else if !prompt_requests.lock().is_empty() {
-                            cancel_deadline
-                                .get_or_insert_with(|| Instant::now() + timeouts.cancel);
+                            cancel_deadline.get_or_insert_with(|| Instant::now() + timeouts.cancel);
                         }
                     }
                     CommandMessage::RefreshBackgroundWork => {
@@ -2299,11 +2382,13 @@ where
                                     let _ = responder.respond(response);
                                 }
                                 PendingAcpUserInput::Elicitation { request, responder } => {
-                                    if let Some(error) = elicitation_answer_error(&request, &answers)
+                                    if let Some(error) =
+                                        elicitation_answer_error(&request, &answers)
                                     {
                                         // Ask again with the reason rather than send
                                         // the agent a value its schema rejects.
-                                        let questions = elicitation_retry_questions(&request, &error);
+                                        let questions =
+                                            elicitation_retry_questions(&request, &error);
                                         pending_user_inputs.lock().insert(
                                             request_id.clone(),
                                             PendingAcpUserInput::Elicitation { request, responder },
@@ -3965,7 +4050,7 @@ fn send_prompt(
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
-    lost_session_recovery: Option<smol::channel::Sender<CommandMessage>>,
+    lost_session_recovery: Option<LostSessionRecovery>,
     prompt_kind: PromptKind,
     antigravity_step_offset: Option<Arc<AtomicI64>>,
     antigravity_fork_context: Option<Arc<Mutex<Option<String>>>>,
@@ -3975,13 +4060,19 @@ fn send_prompt(
         state.produced_content = false;
         state.tools.clear();
     }
-    let retry_text = lost_session_recovery.as_ref().map(|_| text.clone());
+    // The epoch is read on the loop thread, the same one that bumps it for a
+    // Cancel, so it marks exactly which cancels happened after this send.
+    let recovery = lost_session_recovery.map(|recovery| {
+        let sent_epoch = recovery.cancel_epoch.load(Ordering::Acquire);
+        (recovery, sent_epoch, text.clone())
+    });
     // Read before the turn runs, so the failure lookup cannot mistake an
     // earlier turn's record for this one's.
     let kimi_offset = (provider == ProviderKind::Kimi)
         .then(|| crate::kimi_session::wire_offset(native_session_id));
-    let antigravity_offset = (provider == ProviderKind::Antigravity)
-        .then(|| crate::antigravity_session::step_offset_in(native_session_id, config_dir.as_deref()));
+    let antigravity_offset = (provider == ProviderKind::Antigravity).then(|| {
+        crate::antigravity_session::step_offset_in(native_session_id, config_dir.as_deref())
+    });
     let extension_id =
         (provider == ProviderKind::Grok).then(|| format!("waku-{}", uuid::Uuid::new_v4()));
     let content_blocks =
@@ -4013,19 +4104,48 @@ fn send_prompt(
         // The resumed session no longer exists on the provider's side, so every
         // prompt to it fails the same way. Recover even when a concurrent Steer
         // is still in flight so the primary Turn is never dropped.
-        if is_lost_session
-            && let (Some(recovery), Some(text)) = (lost_session_recovery, retry_text)
-            && recovery
+        if is_lost_session && let Some((recovery, sent_epoch, text)) = recovery {
+            if lost_session_recovery_decision(
+                recovery.cancel_epoch.load(Ordering::Acquire),
+                sent_epoch,
+            ) == LostSessionRecoveryDecision::DropBecauseCancelled
+            {
+                // Cancelled before the provider reported the lost session:
+                // the turn is over, and a resend would start it again.
+                if settled_last {
+                    stream_state.lock().tools.clear();
+                    if provider == ProviderKind::Antigravity
+                        && let Some(step_offset) = antigravity_step_offset
+                    {
+                        let sid = native_session_id.clone();
+                        let next_offset = smol::unblock(move || {
+                            crate::antigravity_session::step_offset_in(&sid, config_dir.as_deref())
+                        })
+                        .await;
+                        step_offset.store(next_offset, Ordering::Release);
+                    }
+                    let _ = callback_events.send(DriverEvent::TurnFinished {
+                        success: true,
+                        summary: None,
+                    });
+                }
+                return Ok(());
+            }
+            if recovery
+                .sender
                 .try_send(CommandMessage::RecoverLostSession {
                     failed_session_id: native_session_id.clone(),
                     text,
+                    cancel_epoch: sent_epoch,
+                    settled_last,
                 })
                 .is_ok()
-        {
-            if settled_last {
-                stream_state.lock().tools.clear();
+            {
+                if settled_last {
+                    stream_state.lock().tools.clear();
+                }
+                return Ok(());
             }
-            return Ok(());
         }
         if settled_last {
             let produced_content = {
@@ -4458,7 +4578,9 @@ fn resolve_prompt_attachment_path(
     }
     let candidate = Path::new(mention);
     let resolved = canonical_cwd
-        .and_then(|root| resolve_confined_path_with_canonical_root(root, true, candidate, false).ok())
+        .and_then(|root| {
+            resolve_confined_path_with_canonical_root(root, true, candidate, false).ok()
+        })
         .or_else(|| {
             if !candidate.is_absolute() {
                 return None;
@@ -4603,11 +4725,9 @@ pub(crate) fn build_prompt_content_blocks_with_roots(
         let after_at = &text[at_idx + 1..];
         let slice_end = find_next_mention_boundary(after_at);
         let slice = &after_at[..slice_end];
-        let Some((mention, resolved, metadata, consumed)) = resolve_mention_candidate(
-            slice,
-            canonical_cwd.as_deref(),
-            &canonical_attachment_roots,
-        ) else {
+        let Some((mention, resolved, metadata, consumed)) =
+            resolve_mention_candidate(slice, canonical_cwd.as_deref(), &canonical_attachment_roots)
+        else {
             cursor = at_idx + 1;
             continue;
         };
@@ -6142,7 +6262,10 @@ fn elicitation_content_value(
             ElicitationContentValue::Integer(first.parse::<i64>().ok()?)
         }
         ElicitationPropertySchema::Number(_) => ElicitationContentValue::Number(
-            first.parse::<f64>().ok().filter(|value| value.is_finite())?,
+            first
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())?,
         ),
         ElicitationPropertySchema::Other(_) | &_ => return None,
     })
@@ -6878,9 +7001,7 @@ fn path_basename(raw_path: &str) -> Option<&str> {
     } else {
         normalized
     };
-    trimmed
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
+    trimmed.rsplit(['/', '\\']).find(|part| !part.is_empty())
 }
 
 fn normalize_acp_locations(locations: &Value) -> Value {
@@ -7296,8 +7417,18 @@ fn is_file_search_tool(wire_title: Option<&str>, arguments: Option<&Value>) -> b
     {
         return false;
     }
-    if arg_str(arguments, &["pattern", "glob", "regex", "folder", "file_pattern", "include"])
-        .is_some()
+    if arg_str(
+        arguments,
+        &[
+            "pattern",
+            "glob",
+            "regex",
+            "folder",
+            "file_pattern",
+            "include",
+        ],
+    )
+    .is_some()
         || arg_array(arguments, &["patterns"]).is_some_and(|items| !items.is_empty())
     {
         return true;
@@ -7445,8 +7576,8 @@ pub(crate) fn build_tool_activity_item(
                 "Tool".to_owned()
             }
         });
-    let mcp_server = factory_mcp_server
-        .or_else(|| stored.as_ref().and_then(|tool| tool.mcp_server.clone()));
+    let mcp_server =
+        factory_mcp_server.or_else(|| stored.as_ref().and_then(|tool| tool.mcp_server.clone()));
     let tool_name = canonical_antigravity_tool
         .map(str::to_owned)
         .or(factory_mcp_tool)
@@ -7476,23 +7607,23 @@ pub(crate) fn build_tool_activity_item(
         );
     }
 
-    let fallback_plan_output = if canonical_antigravity_tool == Some("exit_plan_mode")
-        || kind == ActivityKind::Plan
-    {
-        arg_str(arguments, &["plan", "spec", "content", "summary"])
-            .map(|plan| Value::String(plan.to_owned()))
-    } else {
-        artifact_presentation
-            .as_ref()
-            .and_then(|(_, _, _, content)| content.as_ref())
-            .map(|text| Value::String(text.clone()))
-    };
+    let fallback_plan_output =
+        if canonical_antigravity_tool == Some("exit_plan_mode") || kind == ActivityKind::Plan {
+            arg_str(arguments, &["plan", "spec", "content", "summary"])
+                .map(|plan| Value::String(plan.to_owned()))
+        } else {
+            artifact_presentation
+                .as_ref()
+                .and_then(|(_, _, _, content)| content.as_ref())
+                .map(|text| Value::String(text.clone()))
+        };
     let raw_output = content.or_else(|| update.get("rawOutput").filter(|value| !value.is_null()));
     let output = raw_output.or(fallback_plan_output.as_ref());
-    let mut item =
-        activity::tool_activity(id, kind, title, arguments, output, raw_output, failed, complete)
-            .with_tool_name(tool_name.as_deref())
-            .with_mcp_server(mcp_server.as_deref());
+    let mut item = activity::tool_activity(
+        id, kind, title, arguments, output, raw_output, failed, complete,
+    )
+    .with_tool_name(tool_name.as_deref())
+    .with_mcp_server(mcp_server.as_deref());
     if normalized_locations.is_some() || content.is_some() {
         let mut source = Map::new();
         if let Some(arguments) = arguments {
@@ -7871,8 +8002,8 @@ mod tests {
     #[test]
     fn elicitation_numbers_are_validated_and_asked_again_instead_of_sent_as_strings() {
         use agent_client_protocol::schema::v1::{
-            ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
-            IntegerPropertySchema, SessionId,
+            ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, IntegerPropertySchema,
+            SessionId,
         };
 
         let schema = ElicitationSchema::new().property(
@@ -7995,10 +8126,14 @@ mod tests {
             }
         };
         wait_event(|event| matches!(event, DriverEvent::Connected { .. }));
-        cmd_tx.try_send(CommandMessage::Prompt("start".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("start".into()))
+            .unwrap();
         let next_question = || {
-            let DriverEvent::UserInputRequested { request_id, questions } =
-                wait_event(|event| matches!(event, DriverEvent::UserInputRequested { .. }))
+            let DriverEvent::UserInputRequested {
+                request_id,
+                questions,
+            } = wait_event(|event| matches!(event, DriverEvent::UserInputRequested { .. }))
             else {
                 unreachable!();
             };
@@ -8517,10 +8652,7 @@ mod tests {
                     "content": {"type": "text", "text": "historical-before"}
                 }))
                 .unwrap();
-                cx.send_notification(SessionNotification::new(
-                    req.session_id.clone(),
-                    pre_chunk,
-                ))?;
+                cx.send_notification(SessionNotification::new(req.session_id.clone(), pre_chunk))?;
                 responder.respond(LoadSessionResponse::new())?;
                 // Post-response trailing replay + metadata (matching live `agy acp` behavior).
                 let post_chunk: SessionUpdate = serde_json::from_value(json!({
@@ -8528,10 +8660,7 @@ mod tests {
                     "content": {"type": "text", "text": "historical-after"}
                 }))
                 .unwrap();
-                cx.send_notification(SessionNotification::new(
-                    req.session_id.clone(),
-                    post_chunk,
-                ))?;
+                cx.send_notification(SessionNotification::new(req.session_id.clone(), post_chunk))?;
                 cx.send_notification(SessionNotification::new(
                     req.session_id.clone(),
                     SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
@@ -8985,7 +9114,10 @@ mod tests {
             &mut tools,
             None,
         );
-        assert_eq!(pascal_subagent.tool_name.as_deref(), Some("invoke_subagent"));
+        assert_eq!(
+            pascal_subagent.tool_name.as_deref(),
+            Some("invoke_subagent")
+        );
         assert_eq!(pascal_subagent.title, "Subagent: Codebase Researcher");
         assert_eq!(
             pascal_subagent.detail.as_deref(),
@@ -9003,7 +9135,10 @@ mod tests {
             &mut tools,
             None,
         );
-        assert_eq!(define_subagent.tool_name.as_deref(), Some("define_subagent"));
+        assert_eq!(
+            define_subagent.tool_name.as_deref(),
+            Some("define_subagent")
+        );
         assert_eq!(define_subagent.title, "Define subagent: auditor");
         assert_eq!(
             define_subagent.detail.as_deref(),
@@ -9114,7 +9249,10 @@ mod tests {
         assert_eq!(exit_plan.tool_name.as_deref(), Some("exit_plan_mode"));
         assert_eq!(exit_plan.title, "Plan ready");
         assert_eq!(exit_plan.detail.as_deref(), Some("# Plan"));
-        assert_eq!(exit_plan.output.as_deref(), Some("# Plan\n- Step 1\n- Step 2"));
+        assert_eq!(
+            exit_plan.output.as_deref(),
+            Some("# Plan\n- Step 1\n- Step 2")
+        );
 
         // 9. Antigravity /plan write_file with ArtifactMetadata and /C:/... location normalization.
         let plan_artifact = build_tool_activity_item(
@@ -9140,7 +9278,10 @@ mod tests {
         );
         assert_eq!(plan_artifact.kind, ActivityKind::Plan);
         assert_eq!(plan_artifact.title, "Plan: plan.md");
-        assert_eq!(plan_artifact.display_target.as_deref(), Some("Plan: plan.md"));
+        assert_eq!(
+            plan_artifact.display_target.as_deref(),
+            Some("Plan: plan.md")
+        );
         assert_eq!(
             plan_artifact.detail.as_deref(),
             Some("2-bullet implementation plan")
@@ -9154,11 +9295,15 @@ mod tests {
             {"path": "/tmp/plan.md"}
         ]));
         assert_eq!(
-            normalized_locations.pointer("/0/path").and_then(Value::as_str),
+            normalized_locations
+                .pointer("/0/path")
+                .and_then(Value::as_str),
             Some("C:/Users/gaoxi/.gemini/antigravity-cli/brain/123/plan.md")
         );
         assert_eq!(
-            normalized_locations.pointer("/1/path").and_then(Value::as_str),
+            normalized_locations
+                .pointer("/1/path")
+                .and_then(Value::as_str),
             Some("/tmp/plan.md")
         );
 
@@ -10818,10 +10963,7 @@ mod tests {
             None,
         );
         assert_eq!(mcp_title_fallback.mcp_server.as_deref(), Some("linear"));
-        assert_eq!(
-            mcp_title_fallback.tool_name.as_deref(),
-            Some("list_issues")
-        );
+        assert_eq!(mcp_title_fallback.tool_name.as_deref(), Some("list_issues"));
     }
 
     #[test]
@@ -11572,7 +11714,9 @@ mod tests {
 
     #[test]
     fn acp_connection_enforces_timeouts_on_initialize_establish_and_cancel_not_prompt() {
-        use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeResponse, NewSessionResponse};
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionResponse,
+        };
 
         let short_timeouts = AcpTimeouts {
             request: Duration::from_millis(50),
@@ -11722,7 +11866,9 @@ mod tests {
             }
         }
         // First prompt takes 120ms (> 50ms request timeout) and succeeds.
-        cmd_tx.try_send(CommandMessage::Prompt("slow turn".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("slow turn".into()))
+            .unwrap();
         loop {
             let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             if let DriverEvent::TurnFinished { success, .. } = ev {
@@ -11731,7 +11877,9 @@ mod tests {
             }
         }
         // Second prompt hangs; Cancel must settle after `timeouts.cancel` and exit the loop.
-        cmd_tx.try_send(CommandMessage::Prompt("hung turn".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("hung turn".into()))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(20));
         cmd_tx.try_send(CommandMessage::Cancel).unwrap();
         let mut saw_cancel_error = false;
@@ -11851,7 +11999,9 @@ mod tests {
             }
         }
         // Prompt 1 -> Cancel -> Prompt 1 settles normally before cancel timeout.
-        cmd_tx.try_send(CommandMessage::Prompt("first".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("first".into()))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         cmd_tx.try_send(CommandMessage::Cancel).unwrap();
         loop {
@@ -11868,7 +12018,9 @@ mod tests {
                 break;
             }
         }
-        cmd_tx.try_send(CommandMessage::Steer("steer it".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Steer("steer it".into()))
+            .unwrap();
         let mut steer_finished_ok = false;
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -11891,8 +12043,7 @@ mod tests {
     #[test]
     fn acp_antigravity_unsolicited_turn_checks_native_failure_on_settle() {
         use agent_client_protocol::schema::v1::{
-            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse,
-            UsageUpdate,
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionResponse, UsageUpdate,
         };
 
         let root =
@@ -12067,9 +12218,9 @@ mod tests {
                     steered_on_fresh_agent.lock().push((sid.clone(), text));
                     let _ = cx.send_notification(SessionNotification::new(
                         sid,
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                            ContentBlock::Text(TextContent::new("steered ok")),
-                        )),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("steered ok"),
+                        ))),
                     ));
                     responder.respond(PromptResponse::new(StopReason::EndTurn))
                 },
@@ -12108,7 +12259,9 @@ mod tests {
                 break;
             }
         }
-        cmd_tx.try_send(CommandMessage::Steer("steer payload".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Steer("steer payload".into()))
+            .unwrap();
 
         let mut recovered_cursor = None;
         let mut finished_ok = false;
@@ -12238,8 +12391,12 @@ mod tests {
                 break;
             }
         }
-        cmd_tx.try_send(CommandMessage::Prompt("primary turn".into())).unwrap();
-        cmd_tx.try_send(CommandMessage::Steer("follow-up steer".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("primary turn".into()))
+            .unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Steer("follow-up steer".into()))
+            .unwrap();
 
         let mut finished_ok = false;
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -13151,7 +13308,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_finished, "early buffered prompt should execute after handshake");
+        assert!(
+            saw_finished,
+            "early buffered prompt should execute after handshake"
+        );
         cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
         handle.join().unwrap().unwrap();
         assert_eq!(*seen_prompts.lock(), vec!["queued during init"]);
@@ -13245,25 +13405,26 @@ mod tests {
         });
 
         let mut connected_events = Vec::new();
-        let collect_until_finish = |expected_success: bool,
-                                    connected_out: &mut Vec<Option<String>>| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(100)) {
-                    match ev {
-                        DriverEvent::Connected {
-                            provider_cursor: Some(ProviderResumeCursor::Antigravity { fork_context, .. }),
-                        } => connected_out.push(fork_context),
-                        DriverEvent::TurnFinished { success, .. } => {
-                            assert_eq!(success, expected_success);
-                            return;
+        let collect_until_finish =
+            |expected_success: bool, connected_out: &mut Vec<Option<String>>| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if let Ok(ev) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                        match ev {
+                            DriverEvent::Connected {
+                                provider_cursor:
+                                    Some(ProviderResumeCursor::Antigravity { fork_context, .. }),
+                            } => connected_out.push(fork_context),
+                            DriverEvent::TurnFinished { success, .. } => {
+                                assert_eq!(success, expected_success);
+                                return;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            panic!("timed out waiting for TurnFinished");
-        };
+                panic!("timed out waiting for TurnFinished");
+            };
 
         // Initial Connected keeps fork_context.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -13278,17 +13439,23 @@ mod tests {
         assert_eq!(connected_events, vec![Some("prior branch context".into())]);
 
         // Turn 1 fails: fork_context remains preserved.
-        cmd_tx.try_send(CommandMessage::Prompt("try 1".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("try 1".into()))
+            .unwrap();
         collect_until_finish(false, &mut connected_events);
         assert_eq!(connected_events.len(), 1);
 
         // Turn 2 is cancelled: fork_context remains preserved.
-        cmd_tx.try_send(CommandMessage::Prompt("try 2".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("try 2".into()))
+            .unwrap();
         collect_until_finish(true, &mut connected_events);
         assert_eq!(connected_events.len(), 1);
 
         // Turn 3 ends cleanly: fork_context clears and emits updated Connected before TurnFinished.
-        cmd_tx.try_send(CommandMessage::Prompt("try 3".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("try 3".into()))
+            .unwrap();
         collect_until_finish(true, &mut connected_events);
         assert_eq!(
             connected_events,
@@ -13296,7 +13463,9 @@ mod tests {
         );
 
         // Turn 4 no longer receives fork_context.
-        cmd_tx.try_send(CommandMessage::Prompt("try 4".into())).unwrap();
+        cmd_tx
+            .try_send(CommandMessage::Prompt("try 4".into()))
+            .unwrap();
         collect_until_finish(true, &mut connected_events);
         assert_eq!(connected_events.len(), 2);
 

@@ -608,9 +608,8 @@ impl PersistedState {
     }
 
     pub fn apply_daemon_settings(&mut self, settings: DaemonSettings) {
-        // Computer Use is experimental, so a release build must not let a
-        // setting written by a development build leave this client believing
-        // it is on.
+        // Computer Use is prohibited, so a stored enablement cannot leave
+        // this client believing it is on.
         self.computer_use_enabled =
             crate::computer_use::resolve_enabled(settings.computer_use_enabled);
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
@@ -1006,8 +1005,8 @@ impl AppFileWriter {
 
     fn write_inline(&self, settings: AppSettings, state: AppState) -> io::Result<()> {
         let encoded = serde_json::to_vec(&settings).map_err(to_io_error)?;
-        let should_write_settings = self.shared.queue.lock().last_settings_bytes.as_deref()
-            != Some(encoded.as_slice());
+        let should_write_settings =
+            self.shared.queue.lock().last_settings_bytes.as_deref() != Some(encoded.as_slice());
         if should_write_settings {
             write_json_atomically(&self.shared.app_settings_path, &settings)?;
             self.shared.queue.lock().last_settings_bytes = Some(encoded);
@@ -1060,10 +1059,7 @@ fn run_app_file_writer(shared: Arc<AppFileWriterShared>) {
             {
                 shared.wake.wait(&mut queue);
             }
-            if queue.pending_settings.is_none()
-                && queue.pending_state.is_none()
-                && queue.shutdown
-            {
+            if queue.pending_settings.is_none() && queue.pending_state.is_none() && queue.shutdown {
                 queue.exited = true;
                 shared.flushed.notify_all();
                 return;

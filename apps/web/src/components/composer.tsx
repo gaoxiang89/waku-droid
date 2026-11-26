@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Popover } from '@base-ui/react/popover'
 import {
   resolveProviderAccount,
+  resolveProviderExecutionConfig,
   switchSessionAgent,
   validatedAccountId,
   type AgentSession,
@@ -49,6 +50,8 @@ import {
 import { importDaemonPathAttachment, importFiles, readAttachmentImage } from '@/lib/attachments'
 import {
   checkoutWorkspaceBranch,
+  discoverComposerCommands,
+  loadDaemonSettings,
   daemonKeys,
   fetchPlanUsage,
   selectableProjects,
@@ -90,6 +93,7 @@ import { usePrimaryShortcut } from '@/lib/platform'
 import { agentPresetDescription, agentPresetLabel } from '@/lib/agent-preset-presentation'
 import { isProjectlessProject, projectDisplayName } from '@/lib/project-presentation'
 import { userInputAnswers, userInputReady, type PendingUserInput } from '@/lib/event-reducer'
+import { isUnsupportedWebCommand, webComposerCommands } from '@/lib/web-commands'
 import { useRuntime } from '@/lib/runtime-context'
 import { sessionHasStarted } from '@/lib/sidebar-presentation'
 import { cn } from '@/lib/utils'
@@ -240,9 +244,12 @@ export function Composer({
     : workspace.kind === 'worktree'
       ? workspace.branch
       : t('workspace.local')
-  const availableCommands = mergeComposerCommands(
-    composerCommands.data ?? [],
-    session.available_commands ?? [],
+  const availableCommands = webComposerCommands(
+    session.provider,
+    mergeComposerCommands(
+      composerCommands.data ?? [],
+      session.available_commands ?? [],
+    ),
   )
   const autocompleteTrigger = inputFocused ? detectComposerTrigger(prompt, cursor) : null
   const autocompleteKey = autocompleteTrigger
@@ -370,14 +377,52 @@ export function Composer({
     return saveSession(session, project)
   }
 
+  /** Fresh catalog for the submit path: a cold autocomplete or a stale account
+   * scope must not decide whether a typed `/name` expands or travels native. */
+  async function submissionCommands(): Promise<SlashCommand[]> {
+    if (!client || !config) return availableCommands
+    const settings = await queryClient.fetchQuery({
+      queryKey: daemonKeys.settings(config.address),
+      queryFn: () => loadDaemonSettings(client),
+      staleTime: 60_000,
+    })
+    const execution = resolveProviderExecutionConfig(
+      settings,
+      session.provider,
+      session.account_id,
+    )
+    const discovered = await queryClient.fetchQuery({
+      queryKey: daemonKeys.slashCommands(
+        config.address,
+        session.provider,
+        cwd,
+        execution.binaryOverride,
+        execution.configDir,
+      ),
+      queryFn: () => discoverComposerCommands(
+        client,
+        session.provider,
+        cwd,
+        execution.binaryOverride,
+        execution.configDir,
+      ),
+      staleTime: Number.POSITIVE_INFINITY,
+    })
+    return webComposerCommands(
+      session.provider,
+      mergeComposerCommands(discovered, session.available_commands ?? []),
+    )
+  }
+
   function providerPromptOverride(
     submittedPrompt: string,
     submittedAttachments: MessageAttachment[],
+    commands: SlashCommand[] = availableCommands,
   ): string | undefined {
     const expanded = expandedComposerSubmission(
       session.provider,
       submittedPrompt.trim(),
-      availableCommands,
+      commands,
     )
     if (expanded === null) return undefined
     return [
@@ -389,16 +434,21 @@ export function Composer({
   function executeLocalComposerCommand(
     submittedPrompt = prompt,
     fromAutocomplete = false,
+    commands: SlashCommand[] = availableCommands,
   ): boolean {
+    if (isUnsupportedWebCommand(session.provider, submittedPrompt, commands)) {
+      toast.error(t('commands.desktop_only'))
+      return true
+    }
     return executeResumeCommand(submittedPrompt)
-      || executeFastModeToggle(submittedPrompt)
-      || executeGoalCommand(submittedPrompt)
-      || executeCodexUsageCommand(submittedPrompt)
-      || executeAntigravityCommand(submittedPrompt, fromAutocomplete)
+      || executeFastModeToggle(submittedPrompt, commands)
+      || executeGoalCommand(submittedPrompt, commands)
+      || executeCodexUsageCommand(submittedPrompt, commands)
+      || executeAntigravityCommand(submittedPrompt, fromAutocomplete, commands)
   }
 
-  function executeCodexUsageCommand(submittedPrompt: string): boolean {
-    if (!isCodexUsageSubmission(session.provider, submittedPrompt, availableCommands)) return false
+  function executeCodexUsageCommand(submittedPrompt: string, commands = availableCommands): boolean {
+    if (!isCodexUsageSubmission(session.provider, submittedPrompt, commands)) return false
     clearComposerDraft()
     setLocalUsagePanelSignal((value) => value + 1)
     return true
@@ -451,11 +501,12 @@ export function Composer({
   function executeAntigravityCommand(
     submittedPrompt: string,
     fromAutocomplete: boolean,
+    commands: SlashCommand[] = availableCommands,
   ): boolean {
     const command = parseAntigravityLocalCommand(
       session.provider,
       submittedPrompt,
-      availableCommands,
+      commands,
     )
     if (!command) return false
     if (fromAutocomplete && !antigravityLocalCommandExecutesOnAccept(command)) return false
@@ -538,8 +589,8 @@ export function Composer({
     return true
   }
 
-  function executeFastModeToggle(submittedPrompt: string): boolean {
-    if (!isFastModeToggleSubmission(session.provider, submittedPrompt, availableCommands)) return false
+  function executeFastModeToggle(submittedPrompt: string, commands = availableCommands): boolean {
+    if (!isFastModeToggleSubmission(session.provider, submittedPrompt, commands)) return false
     const nextTier = toggledFastServiceTier(
       session.service_tier,
       selectedModel?.service_tiers ?? [],
@@ -559,8 +610,8 @@ export function Composer({
   /** Codex's native `/goal` command, bridged to app-server without starting a
    * turn. The runtime context starts the provider itself when none is live yet,
    * so a goal can be set before the first message. */
-  function executeGoalCommand(submittedPrompt: string): boolean {
-    const command = parseGoalSubmission(session.provider, submittedPrompt, availableCommands)
+  function executeGoalCommand(submittedPrompt: string, commands = availableCommands): boolean {
+    const command = parseGoalSubmission(session.provider, submittedPrompt, commands)
     if (!command) return false
     const goal = session.thread_goal ?? null
     switch (command.kind) {
@@ -604,12 +655,13 @@ export function Composer({
     let cleared = false
     setSubmitting(true)
     try {
+      const commands = await submissionCommands()
       const target = await activateDraft()
       const pending = sendPrompt(
         target,
         submittedPrompt,
         submittedAttachments,
-        providerPromptOverride(submittedPrompt, submittedAttachments),
+        providerPromptOverride(submittedPrompt, submittedAttachments, commands),
       )
       onComposerDraftSubmitted?.()
       setPrompt('')
@@ -643,11 +695,12 @@ export function Composer({
     let cleared = false
     setSubmitting(true)
     try {
+      const commands = await submissionCommands()
       const pending = steerPrompt(
         session,
         submittedPrompt,
         submittedAttachments,
-        providerPromptOverride(submittedPrompt, submittedAttachments),
+        providerPromptOverride(submittedPrompt, submittedAttachments, commands),
       )
       onComposerDraftSubmitted?.()
       setPrompt('')
@@ -714,12 +767,20 @@ export function Composer({
     else void saveSession(next).catch((error) => toast.error(errorMessage(error)))
   }
 
-  function acceptAutocomplete(index = autocompleteHighlight) {
+  async function acceptAutocomplete(index = autocompleteHighlight) {
     if (!autocompleteTrigger) return
     const row = autocompleteRows[index]
     if (!row) return
     const replacement = replaceComposerTrigger(prompt, autocompleteTrigger, row)
-    if (row.kind === 'command' && executeLocalComposerCommand(replacement.text, true)) return
+    if (row.kind === 'command') {
+      try {
+        const commands = await submissionCommands()
+        if (executeLocalComposerCommand(replacement.text, true, commands)) return
+      } catch (error) {
+        toast.error(errorMessage(error))
+        return
+      }
+    }
     pendingCursor.current = replacement.cursor
     setPrompt(replacement.text)
     setDismissedAutocomplete(null)

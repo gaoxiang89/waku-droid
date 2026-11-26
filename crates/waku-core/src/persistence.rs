@@ -561,7 +561,8 @@ impl PersistedState {
     }
 
     pub fn apply_daemon_settings(&mut self, settings: crate::DaemonSettings) {
-        self.computer_use_enabled = settings.computer_use_enabled;
+        self.computer_use_enabled =
+            crate::computer_use::resolve_enabled(settings.computer_use_enabled);
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
@@ -966,6 +967,57 @@ pub struct StateStore {
 
 /// Environment override for the daemon's data directory.
 pub const DATA_DIRECTORY_ENV: &str = "WAKU_DATA_DIR";
+
+/// Snapshot a legacy WAL database through SQLite, never by copying live files.
+/// A failed import aborts startup, leaving the source and any Narel DB intact.
+pub fn import_legacy_database() -> io::Result<()> {
+    if cfg!(debug_assertions) || data_directory_override().is_some() {
+        return Ok(());
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        import_database_from(
+            &data.join("Waku").join("app.db"),
+            &data.join(DATA_DIRECTORY_NAME).join("app.db"),
+        )?;
+    }
+    Ok(())
+}
+
+fn import_database_from(source: &Path, target: &Path) -> io::Result<()> {
+    match fs::metadata(source) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::other("missing data root"))?;
+    waku_protocol::identity::migration::with_import_lock(parent, || {
+        let marker = parent.join(".waku-database-import-v1");
+        if marker.is_file() {
+            return Ok(());
+        }
+        waku_protocol::identity::migration::publish_missing(target, |temporary| {
+            let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(to_io_error)?;
+            source
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(to_io_error)?;
+            source
+                .execute("VACUUM INTO ?1", [temporary.to_string_lossy().as_ref()])
+                .map_err(to_io_error)?;
+            #[cfg(unix)]
+            fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        })?;
+        waku_protocol::identity::migration::publish_missing(&marker, |temporary| {
+            fs::write(
+                temporary,
+                b"Waku database import completed; original retained.\n",
+            )
+        })
+    })
+}
 
 /// `WAKU_DATA_DIR`, when set. A debug daemon a bridge starts on WSL or SSH
 /// needs it: the checkout path compiled into a debug build can be the very
@@ -2016,6 +2068,69 @@ mod tests {
 
     fn temporary_directory() -> PathBuf {
         std::env::temp_dir().join(format!("waku-state-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn legacy_database_import_snapshots_live_wal_and_preserves_existing_target() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("old.db");
+        let new = directory.join("new/app.db");
+        let source = Connection::open(&old).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE history (body TEXT); INSERT INTO history VALUES ('committed WAL');",
+            )
+            .unwrap();
+        assert!(old.with_file_name("old.db-wal").is_file());
+        import_database_from(&old, &new).unwrap();
+        let imported = Connection::open(&new).unwrap();
+        let body: String = imported
+            .query_row("SELECT body FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "committed WAL");
+        source
+            .execute("INSERT INTO history VALUES ('later Waku edit')", [])
+            .unwrap();
+        import_database_from(&old, &new).unwrap();
+        let count: i64 = imported
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "never merge or replace an existing Narel database"
+        );
+        drop(imported);
+        fs::remove_file(&new).unwrap();
+        import_database_from(&old, &new).unwrap();
+        assert!(
+            !new.exists(),
+            "completed imports must not revive deleted Narel history"
+        );
+        drop(source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_legacy_database_import_leaves_no_target_and_can_retry() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("old.db");
+        let new = directory.join("new/app.db");
+        fs::write(&old, "not a database").unwrap();
+        assert!(import_database_from(&old, &new).is_err());
+        assert!(!new.exists());
+        fs::remove_file(&old).unwrap();
+        let source = Connection::open(&old).unwrap();
+        source
+            .execute("CREATE TABLE history (body TEXT)", [])
+            .unwrap();
+        import_database_from(&old, &new).unwrap();
+        assert!(new.is_file());
+        assert!(old.is_file());
+        drop(source);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn store_in(directory: &Path) -> StateStore {
@@ -4115,7 +4230,10 @@ mod tests {
         reopened.hydrate(&mut restored.sessions[0]).unwrap();
         assert!(restored.sessions[0].detail_loaded);
         assert_eq!(restored.sessions[0].available_commands, expected_commands);
-        assert_eq!(restored.sessions[0].thread_goal, Some(expected_goal.clone()));
+        assert_eq!(
+            restored.sessions[0].thread_goal,
+            Some(expected_goal.clone())
+        );
 
         // Saving a hydrated session again must persist those fields rather than
         // wiping them in session_details.data.

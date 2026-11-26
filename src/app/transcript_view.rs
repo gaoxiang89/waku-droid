@@ -16,6 +16,358 @@ const ACTIVITY_DIFF_MAX_HEIGHT: f32 = 400.0;
 /// instead of bloating the transcript vertically.
 const ACTIVITY_SECTION_MAX_HEIGHT: f32 = 400.0;
 
+const ACTIVITY_TILE_BYTES: usize = 2048;
+const ACTIVITY_TILE_NODES: usize = 64;
+const ACTIVITY_DETAILS_CACHE_ENTRIES: usize = 128;
+
+/// A source snapshot, not an address/length fingerprint: same-length edits and
+/// hydration replacements must invalidate too. Compared only after the
+/// incoming-state revision changes, never on a spinner/pulse-only frame.
+struct ActivityDetailSource {
+    activity: ActivityItem,
+    shows_diff: bool,
+    has_images: bool,
+}
+
+impl ActivityDetailSource {
+    fn capture(activity: &ActivityItem) -> Self {
+        // Deliberately don't clone image data URLs, file patches or reasoning.
+        let mut snapshot = ActivityItem::new(
+            None,
+            activity.kind,
+            activity.title.clone(),
+            activity.detail.clone(),
+            true,
+        );
+        snapshot.id = activity.id;
+        snapshot.tool_name = activity.tool_name.clone();
+        snapshot.mcp_server = activity.mcp_server.clone();
+        snapshot.arguments = activity.arguments.clone();
+        snapshot.output = activity.output.clone();
+        snapshot.display_target = activity.display_target.clone();
+        snapshot.failed = activity.failed;
+        Self {
+            activity: snapshot,
+            shows_diff: activity_shows_diff(activity),
+            has_images: !activity.image_urls.is_empty(),
+        }
+    }
+
+    fn matches(&self, activity: &ActivityItem) -> bool {
+        let old = &self.activity;
+        old.kind == activity.kind
+            && old.title == activity.title
+            && old.tool_name == activity.tool_name
+            && old.mcp_server == activity.mcp_server
+            && old.detail == activity.detail
+            && old.arguments == activity.arguments
+            && old.output == activity.output
+            && old.display_target == activity.display_target
+            && old.failed == activity.failed
+            && self.shows_diff == activity_shows_diff(activity)
+            && self.has_images == !activity.image_urls.is_empty()
+    }
+}
+
+pub(super) struct ActivityDetailsEntry {
+    checked_revision: u64,
+    source: Arc<ActivityDetailSource>,
+    prepared: Option<Rc<PreparedActivityDetails>>,
+}
+
+impl ActivityDetailsEntry {
+    fn is_current(&mut self, activity: &ActivityItem, revision: u64) -> bool {
+        if self.checked_revision == revision {
+            return true;
+        }
+        self.checked_revision = revision;
+        self.source.matches(activity)
+    }
+}
+
+enum ActivityDetailTile {
+    Markdown(md::parser::Block),
+    Plain(SharedString),
+}
+
+struct PreparedActivitySection {
+    kind: ActivityDisclosureSectionKind,
+    tiles: Vec<ActivityDetailTile>,
+    list: ListState,
+    scrollbar: Rc<ScrollbarState>,
+    views: RefCell<HashMap<usize, MarkdownView>>,
+}
+
+struct PreparedActivityDetails {
+    sections: Vec<PreparedActivitySection>,
+}
+
+struct ActivitySectionData {
+    kind: ActivityDisclosureSectionKind,
+    tiles: Vec<ActivityDetailTile>,
+}
+
+struct ActivityDetailsData {
+    sections: Vec<ActivitySectionData>,
+}
+
+impl ActivityDetailsData {
+    /// All JSON decoding, full Markdown parsing and tiling happens on a worker.
+    fn prepare(source: &ActivityDetailSource) -> Self {
+        let activity = &source.activity;
+        let has_plan_steps = !activity_plan_steps(activity).is_empty();
+        let sections = activity_disclosure_sections_with_options(
+            activity,
+            source.shows_diff,
+            source.has_images,
+        )
+        .into_iter()
+        .map(|section| {
+            let markdown = activity_section_markdown_body(
+                activity,
+                section.kind,
+                &section.content,
+                has_plan_steps,
+            );
+            let tiles = if let Some(markdown) = markdown {
+                let mut tiles = Vec::new();
+                for top in md::parser::parse(&markdown).blocks {
+                    activity_block_tiles(top.block, &mut tiles);
+                }
+                tiles
+            } else {
+                activity_text_windows(&section.content)
+                    .into_iter()
+                    .map(|text| ActivityDetailTile::Plain(text.into()))
+                    .collect()
+            };
+            ActivitySectionData {
+                kind: section.kind,
+                tiles,
+            }
+        })
+        .collect();
+        Self { sections }
+    }
+
+    fn into_prepared(self) -> PreparedActivityDetails {
+        PreparedActivityDetails {
+            sections: self
+                .sections
+                .into_iter()
+                .map(|section| {
+                    let list = ListState::new(section.tiles.len(), ListAlignment::Top, px(0.0));
+                    PreparedActivitySection {
+                        kind: section.kind,
+                        tiles: section.tiles,
+                        list,
+                        scrollbar: ScrollbarState::new(),
+                        views: RefCell::new(HashMap::new()),
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Lossless UTF-8 byte windows. Prefer line boundaries without ever allowing
+/// a giant paragraph or single output line to defeat the byte bound.
+fn activity_text_windows(text: &str) -> Vec<String> {
+    let mut windows = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + ACTIVITY_TILE_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < text.len()
+            && let Some(line_end) = text[start..end].rfind('\n')
+            && line_end >= ACTIVITY_TILE_BYTES / 2
+        {
+            end = start + line_end + 1;
+        }
+        windows.push(text[start..end].to_owned());
+        start = end;
+    }
+    windows
+}
+
+fn activity_runs_windows(runs: Vec<md::parser::InlineRun>) -> Vec<Vec<md::parser::InlineRun>> {
+    let mut windows = Vec::new();
+    let mut current = Vec::new();
+    let mut bytes = 0;
+    for run in runs {
+        for text in activity_text_windows(&run.text) {
+            if !current.is_empty()
+                && (bytes + text.len() > ACTIVITY_TILE_BYTES
+                    || current.len() >= ACTIVITY_TILE_NODES)
+            {
+                windows.push(std::mem::take(&mut current));
+                bytes = 0;
+            }
+            bytes += text.len();
+            current.push(md::parser::InlineRun {
+                text,
+                style: run.style.clone(),
+            });
+        }
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
+}
+
+/// Text bytes and structural nodes both matter: thousands of empty list items
+/// are cheap in bytes but expensive in layout. Saturation short-circuits walks.
+fn activity_block_cost(block: &md::parser::Block) -> usize {
+    use md::parser::Block;
+    let runs = |runs: &[md::parser::InlineRun]| {
+        runs.iter()
+            .map(|run| {
+                run.text
+                    .len()
+                    .max(ACTIVITY_TILE_BYTES / ACTIVITY_TILE_NODES)
+            })
+            .sum::<usize>()
+    };
+    match block {
+        Block::Paragraph { runs: text } | Block::Heading { runs: text, .. } => runs(text),
+        Block::CodeBlock { code, .. } | Block::DisplayMath { latex: code } => code.len(),
+        Block::BlockQuote { children } => children
+            .iter()
+            .map(activity_block_cost)
+            .map(|cost| cost.max(ACTIVITY_TILE_BYTES / ACTIVITY_TILE_NODES))
+            .sum(),
+        Block::List { items, .. } => items
+            .iter()
+            .map(|item| {
+                item.blocks
+                    .iter()
+                    .map(activity_block_cost)
+                    .sum::<usize>()
+                    .max(ACTIVITY_TILE_BYTES / ACTIVITY_TILE_NODES)
+            })
+            .sum(),
+        Block::Table { header, rows, .. } => header
+            .iter()
+            .chain(rows.iter().flatten())
+            .map(|cell| runs(cell).max(ACTIVITY_TILE_BYTES / ACTIVITY_TILE_NODES))
+            .sum(),
+        Block::Image { .. } | Block::Rule => ACTIVITY_TILE_BYTES / ACTIVITY_TILE_NODES,
+    }
+}
+
+fn activity_block_tiles(block: md::parser::Block, tiles: &mut Vec<ActivityDetailTile>) {
+    use md::parser::{Block, ListItem};
+    if activity_block_cost(&block) <= ACTIVITY_TILE_BYTES {
+        tiles.push(ActivityDetailTile::Markdown(block));
+        return;
+    }
+    match block {
+        Block::Paragraph { runs } => tiles.extend(
+            activity_runs_windows(runs)
+                .into_iter()
+                .map(|runs| ActivityDetailTile::Markdown(Block::Paragraph { runs })),
+        ),
+        Block::Heading { level, runs } => tiles.extend(
+            activity_runs_windows(runs)
+                .into_iter()
+                .map(|runs| ActivityDetailTile::Markdown(Block::Heading { level, runs })),
+        ),
+        Block::CodeBlock { language, code } => {
+            tiles.extend(activity_text_windows(&code).into_iter().map(|code| {
+                ActivityDetailTile::Markdown(Block::CodeBlock {
+                    language: language.clone(),
+                    code,
+                })
+            }))
+        }
+        // Oversized formulas already use selectable source in the math renderer.
+        Block::DisplayMath { latex } => tiles.extend(
+            activity_text_windows(&latex)
+                .into_iter()
+                .map(|text| ActivityDetailTile::Plain(text.into())),
+        ),
+        Block::BlockQuote { children } => {
+            for child in children {
+                let mut parts = Vec::new();
+                activity_block_tiles(child, &mut parts);
+                tiles.extend(parts.into_iter().map(|part| match part {
+                    ActivityDetailTile::Markdown(block) => {
+                        ActivityDetailTile::Markdown(Block::BlockQuote {
+                            children: vec![block],
+                        })
+                    }
+                    plain => plain,
+                }));
+            }
+        }
+        Block::List {
+            ordered_start,
+            items,
+        } => {
+            for (index, item) in items.into_iter().enumerate() {
+                let mut parts = Vec::new();
+                for child in item.blocks {
+                    activity_block_tiles(child, &mut parts);
+                }
+                for (part_index, part) in parts.into_iter().enumerate() {
+                    tiles.push(match part {
+                        ActivityDetailTile::Markdown(block) => {
+                            ActivityDetailTile::Markdown(Block::List {
+                                ordered_start: ordered_start
+                                    .map(|start| start.saturating_add(index as u64)),
+                                items: vec![ListItem {
+                                    task: if part_index == 0 { item.task } else { None },
+                                    blocks: vec![block],
+                                }],
+                            })
+                        }
+                        plain => plain,
+                    });
+                }
+            }
+        }
+        Block::Table {
+            header,
+            rows,
+            align,
+        } => {
+            // Keep ordinary tables as tables, splitting only their rows.
+            // A single oversized cell/header continues as styled paragraphs,
+            // in row-major order: no text is dropped to keep a grid small.
+            let header_cost = header
+                .iter()
+                .flatten()
+                .map(|run| run.text.len())
+                .sum::<usize>();
+            if header_cost < ACTIVITY_TILE_BYTES / 2 {
+                for row in rows {
+                    let table = Block::Table {
+                        header: header.clone(),
+                        rows: vec![row],
+                        align: align.clone(),
+                    };
+                    if activity_block_cost(&table) <= ACTIVITY_TILE_BYTES {
+                        tiles.push(ActivityDetailTile::Markdown(table));
+                    } else if let Block::Table { header, rows, .. } = table {
+                        for cell in header.into_iter().chain(rows.into_iter().flatten()) {
+                            activity_block_tiles(Block::Paragraph { runs: cell }, tiles);
+                        }
+                    }
+                }
+            } else {
+                for cell in header.into_iter().chain(rows.into_iter().flatten()) {
+                    activity_block_tiles(Block::Paragraph { runs: cell }, tiles);
+                }
+            }
+        }
+        // Images are a single bounded layout element, even with a data URL.
+        block => tiles.push(ActivityDetailTile::Markdown(block)),
+    }
+}
+
 fn activity_section_cache_key(id: Uuid, section_kind: ActivityDisclosureSectionKind) -> Uuid {
     let salt: u128 = match section_kind {
         ActivityDisclosureSectionKind::Output => 0,
@@ -204,7 +556,9 @@ impl Waku {
             self.transcript_control_focus(format!("user-message-action-{message_id}"), cx)
         });
         let any_focused = copy.is_focused(window)
-            || fork.as_ref().is_some_and(|handle| handle.is_focused(window))
+            || fork
+                .as_ref()
+                .is_some_and(|handle| handle.is_focused(window))
             || rewind
                 .as_ref()
                 .is_some_and(|handle| handle.is_focused(window));
@@ -884,6 +1238,180 @@ impl ConversationNavigationRail {
 }
 
 impl Waku {
+    /// Call after applying incoming activity/session state, before notifying.
+    /// A pulse-only notify must not advance this revision.
+    pub(super) fn invalidate_activity_details(&mut self) {
+        self.activity_detail_revision = self.activity_detail_revision.wrapping_add(1);
+    }
+
+    fn prepared_activity_details(
+        &self,
+        activity: &ActivityItem,
+        cx: &mut Context<Self>,
+    ) -> Option<Rc<PreparedActivityDetails>> {
+        let revision = self.activity_detail_revision;
+        let mut entries = self.activity_details.borrow_mut();
+        if let Some(entry) = entries.get_mut(&activity.id)
+            && entry.is_current(activity, revision)
+        {
+            return entry.prepared.clone();
+        }
+        if entries.len() >= ACTIVITY_DETAILS_CACHE_ENTRIES
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.checked_revision)
+                .map(|(id, _)| *id)
+        {
+            entries.remove(&oldest);
+        }
+        let id = activity.id;
+        let source = Arc::new(ActivityDetailSource::capture(activity));
+        entries.insert(
+            id,
+            ActivityDetailsEntry {
+                checked_revision: revision,
+                source: source.clone(),
+                prepared: None,
+            },
+        );
+        drop(entries);
+        cx.spawn(async move |this, cx| {
+            let worker_source = source.clone();
+            let data = cx
+                .background_executor()
+                .spawn(async move { ActivityDetailsData::prepare(&worker_source) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut entries = this.activity_details.borrow_mut();
+                // Source identity is a job generation. An evicted or replaced
+                // entry can never be overwritten by an older worker.
+                if let Some(entry) = entries.get_mut(&id)
+                    && Arc::ptr_eq(&entry.source, &source)
+                {
+                    entry.prepared = Some(Rc::new(data.into_prepared()));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        None
+    }
+
+    fn render_activity_detail_viewport(
+        &self,
+        id: Uuid,
+        details: Rc<PreparedActivityDetails>,
+        section_index: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section = &details.sections[section_index];
+        let state = section.list.clone();
+        let key_state = state.clone();
+        let scrollbar_state = section.scrollbar.clone();
+        let section_kind = section.kind;
+        let focus = self.transcript_control_focus(
+            format!("activity-detail-viewport-{id}-{}", section_kind.id()),
+            cx,
+        );
+        let entity = cx.entity().downgrade();
+        // Only the virtual list's row builder touches Markdown blocks. Parent
+        // pulse renders clone the Rc/ListState, not the source or parsed tree.
+        let rows = list(state.clone(), move |tile_index, _, cx| {
+            entity
+                .upgrade()
+                .map(|entity| {
+                    entity.update(cx, |this, cx| {
+                        let section = &details.sections[section_index];
+                        let theme = Theme::current(cx);
+                        let palette = MarkdownPalette::from_theme(&theme);
+                        let row = format!("activity-{id}-{}-tile-{tile_index}", section_kind.id());
+                        let ctx = this
+                            .markdown_ctx(
+                                row.clone(),
+                                &palette,
+                                this.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
+                                false,
+                            )
+                            .with_math_context_menu(this.menu_handle(format!("{row}-math"), cx));
+                        let tile = &section.tiles[tile_index];
+                        let content = match tile {
+                            ActivityDetailTile::Markdown(block) => {
+                                let mut views = section.views.borrow_mut();
+                                // Flatten caches are also bounded as the user scrolls.
+                                if views.len() > 64 {
+                                    views.retain(|index, _| index.abs_diff(tile_index) < 32);
+                                }
+                                let view = views.entry(tile_index).or_default();
+                                md::render::markdown_blocks(view, std::slice::from_ref(block), &ctx)
+                                    .unwrap_or_else(|| div().into_any_element())
+                            }
+                            ActivityDetailTile::Plain(text) => md::render::plain_text(
+                                text.clone(),
+                                md::render::MONO_FAMILY,
+                                FontWeight::NORMAL,
+                                theme.text_secondary,
+                                &ctx,
+                            ),
+                        };
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .min_h(px(20.0))
+                            .pb(px(4.0))
+                            .child(content)
+                            .into_any_element()
+                    })
+                })
+                .unwrap_or_else(|| div().into_any_element())
+        })
+        .size_full();
+        div()
+            .id(SharedString::from(format!(
+                "activity-detail-viewport-{id}-{}",
+                section_kind.id()
+            )))
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .w_full()
+            .min_w_0()
+            // A definite height is necessary for nested list virtualization.
+            .h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+            .relative()
+            .overflow_hidden()
+            // The nested list consumes wheel gestures first; the same gesture
+            // must not also scroll the transcript behind it.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus_visible(|style| style.border_color(theme.accent))
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                window.focus(&focus, cx)
+            })
+            .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "up" => key_state.scroll_by(px(-32.0)),
+                    "down" => key_state.scroll_by(px(32.0)),
+                    "pageup" => key_state.scroll_by(px(-ACTIVITY_SECTION_MAX_HEIGHT * 0.9)),
+                    "pagedown" | "space" => {
+                        key_state.scroll_by(px(ACTIVITY_SECTION_MAX_HEIGHT * 0.9))
+                    }
+                    "home" => key_state.scroll_to(ListOffset {
+                        item_ix: 0,
+                        offset_in_item: Pixels::ZERO,
+                    }),
+                    "end" => key_state.scroll_to_end(),
+                    _ => return,
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(rows)
+            .child(scrollbar::vertical(&state, &scrollbar_state))
+            .into_any_element()
+    }
+
     fn scroll_to_navigation_turn(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
         let row_index = self
             .navigation_turns()
@@ -2482,7 +3010,16 @@ impl Waku {
                     .text_color(theme.text_secondary)
                     .whitespace_normal()
                     .overflow_hidden();
-                for section in sections {
+                // Parsing a large payload is the expensive part of expanding a
+                // card. Prepare it off-thread; until it lands, sections above
+                // the tile budget show a bounded plain-text window instead of
+                // parsing megabytes on the UI thread every frame.
+                let virtualized_details = sections
+                    .iter()
+                    .any(|section| section.content.len() > ACTIVITY_TILE_BYTES)
+                    .then(|| self.prepared_activity_details(activity, cx))
+                    .flatten();
+                for (section_index, section) in sections.into_iter().enumerate() {
                     let section_kind = section.kind;
                     let content = section.content;
                     if matches!(
@@ -2516,8 +3053,11 @@ impl Waku {
                         let copied = self
                             .copied_activity_feedback
                             .contains_key(&(id, section_kind));
-                        let copy_id =
-                            SharedString::from(format!("copy-activity-{}-{}", id, section_kind.id()));
+                        let copy_id = SharedString::from(format!(
+                            "copy-activity-{}-{}",
+                            id,
+                            section_kind.id()
+                        ));
                         let copy_focus = self.transcript_control_focus(copy_id.to_string(), cx);
                         let copy_tooltip = SharedString::from(if copied {
                             tr!("common.copied")
@@ -2582,6 +3122,22 @@ impl Waku {
                     }
                     if !content.is_empty() {
                         let section_cache_key = activity_section_cache_key(id, section_kind);
+                        let markdown_body = activity_section_markdown_body(
+                            activity,
+                            section_kind,
+                            &content,
+                            !plan_steps.is_empty(),
+                        );
+                        let body_len = markdown_body
+                            .as_ref()
+                            .map_or(content.len(), String::len);
+                        // A running command keeps its tail-following viewport;
+                        // every other payload over the tile budget renders
+                        // through the nested virtual list.
+                        let virtualized = body_len > ACTIVITY_TILE_BYTES
+                            && !(activity.kind == ActivityKind::Command
+                                && section_kind == ActivityDisclosureSectionKind::Output
+                                && !activity.complete);
                         if activity.kind == ActivityKind::Plan
                             && matches!(
                                 section_kind,
@@ -2661,6 +3217,51 @@ impl Waku {
                                 );
                             }
                             section_view = section_view.child(checklist);
+                        }
+                        // The task list summarizes progress; a plan's document
+                        // still follows it when the payload holds prose.
+                        if virtualized
+                            && let Some(details) = virtualized_details.as_ref()
+                            && details
+                                .sections
+                                .get(section_index)
+                                .is_some_and(|prepared| prepared.kind == section_kind)
+                        {
+                            section_view =
+                                section_view.child(self.render_activity_detail_viewport(
+                                    id,
+                                    details.clone(),
+                                    section_index,
+                                    theme,
+                                    cx,
+                                ));
+                        } else if virtualized {
+                            let preview = activity_text_windows(&content)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default();
+                            section_view = section_view.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .relative()
+                                    .max_h(px(ACTIVITY_SECTION_MAX_HEIGHT))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .py(px(4.0))
+                                            .pr(px(8.0))
+                                            .child(md::render::plain_text(
+                                                preview,
+                                                md::render::MONO_FAMILY,
+                                                FontWeight::NORMAL,
+                                                theme.text_secondary,
+                                                &ctx,
+                                            )),
+                                    ),
+                            );
                         } else if activity.kind == ActivityKind::Command
                             && section_kind == ActivityDisclosureSectionKind::Output
                         {
@@ -2727,12 +3328,7 @@ impl Waku {
                                         !activity.complete,
                                     )),
                             );
-                        } else if let Some(markdown_body) = activity_section_markdown_body(
-                            activity,
-                            section_kind,
-                            &content,
-                            !plan_steps.is_empty(),
-                        ) {
+                        } else if let Some(markdown_body) = markdown_body {
                             let md_ctx = self
                                 .markdown_ctx(
                                     format!("activity-md-{id}-{}", section_kind.id()),
@@ -3717,5 +4313,41 @@ mod live_reasoning_window_tests {
     fn window_below_the_threshold_keeps_the_cached_start() {
         let content = "a".repeat(LIVE_REASONING_WINDOW_MAX);
         assert_eq!(live_reasoning_window_anchor(7, &content), 7);
+    }
+}
+
+#[cfg(test)]
+mod activity_detail_tests {
+    use super::*;
+
+    fn tool_activity(output: &str) -> ActivityItem {
+        ActivityItem::new(None, ActivityKind::Tool, "Run tool", None, true)
+            .with_output(Some(output.to_owned()))
+    }
+
+    #[test]
+    fn text_windows_stay_on_char_boundaries_and_reassemble_losslessly() {
+        let mut text = String::new();
+        while text.len() < ACTIVITY_TILE_BYTES * 2 + 17 {
+            text.push_str("数据 line\n");
+        }
+        let windows = activity_text_windows(&text);
+        assert!(windows.len() > 1);
+        assert!(
+            windows
+                .iter()
+                .all(|window| window.len() <= ACTIVITY_TILE_BYTES)
+        );
+        assert_eq!(windows.concat(), text);
+    }
+
+    #[test]
+    fn same_length_output_edits_invalidate_the_prepared_snapshot() {
+        let first = tool_activity("alpha");
+        let source = ActivityDetailSource::capture(&first);
+        assert!(source.matches(&first));
+        let edited = tool_activity("bravo");
+        assert_eq!(first.output.as_ref().map(String::len), Some(5));
+        assert!(!source.matches(&edited));
     }
 }

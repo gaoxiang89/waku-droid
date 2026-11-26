@@ -279,6 +279,16 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (!client || phase !== 'connected') {
         throw new Error(translate(localeRef.current, 'errors.daemon_disconnected'))
       }
+      // Preferences can outlive a deleted named account. Never persist that
+      // stale identity while launching with the default account's credentials.
+      if (config) {
+        const settings = await queryClient.fetchQuery({
+          queryKey: daemonKeys.settings(config.address),
+          queryFn: () => loadDaemonSettings(client),
+          staleTime: 60_000,
+        })
+        session = { ...session, account_id: validatedAccountId(settings, session.provider, session.account_id) }
+      }
       const previous = config
         ? queryClient.getQueryData<AgentSession>(
             daemonKeys.session(config.address, session.id),
@@ -462,14 +472,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         } else if (event.event.kind === 'error' && typeof event.event.payload === 'string') {
           entry.lastDriverError = event.event.payload
         } else if (event.event.kind === 'planUsageUpdated') {
-          const cachedSettings = queryClient.getQueryData<DaemonSettings>(
-            daemonKeys.settings(config.address),
-          )
-          const accountId = cachedSettings
-            ? validatedAccountId(cachedSettings, current.provider, current.account_id)
-            : (current.account_id ?? null)
           queryClient.setQueryData<PlanUsage>(
-            daemonKeys.planUsage(config.address, current.provider, accountId),
+            daemonKeys.planUsage(config.address, session.provider, session.account_id ?? null),
             event.event.payload as PlanUsage,
           )
         }
@@ -530,6 +534,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             [session.id]: result.permission ?? undefined,
           }))
         }
+        if (event.event.kind === 'turnFinished') entry.userInputRevision += 1
         if (result.userInput !== undefined) {
           entry.userInputRevision += 1
           setUserInputs((previous) => ({
@@ -1140,7 +1145,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       const key = config && daemonKeys.session(config.address, sessionId)
       if (key) {
         const session = queryClient.getQueryData<AgentSession>(key)
-        if (session) cacheSession({ ...session, status: 'working' })
+        if (session?.status === 'waiting') cacheSession({ ...session, status: 'working' })
       }
     },
     [client, config, queryClient, cacheSession],
@@ -1157,9 +1162,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         sessionId,
         runtime.runtimeId,
       )
-      if (entries.current.get(sessionId) === runtime && runtime.userInputRevision === revision) {
-        setUserInputs((current) => ({ ...current, [sessionId]: undefined }))
-      }
+      // An ack may trail another question, a finished turn or a new runtime.
+      if (entries.current.get(sessionId) !== runtime || runtime.userInputRevision !== revision) return
+      setUserInputs((current) => ({ ...current, [sessionId]: undefined }))
       const key = config && daemonKeys.session(config.address, sessionId)
       if (key) {
         const session = queryClient.getQueryData<AgentSession>(key)

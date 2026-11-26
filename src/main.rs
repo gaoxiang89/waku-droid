@@ -58,6 +58,11 @@ fn main() {
         }
     }
 
+    // Import before GPUI, window preferences, or saved connections are read.
+    if let Err(error) = waku_protocol::identity::import_legacy_user_data() {
+        eprintln!("narel: could not import Waku data; originals are unchanged: {error}");
+        std::process::exit(1);
+    }
     let startup_open = (request.path.is_some() || request.host.is_some()).then_some(request);
     waku::run(startup_open);
 }

@@ -695,6 +695,36 @@ mod tests {
     }
 
     #[test]
+    fn local_bridges_yield_to_discovered_project_and_user_templates() {
+        for scope in [CommandScope::Project, CommandScope::User] {
+            for (provider, prompt, name) in [
+                (ProviderKind::Codex, "/usage", "usage"),
+                (ProviderKind::Antigravity, "/usage", "usage"),
+                (ProviderKind::Antigravity, "/quota", "quota"),
+                (ProviderKind::Droid, "/new", "new"),
+                (ProviderKind::Droid, "/clear", "clear"),
+                (ProviderKind::Droid, "/model custom", "model"),
+                (ProviderKind::Droid, "/autonomy normal", "autonomy"),
+            ] {
+                let mut template = command(name, scope);
+                template.template = Some("Account-local template $ARGUMENTS".into());
+                let commands = [template];
+                assert!(!is_codex_usage_submission(provider, prompt, &commands));
+                assert_eq!(
+                    parse_antigravity_local_command(provider, prompt, &commands),
+                    None
+                );
+                assert_eq!(parse_droid_local_command(provider, prompt, &commands), None);
+                assert!(
+                    resolved_submission(provider, prompt, &commands)
+                        .unwrap()
+                        .starts_with("Account-local template")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn codex_usage_respects_provider_arguments_and_overrides() {
         let builtin = command("usage", CommandScope::Builtin);
         assert!(is_codex_usage_submission(
@@ -784,8 +814,9 @@ mod tests {
             command("effort", CommandScope::Builtin),
             command("swarm", CommandScope::Builtin),
         ];
-        let parse =
-            |prompt: &str| parse_antigravity_local_command(ProviderKind::Antigravity, prompt, &builtins);
+        let parse = |prompt: &str| {
+            parse_antigravity_local_command(ProviderKind::Antigravity, prompt, &builtins)
+        };
 
         assert_eq!(parse("/usage"), Some(AntigravityLocalCommand::Usage));
         assert_eq!(parse("  /usage  "), Some(AntigravityLocalCommand::Usage));
@@ -1090,7 +1121,11 @@ mod tests {
         let mut project = command("model", CommandScope::Project);
         project.template = Some("custom model prompt".into());
         assert_eq!(
-            parse_droid_local_command(ProviderKind::Droid, "/model", std::slice::from_ref(&project)),
+            parse_droid_local_command(
+                ProviderKind::Droid,
+                "/model",
+                std::slice::from_ref(&project)
+            ),
             None
         );
 

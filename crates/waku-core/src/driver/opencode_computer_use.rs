@@ -19,7 +19,9 @@ use crate::driver::DriverEventSender;
 use crate::opencode_api;
 use crate::opencode_service::OpenCodeService;
 
-pub(super) const INSTRUCTION_KEY: &str = "narel-computer-use";
+// Persisted in existing provider sessions, not a display/product name. Keep
+// this key stable so resuming after the rename replaces Waku's old entry.
+pub(super) const INSTRUCTION_KEY: &str = "waku-computer-use";
 
 pub(super) fn tool_identity(name: &str) -> Option<(&str, &str)> {
     let (server, tool) = name
@@ -296,10 +298,7 @@ mod tests {
         if content_length > 0 {
             reader.read_exact(&mut body).unwrap();
         }
-        (
-            request_line,
-            String::from_utf8_lossy(&body).into_owned(),
-        )
+        (request_line, String::from_utf8_lossy(&body).into_owned())
     }
 
     fn write_json(socket: &mut std::net::TcpStream, status: &str, body: &Value) {
@@ -346,9 +345,11 @@ mod tests {
                         .to_owned();
                     server_puts.fetch_add(1, Ordering::SeqCst);
                     server_registered.lock().push(name);
-                    let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                    let _ =
+                        socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
                 } else if request_line.starts_with("DELETE /api/experimental/mcp/") {
-                    let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                    let _ =
+                        socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
                 }
             }
         });
@@ -466,7 +467,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("background cleanup should still issue DELETE");
         assert!(
-            request.starts_with("DELETE /api/experimental/mcp/narel_js_repl_0123456789abcdef0123456789abcdef"),
+            request.starts_with(
+                "DELETE /api/experimental/mcp/narel_js_repl_0123456789abcdef0123456789abcdef"
+            ),
             "{request}"
         );
 

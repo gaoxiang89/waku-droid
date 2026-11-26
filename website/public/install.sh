@@ -2,24 +2,28 @@
 set -eu
 
 # Installs Narel for Linux into ~/.local — no root, no package manager.
-# Downloads the release tarball from https://releases.waku.sh, unpacks it as
+# Installs a locally built Narel tarball, unpacks it as
 # ~/.local/narel.app, links the binary onto PATH, and registers the desktop
 # entry. docs/linux.md documents the equivalent manual steps.
 #
-#   curl -fsSL https://waku.sh/install.sh | sh
+#   WAKU_BUNDLE_PATH=target/release/narel-<version>-<target>.tar.gz sh website/public/install.sh
 #
 # Environment:
 #   WAKU_VERSION        install this version instead of the latest
 #   WAKU_BUNDLE_PATH    install a local tarball instead of downloading
-#   WAKU_RELEASES_URL   base URL to download from
+#   WAKU_RELEASES_URL   optional custom Narel release server (no public default)
 
 usage() {
     cat <<'USAGE'
 Install Narel for Linux into ~/.local.
 
 Usage:
-  curl -fsSL https://waku.sh/install.sh | sh
-  curl -fsSL https://waku.sh/install.sh | sh -s -- --uninstall
+  WAKU_BUNDLE_PATH=/path/to/narel-<version>-<target>.tar.gz sh website/public/install.sh
+  sh website/public/install.sh --uninstall
+
+This fork does not publish Linux desktop archives. Build with
+./scripts/bundle-linux.sh first. Upstream Waku archives are not Narel builds.
+WAKU_RELEASES_URL may explicitly select a custom Narel release server.
 
 Options:
   --uninstall   Remove Narel, leaving ~/.narel (projects and settings) alone
@@ -31,7 +35,7 @@ main() {
     app_dir="$HOME/.local/narel.app"
     bin_link="$HOME/.local/bin/narel"
     desktop_file="$HOME/.local/share/applications/sh.narel.desktop"
-    releases="${WAKU_RELEASES_URL:-https://releases.waku.sh}"
+    releases="${WAKU_RELEASES_URL:-}"
 
     case "${1:-}" in
         --uninstall) uninstall; return ;;
@@ -44,10 +48,16 @@ main() {
             ;;
     esac
 
+    if [ -z "${WAKU_BUNDLE_PATH:-}" ] && [ -z "$releases" ]; then
+        echo "This fork does not publish Narel Linux desktop downloads." >&2
+        echo "Build ./scripts/bundle-linux.sh, then set WAKU_BUNDLE_PATH to its tarball." >&2
+        echo "See docs/linux.md. Upstream releases.waku.sh serves Waku, not Narel." >&2
+        exit 1
+    fi
+
     platform="$(uname -s)"
     if [ "$platform" = "Darwin" ]; then
-        echo "Waku for macOS ships as a signed .dmg that updates itself." >&2
-        echo "Download it from https://waku.sh" >&2
+        echo "This installer supports Linux only; see the fork's source build instructions." >&2
         exit 1
     fi
     if [ "$platform" != "Linux" ]; then
@@ -61,12 +71,14 @@ main() {
         aarch64 | arm64) target="aarch64-unknown-linux-gnu" ;;
         *)
             echo "Unsupported architecture: $machine" >&2
-            echo "Build from source: https://github.com/egoist/waku" >&2
+            echo "Build from source: https://github.com/gaoxiang89/waku-droid" >&2
             exit 1
             ;;
     esac
 
-    if command -v curl >/dev/null 2>&1; then
+    if [ -n "${WAKU_BUNDLE_PATH:-}" ]; then
+        : # Local bundles do not require a download utility.
+    elif command -v curl >/dev/null 2>&1; then
         fetch() { command curl -fsSL "$1"; }
     elif command -v wget >/dev/null 2>&1; then
         fetch() { wget -qO- "$1"; }

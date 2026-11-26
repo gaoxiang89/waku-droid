@@ -278,22 +278,22 @@ fn ssh_target_from_fields(
     } else {
         SshAuthMethod::Agent
     };
-    let target =
-        if user.is_none() && port.is_none() && identity.is_empty() && proxy_jump.is_empty() {
-            SshTarget::ConfigHost {
-                host: hostname,
-                auth_method,
-            }
-        } else {
-            SshTarget::Direct {
-                hostname,
-                port,
-                user,
-                identity_file: (!identity.is_empty()).then(|| identity.to_owned()),
-                auth_method,
-                proxy_jump: (!proxy_jump.is_empty()).then(|| proxy_jump.to_owned()),
-            }
-        };
+    let target = if user.is_none() && port.is_none() && identity.is_empty() && proxy_jump.is_empty()
+    {
+        SshTarget::ConfigHost {
+            host: hostname,
+            auth_method,
+        }
+    } else {
+        SshTarget::Direct {
+            hostname,
+            port,
+            user,
+            identity_file: (!identity.is_empty()).then(|| identity.to_owned()),
+            auth_method,
+            proxy_jump: (!proxy_jump.is_empty()).then(|| proxy_jump.to_owned()),
+        }
+    };
     // Reuse the transport's own validation so the form rejects exactly what
     // ssh would be handed.
     waku_client::remote::ssh::base_args(&target)?;
@@ -407,9 +407,7 @@ impl Waku {
             .cloned()
             .unwrap_or_else(|| Connection::wsl(&distro));
         if !self.connections.startup_loaded {
-            self.connections
-                .local_removed_ids
-                .remove(&connection.id);
+            self.connections.local_removed_ids.remove(&connection.id);
             self.connections
                 .local_upserted_ids
                 .insert(connection.id.clone());
@@ -491,10 +489,9 @@ impl Waku {
                             let existing_disconnected =
                                 existing_key != waku_client::hosts::HostKey::Local
                                     && (this.host_disconnected.contains(&existing_key)
-                                        || this
-                                            .hosts
-                                            .get(&existing_key)
-                                            .is_some_and(|existing| existing.daemon.is_disconnected()));
+                                        || this.hosts.get(&existing_key).is_some_and(|existing| {
+                                            existing.daemon.is_disconnected()
+                                        }));
                             if existing_disconnected {
                                 this.replace_disconnected_host(
                                     &existing_key,

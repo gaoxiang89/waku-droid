@@ -5,6 +5,7 @@ import {
   type ProviderKind,
 } from '@waku/client'
 import { PROVIDERS } from '@/components/waku-icon'
+import { normalizeUsageHistory } from '@/lib/usage-history'
 import { useDaemon } from '@/lib/daemon-context'
 import {
   daemonKeys,
@@ -233,7 +234,7 @@ export function useProviderProbes(
   return collectProviderQueries(queries)
 }
 
-export function useProviderDetections(enabled = true) {
+export function useProviderDetections(enabled = true, providers?: readonly ProviderKind[]) {
   const { client, config, phase } = useDaemon()
   const settings = useDaemonSettings()
   const active = enabled && phase === 'connected' && Boolean(client && config && settings.data)
@@ -244,7 +245,8 @@ export function useProviderDetections(enabled = true) {
         discoverModels: false,
         probeVersion: false,
       }),
-      enabled: active,
+      enabled: active && (!providers || providers.includes(id))
+        && !settings.data?.disabled_providers.includes(id),
       staleTime: 60_000,
     })),
   })
@@ -270,6 +272,7 @@ export function useUsageHistory(
     queryFn: () => loadUsageHistory(requireClient(client), window, projects),
     enabled: phase === 'connected' && Boolean(client && config),
     placeholderData: (previous) => previous,
+    select: normalizeUsageHistory,
   })
 }
 

@@ -318,9 +318,7 @@ mod tests {
         assert_eq!(owners.project(local.id), HostKey::Local);
     }
 
-    fn spawn_mock_daemon_server(
-        connections: usize,
-    ) -> (String, std::thread::JoinHandle<()>) {
+    fn spawn_mock_daemon_server(connections: usize) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = std::thread::spawn(move || {
@@ -395,12 +393,19 @@ mod tests {
             ComposerDraftStore::remote(sup_local.clone()),
             &PersistedState::empty(),
         );
-        registry.hosts.push(Host::new(key_a.clone(), "LAN".into(), sup_a.clone()));
-        registry.hosts.push(Host::new(key_c.clone(), "Other".into(), sup_c.clone()));
+        registry
+            .hosts
+            .push(Host::new(key_a.clone(), "LAN".into(), sup_a.clone()));
+        registry
+            .hosts
+            .push(Host::new(key_c.clone(), "Other".into(), sup_c.clone()));
 
         // Same daemon identity on empty host matches existing host and excludes self.
         let id_b = sup_b.daemon_identity().unwrap();
-        assert_eq!(registry.find_same_daemon(&key_b, &id_b), Some(key_a.clone()));
+        assert_eq!(
+            registry.find_same_daemon(&key_b, &id_b),
+            Some(key_a.clone())
+        );
         assert_eq!(registry.find_same_daemon(&key_a, &id_b), None);
         assert_eq!(
             registry.find_duplicate_host(&key_b, Some(&id_b), &[], &[]),
@@ -410,9 +415,11 @@ mod tests {
         // Distinct hosts with identical directory paths but fresh UUIDs do not collide.
         let proj_a = Project::from_path("/workspace/repo".into());
         let sess_a = AgentSession::new(proj_a.id, ProviderKind::Codex);
-        registry
-            .ownership
-            .register(&key_a, std::slice::from_ref(&proj_a), std::slice::from_ref(&sess_a));
+        registry.ownership.register(
+            &key_a,
+            std::slice::from_ref(&proj_a),
+            std::slice::from_ref(&sess_a),
+        );
 
         let proj_other = Project::from_path("/workspace/repo".into());
         let sess_other = AgentSession::new(proj_other.id, ProviderKind::Codex);

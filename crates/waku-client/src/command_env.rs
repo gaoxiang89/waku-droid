@@ -282,7 +282,10 @@ mod tests {
         let entries: Vec<PathBuf> = std::env::split_paths(&search_path).collect();
         let mut seen = HashSet::new();
         for entry in &entries {
-            assert!(seen.insert(entry.clone()), "duplicate PATH entry: {entry:?}");
+            assert!(
+                seen.insert(entry.clone()),
+                "duplicate PATH entry: {entry:?}"
+            );
         }
         for directory in system_tool_directories() {
             assert!(
@@ -313,7 +316,8 @@ mod tests {
             .expect("System32 directory missing");
         assert!(openssh_index < system32_index);
 
-        if let Some(system_root) = std::env::var_os("SystemRoot").filter(|value| !value.is_empty()) {
+        if let Some(system_root) = std::env::var_os("SystemRoot").filter(|value| !value.is_empty())
+        {
             let live_directories = system_tool_directories();
             let live_system32 = PathBuf::from(system_root).join("System32");
             let live_openssh = live_system32.join("OpenSSH");
