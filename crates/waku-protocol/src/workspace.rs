@@ -200,6 +200,9 @@ pub enum WorkspaceOperation {
         #[ts(type = "string")]
         relative_path: PathBuf,
         overwrite: bool,
+        /// Replace an existing directory at the destination; only for a top-level item the user confirmed.
+        #[serde(default)]
+        replace_directory: bool,
     },
     RenamePath {
         #[ts(type = "string")]

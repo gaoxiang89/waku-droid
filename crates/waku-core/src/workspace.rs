@@ -183,8 +183,15 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             temp_relative_path,
             relative_path,
             overwrite,
+            replace_directory,
         } => {
-            commit_file_upload(&root, &temp_relative_path, &relative_path, overwrite)?;
+            commit_file_upload(
+                &root,
+                &temp_relative_path,
+                &relative_path,
+                overwrite,
+                replace_directory,
+            )?;
             WorkspaceResult::Ack
         }
         WorkspaceOperation::RenamePath {
@@ -759,6 +766,7 @@ fn commit_file_upload(
     temp_relative: &Path,
     relative: &Path,
     overwrite: bool,
+    replace_directory: bool,
 ) -> anyhow::Result<()> {
     let temp = resolve_non_symlink_parents(root, temp_relative)?;
     let path = resolve_non_symlink_parents(root, relative)?;
@@ -776,8 +784,14 @@ fn commit_file_upload(
     }
     match fs::symlink_metadata(&path) {
         Ok(_) if !overwrite => bail!("{} already exists", path.display()),
-        Ok(m) if m.file_type().is_dir() => fs::remove_dir_all(&path)
-            .with_context(|| format!("could not remove directory {}", path.display()))?,
+        Ok(m) if m.file_type().is_dir() => {
+            if replace_directory {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("could not remove directory {}", path.display()))?;
+            } else {
+                bail!("{} is a folder and was not replaced", path.display());
+            }
+        }
         Ok(m) if m.file_type().is_symlink() => remove_non_dir(&path, &m)?,
         Ok(m) => {
             // keep e.g. the executable bit
@@ -2279,6 +2293,7 @@ mod tests {
                 temp_relative_path: temp_a.clone(),
                 relative_path: PathBuf::from("data.txt"),
                 overwrite: false,
+                replace_directory: false,
             })
             .is_err()
         );
@@ -2290,6 +2305,7 @@ mod tests {
             temp_relative_path: temp_a.clone(),
             relative_path: PathBuf::from("data.txt"),
             overwrite: true,
+            replace_directory: false,
         })
         .unwrap();
         assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"new-content");
@@ -2309,6 +2325,7 @@ mod tests {
             temp_relative_path: temp_b.clone(),
             relative_path: PathBuf::from("nested/a.txt"),
             overwrite: false,
+            replace_directory: false,
         })
         .unwrap();
         assert_eq!(fs::read(root.join("nested/a.txt")).unwrap(), b"fresh");
@@ -2340,6 +2357,7 @@ mod tests {
                 temp_relative_path: temp_other,
                 relative_path: PathBuf::from("nested/a.txt"),
                 overwrite: true,
+                replace_directory: false,
             })
             .is_err()
         );
@@ -2351,6 +2369,7 @@ mod tests {
                 temp_relative_path: PathBuf::from("plain.txt"),
                 relative_path: PathBuf::from("renamed.txt"),
                 overwrite: true,
+                replace_directory: false,
             })
             .is_err()
         );
@@ -2370,10 +2389,46 @@ mod tests {
             temp_relative_path: temp_dir_replace,
             relative_path: PathBuf::from("dir_target"),
             overwrite: true,
+            replace_directory: true,
         })
         .unwrap();
         assert!(root.join("dir_target").is_file());
         assert_eq!(fs::read(root.join("dir_target")).unwrap(), b"replaced-dir");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_file_upload_preserves_directory_when_replace_directory_is_false() {
+        let root = std::env::temp_dir().join(format!("waku-commit-dir-guard-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("nested/dir_target")).unwrap();
+        fs::write(root.join("nested/dir_target/inner.txt"), b"keep-inside").unwrap();
+
+        let temp = PathBuf::from(format!("nested/{UPLOAD_TEMP_PREFIX}e{UPLOAD_TEMP_SUFFIX}"));
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp.clone(),
+            offset: 0,
+            bytes: encode_chunk(b"would-clobber"),
+            overwrite: false,
+        })
+        .unwrap();
+
+        let err = execute(WorkspaceOperation::CommitFileUpload {
+            root: root.clone(),
+            temp_relative_path: temp.clone(),
+            relative_path: PathBuf::from("nested/dir_target"),
+            overwrite: true,
+            replace_directory: false,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("is a folder and was not replaced"));
+        assert!(root.join("nested/dir_target").is_dir());
+        assert_eq!(
+            fs::read(root.join("nested/dir_target/inner.txt")).unwrap(),
+            b"keep-inside"
+        );
+        assert!(root.join(&temp).is_file());
 
         fs::remove_dir_all(root).unwrap();
     }

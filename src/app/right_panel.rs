@@ -1809,6 +1809,7 @@ enum PlannedUploadOp {
         rpc_rel: PathBuf,
         size: u64,
         overwrite: bool,
+        replace_directory: bool,
     },
 }
 
@@ -1988,7 +1989,7 @@ fn collect_directory_upload_ops(
         if file_type.is_dir() {
             ops.push(PlannedUploadOp::EnsureDir {
                 rpc_rel: PathBuf::from(&child_rel),
-                overwrite,
+                overwrite: false,
             });
             collect_directory_upload_ops(
                 &child_path,
@@ -2011,6 +2012,7 @@ fn collect_directory_upload_ops(
                 rpc_rel: PathBuf::from(&child_rel),
                 size,
                 overwrite,
+                replace_directory: false,
             });
         }
     }
@@ -2050,6 +2052,7 @@ fn build_upload_plan(
                 rpc_rel: candidate.rpc_rel.clone(),
                 size,
                 overwrite: overwrite_top_level,
+                replace_directory: overwrite_top_level,
             });
         }
     }
@@ -2124,12 +2127,14 @@ fn commit_uploaded_file(
     temp_rel: PathBuf,
     rpc_rel: PathBuf,
     overwrite: bool,
+    replace_directory: bool,
 ) -> anyhow::Result<()> {
     match workspace.request(waku_client::WorkspaceOperation::CommitFileUpload {
         root: project_path,
         temp_relative_path: temp_rel,
         relative_path: rpc_rel,
         overwrite,
+        replace_directory,
     })? {
         waku_client::WorkspaceResult::Ack => Ok(()),
         _ => anyhow::bail!("the daemon returned an invalid upload response"),
@@ -3355,12 +3360,14 @@ mod tests {
             rpc_rel: expected_rel("bundle/nested/hello.txt"),
             size: 5,
             overwrite: false,
+            replace_directory: false,
         }));
         assert!(plan.ops.contains(&PlannedUploadOp::WriteFile {
             local_path: external.join("bundle/root.bin"),
             rpc_rel: expected_rel("bundle/root.bin"),
             size: 7,
             overwrite: false,
+            replace_directory: false,
         }));
         if symlink_created {
             assert!(!plan.ops.iter().any(|op| match op {
@@ -3388,9 +3395,24 @@ mod tests {
 
         let overwrite_plan = build_upload_plan(&candidates, sep, true).unwrap();
         assert!(overwrite_plan.ops.iter().all(|op| match op {
-            PlannedUploadOp::EnsureDir { overwrite, .. } => *overwrite,
-            PlannedUploadOp::WriteFile { overwrite, .. } => *overwrite,
+            PlannedUploadOp::EnsureDir { rpc_rel, overwrite } => {
+                *overwrite == (*rpc_rel == expected_rel("bundle"))
+            }
+            PlannedUploadOp::WriteFile {
+                overwrite,
+                replace_directory,
+                ..
+            } => *overwrite && !*replace_directory,
         }));
+        let top_level_file_overwrite = build_upload_plan(&deduped, sep, true).unwrap();
+        assert!(matches!(
+            top_level_file_overwrite.ops.as_slice(),
+            [PlannedUploadOp::WriteFile {
+                overwrite: true,
+                replace_directory: true,
+                ..
+            }]
+        ));
 
         let mut posix_expanded = HashSet::new();
         expand_workspace_directory_and_ancestors(
@@ -7915,6 +7937,7 @@ impl Waku {
                         rpc_rel,
                         size,
                         overwrite,
+                        replace_directory,
                     } => {
                         let temp_rel = upload_temp_relative_path(&rpc_rel);
                         let mut file_offset: u64 = 0;
@@ -7994,6 +8017,7 @@ impl Waku {
                                         temp_rel,
                                         rpc_rel,
                                         overwrite,
+                                        replace_directory,
                                     )
                                 }
                             })
