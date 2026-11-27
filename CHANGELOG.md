@@ -14,6 +14,12 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.62]
+
+- Keep every pending approval and question from an agent answerable at once: parallel permission requests and elicitation forms queue per session instead of replacing each other, each answer reaches the session and request it belongs to, and the session keeps its waiting state until the queue is empty
+- Validate the agent's initialize handshake before trusting its capabilities, gate prompts during startup and lost-session recovery, and reapply Antigravity's access mode after a reconnect
+- Maximize and restore the bottom terminal panel from its header button, the View menu, the command palette, or `Shift+Esc`, expanding it across the workspace area while keeping the sidebar and top bar accessible
+
 ## [0.1.61]
 
 - Maximize and restore the bottom terminal panel from its header button, the View menu, the command palette, or `Shift+Esc`, expanding it across the workspace area while keeping the sidebar and top bar accessible
