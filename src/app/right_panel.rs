@@ -6590,6 +6590,7 @@ impl Waku {
                 reading: false,
                 read_epoch: 0,
                 pending_goto,
+                overwrite_on_next_save: false,
             },
         );
 
@@ -6716,6 +6717,7 @@ impl Waku {
                 editor.disk_content = content.clone();
                 editor.writable = writable;
                 editor.dirty = false;
+                editor.overwrite_on_next_save = false;
                 let pending_goto = editor.pending_goto;
                 let state = editor.state.clone();
                 state.update(cx, |state, cx| {
@@ -7052,6 +7054,13 @@ impl Waku {
         }
 
         let content = editor.state.read(cx).content().to_owned();
+        let expected_fingerprint = if editor.overwrite_on_next_save {
+            None
+        } else {
+            Some(waku_client::workspace::text_fingerprint(
+                &editor.disk_content,
+            ))
+        };
         let Some(session_id) = self.state.selected_session else {
             return;
         };
@@ -7075,6 +7084,7 @@ impl Waku {
                             root: project_path,
                             relative_path: PathBuf::from(relative_path),
                             content,
+                            expected_fingerprint,
                         })? {
                             waku_client::WorkspaceResult::Ack => Ok(()),
                             _ => anyhow::bail!("the daemon returned an invalid file response"),
@@ -7098,13 +7108,27 @@ impl Waku {
                             let current = editor.state.read(cx).content();
                             editor.disk_content = content.clone();
                             editor.dirty = current != content;
+                            editor.overwrite_on_next_save = false;
                         }
                     }
-                    Err(error) => waku.show_toast(tr!(
-                        "files.could_not_save",
-                        path = relative_path,
-                        error = error.to_string()
-                    )),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains(waku_client::workspace::TEXT_FILE_CONFLICT_ERROR) {
+                            if let Some(editor) =
+                                waku.right_panel_file_editors.get_mut(&relative_path)
+                                && editor.read_epoch == epoch
+                            {
+                                editor.overwrite_on_next_save = true;
+                            }
+                            waku.show_toast(tr!("files.save_conflict", path = relative_path));
+                        } else {
+                            waku.show_toast(tr!(
+                                "files.could_not_save",
+                                path = relative_path,
+                                error = message
+                            ));
+                        }
+                    }
                 }
                 cx.notify();
             });

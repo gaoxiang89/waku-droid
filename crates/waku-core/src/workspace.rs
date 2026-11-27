@@ -10,7 +10,10 @@ use std::process::Output;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
-use waku_protocol::workspace::{DownloadDirectoryEntry, UPLOAD_TEMP_PREFIX, UPLOAD_TEMP_SUFFIX};
+use waku_protocol::workspace::{
+    DownloadDirectoryEntry, TEXT_FILE_CONFLICT_ERROR, UPLOAD_TEMP_PREFIX, UPLOAD_TEMP_SUFFIX,
+    text_fingerprint,
+};
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 /// One chunk of a streamed file download, before base64. The 4/3 inflation
@@ -114,8 +117,13 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             root,
             relative_path,
             content,
+            expected_fingerprint,
         } => {
-            fs::write(resolve_workspace_path(&root, &relative_path)?, content)?;
+            write_text_file(
+                &resolve_workspace_path(&root, &relative_path)?,
+                &content,
+                expected_fingerprint.as_deref(),
+            )?;
             WorkspaceResult::Ack
         }
         WorkspaceOperation::ReadFileChunk {
@@ -535,6 +543,49 @@ fn read_editable_text(path: &Path) -> anyhow::Result<String> {
     }
 
     String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8 text", path.display()))
+}
+
+fn write_text_file(path: &Path, content: &str, expected: Option<&str>) -> anyhow::Result<()> {
+    if let Some(expected) = expected {
+        match fs::read(path) {
+            Ok(bytes) => {
+                let matches = std::str::from_utf8(&bytes)
+                    .is_ok_and(|current| text_fingerprint(current) == expected);
+                if !matches {
+                    bail!("{TEXT_FILE_CONFLICT_ERROR}: {}", path.display());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{TEXT_FILE_CONFLICT_ERROR}: {}", path.display());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not read file {}", path.display()));
+            }
+        }
+    }
+
+    // Resolve symlinks to their target so atomic rename updates the target
+    // rather than replacing the link itself.
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let parent = real
+        .parent()
+        .ok_or_else(|| anyhow!("cannot save file without a parent directory: {}", real.display()))?;
+    let temp = parent.join(format!(".narel-save-{}.tmp", uuid::Uuid::new_v4()));
+
+    if let Err(error) = fs::write(&temp, content) {
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("could not write temporary file {}", temp.display()));
+    }
+    if let Ok(metadata) = fs::metadata(&real) {
+        let _ = fs::set_permissions(&temp, metadata.permissions());
+    }
+    if fs::rename(&temp, &real).is_err() {
+        let _ = fs::remove_file(&temp);
+        fs::write(&real, content)
+            .with_context(|| format!("could not write file {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn read_file_chunk(
@@ -2392,6 +2443,112 @@ mod tests {
             fs::read_to_string(outside.join("keep.txt")).unwrap(),
             "keep"
         );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn write_text_file_checks_fingerprint_and_cleans_up_temp_files() {
+        let root = std::env::temp_dir().join(format!("waku-write-text-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("note.txt");
+        fs::write(&file, "initial").unwrap();
+        let initial_fp = text_fingerprint("initial");
+
+        // (a) Matching fingerprint writes.
+        execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("note.txt"),
+            content: "updated".to_owned(),
+            expected_fingerprint: Some(initial_fp.clone()),
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
+
+        // (b) Stale fingerprint returns TEXT_FILE_CONFLICT_ERROR and leaves file unchanged.
+        let err = execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("note.txt"),
+            content: "clobbered".to_owned(),
+            expected_fingerprint: Some(initial_fp),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(TEXT_FILE_CONFLICT_ERROR), "{err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
+
+        // Missing file with expected fingerprint also triggers conflict error.
+        let missing_err = execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("missing.txt"),
+            content: "new".to_owned(),
+            expected_fingerprint: Some(text_fingerprint("")),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(missing_err.contains(TEXT_FILE_CONFLICT_ERROR), "{missing_err}");
+
+        // Non-UTF-8 file on disk with expected fingerprint is treated as a mismatch.
+        fs::write(root.join("nonutf8.txt"), [0xff, 0xfe, b'a']).unwrap();
+        let nonutf8_err = execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("nonutf8.txt"),
+            content: "utf8".to_owned(),
+            expected_fingerprint: Some(text_fingerprint("\u{fffd}\u{fffd}a")),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(nonutf8_err.contains(TEXT_FILE_CONFLICT_ERROR), "{nonutf8_err}");
+
+        // (c) None overwrites unconditionally.
+        execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("note.txt"),
+            content: "forced".to_owned(),
+            expected_fingerprint: None,
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "forced");
+
+        // (d) No .narel-save- files are left behind.
+        let leftover_temps = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".narel-save-"))
+            .count();
+        assert_eq!(leftover_temps, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_text_file_through_symlink_updates_target_and_preserves_link() {
+        let root = std::env::temp_dir().join(format!("waku-write-symlink-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("waku-write-target-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target.txt");
+        let link = root.join("link.txt");
+        fs::write(&target, "before").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        execute(WorkspaceOperation::WriteTextFile {
+            root: root.clone(),
+            relative_path: PathBuf::from("link.txt"),
+            content: "after".to_owned(),
+            expected_fingerprint: Some(text_fingerprint("before")),
+        })
+        .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "after");
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();

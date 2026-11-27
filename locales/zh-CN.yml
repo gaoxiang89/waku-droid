@@ -1024,6 +1024,7 @@ files.unable_to_edit: "无法编辑此文件：%{error}"
 files.could_not_save_opening: "无法保存 %{path}：文件仍在打开"
 files.could_not_save_read_only: "无法保存 %{path}：文件不可编辑"
 files.could_not_save: "无法保存 %{path}：%{error}"
+files.save_conflict: "%{path} 在打开后已在磁盘上被修改。再次保存将覆盖它。"
 files.download: 下载…
 files.download_to: 选择文件夹的保存位置
 files.download_saved: "已将 %{name} 保存到 %{path}"

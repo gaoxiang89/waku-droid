@@ -2089,6 +2089,8 @@ files.could_not_save_read_only:
   en: "Could not save %{path}: file is not editable"
 files.could_not_save:
   en: "Could not save %{path}: %{error}"
+files.save_conflict:
+  en: "%{path} changed on disk since it was opened. Save again to overwrite it."
 files.download:
   en: Download…
 files.download_to:

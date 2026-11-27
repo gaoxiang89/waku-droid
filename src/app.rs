@@ -826,6 +826,9 @@ struct RightPanelFileEditor {
     /// Line and optional column to select and scroll into view once the file
     /// content and layout are ready.
     pending_goto: Option<(usize, Option<usize>)>,
+    /// Set after a save fails with `TEXT_FILE_CONFLICT_ERROR` so the user's next
+    /// save explicitly overwrites the external edit.
+    overwrite_on_next_save: bool,
 }
 
 /// The identity panels hang off: a directory on a host. Sessions opened into

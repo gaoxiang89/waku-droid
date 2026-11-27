@@ -1067,6 +1067,7 @@ files.unable_to_edit: "このファイルを編集できません：%{error}"
 files.could_not_save_opening: "%{path} を保存できませんでした：まだ開いています"
 files.could_not_save_read_only: "%{path} を保存できませんでした：このファイルは編集できません"
 files.could_not_save: "%{path} を保存できませんでした：%{error}"
+files.save_conflict: "%{path} は開いた後にディスク上で変更されました。もう一度保存すると上書きします。"
 files.download: ダウンロード…
 files.download_to: フォルダーの保存先を選択
 files.download_saved: "%{name} を %{path} に保存しました"

@@ -19,6 +19,21 @@ pub const UPLOAD_TEMP_PREFIX: &str = ".narel-upload-";
 /// `CommitFileUpload` moves it onto its destination.
 pub const UPLOAD_TEMP_SUFFIX: &str = ".partial";
 
+/// Error substring returned when `WriteTextFile` detects that the file on disk
+/// no longer matches the fingerprint of the content the editor loaded.
+pub const TEXT_FILE_CONFLICT_ERROR: &str = "the file changed on disk since it was opened";
+
+/// Computes a stable content fingerprint (FNV-1a 64 over UTF-8 bytes) formatted
+/// as `<byte_len>:<hex_hash>` for detecting external edits before saving.
+pub fn text_fingerprint(content: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in content.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{}:{hash:016x}", content.len())
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ReviewDiffSource {
@@ -106,6 +121,11 @@ pub enum WorkspaceOperation {
         #[ts(type = "string")]
         relative_path: PathBuf,
         content: String,
+        /// Fingerprint of the content the editor loaded; the daemon refuses the
+        /// write when the file on disk no longer matches; `None` overwrites
+        /// unconditionally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_fingerprint: Option<String>,
     },
     /// Reads one bounded chunk of a file starting at `offset`, so arbitrarily
     /// large files travel as many small messages instead of one that the wire
@@ -482,4 +502,23 @@ pub struct WorkspaceWatchState {
     /// Native watching failed or reached its resource budget. Manual refresh
     /// and activation refresh remain available; no full-tree polling fallback.
     pub limited: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_fingerprint_is_stable_and_distinguishes_changes() {
+        let a1 = text_fingerprint("hello\nworld\n");
+        let a2 = text_fingerprint("hello\nworld\n");
+        let b = text_fingerprint("hello\nworld!");
+        let empty = text_fingerprint("");
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, empty);
+        assert!(a1.starts_with("12:"));
+        assert!(empty.starts_with("0:"));
+    }
 }

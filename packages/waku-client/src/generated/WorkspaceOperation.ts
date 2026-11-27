@@ -13,7 +13,13 @@ directories: string[],
 /**
  * Live Review needs the non-ignored source tree; Files alone does not.
  */
-recursive: boolean, watch_git: boolean, } | { "type": "listTree", root: string, expanded_paths: string[], } | { "type": "browseDirectory", path: string | null, } | { "type": "resolvePath", path: string, } | { "type": "readTextFile", root: string, relative_path: string, } | { "type": "writeTextFile", root: string, relative_path: string, content: string, } | { "type": "readFileChunk", root: string, relative_path: string, offset: number,
+recursive: boolean, watch_git: boolean, } | { "type": "listTree", root: string, expanded_paths: string[], } | { "type": "browseDirectory", path: string | null, } | { "type": "resolvePath", path: string, } | { "type": "readTextFile", root: string, relative_path: string, } | { "type": "writeTextFile", root: string, relative_path: string, content: string,
+/**
+ * Fingerprint of the content the editor loaded; the daemon refuses the
+ * write when the file on disk no longer matches; `None` overwrites
+ * unconditionally.
+ */
+expected_fingerprint?: string | null, } | { "type": "readFileChunk", root: string, relative_path: string, offset: number,
 /**
  * Bytes requested; the daemon clamps this to its own per-chunk cap.
  */
