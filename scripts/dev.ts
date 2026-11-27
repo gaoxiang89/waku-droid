@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun";
+import { humanBytes, pruneIncrementalSessions } from "./clean-cache";
 import { bundleComputerUse } from "./cua-driver";
 import { watch, type FSWatcher } from "node:fs";
 import { join, resolve } from "node:path";
@@ -563,6 +564,24 @@ function startWatchers(): void {
   watchers.push(rootWatcher);
 }
 
+// Incremental compilation is on for the workspace crates only. rustc keeps
+// several sessions per crate, so after each build drop everything older than
+// the newest two; those are what the next build reuses, and this is what keeps
+// target/debug/incremental bounded instead of growing for the life of the
+// checkout.
+async function pruneIncrementalCaches(): Promise<void> {
+  try {
+    const pruned = await pruneIncrementalSessions({ keep: 2 });
+    if (pruned.removed.length > 0) {
+      console.log(
+        `[waku-dev] Pruned ${pruned.removed.length} stale incremental session(s) (${humanBytes(pruned.bytes)}).`,
+      );
+    }
+  } catch (error) {
+    console.warn("[waku-dev] Could not prune incremental caches:", error);
+  }
+}
+
 async function drainBuildQueue(): Promise<void> {
   if (building || stopping) return;
   building = true;
@@ -583,6 +602,8 @@ async function drainBuildQueue(): Promise<void> {
         }
         continue;
       }
+
+      await pruneIncrementalCaches();
 
       if (target === "daemon") {
         if (daemonChangeRevision === buildDaemonRevision) {
@@ -626,6 +647,7 @@ async function cleanup(): Promise<void> {
 process.on("SIGINT", () => void cleanup());
 process.on("SIGTERM", () => void cleanup());
 
+await pruneIncrementalCaches();
 startWatchers();
 building = true;
 const initialAppRevision = appChangeRevision;

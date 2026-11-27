@@ -222,13 +222,54 @@ codegen-units = 1
 strip = true
 
 # Keep debug assertions for app code, but do not run GPUI's text shaping and
-# Taffy layout hot paths completely unoptimized. Incremental compilation is
-# deliberately off; see the note in .cargo/config.toml.
+# Taffy layout hot paths completely unoptimized.
 [profile.dev]
 opt-level = 1
+# Only the hand-edited workspace crates get an incremental cache (the
+# per-package overrides below). The ~950 dependency crates never change during
+# a session, so caching them would only add gigabytes of object copies under
+# target/debug/incremental while saving nothing.
+incremental = false
+# Line tables for workspace code: this is what makes a dev-build backtrace and
+# `sample`/perf profile point at a line in src/.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+# Dependencies keep their symbol names but no PDB or line tables. Keeping line
+# tables for the whole graph wrote gigabytes of dependency PDBs into
+# target/debug and made every final link merge them; profilers still resolve
+# dependency frames by symbol, and the app's own frames stay debuggable.
+debug = 0
+
+# The app crate is a 120k-line monolith, so a non-incremental rebuild of one
+# edited module recompiled the whole crate (about 3 minutes on the 16-core dev
+# machine, measured). These six crates are the ones edited by hand; dev.ts
+# prunes each cache to its two newest sessions after every build, which keeps
+# the directory from growing without bound the way it once did.
+[profile.dev.package.waku]
+incremental = true
+debug = "line-tables-only"
+
+[profile.dev.package.waku-core]
+incremental = true
+debug = "line-tables-only"
+
+[profile.dev.package.waku-client]
+incremental = true
+debug = "line-tables-only"
+
+[profile.dev.package.waku-protocol]
+incremental = true
+debug = "line-tables-only"
+
+[profile.dev.package.waku-daemon]
+incremental = true
+debug = "line-tables-only"
+
+[profile.dev.package.waku-computer-use]
+incremental = true
+debug = "line-tables-only"
 
 # With debug assertions GPUI creates its D3D11 device with the debug layer,
 # which fails on every adapter on some Windows machines (0x887A0002) even with
