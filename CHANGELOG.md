@@ -14,6 +14,12 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.57]
+
+- Harden multi-device sync and daemon exposure: rebind resident daemons when changing network exposure or allowed origins, restrict shutdown to loopback peers, prevent stale state overwrites after session rewind, sync steer-accepted state and atomic queued-message claims across desktop, web, and mobile, and persist daemon-side reduced turns while offline
+- Improve persistent terminals and remote connections: harden Windows terminal recovery and unify local/SSH daemon routing, preserve split terminals across directory changes and mobile sheet switches, allow respawning exited terminals on a new working directory, and harden SSH ProxyJump authentication and live supervisor updates
+- Make Antigravity plan-usage fetching strictly manual-only (triggered only by explicit Check/Refresh controls or `/usage`, `/quota`, `/credits`), guard usage probes against interactive OAuth prompts, and read Antigravity skills directly from disk
+
 ## [0.1.56]
 
 - Import an existing Waku installation on first launch: missing files under `~/.waku` and `%LOCALAPPDATA%\Waku` are copied into Narel while originals stay untouched, `app.db` is snapshotted through SQLite, Narel files are never overwritten, and Waku's SSH credential entry is read as a fallback without being deleted
