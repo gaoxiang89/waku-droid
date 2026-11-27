@@ -44,6 +44,7 @@ export type { CreatedWorktree } from "./CreatedWorktree";
 export type { DaemonReady } from "./DaemonReady";
 export type { DaemonSettings } from "./DaemonSettings";
 export type { DaySlice } from "./DaySlice";
+export type { DownloadDirectoryEntry } from "./DownloadDirectoryEntry";
 export type { FileEntry } from "./FileEntry";
 export type { GitCommitDetail } from "./GitCommitDetail";
 export type { GitDiffSpec } from "./GitDiffSpec";

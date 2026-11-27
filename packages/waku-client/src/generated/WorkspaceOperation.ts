@@ -17,7 +17,7 @@ recursive: boolean, watch_git: boolean, } | { "type": "listTree", root: string, 
 /**
  * Bytes requested; the daemon clamps this to its own per-chunk cap.
  */
-length: number, } | { "type": "checkPathsExist", root: string, relative_paths: string[], } | { "type": "ensureDirectory", root: string, relative_path: string, overwrite: boolean, } | { "type": "writeFileChunk", root: string, relative_path: string, offset: number,
+length: number, } | { "type": "listDownloadDirectory", root: string, relative_path: string, } | { "type": "readDownloadFileChunk", root: string, relative_path: string, offset: number, length: number, } | { "type": "checkPathsExist", root: string, relative_paths: string[], } | { "type": "ensureDirectory", root: string, relative_path: string, overwrite: boolean, } | { "type": "writeFileChunk", root: string, relative_path: string, offset: number,
 /**
  * Base64-encoded chunk bytes, capped at `MAX_FILE_CHUNK_BYTES` (8 MiB) decoded.
  */

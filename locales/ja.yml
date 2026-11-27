@@ -1068,8 +1068,9 @@ files.could_not_save_opening: "%{path} を保存できませんでした：ま�
 files.could_not_save_read_only: "%{path} を保存できませんでした：このファイルは編集できません"
 files.could_not_save: "%{path} を保存できませんでした：%{error}"
 files.download: ダウンロード…
+files.download_to: フォルダーの保存先を選択
 files.download_saved: "%{name} を %{path} に保存しました"
-files.download_failed: "ファイルをダウンロードできませんでした：%{error}"
+files.download_failed: "ダウンロードできませんでした：%{error}"
 files.download_canceled: "%{name} のダウンロードをキャンセルしました"
 files.upload: アップロード…
 files.upload_completed: "%{name} をアップロードしました"

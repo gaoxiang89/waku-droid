@@ -2091,10 +2091,12 @@ files.could_not_save:
   en: "Could not save %{path}: %{error}"
 files.download:
   en: Download…
+files.download_to:
+  en: Choose a location for the downloaded folder
 files.download_saved:
   en: "Saved %{name} to %{path}"
 files.download_failed:
-  en: "Could not download the file: %{error}"
+  en: "Download failed: %{error}"
 files.download_canceled:
   en: "Canceled the download of %{name}"
 files.upload:

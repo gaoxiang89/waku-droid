@@ -10,6 +10,8 @@ use waku_protocol::lexical_path;
 use super::*;
 use crate::ui::ActivationExt as _;
 
+mod download;
+
 actions!(
     waku_right_panel,
     [
@@ -26,10 +28,6 @@ const FILE_RENAME_FIELD_CONTEXT: &str = "RightPanelFileRename > TextInput";
 const FILE_DELETE_DIALOG_CONTEXT: &str = "RightPanelFileDeleteDialog";
 const FILE_UPLOAD_DIALOG_CONTEXT: &str = "RightPanelFileUploadDialog";
 
-/// Bytes requested per chunk of a streamed download. The daemon clamps to its
-/// own cap; this keeps every wire message small and gives the progress card
-/// fine-grained updates even for multi-gigabyte files.
-const DOWNLOAD_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 /// Bytes encoded per chunk of a streamed upload. Stays safely under the
 /// daemon's 8 MiB per-chunk decoded cap after base64 framing.
 const UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -5753,15 +5751,16 @@ impl Waku {
                                 .icon("icons/cloud-upload.svg"),
                             );
                         }
-                        if !is_dir {
+                        {
                             let relative_path = menu_relative_path.clone();
                             let item_name = name.clone();
                             items.push(
                                 MenuItem::new(tr!("files.download"), move |_, cx| {
                                     let _ = download_waku.update(cx, |waku, cx| {
-                                        waku.download_right_panel_file(
+                                        waku.download_right_panel_path(
                                             relative_path.clone(),
                                             item_name.clone(),
+                                            is_dir,
                                             cx,
                                         )
                                     });
@@ -7347,146 +7346,6 @@ impl Waku {
             self.right_panel_expanded_paths.remove(&from);
             self.right_panel_expanded_paths.insert(to);
         }
-    }
-
-    /// Streams a remote (or local) file to a path of the user's choosing, one
-    /// chunk per request, so the transfer is bounded only by disk space — the
-    /// VS Code remote-download shape. The bytes travel over the daemon RPC,
-    /// so this works unchanged over SSH and WSL bridges.
-    pub(super) fn download_right_panel_file(
-        &mut self,
-        relative_path: String,
-        name: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project_path) = self.selected_workspace_path().map(Path::to_path_buf) else {
-            return;
-        };
-        let default_directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_default();
-        let receiver = cx.prompt_for_new_path(&default_directory, Some(&name));
-        let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
-        let display_name = name.clone();
-        cx.spawn(async move |waku, cx| {
-            let Ok(Ok(Some(destination))) = receiver.await else {
-                return;
-            };
-            let Ok((download_id, cancel)) =
-                waku.update(cx, |waku, cx| waku.begin_download(display_name.clone(), cx))
-            else {
-                return;
-            };
-            enum Outcome {
-                Complete,
-                Canceled,
-                Failed(anyhow::Error),
-            }
-            let mut offset: u64 = 0;
-            let outcome = loop {
-                if cancel.load(Ordering::Acquire) {
-                    break Outcome::Canceled;
-                }
-                // One request plus one bounded write, both off the UI thread.
-                let step = cx
-                    .background_executor()
-                    .spawn({
-                        let workspace = workspace.clone();
-                        let project_path = project_path.clone();
-                        let relative_path = relative_path.clone();
-                        let destination = destination.clone();
-                        async move {
-                            let response = workspace.request(
-                                waku_client::WorkspaceOperation::ReadFileChunk {
-                                    root: project_path,
-                                    relative_path: PathBuf::from(relative_path),
-                                    offset,
-                                    length: DOWNLOAD_CHUNK_BYTES,
-                                },
-                            )?;
-                            let waku_client::WorkspaceResult::FileChunk {
-                                bytes,
-                                total_bytes,
-                            } = response
-                            else {
-                                anyhow::bail!("the daemon returned an invalid file response");
-                            };
-                            let bytes =
-                                base64::engine::general_purpose::STANDARD.decode(bytes.trim())?;
-                            let mut file = std::fs::OpenOptions::new();
-                            let mut file = if offset == 0 {
-                                file.create(true).write(true).truncate(true)
-                            } else {
-                                file.append(true)
-                            }
-                            .open(&destination)?;
-                            use std::io::Write as _;
-                            file.write_all(&bytes)?;
-                            Ok((bytes.len() as u64, total_bytes))
-                        }
-                    })
-                    .await;
-                match step {
-                    Ok((chunk_bytes, total_bytes)) => {
-                        offset += chunk_bytes;
-                        if waku
-                            .update(cx, |waku, cx| {
-                                waku.update_download_progress(
-                                    download_id,
-                                    offset,
-                                    total_bytes,
-                                    cx,
-                                )
-                            })
-                            .is_err()
-                        {
-                            // The window went away; stop rather than stream
-                            // into a card nobody will see.
-                            break Outcome::Canceled;
-                        }
-                        if chunk_bytes == 0 {
-                            if offset != total_bytes {
-                                break Outcome::Failed(anyhow::anyhow!(
-                                    "the file changed size from {total_bytes} to {offset} bytes while downloading"
-                                ));
-                            }
-                            break Outcome::Complete;
-                        }
-                    }
-                    Err(error) => break Outcome::Failed(error),
-                }
-            };
-            let cleanup = cx.background_executor().spawn({
-                let destination = destination.clone();
-                let keep_file = matches!(outcome, Outcome::Complete);
-                async move {
-                    if !keep_file {
-                        // A canceled or failed transfer leaves nothing behind.
-                        let _ = std::fs::remove_file(&destination);
-                    }
-                }
-            });
-            cleanup.await;
-            let _ = waku.update(cx, |waku, cx| {
-                waku.end_download(download_id, cx);
-                match outcome {
-                    Outcome::Complete => waku.show_success_toast(tr!(
-                        "files.download_saved",
-                        name = display_name,
-                        path = destination.display()
-                    )),
-                    Outcome::Canceled => {
-                        waku.show_toast(tr!("files.download_canceled", name = display_name))
-                    }
-                    Outcome::Failed(error) => waku.show_toast(tr!(
-                        "files.download_failed",
-                        error = error.to_string()
-                    )),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// Parks a delete behind the confirm dialog. Remote deletion is

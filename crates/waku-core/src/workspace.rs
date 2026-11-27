@@ -10,6 +10,7 @@ use std::process::Output;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
+use waku_protocol::workspace::DownloadDirectoryEntry;
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 /// One chunk of a streamed file download, before base64. The 4/3 inflation
@@ -119,42 +120,29 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             relative_path,
             offset,
             length,
-        } => {
-            let path = resolve_workspace_path(&root, &relative_path)?;
-            let metadata = fs::metadata(&path)
-                .with_context(|| format!("could not open file {}", path.display()))?;
-            if metadata.is_dir() {
-                bail!("not a file: {}", path.display());
-            }
-            let total_bytes = metadata.len();
-            let remaining = total_bytes.saturating_sub(offset);
-            let wanted = (length as usize)
-                .min(MAX_FILE_CHUNK_BYTES)
-                .min(remaining as usize);
-            let mut buffer = vec![0u8; wanted];
-            let mut file = fs::File::open(&path)
-                .with_context(|| format!("could not open file {}", path.display()))?;
-            use std::io::{Seek, SeekFrom};
-            file.seek(SeekFrom::Start(offset))
-                .with_context(|| format!("could not seek in file {}", path.display()))?;
-            let mut filled = 0;
-            while filled < wanted {
-                match std::io::Read::read(&mut file, &mut buffer[filled..]) {
-                    Ok(0) => break,
-                    Ok(read) => filled += read,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => {
-                        return Err(anyhow!(error))
-                            .with_context(|| format!("could not read file {}", path.display()));
-                    }
-                }
-            }
-            buffer.truncate(filled);
-            WorkspaceResult::FileChunk {
-                bytes: base64::engine::general_purpose::STANDARD.encode(buffer),
-                total_bytes,
-            }
-        }
+        } => read_file_chunk(
+            &resolve_workspace_path(&root, &relative_path)?,
+            offset,
+            length,
+            false,
+        )?,
+        WorkspaceOperation::ListDownloadDirectory {
+            root,
+            relative_path,
+        } => WorkspaceResult::DownloadDirectory {
+            entries: list_download_directory(&resolve_non_symlink_parents(&root, &relative_path)?)?,
+        },
+        WorkspaceOperation::ReadDownloadFileChunk {
+            root,
+            relative_path,
+            offset,
+            length,
+        } => read_file_chunk(
+            &resolve_non_symlink_parents(&root, &relative_path)?,
+            offset,
+            length,
+            true,
+        )?,
         WorkspaceOperation::CheckPathsExist {
             root,
             relative_paths,
@@ -447,7 +435,7 @@ fn resolve_workspace_path(root: &Path, relative: &Path) -> anyhow::Result<PathBu
 
 /// Resolves `relative` inside `root` while refusing to traverse any existing
 /// intermediate parent directory that is a symbolic link.
-fn resolve_upload_workspace_path(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_non_symlink_parents(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
     let path = resolve_workspace_path(root, relative)?;
     let mut current = root.to_path_buf();
     let mut components = relative.components().peekable();
@@ -466,6 +454,78 @@ fn resolve_upload_workspace_path(root: &Path, relative: &Path) -> anyhow::Result
         }
     }
     Ok(path)
+}
+
+fn list_download_directory(path: &Path) -> anyhow::Result<Vec<DownloadDirectoryEntry>> {
+    let inspect = || format!("could not inspect {}", path.display());
+    if !fs::symlink_metadata(path).with_context(inspect)?.is_dir() {
+        bail!("not a regular directory: {}", path.display());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path).with_context(inspect)? {
+        let entry = entry.with_context(inspect)?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("could not inspect {}", entry.path().display()))?;
+        let file_bytes = if metadata.is_dir() {
+            None
+        } else if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            continue;
+        };
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("a name in {} is not valid UTF-8", path.display()))?;
+        entries.push(DownloadDirectoryEntry { name, file_bytes });
+    }
+    Ok(entries)
+}
+
+fn read_file_chunk(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    regular_only: bool,
+) -> anyhow::Result<WorkspaceResult> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let open_error = || format!("could not open file {}", path.display());
+    let metadata = if regular_only {
+        fs::symlink_metadata(path)
+    } else {
+        fs::metadata(path)
+    }
+    .with_context(open_error)?;
+    if metadata.is_dir() || (regular_only && !metadata.is_file()) {
+        bail!("not a file: {}", path.display());
+    }
+    let total_bytes = metadata.len();
+    let wanted = length
+        .min(MAX_FILE_CHUNK_BYTES as u64)
+        .min(total_bytes.saturating_sub(offset)) as usize;
+    let mut buffer = vec![0u8; wanted];
+    let mut file = fs::File::open(path).with_context(open_error)?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("could not seek in file {}", path.display()))?;
+    let mut filled = 0;
+    while filled < wanted {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(anyhow!(error))
+                    .with_context(|| format!("could not read file {}", path.display()));
+            }
+        }
+    }
+    buffer.truncate(filled);
+    Ok(WorkspaceResult::FileChunk {
+        bytes: base64::engine::general_purpose::STANDARD.encode(buffer),
+        total_bytes,
+    })
 }
 
 /// Removes a regular file or symlink (including directory symlinks on Windows)
@@ -498,7 +558,7 @@ fn check_paths_exist(root: &Path, relative_paths: Vec<PathBuf>) -> anyhow::Resul
 }
 
 fn ensure_directory(root: &Path, relative_path: &Path, overwrite: bool) -> anyhow::Result<()> {
-    let path = resolve_upload_workspace_path(root, relative_path)?;
+    let path = resolve_non_symlink_parents(root, relative_path)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
         Ok(_) if !overwrite => bail!("{} already exists", path.display()),
@@ -533,7 +593,7 @@ fn write_file_chunk(
             MAX_FILE_CHUNK_BYTES
         );
     }
-    let path = resolve_upload_workspace_path(root, relative_path)?;
+    let path = resolve_non_symlink_parents(root, relative_path)?;
     use std::io::{Seek, SeekFrom, Write};
     if offset == 0 {
         match fs::symlink_metadata(&path) {
@@ -1004,6 +1064,68 @@ mod tests {
             })
             .is_err()
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_download_lists_hidden_files_and_empty_directories_without_following_links() {
+        let root = std::env::temp_dir().join(format!("waku-folder-download-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("folder/empty")).unwrap();
+        fs::write(root.join("folder/.hidden"), b"data").unwrap();
+        let has_link = try_symlink(&root.join("folder"), &root.join("folder/loop"));
+
+        let list = |relative_path: &str| {
+            execute(WorkspaceOperation::ListDownloadDirectory {
+                root: root.clone(),
+                relative_path: PathBuf::from(relative_path),
+            })
+        };
+        let WorkspaceResult::DownloadDirectory { entries } = list("folder").unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "empty" && entry.file_bytes.is_none())
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == ".hidden" && entry.file_bytes == Some(4))
+        );
+        assert!(
+            matches!(list("folder/empty").unwrap(), WorkspaceResult::DownloadDirectory { entries } if entries.is_empty())
+        );
+        assert!(list("missing").is_err());
+        assert!(list("../outside").is_err());
+
+        let read = |relative_path: &str| {
+            execute(WorkspaceOperation::ReadDownloadFileChunk {
+                root: root.clone(),
+                relative_path: PathBuf::from(relative_path),
+                offset: 1,
+                length: 2,
+            })
+        };
+        let WorkspaceResult::FileChunk {
+            bytes,
+            total_bytes: 4,
+        } = read("folder/.hidden").unwrap()
+        else {
+            panic!("unexpected workspace response");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(bytes)
+                .unwrap(),
+            b"at"
+        );
+        if has_link {
+            assert!(list("folder/loop").is_err());
+            assert!(read("folder/loop/.hidden").is_err());
+        }
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -49,6 +49,14 @@ pub struct WorkingTreeEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadDirectoryEntry {
+    pub name: String,
+    /// A regular file's size, or `None` for a directory.
+    pub file_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WorkspaceOperation {
     /// Renew a short native-watch lease and read its in-memory change counters.
@@ -103,6 +111,22 @@ pub enum WorkspaceOperation {
         relative_path: PathBuf,
         offset: u64,
         /// Bytes requested; the daemon clamps this to its own per-chunk cap.
+        length: u64,
+    },
+    /// List one directory for a download, without following links.
+    ListDownloadDirectory {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+    },
+    /// Like `ReadFileChunk`, but refuses links in the folder being downloaded.
+    ReadDownloadFileChunk {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
+        offset: u64,
         length: u64,
     },
     /// Checks which workspace-relative paths currently exist on the daemon host
@@ -363,6 +387,9 @@ pub enum WorkspaceResult {
         bytes: String,
         /// File length in bytes when the chunk was read.
         total_bytes: u64,
+    },
+    DownloadDirectory {
+        entries: Vec<DownloadDirectoryEntry>,
     },
     ExistingPaths {
         #[ts(type = "string[]")]

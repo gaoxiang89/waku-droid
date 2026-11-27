@@ -4,6 +4,7 @@ import type { BranchSnapshot } from "./BranchSnapshot";
 import type { Checkpoint } from "./Checkpoint";
 import type { CommitSnapshot } from "./CommitSnapshot";
 import type { CreatedWorktree } from "./CreatedWorktree";
+import type { DownloadDirectoryEntry } from "./DownloadDirectoryEntry";
 import type { FileEntry } from "./FileEntry";
 import type { GitCommitDetail } from "./GitCommitDetail";
 import type { GitFileDiff } from "./GitFileDiff";
@@ -23,4 +24,4 @@ bytes: string,
 /**
  * File length in bytes when the chunk was read.
  */
-total_bytes: number, } | { "type": "existingPaths", relative_paths: string[], } | { "type": "projectFiles", entries: Array<FileEntry>, } | { "type": "slashCommands", commands: Array<SlashCommand>, } | { "type": "projectlessWorkspace", cwd: string, } | { "type": "branches", snapshot: BranchSnapshot | null, } | { "type": "branchChanged", snapshot: BranchSnapshot, } | { "type": "worktreeCreated", worktree: CreatedWorktree, } | { "type": "commitSnapshot", snapshot: CommitSnapshot, } | { "type": "commitMessage", message: string, } | { "type": "checkpoint", checkpoint: Checkpoint, } | { "type": "bool", value: boolean, } | { "type": "turnRefs", turn_counts: Array<number>, } | { "type": "reviewDiff", data: ReviewDiffData, } | { "type": "gitGraph", snapshot: GitGraphSnapshot | null, } | { "type": "gitCommit", detail: GitCommitDetail, } | { "type": "gitCompare", files: Array<GitGraphFile>, } | { "type": "gitFileDiff", diff: GitFileDiff, } | { "type": "antigravitySwarm", snapshot: AntigravitySwarmSnapshot | null, };
+total_bytes: number, } | { "type": "downloadDirectory", entries: Array<DownloadDirectoryEntry>, } | { "type": "existingPaths", relative_paths: string[], } | { "type": "projectFiles", entries: Array<FileEntry>, } | { "type": "slashCommands", commands: Array<SlashCommand>, } | { "type": "projectlessWorkspace", cwd: string, } | { "type": "branches", snapshot: BranchSnapshot | null, } | { "type": "branchChanged", snapshot: BranchSnapshot, } | { "type": "worktreeCreated", worktree: CreatedWorktree, } | { "type": "commitSnapshot", snapshot: CommitSnapshot, } | { "type": "commitMessage", message: string, } | { "type": "checkpoint", checkpoint: Checkpoint, } | { "type": "bool", value: boolean, } | { "type": "turnRefs", turn_counts: Array<number>, } | { "type": "reviewDiff", data: ReviewDiffData, } | { "type": "gitGraph", snapshot: GitGraphSnapshot | null, } | { "type": "gitCommit", detail: GitCommitDetail, } | { "type": "gitCompare", files: Array<GitGraphFile>, } | { "type": "gitFileDiff", diff: GitFileDiff, } | { "type": "antigravitySwarm", snapshot: AntigravitySwarmSnapshot | null, };
