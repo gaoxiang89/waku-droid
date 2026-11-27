@@ -20,7 +20,17 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 13;
+/// Wire protocol revision shared by the desktop, daemon, web, and mobile
+/// clients.
+///
+/// Bump this whenever [`ClientMessage`], [`Command`], [`WorkspaceOperation`],
+/// or [`WorkspaceResult`] gains, loses, or renames a variant, field, or tag.
+/// Older daemons do not ignore unknown requests: they fail to deserialize the
+/// whole message and answer "the daemon could not parse this request", which
+/// surfaces as a broken feature instead of a version mismatch the app can
+/// repair. A client and daemon that disagree here are refused at the
+/// handshake, and the desktop replaces a stale local or remote daemon.
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -641,7 +651,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
     }
 
     #[test]
@@ -650,7 +660,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 13);
+        assert_eq!(PROTOCOL_VERSION, 14);
     }
 
     #[test]
