@@ -19,6 +19,8 @@ the original feature bullet instead of adding separate entries for them.
 - Show two conversations side by side in a chat split view: open a split from the header button, `Ctrl/Cmd+\`, the command palette, the View menu, the sidebar "Open in Split View" action, or `Ctrl/Cmd+click` on a task, with the focused pane driving the header, right panel, and bottom panel
 - Harden Files panel uploads, downloads, and editing: write uploaded and edited files atomically, preserve existing nested files and folders when overwriting uploads, detect external edits before saving, refuse to open oversized, binary, or non-UTF-8 files in the editor, and reject Windows reserved or case-colliding names before starting folder downloads
 - Improve Files tree links and renames: treat directory symlinks and Windows junctions as folders, delete them as links, allow case-only renames on case-insensitive filesystems, and keep expanded subfolders open after renaming a folder
+- Drag files and folders from the Files panel straight into Explorer or the desktop on Windows: local workspaces copy the real files, and SSH/WSL workspaces stream them from the daemon with Explorer's own progress dialog
+- Detect a daemon from another Narel version when connecting instead of running against it; the desktop replaces a stale local or remote daemon or reports the mismatch at the handshake. The desktop, daemon, mobile, and web clients must run the same version.
 
 ## [0.1.59]
 
