@@ -11,6 +11,9 @@ use super::*;
 use crate::ui::ActivationExt as _;
 
 mod download;
+mod drag_out;
+
+pub(in crate::app) use drag_out::DragOutCandidate;
 
 actions!(
     waku_right_panel,
@@ -5620,6 +5623,10 @@ impl Waku {
             let click_absolute_path = absolute_path.clone();
             let menu_relative_path = relative_path.clone();
             let menu_absolute_path = absolute_path.clone();
+            let drag_relative_path = relative_path.clone();
+            let drag_absolute_path = absolute_path.clone();
+            let drag_name = name.clone();
+            let move_relative_path = relative_path.clone();
             let row_focus = menu.trigger_focus_handle().clone();
             let row = div()
                 .id(SharedString::from(format!(
@@ -5753,6 +5760,56 @@ impl Waku {
                                 this.open_right_panel_file(click_relative_path.clone(), cx);
                             }
                         }))
+                        .when(cfg!(windows), |element| {
+                            element
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                                        this.right_panel_drag_out_candidate =
+                                            Some(DragOutCandidate {
+                                                relative_path: drag_relative_path.clone(),
+                                                absolute_path: drag_absolute_path.clone(),
+                                                name: drag_name.clone(),
+                                                is_dir,
+                                                origin: event.position,
+                                            });
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    move |this, event: &MouseMoveEvent, _, cx| {
+                                        if event.pressed_button != Some(MouseButton::Left) {
+                                            return;
+                                        }
+                                        let Some(candidate) =
+                                            this.right_panel_drag_out_candidate.as_ref()
+                                        else {
+                                            return;
+                                        };
+                                        if candidate.relative_path == move_relative_path
+                                            && drag_out::drag_threshold_exceeded(
+                                                candidate.origin,
+                                                event.position,
+                                            )
+                                            && let Some(candidate) =
+                                                this.right_panel_drag_out_candidate.take()
+                                        {
+                                            this.begin_right_panel_drag_out(candidate, cx);
+                                        }
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.right_panel_drag_out_candidate = None;
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.right_panel_drag_out_candidate = None;
+                                    }),
+                                )
+                        })
                 });
             let row_wrapper = self
                 .attach_files_drop_handlers(div().w_full(), drop_target, cx)
@@ -6044,10 +6101,11 @@ impl Waku {
         element
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
-                    if this
-                        .right_panel_files_scroll_handle
-                        .bounds()
-                        .contains(&event.event.position)
+                    if !this.files_drag_out_active
+                        && this
+                            .right_panel_files_scroll_handle
+                            .bounds()
+                            .contains(&event.event.position)
                         && event.bounds.contains(&event.event.position)
                         && this.right_panel_files_drop_target.as_ref() != Some(&move_target)
                     {
@@ -7621,7 +7679,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if paths.is_empty() {
+        if self.files_drag_out_active || paths.is_empty() {
             return;
         }
         let window_handle = window.window_handle();

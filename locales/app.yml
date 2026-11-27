@@ -2113,6 +2113,8 @@ files.download_saved:
   en: "Saved %{name} to %{path}"
 files.download_failed:
   en: "Download failed: %{error}"
+files.drag_out_failed:
+  en: "Could not copy %{name}: %{error}"
 files.download_canceled:
   en: "Canceled the download of %{name}"
 files.upload:

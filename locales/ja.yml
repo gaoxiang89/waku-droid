@@ -1079,6 +1079,7 @@ files.download: ダウンロード…
 files.download_to: フォルダーの保存先を選択
 files.download_saved: "%{name} を %{path} に保存しました"
 files.download_failed: "ダウンロードできませんでした：%{error}"
+files.drag_out_failed: "%{name} をコピーできませんでした: %{error}"
 files.download_canceled: "%{name} のダウンロードをキャンセルしました"
 files.upload: アップロード…
 files.upload_completed: "%{name} をアップロードしました"

@@ -1785,6 +1785,10 @@ pub struct Waku {
     right_panel_upload_confirm: Option<right_panel::RightPanelUploadConfirm>,
     /// Working-tree drop target currently highlighted by an external drag.
     right_panel_files_drop_target: Option<right_panel::FilesDropTarget>,
+    /// Pending left-press on a working-tree row before it crosses the OS drag threshold.
+    right_panel_drag_out_candidate: Option<right_panel::DragOutCandidate>,
+    /// True while an OS drag-out from the Files tree is active.
+    files_drag_out_active: bool,
     /// Find-and-replace over the visible file editor. Created on first use of
     /// the primary find shortcut and kept for the window's lifetime so the
     /// query and toggles survive closing the bar; `open` says whether it shows.
@@ -3676,6 +3680,8 @@ impl Waku {
                 right_panel_delete_confirm: None,
                 right_panel_upload_confirm: None,
                 right_panel_files_drop_target: None,
+                right_panel_drag_out_candidate: None,
+                files_drag_out_active: false,
                 sidebar_collapsed_groups,
                 sidebar_project_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),

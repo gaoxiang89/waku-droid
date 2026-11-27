@@ -131,16 +131,15 @@ struct Download<'a> {
     cancel: &'a AtomicBool,
 }
 
-struct FolderEntry {
-    source: String,
-    destination: PathBuf,
-    file_bytes: Option<u64>,
+pub(super) struct FolderEntry {
+    pub(super) source: String,
+    pub(super) destination: PathBuf,
+    pub(super) file_bytes: Option<u64>,
 }
 
 impl Download<'_> {
     fn check_canceled(&self) -> anyhow::Result<()> {
-        ensure!(!self.cancel.load(Ordering::Acquire), "download canceled");
-        Ok(())
+        check_canceled(self.cancel)
     }
 
     fn save_folder(
@@ -201,52 +200,7 @@ impl Download<'_> {
     }
 
     fn plan_folder(&self, source: &str) -> anyhow::Result<(Vec<FolderEntry>, u64)> {
-        let mut pending = vec![(source.to_owned(), PathBuf::new())];
-        let mut plan = Vec::new();
-        let mut total = 0u64;
-        while let Some((directory, local_path)) = pending.pop() {
-            self.check_canceled()?;
-            let WorkspaceResult::DownloadDirectory { entries } = self
-                .workspace
-                .request(WorkspaceOperation::ListDownloadDirectory {
-                    root: self.root.clone(),
-                    relative_path: PathBuf::from(&directory),
-                })
-                .with_context(|| format!("could not list {directory}"))?
-            else {
-                anyhow::bail!("the daemon returned an invalid directory response");
-            };
-            #[cfg(any(windows, target_os = "macos"))]
-            {
-                let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-                if let Some((a, b)) = case_collision(&names) {
-                    anyhow::bail!(
-                        "\"{a}\" and \"{b}\" differ only in letter case and cannot both be saved here"
-                    );
-                }
-            }
-            for entry in entries {
-                self.check_canceled()?;
-                validate_name(&entry.name)?;
-                // The destination uses local path rules. Keep the source in the
-                // daemon's path syntax (both POSIX and Windows accept a slash).
-                let source = format!("{directory}/{}", entry.name);
-                let destination = local_path.join(&entry.name);
-                if let Some(size) = entry.file_bytes {
-                    total = total
-                        .checked_add(size)
-                        .context("download size exceeds the supported limit")?;
-                } else {
-                    pending.push((source.clone(), destination.clone()));
-                }
-                plan.push(FolderEntry {
-                    source,
-                    destination,
-                    file_bytes: entry.file_bytes,
-                });
-            }
-        }
-        Ok((plan, total))
+        plan_remote_folder(&self.workspace, &self.root, source, self.cancel)
     }
 
     fn save_file(
@@ -351,7 +305,7 @@ fn is_reserved_windows_name(name: &str) -> bool {
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
-fn validate_name(name: &str) -> anyhow::Result<()> {
+pub(super) fn validate_name(name: &str) -> anyhow::Result<()> {
     let valid = Path::new(name).file_name().is_some_and(|part| part == name);
     #[cfg(windows)]
     let valid = valid
@@ -364,6 +318,64 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
         "cannot save \"{name}\" as a local file or folder name"
     );
     Ok(())
+}
+
+fn check_canceled(cancel: &AtomicBool) -> anyhow::Result<()> {
+    ensure!(!cancel.load(Ordering::Acquire), "download canceled");
+    Ok(())
+}
+
+pub(super) fn plan_remote_folder(
+    workspace: &WorkspaceClient,
+    root: &Path,
+    source: &str,
+    cancel: &AtomicBool,
+) -> anyhow::Result<(Vec<FolderEntry>, u64)> {
+    let mut pending = vec![(source.to_owned(), PathBuf::new())];
+    let mut plan = Vec::new();
+    let mut total = 0u64;
+    while let Some((directory, local_path)) = pending.pop() {
+        check_canceled(cancel)?;
+        let WorkspaceResult::DownloadDirectory { entries } = workspace
+            .request(WorkspaceOperation::ListDownloadDirectory {
+                root: root.to_path_buf(),
+                relative_path: PathBuf::from(&directory),
+            })
+            .with_context(|| format!("could not list {directory}"))?
+        else {
+            anyhow::bail!("the daemon returned an invalid directory response");
+        };
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+            if let Some((a, b)) = case_collision(&names) {
+                anyhow::bail!(
+                    "\"{a}\" and \"{b}\" differ only in letter case and cannot both be saved here"
+                );
+            }
+        }
+        for entry in entries {
+            check_canceled(cancel)?;
+            validate_name(&entry.name)?;
+            // The destination uses local path rules. Keep the source in the
+            // daemon's path syntax (both POSIX and Windows accept a slash).
+            let source = format!("{directory}/{}", entry.name);
+            let destination = local_path.join(&entry.name);
+            if let Some(size) = entry.file_bytes {
+                total = total
+                    .checked_add(size)
+                    .context("download size exceeds the supported limit")?;
+            } else {
+                pending.push((source.clone(), destination.clone()));
+            }
+            plan.push(FolderEntry {
+                source,
+                destination,
+                file_bytes: entry.file_bytes,
+            });
+        }
+    }
+    Ok((plan, total))
 }
 
 #[cfg(test)]
