@@ -18,6 +18,9 @@ const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 /// wire's per-message cap, so no whole-file read can ever be assembled into
 /// a single oversized response.
 const MAX_FILE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum file size opened directly in the text editor.
+const MAX_EDITABLE_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub use waku_protocol::workspace::{
@@ -105,7 +108,7 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             root,
             relative_path,
         } => WorkspaceResult::TextFile {
-            content: fs::read_to_string(resolve_workspace_path(&root, &relative_path)?)?,
+            content: read_editable_text(&resolve_workspace_path(&root, &relative_path)?)?,
         },
         WorkspaceOperation::WriteTextFile {
             root,
@@ -492,6 +495,46 @@ fn list_download_directory(path: &Path) -> anyhow::Result<Vec<DownloadDirectoryE
         entries.push(DownloadDirectoryEntry { name, file_bytes });
     }
     Ok(entries)
+}
+
+fn editable_text_too_large(path: &Path, byte_len: u64) -> anyhow::Error {
+    anyhow!(
+        "{} is too large to open in the editor ({:.1} MB; the limit is 8 MB)",
+        path.display(),
+        byte_len as f64 / (1024.0 * 1024.0),
+    )
+}
+
+/// Reads a UTF-8 text file for the editor, rejecting directories, files over
+/// `MAX_EDITABLE_TEXT_BYTES`, binary files (NUL in the first 8 KiB), and invalid UTF-8.
+fn read_editable_text(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read as _;
+
+    let metadata =
+        fs::metadata(path).with_context(|| format!("could not open file {}", path.display()))?;
+    if metadata.is_dir() {
+        bail!("not a file: {}", path.display());
+    }
+    if metadata.len() > MAX_EDITABLE_TEXT_BYTES {
+        return Err(editable_text_too_large(path, metadata.len()));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)
+        .with_context(|| format!("could not open file {}", path.display()))?
+        .take(MAX_EDITABLE_TEXT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read file {}", path.display()))?;
+    if bytes.len() as u64 > MAX_EDITABLE_TEXT_BYTES {
+        return Err(editable_text_too_large(path, bytes.len() as u64));
+    }
+
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    if bytes[..sniff_len].contains(&0) {
+        bail!("{} looks like a binary file", path.display());
+    }
+
+    String::from_utf8(bytes).map_err(|_| anyhow!("{} is not UTF-8 text", path.display()))
 }
 
 fn read_file_chunk(
@@ -1139,6 +1182,47 @@ mod tests {
             })
             .is_err()
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_text_file_rejects_large_binary_and_non_utf8_files() {
+        let root = std::env::temp_dir().join(format!("waku-editor-guards-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("subdir")).unwrap();
+
+        let huge = fs::File::create(root.join("huge.txt")).unwrap();
+        huge.set_len(MAX_EDITABLE_TEXT_BYTES + 1).unwrap();
+        drop(huge);
+
+        fs::write(root.join("binary.bin"), b"abc\0def").unwrap();
+        fs::write(root.join("latin1.txt"), [0xff, 0xfe, b'a']).unwrap();
+        fs::write(root.join("valid.txt"), "hello\nworld\n").unwrap();
+
+        let read = |relative_path: &str| {
+            execute(WorkspaceOperation::ReadTextFile {
+                root: root.clone(),
+                relative_path: PathBuf::from(relative_path),
+            })
+        };
+
+        let dir_err = read("subdir").unwrap_err().to_string();
+        assert!(dir_err.contains("not a file"), "{dir_err}");
+
+        let huge_err = read("huge.txt").unwrap_err().to_string();
+        assert!(huge_err.contains("too large"), "{huge_err}");
+
+        let binary_err = read("binary.bin").unwrap_err().to_string();
+        assert!(binary_err.contains("binary"), "{binary_err}");
+
+        let utf8_err = read("latin1.txt").unwrap_err().to_string();
+        assert!(utf8_err.contains("UTF-8"), "{utf8_err}");
+
+        let WorkspaceResult::TextFile { content } = read("valid.txt").unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        assert_eq!(content, "hello\nworld\n");
 
         fs::remove_dir_all(root).unwrap();
     }
