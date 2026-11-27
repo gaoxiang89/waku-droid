@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.61]
+
+- Maximize and restore the bottom terminal panel from its header button, the View menu, the command palette, or `Shift+Esc`, expanding it across the workspace area while keeping the sidebar and top bar accessible
+
 ## [0.1.60]
 
 - Show two conversations side by side in a chat split view: open a split from the header button, `Ctrl/Cmd+\`, the command palette, the View menu, the sidebar "Open in Split View" action, or `Ctrl/Cmd+click` on a task, with the focused pane driving the header, right panel, and bottom panel
