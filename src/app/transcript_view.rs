@@ -574,6 +574,7 @@ impl Waku {
         &mut self,
         window: &mut Window,
         chat_viewport_width: f32,
+        role: chat_split::ChatPaneRole,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.prefetch_checkpoint_refs(cx);
@@ -759,7 +760,12 @@ impl Waku {
                     entity
                         .upgrade()
                         .map(|entity| {
-                            entity.update(cx, |this, cx| this.transcript_row(index, window, cx))
+                            entity.update(cx, |this, cx| {
+                                this.with_chat_view(role, |this| {
+                                    this.transcript_row(index, window, cx)
+                                })
+                                .unwrap_or_else(|| div().into_any_element())
+                            })
                         })
                         .unwrap_or_else(|| div().into_any_element())
                 })
@@ -1315,6 +1321,7 @@ impl Waku {
             cx,
         );
         let entity = cx.entity().downgrade();
+        let role = self.current_chat_pane_role();
         // Only the virtual list's row builder touches Markdown blocks. Parent
         // pulse renders clone the Rc/ListState, not the source or parsed tree.
         let rows = list(state.clone(), move |tile_index, _, cx| {
@@ -1322,45 +1329,55 @@ impl Waku {
                 .upgrade()
                 .map(|entity| {
                     entity.update(cx, |this, cx| {
-                        let section = &details.sections[section_index];
-                        let theme = Theme::current(cx);
-                        let palette = MarkdownPalette::from_theme(&theme);
-                        let row = format!("activity-{id}-{}-tile-{tile_index}", section_kind.id());
-                        let ctx = this
-                            .markdown_ctx(
-                                row.clone(),
-                                &palette,
-                                this.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
-                                false,
-                            )
-                            .with_math_context_menu(this.menu_handle(format!("{row}-math"), cx));
-                        let tile = &section.tiles[tile_index];
-                        let content = match tile {
-                            ActivityDetailTile::Markdown(block) => {
-                                let mut views = section.views.borrow_mut();
-                                // Flatten caches are also bounded as the user scrolls.
-                                if views.len() > 64 {
-                                    views.retain(|index, _| index.abs_diff(tile_index) < 32);
-                                }
-                                let view = views.entry(tile_index).or_default();
-                                md::render::markdown_blocks(view, std::slice::from_ref(block), &ctx)
+                        this.with_chat_view(role, |this| {
+                            let section = &details.sections[section_index];
+                            let theme = Theme::current(cx);
+                            let palette = MarkdownPalette::from_theme(&theme);
+                            let row =
+                                format!("activity-{id}-{}-tile-{tile_index}", section_kind.id());
+                            let ctx = this
+                                .markdown_ctx(
+                                    row.clone(),
+                                    &palette,
+                                    this.scaled_markdown_metrics(MarkdownMetrics::COMPACT),
+                                    false,
+                                )
+                                .with_math_context_menu(
+                                    this.menu_handle(format!("{row}-math"), cx),
+                                );
+                            let tile = &section.tiles[tile_index];
+                            let content = match tile {
+                                ActivityDetailTile::Markdown(block) => {
+                                    let mut views = section.views.borrow_mut();
+                                    // Flatten caches are also bounded as the user scrolls.
+                                    if views.len() > 64 {
+                                        views.retain(|index, _| index.abs_diff(tile_index) < 32);
+                                    }
+                                    let view = views.entry(tile_index).or_default();
+                                    md::render::markdown_blocks(
+                                        view,
+                                        std::slice::from_ref(block),
+                                        &ctx,
+                                    )
                                     .unwrap_or_else(|| div().into_any_element())
-                            }
-                            ActivityDetailTile::Plain(text) => md::render::plain_text(
-                                text.clone(),
-                                md::render::MONO_FAMILY,
-                                FontWeight::NORMAL,
-                                theme.text_secondary,
-                                &ctx,
-                            ),
-                        };
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .min_h(px(20.0))
-                            .pb(px(4.0))
-                            .child(content)
-                            .into_any_element()
+                                }
+                                ActivityDetailTile::Plain(text) => md::render::plain_text(
+                                    text.clone(),
+                                    md::render::MONO_FAMILY,
+                                    FontWeight::NORMAL,
+                                    theme.text_secondary,
+                                    &ctx,
+                                ),
+                            };
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .min_h(px(20.0))
+                                .pb(px(4.0))
+                                .child(content)
+                                .into_any_element()
+                        })
+                        .unwrap_or_else(|| div().into_any_element())
                     })
                 })
                 .unwrap_or_else(|| div().into_any_element())

@@ -2579,7 +2579,10 @@ impl Waku {
             self.pending_session_activation
                 .map(|pending| pending.session_id),
             session_id,
-        );
+        ) || self
+            .chat_split
+            .as_ref()
+            .is_some_and(|split| split.session_id == session_id);
         let working = matches!(
             session.status,
             SessionStatus::Connecting | SessionStatus::Working
@@ -2643,6 +2646,7 @@ impl Waku {
         };
         let session_pinned = session.pinned;
         let session_archived = session.archived;
+        let can_split = !session_archived && self.state.selected_session != Some(session_id);
         let waku = cx.entity().downgrade();
         let menu = self.menu_handle(format!("session-{session_id}"), cx);
         let row_focus = menu.trigger_focus_handle().clone();
@@ -2749,8 +2753,12 @@ impl Waku {
                             cx.stop_propagation();
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_session(session_id, cx);
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        if event.modifiers().secondary() {
+                            this.open_in_split(session_id, window, cx);
+                        } else {
+                            this.select_session(session_id, cx);
+                        }
                     }))
             });
         let row = if renaming {
@@ -2773,6 +2781,7 @@ impl Waku {
                     let delete_waku = waku.clone();
                     let pin_waku = waku.clone();
                     let archive_waku = waku.clone();
+                    let split_waku = waku.clone();
                     let delete_row_focus = row_focus.clone();
                     let mut items = Vec::new();
                     if session_archived {
@@ -2813,6 +2822,16 @@ impl Waku {
                                 });
                             })
                             .icon("icons/archive.svg"),
+                        );
+                    }
+                    if can_split {
+                        items.push(
+                            MenuItem::new(tr!("sidebar.open_in_split"), move |window, cx| {
+                                let _ = split_waku.update(cx, |waku, cx| {
+                                    waku.open_in_split(session_id, window, cx);
+                                });
+                            })
+                            .icon("icons/split.svg"),
                         );
                     }
                     items.extend([
@@ -2971,6 +2990,9 @@ impl Waku {
                     .flex()
                     .items_center()
                     .gap(px(4.0))
+                    .when(self.state.selected_session.is_some(), |controls| {
+                        controls.child(self.render_chat_split_toggle(cx))
+                    })
                     .child(self.render_bottom_panel_toggle(cx))
                     .child(self.render_header_surface_buttons(cx))
                     .child(self.render_notifications_control(cx)),
@@ -3138,7 +3160,7 @@ impl Waku {
     }
 }
 
-fn localized_session_title(session: &AgentSession) -> String {
+pub(super) fn localized_session_title(session: &AgentSession) -> String {
     let title = session.display_title();
     if title == AgentSession::DEFAULT_TITLE {
         tr!("session.new_task")

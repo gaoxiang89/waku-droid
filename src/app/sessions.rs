@@ -261,6 +261,14 @@ impl Waku {
         }) {
             return;
         }
+        if let Some(split) = self.chat_split.as_ref()
+            && split.session_id == session_id
+        {
+            self.pending_session_activation = None;
+            let side = split.focused_side.other();
+            self.focus_chat_pane(side, cx);
+            return;
+        }
         self.expand_sidebar_path_to_session(session_id);
         self.reveal_sidebar_session(session_id);
         let needs_hydration = self
@@ -367,30 +375,49 @@ impl Waku {
                         } else {
                             false
                         };
-                        let pending = waku
-                            .pending_session_activation
-                            .filter(|pending| pending.session_id == session_id);
-                        if pending.is_some() {
-                            waku.pending_session_activation = None;
-                        }
-                        if replaced && let Some(pending) = pending {
-                            waku.finish_session_activation(session_id, pending.transition, cx);
-                        } else if waku.state.selected_session == Some(session_id) {
-                            waku.reset_visible_state();
-                            waku.reset_transcript_rows(waku.transcript_row_count());
-                            waku.refresh_composer_sources(cx);
-                            waku.refresh_selected_antigravity_swarm_if_relevant(cx);
-                            if waku
-                                .state
-                                .sessions
-                                .iter()
-                                .any(|s| s.id == session_id && (s.status.is_busy() || s.has_started()))
-                            {
-                                waku.start_runtime_attachment(session_id, cx);
+                        let pending_split = replaced
+                            .then(|| {
+                                (waku.pending_split_open.as_ref().map(|(id, _)| *id)
+                                    == Some(session_id))
+                                .then(|| waku.pending_split_open.take())
+                                .flatten()
+                            })
+                            .flatten();
+                        if let Some((_, view)) = pending_split {
+                            waku.open_session_in_split(session_id, view, cx);
+                        } else {
+                            let pending = waku
+                                .pending_session_activation
+                                .filter(|pending| pending.session_id == session_id);
+                            if pending.is_some() {
+                                waku.pending_session_activation = None;
+                            }
+                            if replaced && let Some(pending) = pending {
+                                waku.finish_session_activation(session_id, pending.transition, cx);
+                            } else if waku.state.selected_session == Some(session_id) {
+                                waku.reset_visible_state();
+                                waku.reset_transcript_rows(waku.transcript_row_count());
+                                waku.refresh_composer_sources(cx);
+                                waku.refresh_selected_antigravity_swarm_if_relevant(cx);
+                                if waku
+                                    .state
+                                    .sessions
+                                    .iter()
+                                    .any(|s| s.id == session_id && (s.status.is_busy() || s.has_started()))
+                                {
+                                    waku.start_runtime_attachment(session_id, cx);
+                                }
                             }
                         }
                     }
                     Err(error) => {
+                        if waku
+                            .pending_split_open
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == session_id)
+                        {
+                            waku.pending_split_open = None;
+                        }
                         if waku
                             .pending_session_activation
                             .is_some_and(|pending| pending.session_id == session_id)
@@ -407,6 +434,18 @@ impl Waku {
     }
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        self.activate_session_with(session_id, chat_split::ChatActivation::Replace, cx);
+    }
+
+    pub(super) fn activate_session_with(
+        &mut self,
+        session_id: Uuid,
+        activation: chat_split::ChatActivation,
+        cx: &mut Context<Self>,
+    ) {
+        let preserve = matches!(activation, chat_split::ChatActivation::Preserve);
+        let previous_selected = self.state.selected_session;
+        let previous_project = self.state.selected_project;
         let session_changed = self.state.selected_session != Some(session_id);
         // Panels belong to the workspace, so moving between sessions that
         // open into the same directory keeps Files, Terminal, and GitGraph
@@ -424,6 +463,31 @@ impl Waku {
             if panel_scope_changed {
                 self.store_selected_right_panel_state();
                 self.store_selected_bottom_panel_state();
+            }
+        }
+        match activation {
+            chat_split::ChatActivation::Replace => {}
+            chat_split::ChatActivation::Preserve => {
+                if let Some(mut split) = self.chat_split.take() {
+                    self.exchange_chat_view_fields(&mut split.view);
+                    if let Some(prev) = previous_selected {
+                        split.session_id = prev;
+                        split.project_id = previous_project;
+                        split.focused_side = split.focused_side.other();
+                        self.chat_split = Some(split);
+                    }
+                }
+            }
+            chat_split::ChatActivation::FreshPane(mut view) => {
+                self.exchange_chat_view_fields(&mut view);
+                if let Some(prev) = previous_selected {
+                    self.chat_split = Some(chat_split::ChatSplit {
+                        session_id: prev,
+                        project_id: previous_project,
+                        focused_side: chat_split::ChatPaneSide::Right,
+                        view,
+                    });
+                }
             }
         }
         self.state.selected_session = Some(session_id);
@@ -470,7 +534,9 @@ impl Waku {
             self.session_navigation.remember_new_task(session_id);
         }
         if session_changed {
-            self.restore_selected_composer_draft(cx);
+            if !preserve {
+                self.restore_selected_composer_draft(cx);
+            }
             if panel_scope_changed {
                 self.restore_right_panel_state(session_id, cx);
                 self.restore_bottom_panel_state(session_id);
@@ -484,7 +550,9 @@ impl Waku {
             self.ensure_right_panel_terminals(cx);
         }
         self.restore_persistent_terminals(cx);
-        self.reset_visible_state();
+        if !preserve {
+            self.reset_visible_state();
+        }
         if session_changed {
             // Each materialized worktree has its own cache entry. A task that
             // finished while another session was selected could otherwise
@@ -495,7 +563,9 @@ impl Waku {
             self.sync_antigravity_swarm_polling(cx);
         }
         self.refresh_composer_sources(cx);
-        self.reset_transcript_rows(self.transcript_row_count());
+        if !preserve {
+            self.reset_transcript_rows(self.transcript_row_count());
+        }
         self.save();
         if self
             .selected_session()
@@ -526,12 +596,11 @@ impl Waku {
         self.refresh_selected_antigravity_swarm_if_relevant(cx);
     }
 
-    pub(super) fn create_session_for(
+    pub(super) fn ensure_draft_session_for(
         &mut self,
         project_id: Uuid,
         provider: ProviderKind,
-        cx: &mut Context<Self>,
-    ) {
+    ) -> Uuid {
         if let Some(draft_id) = self
             .state
             .sessions
@@ -539,8 +608,7 @@ impl Waku {
             .find(|session| session.project_id == project_id && !session.has_started())
             .map(|session| session.id)
         {
-            self.select_session(draft_id, cx);
-            return;
+            return draft_id;
         }
         // A task opened from the current task carries its working access mode.
         // `last_runtime_mode` covers launch and the few creation paths without
@@ -570,6 +638,16 @@ impl Waku {
             .sessions
             .insert(session.id, self.hosts.ownership.project(project_id));
         self.state.push_session(session);
+        id
+    }
+
+    pub(super) fn create_session_for(
+        &mut self,
+        project_id: Uuid,
+        provider: ProviderKind,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.ensure_draft_session_for(project_id, provider);
         self.select_session(id, cx);
     }
 

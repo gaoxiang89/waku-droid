@@ -40,6 +40,8 @@ menu.toggle_right_panel:
   en: Toggle Right Panel
 menu.toggle_bottom_panel:
   en: Toggle Bottom Panel
+menu.toggle_chat_split:
+  en: Toggle Split Chat
 menu.new_terminal:
   en: New Terminal
 menu.focus_composer:
@@ -128,6 +130,10 @@ command_palette.show_bottom_panel:
   en: Show bottom panel
 command_palette.hide_bottom_panel:
   en: Hide bottom panel
+command_palette.split_chat:
+  en: Split Chat
+command_palette.close_chat_split:
+  en: Close Split Chat
 command_palette.new_terminal:
   en: New terminal
 command_palette.toggle_files:
@@ -552,6 +558,8 @@ sidebar.unpin:
   en: Unpin task
 sidebar.pinned:
   en: Pinned
+sidebar.open_in_split:
+  en: Open in Split View
 project.options:
   en: Workspace options
 project.archive:
@@ -1949,6 +1957,12 @@ bottom_panel.tabs:
   en: Terminal tabs
 bottom_panel.close_tab:
   en: Close %{title}
+chat_split.toggle:
+  en: Split Chat
+chat_split.close_pane:
+  en: Close Pane
+chat_split.already_new_task:
+  en: Start this task first, or open another task in split view from the sidebar.
 
 open_in.open:
   en: Open project in %{app}

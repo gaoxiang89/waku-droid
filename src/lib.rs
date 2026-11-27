@@ -71,6 +71,7 @@ actions!(
         ToggleSidebar,
         ToggleRightPanel,
         ToggleBottomPanel,
+        ToggleChatSplit,
         ToggleFilesSurface,
         ToggleGitGraphSurface,
         NewTerminal,
@@ -265,6 +266,7 @@ pub fn run(startup_open: Option<crate::cli::StartupOpenRequest>) {
                 // The VS Code convention for the terminal panel beneath the
                 // editor.
                 KeyBinding::new("secondary-j", ToggleBottomPanel, None),
+                KeyBinding::new("secondary-\\", ToggleChatSplit, Some("Waku")),
                 // VS Code again: the explorer and source-control chords.
                 KeyBinding::new("secondary-shift-e", ToggleFilesSurface, None),
                 KeyBinding::new("secondary-shift-g", ToggleGitGraphSurface, None),
@@ -530,6 +532,7 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                 MenuItem::action(tr!("menu.toggle_sidebar"), ToggleSidebar),
                 MenuItem::action(tr!("menu.toggle_right_panel"), ToggleRightPanel),
                 MenuItem::action(tr!("menu.toggle_bottom_panel"), ToggleBottomPanel),
+                MenuItem::action(tr!("menu.toggle_chat_split"), ToggleChatSplit),
                 MenuItem::action(tr!("menu.new_terminal"), NewTerminal),
                 MenuItem::action(tr!("menu.focus_composer"), FocusComposer),
                 MenuItem::action(tr!("menu.toggle_model_picker"), ToggleModelPicker),

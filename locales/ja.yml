@@ -20,6 +20,7 @@ menu.command_palette: コマンドパレット…
 menu.toggle_sidebar: サイドバーの表示を切り替える
 menu.toggle_right_panel: 右パネルの表示を切り替える
 menu.toggle_bottom_panel: 下パネルの表示を切り替える
+menu.toggle_chat_split: チャットを分割表示
 menu.new_terminal: 新規ターミナル
 menu.focus_composer: 入力欄にフォーカスを移動
 menu.toggle_model_picker: モデル選択の表示を切り替える
@@ -65,6 +66,8 @@ command_palette.show_right_panel: 右パネルを表示
 command_palette.hide_right_panel: 右パネルを隠す
 command_palette.show_bottom_panel: 下パネルを表示
 command_palette.hide_bottom_panel: 下パネルを隠す
+command_palette.split_chat: チャットを分割
+command_palette.close_chat_split: チャット分割を閉じる
 command_palette.new_terminal: 新規ターミナル
 command_palette.toggle_files: ファイルパネルを切り替え
 command_palette.toggle_git_graph: Git Graph パネルを切り替え
@@ -282,6 +285,7 @@ sidebar.search: 検索
 sidebar.pin: タスクをピン留め
 sidebar.unpin: ピン留めを解除
 sidebar.pinned: ピン留め済み
+sidebar.open_in_split: 分割ビューで開く
 project.options: ワークスペースのオプション
 project.archive: ワークスペースをアーカイブ
 project.restore: ワークスペースを復元
@@ -994,6 +998,9 @@ bottom_panel.split_down: ターミナルを上下に分割
 bottom_panel.close_pane: 分割ペインを閉じる
 bottom_panel.tabs: ターミナルタブ
 bottom_panel.close_tab: "%{title} を閉じる"
+chat_split.toggle: チャットを分割
+chat_split.close_pane: ペインを閉じる
+chat_split.already_new_task: まずこのタスクを開始するか、サイドバーから別のタスクを分割ビューで開いてください。
 
 open_in.open: "プロジェクトを %{app} で開く"
 open_in.choose: プロジェクトを開くアプリを選択…

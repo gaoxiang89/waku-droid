@@ -4870,6 +4870,7 @@ impl Waku {
         let mut persisted_state_changed = false;
         let mut force_save = false;
         let mut selected_changed = false;
+        let mut split_changed = false;
         for session_id in session_ids {
             let Some(mut runtime) = self.runtimes.remove(&session_id) else {
                 continue;
@@ -4943,6 +4944,13 @@ impl Waku {
                 && (runtime_changed || follow_up_remeasure)
             {
                 selected_changed = true;
+            } else if self
+                .chat_split
+                .as_ref()
+                .is_some_and(|split| split.session_id == session_id)
+                && (runtime_changed || follow_up_remeasure)
+            {
+                split_changed = true;
             }
         }
 
@@ -4963,6 +4971,11 @@ impl Waku {
         }
         if selected_changed {
             self.remeasure_transcript_tail();
+        }
+        if split_changed {
+            let _ = self.with_chat_view(chat_split::ChatPaneRole::Unfocused, |this| {
+                this.remeasure_transcript_tail();
+            });
         }
         if self.stream_state_dirty
             && (force_save || self.last_stream_save.elapsed() >= STREAM_SAVE_INTERVAL)

@@ -197,6 +197,13 @@ impl Waku {
             - self.effective_files_panel_width(window)
     }
 
+    pub(super) fn chat_pane_width(&self, window: &Window) -> f32 {
+        chat_split::split_chat_pane_width(
+            self.chat_viewport_width(window),
+            self.chat_split.is_some(),
+        )
+    }
+
     /// [`WakuPane`] delegate for the sidebar island.
     pub(super) fn sidebar_pane_content(
         &mut self,
@@ -208,24 +215,117 @@ impl Waku {
             .into_any_element()
     }
 
-    /// [`WakuPane`] delegate for the transcript island.
+    /// [`WakuPane`] delegate for the primary transcript island.
     pub(super) fn transcript_pane_content(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chat_viewport_width = self.chat_viewport_width(window);
-        // The transcript's own element sizes itself with `flex_1`, which only
-        // stretches inside a flex parent. A cached pane lays its content out
-        // as a root, so give it that parent here or its height collapses to
-        // the zero flex basis.
-        div()
-            .size_full()
+        self.chat_pane_transcript(chat_split::ChatPaneSide::Left, window, cx)
+    }
+
+    /// [`WakuPane`] delegate for the split transcript island.
+    pub(super) fn split_transcript_pane_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.chat_pane_transcript(chat_split::ChatPaneSide::Right, window, cx)
+    }
+
+    fn chat_pane_transcript(
+        &mut self,
+        side: chat_split::ChatPaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let role = self.chat_role_for_side(side);
+        let pane_width = self.chat_pane_width(window);
+        self.with_chat_view(role, |this| {
+            // The transcript's own element sizes itself with `flex_1`, which only
+            // stretches inside a flex parent. A cached pane lays its content out
+            // as a root, so give it that parent here or its height collapses to
+            // the zero flex basis.
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .child(this.render_transcript(window, pane_width, role, cx))
+                .into_any_element()
+        })
+        .unwrap_or_else(|| div().into_any_element())
+    }
+
+    fn render_chat_pane(
+        &mut self,
+        side: chat_split::ChatPaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let role = self.chat_role_for_side(side);
+        let split = self.chat_split.is_some();
+        let island = match side {
+            chat_split::ChatPaneSide::Left => self.transcript_pane.clone(),
+            chat_split::ChatPaneSide::Right => self.split_transcript_pane.clone(),
+        };
+        let Some((transcript_or_empty, permission, queued_and_composer, title)) =
+            self.with_chat_view(role, |this| {
+                let empty = should_render_empty_state(this.selected_session());
+                let transcript_or_empty = if empty {
+                    this.render_empty_state(cx).into_any_element()
+                } else {
+                    island
+                        .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
+                        .into_any_element()
+                };
+                let permission = this.render_permission(window, cx);
+                let queued_and_composer = this.selected_project().is_some().then(|| {
+                    (
+                        this.render_queued_messages(cx),
+                        this.render_composer(window, cx),
+                    )
+                });
+                let title = this
+                    .selected_session()
+                    .map(sidebar::localized_session_title)
+                    .unwrap_or_else(|| tr!("session.new_task"));
+                (transcript_or_empty, permission, queued_and_composer, title)
+            })
+        else {
+            return div().into_any_element();
+        };
+        let focused = role == chat_split::ChatPaneRole::Focused;
+        let mut body = div()
+            .id(side.body_id())
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .flex()
             .flex_col()
+            .child(transcript_or_empty)
+            .children(permission);
+        if let Some((queued, composer)) = queued_and_composer {
+            body = body.children(queued).child(composer);
+        }
+        if split && !focused {
+            body = body.capture_any_mouse_down(cx.listener(
+                move |this, _: &MouseDownEvent, _, cx| {
+                    this.focus_chat_pane(side, cx);
+                },
+            ));
+        }
+        let mut outer = div()
+            .id(side.pane_id())
+            .flex_1()
+            .min_w_0()
             .min_h_0()
-            .child(self.render_transcript(window, chat_viewport_width, cx))
-            .into_any_element()
+            .flex()
+            .flex_col();
+        if split {
+            outer = outer.child(self.render_chat_pane_header(side, focused, title, cx));
+        }
+        outer.child(body).into_any_element()
     }
 
     /// [`WakuPane`] delegate for the right-panel island.
@@ -340,9 +440,28 @@ impl Render for Waku {
         // settings covers them and while the window isn't drawing at all.
         self.schedule_time_label_wake(cx);
 
+        self.reconcile_chat_split();
         let theme = Theme::current(cx);
-        let empty = should_render_empty_state(self.selected_session());
-        let permission = self.render_permission(window, cx);
+        let chat_area = if self.chat_split.is_some() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .flex()
+                .flex_row()
+                .child(self.render_chat_pane(chat_split::ChatPaneSide::Left, window, cx))
+                .child(
+                    div()
+                        .w(px(chat_split::CHAT_SPLIT_DIVIDER_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .bg(theme.border),
+                )
+                .child(self.render_chat_pane(chat_split::ChatPaneSide::Right, window, cx))
+                .into_any_element()
+        } else {
+            self.render_chat_pane(chat_split::ChatPaneSide::Left, window, cx)
+        };
         let computer_use = self.render_computer_use_overlay(window, cx);
         let command_palette = self.render_command_palette(window, cx);
         let commit_dialog = self.render_commit_dialog(cx);
@@ -363,6 +482,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
+            .on_action(cx.listener(Self::toggle_chat_split_action))
             .on_action(cx.listener(Self::toggle_files_surface_action))
             .on_action(cx.listener(Self::toggle_git_graph_surface_action))
             .on_action(cx.listener(Self::new_terminal_action))
@@ -456,21 +576,9 @@ impl Render for Waku {
                             .when(panels.sidebar > 0.0, |element| {
                                 element.border_l_1().border_color(theme.sidebar_border)
                             })
-                            .child(if empty {
-                                self.render_empty_state(cx).into_any_element()
-                            } else {
-                                self.transcript_pane
-                                    .clone()
-                                    .cached(
-                                        StyleRefinement::default().flex_1().min_h(px(0.0)).w_full(),
-                                    )
-                                    .into_any_element()
-                            })
-                            .children(permission)
+                            .child(chat_area)
                             .when(self.selected_project().is_some(), |element| {
                                 element
-                                    .children(self.render_queued_messages(cx))
-                                    .child(self.render_composer(window, cx))
                                     // The bottom panel sits between the composer and
                                     // the workspace footer. It slides through the same
                                     // narrowing-container trick as the side panels,

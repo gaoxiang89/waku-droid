@@ -446,14 +446,14 @@ impl Waku {
 
     pub(super) fn sync_transcript_layout_width(&self, window: &Window) -> bool {
         let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
-        let sidebar_width = px(sidebar_width);
-        let right_panel_width = px(right_panel_width);
-        let content_width = (window.viewport_size().width
-            - sidebar_width
-            - right_panel_width
-            - px(self.effective_files_panel_width(window))
-            - px(40.0))
-        .clamp(px(1.0), px(CONTENT_MAX_WIDTH));
+        let mut column = window.viewport_size().width
+            - px(sidebar_width)
+            - px(right_panel_width)
+            - px(self.effective_files_panel_width(window));
+        if self.chat_split.is_some() {
+            column = (column - px(chat_split::CHAT_SPLIT_DIVIDER_WIDTH)) * 0.5;
+        }
+        let content_width = (column - px(40.0)).clamp(px(1.0), px(CONTENT_MAX_WIDTH));
         let previous = self.transcript_layout_width.replace(content_width);
         if previous > Pixels::ZERO && (previous - content_width).abs() < px(1.0) {
             return false;

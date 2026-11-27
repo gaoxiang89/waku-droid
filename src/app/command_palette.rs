@@ -165,6 +165,7 @@ enum PaletteAction {
     ToggleSidebar,
     ToggleRightPanel,
     ToggleBottomPanel,
+    ToggleChatSplit,
     ToggleFilesSurface,
     ToggleGitGraphSurface,
     ToggleSwarmSurface,
@@ -842,6 +843,19 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⌘J", "Ctrl+J")),
                 PaletteAction::ToggleBottomPanel,
                 "toggle show hide bottom panel terminal shell console",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!(if self.chat_split.is_some() {
+                    "command_palette.close_chat_split"
+                } else {
+                    "command_palette.split_chat"
+                }),
+                "icons/split.svg",
+                Some(crate::platform::primary_shortcut("⌘\\", "Ctrl+\\")),
+                PaletteAction::ToggleChatSplit,
+                "split chat conversation side by side two panes dialog dual 分屏 对话",
                 next(),
             ),
             CommandPaletteItem::command(
@@ -1891,6 +1905,9 @@ impl Waku {
             }
             PaletteAction::ToggleBottomPanel => {
                 self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
+            }
+            PaletteAction::ToggleChatSplit => {
+                self.toggle_chat_split_action(&ToggleChatSplit, window, cx)
             }
             PaletteAction::ToggleFilesSurface => {
                 self.toggle_files_surface_action(&ToggleFilesSurface, window, cx)

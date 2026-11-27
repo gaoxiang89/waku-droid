@@ -75,9 +75,10 @@ use crate::{
     OpenResumePicker, OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
     ResizeTerminalPaneLeft, ResizeTerminalPaneRight, ResizeTerminalPaneUp, SaveFile,
     SelectFirstTask, SelectLastTask, SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward,
-    SwitchTaskForward, ToggleBottomPanel, ToggleCommandPalette, ToggleFilesSurface,
-    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
-    ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
+    SwitchTaskForward, ToggleBottomPanel, ToggleChatSplit, ToggleCommandPalette,
+    ToggleFilesSurface, ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord,
+    ToggleFpsCounter, ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
+    ToggleUsagePanel,
 };
 use terminal_split::{
     MAX_SPLIT_PANES, ResizeDirection, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup,
@@ -2037,9 +2038,14 @@ pub struct Waku {
     /// Cached islands of the root view; see [`WakuPane`].
     sidebar_pane: Entity<WakuPane>,
     transcript_pane: Entity<WakuPane>,
+    split_transcript_pane: Entity<WakuPane>,
     right_panel_pane: Entity<WakuPane>,
     files_panel_pane: Entity<WakuPane>,
     bottom_panel_pane: Entity<WakuPane>,
+    chat_split: Option<chat_split::ChatSplit>,
+    chat_view_exchanged: bool,
+    pending_split_open: Option<(Uuid, chat_split::ChatViewState)>,
+    chat_pane_close_focus: [FocusHandle; 2],
     /// The unix second the pending time-label wake-up targets, or `None` when
     /// none is armed. See `schedule_time_label_wake`.
     time_label_wake: Cell<Option<u64>>,
@@ -2056,6 +2062,7 @@ mod autocomplete;
 mod background_work;
 mod bottom_panel;
 mod branches;
+mod chat_split;
 mod command_palette;
 mod commit_dialog;
 mod components;
@@ -2499,6 +2506,90 @@ impl Waku {
         }
     }
 
+    pub(super) fn subscribe_composer_events(
+        composer: &Entity<ComposerInput>,
+        cx: &mut Context<Self>,
+    ) {
+        // Edits, not raw notifies: a field also notifies for caret blinks
+        // and selection changes, and none of the app chrome depends on
+        // those — re-rendering the window twice a second for a blinking
+        // caret is exactly what the Performance guidance forbids.
+        cx.subscribe(
+            composer,
+            |this: &mut Self, emitter, event: &ComposerEvent, cx| {
+                if emitter != this.composer {
+                    if matches!(event, ComposerEvent::Focus) {
+                        this.focus_chat_pane_owning_composer(&emitter, cx);
+                    }
+                    return;
+                }
+                match event {
+                    ComposerEvent::Submit(prompt) => {
+                        if let Some(session_id) = this.selected_session().and_then(|session| {
+                            this.response_fork_preparations
+                                .contains_key(&session.id)
+                                .then_some(session.id)
+                        }) {
+                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
+                        } else if let Some(submission) =
+                            this.submission_with_attachments(prompt, cx)
+                        {
+                            this.submit_composer_submission(submission, cx);
+                        }
+                    }
+                    ComposerEvent::SubmitSteer(prompt) => {
+                        if let Some(session_id) = this.selected_session().and_then(|session| {
+                            this.response_fork_preparations
+                                .contains_key(&session.id)
+                                .then_some(session.id)
+                        }) {
+                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
+                        } else if let Some(submission) =
+                            this.submission_with_attachments_for_steer(prompt, cx)
+                        {
+                            this.steer_composer_submission(submission, cx);
+                        }
+                    }
+                    ComposerEvent::SteerQueued => {
+                        // Staged attachments make this a real draft even when
+                        // the text field is empty. Preserve the shortcut's
+                        // previous no-op behavior until that draft is sent or
+                        // cleared.
+                        if this.composer_attachments.is_empty() {
+                            this.steer_oldest_queued_message(cx);
+                        }
+                    }
+                    ComposerEvent::Edited => {
+                        this.schedule_composer_draft_save(cx);
+                        cx.notify();
+                    }
+                    ComposerEvent::Focus => {}
+                    ComposerEvent::BackspaceOnEmpty => {
+                        if this.composer_attachments.pop().is_some() {
+                            this.schedule_composer_draft_save(cx);
+                            cx.notify();
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+
+        // Clipboard images and Finder file copies are attachment payloads,
+        // not text paths. The input owns representation priority; Waku
+        // owns durable staging and composer/session state.
+        cx.subscribe(
+            composer,
+            |this: &mut Self, emitter, event: &ComposerAttachmentPaste, cx| {
+                if emitter != this.composer {
+                    return;
+                }
+                this.stage_pasted_attachments(event.0.clone(), cx);
+            },
+        )
+        .detach();
+    }
+
     pub fn new(
         window: &mut Window,
         cx: &mut App,
@@ -2616,6 +2707,7 @@ impl Waku {
         let navigation_rail = cx.new(|_| ConversationNavigationRail::new());
         let sidebar_pane = WakuPane::new(Waku::sidebar_pane_content, cx);
         let transcript_pane = WakuPane::new(Waku::transcript_pane_content, cx);
+        let split_transcript_pane = WakuPane::new(Waku::split_transcript_pane_content, cx);
         let right_panel_pane = WakuPane::new(Waku::right_panel_pane_content, cx);
         let files_panel_pane = WakuPane::new(Waku::files_panel_pane_content, cx);
         let bottom_panel_pane = WakuPane::new(Waku::bottom_panel_pane_content, cx);
@@ -2841,48 +2933,19 @@ impl Waku {
         }) {
             session_navigation.remember_new_task(session_id);
         }
-        // Measure visible rows only, with a generous overdraw — the same shape
-        // Zed's own agent chat uses. `measure_all` lays out every row in the
-        // session on the first frame and again after any structural splice,
-        // which a long transcript cannot afford.
-        let transcript_rows = ListState::new(0, ListAlignment::Bottom, px(2048.0));
-        let anchored_transcript_rows = ListState::new(0, ListAlignment::Top, px(2048.0));
+        let (
+            transcript_rows,
+            anchored_transcript_rows,
+            transcript_is_scrolled,
+            transcript_anchor_following,
+            transcript_tail_recheck,
+        ) = chat_split::transcript_list_states();
         let sidebar_list_state = ListState::new(0, ListAlignment::Top, px(256.0));
         let usage_projects_list = ListState::new(0, ListAlignment::Top, px(256.0));
         let branch_picker_list_state = ListState::new(0, ListAlignment::Top, px(152.0));
         let project_picker_list_state = ListState::new(0, ListAlignment::Top, px(152.0));
         let git_graph_list_state =
             ListState::new(0, ListAlignment::Top, px(256.0)).with_uniform_item_height(px(48.0));
-        let transcript_is_scrolled = Rc::new(Cell::new(false));
-        let transcript_anchor_following = Rc::new(Cell::new(false));
-        let transcript_tail_recheck = Rc::new(Cell::new(false));
-        // A wheel scroll drops tail following and asks the next measured frame
-        // whether it landed back on the tail. GPUI re-engages its own tail pin
-        // when a bottom-aligned list reaches the end — it represents that end as
-        // no logical offset — but a turn renders through the top-aligned
-        // anchored list, whose end is an ordinary offset, so only this can.
-        transcript_rows.set_scroll_handler({
-            let transcript_is_scrolled = transcript_is_scrolled.clone();
-            let transcript_anchor_following = transcript_anchor_following.clone();
-            let transcript_tail_recheck = transcript_tail_recheck.clone();
-            move |event, window, _| {
-                transcript_is_scrolled.set(event.is_scrolled);
-                transcript_anchor_following.set(false);
-                transcript_tail_recheck.set(true);
-                window.refresh();
-            }
-        });
-        anchored_transcript_rows.set_scroll_handler({
-            let transcript_is_scrolled = transcript_is_scrolled.clone();
-            let transcript_anchor_following = transcript_anchor_following.clone();
-            let transcript_tail_recheck = transcript_tail_recheck.clone();
-            move |event, window, _| {
-                transcript_is_scrolled.set(event.is_scrolled);
-                transcript_anchor_following.set(false);
-                transcript_tail_recheck.set(true);
-                window.refresh();
-            }
-        });
         // Enable GPUI's experimental overlay plane so deferred draws (menus,
         // tooltips, popovers) composite above native content — without it the
         // browser surface would cover them.
@@ -2918,6 +2981,7 @@ impl Waku {
             let git_graph_next_match_focus = cx.focus_handle();
             let git_graph_load_more_focus = cx.focus_handle();
             let git_graph_copy_focus = cx.focus_handle();
+            let chat_pane_close_focus = [cx.focus_handle(), cx.focus_handle()];
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
                 &task_switcher_focus,
@@ -3002,73 +3066,7 @@ impl Waku {
             })
             .detach();
 
-            // Edits, not raw notifies: a field also notifies for caret blinks
-            // and selection changes, and none of the app chrome depends on
-            // those — re-rendering the window twice a second for a blinking
-            // caret is exactly what the Performance guidance forbids.
-            cx.subscribe(
-                &composer,
-                |this: &mut Self, _, event: &ComposerEvent, cx| match event {
-                    ComposerEvent::Submit(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
-                        }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments(prompt, cx)
-                        {
-                            this.submit_composer_submission(submission, cx);
-                        }
-                    }
-                    ComposerEvent::SubmitSteer(prompt) => {
-                        if let Some(session_id) = this.selected_session().and_then(|session| {
-                            this.response_fork_preparations
-                                .contains_key(&session.id)
-                                .then_some(session.id)
-                        }) {
-                            this.defer_restore_composer_after_fork(session_id, prompt.clone(), cx);
-                        } else if let Some(submission) =
-                            this.submission_with_attachments_for_steer(prompt, cx)
-                        {
-                            this.steer_composer_submission(submission, cx);
-                        }
-                    }
-                    ComposerEvent::SteerQueued => {
-                        // Staged attachments make this a real draft even when
-                        // the text field is empty. Preserve the shortcut's
-                        // previous no-op behavior until that draft is sent or
-                        // cleared.
-                        if this.composer_attachments.is_empty() {
-                            this.steer_oldest_queued_message(cx);
-                        }
-                    }
-                    ComposerEvent::Edited => {
-                        this.schedule_composer_draft_save(cx);
-                        cx.notify();
-                    }
-                    ComposerEvent::Focus => {}
-                    ComposerEvent::BackspaceOnEmpty => {
-                        if this.composer_attachments.pop().is_some() {
-                            this.schedule_composer_draft_save(cx);
-                            cx.notify();
-                        }
-                    }
-                },
-            )
-            .detach();
-
-            // Clipboard images and Finder file copies are attachment payloads,
-            // not text paths. The input owns representation priority; Waku
-            // owns durable staging and composer/session state.
-            cx.subscribe(
-                &composer,
-                |this: &mut Self, _, event: &ComposerAttachmentPaste, cx| {
-                    this.stage_pasted_attachments(event.0.clone(), cx);
-                },
-            )
-            .detach();
+            Self::subscribe_composer_events(&composer, cx);
 
             // A normal Cmd-Q waits briefly for this future, so even an edit
             // made inside the debounce window is durable before the process
@@ -3856,9 +3854,14 @@ impl Waku {
                 navigation_rail_reset_generation: Cell::new(0),
                 sidebar_pane: sidebar_pane.clone(),
                 transcript_pane: transcript_pane.clone(),
+                split_transcript_pane: split_transcript_pane.clone(),
                 right_panel_pane: right_panel_pane.clone(),
                 files_panel_pane: files_panel_pane.clone(),
                 bottom_panel_pane: bottom_panel_pane.clone(),
+                chat_split: None,
+                chat_view_exchanged: false,
+                pending_split_open: None,
+                chat_pane_close_focus,
                 time_label_wake: Cell::new(None),
                 time_label_wake_generation: Cell::new(0),
                 fps_last_frame: Instant::now(),
@@ -3870,6 +3873,7 @@ impl Waku {
         for pane in [
             &sidebar_pane,
             &transcript_pane,
+            &split_transcript_pane,
             &right_panel_pane,
             &files_panel_pane,
             &bottom_panel_pane,
