@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -215,6 +216,15 @@ impl Download<'_> {
             else {
                 anyhow::bail!("the daemon returned an invalid directory response");
             };
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+                if let Some((a, b)) = case_collision(&names) {
+                    anyhow::bail!(
+                        "\"{a}\" and \"{b}\" differ only in letter case and cannot both be saved here"
+                    );
+                }
+            }
             for entry in entries {
                 self.check_canceled()?;
                 validate_name(&entry.name)?;
@@ -318,16 +328,75 @@ impl Download<'_> {
     }
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos", test)), allow(dead_code))]
+fn case_collision(names: &[&str]) -> Option<(String, String)> {
+    let mut seen = HashMap::with_capacity(names.len());
+    for &name in names {
+        if let Some(first) = seen.insert(name.to_lowercase(), name) {
+            return Some((first.to_owned(), name.to_owned()));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn is_reserved_windows_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+    RESERVED
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+}
+
 fn validate_name(name: &str) -> anyhow::Result<()> {
     let valid = Path::new(name).file_name().is_some_and(|part| part == name);
     #[cfg(windows)]
     let valid = valid
         && !name.contains(['<', '>', ':', '"', '|', '?', '*'])
         && !name.ends_with([' ', '.'])
-        && !name.chars().any(char::is_control);
+        && !name.chars().any(char::is_control)
+        && !is_reserved_windows_name(name);
     ensure!(
         valid,
         "cannot save \"{name}\" as a local file or folder name"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_collision_detects_case_only_siblings() {
+        assert_eq!(
+            case_collision(&["README", "src", "readme"]),
+            Some(("README".to_owned(), "readme".to_owned()))
+        );
+    }
+
+    #[test]
+    fn case_collision_returns_none_for_distinct_names() {
+        assert_eq!(case_collision(&["README", "Cargo.toml", "src"]), None);
+        assert_eq!(case_collision(&[]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_name_rejects_windows_reserved_names() {
+        for name in ["CON", "con.txt", "Lpt1.log", "PRN", "aux.md", "nul", "COM9"] {
+            assert!(validate_name(name).is_err(), "expected {name} to fail");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_name_accepts_non_reserved_names() {
+        for name in ["console.txt", "com10", "lpt0", "my.con"] {
+            assert!(validate_name(name).is_ok(), "expected {name} to pass");
+        }
+    }
 }
