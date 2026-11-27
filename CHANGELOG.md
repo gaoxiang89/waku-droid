@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.59]
+
+- Detect a daemon from another Narel version when connecting instead of running against it: folder downloads no longer fail with "the daemon could not parse this request" when a local or remote host still runs an older resident daemon, and the desktop replaces a stale daemon or reports the mismatch at the handshake. The desktop, daemon, mobile, and web clients must run the same version.
+
 ## [0.1.58]
 
 - Download folders from the Files panel in local, SSH, and WSL workspaces. Choose a local destination, track progress, and cancel the transfer if needed. Downloads preserve nested and empty folders, skip symbolic links, and protect existing destination folders from being overwritten.
