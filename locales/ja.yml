@@ -20,6 +20,7 @@ menu.command_palette: コマンドパレット…
 menu.toggle_sidebar: サイドバーの表示を切り替える
 menu.toggle_right_panel: 右パネルの表示を切り替える
 menu.toggle_bottom_panel: 下パネルの表示を切り替える
+menu.toggle_bottom_panel_maximize: 下パネルの最大化を切り替え
 menu.toggle_chat_split: チャットを分割表示
 menu.new_terminal: 新規ターミナル
 menu.focus_composer: 入力欄にフォーカスを移動
@@ -66,6 +67,8 @@ command_palette.show_right_panel: 右パネルを表示
 command_palette.hide_right_panel: 右パネルを隠す
 command_palette.show_bottom_panel: 下パネルを表示
 command_palette.hide_bottom_panel: 下パネルを隠す
+command_palette.maximize_bottom_panel: 下パネルを最大化
+command_palette.restore_bottom_panel: 下パネルを元のサイズに戻す
 command_palette.split_chat: チャットを分割
 command_palette.close_chat_split: チャット分割を閉じる
 command_palette.new_terminal: 新規ターミナル
@@ -998,6 +1001,8 @@ bottom_panel.split_down: ターミナルを上下に分割
 bottom_panel.close_pane: 分割ペインを閉じる
 bottom_panel.tabs: ターミナルタブ
 bottom_panel.close_tab: "%{title} を閉じる"
+bottom_panel.maximize: 下パネルを最大化
+bottom_panel.restore: 下パネルを元のサイズに戻す
 chat_split.toggle: チャットを分割
 chat_split.close_pane: ペインを閉じる
 chat_split.already_new_task: まずこのタスクを開始するか、サイドバーから別のタスクを分割ビューで開いてください。

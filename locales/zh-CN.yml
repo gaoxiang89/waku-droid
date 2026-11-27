@@ -20,6 +20,7 @@ menu.command_palette: 命令面板…
 menu.toggle_sidebar: 显示或隐藏侧边栏
 menu.toggle_right_panel: 显示或隐藏右侧面板
 menu.toggle_bottom_panel: 显示或隐藏底部面板
+menu.toggle_bottom_panel_maximize: 最大化或还原底部面板
 menu.toggle_chat_split: 分屏显示对话
 menu.new_terminal: 新建终端
 menu.focus_composer: 将焦点移到输入框
@@ -64,6 +65,8 @@ command_palette.show_right_panel: 显示右侧面板
 command_palette.hide_right_panel: 隐藏右侧面板
 command_palette.show_bottom_panel: 显示底部面板
 command_palette.hide_bottom_panel: 隐藏底部面板
+command_palette.maximize_bottom_panel: 最大化底部面板
+command_palette.restore_bottom_panel: 还原底部面板
 command_palette.split_chat: 分屏对话
 command_palette.close_chat_split: 关闭分屏对话
 command_palette.new_terminal: 新建终端
@@ -961,6 +964,8 @@ bottom_panel.split_down: 向下分屏
 bottom_panel.close_pane: 关闭终端分屏
 bottom_panel.tabs: 终端标签页
 bottom_panel.close_tab: 关闭%{title}
+bottom_panel.maximize: 最大化底部面板
+bottom_panel.restore: 还原底部面板
 chat_split.toggle: 分屏对话
 chat_split.close_pane: 关闭此窗格
 chat_split.already_new_task: 请先开始当前任务，或从侧边栏将其他任务在分屏中打开。

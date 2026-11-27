@@ -75,7 +75,8 @@ use crate::{
     OpenResumePicker, OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
     ResizeTerminalPaneLeft, ResizeTerminalPaneRight, ResizeTerminalPaneUp, SaveFile,
     SelectFirstTask, SelectLastTask, SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward,
-    SwitchTaskForward, ToggleBottomPanel, ToggleChatSplit, ToggleCommandPalette,
+    SwitchTaskForward, ToggleBottomPanel, ToggleBottomPanelMaximize, ToggleChatSplit,
+    ToggleCommandPalette,
     ToggleFilesSurface, ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord,
     ToggleFpsCounter, ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
     ToggleUsagePanel,
@@ -941,6 +942,7 @@ impl RightPanelWorkspaceState {
 /// session goes away.
 struct BottomPanelWorkspaceState {
     visible: bool,
+    maximized: bool,
     groups: Vec<SplitGroup>,
     active_group: Option<usize>,
     tabs_scroll_handle: ScrollHandle,
@@ -951,6 +953,7 @@ impl BottomPanelWorkspaceState {
     fn empty(visible: bool) -> Self {
         Self {
             visible,
+            maximized: false,
             groups: Vec::new(),
             active_group: None,
             tabs_scroll_handle: ScrollHandle::new(),
@@ -1720,6 +1723,7 @@ pub struct Waku {
     files_panel_visible: bool,
     files_panel_width: f32,
     bottom_panel_visible: bool,
+    bottom_panel_maximized: bool,
     bottom_panel_height: f32,
     /// The show/hide slide each panel is in the middle of, if any. Driven by
     /// hand from `render` (see [`motion::WidthTween`]) because the width these
@@ -3694,6 +3698,7 @@ impl Waku {
                 files_panel_visible,
                 files_panel_width,
                 bottom_panel_visible,
+                bottom_panel_maximized: false,
                 bottom_panel_height,
                 bottom_panel_terminal_groups: Vec::new(),
                 bottom_panel_active_group: None,

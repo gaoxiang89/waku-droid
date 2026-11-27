@@ -3860,6 +3860,7 @@ impl Waku {
         surface: RightPanelSurface,
         cx: &mut Context<Self>,
     ) {
+        self.set_bottom_panel_maximized(false, cx);
         if surface == RightPanelSurface::Files {
             self.set_files_panel_visible(true, cx);
             return;
@@ -3923,6 +3924,15 @@ impl Waku {
         surface: RightPanelSurface,
         cx: &mut Context<Self>,
     ) {
+        if self.is_bottom_panel_maximized() {
+            self.set_bottom_panel_maximized(false, cx);
+            if surface == RightPanelSurface::Files {
+                self.set_files_panel_visible(true, cx);
+            } else {
+                self.open_right_panel_surface(surface, cx);
+            }
+            return;
+        }
         if surface == RightPanelSurface::Files {
             self.set_files_panel_visible(!self.files_panel_visible, cx);
             return;
@@ -4141,7 +4151,8 @@ impl Waku {
     /// only when a terminal is already what is showing.
     fn render_header_right_terminal_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let active = self.right_panel_visible
+        let active = !self.is_bottom_panel_maximized()
+            && self.right_panel_visible
             && matches!(
                 self.active_right_panel_surface(),
                 Some(RightPanelSurface::Terminal(_))
@@ -4237,8 +4248,12 @@ impl Waku {
     }
 
     pub(super) fn toggle_right_panel_terminal(&mut self, cx: &mut Context<Self>) {
+        let was_maximized = self.is_bottom_panel_maximized();
+        if was_maximized {
+            self.set_bottom_panel_maximized(false, cx);
+        }
         match right_panel_terminal_toggle(
-            self.right_panel_visible,
+            self.right_panel_visible && !was_maximized,
             &self.right_panel_surfaces,
             self.right_panel_active_surface,
         ) {
@@ -4265,11 +4280,12 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let active = if surface == RightPanelSurface::Files {
-            self.files_panel_visible
-        } else {
-            self.right_panel_visible && self.active_right_panel_surface() == Some(&surface)
-        };
+        let active = !self.is_bottom_panel_maximized()
+            && if surface == RightPanelSurface::Files {
+                self.files_panel_visible
+            } else {
+                self.right_panel_visible && self.active_right_panel_surface() == Some(&surface)
+            };
         let focus = self.transcript_control_focus(id, cx);
         let key_surface = surface.clone();
         div()
@@ -4329,6 +4345,7 @@ impl Waku {
 
     pub(super) fn set_files_panel_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if visible {
+            self.set_bottom_panel_maximized(false, cx);
             self.refresh_right_panel_working_tree(cx);
         }
         if self.files_panel_visible == visible {
@@ -4566,6 +4583,7 @@ impl Waku {
         // not apply to it: shown mid-slide it would hang over the transcript
         // at full width. Keep it down until the panel has finished moving.
         let active_browser = if self.settings_page.is_none()
+            && !self.is_bottom_panel_maximized()
             && self.right_panel_visible
             && self.right_panel_slide.is_none()
         {

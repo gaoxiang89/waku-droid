@@ -152,6 +152,9 @@ impl Waku {
             },
         );
         let bottom_panel_content = self.effective_bottom_panel_height(window);
+        if self.is_bottom_panel_maximized() {
+            self.bottom_panel_slide = None;
+        }
         let bottom_panel = slide_width(
             &mut self.bottom_panel_slide,
             if self.bottom_panel_visible {
@@ -348,13 +351,37 @@ impl Waku {
             .into_any_element()
     }
 
+    fn maximized_bottom_panel_size(&self, window: &Window) -> (f32, f32) {
+        let viewport = window.viewport_size();
+        let (horizontal_inset, vertical_inset) = match window.window_decorations() {
+            gpui::Decorations::Client { tiling } => {
+                let edge = 11.0;
+                let horizontal =
+                    if !tiling.left { edge } else { 0.0 } + if !tiling.right { edge } else { 0.0 };
+                let vertical =
+                    if !tiling.top { edge } else { 0.0 } + if !tiling.bottom { edge } else { 0.0 };
+                (horizontal, vertical)
+            }
+            gpui::Decorations::Server => (0.0, 0.0),
+        };
+        let width = (f32::from(viewport.width) - horizontal_inset).max(0.0);
+        let height = (f32::from(viewport.height) - vertical_inset - WINDOW_HEADER_HEIGHT).max(0.0);
+        (width, height)
+    }
+
     pub(super) fn bottom_panel_pane_content(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let height = self.effective_bottom_panel_height(window);
-        let width = self.chat_viewport_width(window);
+        let (width, height) = if self.is_bottom_panel_maximized() {
+            self.maximized_bottom_panel_size(window)
+        } else {
+            (
+                self.chat_viewport_width(window),
+                self.effective_bottom_panel_height(window),
+            )
+        };
         self.render_bottom_panel(height, width, window, cx)
             .into_any_element()
     }
@@ -473,8 +500,18 @@ impl Render for Waku {
         let git_graph_dialog = self.render_git_graph_dialog(cx);
         let remote_folder_picker = self.render_remote_folder_picker(window, cx);
         let toast = self.render_notifications(cx);
+        let bottom_panel_maximized = self.is_bottom_panel_maximized();
+        let (center_toast, maximized_toast) = if bottom_panel_maximized {
+            (None, toast)
+        } else {
+            (toast, None)
+        };
         let content = div()
-            .key_context("Waku")
+            .key_context(if bottom_panel_maximized {
+                "Waku BottomPanelMaximized"
+            } else {
+                "Waku"
+            })
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
             .on_action(cx.listener(Self::new_session_action))
             .on_action(cx.listener(Self::new_project_action))
@@ -482,6 +519,7 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
+            .on_action(cx.listener(Self::toggle_bottom_panel_maximize_action))
             .on_action(cx.listener(Self::toggle_chat_split_action))
             .on_action(cx.listener(Self::toggle_files_surface_action))
             .on_action(cx.listener(Self::toggle_git_graph_surface_action))
@@ -543,6 +581,7 @@ impl Render for Waku {
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    .relative()
                     .flex()
                     // Both panels slide through a container that narrows while their
                     // content keeps its full width and is clipped: the sidebar list
@@ -584,8 +623,10 @@ impl Render for Waku {
                                     // narrowing-container trick as the side panels,
                                     // flipped: the content stays pinned to the column's
                                     // bottom edge and only the clip moves.
-                                    .when(panels.bottom_panel > 0.0, |element| {
-                                        element.child(
+                                    .when(
+                                        !bottom_panel_maximized && panels.bottom_panel > 0.0,
+                                        |element| {
+                                            element.child(
                                             div()
                                                 .w_full()
                                                 .flex_none()
@@ -604,12 +645,13 @@ impl Render for Waku {
                                                             .h(px(panels.bottom_panel_content)),
                                                     ),
                                                 ),
-                                        )
-                                    })
+                                            )
+                                        },
+                                    )
                                     .child(self.render_workspace_footer(cx))
                             })
                             .relative()
-                            .children(toast)
+                            .children(center_toast)
                             .when(self.sidebar_visible, |element| {
                                 element.child(self.render_panel_resize_handle(
                                     "sidebar-resize-handle",
@@ -653,7 +695,24 @@ impl Render for Waku {
                                     .flex_none(),
                             ),
                         )
-                    }),
+                    })
+                    .when(bottom_panel_maximized, |root| {
+                        root.child(
+                            div()
+                                .id("bottom-panel-maximized-layer")
+                                .occlude()
+                                .absolute()
+                                .inset_0()
+                                .overflow_hidden()
+                                .bg(theme.surface)
+                                .child(
+                                    self.bottom_panel_pane
+                                        .clone()
+                                        .cached(StyleRefinement::default().size_full()),
+                                ),
+                        )
+                    })
+                    .children(maximized_toast),
             )
             .children(computer_use)
             .children(command_palette)

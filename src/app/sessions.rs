@@ -541,6 +541,10 @@ impl Waku {
                 self.restore_right_panel_state(session_id, cx);
                 self.restore_bottom_panel_state(session_id);
             } else {
+                if self.bottom_panel_maximized {
+                    self.bottom_panel_maximized = false;
+                    self.bottom_panel_slide = None;
+                }
                 // Same workspace: the live panels are already the right ones,
                 // but a terminal opened earlier may still bind to another
                 // directory the session has since moved off of.
@@ -842,13 +846,22 @@ impl Waku {
         cx.notify();
     }
 
+    pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.is_bottom_panel_maximized() {
+            self.set_bottom_panel_maximized(false, cx);
+            self.set_sidebar_visible(true, cx);
+        } else {
+            self.set_sidebar_visible(!self.sidebar_visible, cx);
+        }
+    }
+
     pub(super) fn toggle_sidebar_action(
         &mut self,
         _: &ToggleSidebar,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_sidebar_visible(!self.sidebar_visible, cx);
+        self.toggle_sidebar(cx);
     }
 
     pub(super) fn toggle_right_panel_action(
@@ -857,7 +870,12 @@ impl Waku {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_right_panel_visible(!self.right_panel_visible, cx);
+        if self.is_bottom_panel_maximized() {
+            self.set_bottom_panel_maximized(false, cx);
+            self.set_right_panel_visible(true, cx);
+        } else {
+            self.set_right_panel_visible(!self.right_panel_visible, cx);
+        }
     }
 
     pub(super) fn toggle_bottom_panel_action(
@@ -948,7 +966,11 @@ impl Waku {
             return;
         }
         self.bottom_panel_visible = visible;
-        self.bottom_panel_slide = self.begin_panel_slide(self.bottom_panel_rendered_height, cx);
+        self.bottom_panel_slide = if self.bottom_panel_maximized {
+            None
+        } else {
+            self.begin_panel_slide(self.bottom_panel_rendered_height, cx)
+        };
         self.persist_panel_layout();
         cx.notify();
     }
@@ -1254,6 +1276,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.settings_page = None;
+        self.set_bottom_panel_maximized(false, cx);
         let focus_handle = self.composer_focus(cx);
         window.focus(&focus_handle, cx);
         cx.notify();

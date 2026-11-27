@@ -125,6 +125,7 @@ impl Waku {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::toggle_right_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
+            .on_action(cx.listener(Self::toggle_bottom_panel_maximize_action))
             .on_action(cx.listener(Self::new_terminal_action))
             .on_action(cx.listener(Self::toggle_command_palette_action))
             .on_action(cx.listener(Self::toggle_fps_counter_action))

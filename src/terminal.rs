@@ -2525,16 +2525,20 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        // The bottom panel's terminals leave ctrl+pageup/pagedown unhandled so
-        // the panel's tab-cycle key bindings (bound in the
-        // `BottomPanelTerminal` context) receive them instead of the shell.
+        // The bottom panel's terminals leave ctrl+pageup/pagedown and
+        // shift+escape unhandled so the panel's tab-cycle and zoom key bindings
+        // (bound in the `BottomPanelTerminal` context) receive them instead of
+        // the shell.
         if self.bottom_panel_tabs
-            && keystroke.modifiers.control
             && !keystroke.modifiers.alt
-            && !keystroke.modifiers.shift
             && !keystroke.modifiers.platform
             && !keystroke.modifiers.function
-            && matches!(keystroke.key.as_str(), "pageup" | "pagedown")
+            && ((keystroke.modifiers.control
+                && !keystroke.modifiers.shift
+                && matches!(keystroke.key.as_str(), "pageup" | "pagedown"))
+                || (keystroke.modifiers.shift
+                    && !keystroke.modifiers.control
+                    && keystroke.key == "escape"))
         {
             return;
         }
@@ -5448,6 +5452,35 @@ mod tests {
                     cx,
                 );
                 assert_eq!(written.try_recv().unwrap(), vec![3]);
+                view.bottom_panel_tabs = true;
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: key(
+                            "escape",
+                            None,
+                            Modifiers {
+                                shift: true,
+                                ..Default::default()
+                            },
+                        ),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(written.is_empty());
+                view.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: key("escape", None, Modifiers::default()),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(written.try_recv().unwrap(), b"\x1b");
+                view.bottom_panel_tabs = false;
                 view.exited = true;
                 assert!(!view.accepts_text_input(window, cx));
             });

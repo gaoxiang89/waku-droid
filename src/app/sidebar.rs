@@ -691,13 +691,13 @@ impl Waku {
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.set_sidebar_visible(!this.sidebar_visible, cx);
+                this.toggle_sidebar(cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if !event.keystroke.modifiers.modified()
                     && matches!(event.keystroke.key.as_str(), "enter" | "space")
                 {
-                    this.set_sidebar_visible(!this.sidebar_visible, cx);
+                    this.toggle_sidebar(cx);
                     cx.stop_propagation();
                 }
             }))

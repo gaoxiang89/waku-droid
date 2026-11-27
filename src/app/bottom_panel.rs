@@ -3,6 +3,7 @@ use super::right_panel::{
     PanelTabs, TAB_SCROLL_FADE_WIDTH, TabScrollFadeSide, tab_scroll_fade, tab_scroll_reveal_guard,
 };
 use super::*;
+use crate::ui::ActivationExt;
 
 /// Height of the tab strip that owns the panel's chrome — the same 34 px the
 /// terminal's built-in toolbar occupied, so the grid keeps every pixel it had.
@@ -140,7 +141,6 @@ impl Waku {
                 );
                 div()
                     .id("bottom-panel-body")
-                    .key_context(crate::terminal::BOTTOM_PANEL_TERMINAL_CONTEXT)
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -159,19 +159,26 @@ impl Waku {
                 )
                 .into_any_element(),
         };
+        let maximized = self.is_bottom_panel_maximized();
         div()
             .id("bottom-panel")
+            .key_context(crate::terminal::BOTTOM_PANEL_TERMINAL_CONTEXT)
             .w_full()
             .h(px(height))
             .flex_none()
             .flex()
             .flex_col()
-            .border_t_1()
-            .border_color(Theme::current(cx).border_strong)
+            .when(!maximized, |element| {
+                element
+                    .border_t_1()
+                    .border_color(Theme::current(cx).border_strong)
+            })
             .bg(Theme::current(cx).surface)
             .relative()
             .child(body)
-            .child(self.render_bottom_panel_resize_handle(cx))
+            .when(!maximized, |element| {
+                element.child(self.render_bottom_panel_resize_handle(cx))
+            })
     }
 
     /// One tab's split tree, shared by both panels: the bottom panel's tab
@@ -580,6 +587,8 @@ impl Waku {
         let split_weak = cx.entity().downgrade();
         let split_down_weak = cx.entity().downgrade();
         let split_pane = self.active_bottom_panel_terminal();
+        let maximized = self.is_bottom_panel_maximized();
+        let maximize_focus = self.transcript_control_focus("maximize-bottom-panel-terminal", cx);
         div()
             .id("bottom-panel-tab-strip")
             .h(px(BOTTOM_PANEL_TAB_STRIP_HEIGHT))
@@ -687,7 +696,54 @@ impl Waku {
                                     });
                                 }),
                             )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .id("maximize-bottom-panel-terminal")
+                            .track_focus(&maximize_focus)
+                            .tab_index(0)
+                            .size(px(22.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_default()
+                            .focus_visible(|style| {
+                                style
+                                    .bg(theme.overlay)
+                                    .border_1()
+                                    .border_color(theme.accent)
+                            })
+                            .when(maximized, |element| element.bg(theme.overlay_strong))
+                            .when(!maximized, |element| {
+                                element.hover(|element| element.bg(theme.overlay))
+                            })
+                            .active(|element| element.bg(theme.overlay_strong))
+                            .child(icon(
+                                if maximized {
+                                    "icons/minimize.svg"
+                                } else {
+                                    "icons/maximize.svg"
+                                },
+                                13.0,
+                                if maximized {
+                                    theme.text
+                                } else {
+                                    theme.text_tertiary
+                                },
+                            ))
+                            .tooltip(Tooltip::with_shortcut(
+                                if maximized {
+                                    tr!("bottom_panel.restore")
+                                } else {
+                                    tr!("bottom_panel.maximize")
+                                },
+                                crate::platform::primary_shortcut("⇧Esc", "Shift+Esc"),
+                            ))
+                            .on_activation(cx, |this, _, cx| {
+                                this.toggle_bottom_panel_maximize(cx);
+                            }),
+                    ),
             )
     }
 
@@ -741,6 +797,60 @@ impl Waku {
         self.bottom_panel_active_group
             .and_then(|index| self.bottom_panel_terminal_groups.get(index))
             .and_then(SplitGroup::active_or_first)
+    }
+
+    pub(super) fn is_bottom_panel_maximized(&self) -> bool {
+        self.selected_project().is_some()
+            && self.bottom_panel_visible
+            && self.bottom_panel_maximized
+    }
+
+    pub(super) fn set_bottom_panel_maximized(&mut self, maximized: bool, cx: &mut Context<Self>) {
+        if maximized {
+            if self.selected_project().is_none() {
+                return;
+            }
+            self.ensure_bottom_panel_terminal(cx);
+            self.bottom_panel_pending_terminal_focus = true;
+            if self
+                .panel_resize_drag
+                .is_some_and(|drag| drag.target == PanelResizeTarget::BottomPanel)
+            {
+                self.panel_resize_drag = None;
+            }
+            let visibility_changed = !self.bottom_panel_visible;
+            self.bottom_panel_visible = true;
+            if self.bottom_panel_maximized && !visibility_changed {
+                cx.notify();
+                return;
+            }
+            self.bottom_panel_maximized = true;
+            self.bottom_panel_slide = None;
+            if visibility_changed {
+                self.persist_panel_layout();
+            }
+            self.save_terminal_layouts(cx, None);
+            cx.notify();
+            return;
+        }
+        if !self.bottom_panel_maximized {
+            return;
+        }
+        self.bottom_panel_maximized = false;
+        self.bottom_panel_slide = None;
+        self.save_terminal_layouts(cx, None);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_bottom_panel_maximize(&mut self, cx: &mut Context<Self>) {
+        if self.is_bottom_panel_maximized() {
+            self.set_bottom_panel_maximized(false, cx);
+            if self.bottom_panel_visible && self.bottom_panel_active_group.is_some() {
+                self.bottom_panel_pending_terminal_focus = true;
+            }
+        } else {
+            self.set_bottom_panel_maximized(true, cx);
+        }
     }
 
     /// Show the panel with a fresh terminal — the `+` button, shortcut, and
@@ -987,6 +1097,7 @@ impl Waku {
     fn take_active_bottom_panel_state(&mut self) -> BottomPanelWorkspaceState {
         BottomPanelWorkspaceState {
             visible: self.bottom_panel_visible,
+            maximized: std::mem::replace(&mut self.bottom_panel_maximized, false),
             groups: std::mem::take(&mut self.bottom_panel_terminal_groups),
             active_group: self.bottom_panel_active_group.take(),
             tabs_scroll_handle: std::mem::replace(
@@ -999,6 +1110,7 @@ impl Waku {
 
     fn replace_active_bottom_panel_state(&mut self, state: BottomPanelWorkspaceState) {
         self.bottom_panel_visible = state.visible;
+        self.bottom_panel_maximized = state.maximized;
         self.bottom_panel_terminal_groups = state.groups;
         self.bottom_panel_active_group = state.active_group;
         self.bottom_panel_tabs_scroll_handle = state.tabs_scroll_handle;
@@ -1208,6 +1320,7 @@ impl Waku {
             None => {
                 self.bottom_panel_pending_tab_reveal = None;
                 self.bottom_panel_pending_terminal_focus = false;
+                self.bottom_panel_maximized = false;
                 self.set_bottom_panel_visible(false, cx);
             }
         }
@@ -1282,6 +1395,19 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.open_bottom_panel_terminal(cx);
+    }
+
+    pub(super) fn toggle_bottom_panel_maximize_action(
+        &mut self,
+        _: &ToggleBottomPanelMaximize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_project().is_none() {
+            return;
+        }
+        self.settings_page = None;
+        self.toggle_bottom_panel_maximize(cx);
     }
 
     pub(super) fn next_terminal_action(
@@ -1493,12 +1619,14 @@ mod tests {
         let mut states = HashMap::new();
         let mut state = BottomPanelWorkspaceState::empty(true);
         state.active_group = Some(0);
+        state.maximized = true;
         states.insert(scope.clone(), state);
 
         // A workspace with no stored panel state opens closed, exactly as the
         // right panel treats one never visited before.
         let missing = BottomPanelWorkspaceState::take_or_closed(&mut states, &other_scope);
         assert!(!missing.visible);
+        assert!(!missing.maximized);
         assert_eq!(missing.active_group, None);
 
         // Taking hands the stored state over once, so a workspace opened twice
@@ -1507,9 +1635,11 @@ mod tests {
         // of the workspace reads the same entry.
         let restored = BottomPanelWorkspaceState::take_or_closed(&mut states, &scope);
         assert!(restored.visible);
+        assert!(restored.maximized);
         assert_eq!(restored.active_group, Some(0));
         let again = BottomPanelWorkspaceState::take_or_closed(&mut states, &scope);
         assert!(!again.visible);
+        assert!(!again.maximized);
         assert!(again.groups.is_empty());
     }
 

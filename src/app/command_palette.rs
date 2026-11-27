@@ -165,6 +165,7 @@ enum PaletteAction {
     ToggleSidebar,
     ToggleRightPanel,
     ToggleBottomPanel,
+    ToggleBottomPanelMaximize,
     ToggleChatSplit,
     ToggleFilesSurface,
     ToggleGitGraphSurface,
@@ -843,6 +844,23 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⌘J", "Ctrl+J")),
                 PaletteAction::ToggleBottomPanel,
                 "toggle show hide bottom panel terminal shell console",
+                next(),
+            ),
+            CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!(if self.is_bottom_panel_maximized() {
+                    "command_palette.restore_bottom_panel"
+                } else {
+                    "command_palette.maximize_bottom_panel"
+                }),
+                if self.is_bottom_panel_maximized() {
+                    "icons/minimize.svg"
+                } else {
+                    "icons/maximize.svg"
+                },
+                Some(crate::platform::primary_shortcut("⇧Esc", "Shift+Esc")),
+                PaletteAction::ToggleBottomPanelMaximize,
+                "maximize minimize restore zoom expand bottom panel terminal shell console 最大化 还原 终端",
                 next(),
             ),
             CommandPaletteItem::command(
@@ -1905,6 +1923,9 @@ impl Waku {
             }
             PaletteAction::ToggleBottomPanel => {
                 self.toggle_bottom_panel_action(&ToggleBottomPanel, window, cx)
+            }
+            PaletteAction::ToggleBottomPanelMaximize => {
+                self.toggle_bottom_panel_maximize_action(&ToggleBottomPanelMaximize, window, cx)
             }
             PaletteAction::ToggleChatSplit => {
                 self.toggle_chat_split_action(&ToggleChatSplit, window, cx)

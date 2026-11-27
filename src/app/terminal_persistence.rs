@@ -26,6 +26,8 @@ struct SavedWorkspace {
     bottom: Vec<SavedGroup>,
     bottom_active: Option<usize>,
     bottom_visible: bool,
+    #[serde(default)]
+    bottom_maximized: bool,
     right: Vec<(Uuid, SavedGroup)>,
     right_active: Option<Uuid>,
     right_visible: bool,
@@ -103,6 +105,32 @@ mod tests {
             serde_json::from_slice::<PanelScope>(&serde_json::to_vec(&remote).unwrap()).unwrap(),
             remote
         );
+    }
+    #[test]
+    fn saved_workspace_defaults_bottom_maximized_and_round_trips_it() {
+        let scope = PanelScope {
+            host: HostKey::Local,
+            workspace: PathBuf::from("/work/project"),
+        };
+        let legacy = serde_json::json!({
+            "scope": scope,
+            "bottom": [],
+            "bottom_active": null,
+            "bottom_visible": true,
+            "right": [],
+            "right_active": null,
+            "right_visible": false
+        });
+        let decoded: SavedWorkspace = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.bottom_maximized);
+
+        let maximized = SavedWorkspace {
+            bottom_maximized: true,
+            ..decoded
+        };
+        let round_tripped: SavedWorkspace =
+            serde_json::from_slice(&serde_json::to_vec(&maximized).unwrap()).unwrap();
+        assert!(round_tripped.bottom_maximized);
     }
     #[test]
     fn malformed_split_is_not_restored() {
@@ -395,6 +423,8 @@ impl Waku {
                 .bottom_active
                 .filter(|i| *i < self.bottom_panel_terminal_groups.len());
             self.bottom_panel_visible = saved.bottom_visible;
+            self.bottom_panel_maximized =
+                saved.bottom_maximized && !self.bottom_panel_terminal_groups.is_empty();
         }
         for (id, group) in &saved.right {
             if !self.right_panel_terminal_groups.contains_key(id) {
@@ -480,6 +510,11 @@ impl Waku {
                     self.bottom_panel_visible
                 } else {
                     bottom.is_some_and(|s| s.visible)
+                },
+                bottom_maximized: if is_active {
+                    self.bottom_panel_maximized
+                } else {
+                    bottom.is_some_and(|s| s.maximized)
                 },
                 right: surfaces
                     .iter()

@@ -1006,7 +1006,8 @@ impl Waku {
     }
 
     pub(super) fn is_swarm_surface_visible(&self) -> bool {
-        self.right_panel_visible
+        !self.is_bottom_panel_maximized()
+            && self.right_panel_visible
             && self.active_right_panel_surface() == Some(&RightPanelSurface::Swarm)
     }
 

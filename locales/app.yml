@@ -40,6 +40,8 @@ menu.toggle_right_panel:
   en: Toggle Right Panel
 menu.toggle_bottom_panel:
   en: Toggle Bottom Panel
+menu.toggle_bottom_panel_maximize:
+  en: Maximize Bottom Panel
 menu.toggle_chat_split:
   en: Toggle Split Chat
 menu.new_terminal:
@@ -130,6 +132,10 @@ command_palette.show_bottom_panel:
   en: Show bottom panel
 command_palette.hide_bottom_panel:
   en: Hide bottom panel
+command_palette.maximize_bottom_panel:
+  en: Maximize bottom panel
+command_palette.restore_bottom_panel:
+  en: Restore bottom panel
 command_palette.split_chat:
   en: Split Chat
 command_palette.close_chat_split:
@@ -1957,6 +1963,10 @@ bottom_panel.tabs:
   en: Terminal tabs
 bottom_panel.close_tab:
   en: Close %{title}
+bottom_panel.maximize:
+  en: Maximize bottom panel
+bottom_panel.restore:
+  en: Restore bottom panel
 chat_split.toggle:
   en: Split Chat
 chat_split.close_pane:

@@ -467,7 +467,12 @@ impl Waku {
     }
 
     pub(super) fn toggle_chat_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.chat_split.is_some() {
+        if self.is_bottom_panel_maximized() {
+            self.set_bottom_panel_maximized(false, cx);
+            if self.chat_split.is_some() {
+                return;
+            }
+        } else if self.chat_split.is_some() {
             self.discard_unfocused_chat_pane(cx);
             return;
         }
@@ -515,7 +520,7 @@ impl Waku {
 
     pub(super) fn render_chat_split_toggle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let active = self.chat_split.is_some();
+        let active = !self.is_bottom_panel_maximized() && self.chat_split.is_some();
         let focus = self.transcript_control_focus("toggle-chat-split", cx);
         div()
             .id("toggle-chat-split")
