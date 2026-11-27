@@ -14,6 +14,10 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.58]
+
+- Download folders from the Files panel in local, SSH, and WSL workspaces. Choose a local destination, track progress, and cancel the transfer if needed. Downloads preserve nested and empty folders, skip symbolic links, and protect existing destination folders from being overwritten.
+
 ## [0.1.57]
 
 - Harden multi-device sync and daemon exposure: rebind resident daemons when changing network exposure or allowed origins, restrict shutdown to loopback peers, prevent stale state overwrites after session rewind, sync steer-accepted state and atomic queued-message claims across desktop, web, and mobile, and persist daemon-side reduced turns while offline
