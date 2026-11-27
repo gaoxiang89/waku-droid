@@ -229,6 +229,10 @@ struct PendingInput {
     /// Whether a cancelled entry goes back to the app's follow-up queue: only
     /// a steer does, because a prompt is already in the transcript.
     steer: bool,
+    /// Whether `DriverEvent::steer_accepted` was already emitted for this
+    /// steer (preventing a subsequent `SteerRejected` from corrupting
+    /// daemon steer metadata or duplicating the message).
+    accepted: bool,
 }
 
 struct StreamState {
@@ -1002,6 +1006,7 @@ fn handle_command(worker: &mut Worker, message: DriverCommand, state: &mut Strea
                         inbox_id: inbox.id,
                         message: text,
                         steer: false,
+                        accepted: false,
                     });
                 }
                 Ok(None) => state.pending_input = None,
@@ -1048,6 +1053,7 @@ fn handle_command(worker: &mut Worker, message: DriverCommand, state: &mut Strea
                         inbox_id: inbox.id,
                         message: text.clone(),
                         steer: true,
+                        accepted: true,
                     });
                     // The inbox event is authoritative; this 2xx is only the
                     // fallback for a response Waku never sees.
@@ -1733,12 +1739,18 @@ fn handle_event(
             if Some(pending.inbox_id.as_str()) != data.get("inboxID").and_then(Value::as_str) {
                 return;
             }
-            // The app falls back to its own follow-up queue.
-            if pending.steer {
+            // The app falls back to its own follow-up queue only if the steer
+            // has not already been reported as accepted.
+            if pending.steer && !pending.accepted {
                 let _ = events.send(DriverEvent::SteerRejected {
                     message: pending.message.clone(),
                     reason: tr!("errors.provider_rejected_prompt", provider = "OpenCode"),
                 });
+            } else if pending.steer {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.provider_rejected_prompt",
+                    provider = "OpenCode"
+                )));
             }
             state.pending_input = None;
         }
@@ -2485,6 +2497,33 @@ mod tests {
         fn drain(&self) -> Vec<DriverEvent> {
             self.seen.try_iter().collect()
         }
+    }
+
+    #[test]
+    fn accepted_steer_cancelled_in_inbox_emits_error_not_steer_rejected() {
+        let mut harness = Harness::new(RuntimeMode::FullAccess);
+        harness.state.pending_input = Some(PendingInput {
+            inbox_id: "inb_1".into(),
+            message: "follow-up".into(),
+            steer: true,
+            accepted: true,
+        });
+        harness.feed(json!({
+            "type": "session.inbox.cancelled",
+            "data": { "sessionID": "ses_1", "inboxID": "inb_1" }
+        }));
+        let events = harness.drain();
+        assert!(
+            events.iter().any(|e| matches!(e, DriverEvent::Error(_))),
+            "expected Error for cancelled accepted steer, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DriverEvent::SteerRejected { .. })),
+            "accepted steer must never emit SteerRejected after SteerAccepted: {events:?}"
+        );
+        assert!(harness.state.pending_input.is_none());
     }
 
     /// Answers each request with the next canned response, in order, and
@@ -3399,6 +3438,7 @@ mod tests {
             inbox_id: "msg_1".into(),
             message: "keep going".into(),
             steer: true,
+            accepted: false,
         });
         // The exact payload the service sends: the entry is `inboxID`.
         harness.feed(json!({"type": "session.inbox.cancelled", "data": {"sessionID": "ses_1", "inboxID": "msg_1"}}));
@@ -3413,6 +3453,7 @@ mod tests {
             inbox_id: "msg_2".into(),
             message: "first prompt".into(),
             steer: false,
+            accepted: false,
         });
         harness.feed(json!({"type": "session.inbox.cancelled", "data": {"sessionID": "ses_1", "inboxID": "msg_2"}}));
         assert!(harness.drain().is_empty());
@@ -3426,6 +3467,7 @@ mod tests {
             inbox_id: "msg_1".into(),
             message: "also check the tests".into(),
             steer: true,
+            accepted: false,
         });
         harness.feed(json!({"type": "session.inbox.delivered", "data": {"sessionID": "ses_1", "inboxID": "msg_other"}}));
         assert!(harness.state.pending_input.is_some());

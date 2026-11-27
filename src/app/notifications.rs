@@ -193,9 +193,9 @@ impl Waku {
     pub(super) fn reconcile_session_notifications(&mut self, session_id: Uuid) {
         let runtime = self.runtimes.get(&session_id);
         let approval = runtime.is_some_and(|r| {
-            r.pending_permission.is_some() || r.pending_computer_approval.is_some()
+            !r.pending_permissions.is_empty() || r.pending_computer_approval.is_some()
         });
-        let input = runtime.is_some_and(|r| r.pending_user_input.is_some());
+        let input = runtime.is_some_and(|r| !r.pending_user_inputs.is_empty());
         let background = self
             .state
             .sessions

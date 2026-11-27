@@ -4,11 +4,11 @@
 //! unknown-method errors, stdio lifetime, and protocol type validation. Waku
 //! only adapts typed ACP messages to its provider-neutral [`DriverEvent`]s.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,7 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
 use super::activity;
+use crate::acp_session::validate_initialize;
 use crate::driver::{
     DriverControl, DriverEventSender, DriverEventSink, DriverStartOptions, SessionOptions,
 };
@@ -65,7 +66,7 @@ enum PromptKind {
 enum CommandMessage {
     Prompt(String),
     Steer(String),
-    Cancel,
+    Cancel(u64),
     RefreshBackgroundWork,
     StopBackgroundWork {
         key: BackgroundWorkKey,
@@ -95,8 +96,7 @@ enum CommandMessage {
     RecoverLostSession {
         failed_session_id: String,
         text: String,
-        /// The loop's cancel epoch when the failed prompt was sent. A Cancel
-        /// handled since then bumps the epoch, and the resend is dropped.
+        /// The cancel epoch when the failed prompt was sent.
         cancel_epoch: u64,
         /// Whether the failed prompt was the last one in flight, so that
         /// dropping the resend must finish the turn itself.
@@ -110,7 +110,24 @@ enum CommandMessage {
 #[derive(Clone)]
 struct LostSessionRecovery {
     sender: smol::channel::Sender<CommandMessage>,
-    cancel_epoch: Arc<AtomicU64>,
+    cancel_epoch: Arc<Mutex<u64>>,
+}
+
+enum PromptRecovery<'a> {
+    Allow {
+        recovery: LostSessionRecovery,
+        sent_epoch: u64,
+    },
+    Resend {
+        cancel_epoch: &'a Mutex<u64>,
+        sent_epoch: u64,
+    },
+}
+
+fn queue_cancel(commands: &smol::channel::Sender<CommandMessage>, cancel_epoch: &Mutex<u64>) {
+    let mut epoch = cancel_epoch.lock();
+    *epoch = epoch.wrapping_add(1);
+    let _ = commands.try_send(CommandMessage::Cancel(*epoch));
 }
 
 /// Whether a lost Antigravity transcript may start a fresh session and resend.
@@ -240,6 +257,7 @@ fn connected_provider_cursor(
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
+    cancel_epoch: Arc<Mutex<u64>>,
     supports_steer: bool,
     mode: Mutex<RuntimeMode>,
     /// Factory Droid (config option) and Antigravity (`session/set_mode`)
@@ -394,6 +412,8 @@ impl AcpDriver {
             stderr_lines.clone(),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
+        let cancel_epoch = Arc::new(Mutex::new(0));
+        let connection_cancel_epoch = cancel_epoch.clone();
         let provider_name = provider.display_name();
         let thread_events = events.clone();
 
@@ -424,6 +444,7 @@ impl AcpDriver {
                     computer_use_instructions,
                     grok_title_home,
                     command_rx,
+                    connection_cancel_epoch,
                     thread_events.clone(),
                 ));
                 if let Err(error) = result {
@@ -438,6 +459,7 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
+            cancel_epoch,
             // These reject a second `session/prompt` while one is running, so
             // Waku keeps follow-ups queued until the current turn settles.
             // Antigravity (`agy acp`) accepts mid-turn `session/prompt` and
@@ -899,6 +921,41 @@ impl PendingPrompts {
 type PendingPromptRequests = Arc<Mutex<PendingPrompts>>;
 type SharedSessionModes = Arc<Mutex<Option<SessionModeState>>>;
 
+#[derive(Default)]
+struct SessionUpdateScope {
+    active: Option<SessionId>,
+    opening: Option<VecDeque<SessionNotification>>,
+}
+
+impl SessionUpdateScope {
+    fn begin_new(&mut self) {
+        self.opening = Some(VecDeque::new());
+    }
+
+    fn activate(&mut self, session_id: &SessionId) -> VecDeque<SessionNotification> {
+        self.active = Some(session_id.clone());
+        let mut buffered = self.opening.take().unwrap_or_default();
+        buffered.retain(|notification| &notification.session_id == session_id);
+        buffered
+    }
+
+    fn route(&mut self, notification: SessionNotification) -> Option<SessionNotification> {
+        let is_active = self.active.as_ref() == Some(&notification.session_id);
+        if let Some(opening) = &mut self.opening {
+            if !is_active {
+                // Some agents advertise commands before replying to session/new.
+                const MAX_EARLY_UPDATES: usize = 256;
+                if opening.len() == MAX_EARLY_UPDATES {
+                    opening.pop_front();
+                }
+                opening.push_back(notification);
+            }
+            return None;
+        }
+        is_active.then_some(notification)
+    }
+}
+
 /// `agy acp` can return `session/load` mid-replay and continue streaming
 /// historical transcript chunks afterward. Draining a short quiet window before
 /// reporting `Connected` and holding a brief post-load guard keeps replay
@@ -1160,6 +1217,7 @@ async fn run_sdk_connection(
     computer_use_instructions: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
     commands: smol::channel::Receiver<CommandMessage>,
+    cancel_epoch: Arc<Mutex<u64>>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
     run_sdk_connection_with(
@@ -1179,6 +1237,7 @@ async fn run_sdk_connection(
         computer_use_instructions,
         grok_title_home,
         commands,
+        cancel_epoch,
         events,
         AcpTimeouts::default(),
     )
@@ -1203,6 +1262,7 @@ async fn run_sdk_connection_with<A>(
     computer_use_instructions: Option<String>,
     grok_title_home: Option<std::path::PathBuf>,
     commands: smol::channel::Receiver<CommandMessage>,
+    cancel_epoch: Arc<Mutex<u64>>,
     events: DriverEventSender,
     timeouts: AcpTimeouts,
 ) -> agent_client_protocol::Result<()>
@@ -1244,102 +1304,112 @@ where
     let terminal_release_events = events.clone();
     let cleanup_terminals = terminals.clone();
 
+    let session_update_scope = Arc::new(Mutex::new(SessionUpdateScope::default()));
+    let handle_notification = {
+        let events = events.clone();
+        let suppress_session_updates = suppress_session_updates.clone();
+        let stream_state = stream_state.clone();
+        let prompt_requests = prompt_requests.clone();
+        let pending_permissions = pending_permissions.clone();
+        let pending_user_inputs = pending_user_inputs.clone();
+        let unsolicited_turn = unsolicited_turn.clone();
+        let unsolicited_wake_tx = unsolicited_wake_tx.clone();
+        let access_mode = access_mode.clone();
+        let session_modes = session_modes.clone();
+        let antigravity_modes = antigravity_modes.clone();
+        let config_options = config_options.clone();
+        let droid_autonomy_ready = droid_autonomy_ready.clone();
+        move |notification: SessionNotification,
+              connection: &ConnectionTo<Agent>|
+              -> agent_client_protocol::Result<()> {
+            let is_replay_chunk = is_replay_transcript_update(&notification.update);
+            if is_replay_chunk
+                && suppress_session_updates
+                    .should_suppress_replay(Instant::now(), ANTIGRAVITY_POST_LOAD_GUARD_WINDOW)
+            {
+                return Ok(());
+            }
+            let in_load = suppress_session_updates.is_in_flight();
+            if !in_load {
+                if let SessionUpdate::CurrentModeUpdate(update) = &notification.update {
+                    set_current_session_mode_id(
+                        provider,
+                        &session_modes,
+                        &antigravity_modes,
+                        update.current_mode_id.clone(),
+                    );
+                }
+                let drifted = track_session_state(
+                    provider,
+                    &notification.update,
+                    *access_mode.lock(),
+                    &config_options,
+                );
+                if drifted && droid_autonomy_ready.load(Ordering::Acquire) {
+                    restore_droid_autonomy(
+                        connection,
+                        notification.session_id.clone(),
+                        droid_autonomy_level(*access_mode.lock()),
+                        &config_options,
+                        &events,
+                    )?;
+                }
+            }
+
+            let is_antigravity_out_of_turn = provider == ProviderKind::Antigravity
+                && !in_load
+                && prompt_requests.lock().is_empty();
+            let is_content = is_unsolicited_turn_content(&notification.update);
+            let is_usage = matches!(notification.update, SessionUpdate::UsageUpdate(_));
+            if is_antigravity_out_of_turn && is_content {
+                let started = unsolicited_turn.lock().on_content_update();
+                if started {
+                    {
+                        let mut state = stream_state.lock();
+                        state.tools.clear();
+                        state.produced_content = false;
+                    }
+                    let _ = events.send(DriverEvent::TurnStarted);
+                }
+            }
+
+            let update_snapshot = is_antigravity_out_of_turn.then(|| notification.update.clone());
+            let (has_in_flight_tools, completed_tool_name) = {
+                let mut state = stream_state.lock();
+                handle_session_update(provider, notification, &events, &mut state)?;
+                (
+                    state.has_in_flight_tools(),
+                    state.last_completed_tool_name.take(),
+                )
+            };
+
+            if let Some(update_snapshot) = update_snapshot.as_ref()
+                && (is_content || is_usage)
+            {
+                let has_in_flight_work = has_in_flight_tools
+                    || !pending_permissions.lock().is_empty()
+                    || !pending_user_inputs.lock().is_empty();
+                let mut unsolicited = unsolicited_turn.lock();
+                unsolicited.on_stream_update(update_snapshot, completed_tool_name.as_deref());
+                let delay = unsolicited.settle_delay(update_snapshot);
+                if unsolicited.schedule_settle(Instant::now(), delay, has_in_flight_work) {
+                    let _ = unsolicited_wake_tx.try_send(());
+                }
+            }
+            Ok(())
+        }
+    };
     let result = Client
         .builder()
         .name("waku")
         .on_receive_notification(
             {
-                let events = events.clone();
-                let suppress_session_updates = suppress_session_updates.clone();
-                let stream_state = stream_state.clone();
-                let prompt_requests = prompt_requests.clone();
-                let pending_permissions = pending_permissions.clone();
-                let pending_user_inputs = pending_user_inputs.clone();
-                let unsolicited_turn = unsolicited_turn.clone();
-                let unsolicited_wake_tx = unsolicited_wake_tx.clone();
-                let access_mode = access_mode.clone();
-                let session_modes = session_modes.clone();
-                let antigravity_modes = antigravity_modes.clone();
-                let config_options = config_options.clone();
-                let droid_autonomy_ready = droid_autonomy_ready.clone();
+                let session_update_scope = session_update_scope.clone();
+                let handle_notification = handle_notification.clone();
                 async move |notification: SessionNotification, connection: ConnectionTo<Agent>| {
-                    let is_replay_chunk = is_replay_transcript_update(&notification.update);
-                    if is_replay_chunk
-                        && suppress_session_updates.should_suppress_replay(
-                            Instant::now(),
-                            ANTIGRAVITY_POST_LOAD_GUARD_WINDOW,
-                        )
-                    {
-                        return Ok(());
-                    }
-                    let in_load = suppress_session_updates.is_in_flight();
-                    if !in_load {
-                        if let SessionUpdate::CurrentModeUpdate(update) = &notification.update {
-                            set_current_session_mode_id(
-                                provider,
-                                &session_modes,
-                                &antigravity_modes,
-                                update.current_mode_id.clone(),
-                            );
-                        }
-                        let drifted = track_session_state(
-                            provider,
-                            &notification.update,
-                            *access_mode.lock(),
-                            &config_options,
-                        );
-                        if drifted && droid_autonomy_ready.load(Ordering::Acquire) {
-                            restore_droid_autonomy(
-                                &connection,
-                                notification.session_id.clone(),
-                                droid_autonomy_level(*access_mode.lock()),
-                                &config_options,
-                                &events,
-                            )?;
-                        }
-                    }
-
-                    let is_antigravity_out_of_turn = provider == ProviderKind::Antigravity
-                        && !in_load
-                        && prompt_requests.lock().is_empty();
-                    let is_content = is_unsolicited_turn_content(&notification.update);
-                    let is_usage = matches!(notification.update, SessionUpdate::UsageUpdate(_));
-                    if is_antigravity_out_of_turn && is_content {
-                        let started = unsolicited_turn.lock().on_content_update();
-                        if started {
-                            {
-                                let mut state = stream_state.lock();
-                                state.tools.clear();
-                                state.produced_content = false;
-                            }
-                            let _ = events.send(DriverEvent::TurnStarted);
-                        }
-                    }
-
-                    let update_snapshot =
-                        is_antigravity_out_of_turn.then(|| notification.update.clone());
-                    let (has_in_flight_tools, completed_tool_name) = {
-                        let mut state = stream_state.lock();
-                        handle_session_update(provider, notification, &events, &mut state)?;
-                        (
-                            state.has_in_flight_tools(),
-                            state.last_completed_tool_name.take(),
-                        )
-                    };
-
-                    if let Some(update_snapshot) = update_snapshot.as_ref()
-                        && (is_content || is_usage)
-                    {
-                        let has_in_flight_work = has_in_flight_tools
-                            || !pending_permissions.lock().is_empty()
-                            || !pending_user_inputs.lock().is_empty();
-                        let mut unsolicited = unsolicited_turn.lock();
-                        unsolicited
-                            .on_stream_update(update_snapshot, completed_tool_name.as_deref());
-                        let delay = unsolicited.settle_delay(update_snapshot);
-                        if unsolicited.schedule_settle(Instant::now(), delay, has_in_flight_work) {
-                            let _ = unsolicited_wake_tx.try_send(());
-                        }
+                    let notification = session_update_scope.lock().route(notification);
+                    if let Some(notification) = notification {
+                        handle_notification(notification, &connection)?;
                     }
                     Ok(())
                 }
@@ -1639,21 +1709,23 @@ where
             let mut current_tier = service_tier;
             let mut current_window = context_window;
             let startup = race_startup_with_shutdown(&commands, &buffered_commands, async {
-                let initialize = await_acp_request(
-                    connection
-                        .send_request(
-                            InitializeRequest::new(ProtocolVersion::V1)
-                                .client_capabilities(client_capabilities)
-                                .client_info(Implementation::new(
-                                    "waku",
-                                    env!("CARGO_PKG_VERSION"),
-                                )),
-                        )
-                        .block_task(),
-                    timeouts.request,
-                    "ACP initialize",
-                )
-                .await?;
+                let initialize = validate_initialize(
+                    await_acp_request(
+                        connection
+                            .send_request(
+                                InitializeRequest::new(ProtocolVersion::V1)
+                                    .client_capabilities(client_capabilities)
+                                    .client_info(Implementation::new(
+                                        "waku",
+                                        env!("CARGO_PKG_VERSION"),
+                                    )),
+                            )
+                            .block_task(),
+                        timeouts.request,
+                        "ACP initialize",
+                    )
+                    .await?,
+                )?;
                 let prompt_capabilities = initialize.agent_capabilities.prompt_capabilities.clone();
                 let supports_fork = initialize
                     .agent_capabilities
@@ -1668,9 +1740,14 @@ where
                     &cwd,
                     &acp_mcp_servers,
                     &suppress_session_updates,
+                    &session_update_scope,
                     timeouts.request,
                 )
                 .await?;
+                let early_updates = session_update_scope.lock().activate(&session_id);
+                for notification in early_updates {
+                    handle_notification(notification, &connection)?;
+                }
                 sync_session_modes_state(
                     provider,
                     &session_modes,
@@ -1679,7 +1756,22 @@ where
                 );
                 *config_options.lock() = initial_config_options;
 
-                if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
+                if provider == ProviderKind::Antigravity {
+                    if let Err(error) = configure_antigravity_session_mode(
+                        &connection,
+                        &session_id,
+                        modes.as_ref(),
+                        mode,
+                        timeouts.request,
+                        &session_modes,
+                        &antigravity_modes,
+                    )
+                    .await
+                    {
+                        let _ = events.send(DriverEvent::Error(error));
+                        return Ok(None);
+                    }
+                } else if let Some(mode_id) = desired_access_mode(provider, modes.as_ref(), mode) {
                     // Mode selection is opportunistic: an agent can advertise a
                     // mode but reject a later transition without invalidating the
                     // session itself.
@@ -1793,9 +1885,10 @@ where
             let (recovery_tx, recovery_rx) = smol::channel::unbounded::<CommandMessage>();
             let lost_session_recovery = LostSessionRecovery {
                 sender: recovery_tx,
-                cancel_epoch: Arc::new(AtomicU64::new(0)),
+                cancel_epoch,
             };
             let mut cancel_deadline: Option<Instant> = None;
+            let mut processed_cancel_epoch = 0;
 
             enum LoopEvent {
                 Command(Option<CommandMessage>),
@@ -1953,7 +2046,7 @@ where
                         settled_last,
                     } => {
                         if lost_session_recovery_decision(
-                            lost_session_recovery.cancel_epoch.load(Ordering::Acquire),
+                            *lost_session_recovery.cancel_epoch.lock(),
                             sent_cancel_epoch,
                         ) == LostSessionRecoveryDecision::DropBecauseCancelled
                         {
@@ -1996,18 +2089,21 @@ where
                                 grok_title_home.clone(),
                                 title_refresh.clone(),
                                 stream_state.clone(),
-                                None,
+                                Some(PromptRecovery::Resend {
+                                    cancel_epoch: &lost_session_recovery.cancel_epoch,
+                                    sent_epoch: sent_cancel_epoch,
+                                }),
                                 resend_kind,
                                 Some(antigravity_step_offset.clone()),
                                 (provider == ProviderKind::Antigravity)
                                     .then(|| antigravity_fork_context.clone()),
-                            ) && prompt_requests.lock().is_empty()
-                            {
-                                let _ = events.send(DriverEvent::Error(error.to_string()));
-                                let _ = events.send(DriverEvent::TurnFinished {
-                                    success: false,
-                                    summary: None,
-                                });
+                            ) {
+                                finish_failed_recovery(
+                                    error,
+                                    settled_last,
+                                    &prompt_requests,
+                                    &events,
+                                );
                             }
                             continue;
                         }
@@ -2019,6 +2115,7 @@ where
                             &cwd,
                             &acp_mcp_servers,
                             &suppress_session_updates,
+                            &session_update_scope,
                             timeouts.request,
                         )
                         .await
@@ -2026,6 +2123,11 @@ where
                             Ok((fresh_session_id, modes, fresh_config_options)) => {
                                 session_id = fresh_session_id;
                                 native_session_id = session_id.to_string();
+                                let early_updates =
+                                    session_update_scope.lock().activate(&session_id);
+                                for notification in early_updates {
+                                    handle_notification(notification, &connection)?;
+                                }
                                 sync_session_modes_state(
                                     provider,
                                     &session_modes,
@@ -2046,29 +2148,23 @@ where
                                     antigravity_step_offset.store(next_offset, Ordering::Release);
                                 }
                                 let live_mode = *access_mode.lock();
-                                if let Some(mode_id) =
-                                    desired_access_mode(provider, modes.as_ref(), live_mode)
+                                if let Err(error) = configure_antigravity_session_mode(
+                                    &connection,
+                                    &session_id,
+                                    modes.as_ref(),
+                                    live_mode,
+                                    timeouts.request,
+                                    &session_modes,
+                                    &antigravity_modes,
+                                )
+                                .await
                                 {
-                                    if await_acp_request(
-                                        connection
-                                            .send_request(SetSessionModeRequest::new(
-                                                session_id.clone(),
-                                                mode_id.clone(),
-                                            ))
-                                            .block_task(),
-                                        timeouts.request,
-                                        "ACP session/set_mode",
-                                    )
-                                    .await
-                                    .is_ok()
-                                    {
-                                        set_current_session_mode_id(
-                                            provider,
-                                            &session_modes,
-                                            &antigravity_modes,
-                                            mode_id,
-                                        );
-                                    }
+                                    let _ = events.send(DriverEvent::Error(error));
+                                    let _ = events.send(DriverEvent::TurnFinished {
+                                        success: false,
+                                        summary: None,
+                                    });
+                                    break;
                                 }
                                 sync_cached_session_model(
                                     &connection,
@@ -2107,28 +2203,37 @@ where
                                     grok_title_home.clone(),
                                     title_refresh.clone(),
                                     stream_state.clone(),
-                                    None,
+                                    Some(PromptRecovery::Resend {
+                                        cancel_epoch: &lost_session_recovery.cancel_epoch,
+                                        sent_epoch: sent_cancel_epoch,
+                                    }),
                                     PromptKind::Turn,
                                     Some(antigravity_step_offset.clone()),
                                     (provider == ProviderKind::Antigravity)
                                         .then(|| antigravity_fork_context.clone()),
-                                ) && prompt_requests.lock().is_empty()
-                                {
-                                    let _ = events.send(DriverEvent::Error(error.to_string()));
-                                    let _ = events.send(DriverEvent::TurnFinished {
-                                        success: false,
-                                        summary: None,
-                                    });
+                                ) {
+                                    finish_failed_recovery(
+                                        error,
+                                        settled_last,
+                                        &prompt_requests,
+                                        &events,
+                                    );
                                 }
                             }
                             Err(error) => {
-                                if prompt_requests.lock().is_empty() {
-                                    let _ = events.send(DriverEvent::Error(error.to_string()));
-                                    let _ = events.send(DriverEvent::TurnFinished {
-                                        success: false,
-                                        summary: None,
-                                    });
-                                }
+                                let error = if *lost_session_recovery.cancel_epoch.lock()
+                                    == sent_cancel_epoch
+                                {
+                                    error
+                                } else {
+                                    agent_client_protocol::Error::request_cancelled()
+                                };
+                                finish_failed_recovery(
+                                    error,
+                                    settled_last,
+                                    &prompt_requests,
+                                    &events,
+                                );
                             }
                         }
                     }
@@ -2163,8 +2268,12 @@ where
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
-                            (provider == ProviderKind::Antigravity)
-                                .then(|| lost_session_recovery.clone()),
+                            (provider == ProviderKind::Antigravity).then(|| {
+                                PromptRecovery::Allow {
+                                    recovery: lost_session_recovery.clone(),
+                                    sent_epoch: processed_cancel_epoch,
+                                }
+                            }),
                             PromptKind::Turn,
                             Some(antigravity_step_offset.clone()),
                             (provider == ProviderKind::Antigravity)
@@ -2212,8 +2321,12 @@ where
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
-                            (provider == ProviderKind::Antigravity)
-                                .then(|| lost_session_recovery.clone()),
+                            (provider == ProviderKind::Antigravity).then(|| {
+                                PromptRecovery::Allow {
+                                    recovery: lost_session_recovery.clone(),
+                                    sent_epoch: processed_cancel_epoch,
+                                }
+                            }),
                             PromptKind::Steer,
                             Some(antigravity_step_offset.clone()),
                             (provider == ProviderKind::Antigravity)
@@ -2234,10 +2347,8 @@ where
                             }
                         }
                     }
-                    CommandMessage::Cancel => {
-                        lost_session_recovery
-                            .cancel_epoch
-                            .fetch_add(1, Ordering::AcqRel);
+                    CommandMessage::Cancel(epoch) => {
+                        processed_cancel_epoch = epoch;
                         let _ = connection
                             .send_notification(CancelNotification::new(session_id.clone()));
                         cancel_pending_permissions(&pending_permissions);
@@ -2631,6 +2742,7 @@ async fn establish_session(
     cwd: &Path,
     mcp_servers: &[McpServer],
     suppress_session_updates: &ReplaySuppression,
+    session_update_scope: &Mutex<SessionUpdateScope>,
     request_timeout: Duration,
 ) -> agent_client_protocol::Result<(
     SessionId,
@@ -2651,6 +2763,9 @@ async fn establish_session(
                 .resume
                 .is_some()
         {
+            session_update_scope
+                .lock()
+                .activate(&SessionId::new(existing));
             let mut request = ResumeSessionRequest::new(existing.to_owned(), cwd);
             if !mcp_servers.is_empty() {
                 request = request.mcp_servers(mcp_servers.to_vec());
@@ -2683,6 +2798,9 @@ async fn establish_session(
         }
 
         if initialize.agent_capabilities.load_session {
+            session_update_scope
+                .lock()
+                .activate(&SessionId::new(existing));
             suppress_session_updates.begin_load();
             let mut request = LoadSessionRequest::new(existing.to_owned(), cwd);
             if !mcp_servers.is_empty() {
@@ -2726,6 +2844,7 @@ async fn establish_session(
         }
     }
 
+    session_update_scope.lock().begin_new();
     let mut request = NewSessionRequest::new(cwd);
     if !mcp_servers.is_empty() {
         request = request.mcp_servers(mcp_servers.to_vec());
@@ -2739,6 +2858,28 @@ async fn establish_session(
     Ok((response.session_id, response.modes, response.config_options))
 }
 
+fn antigravity_mode_target(modes: &SessionModeState, mode: RuntimeMode) -> Option<SessionModeId> {
+    let find_mode = |target: &str| {
+        if modes
+            .current_mode_id
+            .to_string()
+            .eq_ignore_ascii_case(target)
+        {
+            return Some(modes.current_mode_id.clone());
+        }
+        modes
+            .available_modes
+            .iter()
+            .find(|mode| mode.id.to_string().eq_ignore_ascii_case(target))
+            .map(|mode| mode.id.clone())
+    };
+    match mode {
+        RuntimeMode::AutoAcceptEdits => find_mode("accept-edits"),
+        RuntimeMode::Auto => find_mode("auto").or_else(|| find_mode("default")),
+        RuntimeMode::Ask | RuntimeMode::FullAccess => find_mode("default"),
+    }
+}
+
 fn desired_access_mode(
     provider: ProviderKind,
     modes: Option<&SessionModeState>,
@@ -2750,18 +2891,7 @@ fn desired_access_mode(
         // `RuntimeMode::Auto` selects native `auto` when advertised (falling
         // back to `default` on older builds); `Ask` and `FullAccess` stay on
         // `default` while Waku's own permission policy handles prompts.
-        let find_mode = |target: &str| {
-            modes
-                .available_modes
-                .iter()
-                .find(|mode| mode.id.to_string().eq_ignore_ascii_case(target))
-                .map(|mode| mode.id.clone())
-        };
-        match mode {
-            RuntimeMode::AutoAcceptEdits => find_mode("accept-edits")?,
-            RuntimeMode::Auto => find_mode("auto").or_else(|| find_mode("default"))?,
-            RuntimeMode::Ask | RuntimeMode::FullAccess => find_mode("default")?,
-        }
+        antigravity_mode_target(modes, mode)?
     } else if provider == ProviderKind::Fx {
         let desired = if mode == RuntimeMode::Ask {
             "ask"
@@ -3290,9 +3420,15 @@ async fn apply_antigravity_mode(
             error = "Antigravity did not advertise session modes"
         ));
     };
-    let Some(desired) = desired_access_mode(ProviderKind::Antigravity, Some(modes), mode) else {
-        return Ok(None);
+    let Some(desired) = antigravity_mode_target(modes, mode) else {
+        return Err(tr!(
+            "errors.set_session_option",
+            error = "Antigravity did not advertise the requested access mode"
+        ));
     };
+    if desired == modes.current_mode_id {
+        return Ok(None);
+    }
     await_acp_request(
         connection
             .send_request(SetSessionModeRequest::new(
@@ -3306,6 +3442,32 @@ async fn apply_antigravity_mode(
     .await
     .map(|_| Some(desired))
     .map_err(|error| tr!("errors.set_session_option", error = error))
+}
+
+async fn configure_antigravity_session_mode(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    modes: Option<&SessionModeState>,
+    mode: RuntimeMode,
+    request_timeout: Duration,
+    session_modes: &SharedSessionModes,
+    antigravity_modes: &Mutex<AntigravityNativeModeState>,
+) -> Result<(), String> {
+    let Some(modes) = modes else {
+        // Older agents without native modes use Waku's approval policy.
+        return Ok(());
+    };
+    if let Some(mode_id) =
+        apply_antigravity_mode(connection, session_id, Some(modes), mode, request_timeout).await?
+    {
+        set_current_session_mode_id(
+            ProviderKind::Antigravity,
+            session_modes,
+            antigravity_modes,
+            mode_id,
+        );
+    }
+    Ok(())
 }
 
 /// Writes Droid's autonomy level for `mode`. `Ok(None)` means the session
@@ -4050,7 +4212,7 @@ fn send_prompt(
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
-    lost_session_recovery: Option<LostSessionRecovery>,
+    prompt_recovery: Option<PromptRecovery<'_>>,
     prompt_kind: PromptKind,
     antigravity_step_offset: Option<Arc<AtomicI64>>,
     antigravity_fork_context: Option<Arc<Mutex<Option<String>>>>,
@@ -4060,12 +4222,6 @@ fn send_prompt(
         state.produced_content = false;
         state.tools.clear();
     }
-    // The epoch is read on the loop thread, the same one that bumps it for a
-    // Cancel, so it marks exactly which cancels happened after this send.
-    let recovery = lost_session_recovery.map(|recovery| {
-        let sent_epoch = recovery.cancel_epoch.load(Ordering::Acquire);
-        (recovery, sent_epoch, text.clone())
-    });
     // Read before the turn runs, so the failure lookup cannot mistake an
     // earlier turn's record for this one's.
     let kimi_offset = (provider == ProviderKind::Kimi)
@@ -4084,7 +4240,28 @@ fn send_prompt(
         meta.insert("requestId".into(), Value::String(extension_id.clone()));
         request = request.meta(meta);
     }
-    let sent = connection.send_request(request);
+    let (sent, recovery) = match prompt_recovery {
+        Some(PromptRecovery::Allow {
+            recovery,
+            sent_epoch,
+        }) => (
+            connection.send_request(request),
+            Some((recovery, sent_epoch, text)),
+        ),
+        Some(PromptRecovery::Resend {
+            cancel_epoch,
+            sent_epoch,
+        }) => {
+            // Serialize the final send with cancellation at the public driver
+            // handle, after any lookup or attachment I/O.
+            let epoch = cancel_epoch.lock();
+            if *epoch != sent_epoch {
+                return Err(agent_client_protocol::Error::request_cancelled());
+            }
+            (connection.send_request(request), None)
+        }
+        None => (connection.send_request(request), None),
+    };
     let request_id = sent.id().clone();
     prompt_requests.lock().insert(
         request_id.clone(),
@@ -4105,10 +4282,8 @@ fn send_prompt(
         // prompt to it fails the same way. Recover even when a concurrent Steer
         // is still in flight so the primary Turn is never dropped.
         if is_lost_session && let Some((recovery, sent_epoch, text)) = recovery {
-            if lost_session_recovery_decision(
-                recovery.cancel_epoch.load(Ordering::Acquire),
-                sent_epoch,
-            ) == LostSessionRecoveryDecision::DropBecauseCancelled
+            if lost_session_recovery_decision(*recovery.cancel_epoch.lock(), sent_epoch)
+                == LostSessionRecoveryDecision::DropBecauseCancelled
             {
                 // Cancelled before the provider reported the lost session:
                 // the turn is over, and a resend would start it again.
@@ -4959,7 +5134,7 @@ fn handle_create_terminal_request(
 }
 
 const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT: usize = 1_048_576;
-const MAX_COMPLETED_TERMINALS: usize = 64;
+const MAX_UNRELEASED_TERMINALS: usize = 64;
 
 struct AcpTerminalProcess {
     id: String,
@@ -4968,7 +5143,7 @@ struct AcpTerminalProcess {
     cwd_display: String,
     started_at_ms: u64,
     updated_at_ms: u64,
-    completed_seq: Option<u64>,
+
     output: String,
     output_truncated: bool,
     output_byte_limit: usize,
@@ -5103,35 +5278,7 @@ impl AcpTerminalProcess {
 
 #[derive(Default)]
 pub(crate) struct AcpTerminalRegistry {
-    terminals: Arc<Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>>,
-    next_completed_seq: Arc<AtomicU64>,
-}
-
-fn evict_completed_terminals_in(
-    terminals: &Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>,
-    max_completed: usize,
-) {
-    let mut map = terminals.lock();
-    let mut completed = Vec::new();
-    for (id, entry) in map.iter() {
-        let proc = entry.lock();
-        if proc.exit_status.is_some() && proc.waiters.is_empty() {
-            completed.push((
-                proc.completed_seq.unwrap_or(0),
-                proc.updated_at_ms,
-                proc.started_at_ms,
-                id.clone(),
-            ));
-        }
-    }
-    if completed.len() <= max_completed {
-        return;
-    }
-    completed.sort();
-    let remove_count = completed.len() - max_completed;
-    for (_, _, _, id) in completed.into_iter().take(remove_count) {
-        map.remove(&id);
-    }
+    terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminalProcess>>>>,
 }
 
 fn terminal_command_search_path(command: &str, work_dir: &Path) -> Option<OsString> {
@@ -5235,6 +5382,12 @@ impl AcpTerminalRegistry {
         work_dir: PathBuf,
         events: &DriverEventSender,
     ) -> agent_client_protocol::Result<CreateTerminalResponse> {
+        let mut terminals = self.terminals.lock();
+        if terminals.len() >= MAX_UNRELEASED_TERMINALS {
+            return Err(agent_client_protocol::util::internal_error(
+                "Too many ACP terminals; release a terminal before creating another",
+            ));
+        }
         let mut child = Self::spawn_command(&request, &work_dir).map_err(|error| {
             agent_client_protocol::util::internal_error(format!(
                 "Failed to spawn terminal command `{}`: {error}",
@@ -5264,7 +5417,7 @@ impl AcpTerminalRegistry {
             cwd_display: work_dir.display().to_string(),
             started_at_ms: now,
             updated_at_ms: now,
-            completed_seq: None,
+
             output: String::new(),
             output_truncated: false,
             output_byte_limit,
@@ -5275,8 +5428,8 @@ impl AcpTerminalRegistry {
             job,
             waiters: Vec::new(),
         }));
-        self.terminals.lock().insert(id.clone(), entry.clone());
-        evict_completed_terminals_in(&self.terminals, MAX_COMPLETED_TERMINALS);
+        terminals.insert(id.clone(), entry.clone());
+        drop(terminals);
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
             entry.lock().to_background_work_item(),
         )));
@@ -5289,8 +5442,6 @@ impl AcpTerminalRegistry {
         });
         let wait_entry = entry;
         let wait_events = events.clone();
-        let wait_terminals = Arc::clone(&self.terminals);
-        let wait_completed_seq = Arc::clone(&self.next_completed_seq);
         let _ = thread::Builder::new()
             .name("waku-acp-term-wait".into())
             .spawn(move || {
@@ -5326,17 +5477,12 @@ impl AcpTerminalRegistry {
                     let mut proc = wait_entry.lock();
                     proc.updated_at_ms = unix_time_millis();
                     proc.exit_status = Some(status.clone());
-                    if proc.completed_seq.is_none() {
-                        proc.completed_seq =
-                            Some(wait_completed_seq.fetch_add(1, Ordering::Relaxed) + 1);
-                    }
                     let waiters = std::mem::take(&mut proc.waiters);
                     (proc.to_background_work_item(), waiters)
                 };
                 for waiter in waiters {
                     let _ = waiter.respond(WaitForTerminalExitResponse::new(status.clone()));
                 }
-                evict_completed_terminals_in(&wait_terminals, MAX_COMPLETED_TERMINALS);
                 let _ = wait_events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
                     item,
                 )));
@@ -5550,14 +5696,9 @@ impl AcpTerminalRegistry {
                 proc.kill_process_tree();
                 proc.exit_status = Some(TerminalExitStatus::new());
                 proc.updated_at_ms = unix_time_millis();
-                if proc.completed_seq.is_none() {
-                    proc.completed_seq =
-                        Some(self.next_completed_seq.fetch_add(1, Ordering::Relaxed) + 1);
-                }
             }
             proc.to_background_work_item()
         };
-        evict_completed_terminals_in(&self.terminals, MAX_COMPLETED_TERMINALS);
         let _ = events.send(DriverEvent::BackgroundWork(BackgroundWorkEvent::Upsert(
             item,
         )));
@@ -5588,6 +5729,24 @@ impl AcpTerminalRegistry {
 
 fn settle_prompt_request(prompt_requests: &Mutex<PendingPrompts>, request_id: &RequestId) -> bool {
     prompt_requests.lock().settle_request(request_id)
+}
+
+fn finish_failed_recovery(
+    error: agent_client_protocol::Error,
+    settled_last: bool,
+    prompt_requests: &PendingPromptRequests,
+    events: &DriverEventSender,
+) {
+    let cancelled = error.code == agent_client_protocol::ErrorCode::RequestCancelled;
+    if prompt_requests.lock().is_empty() && (!cancelled || settled_last) {
+        if !cancelled {
+            let _ = events.send(DriverEvent::Error(error.to_string()));
+        }
+        let _ = events.send(DriverEvent::TurnFinished {
+            success: cancelled,
+            summary: None,
+        });
+    }
 }
 
 fn finish_xai_prompt_complete(
@@ -7686,7 +7845,7 @@ impl DriverControl for AcpDriver {
     }
 
     fn cancel(&self) {
-        let _ = self.commands.try_send(CommandMessage::Cancel);
+        queue_cancel(&self.commands, &self.cancel_epoch);
     }
 
     fn cancel_computer_use(&self) {
@@ -8111,6 +8270,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -8714,6 +8874,7 @@ mod tests {
                         &cwd,
                         &[],
                         &suppress_conn,
+                        &Mutex::new(SessionUpdateScope::default()),
                         ACP_REQUEST_TIMEOUT,
                     )
                     .await?;
@@ -10635,7 +10796,6 @@ mod tests {
             cwd_display: ".".to_owned(),
             started_at_ms: 100,
             updated_at_ms: 200,
-            completed_seq: Some(1),
             output: "ok\n".to_owned(),
             output_truncated: false,
             output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
@@ -11104,6 +11264,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    &Mutex::new(SessionUpdateScope::default()),
                     ACP_REQUEST_TIMEOUT,
                 )
                 .await;
@@ -11158,6 +11319,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    &Mutex::new(SessionUpdateScope::default()),
                     ACP_REQUEST_TIMEOUT,
                 )
                 .await;
@@ -11210,6 +11372,7 @@ mod tests {
                     &cwd_clone,
                     &[],
                     &suppress,
+                    &Mutex::new(SessionUpdateScope::default()),
                     ACP_REQUEST_TIMEOUT,
                 )
                 .await?;
@@ -11619,61 +11782,68 @@ mod tests {
     }
 
     #[test]
-    fn acp_terminal_registry_evicts_oldest_completed_entries_and_keeps_running() {
+    fn acp_terminal_quota_preserves_unreleased_output_and_exit_status() {
         let registry = AcpTerminalRegistry::default();
-        let make_proc = |id: &str, completed_seq: Option<u64>, updated_at_ms: u64| {
-            Arc::new(Mutex::new(AcpTerminalProcess {
-                id: id.to_owned(),
-                title: id.to_owned(),
-                command_display: id.to_owned(),
-                cwd_display: ".".to_owned(),
-                started_at_ms: updated_at_ms,
-                updated_at_ms,
-                completed_seq,
-                output: String::new(),
-                output_truncated: false,
-                output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
-                exit_status: completed_seq.map(|_| TerminalExitStatus::new().exit_code(Some(0))),
-                killed: false,
-                child_pid: 0,
-                #[cfg(windows)]
-                job: None,
-                waiters: Vec::new(),
-            }))
-        };
-
-        {
-            let mut map = registry.terminals.lock();
-            map.insert("running-1".into(), make_proc("running-1", None, 10));
-            map.insert("done-1".into(), make_proc("done-1", Some(1), 100));
-            map.insert("done-2".into(), make_proc("done-2", Some(2), 200));
-            map.insert("done-3".into(), make_proc("done-3", Some(3), 300));
-            map.insert("done-4".into(), make_proc("done-4", Some(4), 400));
+        let (events, _rx) = crate::driver::test_event_channel();
+        for index in 0..MAX_UNRELEASED_TERMINALS {
+            let id = format!("done-{index}");
+            registry.terminals.lock().insert(
+                id.clone(),
+                Arc::new(Mutex::new(AcpTerminalProcess {
+                    id,
+                    title: "terminal".to_owned(),
+                    command_display: "terminal".to_owned(),
+                    cwd_display: ".".to_owned(),
+                    started_at_ms: 0,
+                    updated_at_ms: 0,
+                    output: "done".into(),
+                    output_truncated: false,
+                    output_byte_limit: DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
+                    exit_status: Some(TerminalExitStatus::new().exit_code(Some(0))),
+                    killed: false,
+                    child_pid: 0,
+                    #[cfg(windows)]
+                    job: None,
+                    waiters: Vec::new(),
+                })),
+            );
         }
+        let blocked = registry.create_terminal_in_dir(
+            CreateTerminalRequest::new("session", "must-not-spawn"),
+            std::env::temp_dir(),
+            &events,
+        );
+        let error = blocked.unwrap_err();
+        assert!(error.to_string().contains("release a terminal"), "{error}");
 
-        evict_completed_terminals_in(&registry.terminals, 2);
+        let response = registry
+            .terminal_output(TerminalOutputRequest::new("session", "done-0"))
+            .unwrap();
+        assert_eq!(response.output, "done");
+        assert_eq!(response.exit_status.unwrap().exit_code, Some(0));
+        registry
+            .release_terminal(ReleaseTerminalRequest::new("session", "done-0"), &events)
+            .unwrap();
+        assert!(
+            registry
+                .terminal_output(TerminalOutputRequest::new("session", "done-0"))
+                .is_err()
+        );
 
-        let map = registry.terminals.lock();
-        assert!(
-            map.contains_key("running-1"),
-            "running terminals must not be evicted"
-        );
-        assert!(
-            !map.contains_key("done-1"),
-            "oldest completed terminal should be evicted"
-        );
-        assert!(
-            !map.contains_key("done-2"),
-            "second oldest completed terminal should be evicted"
-        );
-        assert!(
-            map.contains_key("done-3"),
-            "newer completed terminal should be retained"
-        );
-        assert!(
-            map.contains_key("done-4"),
-            "newest completed terminal should be retained"
-        );
+        let available = registry
+            .create_terminal_in_dir(
+                CreateTerminalRequest::new("session", "echo slot available"),
+                std::env::temp_dir(),
+                &events,
+            )
+            .expect("release should make room for another terminal");
+        assert_eq!(registry.terminals.lock().len(), MAX_UNRELEASED_TERMINALS);
+        registry
+            .release_terminal(
+                ReleaseTerminalRequest::new("session", available.terminal_id),
+                &events,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -11749,6 +11919,7 @@ mod tests {
             None,
             None,
             cmd_rx,
+            Arc::default(),
             events,
             short_timeouts,
         ))
@@ -11792,6 +11963,7 @@ mod tests {
             None,
             None,
             cmd_rx,
+            Arc::default(),
             events,
             short_timeouts,
         ))
@@ -11834,6 +12006,8 @@ mod tests {
                 agent_client_protocol::on_receive_request!(),
             );
         let (events, event_rx) = crate::driver::test_event_channel();
+        let cancel_epoch = Arc::new(Mutex::new(0));
+        let connection_cancel_epoch = cancel_epoch.clone();
         let (cmd_tx, cmd_rx) = smol::channel::unbounded();
         let handle = std::thread::spawn(move || {
             smol::block_on(run_sdk_connection_with(
@@ -11853,6 +12027,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                connection_cancel_epoch,
                 events,
                 short_timeouts,
             ))
@@ -11881,7 +12056,7 @@ mod tests {
             .try_send(CommandMessage::Prompt("hung turn".into()))
             .unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        cmd_tx.try_send(CommandMessage::Cancel).unwrap();
+        queue_cancel(&cmd_tx, &cancel_epoch);
         let mut saw_cancel_error = false;
         loop {
             let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -11968,6 +12143,8 @@ mod tests {
             );
 
         let (events, event_rx) = crate::driver::test_event_channel();
+        let cancel_epoch = Arc::new(Mutex::new(0));
+        let connection_cancel_epoch = cancel_epoch.clone();
         let (cmd_tx, cmd_rx) = smol::channel::unbounded();
         let handle = std::thread::spawn(move || {
             smol::block_on(run_sdk_connection_with(
@@ -11987,6 +12164,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                connection_cancel_epoch,
                 events,
                 short_timeouts,
             ))
@@ -12003,7 +12181,7 @@ mod tests {
             .try_send(CommandMessage::Prompt("first".into()))
             .unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        cmd_tx.try_send(CommandMessage::Cancel).unwrap();
+        queue_cancel(&cmd_tx, &cancel_epoch);
         loop {
             let ev = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             if let DriverEvent::TurnFinished { success, .. } = ev {
@@ -12125,6 +12303,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -12247,6 +12426,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -12380,6 +12560,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -12419,6 +12600,226 @@ mod tests {
         );
         let _ = cmd_tx.try_send(CommandMessage::Shutdown);
         handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn acp_antigravity_gates_prompts_during_startup_and_lost_session_recovery() {
+        use agent_client_protocol::schema::v1::{ContentChunk, NewSessionResponse};
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Case {
+            UnsupportedVersion,
+            RejectedStartupMode,
+            RejectedRecoveryMode,
+            CancelledRecovery,
+        }
+
+        for case in [
+            Case::UnsupportedVersion,
+            Case::RejectedStartupMode,
+            Case::RejectedRecoveryMode,
+            Case::CancelledRecovery,
+        ] {
+            let opens = Arc::new(AtomicUsize::new(0));
+            let agent_opens = opens.clone();
+            let fresh_prompts = Arc::new(Mutex::new(Vec::new()));
+            let agent_fresh_prompts = fresh_prompts.clone();
+            let (recovery_started, recovery_in_flight) = std::sync::mpsc::sync_channel(1);
+            let (complete_recovery, finish_new) = smol::channel::bounded(1);
+            let agent = Agent
+                .builder()
+                .on_receive_request(
+                    async move |_: InitializeRequest, responder, _| {
+                        let version = if case == Case::UnsupportedVersion {
+                            ProtocolVersion::from(2)
+                        } else {
+                            ProtocolVersion::V1
+                        };
+                        responder.respond(InitializeResponse::new(version))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_: NewSessionRequest, responder, cx| {
+                        let fresh = agent_opens.fetch_add(1, Ordering::Relaxed) != 0;
+                        if fresh && case == Case::CancelledRecovery {
+                            recovery_started.send(()).unwrap();
+                            finish_new.recv().await.unwrap();
+                            for (id, message) in [
+                                ("review-lost-session", "stale update"),
+                                ("unrelated-session", "other update"),
+                            ] {
+                                cx.send_notification(SessionNotification::new(
+                                    id,
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(message)),
+                                    )),
+                                ))?;
+                            }
+                        }
+                        let mode = if (!fresh && case == Case::RejectedStartupMode)
+                            || (fresh && case == Case::RejectedRecoveryMode)
+                        {
+                            "auto"
+                        } else {
+                            "default"
+                        };
+                        let id = if fresh {
+                            "review-new-session"
+                        } else {
+                            "review-lost-session"
+                        };
+                        responder.respond(NewSessionResponse::new(id).modes(SessionModeState::new(
+                            mode,
+                            vec![
+                                SessionMode::new("default", "Default"),
+                                SessionMode::new("auto", "Auto"),
+                            ],
+                        )))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: SetSessionModeRequest, responder, _| {
+                        assert_eq!(request.mode_id.to_string(), "default");
+                        responder.respond_with_error(agent_client_protocol::util::internal_error(
+                            "supervised mode denied",
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: PromptRequest, responder, cx| {
+                        if request.session_id.to_string() == "review-lost-session" {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "not_found: trajectory not found: review-lost-session",
+                                ),
+                            );
+                        }
+                        if let Some(ContentBlock::Text(text)) = request.prompt.first() {
+                            agent_fresh_prompts.lock().push(text.text.clone());
+                        }
+                        cx.send_notification(SessionNotification::new(
+                            request.session_id,
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("fresh answer")),
+                            )),
+                        ))?;
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                );
+            let (events, event_rx) = crate::driver::test_event_channel();
+            let (cmd_tx, cmd_rx) = smol::channel::unbounded();
+            let cancel_epoch = Arc::new(Mutex::new(0));
+            let connection_cancel_epoch = cancel_epoch.clone();
+            let (finished, completion) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::spawn(move || {
+                let result = smol::block_on(run_sdk_connection_with(
+                    agent,
+                    ProviderKind::Antigravity,
+                    std::env::temp_dir(),
+                    Vec::new(),
+                    RuntimeMode::Ask,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    cmd_rx,
+                    connection_cancel_epoch,
+                    events,
+                    AcpTimeouts::default(),
+                ));
+                let _ = finished.send(result);
+            });
+            cmd_tx
+                .try_send(CommandMessage::Prompt("original prompt".into()))
+                .unwrap();
+
+            match case {
+                Case::UnsupportedVersion => {
+                    let error = completion
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap_err();
+                    assert!(
+                        error.to_string().contains("Unsupported ACP protocol version 2"),
+                        "{error}"
+                    );
+                    assert_eq!(opens.load(Ordering::Relaxed), 0);
+                }
+                Case::RejectedStartupMode | Case::RejectedRecoveryMode => {
+                    completion
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                    let events = event_rx.try_iter().collect::<Vec<_>>();
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| matches!(event, DriverEvent::Error(error)
+                        if error.contains("supervised mode denied"))),
+                        "{case:?}: {events:?}"
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, DriverEvent::Connected { .. }))
+                            .count(),
+                        usize::from(case == Case::RejectedRecoveryMode),
+                    );
+                    assert!(fresh_prompts.lock().is_empty());
+                }
+                Case::CancelledRecovery => {
+                    recovery_in_flight
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    queue_cancel(&cmd_tx, &cancel_epoch);
+                    complete_recovery.try_send(()).unwrap();
+                    loop {
+                        match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                            DriverEvent::TurnFinished { success, .. } => {
+                                assert!(success);
+                                break;
+                            }
+                            DriverEvent::TextDelta(text) | DriverEvent::Error(text) => {
+                                panic!("cancelled recovery emitted: {text}");
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(fresh_prompts.lock().is_empty());
+                    cmd_tx
+                        .try_send(CommandMessage::Prompt("next prompt".into()))
+                        .unwrap();
+                    loop {
+                        match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                            DriverEvent::TextDelta(text) => assert_eq!(text, "fresh answer"),
+                            DriverEvent::TurnFinished { success, .. } => {
+                                assert!(success);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(*fresh_prompts.lock(), ["next prompt"]);
+                    cmd_tx.try_send(CommandMessage::Shutdown).unwrap();
+                    completion
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            handle.join().unwrap();
+        }
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:
@@ -13010,6 +13411,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -13201,6 +13603,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 timeouts,
             ))
@@ -13293,6 +13696,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))
@@ -13399,6 +13803,7 @@ mod tests {
                 None,
                 None,
                 cmd_rx,
+                Arc::default(),
                 events,
                 AcpTimeouts::default(),
             ))

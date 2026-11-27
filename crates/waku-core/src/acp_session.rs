@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
-    SessionNotification,
+    ClientCapabilities, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    LoadSessionRequest, SessionId, SessionNotification,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo};
 use anyhow::{Context as _, anyhow};
@@ -64,6 +64,22 @@ fn initialize_request() -> InitializeRequest {
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(ClientCapabilities::new().terminal(false))
         .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION")))
+}
+
+pub(crate) fn validate_initialize(
+    response: InitializeResponse,
+) -> agent_client_protocol::Result<InitializeResponse> {
+    if response.protocol_version != ProtocolVersion::V1 {
+        return Err(agent_client_protocol::Error::new(
+            agent_client_protocol::ErrorCode::InvalidRequest.into(),
+            format!(
+                "Unsupported ACP protocol version {} (Waku supports {})",
+                response.protocol_version,
+                ProtocolVersion::V1,
+            ),
+        ));
+    }
+    Ok(response)
 }
 
 fn timestamp(value: Option<&str>) -> u64 {
@@ -257,10 +273,12 @@ where
     let request = Client.builder().name("waku-session-catalog").connect_with(
         agent,
         async move |connection: ConnectionTo<Agent>| {
-            let initialize = connection
-                .send_request(initialize_request())
-                .block_task()
-                .await?;
+            let initialize = validate_initialize(
+                connection
+                    .send_request(initialize_request())
+                    .block_task()
+                    .await?,
+            )?;
             if initialize
                 .agent_capabilities
                 .session_capabilities
@@ -426,13 +444,16 @@ where
     let (update_tx, update_rx) = smol::channel::bounded::<()>(1);
     let cwd = cwd.to_path_buf();
     let session_id = session_id.to_owned();
+    let replay_session_id = SessionId::new(session_id.clone());
 
     let request = Client
         .builder()
         .name("waku-session-import")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                if let Ok(update) = serde_json::to_value(notification.update) {
+                if notification.session_id == replay_session_id
+                    && let Ok(update) = serde_json::to_value(notification.update)
+                {
                     captured.lock().push(update);
                     *last_update_seen.lock() = Some(Instant::now());
                     let _ = update_tx.try_send(());
@@ -442,10 +463,12 @@ where
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
-            let initialize = connection
-                .send_request(initialize_request())
-                .block_task()
-                .await?;
+            let initialize = validate_initialize(
+                connection
+                    .send_request(initialize_request())
+                    .block_task()
+                    .await?,
+            )?;
             if !initialize.agent_capabilities.load_session {
                 return Err(agent_client_protocol::Error::new(
                     agent_client_protocol::ErrorCode::MethodNotFound.into(),
@@ -1347,6 +1370,14 @@ mod tests {
             .on_receive_request(
                 async move |req: LoadSessionRequest, responder, cx| {
                     let session_id = req.session_id.clone();
+                    cx.send_notification(SessionNotification::new(
+                        "different-session",
+                        agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                ContentBlock::Text(TextContent::new("unrelated prompt")),
+                            ),
+                        ),
+                    ))?;
                     responder.respond(LoadSessionResponse::new())?;
                     // Emit trailing replay chunks after `session/load` responds,
                     // spaced past the old fixed 50ms sleep.

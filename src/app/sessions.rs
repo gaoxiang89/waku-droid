@@ -1812,8 +1812,8 @@ impl Waku {
         self.settle_foreground_work(session_id, BackgroundWorkStatus::Stopped);
         if let Some(runtime) = runtime.as_mut() {
             runtime.stream_phase = None;
-            runtime.pending_permission = None;
-            runtime.pending_user_input = None;
+            runtime.pending_permissions.clear();
+            runtime.pending_user_inputs.clear();
             runtime.pending_computer_approval = None;
             runtime.computer_use_previews.clear();
         }
@@ -1856,18 +1856,30 @@ impl Waku {
 
     pub(super) fn respond_permission(
         &mut self,
-        request_id: String,
+        session_id: Uuid,
+        request_id: &str,
         option_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.state.selected_session else {
+        if self.state.selected_session != Some(session_id) {
+            return;
+        }
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
             return;
         };
-        if let Some(runtime) = self.runtimes.get_mut(&session_id) {
-            runtime.driver.respond(request_id, option_id);
-            runtime.pending_permission = None;
+        if runtime
+            .pending_permissions
+            .front()
+            .is_none_or(|pending| pending.request_id != request_id)
+        {
+            return;
         }
-        if let Some(session) = self.selected_session_mut() {
+        runtime.driver.respond(request_id.to_owned(), option_id);
+        runtime.pending_permissions.pop_front();
+        if runtime.pending_permissions.is_empty()
+            && runtime.pending_user_inputs.is_empty()
+            && let Some(session) = self.selected_session_mut()
+        {
             session.status = SessionStatus::Working;
         }
         self.reconcile_session_notifications(session_id);
@@ -1884,6 +1896,7 @@ impl Waku {
     pub(super) fn update_user_input_custom_answer(
         &mut self,
         session_id: Uuid,
+        request_id: &str,
         question_id: String,
         answer: impl AsRef<str>,
         cx: &mut Context<Self>,
@@ -1891,7 +1904,8 @@ impl Waku {
         let Some(pending) = self
             .runtimes
             .get_mut(&session_id)
-            .and_then(|runtime| runtime.pending_user_input.as_mut())
+            .and_then(|runtime| runtime.pending_user_inputs.front_mut())
+            .filter(|pending| pending.request_id == request_id)
         else {
             return;
         };
@@ -1915,18 +1929,21 @@ impl Waku {
 
     pub(super) fn select_user_input_option(
         &mut self,
+        session_id: Uuid,
+        request_id: &str,
         question_id: String,
         label: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.state.selected_session else {
+        if self.state.selected_session != Some(session_id) {
             return;
-        };
-        let request_id = {
+        }
+        {
             let Some(pending) = self
                 .runtimes
                 .get_mut(&session_id)
-                .and_then(|runtime| runtime.pending_user_input.as_mut())
+                .and_then(|runtime| runtime.pending_user_inputs.front_mut())
+                .filter(|pending| pending.request_id == request_id)
             else {
                 return;
             };
@@ -1953,9 +1970,8 @@ impl Waku {
                 pending.selections.remove(&question_id);
             }
             pending.custom_answers.remove(&question_id);
-            pending.request_id.clone()
-        };
-        let key = user_input_field_key(session_id, &request_id, &question_id);
+        }
+        let key = user_input_field_key(session_id, request_id, &question_id);
         if let Some(input) = self.user_input_fields.borrow().get(&key).cloned() {
             cx.defer(move |cx| {
                 input.update(cx, |input, cx| {
@@ -1968,21 +1984,26 @@ impl Waku {
         cx.notify();
     }
 
-    pub(super) fn submit_user_input_form(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.state.selected_session else {
+    pub(super) fn submit_user_input_form(
+        &mut self,
+        session_id: Uuid,
+        request_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.selected_session != Some(session_id) {
             return;
-        };
+        }
         let Some(runtime) = self.runtimes.get_mut(&session_id) else {
             return;
         };
         if !runtime
-            .pending_user_input
-            .as_ref()
-            .is_some_and(|pending| pending.ready_to_submit())
+            .pending_user_inputs
+            .front()
+            .is_some_and(|pending| pending.request_id == request_id && pending.ready_to_submit())
         {
             return;
         }
-        let Some(pending) = runtime.pending_user_input.take() else {
+        let Some(pending) = runtime.pending_user_inputs.pop_front() else {
             return;
         };
         let record = pending.transcript_record();
@@ -1990,13 +2011,17 @@ impl Waku {
         runtime
             .driver
             .respond_user_input(pending.request_id, answers);
+        let waiting =
+            !runtime.pending_permissions.is_empty() || !runtime.pending_user_inputs.is_empty();
         let recorded = !record.is_empty();
         if let Some(session) = self.state.session_mut(session_id) {
             if recorded {
                 session.push_message(MessageRole::User, record);
                 session.updated_at = unix_time();
             }
-            session.status = SessionStatus::Working;
+            if !waiting {
+                session.status = SessionStatus::Working;
+            }
         }
         if recorded {
             self.state.mark_session_dirty(session_id);

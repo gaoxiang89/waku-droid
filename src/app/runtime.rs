@@ -3152,8 +3152,8 @@ impl Waku {
                 .retain(|event| matches!(event, DriverEvent::BackgroundWork(_)));
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
-            runtime.pending_permission = None;
-            runtime.pending_user_input = None;
+            runtime.pending_permissions.clear();
+            runtime.pending_user_inputs.clear();
             runtime.pending_computer_approval = None;
         }
         self.clear_user_input_fields(session_id);
@@ -3615,8 +3615,8 @@ impl Waku {
                 stream_phase: None,
                 park_announced: false,
                 stream_remeasure_pending: false,
-                pending_permission: None,
-                pending_user_input: None,
+                pending_permissions: VecDeque::new(),
+                pending_user_inputs: VecDeque::new(),
                 pending_computer_approval: None,
                 computer_use_previews: Vec::new(),
                 computer_session_grants: HashSet::new(),
@@ -4420,8 +4420,8 @@ impl Waku {
             runtime.pending_steers.clear();
             runtime.stream_remeasure_pending = false;
             runtime.stream_phase = None;
-            runtime.pending_permission = None;
-            runtime.pending_user_input = None;
+            runtime.pending_permissions.clear();
+            runtime.pending_user_inputs.clear();
             runtime.pending_computer_approval = None;
             runtime.last_active_at = Instant::now();
         }

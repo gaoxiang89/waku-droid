@@ -116,13 +116,19 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        if let Some(input) = self.selected_runtime()?.pending_user_input.clone() {
+        if let Some(input) = self
+            .selected_runtime()?
+            .pending_user_inputs
+            .front()
+            .cloned()
+        {
             return Some(self.render_user_input(input, window, cx));
         }
         if let Some(permission) = self.selected_runtime()?.pending_computer_approval.as_ref() {
             return Some(self.render_computer_permission(permission, cx));
         }
-        let permission = self.selected_runtime()?.pending_permission.as_ref()?;
+        let session_id = self.state.selected_session?;
+        let permission = self.selected_runtime()?.pending_permissions.front()?;
         let theme = Theme::current(cx);
         let request_id = permission.request_id.clone();
         let detail_viewport = self
@@ -177,12 +183,13 @@ impl Waku {
                     .active(|element| element.opacity(0.8))
                     .child(SharedString::from(option.label.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.respond_permission(request_id.clone(), option_id.clone(), cx);
+                        this.respond_permission(session_id, &request_id, option_id.clone(), cx);
                     }))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                             this.respond_permission(
-                                key_request_id.clone(),
+                                session_id,
+                                &key_request_id,
                                 key_option_id.clone(),
                                 cx,
                             );
@@ -282,27 +289,30 @@ impl Waku {
         }
         let input = cx
             .new(|cx| TextInput::new(window, cx).placeholder(tr!("user_input.other_placeholder")));
+        let request_id = request_id.to_owned();
         let question_id = question_id.to_owned();
         cx.subscribe(
             &input,
             move |_this, field, event: &InputEvent, cx| match event {
                 InputEvent::Submit(_) => {
                     let waku = cx.weak_entity();
+                    let request_id = request_id.clone();
                     cx.defer(move |cx| {
-                        let _ = waku.update(cx, |this, cx| this.submit_user_input_form(cx));
+                        let _ = waku.update(cx, |this, cx| {
+                            this.submit_user_input_form(session_id, &request_id, cx);
+                        });
                     });
                 }
                 InputEvent::Edited => {
                     let answer = field.read(cx).content().to_owned();
+                    let request_id = request_id.clone();
                     let question_id = question_id.clone();
                     let waku = cx.weak_entity();
                     cx.defer(move |cx| {
                         let _ = waku.update(cx, |this, cx| {
-                            let Some(session_id) = this.state.selected_session else {
-                                return;
-                            };
                             this.update_user_input_custom_answer(
                                 session_id,
+                                &request_id,
                                 question_id,
                                 answer,
                                 cx,
@@ -363,6 +373,8 @@ impl Waku {
                 let is_selected = selected.iter().any(|answer| answer == &option.label);
                 let question_id = question.id.clone();
                 let key_question_id = question.id.clone();
+                let click_request_id = request_id.clone();
+                let key_request_id = request_id.clone();
                 let click_label = option.label.clone();
                 let key_label = option.label.clone();
                 let focus = self.transcript_control_focus(
@@ -473,6 +485,8 @@ impl Waku {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.select_user_input_option(
+                                session_id,
+                                &click_request_id,
                                 question_id.clone(),
                                 click_label.clone(),
                                 cx,
@@ -486,6 +500,8 @@ impl Waku {
                             let target = match event.keystroke.key.as_str() {
                                 "enter" | "space" => {
                                     this.select_user_input_option(
+                                        session_id,
+                                        &key_request_id,
                                         key_question_id.clone(),
                                         key_label.clone(),
                                         cx,
@@ -595,6 +611,8 @@ impl Waku {
             .child(tr!("common.cancel"));
         let submit_focus =
             self.transcript_control_focus(format!("user-input-{request_id}-submit"), cx);
+        let click_request_id = request_id.clone();
+        let key_request_id = request_id.clone();
         let submit = div()
             .id(SharedString::from(format!(
                 "user-input-{request_id}-submit"
@@ -621,12 +639,14 @@ impl Waku {
                     .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .hover(|style| style.opacity(0.9))
                     .active(|style| style.opacity(0.8))
-                    .on_click(cx.listener(|this, _, _, cx| this.submit_user_input_form(cx)))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.submit_user_input_form(session_id, &click_request_id, cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         if !event.keystroke.modifiers.modified()
                             && matches!(event.keystroke.key.as_str(), "enter" | "space")
                         {
-                            this.submit_user_input_form(cx);
+                            this.submit_user_input_form(session_id, &key_request_id, cx);
                             cx.stop_propagation();
                         }
                     }))

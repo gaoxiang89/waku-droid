@@ -24,6 +24,8 @@ use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, UntypedMessa
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Map, Value, json};
 
+use crate::acp_session::validate_initialize;
+
 use crate::model::{ProviderAgentPreset, ProviderKind, ProviderModel, ProviderModelOption};
 use waku_protocol::composer::{CommandScope, SlashCommand};
 use waku_protocol::model_catalog::normalize_cursor_reasoning_effort;
@@ -357,7 +359,7 @@ fn discover_cursor_models_via_acp(binary: &Path) -> Vec<ProviderModel> {
             let mut meta = Map::new();
             meta.insert("parameterizedModelPicker".to_owned(), Value::Bool(true));
             capabilities = capabilities.meta(meta);
-            connection
+            let initialize = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
                         .client_capabilities(capabilities)
@@ -365,6 +367,7 @@ fn discover_cursor_models_via_acp(binary: &Path) -> Vec<ProviderModel> {
                 )
                 .block_task()
                 .await?;
+            validate_initialize(initialize)?;
             let request = UntypedMessage::new("cursor/list_available_models", json!({}))?;
             connection.send_request(request).block_task().await
         });
@@ -995,6 +998,7 @@ where
                 )
                 .block_task()
                 .await?;
+            let initialize = validate_initialize(initialize)?;
             if !droid_supports_models_list(&initialize) {
                 return Err(agent_client_protocol::util::internal_error(
                     "Factory Droid did not advertise _meta.factory.modelsList",
@@ -1485,6 +1489,7 @@ where
                     )
                     .block_task()
                     .await?;
+                let initialize = validate_initialize(initialize)?;
                 let supports_close = initialize
                     .agent_capabilities
                     .session_capabilities
@@ -1603,6 +1608,7 @@ where
                     )
                     .block_task()
                     .await?;
+                let initialize = validate_initialize(initialize)?;
                 let supports_close = initialize
                     .agent_capabilities
                     .session_capabilities

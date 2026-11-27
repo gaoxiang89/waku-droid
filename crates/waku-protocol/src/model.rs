@@ -188,6 +188,21 @@ impl ProviderKind {
     pub fn supports_multiple_accounts(self) -> bool {
         matches!(self, Self::Antigravity | Self::Claude | Self::Codex)
     }
+
+    /// Whether this provider's transport only supports `RuntimeMode::FullAccess`
+    /// (`amp --dangerously-allow-all`, `pi --approve`, `omp --yolo`).
+    pub fn requires_full_access(self) -> bool {
+        matches!(self, Self::Amp | Self::OhMyPi | Self::Pi)
+    }
+
+    /// Clamps `mode` to the closest access mode supported by `self`.
+    pub fn effective_runtime_mode(self, mode: RuntimeMode) -> RuntimeMode {
+        if self.requires_full_access() {
+            RuntimeMode::FullAccess
+        } else {
+            mode
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -6085,5 +6100,28 @@ mod tests {
         let restored_skeleton: AgentSession = serde_json::from_value(skeleton_json).unwrap();
         assert!(!restored_skeleton.detail_loaded);
         assert!(restored_skeleton.has_started());
+    }
+
+    #[test]
+    fn provider_effective_runtime_mode_clamps_full_access_only_providers() {
+        for provider in ProviderKind::ALL {
+            let full_only = matches!(
+                provider,
+                ProviderKind::Amp | ProviderKind::OhMyPi | ProviderKind::Pi
+            );
+            assert_eq!(provider.requires_full_access(), full_only);
+            for mode in RuntimeMode::ACCESS_OPTIONS {
+                let expected = if full_only {
+                    RuntimeMode::FullAccess
+                } else {
+                    mode
+                };
+                assert_eq!(
+                    provider.effective_runtime_mode(mode),
+                    expected,
+                    "{provider:?} with {mode:?}"
+                );
+            }
+        }
     }
 }

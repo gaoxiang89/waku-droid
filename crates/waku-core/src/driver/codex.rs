@@ -647,6 +647,7 @@ impl CodexDriver {
             (usize, Sender<Result<(), String>>),
         >::new()));
         let pending_steers = Arc::new(Mutex::new(HashMap::<u64, String>::new()));
+        let pending_turn_starts = Arc::new(Mutex::new(HashSet::<u64>::new()));
         let background_rpcs = Arc::new(Mutex::new(BackgroundRpcState::default()));
         let goal_rpcs = Arc::new(Mutex::new(GoalRpcState::default()));
         let title_generation = Arc::new(Mutex::new(CodexTitleGeneration {
@@ -660,6 +661,7 @@ impl CodexDriver {
         let writer_turn_ids = turn_ids.clone();
         let writer_pending_rollbacks = pending_rollbacks.clone();
         let writer_pending_steers = pending_steers.clone();
+        let writer_pending_turn_starts = pending_turn_starts.clone();
         let writer_background_rpcs = background_rpcs.clone();
         let writer_goal_rpcs = goal_rpcs.clone();
         let writer_title_generation = title_generation.clone();
@@ -813,6 +815,10 @@ impl CodexDriver {
                                 let _ = writer_events.send(DriverEvent::Error(tr!(
                                     "errors.codex_thread_open_incomplete"
                                 )));
+                                let _ = writer_events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
                                 continue;
                             };
                             {
@@ -824,6 +830,7 @@ impl CodexDriver {
                                 }
                             }
                             next_request_id += 1;
+                            let request_id = next_request_id;
                             let mut params = turn_start_params(
                                 &thread_id,
                                 text,
@@ -840,11 +847,26 @@ impl CodexDriver {
                             if let Some(service_tier) = service_tier.as_deref() {
                                 params["serviceTier"] = json!(service_tier);
                             }
-                            json!({
+                            writer_pending_turn_starts.lock().insert(request_id);
+                            let message = json!({
                                 "method": "turn/start",
-                                "id": next_request_id,
+                                "id": request_id,
                                 "params": params
-                            })
+                            });
+                            if let Err(error) = write_json_line(&mut stdin, &message) {
+                                writer_pending_turn_starts.lock().remove(&request_id);
+                                let _ = writer_events.send(DriverEvent::Error(tr!(
+                                    "errors.provider_transport_write",
+                                    provider = "Codex",
+                                    error = error
+                                )));
+                                let _ = writer_events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                                break;
+                            }
+                            continue;
                         }
                         CommandMessage::Steer(text) => {
                             let (thread_id, active_turn_id) =
@@ -1125,6 +1147,7 @@ impl CodexDriver {
         let reader_turn_ids = turn_ids.clone();
         let reader_pending_rollbacks = pending_rollbacks.clone();
         let reader_pending_steers = pending_steers.clone();
+        let reader_pending_turn_starts = pending_turn_starts;
         let reader_background_rpcs = background_rpcs.clone();
         let reader_goal_rpcs = goal_rpcs.clone();
         let reader_title_generation = title_generation;
@@ -1154,6 +1177,7 @@ impl CodexDriver {
                                         &reader_turn_ids,
                                         &reader_pending_rollbacks,
                                         &reader_pending_steers,
+                                        &reader_pending_turn_starts,
                                         &reader_background_rpcs,
                                         &reader_goal_rpcs,
                                         &reader_commands,
@@ -2149,6 +2173,7 @@ fn handle_codex_message(
     turn_ids: &Mutex<Vec<String>>,
     pending_rollbacks: &Mutex<HashMap<u64, (usize, Sender<Result<(), String>>)>>,
     pending_steers: &Mutex<HashMap<u64, String>>,
+    pending_turn_starts: &Mutex<HashSet<u64>>,
     background_rpcs: &Mutex<BackgroundRpcState>,
     goal_rpcs: &Mutex<GoalRpcState>,
     commands: &Sender<CommandMessage>,
@@ -2239,6 +2264,25 @@ fn handle_codex_message(
                     )));
                 }
             }
+        }
+        return;
+    }
+    if is_response
+        && let Some(id) = value.get("id").and_then(Value::as_u64)
+        && id != 1
+        && pending_turn_starts.lock().remove(&id)
+    {
+        if value.get("error").is_some() {
+            let error = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| tr!("errors.provider_start_turn", provider = "Codex"));
+            let _ = events.send(DriverEvent::Error(error));
+            let _ = events.send(DriverEvent::TurnFinished {
+                success: false,
+                summary: None,
+            });
         }
         return;
     }
@@ -3257,6 +3301,7 @@ mod tests {
                 &self.turn_ids,
                 &self.rollbacks,
                 &self.steers,
+                &Mutex::new(HashSet::new()),
                 &self.background,
                 &self.goals,
                 &self.commands,
@@ -3709,6 +3754,7 @@ mod tests {
                 &turn_ids,
                 &pending_rollbacks,
                 &pending_steers,
+                &Mutex::new(HashSet::new()),
                 &background_rpcs,
                 &goal_rpcs,
                 &goal_commands,
@@ -3778,6 +3824,7 @@ mod tests {
             &turn_ids,
             &pending_rollbacks,
             &pending_steers,
+            &Mutex::new(HashSet::new()),
             &background_rpcs,
             &goal_rpcs,
             &goal_commands,
@@ -3813,6 +3860,7 @@ mod tests {
             &turn_ids,
             &pending_rollbacks,
             &pending_steers,
+            &Mutex::new(HashSet::new()),
             &background_rpcs,
             &goal_rpcs,
             &goal_commands,
@@ -3865,6 +3913,7 @@ mod tests {
                 &turn_ids,
                 &pending_rollbacks,
                 &pending_steers,
+                &Mutex::new(HashSet::new()),
                 &background_rpcs,
                 &goal_rpcs,
                 &goal_commands,
@@ -3910,6 +3959,7 @@ mod tests {
             &turn_ids,
             &pending_rollbacks,
             &pending_steers,
+            &Mutex::new(HashSet::new()),
             &background_rpcs,
             &goal_rpcs,
             &goal_commands,
@@ -3948,6 +3998,7 @@ mod tests {
             &turn_ids,
             &pending_rollbacks,
             &pending_steers,
+            &Mutex::new(HashSet::new()),
             &background_rpcs,
             &goal_rpcs,
             &goal_commands,
@@ -4022,6 +4073,7 @@ mod tests {
             &turn_ids,
             &pending_rollbacks,
             &pending_steers,
+            &Mutex::new(HashSet::new()),
             &background_rpcs,
             &goal_rpcs,
             &goal_commands,
@@ -4130,6 +4182,7 @@ mod tests {
                 &turn_ids,
                 &pending_rollbacks,
                 &pending_steers,
+                &Mutex::new(HashSet::new()),
                 &background_rpcs,
                 &goal_rpcs,
                 &goal_commands,
@@ -4506,6 +4559,7 @@ mod tests {
             &harness.turn_ids,
             &harness.rollbacks,
             &harness.steers,
+            &Mutex::new(HashSet::new()),
             &harness.background,
             &harness.goals,
             &harness.commands,
@@ -4669,5 +4723,50 @@ mod tests {
         reader.join().unwrap();
         reaper.join().unwrap();
         assert!(lifecycle.was_terminated());
+    }
+
+    #[test]
+    fn turn_start_error_response_settles_turn_with_failure() {
+        let thread_id = ThreadIdState::ready("thread-1");
+        let turn_id = Mutex::new(None);
+        let turn_ids = Mutex::new(Vec::new());
+        let pending_rollbacks = Mutex::new(HashMap::new());
+        let pending_steers = Mutex::new(HashMap::new());
+        let pending_turn_starts = Mutex::new(HashSet::from([11_u64]));
+        let background_rpcs = Mutex::new(BackgroundRpcState::default());
+        let goal_rpcs = Mutex::new(GoalRpcState::default());
+        let (commands, _command_rx) = unbounded();
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let mut stream_state = CodexStreamState::default();
+
+        handle_codex_message(
+            json!({
+                "id": 11,
+                "error": { "code": -32602, "message": "invalid model" }
+            }),
+            &thread_id,
+            &turn_id,
+            &turn_ids,
+            &pending_rollbacks,
+            &pending_steers,
+            &pending_turn_starts,
+            &background_rpcs,
+            &goal_rpcs,
+            &commands,
+            &events,
+            &mut stream_state,
+        );
+
+        let seen: Vec<_> = event_rx.try_iter().collect();
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                DriverEvent::Error(message),
+                DriverEvent::TurnFinished {
+                    success: false,
+                    summary: None
+                }
+            ] if message == "invalid model"
+        ));
     }
 }

@@ -64,6 +64,38 @@ struct LiveSessionRuntime {
     busy: Arc<AtomicBool>,
     last_active_at: Arc<Mutex<Instant>>,
     pending_steers: Arc<Mutex<VecDeque<PendingSteerMeta>>>,
+    pending_interactions: Arc<Mutex<PendingInteractionIds>>,
+}
+
+#[derive(Default)]
+struct PendingInteractionIds {
+    permissions: HashSet<String>,
+    user_inputs: HashSet<String>,
+}
+
+impl PendingInteractionIds {
+    fn track(&mut self, event: &DriverEvent) -> bool {
+        match event {
+            DriverEvent::Permission { request_id, .. } => {
+                self.permissions.insert(request_id.clone());
+            }
+            DriverEvent::UserInputRequested { request_id, .. } => {
+                self.user_inputs.insert(request_id.clone());
+            }
+            DriverEvent::PermissionResolved { request_id } => {
+                self.permissions.remove(request_id);
+            }
+            DriverEvent::UserInputResolved { request_id } => {
+                self.user_inputs.remove(request_id);
+            }
+            DriverEvent::TurnFinished { .. } | DriverEvent::ProcessExited => {
+                self.permissions.clear();
+                self.user_inputs.clear();
+            }
+            _ => {}
+        }
+        !self.permissions.is_empty() || !self.user_inputs.is_empty()
+    }
 }
 
 impl LiveSessionRuntime {
@@ -322,6 +354,7 @@ impl WakuBackend {
                 busy: Arc::new(AtomicBool::new(false)),
                 last_active_at: Arc::new(Mutex::new(Instant::now())),
                 pending_steers: Arc::new(Mutex::new(VecDeque::new())),
+                pending_interactions: Arc::default(),
             },
         );
     }
@@ -1131,12 +1164,14 @@ impl Backend for WakuBackend {
                 let busy = Arc::new(AtomicBool::new(false));
                 let last_active_at = Arc::new(Mutex::new(Instant::now()));
                 let pending_steers = Arc::new(Mutex::new(VecDeque::<PendingSteerMeta>::new()));
+                let pending_interactions = Arc::new(Mutex::new(PendingInteractionIds::default()));
                 let forward_sessions = Arc::downgrade(&self.sessions);
                 let forward_task_state = Arc::downgrade(&self.task_state);
                 let forward_task_store = Arc::downgrade(&self.task_store);
                 let forward_busy = busy.clone();
                 let forward_last_active = last_active_at.clone();
                 let forward_pending_steers = pending_steers.clone();
+                let forward_pending_interactions = pending_interactions.clone();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
@@ -1193,6 +1228,18 @@ impl Backend for WakuBackend {
                                     | DriverEvent::TurnParked
                                     | DriverEvent::ProcessExited
                             );
+                            // Serialize publishing and reducing interactive events with
+                            // replies from other clients. Stream deltas skip this lock.
+                            let mut interactions = matches!(
+                                &event,
+                                DriverEvent::Permission { .. }
+                                    | DriverEvent::UserInputRequested { .. }
+                                    | DriverEvent::PermissionResolved { .. }
+                                    | DriverEvent::UserInputResolved { .. }
+                                    | DriverEvent::TurnFinished { .. }
+                                    | DriverEvent::ProcessExited
+                            )
+                            .then(|| forward_pending_interactions.lock());
                             let wire = event_to_wire(event.clone()).unwrap_or_else(|error| {
                                 WireDriverEvent::new(
                                     "error",
@@ -1204,6 +1251,8 @@ impl Backend for WakuBackend {
                             let Some(cursor) = events.send_sequenced(wire) else {
                                 break;
                             };
+                            let waiting =
+                                interactions.as_mut().is_some_and(|ids| ids.track(&event));
                             if let (Some(task_state), Some(task_store), Some(sessions)) = (
                                 forward_task_state.upgrade(),
                                 forward_task_store.upgrade(),
@@ -1215,6 +1264,7 @@ impl Backend for WakuBackend {
                                     &sessions,
                                     session_id,
                                     &event,
+                                    waiting,
                                     Some(cursor),
                                     is_turn_settle,
                                     events.subscriber_count(),
@@ -1224,6 +1274,7 @@ impl Backend for WakuBackend {
                                     events.notify_task_state_changed();
                                 }
                             }
+                            drop(interactions);
                             if matches!(event, DriverEvent::TurnFinished { .. }) {
                                 turn_event_count = 0;
                             }
@@ -1252,6 +1303,7 @@ impl Backend for WakuBackend {
                                 &sessions,
                                 session_id,
                                 &DriverEvent::ProcessExited,
+                                false,
                                 None,
                                 true,
                                 events.subscriber_count(),
@@ -1289,6 +1341,7 @@ impl Backend for WakuBackend {
                         busy,
                         last_active_at,
                         pending_steers,
+                        pending_interactions,
                     },
                 );
                 Ok(ResponsePayload::Started { supports_steer })
@@ -1333,7 +1386,7 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::QueuedMessageClaimed { claimed: true })
             }
             command => {
-                let (driver, busy, pending_steers) = {
+                let (driver, busy, pending_steers, pending_interactions) = {
                     let sessions = self.sessions.lock();
                     let live = sessions
                         .get(&session_id)
@@ -1349,6 +1402,7 @@ impl Backend for WakuBackend {
                         live.driver.clone(),
                         live.busy.clone(),
                         live.pending_steers.clone(),
+                        live.pending_interactions.clone(),
                     )
                 };
                 if matches!(&command, Command::Prompt { .. }) {
@@ -1385,6 +1439,7 @@ impl Backend for WakuBackend {
                             &self.sessions,
                             session_id,
                             &decoded,
+                            false,
                             Some(cursor),
                             false,
                             events.subscriber_count(),
@@ -1403,24 +1458,29 @@ impl Backend for WakuBackend {
                     }
                     _ => None,
                 };
-                let outcome = handle_driver_command(&driver, command)?;
-                if let Some(resolved_event) = resolved_event
-                    && let Ok(wire) = event_to_wire(resolved_event.clone())
-                    && let Some(cursor) = events.send_sequenced(wire)
-                {
-                    reduce_and_maybe_persist_daemon_event(
-                        &self.task_state,
-                        &self.task_store,
-                        &self.sessions,
-                        session_id,
-                        &resolved_event,
-                        Some(cursor),
-                        false,
-                        events.subscriber_count(),
-                        0,
-                    );
+                // Mirror the resolution before the driver can emit a retry
+                // for the same request ID (for example, ACP form validation).
+                if let Some(resolved_event) = resolved_event {
+                    let mut interactions = pending_interactions.lock();
+                    if let Ok(wire) = event_to_wire(resolved_event.clone())
+                        && let Some(cursor) = events.send_sequenced(wire)
+                    {
+                        let waiting = interactions.track(&resolved_event);
+                        reduce_and_maybe_persist_daemon_event(
+                            &self.task_state,
+                            &self.task_store,
+                            &self.sessions,
+                            session_id,
+                            &resolved_event,
+                            waiting,
+                            Some(cursor),
+                            false,
+                            events.subscriber_count(),
+                            0,
+                        );
+                    }
                 }
-                Ok(outcome)
+                handle_driver_command(&driver, command)
             }
         }
     }
@@ -3018,6 +3078,7 @@ fn reduce_and_maybe_persist_daemon_event(
     live_sessions: &Mutex<HashMap<Uuid, LiveSessionRuntime>>,
     session_id: Uuid,
     event: &DriverEvent,
+    waiting_for_interaction: bool,
     cursor: Option<RuntimeEventCursor>,
     flush_to_store: bool,
     subscriber_count: usize,
@@ -3036,7 +3097,12 @@ fn reduce_and_maybe_persist_daemon_event(
     {
         return false;
     }
-    let (changed, settled) = reduce_daemon_driver_event(&mut state.sessions[index], event, cursor);
+    let (changed, settled) = reduce_daemon_driver_event(
+        &mut state.sessions[index],
+        event,
+        waiting_for_interaction,
+        cursor,
+    );
     let bump_version = settled
         && (matches!(event, DriverEvent::ProcessExited)
             || subscriber_count == 0
@@ -3060,6 +3126,7 @@ fn reduce_and_maybe_persist_daemon_event(
 fn reduce_daemon_driver_event(
     session: &mut AgentSession,
     event: &DriverEvent,
+    waiting_for_interaction: bool,
     cursor: Option<RuntimeEventCursor>,
 ) -> (bool, bool) {
     if let Some(cursor) = cursor {
@@ -3214,7 +3281,7 @@ fn reduce_daemon_driver_event(
             }
         }
         DriverEvent::PermissionResolved { .. } | DriverEvent::UserInputResolved { .. } => {
-            if session.status == SessionStatus::Waiting {
+            if session.status == SessionStatus::Waiting && !waiting_for_interaction {
                 session.status = SessionStatus::Working;
                 changed = true;
             }
@@ -3302,6 +3369,47 @@ fn reduce_daemon_driver_event(
         session.updated_at = unix_time();
     }
     (changed, settled)
+}
+
+#[cfg(test)]
+#[test]
+fn resolving_one_request_keeps_the_daemon_waiting_for_other_interactions() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Droid);
+    session.status = SessionStatus::Working;
+    let mut pending = PendingInteractionIds::default();
+    for (event, status) in [
+        (
+            DriverEvent::Permission {
+                request_id: "one".to_owned(),
+                title: "Approval".to_owned(),
+                detail: String::new(),
+                options: Vec::new(),
+            },
+            SessionStatus::Waiting,
+        ),
+        (
+            DriverEvent::UserInputRequested {
+                request_id: "two".to_owned(),
+                questions: Vec::new(),
+            },
+            SessionStatus::Waiting,
+        ),
+        (
+            DriverEvent::UserInputResolved {
+                request_id: "two".to_owned(),
+            },
+            SessionStatus::Waiting,
+        ),
+        (
+            DriverEvent::PermissionResolved {
+                request_id: "one".to_owned(),
+            },
+            SessionStatus::Working,
+        ),
+    ] {
+        reduce_daemon_driver_event(&mut session, &event, pending.track(&event), None);
+        assert_eq!(session.status, status);
+    }
 }
 
 fn settle_daemon_session(

@@ -1064,8 +1064,8 @@ struct SessionRuntime {
     /// wake that parks again does not repeat it. Cleared when the turn ends.
     park_announced: bool,
     stream_remeasure_pending: bool,
-    pending_permission: Option<PendingPermission>,
-    pending_user_input: Option<PendingUserInput>,
+    pending_permissions: VecDeque<PendingPermission>,
+    pending_user_inputs: VecDeque<PendingUserInput>,
     pending_computer_approval: Option<PendingComputerApproval>,
     /// Back-to-front stack of window previews captured during the active turn.
     computer_use_previews: Vec<ComputerUsePreview>,

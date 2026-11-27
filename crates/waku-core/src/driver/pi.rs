@@ -407,7 +407,22 @@ impl PiDriver {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        let mut child = crate::command_env::spawn(command)
+        struct PiStartupChildGuard {
+            child: Option<Child>,
+            process: Arc<PiProcessHandle>,
+        }
+        impl Drop for PiStartupChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    self.process.force_terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.process.mark_exited();
+                }
+            }
+        }
+
+        let child = crate::command_env::spawn(command)
             .with_context(|| format!("failed to start `{} --mode rpc`", binary.display()))?;
         let child_pid = child.id();
         #[cfg(windows)]
@@ -417,35 +432,35 @@ impl PiDriver {
             #[cfg(windows)]
             job,
         ));
-        let Some(stdin) = child.stdin.take() else {
-            process.force_terminate();
-            let _ = child.wait();
-            process.mark_exited();
+        let mut child_guard = PiStartupChildGuard {
+            child: Some(child),
+            process: process.clone(),
+        };
+        let Some(stdin) = child_guard.child.as_mut().and_then(|c| c.stdin.take()) else {
             return Err(anyhow!("{} stdin unavailable", flavor.display_name()));
         };
-        let Some(stdout) = child.stdout.take() else {
-            process.force_terminate();
-            let _ = child.wait();
-            process.mark_exited();
+        let Some(stdout) = child_guard.child.as_mut().and_then(|c| c.stdout.take()) else {
             return Err(anyhow!("{} stdout unavailable", flavor.display_name()));
         };
-        let Some(stderr) = child.stderr.take() else {
-            process.force_terminate();
-            let _ = child.wait();
-            process.mark_exited();
+        let Some(stderr) = child_guard.child.as_mut().and_then(|c| c.stderr.take()) else {
             return Err(anyhow!("{} stderr unavailable", flavor.display_name()));
         };
 
         let (commands, command_rx) = unbounded();
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let turn_active = Arc::new(AtomicBool::new(false));
         let reader_pending = pending.clone();
         let reader_commands = commands.clone();
         let reader_events = events.clone();
+        let reader_turn_active = turn_active.clone();
         let reader_thread =
             thread::Builder::new()
                 .name("waku-pi-reader".into())
                 .spawn(move || {
-                    let mut stream_state = PiStreamState::default();
+                    let mut stream_state = PiStreamState {
+                        turn_active: reader_turn_active,
+                        ..PiStreamState::default()
+                    };
                     let mut chunks = ChunkAssembly::default();
                     for line in BufReader::new(stdout).lines() {
                         match line {
@@ -508,6 +523,7 @@ impl PiDriver {
         let writer_pending = pending;
         let writer_events = events.clone();
         let writer_process = process.clone();
+        let writer_turn_active = turn_active;
         thread::Builder::new()
             .name("waku-pi-writer".into())
             .spawn(move || {
@@ -693,6 +709,16 @@ impl PiDriver {
                             }
                         }
                         CommandMessage::Steer(prompt) => {
+                            if !writer_turn_active.load(Ordering::Acquire) {
+                                let _ = writer_events.send(DriverEvent::SteerRejected {
+                                    message: prompt,
+                                    reason: tr!(
+                                        "errors.provider_no_active_turn",
+                                        provider = flavor.display_name()
+                                    ),
+                                });
+                                continue;
+                            }
                             let result = send_request(
                                 &mut stdin,
                                 &writer_pending,
@@ -842,6 +868,10 @@ impl PiDriver {
         // `child` to prevent PID-reuse kills, and suppress expected shutdown
         // exit codes.
         let process_handle = process.clone();
+        let mut child = child_guard
+            .child
+            .take()
+            .expect("startup child guard owns child");
         thread::Builder::new()
             .name("waku-pi-process".into())
             .spawn(move || {
@@ -1659,6 +1689,17 @@ struct PiStreamState {
     message_saw_reasoning: bool,
     failed: bool,
     tools: HashMap<String, (ActivityKind, String)>,
+    turn_active: Arc<AtomicBool>,
+}
+
+impl PiStreamState {
+    fn reset_turn(&mut self) {
+        self.turn_active.store(false, Ordering::Release);
+        *self = Self {
+            turn_active: self.turn_active.clone(),
+            ..Self::default()
+        };
+    }
 }
 
 fn handle_pi_message(
@@ -1706,7 +1747,7 @@ fn handle_pi_message(
                 success,
                 summary: error,
             });
-            *state = PiStreamState::default();
+            state.reset_turn();
             return;
         }
         let Some(PendingResponse::Request(response)) = pending.lock().remove(id) else {
@@ -1766,7 +1807,7 @@ fn handle_pi_message(
                 }),
             });
         }
-        *state = PiStreamState::default();
+        state.reset_turn();
         return;
     }
 
@@ -1779,6 +1820,7 @@ fn handle_pi_message(
             {
                 if !state.run_started {
                     state.run_started = true;
+                    state.turn_active.store(true, Ordering::Release);
                     let _ = events.send(DriverEvent::TurnStarted);
                 }
                 // Each command_output is a complete output block, unlike
@@ -1790,6 +1832,7 @@ fn handle_pi_message(
             if !state.run_started {
                 state.run_started = true;
                 state.failed = false;
+                state.turn_active.store(true, Ordering::Release);
                 let _ = events.send(DriverEvent::TurnStarted);
             }
         }
@@ -1831,6 +1874,21 @@ fn handle_pi_message(
         }
         "message_end" => {
             if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
+                if value.pointer("/message/stopReason").and_then(Value::as_str) == Some("error")
+                    && !state.failed
+                {
+                    state.failed = true;
+                    let message = value
+                        .pointer("/message/errorMessage")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|msg| !msg.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            pi_error_message(flavor, value.get("message").unwrap_or(&value))
+                        });
+                    let _ = events.send(DriverEvent::Error(message));
+                }
                 // This is the context the next call starts from, not the
                 // cumulative billed total for the whole session.
                 if let Some(tokens) = value.get("message").and_then(pi_message_context_tokens) {
@@ -3137,5 +3195,37 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("dropping ScopedChildProcess must terminate the child process tree");
+    }
+
+    #[test]
+    fn message_end_with_error_stop_reason_fails_empty_turn() {
+        let (pending, commands, _command_rx, mut state) = harness();
+        let (events, event_rx) = unbounded();
+
+        for frame in [
+            json!({"type": "agent_start"}),
+            json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "Quota exceeded",
+                    "content": []
+                }
+            }),
+            json!({"type": "agent_settled"}),
+        ] {
+            handle_pi_message(PiFlavor::Pi, frame, &pending, &commands, &events, &mut state);
+        }
+
+        let seen: Vec<_> = event_rx.try_iter().collect();
+        assert!(seen.iter().any(|e| matches!(e, DriverEvent::Error(msg) if msg == "Quota exceeded")));
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            DriverEvent::TurnFinished {
+                success: false,
+                ..
+            }
+        )));
     }
 }

@@ -937,7 +937,8 @@ pub fn list_project_files(root: &Path, cap: usize) -> Vec<FileEntry> {
 }
 
 fn git_listed_files(root: &Path, cap: usize) -> Option<Vec<String>> {
-    let output = crate::command_env::plain_command("git")
+    let mut command = crate::command_env::command("git");
+    command
         .arg("-C")
         .arg(root)
         .args([
@@ -946,9 +947,10 @@ fn git_listed_files(root: &Path, cap: usize) -> Option<Vec<String>> {
             "--others",
             "--exclude-standard",
             "-z",
-        ])
-        .output()
-        .ok()?;
+        ]);
+    let output =
+        crate::command_env::output_with_timeout(&mut command, std::time::Duration::from_secs(5))
+            .ok()?;
     if !output.status.success() {
         return None;
     }

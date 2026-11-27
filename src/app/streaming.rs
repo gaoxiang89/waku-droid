@@ -560,11 +560,11 @@ impl Waku {
                 options,
             } => {
                 if self.accepts_turn_output(session_id) {
-                    let fresh = runtime
-                        .pending_permission
-                        .as_ref()
-                        .is_none_or(|pending| pending.request_id != request_id);
-                    if fresh {
+                    let index = runtime
+                        .pending_permissions
+                        .iter()
+                        .position(|pending| pending.request_id == request_id);
+                    if index.is_none() {
                         self.notify_session_attention(
                             session_id,
                             AppNotificationKind::Approval,
@@ -572,12 +572,17 @@ impl Waku {
                             cx,
                         );
                     }
-                    runtime.pending_permission = Some(PendingPermission {
+                    let pending = PendingPermission {
                         request_id,
                         title,
                         detail,
                         options,
-                    });
+                    };
+                    if let Some(index) = index {
+                        runtime.pending_permissions[index] = pending;
+                    } else {
+                        runtime.pending_permissions.push_back(pending);
+                    }
                     if let Some(session) = self.state.session_mut(session_id) {
                         session.status = SessionStatus::Waiting;
                     }
@@ -588,11 +593,11 @@ impl Waku {
                 questions,
             } => {
                 if self.accepts_turn_output(session_id) && !questions.is_empty() {
-                    let fresh = runtime
-                        .pending_user_input
-                        .as_ref()
-                        .is_none_or(|pending| pending.request_id != request_id);
-                    if fresh {
+                    let index = runtime
+                        .pending_user_inputs
+                        .iter()
+                        .position(|pending| pending.request_id == request_id);
+                    if index.is_none() {
                         self.notify_session_attention(
                             session_id,
                             AppNotificationKind::Input,
@@ -604,21 +609,29 @@ impl Waku {
                             cx,
                         );
                     }
-                    self.clear_user_input_fields(session_id);
-                    runtime.pending_user_input = Some(PendingUserInput::new(request_id, questions));
+                    let pending = PendingUserInput::new(request_id, questions);
+                    if let Some(index) = index {
+                        if index == 0 {
+                            self.clear_user_input_fields(session_id);
+                        }
+                        runtime.pending_user_inputs[index] = pending;
+                    } else {
+                        runtime.pending_user_inputs.push_back(pending);
+                    }
                     if let Some(session) = self.state.session_mut(session_id) {
                         session.status = SessionStatus::Waiting;
                     }
                 }
             }
             DriverEvent::PermissionResolved { request_id } => {
-                if runtime
-                    .pending_permission
-                    .as_ref()
-                    .is_some_and(|pending| pending.request_id == request_id)
+                if let Some(index) = runtime
+                    .pending_permissions
+                    .iter()
+                    .position(|pending| pending.request_id == request_id)
                 {
-                    runtime.pending_permission = None;
-                    if runtime.pending_user_input.is_none()
+                    runtime.pending_permissions.remove(index);
+                    if runtime.pending_permissions.is_empty()
+                        && runtime.pending_user_inputs.is_empty()
                         && let Some(session) = self.state.session_mut(session_id)
                         && session.status == SessionStatus::Waiting
                     {
@@ -628,14 +641,17 @@ impl Waku {
                 }
             }
             DriverEvent::UserInputResolved { request_id } => {
-                if runtime
-                    .pending_user_input
-                    .as_ref()
-                    .is_some_and(|pending| pending.request_id == request_id)
+                if let Some(index) = runtime
+                    .pending_user_inputs
+                    .iter()
+                    .position(|pending| pending.request_id == request_id)
                 {
-                    runtime.pending_user_input = None;
-                    self.clear_user_input_fields(session_id);
-                    if runtime.pending_permission.is_none()
+                    runtime.pending_user_inputs.remove(index);
+                    if index == 0 {
+                        self.clear_user_input_fields(session_id);
+                    }
+                    if runtime.pending_permissions.is_empty()
+                        && runtime.pending_user_inputs.is_empty()
                         && let Some(session) = self.state.session_mut(session_id)
                         && session.status == SessionStatus::Waiting
                     {
@@ -912,8 +928,8 @@ impl Waku {
                 // The settled turn keeps its average in `stream_stats`; the
                 // live window has no further use.
                 self.token_rate_meters.remove(&session_id);
-                runtime.pending_permission = None;
-                runtime.pending_user_input = None;
+                runtime.pending_permissions.clear();
+                runtime.pending_user_inputs.clear();
                 self.clear_user_input_fields(session_id);
                 runtime.pending_computer_approval = None;
                 runtime.driver.cancel_computer_use();
@@ -1004,8 +1020,8 @@ impl Waku {
                 self.finish_streaming_assistant(session_id);
                 self.complete_turn_blocks(session_id);
                 runtime.stream_phase = None;
-                runtime.pending_permission = None;
-                runtime.pending_user_input = None;
+                runtime.pending_permissions.clear();
+                runtime.pending_user_inputs.clear();
                 self.clear_user_input_fields(session_id);
                 runtime.pending_computer_approval = None;
                 runtime.driver.cancel_computer_use();

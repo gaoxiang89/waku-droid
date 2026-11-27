@@ -292,7 +292,7 @@ pub struct ClaudeDriver {
     process: Option<Arc<ProcessLifecycle>>,
     mode: RuntimeMode,
     reasoning_effort: Option<String>,
-    current_model: Mutex<Option<String>>,
+    current_model: Arc<Mutex<Option<String>>>,
 }
 
 /// The permission posture Claude is launched with.
@@ -477,6 +477,9 @@ impl ClaudeDriver {
         let (commands, command_rx) = unbounded();
         let turn_state = Arc::new(Mutex::new(ClaudeTurnState::default()));
         let pending_task_stops = Arc::new(Mutex::new(HashMap::<String, BackgroundWorkKey>::new()));
+        let pending_model_sets = Arc::new(Mutex::new(HashMap::<String, Option<String>>::new()));
+        let shared_live_tasks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let shared_current_model = Arc::new(Mutex::new(launch_model.clone()));
         let pending_user_inputs = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
 
         let reader_events = events.clone();
@@ -485,6 +488,9 @@ impl ClaudeDriver {
         let reader_session = session_id.clone();
         let reader_config_dir = config_dir.clone();
         let reader_pending_task_stops = pending_task_stops.clone();
+        let reader_pending_model_sets = pending_model_sets.clone();
+        let reader_live_tasks = shared_live_tasks.clone();
+        let reader_current_model = shared_current_model.clone();
         let reader_pending_user_inputs = pending_user_inputs.clone();
         let reader_thread = thread::Builder::new()
             .name("waku-claude-reader".into())
@@ -492,6 +498,9 @@ impl ClaudeDriver {
                 let mut state = ClaudeStreamState {
                     config_dir: reader_config_dir,
                     pending_task_stops: reader_pending_task_stops,
+                    pending_model_sets: reader_pending_model_sets,
+                    shared_live_tasks: reader_live_tasks,
+                    shared_current_model: reader_current_model,
                     pending_user_inputs: reader_pending_user_inputs,
                     ..ClaudeStreamState::default()
                 };
@@ -517,11 +526,14 @@ impl ClaudeDriver {
         let writer_events = events.clone();
         let writer_turn = turn_state.clone();
         let writer_pending_task_stops = pending_task_stops;
+        let writer_pending_model_sets = pending_model_sets;
+        let writer_live_tasks = shared_live_tasks;
+        let writer_current_model = shared_current_model.clone();
         let writer_pending_user_inputs = pending_user_inputs.clone();
         let writer_title_refresh = super::title_refresh::NativeTitleRefresh::default();
         let title_session_id = session_id;
         let title_config_dir = config_dir;
-        let writer_launch_model = launch_model.clone();
+        let writer_launch_model = launch_model;
         thread::Builder::new()
             .name("waku-claude-writer".into())
             .spawn(move || {
@@ -559,15 +571,45 @@ impl ClaudeDriver {
                         }
                         CommandMessage::Cancel => {
                             writer_pending_user_inputs.lock().clear();
-                            next_request_id += 1;
-                            write_line(
-                                &mut stdin,
-                                &json!({
-                                    "type": "control_request",
-                                    "request_id": format!("waku-{next_request_id}"),
-                                    "request": {"subtype": "interrupt"}
-                                }),
-                            )
+                            let was_parked = {
+                                let mut turn = writer_turn.lock();
+                                if turn.active && turn.parked {
+                                    turn.active = false;
+                                    turn.parked = false;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if was_parked {
+                                let task_ids = writer_live_tasks.lock().clone();
+                                let mut write_result = Ok(());
+                                for task_id in task_ids {
+                                    next_request_id += 1;
+                                    write_result = write_line(
+                                        &mut stdin,
+                                        &stop_task_request(next_request_id, &task_id),
+                                    );
+                                    if write_result.is_err() {
+                                        break;
+                                    }
+                                }
+                                let _ = writer_events.send(DriverEvent::TurnFinished {
+                                    success: false,
+                                    summary: None,
+                                });
+                                write_result
+                            } else {
+                                next_request_id += 1;
+                                write_line(
+                                    &mut stdin,
+                                    &json!({
+                                        "type": "control_request",
+                                        "request_id": format!("waku-{next_request_id}"),
+                                        "request": {"subtype": "interrupt"}
+                                    }),
+                                )
+                            }
                         }
                         CommandMessage::Respond {
                             request_id,
@@ -670,13 +712,19 @@ impl ClaudeDriver {
                             let Some(model) = next_model.as_deref() else {
                                 continue;
                             };
+                            let previous_model = current_model.clone();
                             current_model = next_model.clone();
+                            *writer_current_model.lock() = next_model.clone();
                             next_request_id += 1;
+                            let request_id = format!("waku-{next_request_id}");
+                            writer_pending_model_sets
+                                .lock()
+                                .insert(request_id.clone(), previous_model);
                             write_line(
                                 &mut stdin,
                                 &json!({
                                     "type": "control_request",
-                                    "request_id": format!("waku-{next_request_id}"),
+                                    "request_id": request_id,
                                     "request": {"subtype": "set_model", "model": model}
                                 }),
                             )
@@ -763,7 +811,7 @@ impl ClaudeDriver {
             process: Some(process),
             mode,
             reasoning_effort,
-            current_model: Mutex::new(launch_model),
+            current_model: shared_current_model,
         })
     }
 }
@@ -1057,6 +1105,9 @@ struct ClaudeStreamState {
     /// Stop handles for native Bash output files currently being tailed.
     task_output_tails: ClaudeTaskOutputTails,
     pending_task_stops: Arc<Mutex<HashMap<String, BackgroundWorkKey>>>,
+    pending_model_sets: Arc<Mutex<HashMap<String, Option<String>>>>,
+    shared_live_tasks: Arc<Mutex<Vec<String>>>,
+    shared_current_model: Arc<Mutex<Option<String>>>,
     pending_user_inputs: Arc<Mutex<HashMap<String, Value>>>,
     /// Model of the latest main-thread assistant message, so the settled
     /// turn's `modelUsage` map can be read for that model's context window
@@ -1556,6 +1607,7 @@ fn handle_claude_system(
             state.task_output_tails.stop(removed);
         }
         state.live_tasks = next_live_tasks;
+        *state.shared_live_tasks.lock() = state.live_tasks.iter().cloned().collect();
         let items = tasks
             .iter()
             .filter_map(|entry| {
@@ -1799,10 +1851,30 @@ fn handle_message(
             else {
                 return;
             };
+            let subtype = value.pointer("/response/subtype").and_then(Value::as_str);
+            if let Some(previous_model) = state.pending_model_sets.lock().remove(request_id) {
+                let is_error = subtype == Some("error")
+                    || value
+                        .pointer("/response/is_error")
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                if is_error {
+                    *state.shared_current_model.lock() = previous_model;
+                    let error = value
+                        .pointer("/response/error")
+                        .or_else(|| value.pointer("/response/response/message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("model switch rejected");
+                    let _ = events.send(DriverEvent::Error(tr!(
+                        "errors.select_model",
+                        error = error
+                    )));
+                }
+                return;
+            }
             let Some(key) = state.pending_task_stops.lock().remove(request_id) else {
                 return;
             };
-            let subtype = value.pointer("/response/subtype").and_then(Value::as_str);
             let stop_status = value
                 .pointer("/response/response/status")
                 .or_else(|| value.pointer("/response/status"))
@@ -2557,7 +2629,7 @@ mod tests {
             process: None,
             mode: RuntimeMode::FullAccess,
             reasoning_effort: None,
-            current_model: Mutex::new(None),
+            current_model: Arc::new(Mutex::new(None)),
         };
 
         assert!(driver.supports_steer());
@@ -2580,7 +2652,7 @@ mod tests {
             process: None,
             mode: RuntimeMode::AutoAcceptEdits,
             reasoning_effort: Some("high".into()),
-            current_model: Mutex::new(Some("claude-sonnet-4-6".into())),
+            current_model: Arc::new(Mutex::new(Some("claude-sonnet-4-6".into()))),
         };
         let opts = |mode, model: Option<&str>, effort: Option<&str>, window: Option<&str>| {
             SessionOptions {
