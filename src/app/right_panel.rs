@@ -1372,7 +1372,13 @@ fn visible_working_tree_entries(
                 if name == ".git" {
                     return None;
                 }
-                let is_dir = entry.file_type().ok()?.is_dir();
+                let file_type = entry.file_type().ok()?;
+                // Follow directory symlinks and Windows junctions; `visit` only
+                // descends into `expanded_paths` (a finite, user-driven set), so
+                // link cycles cannot loop forever.
+                let is_dir = file_type.is_dir()
+                    || (file_type.is_symlink()
+                        && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()));
                 Some((entry.path(), name, is_dir))
             })
             .collect::<Vec<_>>();

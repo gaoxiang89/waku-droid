@@ -836,7 +836,14 @@ fn list_tree(root: &Path, expanded_paths: &HashSet<PathBuf>) -> Vec<WorkingTreeE
                 if name == ".git" {
                     return None;
                 }
-                let is_dir = entry.file_type().ok()?.is_dir();
+                let file_type = entry.file_type().ok()?;
+                // Follow directory symlinks and Windows junctions so linked folders
+                // appear as expandable directories; dangling links stay files.
+                // `visit` only descends into `expanded_paths` (a finite, user-driven
+                // set), so link cycles cannot loop forever.
+                let is_dir = file_type.is_dir()
+                    || (file_type.is_symlink()
+                        && fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()));
                 Some((entry.path(), name, is_dir))
             })
             .collect::<Vec<_>>();
@@ -2552,6 +2559,61 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn list_tree_treats_directory_links_as_directories() {
+        let root = std::env::temp_dir().join(format!("waku-tree-links-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/inner.txt"), "hello\n").unwrap();
+
+        #[cfg(unix)]
+        let link_created = std::os::unix::fs::symlink(root.join("real"), root.join("link")).is_ok();
+        #[cfg(windows)]
+        let link_created =
+            std::os::windows::fs::symlink_dir(root.join("real"), root.join("link")).is_ok();
+        if !link_created {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        #[cfg(unix)]
+        let dangling_created =
+            std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).is_ok();
+        #[cfg(windows)]
+        let dangling_created =
+            std::os::windows::fs::symlink_dir(root.join("missing"), root.join("dangling")).is_ok();
+
+        let collapsed = list_tree(&root, &HashSet::new());
+        let link_entry = collapsed
+            .iter()
+            .find(|entry| entry.name == "link")
+            .expect("link entry should be listed");
+        assert!(link_entry.is_dir);
+        assert!(!link_entry.expanded);
+
+        if dangling_created {
+            let dangling_entry = collapsed
+                .iter()
+                .find(|entry| entry.name == "dangling")
+                .expect("dangling link entry should be listed");
+            assert!(!dangling_entry.is_dir);
+        }
+
+        let expanded = HashSet::from([root.join("link")]);
+        let expanded_tree = list_tree(&root, &expanded);
+        let expected_inner_rel = Path::new("link")
+            .join("inner.txt")
+            .to_string_lossy()
+            .into_owned();
+        let inner_entry = expanded_tree
+            .iter()
+            .find(|entry| entry.relative_path == expected_inner_rel)
+            .expect("inner.txt under expanded link should be listed");
+        assert_eq!(inner_entry.depth, 1);
+        assert!(!inner_entry.is_dir);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
