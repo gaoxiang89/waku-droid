@@ -1803,7 +1803,6 @@ enum PlannedUploadOp {
         rpc_rel: PathBuf,
         size: u64,
         overwrite: bool,
-        existed_before: bool,
     },
 }
 
@@ -1844,6 +1843,38 @@ fn expand_workspace_directory_and_ancestors(
         }
         prefix.push_str(segment);
         expanded_paths.insert(join_workspace_path(workspace, &prefix));
+    }
+}
+
+/// Moves expanded-directory keys — absolute daemon paths — under a renamed entry.
+fn retarget_expanded_paths(
+    expanded: &mut HashSet<PathBuf>,
+    project_path: &Path,
+    from_relative: &str,
+    to_relative: &str,
+) {
+    let from = join_workspace_path(project_path, from_relative)
+        .to_string_lossy()
+        .into_owned();
+    let to = join_workspace_path(project_path, to_relative)
+        .to_string_lossy()
+        .into_owned();
+    let moves: Vec<(PathBuf, PathBuf)> = expanded
+        .iter()
+        .filter_map(|path| {
+            let key = path.to_string_lossy();
+            if key == from {
+                return Some((path.clone(), PathBuf::from(&to)));
+            }
+            ['/', '\\'].into_iter().find_map(|sep| {
+                key.strip_prefix(&format!("{from}{sep}"))
+                    .map(|rest| (path.clone(), PathBuf::from(format!("{to}{sep}{rest}"))))
+            })
+        })
+        .collect();
+    for (old, new) in moves {
+        expanded.remove(&old);
+        expanded.insert(new);
     }
 }
 
@@ -1925,7 +1956,6 @@ fn collect_directory_upload_ops(
     rel_dir: &str,
     sep: char,
     overwrite: bool,
-    dir_existed_before: bool,
     ops: &mut Vec<PlannedUploadOp>,
     total_bytes: &mut u64,
 ) -> anyhow::Result<()> {
@@ -1959,7 +1989,6 @@ fn collect_directory_upload_ops(
                 &child_rel,
                 sep,
                 overwrite,
-                dir_existed_before,
                 ops,
                 total_bytes,
             )?;
@@ -1976,7 +2005,6 @@ fn collect_directory_upload_ops(
                 rpc_rel: PathBuf::from(&child_rel),
                 size,
                 overwrite,
-                existed_before: dir_existed_before,
             });
         }
     }
@@ -1987,12 +2015,10 @@ fn build_upload_plan(
     candidates: &[UploadTopLevelCandidate],
     sep: char,
     overwrite_top_level: bool,
-    existing_top_level: &HashSet<PathBuf>,
 ) -> anyhow::Result<UploadPlan> {
     let mut ops = Vec::new();
     let mut total_bytes: u64 = 0;
     for candidate in candidates {
-        let top_existed = existing_top_level.contains(&candidate.rpc_rel);
         if candidate.is_dir {
             ops.push(PlannedUploadOp::EnsureDir {
                 rpc_rel: candidate.rpc_rel.clone(),
@@ -2003,7 +2029,6 @@ fn build_upload_plan(
                 &candidate.ui_rel,
                 sep,
                 overwrite_top_level,
-                top_existed,
                 &mut ops,
                 &mut total_bytes,
             )?;
@@ -2019,7 +2044,6 @@ fn build_upload_plan(
                 rpc_rel: candidate.rpc_rel.clone(),
                 size,
                 overwrite: overwrite_top_level,
-                existed_before: top_existed,
             });
         }
     }
@@ -2073,14 +2097,46 @@ fn prepare_and_check_upload_paths(
     Ok(Some((candidates, existing)))
 }
 
+/// A unique temporary sibling of `rpc_rel`, keeping the tree's own separator.
+fn upload_temp_relative_path(rpc_rel: &Path) -> PathBuf {
+    let rel = rpc_rel.to_string_lossy();
+    let name = format!(
+        "{}{}{}",
+        waku_protocol::workspace::UPLOAD_TEMP_PREFIX,
+        Uuid::new_v4(),
+        waku_protocol::workspace::UPLOAD_TEMP_SUFFIX
+    );
+    match rel.rfind(['/', '\\']) {
+        Some(index) => PathBuf::from(format!("{}{name}", &rel[..=index])),
+        None => PathBuf::from(name),
+    }
+}
+
+fn commit_uploaded_file(
+    workspace: &waku_client::WorkspaceClient,
+    project_path: PathBuf,
+    temp_rel: PathBuf,
+    rpc_rel: PathBuf,
+    overwrite: bool,
+) -> anyhow::Result<()> {
+    match workspace.request(waku_client::WorkspaceOperation::CommitFileUpload {
+        root: project_path,
+        temp_relative_path: temp_rel,
+        relative_path: rpc_rel,
+        overwrite,
+    })? {
+        waku_client::WorkspaceResult::Ack => Ok(()),
+        _ => anyhow::bail!("the daemon returned an invalid upload response"),
+    }
+}
+
 fn upload_file_chunk(
     workspace: &waku_client::WorkspaceClient,
     project_path: PathBuf,
     local_path: &Path,
-    rpc_rel: PathBuf,
+    temp_rel: PathBuf,
     expected_size: u64,
     file_offset: u64,
-    overwrite: bool,
 ) -> anyhow::Result<u64> {
     let mut file = std::fs::File::open(local_path)
         .with_context(|| format!("could not open {}", local_path.display()))?;
@@ -2107,10 +2163,10 @@ fn upload_file_chunk(
     let bytes = base64::engine::general_purpose::STANDARD.encode(&buffer);
     match workspace.request(waku_client::WorkspaceOperation::WriteFileChunk {
         root: project_path,
-        relative_path: rpc_rel,
+        relative_path: temp_rel,
         offset: file_offset,
         bytes,
-        overwrite,
+        overwrite: false,
     })? {
         waku_client::WorkspaceResult::Ack => Ok(want as u64),
         _ => anyhow::bail!("the daemon returned an invalid upload response"),
@@ -3263,7 +3319,7 @@ mod tests {
         assert!(candidates[0].is_dir);
 
         let sep = workspace_separator(&workspace);
-        let plan = build_upload_plan(&candidates, sep, false, &HashSet::new()).unwrap();
+        let plan = build_upload_plan(&candidates, sep, false).unwrap();
         assert_eq!(plan.total_bytes, 12);
         assert_eq!(
             plan.single_uploaded_dir_rel.as_deref(),
@@ -3293,14 +3349,12 @@ mod tests {
             rpc_rel: expected_rel("bundle/nested/hello.txt"),
             size: 5,
             overwrite: false,
-            existed_before: false,
         }));
         assert!(plan.ops.contains(&PlannedUploadOp::WriteFile {
             local_path: external.join("bundle/root.bin"),
             rpc_rel: expected_rel("bundle/root.bin"),
             size: 7,
             overwrite: false,
-            existed_before: false,
         }));
         if symlink_created {
             assert!(!plan.ops.iter().any(|op| match op {
@@ -3326,20 +3380,10 @@ mod tests {
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].source_path, external.join("other/dup_a.txt"));
 
-        let overwrite_plan = build_upload_plan(
-            &candidates,
-            sep,
-            true,
-            &HashSet::from([expected_rel("bundle")]),
-        )
-        .unwrap();
+        let overwrite_plan = build_upload_plan(&candidates, sep, true).unwrap();
         assert!(overwrite_plan.ops.iter().all(|op| match op {
             PlannedUploadOp::EnsureDir { overwrite, .. } => *overwrite,
-            PlannedUploadOp::WriteFile {
-                overwrite,
-                existed_before,
-                ..
-            } => *overwrite && *existed_before,
+            PlannedUploadOp::WriteFile { overwrite, .. } => *overwrite,
         }));
 
         let mut posix_expanded = HashSet::new();
@@ -3362,6 +3406,62 @@ mod tests {
         assert!(win_expanded.contains(&PathBuf::from(r"C:\repo\src\ui")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn upload_temp_paths_stay_beside_their_destination() {
+        let posix = upload_temp_relative_path(Path::new("a/b/c.txt"));
+        let posix_str = posix.to_string_lossy();
+        assert!(posix_str.starts_with("a/b/.narel-upload-"));
+        assert!(posix_str.ends_with(".partial"));
+
+        let windows = upload_temp_relative_path(Path::new(r"a\b.txt"));
+        let windows_str = windows.to_string_lossy();
+        assert!(windows_str.starts_with(r"a\.narel-upload-"));
+        assert!(windows_str.ends_with(".partial"));
+
+        let top = upload_temp_relative_path(Path::new("top.txt"));
+        let top_str = top.to_string_lossy();
+        assert!(top_str.starts_with(".narel-upload-"));
+        assert!(top_str.ends_with(".partial"));
+        assert!(!top_str.contains(['/', '\\']));
+    }
+
+    #[test]
+    fn rename_retargets_expanded_directories() {
+        let posix_root = Path::new("/home/dev/repo");
+        let mut posix_expanded = HashSet::from([
+            PathBuf::from("/home/dev/repo/src"),
+            PathBuf::from("/home/dev/repo/src/ui"),
+            PathBuf::from("/home/dev/repo/srcx"),
+            PathBuf::from("/home/dev/repo/other"),
+        ]);
+        retarget_expanded_paths(&mut posix_expanded, posix_root, "src", "lib");
+        assert_eq!(
+            posix_expanded,
+            HashSet::from([
+                PathBuf::from("/home/dev/repo/lib"),
+                PathBuf::from("/home/dev/repo/lib/ui"),
+                PathBuf::from("/home/dev/repo/srcx"),
+                PathBuf::from("/home/dev/repo/other"),
+            ])
+        );
+
+        let win_root = Path::new(r"C:\repo");
+        let mut win_expanded = HashSet::from([
+            join_workspace_path(win_root, "src"),
+            join_workspace_path(win_root, r"src\ui"),
+            join_workspace_path(win_root, r"src\ui\icons"),
+        ]);
+        retarget_expanded_paths(&mut win_expanded, win_root, r"src\ui", r"src\view");
+        assert_eq!(
+            win_expanded,
+            HashSet::from([
+                join_workspace_path(win_root, "src"),
+                join_workspace_path(win_root, r"src\view"),
+                join_workspace_path(win_root, r"src\view\icons"),
+            ])
+        );
     }
 }
 
@@ -7246,7 +7346,11 @@ impl Waku {
                         }
                         match result {
                             Ok(()) => {
-                                waku.retarget_right_panel_file_paths(&from_relative, &to_relative);
+                                waku.retarget_right_panel_file_paths(
+                                    &project_path,
+                                    &from_relative,
+                                    &to_relative,
+                                );
                                 waku.refresh_right_panel_working_tree(cx);
                                 cx.notify();
                             }
@@ -7281,7 +7385,12 @@ impl Waku {
 
     /// Moves every reference to a just-renamed entry — open editors, tabs, the
     /// selected file, and the expanded-directory set — onto its new path.
-    fn retarget_right_panel_file_paths(&mut self, from_relative: &str, to_relative: &str) {
+    fn retarget_right_panel_file_paths(
+        &mut self,
+        project_path: &Path,
+        from_relative: &str,
+        to_relative: &str,
+    ) {
         fn retarget(key: &str, from: &str, to: &str) -> Option<String> {
             if key == from {
                 return Some(to.to_owned());
@@ -7333,19 +7442,12 @@ impl Waku {
                 absolute_path: absolute_path.clone(),
             });
         }
-        let absolute_moves: Vec<(PathBuf, PathBuf)> = self
-            .right_panel_expanded_paths
-            .iter()
-            .filter_map(|path| {
-                let key = path.to_string_lossy();
-                retarget(&key, from_relative, to_relative)
-                    .map(|to| (path.clone(), PathBuf::from(to)))
-            })
-            .collect();
-        for (from, to) in absolute_moves {
-            self.right_panel_expanded_paths.remove(&from);
-            self.right_panel_expanded_paths.insert(to);
-        }
+        retarget_expanded_paths(
+            &mut self.right_panel_expanded_paths,
+            project_path,
+            from_relative,
+            to_relative,
+        );
     }
 
     /// Parks a delete behind the confirm dialog. Remote deletion is
@@ -7557,7 +7659,6 @@ impl Waku {
                                 host_key,
                                 daemon,
                                 false,
-                                HashSet::new(),
                                 cx,
                             );
                             None
@@ -7661,7 +7762,7 @@ impl Waku {
                     return;
                 }
                 match prepared {
-                    Ok(Some((candidates, existing))) => {
+                    Ok(Some((candidates, _existing))) => {
                         waku.execute_right_panel_upload(
                             candidates,
                             confirm.target_dir,
@@ -7669,7 +7770,6 @@ impl Waku {
                             confirm.host_key,
                             daemon,
                             true,
-                            existing.into_iter().collect(),
                             cx,
                         );
                     }
@@ -7703,7 +7803,6 @@ impl Waku {
         host_key: waku_client::hosts::HostKey,
         daemon: waku_client::DaemonSupervisor,
         overwrite_top_level: bool,
-        existing_top_level: HashSet<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         if candidates.is_empty() {
@@ -7714,56 +7813,7 @@ impl Waku {
             let sep = workspace_separator(&project_path);
             let plan_result = cx
                 .background_executor()
-                .spawn({
-                    let workspace = workspace.clone();
-                    let project_path = project_path.clone();
-                    let existing_top_level = existing_top_level.clone();
-                    async move {
-                        let mut plan = build_upload_plan(
-                            &candidates,
-                            sep,
-                            overwrite_top_level,
-                            &existing_top_level,
-                        )?;
-                        if overwrite_top_level {
-                            let nested_write_rels = plan
-                                .ops
-                                .iter()
-                                .filter_map(|op| match op {
-                                    PlannedUploadOp::WriteFile {
-                                        rpc_rel,
-                                        existed_before: true,
-                                        ..
-                                    } if !existing_top_level.contains(rpc_rel) => {
-                                        Some(rpc_rel.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>();
-                            if !nested_write_rels.is_empty() {
-                                let nested_existing = check_workspace_paths_exist(
-                                    &workspace,
-                                    project_path,
-                                    nested_write_rels,
-                                )?
-                                .into_iter()
-                                .collect::<HashSet<_>>();
-                                for op in &mut plan.ops {
-                                    if let PlannedUploadOp::WriteFile {
-                                        rpc_rel,
-                                        existed_before,
-                                        ..
-                                    } = op
-                                        && !existing_top_level.contains(rpc_rel)
-                                    {
-                                        *existed_before = nested_existing.contains(rpc_rel);
-                                    }
-                                }
-                            }
-                        }
-                        Ok::<_, anyhow::Error>(plan)
-                    }
-                })
+                .spawn(async move { build_upload_plan(&candidates, sep, overwrite_top_level) })
                 .await;
 
             let plan = match plan_result {
@@ -7835,13 +7885,13 @@ impl Waku {
                         rpc_rel,
                         size,
                         overwrite,
-                        existed_before,
                     } => {
+                        let temp_rel = upload_temp_relative_path(&rpc_rel);
                         let mut file_offset: u64 = 0;
                         loop {
                             if cancel.load(Ordering::Acquire) {
-                                if !existed_before && file_offset > 0 {
-                                    partial_to_delete = Some(rpc_rel.clone());
+                                if file_offset > 0 {
+                                    partial_to_delete = Some(temp_rel.clone());
                                 }
                                 outcome = Outcome::Canceled;
                                 break 'ops;
@@ -7852,23 +7902,21 @@ impl Waku {
                                     let workspace = workspace.clone();
                                     let project_path = project_path.clone();
                                     let local_path = local_path.clone();
-                                    let rpc_rel = rpc_rel.clone();
+                                    let temp_rel = temp_rel.clone();
                                     async move {
                                         upload_file_chunk(
                                             &workspace,
                                             project_path,
                                             &local_path,
-                                            rpc_rel,
+                                            temp_rel,
                                             size,
                                             file_offset,
-                                            overwrite,
                                         )
                                     }
                                 })
                                 .await;
                             match step {
                                 Ok(chunk_bytes) => {
-                                    any_mutated = true;
                                     file_offset += chunk_bytes;
                                     total_written += chunk_bytes;
                                     if waku
@@ -7882,10 +7930,7 @@ impl Waku {
                                         })
                                         .is_err()
                                     {
-                                        if !existed_before && file_offset > 0 && file_offset < size
-                                        {
-                                            partial_to_delete = Some(rpc_rel.clone());
-                                        }
+                                        partial_to_delete = Some(temp_rel.clone());
                                         outcome = Outcome::Canceled;
                                         break 'ops;
                                     }
@@ -7894,12 +7939,41 @@ impl Waku {
                                     }
                                 }
                                 Err(error) => {
-                                    if !existed_before && file_offset > 0 {
-                                        partial_to_delete = Some(rpc_rel.clone());
-                                    }
+                                    partial_to_delete = Some(temp_rel.clone());
                                     outcome = Outcome::Failed(error);
                                     break 'ops;
                                 }
+                            }
+                        }
+                        if cancel.load(Ordering::Acquire) {
+                            partial_to_delete = Some(temp_rel);
+                            outcome = Outcome::Canceled;
+                            break 'ops;
+                        }
+                        let commit = cx
+                            .background_executor()
+                            .spawn({
+                                let workspace = workspace.clone();
+                                let project_path = project_path.clone();
+                                let temp_rel = temp_rel.clone();
+                                let rpc_rel = rpc_rel.clone();
+                                async move {
+                                    commit_uploaded_file(
+                                        &workspace,
+                                        project_path,
+                                        temp_rel,
+                                        rpc_rel,
+                                        overwrite,
+                                    )
+                                }
+                            })
+                            .await;
+                        match commit {
+                            Ok(()) => any_mutated = true,
+                            Err(error) => {
+                                partial_to_delete = Some(temp_rel);
+                                outcome = Outcome::Failed(error);
+                                break 'ops;
                             }
                         }
                     }

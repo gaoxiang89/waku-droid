@@ -12,6 +12,13 @@ use crate::git::{
 };
 use crate::model::{Checkpoint, ProviderKind};
 
+/// File-name prefix of the temporary sibling an upload writes before
+/// `CommitFileUpload` moves it onto its destination.
+pub const UPLOAD_TEMP_PREFIX: &str = ".narel-upload-";
+/// File-name suffix of the temporary sibling an upload writes before
+/// `CommitFileUpload` moves it onto its destination.
+pub const UPLOAD_TEMP_SUFFIX: &str = ".partial";
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub enum ReviewDiffSource {
@@ -158,6 +165,20 @@ pub enum WorkspaceOperation {
         offset: u64,
         /// Base64-encoded chunk bytes, capped at `MAX_FILE_CHUNK_BYTES` (8 MiB) decoded.
         bytes: String,
+        overwrite: bool,
+    },
+    /// Moves a completed upload from its temporary sibling (named
+    /// `UPLOAD_TEMP_PREFIX…UPLOAD_TEMP_SUFFIX`, in the destination's directory)
+    /// onto `relative_path`. An existing destination is replaced only when
+    /// `overwrite` is true, and only after every chunk has landed, so a failed
+    /// or canceled upload never truncates the file it was replacing.
+    CommitFileUpload {
+        #[ts(type = "string")]
+        root: PathBuf,
+        #[ts(type = "string")]
+        temp_relative_path: PathBuf,
+        #[ts(type = "string")]
+        relative_path: PathBuf,
         overwrite: bool,
     },
     RenamePath {

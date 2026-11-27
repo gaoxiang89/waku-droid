@@ -10,7 +10,7 @@ use std::process::Output;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine as _;
-use waku_protocol::workspace::DownloadDirectoryEntry;
+use waku_protocol::workspace::{DownloadDirectoryEntry, UPLOAD_TEMP_PREFIX, UPLOAD_TEMP_SUFFIX};
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
 /// One chunk of a streamed file download, before base64. The 4/3 inflation
@@ -167,6 +167,15 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             write_file_chunk(&root, &relative_path, offset, &bytes, overwrite)?;
             WorkspaceResult::Ack
         }
+        WorkspaceOperation::CommitFileUpload {
+            root,
+            temp_relative_path,
+            relative_path,
+            overwrite,
+        } => {
+            commit_file_upload(&root, &temp_relative_path, &relative_path, overwrite)?;
+            WorkspaceResult::Ack
+        }
         WorkspaceOperation::RenamePath {
             root,
             from_relative_path,
@@ -174,7 +183,7 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         } => {
             let from = resolve_workspace_path(&root, &from_relative_path)?;
             let to = resolve_workspace_path(&root, &to_relative_path)?;
-            if fs::symlink_metadata(&to).is_ok() {
+            if fs::symlink_metadata(&to).is_ok() && !is_case_only_rename(&from, &to) {
                 bail!(
                     "{} already exists in the destination directory",
                     to.display()
@@ -220,12 +229,14 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
             relative_path,
         } => {
             let path = resolve_workspace_path(&root, &relative_path)?;
-            if fs::symlink_metadata(&path)?.is_dir() {
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("could not inspect {}", path.display()))?;
+            if metadata.file_type().is_dir() {
                 fs::remove_dir_all(&path)
                     .with_context(|| format!("could not remove directory {}", path.display()))?;
             } else {
-                fs::remove_file(&path)
-                    .with_context(|| format!("could not remove file {}", path.display()))?;
+                // Links (including Windows directory symlinks and junctions) are removed, never followed.
+                remove_non_dir(&path, &metadata)?;
             }
             WorkspaceResult::Ack
         }
@@ -647,6 +658,70 @@ fn write_file_chunk(
     file.write_all(&decoded)
         .with_context(|| format!("could not write file {}", path.display()))?;
     Ok(())
+}
+
+fn commit_file_upload(
+    root: &Path,
+    temp_relative: &Path,
+    relative: &Path,
+    overwrite: bool,
+) -> anyhow::Result<()> {
+    let temp = resolve_non_symlink_parents(root, temp_relative)?;
+    let path = resolve_non_symlink_parents(root, relative)?;
+    let is_upload_temp = temp
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(UPLOAD_TEMP_PREFIX) && n.ends_with(UPLOAD_TEMP_SUFFIX));
+    if !is_upload_temp || temp.parent() != path.parent() {
+        bail!("invalid upload temporary path");
+    }
+    let temp_metadata =
+        fs::symlink_metadata(&temp).with_context(|| format!("could not open file {}", temp.display()))?;
+    if !temp_metadata.file_type().is_file() {
+        bail!("not a regular file: {}", temp.display());
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) if !overwrite => bail!("{} already exists", path.display()),
+        Ok(m) if m.file_type().is_dir() => fs::remove_dir_all(&path)
+            .with_context(|| format!("could not remove directory {}", path.display()))?,
+        Ok(m) if m.file_type().is_symlink() => remove_non_dir(&path, &m)?,
+        Ok(m) => {
+            // keep e.g. the executable bit
+            let _ = fs::set_permissions(&temp, m.permissions());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    fs::rename(&temp, &path)
+        .with_context(|| format!("could not replace {}", path.display()))?;
+    Ok(())
+}
+
+/// True when `to` differs from `from` only by letter case and the directory
+/// has no separate entry named `to` — a case-insensitive filesystem (macOS,
+/// Windows) reporting `to` as existing only because it is `from` itself.
+fn is_case_only_rename(from: &Path, to: &Path) -> bool {
+    let (Some(parent), Some(to_parent)) = (from.parent(), to.parent()) else {
+        return false;
+    };
+    let (Some(from_name), Some(to_name)) = (from.file_name(), to.file_name()) else {
+        return false;
+    };
+    if parent != to_parent || from_name == to_name {
+        return false;
+    }
+    let (Some(a), Some(b)) = (from_name.to_str(), to_name.to_str()) else {
+        return false;
+    };
+    if a.to_lowercase() != b.to_lowercase() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    !entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() == to_name)
 }
 
 fn list_tree(root: &Path, expanded_paths: &HashSet<PathBuf>) -> Vec<WorkingTreeEntry> {
@@ -2029,6 +2104,213 @@ mod tests {
         assert!(execute(WorkspaceOperation::ResolvePath { path: "   ".into() }).is_err());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_file_upload_replaces_only_after_the_upload_completes() {
+        let root = std::env::temp_dir().join(format!("waku-commit-upload-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("data.txt"), b"original").unwrap();
+
+        let temp_a = PathBuf::from(format!("{UPLOAD_TEMP_PREFIX}a{UPLOAD_TEMP_SUFFIX}"));
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp_a.clone(),
+            offset: 0,
+            bytes: encode_chunk(b"new-"),
+            overwrite: false,
+        })
+        .unwrap();
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp_a.clone(),
+            offset: 4,
+            bytes: encode_chunk(b"content"),
+            overwrite: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"original");
+
+        assert!(
+            execute(WorkspaceOperation::CommitFileUpload {
+                root: root.clone(),
+                temp_relative_path: temp_a.clone(),
+                relative_path: PathBuf::from("data.txt"),
+                overwrite: false,
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"original");
+        assert!(root.join(&temp_a).is_file());
+
+        execute(WorkspaceOperation::CommitFileUpload {
+            root: root.clone(),
+            temp_relative_path: temp_a.clone(),
+            relative_path: PathBuf::from("data.txt"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("data.txt")).unwrap(), b"new-content");
+        assert!(!root.join(&temp_a).exists());
+
+        let temp_b = PathBuf::from(format!("nested/{UPLOAD_TEMP_PREFIX}b{UPLOAD_TEMP_SUFFIX}"));
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp_b.clone(),
+            offset: 0,
+            bytes: encode_chunk(b"fresh"),
+            overwrite: false,
+        })
+        .unwrap();
+        execute(WorkspaceOperation::CommitFileUpload {
+            root: root.clone(),
+            temp_relative_path: temp_b.clone(),
+            relative_path: PathBuf::from("nested/a.txt"),
+            overwrite: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read(root.join("nested/a.txt")).unwrap(), b"fresh");
+        assert!(!root.join(&temp_b).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commit_file_upload_rejects_foreign_paths_and_replaces_directories() {
+        let root = std::env::temp_dir().join(format!("waku-commit-guard-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(root.join("dir_target")).unwrap();
+        fs::write(root.join("dir_target/inner.txt"), b"inside").unwrap();
+
+        let temp_other = PathBuf::from(format!("other/{UPLOAD_TEMP_PREFIX}c{UPLOAD_TEMP_SUFFIX}"));
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp_other.clone(),
+            offset: 0,
+            bytes: encode_chunk(b"cross-dir"),
+            overwrite: false,
+        })
+        .unwrap();
+        assert!(
+            execute(WorkspaceOperation::CommitFileUpload {
+                root: root.clone(),
+                temp_relative_path: temp_other,
+                relative_path: PathBuf::from("nested/a.txt"),
+                overwrite: true,
+            })
+            .is_err()
+        );
+
+        fs::write(root.join("plain.txt"), b"keep").unwrap();
+        assert!(
+            execute(WorkspaceOperation::CommitFileUpload {
+                root: root.clone(),
+                temp_relative_path: PathBuf::from("plain.txt"),
+                relative_path: PathBuf::from("renamed.txt"),
+                overwrite: true,
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(root.join("plain.txt")).unwrap(), b"keep");
+
+        let temp_dir_replace = PathBuf::from(format!("{UPLOAD_TEMP_PREFIX}d{UPLOAD_TEMP_SUFFIX}"));
+        execute(WorkspaceOperation::WriteFileChunk {
+            root: root.clone(),
+            relative_path: temp_dir_replace.clone(),
+            offset: 0,
+            bytes: encode_chunk(b"replaced-dir"),
+            overwrite: false,
+        })
+        .unwrap();
+        execute(WorkspaceOperation::CommitFileUpload {
+            root: root.clone(),
+            temp_relative_path: temp_dir_replace,
+            relative_path: PathBuf::from("dir_target"),
+            overwrite: true,
+        })
+        .unwrap();
+        assert!(root.join("dir_target").is_file());
+        assert_eq!(fs::read(root.join("dir_target")).unwrap(), b"replaced-dir");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_allows_case_only_changes_but_not_distinct_entries() {
+        let root = std::env::temp_dir().join(format!("waku-case-rename-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("readme.md"), b"hello").unwrap();
+
+        execute(WorkspaceOperation::RenamePath {
+            root: root.clone(),
+            from_relative_path: PathBuf::from("readme.md"),
+            to_relative_path: PathBuf::from("README.md"),
+        })
+        .unwrap();
+        let names = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "README.md"));
+        assert!(!names.iter().any(|name| name == "readme.md"));
+
+        fs::write(root.join("x.txt"), b"lower").unwrap();
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join("X.txt"))
+            .is_ok()
+        {
+            fs::write(root.join("X.txt"), b"upper").unwrap();
+            assert!(
+                execute(WorkspaceOperation::RenamePath {
+                    root: root.clone(),
+                    from_relative_path: PathBuf::from("x.txt"),
+                    to_relative_path: PathBuf::from("X.txt"),
+                })
+                .is_err()
+            );
+            assert_eq!(fs::read(root.join("x.txt")).unwrap(), b"lower");
+            assert_eq!(fs::read(root.join("X.txt")).unwrap(), b"upper");
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_a_directory_link_without_touching_its_target() {
+        let root = std::env::temp_dir().join(format!("waku-delete-link-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("waku-delete-target-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "keep").unwrap();
+
+        let link = root.join("link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        if !linked {
+            fs::remove_dir_all(root).unwrap();
+            fs::remove_dir_all(outside).unwrap();
+            return;
+        }
+
+        execute(WorkspaceOperation::DeletePath {
+            root: root.clone(),
+            relative_path: PathBuf::from("link"),
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("keep.txt")).unwrap(),
+            "keep"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
 
