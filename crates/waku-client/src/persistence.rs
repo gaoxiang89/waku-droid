@@ -354,6 +354,10 @@ struct AppState {
     bottom_panel_height: f32,
     #[serde(default = "default_chat_split_ratio")]
     chat_split_ratio: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_split_session: Option<Uuid>,
+    #[serde(default)]
+    chat_split_focused_right: bool,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -432,6 +436,10 @@ pub struct PersistedState {
     /// Share of the chat column the left pane takes in a split chat.
     #[serde(default = "default_chat_split_ratio")]
     pub chat_split_ratio: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_split_session: Option<Uuid>,
+    #[serde(default)]
+    pub chat_split_focused_right: bool,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -508,6 +516,8 @@ impl PersistedState {
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
             chat_split_ratio: default_chat_split_ratio(),
+            chat_split_session: None,
+            chat_split_focused_right: false,
             markdown_preview: false,
             window_state: None,
             computer_use_enabled: false,
@@ -669,6 +679,9 @@ impl PersistedState {
             right_panel_width: self.right_panel_width,
             bottom_panel_height: self.bottom_panel_height,
             chat_split_ratio: self.chat_split_ratio,
+            chat_split_session: self.persistable_chat_split_session(),
+            chat_split_focused_right: self.persistable_chat_split_session().is_some()
+                && self.chat_split_focused_right,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
         }
@@ -709,6 +722,8 @@ impl PersistedState {
         self.closed_project_ids = app_state.closed_project_ids;
         self.right_panel_width = app_state.right_panel_width;
         self.chat_split_ratio = app_state.chat_split_ratio;
+        self.chat_split_session = app_state.chat_split_session;
+        self.chat_split_focused_right = app_state.chat_split_focused_right;
         self.bottom_panel_height = app_state.bottom_panel_height;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
@@ -719,6 +734,19 @@ impl PersistedState {
             self.sessions
                 .iter()
                 .any(|session| session.id == *selected && session.has_started())
+        })
+    }
+
+    fn persistable_chat_split_session(&self) -> Option<Uuid> {
+        let selected = self.persistable_selected_session()?;
+        self.chat_split_session.filter(|split_id| {
+            *split_id != selected
+                && self.sessions.iter().any(|session| {
+                    session.id == *split_id
+                        && !session.archived
+                        && session.has_started()
+                        && self.project_is_open(session.project_id)
+                })
         })
     }
 
@@ -743,6 +771,7 @@ impl PersistedState {
             .selected_session
             .is_some_and(|selected| self.sessions.iter().any(|session| session.id == selected))
         {
+            self.reconcile_persisted_chat_split();
             return;
         }
         self.selected_session = None;
@@ -750,11 +779,27 @@ impl PersistedState {
             .selected_project
             .filter(|selected| self.projects.iter().any(|project| project.id == *selected))
         else {
+            self.reconcile_persisted_chat_split();
             return;
         };
         let session = self.new_session(project_id, self.last_provider);
         self.selected_session = Some(session.id);
         self.sessions.push(session);
+        self.reconcile_persisted_chat_split();
+    }
+
+    fn reconcile_persisted_chat_split(&mut self) {
+        let valid = self.selected_session.is_some()
+            && self.chat_split_session != self.selected_session
+            && self.chat_split_session.is_some_and(|split_id| {
+                self.sessions.iter().find(|s| s.id == split_id).is_none_or(|session| {
+                    !session.archived && self.project_is_open(session.project_id)
+                })
+            });
+        if !valid {
+            self.chat_split_session = None;
+            self.chat_split_focused_right = false;
+        }
     }
 
     fn migrate_loaded(&mut self) {
@@ -1279,6 +1324,14 @@ impl StateStore {
         {
             let _ = self.hydrate(session);
         }
+        if let Some(split_id) = state.chat_split_session
+            && let Some(session) = state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == split_id)
+        {
+            let _ = self.hydrate(session);
+        }
         state
     }
 
@@ -1741,6 +1794,47 @@ mod tests {
         let mut restored = PersistedState::empty();
         restored.apply_app_state(serde_json::from_value(encoded).unwrap());
         assert_eq!(restored.chat_split_ratio, 0.62);
+    }
+
+    #[test]
+    fn chat_split_session_roundtrips_only_for_distinct_started_open_task() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project_id = state.projects[0].id;
+        let first_id = state.sessions[0].id;
+        state.sessions[0].detail_loaded = false;
+
+        let mut second = state.new_session(project_id, ProviderKind::Codex);
+        second.detail_loaded = false;
+        let second_id = second.id;
+        state.sessions.push(second);
+
+        let draft = state.new_session(project_id, ProviderKind::Codex);
+        let draft_id = draft.id;
+        state.sessions.push(draft);
+
+        state.selected_session = Some(first_id);
+        state.chat_split_session = Some(second_id);
+        state.chat_split_focused_right = true;
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.projects = state.projects.clone();
+        restored.sessions = state.sessions.clone();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+        restored.ensure_runtime_session();
+        assert_eq!(restored.chat_split_session, Some(second_id));
+        assert!(restored.chat_split_focused_right);
+
+        // Draft, self-split, and archived split targets must not persist.
+        state.chat_split_session = Some(draft_id);
+        assert_eq!(state.app_state().chat_split_session, None);
+        assert!(!state.app_state().chat_split_focused_right);
+
+        state.chat_split_session = Some(first_id);
+        assert_eq!(state.app_state().chat_split_session, None);
+
+        state.chat_split_session = Some(second_id);
+        state.sessions[1].archived = true;
+        assert_eq!(state.app_state().chat_split_session, None);
     }
 
     #[test]

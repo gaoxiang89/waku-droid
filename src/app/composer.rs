@@ -2572,21 +2572,45 @@ impl Waku {
                 .await;
             let _ = waku.update(cx, |waku, cx| match result {
                 Ok(stored) => {
-                    if waku.selected_composer_draft_key() != draft_owner {
-                        return;
-                    }
-                    let mut changed = false;
-                    for (attachment, preview_image, is_image) in stored {
-                        changed |= waku.stage_daemon_attachment(
-                            attachment.path,
-                            attachment.name,
-                            attachment.is_dir,
-                            is_image,
-                            attachment.reference,
-                            preview_image,
-                        );
-                    }
-                    if changed {
+                    if waku.selected_composer_draft_key() == draft_owner {
+                        let mut changed = false;
+                        for (attachment, preview_image, is_image) in stored {
+                            changed |= waku.stage_daemon_attachment(
+                                attachment.path,
+                                attachment.name,
+                                attachment.is_dir,
+                                is_image,
+                                attachment.reference,
+                                preview_image,
+                            );
+                        }
+                        if changed {
+                            waku.schedule_composer_draft_save(cx);
+                            cx.notify();
+                        }
+                    } else if waku
+                        .with_chat_view(chat_split::ChatPaneRole::Unfocused, |waku| {
+                            if waku.selected_composer_draft_key() != draft_owner {
+                                return false;
+                            }
+                            let mut changed = false;
+                            for (attachment, preview_image, is_image) in stored {
+                                changed |= waku.stage_daemon_attachment(
+                                    attachment.path,
+                                    attachment.name,
+                                    attachment.is_dir,
+                                    is_image,
+                                    attachment.reference,
+                                    preview_image,
+                                );
+                            }
+                            if changed {
+                                waku.capture_current_composer_draft(cx);
+                            }
+                            changed
+                        })
+                        .unwrap_or(false)
+                    {
                         waku.schedule_composer_draft_save(cx);
                         cx.notify();
                     }
@@ -3979,6 +4003,7 @@ impl Waku {
 
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
+        let side = self.current_chat_pane_side();
         let session = self.selected_session();
         let preparing = session.is_some_and(|session| {
             self.submission_preparations.contains(&session.id)
@@ -4025,7 +4050,8 @@ impl Waku {
                 .drag_over::<ExternalPaths>(move |style, _, _, _| {
                     style.bg(drop_wash).border_color(drop_ring)
                 })
-                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                    this.focus_chat_pane(side, cx);
                     this.stage_dropped_files(paths, window, cx);
                 }))
                 // Anchor for the bounds probe the autocomplete popup aligns to.

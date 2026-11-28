@@ -395,7 +395,7 @@ fn sidebar_project_is_projectless(project: &Project, projectless_roots: &[PathBu
             .any(|root| lexical_path_starts_with(&project.path, root))
 }
 
-fn persisted_sidebar_branch_label(workspace: &SessionWorkspace) -> Option<&str> {
+pub(super) fn persisted_sidebar_branch_label(workspace: &SessionWorkspace) -> Option<&str> {
     match workspace {
         SessionWorkspace::Local => None,
         SessionWorkspace::NewWorktree { base_branch } => base_branch.as_deref(),
@@ -2258,7 +2258,23 @@ impl Waku {
         else {
             return;
         };
+        if session.archived == archived {
+            return;
+        }
         let project_id = session.project_id;
+        if archived && !self.state.sidebar_show_archived {
+            if self.state.selected_session == Some(session_id)
+                && let Some(focused_side) = self.chat_split.as_ref().map(|split| split.focused_side)
+            {
+                self.close_chat_pane(focused_side, cx);
+            } else if self
+                .chat_split
+                .as_ref()
+                .is_some_and(|split| split.session_id == session_id)
+            {
+                self.discard_unfocused_chat_pane(cx);
+            }
+        }
         let was_selected = self.state.selected_session == Some(session_id);
         if !self
             .state
@@ -2789,8 +2805,13 @@ impl Waku {
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
                         if matches!(key, "enter" | "space") {
-                            this.select_session(session_id, cx);
-                            cx.stop_propagation();
+                            if event.keystroke.modifiers.secondary() {
+                                this.open_in_split(session_id, window, cx);
+                                cx.stop_propagation();
+                            } else if !event.keystroke.modifiers.modified() {
+                                this.select_session(session_id, cx);
+                                cx.stop_propagation();
+                            }
                         } else if key == "f10" && event.keystroke.modifiers.shift {
                             keyboard_menu.open_context_menu(window, cx);
                             cx.stop_propagation();

@@ -427,7 +427,7 @@ impl Waku {
             let was_in_settings = self.settings_page.is_some();
             self.settings_page = None;
             self.select_session(selected, cx);
-            if was_in_settings {
+            if was_in_settings || self.state.selected_session != original {
                 focus_after = Some(self.composer_focus(cx));
             }
         }

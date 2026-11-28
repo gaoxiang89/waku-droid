@@ -4101,6 +4101,8 @@ impl Waku {
                 let focus_handle = self.composer_focus(cx);
                 window.focus(&focus_handle, cx);
             }
+        } else if let Some(focused_side) = self.chat_split.as_ref().map(|split| split.focused_side) {
+            self.close_chat_pane(focused_side, cx);
         } else {
             self.close_or_hide_window(window);
         }

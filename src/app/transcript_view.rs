@@ -1234,10 +1234,11 @@ impl ConversationNavigationRail {
         cx.stop_propagation();
     }
 
-    fn activate_turn(&self, message_id: Uuid, cx: &mut Context<Self>) {
+    fn activate_turn(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        let rail = cx.entity();
         if let Some(waku) = &self.waku {
             let _ = waku.update(cx, |waku, cx| {
-                waku.scroll_to_navigation_turn(message_id, cx)
+                waku.scroll_navigation_rail_turn(&rail, message_id, cx)
             });
         }
     }
@@ -1427,6 +1428,22 @@ impl Waku {
             .child(rows)
             .child(scrollbar::vertical(&state, &scrollbar_state))
             .into_any_element()
+    }
+
+    pub(super) fn scroll_navigation_rail_turn(
+        &mut self,
+        rail: &Entity<ConversationNavigationRail>,
+        message_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if &self.view.navigation_rail == rail {
+            self.scroll_to_navigation_turn(message_id, cx);
+        } else if let Some(other_side) = self.chat_split.as_ref().and_then(|split| {
+            (&split.view.navigation_rail == rail).then_some(split.focused_side.other())
+        }) {
+            self.focus_chat_pane(other_side, cx);
+            self.scroll_to_navigation_turn(message_id, cx);
+        }
     }
 
     fn scroll_to_navigation_turn(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
@@ -2043,14 +2060,21 @@ impl Waku {
             );
         if let Some(turn_id) = response_turn_id {
             let hover_target = (turn_id, kind);
+            let side = self.current_chat_pane_side();
             row = row.on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                let previous = this.view.hovered_response_row;
-                if *hovering {
-                    this.view.hovered_response_row = Some(hover_target);
-                } else if previous == Some(hover_target) {
-                    this.view.hovered_response_row = None;
-                }
-                if this.view.hovered_response_row != previous {
+                let role = this.chat_role_for_side(side);
+                let changed = this
+                    .with_chat_view(role, |this| {
+                        let previous = this.view.hovered_response_row;
+                        if *hovering {
+                            this.view.hovered_response_row = Some(hover_target);
+                        } else if previous == Some(hover_target) {
+                            this.view.hovered_response_row = None;
+                        }
+                        this.view.hovered_response_row != previous
+                    })
+                    .unwrap_or(false);
+                if changed {
                     cx.notify();
                 }
             }));

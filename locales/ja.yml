@@ -24,6 +24,8 @@ menu.toggle_bottom_panel_maximize: 下パネルの最大化を切り替え
 menu.toggle_chat_split: チャットを分割表示
 menu.focus_left_chat_pane: 左のチャットペインにフォーカス
 menu.focus_right_chat_pane: 右のチャットペインにフォーカス
+menu.swap_chat_panes: 左右のチャットペインを入れ替え
+menu.close_chat_pane: 現在のチャットペインを閉じる
 menu.new_terminal: 新規ターミナル
 menu.focus_composer: 入力欄にフォーカスを移動
 menu.toggle_model_picker: モデル選択の表示を切り替える
@@ -74,6 +76,9 @@ command_palette.restore_bottom_panel: 下パネルを元のサイズに戻す
 command_palette.split_chat: チャットを分割
 command_palette.close_chat_split: チャット分割を閉じる
 command_palette.focus_other_chat_pane: もう一方のチャットペインに切り替え
+command_palette.swap_chat_panes: 左右のチャットペインを入れ替え
+command_palette.close_chat_pane: フォーカス中のチャットペインを閉じる
+command_palette.in_split: 分割中
 command_palette.new_terminal: 新規ターミナル
 command_palette.toggle_files: ファイルパネルを切り替え
 command_palette.toggle_git_graph: Git Graph パネルを切り替え
@@ -1017,6 +1022,8 @@ chat_split.already_new_task: まずこのタスクを開始するか、サイド
 chat_split.focus_pane: このペインにフォーカス
 chat_split.switch_pane: 非表示のペインに切り替え
 chat_split.resize: ドラッグでサイズ変更・ダブルクリックで均等に分割
+chat_split.swap_panes: 左右のペインを入れ替え
+chat_split.status_working: タスク実行中
 
 open_in.open: "プロジェクトを %{app} で開く"
 open_in.choose: プロジェクトを開くアプリを選択…

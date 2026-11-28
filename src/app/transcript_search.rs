@@ -82,10 +82,43 @@ impl Waku {
         let query = cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("input.find")));
         cx.subscribe(
             &query,
-            |this: &mut Self, _, event: &InputEvent, cx| match event {
-                InputEvent::Edited => this.refresh_transcript_search(cx),
-                InputEvent::Submit(_) => this.navigate_transcript_search(false, cx),
-                InputEvent::Focus | InputEvent::BackspaceOnEmpty => {}
+            |this: &mut Self, emitter, event: &InputEvent, cx| {
+                if this
+                    .view
+                    .transcript_search
+                    .as_ref()
+                    .is_some_and(|search| search.query == emitter)
+                {
+                    match event {
+                        InputEvent::Edited => this.refresh_transcript_search(cx),
+                        InputEvent::Submit(_) => this.navigate_transcript_search(false, cx),
+                        InputEvent::Focus | InputEvent::BackspaceOnEmpty => {}
+                    }
+                } else if let Some(other_side) = this.chat_split.as_ref().and_then(|split| {
+                    split
+                        .view
+                        .transcript_search
+                        .as_ref()
+                        .is_some_and(|search| search.query == emitter)
+                        .then_some(split.focused_side.other())
+                }) {
+                    match event {
+                        InputEvent::Focus => this.focus_chat_pane(other_side, cx),
+                        InputEvent::Edited => {
+                            let _ = this.with_chat_view(
+                                chat_split::ChatPaneRole::Unfocused,
+                                |this| this.refresh_transcript_search(cx),
+                            );
+                        }
+                        InputEvent::Submit(_) => {
+                            let _ = this.with_chat_view(
+                                chat_split::ChatPaneRole::Unfocused,
+                                |this| this.navigate_transcript_search(false, cx),
+                            );
+                        }
+                        InputEvent::BackspaceOnEmpty => {}
+                    }
+                }
             },
         )
         .detach();

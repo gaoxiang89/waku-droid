@@ -407,6 +407,28 @@ impl Waku {
                                 {
                                     waku.start_runtime_attachment(session_id, cx);
                                 }
+                            } else if waku
+                                .chat_split
+                                .as_ref()
+                                .is_some_and(|split| split.session_id == session_id)
+                            {
+                                let _ = waku.with_chat_view(
+                                    chat_split::ChatPaneRole::Unfocused,
+                                    |waku| {
+                                        waku.reset_visible_state();
+                                        let count = waku.transcript_row_count();
+                                        waku.reset_transcript_rows(count);
+                                    },
+                                );
+                                waku.refresh_composer_sources(cx);
+                                if waku
+                                    .state
+                                    .sessions
+                                    .iter()
+                                    .any(|s| s.id == session_id && (s.status.is_busy() || s.has_started()))
+                                {
+                                    waku.start_runtime_attachment(session_id, cx);
+                                }
                             }
                         }
                     }
@@ -693,6 +715,17 @@ impl Waku {
         let project_path = self
             .workspace_path_for_session(&self.state.sessions[index])
             .map(std::path::Path::to_path_buf);
+        if self.state.selected_session == Some(session_id)
+            && let Some(focused_side) = self.chat_split.as_ref().map(|split| split.focused_side)
+        {
+            self.close_chat_pane(focused_side, cx);
+        } else if self
+            .chat_split
+            .as_ref()
+            .is_some_and(|split| split.session_id == session_id)
+        {
+            self.chat_split = None;
+        }
         let was_selected = self.state.selected_session == Some(session_id);
         self.submission_preparations.remove(&session_id);
         self.goal_runtime_starts.remove(&session_id);

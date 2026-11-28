@@ -23,6 +23,7 @@ actions!(
         SelectPageDown,
         SelectPageUp,
         Confirm,
+        ConfirmInSplit,
         Dismiss
     ]
 );
@@ -61,6 +62,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("pagedown", SelectPageDown, Some(SEARCH_CONTEXT)),
         KeyBinding::new("pageup", SelectPageUp, Some(SEARCH_CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("secondary-enter", ConfirmInSplit, Some(SEARCH_CONTEXT)),
         // Bound at the palette, not the field: the query field's own
         // clear-on-escape outranks this (deeper context) while it has text,
         // and an empty field propagates the keystroke down to it.
@@ -168,6 +170,8 @@ enum PaletteAction {
     ToggleBottomPanelMaximize,
     ToggleChatSplit,
     FocusOtherChatPane,
+    SwapChatPanes,
+    CloseChatPane,
     ToggleFilesSurface,
     ToggleGitGraphSurface,
     ToggleSwarmSurface,
@@ -812,6 +816,24 @@ impl Waku {
                 "focus switch other chat pane split side left right conversation 切换 窗格 分屏",
                 next(),
             ));
+            commands.push(CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.swap_chat_panes"),
+                "icons/arrow-left-right.svg",
+                None,
+                PaletteAction::SwapChatPanes,
+                "swap exchange flip left right chat panes split 交换 对调 左右 窗格 分屏",
+                next(),
+            ));
+            commands.push(CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.close_chat_pane"),
+                "icons/x.svg",
+                Some(crate::platform::primary_shortcut("⇧⌘W", "Ctrl+Shift+W")),
+                PaletteAction::CloseChatPane,
+                "closechatpane close focused current chat pane split 关闭 窗格 分屏",
+                next(),
+            ));
         }
         commands.push(CommandPaletteItem::command(
             PaletteSection::Commands,
@@ -1154,6 +1176,12 @@ impl Waku {
                 }
                 if Some(session.id) == self.state.selected_session {
                     details.push(tr!("command_palette.current"));
+                } else if self
+                    .chat_split
+                    .as_ref()
+                    .is_some_and(|split| split.session_id == session.id)
+                {
+                    details.push(tr!("command_palette.in_split"));
                 }
                 let detail = details.join(" · ");
                 let label = session.display_title().to_owned();
@@ -1887,6 +1915,7 @@ impl Waku {
     fn execute_command_palette_selection(
         &mut self,
         index: Option<usize>,
+        in_split: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1947,6 +1976,10 @@ impl Waku {
                 self.toggle_chat_split_action(&ToggleChatSplit, window, cx)
             }
             PaletteAction::FocusOtherChatPane => self.focus_other_chat_pane(cx),
+            PaletteAction::SwapChatPanes => self.swap_chat_panes(cx),
+            PaletteAction::CloseChatPane => {
+                self.close_chat_pane_action(&CloseChatPane, window, cx)
+            }
             PaletteAction::ToggleFilesSurface => {
                 self.toggle_files_surface_action(&ToggleFilesSurface, window, cx)
             }
@@ -1988,9 +2021,19 @@ impl Waku {
             }
             PaletteAction::SelectTask(session_id) => {
                 self.settings_page = None;
-                self.select_session(session_id, cx);
-                let focus = self.composer_focus(cx);
-                window.focus(&focus, cx);
+                let can_split = in_split
+                    && self.state.sessions.iter().any(|session| {
+                        session.id == session_id
+                            && !session.archived
+                            && self.state.project_is_open(session.project_id)
+                    });
+                if can_split {
+                    self.open_in_split(session_id, window, cx);
+                } else {
+                    self.select_session(session_id, cx);
+                    let focus = self.composer_focus(cx);
+                    window.focus(&focus, cx);
+                }
             }
             PaletteAction::OpenFile {
                 relative_path,
@@ -2297,8 +2340,13 @@ impl Waku {
                                 this.set_command_palette_selection(index, cx);
                             }
                         }))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.execute_command_palette_selection(Some(index), window, cx);
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            this.execute_command_palette_selection(
+                                Some(index),
+                                event.modifiers().secondary(),
+                                window,
+                                cx,
+                            );
                             cx.stop_propagation();
                         }))
                         .child(
@@ -2418,7 +2466,10 @@ impl Waku {
                     this.move_command_palette_selection(-PAGE_STEP, cx)
                 }))
                 .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                    this.execute_command_palette_selection(None, window, cx)
+                    this.execute_command_palette_selection(None, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ConfirmInSplit, window, cx| {
+                    this.execute_command_palette_selection(None, true, window, cx)
                 }))
                 .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
                     this.dismiss_command_palette(window, cx)

@@ -68,19 +68,17 @@ use crate::ui::{
     icon_button, motion, provider_color, provider_mark, status_color, toggle_switch,
 };
 use crate::{
-    CancelTaskSwitch, CancelTurn, CloseFind, CloseTerminalPane, CloseWindow, ConfirmTaskSwitch,
-    CopySelection, FindNext, FindPrevious, FocusComposer, FocusLeftChatPane, FocusRightChatPane,
-    FocusTerminalPaneDown,
-    FocusTerminalPaneLeft, FocusTerminalPaneRight, FocusTerminalPaneUp, NavigateBack,
-    NavigateForward, NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace,
-    OpenResumePicker, OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
-    ResizeTerminalPaneLeft, ResizeTerminalPaneRight, ResizeTerminalPaneUp, SaveFile,
-    SelectFirstTask, SelectLastTask, SplitTerminalDown, SplitTerminalRight, SwitchTaskBackward,
-    SwitchTaskForward, ToggleBottomPanel, ToggleBottomPanelMaximize, ToggleChatSplit,
-    ToggleCommandPalette,
-    ToggleFilesSurface, ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord,
-    ToggleFpsCounter, ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar,
-    ToggleUsagePanel,
+    CancelTaskSwitch, CancelTurn, CloseChatPane, CloseFind, CloseTerminalPane, CloseWindow,
+    ConfirmTaskSwitch, CopySelection, FindNext, FindPrevious, FocusComposer, FocusLeftChatPane,
+    FocusRightChatPane, FocusTerminalPaneDown, FocusTerminalPaneLeft, FocusTerminalPaneRight,
+    FocusTerminalPaneUp, NavigateBack, NavigateForward, NewProject, NewSession, NewTerminal,
+    NextTerminal, OpenFind, OpenFindReplace, OpenResumePicker, OpenSettings, PreviousTerminal,
+    ReplaceAllMatches, ResizeTerminalPaneDown, ResizeTerminalPaneLeft, ResizeTerminalPaneRight,
+    ResizeTerminalPaneUp, SaveFile, SelectFirstTask, SelectLastTask, SplitTerminalDown,
+    SplitTerminalRight, SwapChatPanes, SwitchTaskBackward, SwitchTaskForward, ToggleBottomPanel,
+    ToggleBottomPanelMaximize, ToggleChatSplit, ToggleCommandPalette, ToggleFilesSurface,
+    ToggleFindCaseSensitive, ToggleFindRegex, ToggleFindWholeWord, ToggleFpsCounter,
+    ToggleGitGraphSurface, ToggleModelPicker, ToggleRightPanel, ToggleSidebar, ToggleUsagePanel,
 };
 use terminal_split::{
     MAX_SPLIT_PANES, ResizeDirection, SPLIT_DIVIDER_SIZE, SplitDividerDrag, SplitGroup,
@@ -1944,6 +1942,9 @@ pub struct Waku {
     /// Keyboard stops for an unfocused pane's header, and for the switch chip
     /// that stands in for a pane hidden by a too-narrow column.
     chat_pane_header_focus: [FocusHandle; 2],
+    chat_pane_focus: [FocusHandle; 2],
+    chat_pane_swap_focus: [FocusHandle; 2],
+    chat_split_resize_focus: FocusHandle,
     /// Share of the chat column the left pane takes while split.
     chat_split_ratio: f32,
     /// The unix second the pending time-label wake-up targets, or `None` when
@@ -2693,6 +2694,30 @@ impl Waku {
         {
             startup_live_session_ids.push(selected);
         }
+        let restored_split_session = state
+            .chat_split_session
+            .filter(|split_id| {
+                state.selected_session.is_some()
+                    && state.selected_session != Some(*split_id)
+                    && state.sessions.iter().any(|session| {
+                        session.id == *split_id
+                            && !session.archived
+                            && session.has_started()
+                            && state.project_is_open(session.project_id)
+                    })
+            })
+            .and_then(|split_id| {
+                state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == split_id)
+                    .map(|session| (split_id, session.project_id, session.detail_loaded))
+            });
+        if let Some((split_id, _, _)) = restored_split_session
+            && !startup_live_session_ids.contains(&split_id)
+        {
+            startup_live_session_ids.push(split_id);
+        }
         let mut interrupted_turn_checkpoints = Vec::new();
         for session in &mut state.sessions {
             session.migrate_legacy_state();
@@ -2884,6 +2909,9 @@ impl Waku {
             let git_graph_copy_focus = cx.focus_handle();
             let chat_pane_close_focus = [cx.focus_handle(), cx.focus_handle()];
             let chat_pane_header_focus = [cx.focus_handle(), cx.focus_handle()];
+            let chat_pane_focus = [cx.focus_handle(), cx.focus_handle()];
+            let chat_pane_swap_focus = [cx.focus_handle(), cx.focus_handle()];
+            let chat_split_resize_focus = cx.focus_handle();
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
                 &task_switcher_focus,
@@ -2894,9 +2922,42 @@ impl Waku {
             )
             .detach();
             let mut task_switcher = task_switcher::TaskSwitcherUi::new(task_switcher_focus);
+            if let Some((split_id, _, _)) = restored_split_session {
+                task_switcher.record_access(split_id);
+            }
             if let Some(selected_session) = state.selected_session {
                 task_switcher.record_access(selected_session);
             }
+            let chat_split = restored_split_session.map(|(split_id, split_project_id, _)| {
+                let mut split_view = chat_split::ChatViewState::new(window, cx);
+                let split_draft = state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == split_id)
+                    .and_then(|session| composer_drafts.get_for(session))
+                    .cloned()
+                    .unwrap_or_default();
+                if !split_draft.text.is_empty() {
+                    split_view
+                        .composer
+                        .update(cx, |input, cx| input.set_content(split_draft.text, cx));
+                }
+                split_view.composer_attachments = split_draft
+                    .attachments
+                    .into_iter()
+                    .map(ComposerAttachment::from)
+                    .collect();
+                chat_split::ChatSplit {
+                    session_id: split_id,
+                    project_id: Some(split_project_id),
+                    focused_side: if state.chat_split_focused_right {
+                        chat_split::ChatPaneSide::Right
+                    } else {
+                        chat_split::ChatPaneSide::Left
+                    },
+                    view: split_view,
+                }
+            });
 
             cx.on_focus(&updater_button_focus, window, |this: &mut Self, _, cx| {
                 this.set_updater_button_focused(true, cx);
@@ -3765,11 +3826,14 @@ impl Waku {
                     navigation_rail: navigation_rail.clone(),
                     navigation_rail_reset_generation: Cell::new(0),
                 },
-                chat_split: None,
+                chat_split,
                 chat_view_exchanged: false,
                 pending_split_open: None,
                 chat_pane_close_focus,
                 chat_pane_header_focus,
+                chat_pane_focus,
+                chat_pane_swap_focus,
+                chat_split_resize_focus,
                 chat_split_ratio,
                 time_label_wake: Cell::new(None),
                 time_label_wake_generation: Cell::new(0),
@@ -3779,6 +3843,17 @@ impl Waku {
             }
         });
         navigation_rail.update(cx, |rail, _| rail.set_waku(entity.downgrade()));
+        for side in [chat_split::ChatPaneSide::Left, chat_split::ChatPaneSide::Right] {
+            let handle = entity.read(cx).chat_pane_focus[side.index()].clone();
+            let weak = entity.downgrade();
+            window
+                .on_focus_in(&handle, cx, move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.focus_chat_pane(side, cx);
+                    });
+                })
+                .detach();
+        }
         for pane in [
             &sidebar_pane,
             &transcript_pane,
@@ -3791,6 +3866,17 @@ impl Waku {
         }
         let initial_row_count = entity.read(cx).transcript_row_count();
         entity.read(cx).reset_transcript_rows(initial_row_count);
+        if let Some((split_id, _, detail_loaded)) = restored_split_session {
+            entity.update(cx, |this, cx| {
+                let _ = this.with_chat_view(chat_split::ChatPaneRole::Unfocused, |this| {
+                    let count = this.transcript_row_count();
+                    this.reset_transcript_rows(count);
+                });
+                if !detail_loaded {
+                    this.ensure_session_loaded(split_id, cx);
+                }
+            });
+        }
         // Everything launch needs from `git` or the filesystem, started now
         // that there is an entity to notify and deliberately not before the
         // first frame.

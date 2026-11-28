@@ -2244,6 +2244,13 @@ impl Waku {
 
     pub(super) fn save(&mut self) {
         self.last_stream_save = Instant::now();
+        if !self.chat_view_exchanged {
+            self.state.chat_split_session = self.chat_split.as_ref().map(|split| split.session_id);
+            self.state.chat_split_focused_right = self
+                .chat_split
+                .as_ref()
+                .is_some_and(|split| split.focused_side == chat_split::ChatPaneSide::Right);
+        }
         let daemon_error = self
             .daemon
             .update_settings(self.state.daemon_settings())
@@ -4988,7 +4995,7 @@ impl Waku {
             // detail snapshots before trusting them.
             self.invalidate_activity_details();
         }
-        changed || selected_changed
+        changed || selected_changed || split_changed
     }
 }
 

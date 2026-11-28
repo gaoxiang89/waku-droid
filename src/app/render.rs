@@ -274,7 +274,7 @@ impl Waku {
             chat_split::ChatPaneSide::Left => self.transcript_pane.clone(),
             chat_split::ChatPaneSide::Right => self.split_transcript_pane.clone(),
         };
-        let Some((transcript_or_empty, permission, queued_and_composer, title)) =
+        let Some((transcript_or_empty, permission, queued_and_composer, session_id)) =
             self.with_chat_view(role, |this| {
                 let empty = should_render_empty_state(this.selected_session());
                 let transcript_or_empty = if empty {
@@ -291,11 +291,12 @@ impl Waku {
                         this.render_composer(window, cx),
                     )
                 });
-                let title = this
-                    .selected_session()
-                    .map(sidebar::localized_session_title)
-                    .unwrap_or_else(|| tr!("session.new_task"));
-                (transcript_or_empty, permission, queued_and_composer, title)
+                (
+                    transcript_or_empty,
+                    permission,
+                    queued_and_composer,
+                    this.state.selected_session,
+                )
             })
         else {
             return div().into_any_element();
@@ -303,6 +304,8 @@ impl Waku {
         let focused = role == chat_split::ChatPaneRole::Focused;
         let mut body = div()
             .id(side.body_id())
+            .track_focus(&self.chat_pane_focus[side.index()])
+            .tab_stop(false)
             .flex_1()
             .min_h_0()
             .w_full()
@@ -314,9 +317,30 @@ impl Waku {
             body = body.children(queued).child(composer);
         }
         if split && !focused {
+            let other = side.other();
             body = body.capture_any_mouse_down(cx.listener(
-                move |this, _: &MouseDownEvent, _, cx| {
+                move |this, _: &MouseDownEvent, window, cx| {
+                    let should_move_composer_focus =
+                        this.chat_pane_has_focus(other, window, cx) || window.focused(cx).is_none();
                     this.focus_chat_pane(side, cx);
+                    if should_move_composer_focus {
+                        let weak = cx.entity().downgrade();
+                        window.defer(cx, move |window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                let still_focused = this
+                                    .chat_split
+                                    .as_ref()
+                                    .is_some_and(|split| split.focused_side == side);
+                                if still_focused
+                                    && (this.chat_pane_has_focus(other, window, cx)
+                                        || window.focused(cx).is_none())
+                                {
+                                    let focus = this.composer_focus(cx);
+                                    window.focus(&focus, cx);
+                                }
+                            });
+                        });
+                    }
                 },
             ));
         }
@@ -331,21 +355,20 @@ impl Waku {
             None => outer.flex_1(),
         };
         if split {
-            let hidden_other_title = hidden_other
-                .then(|| {
-                    let other_session = self.chat_split.as_ref()?.session_id;
-                    self.state
-                        .sessions
-                        .iter()
-                        .find(|session| session.id == other_session)
-                        .map(sidebar::localized_session_title)
-                })
-                .flatten();
+            let show_project = self
+                .chat_split
+                .as_ref()
+                .is_some_and(|split| split.project_id != self.state.selected_project);
+            let meta = self.chat_pane_header_meta(session_id, show_project);
+            let hidden_other = hidden_other.then(|| {
+                let other_session = self.chat_split.as_ref().map(|split| split.session_id);
+                self.chat_pane_header_meta(other_session, show_project)
+            });
             outer = outer.child(self.render_chat_pane_header(
                 side,
                 focused,
-                title,
-                hidden_other_title,
+                meta,
+                hidden_other,
                 cx,
             ));
         }
@@ -534,7 +557,82 @@ impl Render for Waku {
                                 PanelResizeTarget::ChatSplit,
                                 cx,
                             )
-                            .tooltip(Tooltip::text(tr!("chat_split.resize"))),
+                            .track_focus(&self.chat_split_resize_focus)
+                            .tab_index(0)
+                            .focus_visible(|style| style.bg(theme.accent.opacity(0.18)))
+                            .when(self.chat_split_resize_focus.is_focused(window), |handle| {
+                                handle.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(5.0))
+                                        .w(px(2.0))
+                                        .h_full()
+                                        .bg(theme.accent),
+                                )
+                            })
+                            .tooltip(Tooltip::text(tr!("chat_split.resize")))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.modifiers.modified() {
+                                    return;
+                                }
+                                let column = this.chat_viewport_width(window);
+                                match event.keystroke.key.as_str() {
+                                    "left" => {
+                                        if let Some(ratio) = chat_split::step_chat_split_ratio(
+                                            column,
+                                            this.chat_split_ratio,
+                                            -0.05,
+                                        ) {
+                                            this.chat_split_ratio = ratio;
+                                            this.persist_panel_layout();
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                    "right" => {
+                                        if let Some(ratio) = chat_split::step_chat_split_ratio(
+                                            column,
+                                            this.chat_split_ratio,
+                                            0.05,
+                                        ) {
+                                            this.chat_split_ratio = ratio;
+                                            this.persist_panel_layout();
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                    "home" => {
+                                        if let Some(ratio) = chat_split::step_chat_split_ratio(
+                                            column,
+                                            this.chat_split_ratio,
+                                            -1.0,
+                                        ) {
+                                            this.chat_split_ratio = ratio;
+                                            this.persist_panel_layout();
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                    "end" => {
+                                        if let Some(ratio) = chat_split::step_chat_split_ratio(
+                                            column,
+                                            this.chat_split_ratio,
+                                            1.0,
+                                        ) {
+                                            this.chat_split_ratio = ratio;
+                                            this.persist_panel_layout();
+                                            cx.notify();
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                    "enter" | "space" => {
+                                        this.reset_chat_split_ratio(cx);
+                                        cx.stop_propagation();
+                                    }
+                                    _ => {}
+                                }
+                            })),
                         ),
                 )
                 .into_any_element(),
@@ -579,6 +677,8 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_chat_split_action))
             .on_action(cx.listener(Self::focus_left_chat_pane_action))
             .on_action(cx.listener(Self::focus_right_chat_pane_action))
+            .on_action(cx.listener(Self::swap_chat_panes_action))
+            .on_action(cx.listener(Self::close_chat_pane_action))
             .on_action(cx.listener(Self::toggle_files_surface_action))
             .on_action(cx.listener(Self::toggle_git_graph_surface_action))
             .on_action(cx.listener(Self::new_terminal_action))

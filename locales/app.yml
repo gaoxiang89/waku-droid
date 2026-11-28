@@ -48,6 +48,10 @@ menu.focus_left_chat_pane:
   en: Focus Left Chat Pane
 menu.focus_right_chat_pane:
   en: Focus Right Chat Pane
+menu.swap_chat_panes:
+  en: Swap Chat Panes
+menu.close_chat_pane:
+  en: Close Chat Pane
 menu.new_terminal:
   en: New Terminal
 menu.focus_composer:
@@ -146,6 +150,12 @@ command_palette.close_chat_split:
   en: Close Split Chat
 command_palette.focus_other_chat_pane:
   en: Switch to Other Chat Pane
+command_palette.swap_chat_panes:
+  en: Swap Chat Panes
+command_palette.close_chat_pane:
+  en: Close Focused Chat Pane
+command_palette.in_split:
+  en: Split
 command_palette.new_terminal:
   en: New terminal
 command_palette.toggle_files:
@@ -1995,6 +2005,10 @@ chat_split.switch_pane:
   en: Switch to Hidden Pane
 chat_split.resize:
   en: Drag to resize · Double-click to split evenly
+chat_split.swap_panes:
+  en: Swap Left and Right Panes
+chat_split.status_working:
+  en: Task is running
 
 open_in.open:
   en: Open project in %{app}

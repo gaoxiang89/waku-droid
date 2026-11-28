@@ -24,6 +24,8 @@ menu.toggle_bottom_panel_maximize: 最大化或还原底部面板
 menu.toggle_chat_split: 分屏显示对话
 menu.focus_left_chat_pane: 聚焦左侧对话窗格
 menu.focus_right_chat_pane: 聚焦右侧对话窗格
+menu.swap_chat_panes: 交换左右对话窗格
+menu.close_chat_pane: 关闭当前对话窗格
 menu.new_terminal: 新建终端
 menu.focus_composer: 将焦点移到输入框
 menu.toggle_model_picker: 打开或关闭模型选择器
@@ -72,6 +74,9 @@ command_palette.restore_bottom_panel: 还原底部面板
 command_palette.split_chat: 分屏对话
 command_palette.close_chat_split: 关闭分屏对话
 command_palette.focus_other_chat_pane: 切换到另一个对话窗格
+command_palette.swap_chat_panes: 交换左右对话窗格
+command_palette.close_chat_pane: 关闭当前对话窗格
+command_palette.in_split: 分屏
 command_palette.new_terminal: 新建终端
 command_palette.toggle_files: 切换文件面板
 command_palette.toggle_git_graph: 切换 Git Graph 面板
@@ -980,6 +985,8 @@ chat_split.already_new_task: 请先开始当前任务，或从侧边栏将其他
 chat_split.focus_pane: 聚焦此窗格
 chat_split.switch_pane: 切换到隐藏的窗格
 chat_split.resize: 拖动调整宽度 · 双击恢复均分
+chat_split.swap_panes: 交换左右窗格
+chat_split.status_working: 任务正在运行
 open_in.open: 用%{app}打开项目
 open_in.choose: 选择打开项目的应用…
 notifications.title: 通知

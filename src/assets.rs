@@ -21,6 +21,7 @@ const ICONS: &[(&str, &[u8])] = icons![
     "archive",
     "arrow-down",
     "arrow-left",
+    "arrow-left-right",
     "arrow-right",
     "arrow-up",
     "arrow-up-right",

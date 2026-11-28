@@ -76,6 +76,13 @@ impl ChatPaneSide {
             Self::Right => "chat-pane-switch-right",
         }
     }
+
+    pub(super) const fn swap_id(self) -> &'static str {
+        match self {
+            Self::Left => "chat-pane-swap-left",
+            Self::Right => "chat-pane-swap-right",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,6 +374,55 @@ pub(super) fn sanitize_chat_split_ratio(ratio: f32) -> f32 {
     }
 }
 
+pub(super) fn step_chat_split_ratio(column: f32, ratio: f32, delta_ratio: f32) -> Option<f32> {
+    let (left, _) = chat_split_widths(column, ratio)?;
+    let available = column - CHAT_SPLIT_DIVIDER_WIDTH;
+    let next_left = (left + available * delta_ratio)
+        .clamp(CHAT_PANE_MIN_WIDTH, available - CHAT_PANE_MIN_WIDTH);
+    Some(next_left / available)
+}
+
+pub(super) struct ChatPaneHeaderMeta {
+    pub(super) title: String,
+    pub(super) context_label: Option<String>,
+    pub(super) status: SessionStatus,
+    pub(super) needs_attention: bool,
+}
+
+fn chat_pane_status_badge(
+    meta: &ChatPaneHeaderMeta,
+    theme: &Theme,
+) -> Option<(&'static str, Hsla, String)> {
+    // Pane headers render under the root `Waku` view rather than a `WakuPane`
+    // island, so keep status badges static instead of leasing the pulse clock.
+    if meta.needs_attention || meta.status == SessionStatus::Waiting {
+        Some((
+            "icons/alert.svg",
+            theme.warning,
+            tr!("sidebar.status_waiting"),
+        ))
+    } else if meta.status == SessionStatus::Failed {
+        Some(("icons/x.svg", theme.danger, tr!("sidebar.status_failed")))
+    } else if meta.status == SessionStatus::Background {
+        Some((
+            "icons/hourglass.svg",
+            status_color(theme, meta.status),
+            tr!("sidebar.status_background"),
+        ))
+    } else if matches!(
+        meta.status,
+        SessionStatus::Connecting | SessionStatus::Working
+    ) {
+        Some((
+            "icons/zap.svg",
+            theme.accent,
+            tr!("chat_split.status_working"),
+        ))
+    } else {
+        None
+    }
+}
+
 impl Waku {
     fn exchange_with_split(&mut self) -> bool {
         let Some(mut split) = self.chat_split.take() else {
@@ -513,6 +569,99 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.focus_chat_pane_from_keyboard(ChatPaneSide::Right, cx);
+    }
+
+    pub(super) fn swap_chat_panes(&mut self, cx: &mut Context<Self>) {
+        if self.chat_view_exchanged {
+            return;
+        }
+        let Some(split) = self.chat_split.as_mut() else {
+            return;
+        };
+        split.focused_side = split.focused_side.other();
+        self.save();
+        cx.notify();
+    }
+
+    pub(super) fn swap_chat_panes_action(
+        &mut self,
+        _: &SwapChatPanes,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.swap_chat_panes(cx);
+    }
+
+    pub(super) fn close_chat_pane_action(
+        &mut self,
+        _: &CloseChatPane,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(side) = self.chat_split.as_ref().map(|split| split.focused_side) {
+            self.close_chat_pane(side, cx);
+        }
+    }
+
+    pub(super) fn chat_pane_has_focus(
+        &self,
+        side: ChatPaneSide,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        let index = side.index();
+        self.chat_pane_focus[index].contains_focused(window, cx)
+            || self.chat_pane_header_focus[index].is_focused(window)
+            || self.chat_pane_close_focus[index].is_focused(window)
+            || self.chat_pane_swap_focus[index].is_focused(window)
+    }
+
+    pub(super) fn chat_pane_header_meta(
+        &self,
+        session_id: Option<Uuid>,
+        show_project: bool,
+    ) -> ChatPaneHeaderMeta {
+        let Some(session) = session_id.and_then(|id| {
+            self.state
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+        }) else {
+            return ChatPaneHeaderMeta {
+                title: tr!("session.new_task"),
+                context_label: None,
+                status: SessionStatus::Idle,
+                needs_attention: false,
+            };
+        };
+        let title = sidebar::localized_session_title(session);
+        let mut context_parts = Vec::new();
+        if show_project
+            && let Some(project) = self
+                .state
+                .projects
+                .iter()
+                .find(|project| project.id == session.project_id)
+                .filter(|project| !project.is_projectless())
+        {
+            context_parts.push(project.display_name());
+        }
+        if let Some(branch) = sidebar::persisted_sidebar_branch_label(&session.workspace) {
+            context_parts.push(branch.to_owned());
+        }
+        let context_label = (!context_parts.is_empty()).then(|| context_parts.join(" · "));
+        let needs_attention = session.status == SessionStatus::Waiting
+            || self.runtimes.get(&session.id).is_some_and(|runtime| {
+                !runtime.pending_permissions.is_empty()
+                    || !runtime.pending_user_inputs.is_empty()
+                    || runtime.pending_computer_approval.is_some()
+            });
+        ChatPaneHeaderMeta {
+            title,
+            context_label,
+            status: session.status,
+            needs_attention,
+        }
     }
 
     pub(super) fn reset_chat_split_ratio(&mut self, cx: &mut Context<Self>) {
@@ -665,6 +814,19 @@ impl Waku {
             .selected_session()
             .is_none_or(|session| !session.has_started())
         {
+            if let Some(recent_id) = self
+                .state
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.project_id == project_id && !session.archived && session.has_started()
+                })
+                .max_by_key(|session| session.last_reply_at.unwrap_or(session.created_at))
+                .map(|session| session.id)
+            {
+                self.open_in_split(recent_id, window, cx);
+                return;
+            }
             self.show_toast(tr!("chat_split.already_new_task"));
             cx.notify();
             return;
@@ -762,11 +924,52 @@ impl Waku {
         &self,
         side: ChatPaneSide,
         focused: bool,
-        title: String,
-        hidden_other_title: Option<String>,
+        meta: ChatPaneHeaderMeta,
+        hidden_other: Option<ChatPaneHeaderMeta>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
+        let status_badge = chat_pane_status_badge(&meta, &theme);
+        let swap_button = hidden_other.is_none().then(|| {
+            let swap_focus = self.chat_pane_swap_focus[side.index()].clone();
+            div()
+                .id(side.swap_id())
+                .track_focus(&swap_focus)
+                .tab_index(0)
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_default()
+                .focus_visible(|style| {
+                    style
+                        .bg(theme.overlay)
+                        .border_1()
+                        .border_color(theme.accent)
+                })
+                .hover(|style| style.bg(theme.overlay))
+                .active(|style| style.bg(theme.overlay_strong))
+                .child(icon("icons/arrow-left-right.svg", 12.0, theme.text_tertiary))
+                .tooltip(Tooltip::text(tr!("chat_split.swap_panes")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.swap_chat_panes(cx);
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if !event.keystroke.modifiers.modified()
+                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.swap_chat_panes(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+        });
         let close_focus = self.chat_pane_close_focus[side.index()].clone();
         let close_button = div()
             .id(side.close_id())
@@ -809,8 +1012,9 @@ impl Waku {
         // Shown while the column is too narrow for both panes: the hidden
         // pane stays one click or keystroke away instead of vanishing.
         let other = side.other();
-        let switch_chip = hidden_other_title.map(|other_title| {
+        let switch_chip = hidden_other.map(|other_meta| {
             let focus = self.chat_pane_header_focus[other.index()].clone();
+            let other_badge = chat_pane_status_badge(&other_meta, &theme);
             div()
                 .id(side.switch_id())
                 .track_focus(&focus)
@@ -830,13 +1034,16 @@ impl Waku {
                 .hover(|style| style.bg(theme.overlay))
                 .active(|style| style.bg(theme.overlay_strong))
                 .child(icon(other.icon(), 12.0, theme.text_tertiary))
+                .when_some(other_badge, |element, (icon_path, color, _)| {
+                    element.child(icon(icon_path, 11.0, color))
+                })
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
                         .text_size(sp(12.0))
                         .text_color(theme.text_secondary)
-                        .child(SharedString::from(other_title)),
+                        .child(SharedString::from(other_meta.title)),
                 )
                 .tooltip(Tooltip::with_shortcut(
                     tr!("chat_split.switch_pane"),
@@ -896,7 +1103,8 @@ impl Waku {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.focus_chat_pane(side, cx);
+                            cx.stop_propagation();
+                            this.focus_chat_pane_from_keyboard(side, cx);
                         }),
                     )
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
@@ -921,15 +1129,50 @@ impl Waku {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_size(sp(12.5))
-                    .when(focused, |element| {
-                        element.text_color(theme.text).font_weight(FontWeight::MEDIUM)
-                    })
-                    .when(!focused, |element| element.text_color(theme.text_tertiary))
-                    .child(SharedString::from(title)),
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(sp(12.5))
+                            .when(focused, |element| {
+                                element.text_color(theme.text).font_weight(FontWeight::MEDIUM)
+                            })
+                            .when(!focused, |element| element.text_color(theme.text_tertiary))
+                            .child(SharedString::from(meta.title)),
+                    )
+                    .when_some(meta.context_label, |element, label| {
+                        element.child(
+                            div()
+                                .min_w_0()
+                                .max_w(px(180.0))
+                                .truncate()
+                                .text_size(sp(11.5))
+                                .text_color(theme.text_tertiary)
+                                .child(SharedString::from(label)),
+                        )
+                    }),
             )
+            .when_some(status_badge, |element, (icon_path, color, tooltip_text)| {
+                element.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-pane-status-{}",
+                            side.index()
+                        )))
+                        .flex_none()
+                        .size(px(14.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .tooltip(Tooltip::text(tooltip_text))
+                        .child(icon(icon_path, 12.0, color)),
+                )
+            })
             .children(switch_chip)
+            .children(swap_button)
             .child(close_button)
     }
 }
@@ -959,5 +1202,16 @@ mod tests {
         assert_eq!(chat_split_widths(720.0, 0.5), None);
         assert_eq!(chat_split_widths(721.0, 0.5), Some((360.0, 360.0)));
         assert_eq!(chat_split_widths(0.0, 0.5), None);
+    }
+
+    #[test]
+    fn step_chat_split_ratio_moves_from_clamped_edge_within_minimums() {
+        assert_eq!(step_chat_split_ratio(720.0, 0.5, 0.05), None);
+        let stepped = step_chat_split_ratio(1001.0, 0.0, 0.05).unwrap();
+        assert!((stepped - 0.41).abs() < 1e-4);
+        let clamped_max = step_chat_split_ratio(1001.0, 0.5, 1.0).unwrap();
+        assert!((clamped_max - 0.64).abs() < 1e-4);
+        let clamped_min = step_chat_split_ratio(1001.0, 0.5, -1.0).unwrap();
+        assert!((clamped_min - 0.36).abs() < 1e-4);
     }
 }
