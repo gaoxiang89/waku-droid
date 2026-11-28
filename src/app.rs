@@ -1968,6 +1968,7 @@ mod command_palette;
 mod commit_dialog;
 mod components;
 mod composer;
+pub(crate) use composer::attachment_upload_from_path;
 mod connections_page;
 mod drafts;
 mod file_search;

@@ -176,7 +176,7 @@ raw-window-handle = "0.6"
 ed25519-dalek = "2"
 flate2 = "1"
 # Matches the version GPUI exposes through `WindowOptions::icon`.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff"] }
 tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]

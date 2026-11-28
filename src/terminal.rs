@@ -49,6 +49,23 @@ fn primary_modifier_pressed(modifiers: &Modifiers) -> bool {
     modifiers.secondary()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardPlatform {
+    MacOs,
+    Windows,
+    Linux,
+}
+
+impl ClipboardPlatform {
+    const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::MacOs
+    } else if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Linux
+    };
+}
+
 #[inline]
 fn terminal_clipboard_modifier_pressed(modifiers: &Modifiers) -> bool {
     if cfg!(target_os = "macos") {
@@ -58,6 +75,72 @@ fn terminal_clipboard_modifier_pressed(modifiers: &Modifiers) -> bool {
         modifiers.control && modifiers.shift && !modifiers.alt && !modifiers.platform
     }
 }
+
+fn terminal_copy_shortcut_for(
+    platform: ClipboardPlatform,
+    keystroke: &Keystroke,
+    has_selection: bool,
+) -> bool {
+    let modifiers = keystroke.modifiers;
+    if modifiers.function || modifiers.alt {
+        return false;
+    }
+    match platform {
+        ClipboardPlatform::MacOs => {
+            modifiers.platform
+                && !modifiers.control
+                && !modifiers.shift
+                && keystroke.key.eq_ignore_ascii_case("c")
+        }
+        ClipboardPlatform::Windows | ClipboardPlatform::Linux => {
+            if modifiers.platform {
+                return false;
+            }
+            (modifiers.control
+                && (modifiers.shift || has_selection)
+                && keystroke.key.eq_ignore_ascii_case("c"))
+                || (modifiers.control
+                    && !modifiers.shift
+                    && keystroke.key.eq_ignore_ascii_case("insert"))
+        }
+    }
+}
+
+fn terminal_paste_shortcut_for(platform: ClipboardPlatform, keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    if modifiers.function || modifiers.alt {
+        return false;
+    }
+    match platform {
+        ClipboardPlatform::MacOs => {
+            modifiers.platform
+                && !modifiers.control
+                && !modifiers.shift
+                && keystroke.key.eq_ignore_ascii_case("v")
+        }
+        ClipboardPlatform::Windows => {
+            if modifiers.platform {
+                return false;
+            }
+            (modifiers.control && keystroke.key.eq_ignore_ascii_case("v"))
+                || (modifiers.shift
+                    && !modifiers.control
+                    && keystroke.key.eq_ignore_ascii_case("insert"))
+        }
+        ClipboardPlatform::Linux => {
+            if modifiers.platform {
+                return false;
+            }
+            (modifiers.control && modifiers.shift && keystroke.key.eq_ignore_ascii_case("v"))
+                || (modifiers.shift
+                    && !modifiers.control
+                    && keystroke.key.eq_ignore_ascii_case("insert"))
+        }
+    }
+}
+
+const MAX_TERMINAL_PASTE_BYTES: usize = 16 * 1024 * 1024;
+const TERMINAL_PASTE_CHUNK_BYTES: usize = 64 * 1024;
 const TERMINAL_PADDING_X: f32 = 10.0;
 const TERMINAL_PADDING_Y: f32 = 8.0;
 const TERMINAL_TOOLBAR_HEIGHT: f32 = 34.0;
@@ -1813,19 +1896,43 @@ enum TerminalPasteContent {
     Paths(Vec<PathBuf>),
 }
 
-fn extract_terminal_paste_content(clipboard: &ClipboardItem) -> Option<TerminalPasteContent> {
-    if let Some(ClipboardEntry::Image(image)) = clipboard.entries().first() {
-        if !image.bytes.is_empty() {
-            return Some(TerminalPasteContent::Image {
+fn first_clipboard_paths(clipboard: &ClipboardItem) -> Option<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = clipboard
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(external) if !external.paths().is_empty() => {
+                Some(external.paths().iter().cloned())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn first_clipboard_image(clipboard: &ClipboardItem) -> Option<TerminalPasteContent> {
+    clipboard.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+            Some(TerminalPasteContent::Image {
                 format: image.format,
                 bytes: image.bytes.clone(),
-            });
+            })
         }
-    }
+        _ => None,
+    })
+}
 
-    if let Some(ClipboardEntry::ExternalPaths(external)) = clipboard.entries().first() {
-        if !external.paths().is_empty() {
-            return Some(TerminalPasteContent::Paths(external.paths().to_vec()));
+fn extract_terminal_paste_content(clipboard: &ClipboardItem) -> Option<TerminalPasteContent> {
+    if matches!(
+        clipboard.entries().first(),
+        Some(ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_))
+    ) {
+        if let Some(paths) = first_clipboard_paths(clipboard) {
+            return Some(TerminalPasteContent::Paths(paths));
+        }
+        if let Some(image) = first_clipboard_image(clipboard) {
+            return Some(image);
         }
     }
 
@@ -1833,22 +1940,9 @@ fn extract_terminal_paste_content(clipboard: &ClipboardItem) -> Option<TerminalP
         return Some(TerminalPasteContent::Text(text));
     }
 
-    for entry in clipboard.entries() {
-        match entry {
-            ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
-                return Some(TerminalPasteContent::Image {
-                    format: image.format,
-                    bytes: image.bytes.clone(),
-                });
-            }
-            ClipboardEntry::ExternalPaths(external) if !external.paths().is_empty() => {
-                return Some(TerminalPasteContent::Paths(external.paths().to_vec()));
-            }
-            _ => {}
-        }
-    }
-
-    None
+    first_clipboard_paths(clipboard)
+        .map(TerminalPasteContent::Paths)
+        .or_else(|| first_clipboard_image(clipboard))
 }
 
 fn clipboard_has_paste_content(clipboard: &ClipboardItem) -> bool {
@@ -1977,24 +2071,48 @@ fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
     ImageFormat::from_mime_type(mime)
 }
 
-/// What pasting copied files into a daemon terminal produced: host paths for
-/// the images it uploaded, and how many files it had to leave behind.
+/// What pasting copied files or folders into a daemon terminal produced: host
+/// paths for the uploaded payloads, and how many items failed to upload.
 #[derive(Debug, Default)]
 struct UploadedPastePaths {
     paths: Vec<PathBuf>,
     skipped: usize,
 }
 
-/// Copied files live on this machine, not on the daemon host. Images are
-/// uploaded like a clipboard image; anything else cannot be reached from the
-/// remote shell and is skipped.
+fn save_pasted_attachment(launcher: TerminalLauncher, path: &Path) -> Result<PathBuf> {
+    let (name, upload, _) = crate::app::attachment_upload_from_path(path)?;
+    if let TerminalLauncher::Daemon(daemon) = launcher {
+        let response = daemon.client().request(
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            waku_client::Command::ImportAttachment { name, upload },
+        )?;
+        return match response {
+            waku_client::ResponsePayload::AttachmentStored { attachment } => Ok(attachment.path),
+            _ => anyhow::bail!("Waku daemon returned an invalid attachment response"),
+        };
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Copied files and directories live on this machine, not on the daemon host.
+/// Images route through `StoreBlob` (so BMP/TIFF re-encodes to PNG); all other
+/// files and directories upload through `ImportAttachment`.
 fn upload_pasted_paths(launcher: TerminalLauncher, paths: Vec<PathBuf>) -> UploadedPastePaths {
     let mut uploaded = UploadedPastePaths::default();
+    let max_image_bytes = waku_client::attachments::MAX_ATTACHMENT_BYTES as u64;
     for path in paths {
-        let stored = image_format_for_path(&path).and_then(|format| {
-            let bytes = std::fs::read(&path).ok()?;
-            save_pasted_image(launcher.clone(), format, bytes).ok()
-        });
+        let is_uploadable_image = std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_image_bytes)
+            && image_format_for_path(&path).is_some();
+        let stored = if is_uploadable_image {
+            image_format_for_path(&path).and_then(|format| {
+                let bytes = std::fs::read(&path).ok()?;
+                save_pasted_image(launcher.clone(), format, bytes).ok()
+            })
+        } else {
+            save_pasted_attachment(launcher.clone(), &path).ok()
+        };
         match stored {
             Some(stored) => uploaded.paths.push(stored),
             None => uploaded.skipped += 1,
@@ -2542,17 +2660,16 @@ impl TerminalView {
         {
             return;
         }
-        if (terminal_clipboard_modifier_pressed(&keystroke.modifiers)
-            || (!cfg!(target_os = "macos")
-                && keystroke.modifiers.control
-                && !keystroke.modifiers.shift
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.platform
-                && self.selected_text().is_some()))
-            && keystroke.key.eq_ignore_ascii_case("c")
-        {
+        if terminal_copy_shortcut_for(
+            ClipboardPlatform::CURRENT,
+            keystroke,
+            self.selected_text().is_some(),
+        ) {
             self.copy_selection(cx);
-            if !cfg!(target_os = "macos") && !keystroke.modifiers.shift {
+            if !cfg!(target_os = "macos")
+                && keystroke.key.eq_ignore_ascii_case("c")
+                && !keystroke.modifiers.shift
+            {
                 if let Some(session) = &self.session {
                     session.term.lock_unfair().selection = None;
                     session.dirty.store(true, Ordering::Release);
@@ -2575,9 +2692,7 @@ impl TerminalView {
         let Some(session) = &self.session else {
             return;
         };
-        if terminal_clipboard_modifier_pressed(&keystroke.modifiers)
-            && keystroke.key.eq_ignore_ascii_case("v")
-        {
+        if terminal_paste_shortcut_for(ClipboardPlatform::CURRENT, keystroke) {
             self.paste_from_clipboard(cx);
             window.prevent_default();
             cx.stop_propagation();
@@ -2977,12 +3092,22 @@ impl TerminalView {
     }
 
     fn paste(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() || self.exited {
+            return;
+        }
         self.pause_cursor_blink(cx);
         let Some(session) = &self.session else {
             return;
         };
+        if text.len() > MAX_TERMINAL_PASTE_BYTES {
+            cx.emit(TerminalNotice(tr!("terminal.paste_too_large")));
+            return;
+        }
         session.prepare_for_user_input();
-        session.write(bracketed_paste(text, session.mode()));
+        let payload = bracketed_paste(text, session.mode());
+        for chunk in utf8_byte_chunks(&payload, TERMINAL_PASTE_CHUNK_BYTES) {
+            session.write(chunk.to_vec());
+        }
         cx.notify();
     }
 
@@ -2995,7 +3120,7 @@ impl TerminalView {
     }
 
     fn paste_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if paths.is_empty() || self.session.is_none() {
+        if paths.is_empty() || self.session.is_none() || self.exited {
             return;
         }
         if self.launcher.is_local() {
@@ -3032,7 +3157,7 @@ impl TerminalView {
     }
 
     pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
-        if self.session.is_none() {
+        if self.session.is_none() || self.exited {
             return;
         }
         let Some(clipboard) = cx.read_from_clipboard() else {
@@ -3535,18 +3660,18 @@ impl Render for TerminalView {
             "terminal-context-menu",
             &self.context_menu,
             move |cx| {
-                let has_selection = context_terminal.read(cx).selected_text().is_some();
-                let can_paste = cx
-                    .read_from_clipboard()
-                    .as_ref()
-                    .is_some_and(clipboard_has_paste_content);
-                let has_session = context_terminal.read(cx).session.is_some();
-                let can_split = context_terminal.read(cx).can_split;
-                let bottom_panel_tabs = context_terminal.read(cx).bottom_panel_tabs;
-                let can_restart = {
-                    let view = context_terminal.read(cx);
-                    view.exited || view.error.is_some()
-                };
+                let view = context_terminal.read(cx);
+                let has_selection = view.selected_text().is_some();
+                let has_session = view.session.is_some();
+                let can_paste = has_session
+                    && !view.exited
+                    && cx
+                        .read_from_clipboard()
+                        .as_ref()
+                        .is_some_and(clipboard_has_paste_content);
+                let can_split = view.can_split;
+                let bottom_panel_tabs = view.bottom_panel_tabs;
+                let can_restart = view.exited || view.error.is_some();
 
                 let copy_terminal = context_terminal.clone();
                 let context_selection_terminal = context_terminal.clone();
@@ -3745,6 +3870,11 @@ impl Render for TerminalView {
                     this.paste_paths(paths.paths().to_vec(), cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::input::Copy, _, cx| this.copy_selection(cx)))
+            .on_action(
+                cx.listener(|this, _: &crate::input::Paste, _, cx| this.paste_from_clipboard(cx)),
+            )
+            .on_action(cx.listener(|this, _: &crate::input::SelectAll, _, cx| this.select_all(cx)))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -4226,13 +4356,37 @@ fn mouse_report_with_state(
 
 fn bracketed_paste(text: String, mode: TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
-        // Strip ESC and bracketed-paste closing markers so clipboard content
-        // cannot break out of the paste envelope and execute shell commands.
-        let sanitized = text.replace("\x1b[201~", "").replace('\x1b', "");
+        // Normalize CRLF and strip ESC, C1 CSI, and bracketed-paste closing
+        // markers so clipboard content cannot leave trailing CR or break out of
+        // the paste envelope to execute shell commands.
+        let sanitized = text
+            .replace("\r\n", "\n")
+            .replace("\x1b[201~", "")
+            .replace(['\x1b', '\u{009b}'], "");
         format!("\x1b[200~{sanitized}\x1b[201~").into_bytes()
     } else {
-        text.into_bytes()
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
+}
+
+fn utf8_byte_chunks(mut bytes: &[u8], max_chunk: usize) -> Vec<&[u8]> {
+    let chunk_limit = max_chunk.max(4);
+    let mut chunks = Vec::new();
+    while bytes.len() > chunk_limit {
+        let mut split = chunk_limit;
+        while split > 0 && (bytes[split] & 0b1100_0000) == 0b1000_0000 {
+            split -= 1;
+        }
+        if split == 0 {
+            split = chunk_limit;
+        }
+        chunks.push(&bytes[..split]);
+        bytes = &bytes[split..];
+    }
+    if !bytes.is_empty() {
+        chunks.push(bytes);
+    }
+    chunks
 }
 
 fn terminal_uses_text_input(event: &KeyDownEvent) -> bool {
@@ -6119,9 +6273,8 @@ mod tests {
         assert_eq!(shielded, expected);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_terminal_clipboard_shortcuts_preserve_ctrl_c_for_sigint() {
+    fn terminal_clipboard_shortcuts_match_platform_conventions() {
         let control = Modifiers {
             control: true,
             ..Default::default()
@@ -6131,10 +6284,103 @@ mod tests {
             shift: true,
             ..Default::default()
         };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let command = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
 
-        assert!(primary_modifier_pressed(&control));
-        assert!(!terminal_clipboard_modifier_pressed(&control));
-        assert!(terminal_clipboard_modifier_pressed(&control_shift));
+        let ctrl_c = key("c", Some("c"), control);
+        let ctrl_shift_c = key("c", Some("C"), control_shift);
+        let cmd_c = key("c", Some("c"), command);
+        let ctrl_insert = key("insert", None, control);
+        let ctrl_v = key("v", Some("v"), control);
+        let ctrl_shift_v = key("v", Some("V"), control_shift);
+        let cmd_v = key("v", Some("v"), command);
+        let shift_insert = key("insert", None, shift);
+
+        assert!(!terminal_copy_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_c,
+            false
+        ));
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_c,
+            true
+        ));
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_shift_c,
+            false
+        ));
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_insert,
+            false
+        ));
+        assert!(!terminal_paste_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_v
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::Linux,
+            &ctrl_shift_v
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::Linux,
+            &shift_insert
+        ));
+
+        assert!(!terminal_copy_shortcut_for(
+            ClipboardPlatform::Windows,
+            &ctrl_c,
+            false
+        ));
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::Windows,
+            &ctrl_c,
+            true
+        ));
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::Windows,
+            &ctrl_insert,
+            false
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::Windows,
+            &ctrl_v
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::Windows,
+            &ctrl_shift_v
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::Windows,
+            &shift_insert
+        ));
+
+        assert!(terminal_copy_shortcut_for(
+            ClipboardPlatform::MacOs,
+            &cmd_c,
+            false
+        ));
+        assert!(!terminal_copy_shortcut_for(
+            ClipboardPlatform::MacOs,
+            &ctrl_c,
+            true
+        ));
+        assert!(terminal_paste_shortcut_for(
+            ClipboardPlatform::MacOs,
+            &cmd_v
+        ));
+        assert!(!terminal_paste_shortcut_for(
+            ClipboardPlatform::MacOs,
+            &ctrl_v
+        ));
     }
 
     #[test]
@@ -6381,8 +6627,6 @@ mod tests {
         );
     }
 
-    // Linux builds `image` with PNG alone, so BMP falls through unchanged there.
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn pasted_bmp_is_re_encoded_as_png() {
         let mut bmp = Vec::new();
@@ -6399,7 +6643,7 @@ mod tests {
     }
 
     #[test]
-    fn copied_image_files_upload_and_other_files_are_skipped() {
+    fn copied_files_and_directories_upload_and_missing_paths_are_skipped() {
         assert_eq!(
             image_format_for_path(Path::new("shot.PNG")),
             Some(ImageFormat::Png)
@@ -6413,7 +6657,8 @@ mod tests {
 
         let dir =
             std::env::temp_dir().join(format!("waku-paste-test-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let nested_dir = dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
         let image = dir.join("shot.png");
         let mut png = Vec::new();
         image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]))
@@ -6422,13 +6667,19 @@ mod tests {
         std::fs::write(&image, &png).unwrap();
         let text = dir.join("notes.txt");
         std::fs::write(&text, "hi").unwrap();
+        std::fs::write(nested_dir.join("inside.txt"), "nested").unwrap();
         let missing = dir.join("gone.png");
 
         // The local launcher stands in for the daemon upload: same sorting.
-        let uploaded = upload_pasted_paths(TerminalLauncher::Local, vec![image, text, missing]);
-        assert_eq!(uploaded.paths.len(), 1);
+        let uploaded = upload_pasted_paths(
+            TerminalLauncher::Local,
+            vec![image, text.clone(), nested_dir.clone(), missing],
+        );
+        assert_eq!(uploaded.paths.len(), 3);
         assert_eq!(std::fs::read(&uploaded.paths[0]).unwrap(), png);
-        assert_eq!(uploaded.skipped, 2);
+        assert_eq!(uploaded.paths[1], text);
+        assert_eq!(uploaded.paths[2], nested_dir);
+        assert_eq!(uploaded.skipped, 1);
         let _ = std::fs::remove_file(&uploaded.paths[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6493,7 +6744,7 @@ mod tests {
         // External paths clipboard
         let paths = ExternalPaths(vec![PathBuf::from("/tmp/file.png")].into());
         let paths_item = ClipboardItem {
-            entries: vec![ClipboardEntry::ExternalPaths(paths)],
+            entries: vec![ClipboardEntry::ExternalPaths(paths.clone())],
         };
         assert_eq!(
             extract_terminal_paste_content(&paths_item),
@@ -6502,6 +6753,32 @@ mod tests {
             )]))
         );
         assert!(clipboard_has_paste_content(&paths_item));
+
+        // Dual-format media clipboard (e.g. Windows Explorer copied image): prefer paths.
+        let dual_media_item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Image(image.clone()),
+                ClipboardEntry::ExternalPaths(paths.clone()),
+            ],
+        };
+        assert_eq!(
+            extract_terminal_paste_content(&dual_media_item),
+            Some(TerminalPasteContent::Paths(vec![PathBuf::from(
+                "/tmp/file.png"
+            )]))
+        );
+
+        // Text-first clipboard keeps text priority even if an image entry follows.
+        let text_first_item = ClipboardItem {
+            entries: vec![
+                ClipboardEntry::from("prefer text".to_string()),
+                ClipboardEntry::Image(image),
+            ],
+        };
+        assert_eq!(
+            extract_terminal_paste_content(&text_first_item),
+            Some(TerminalPasteContent::Text("prefer text".into()))
+        );
 
         // Empty clipboard
         let empty_item = ClipboardItem { entries: vec![] };
@@ -6771,11 +7048,278 @@ mod tests {
     fn bracketed_paste_strips_injected_escape_sequences() {
         assert_eq!(
             bracketed_paste(
-                "safe\x1b[201~; rm -rf /\x1b[200~".into(),
+                "safe\r\n\x1b[201~; rm -rf /\x1b[200~\u{009b}31m".into(),
                 TermMode::BRACKETED_PASTE
             ),
-            b"\x1b[200~safe; rm -rf /[200~\x1b[201~"
+            b"\x1b[200~safe\n; rm -rf /[200~31m\x1b[201~"
         );
+        assert_eq!(
+            bracketed_paste("one\r\ntwo\nthree".into(), TermMode::empty()),
+            b"one\rtwo\rthree"
+        );
+    }
+
+    #[test]
+    fn utf8_byte_chunks_keep_multibyte_characters_intact() {
+        let text = "你好世界abc你好".to_owned();
+        let chunks = utf8_byte_chunks(text.as_bytes(), 5);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk).is_ok());
+            assert!(chunk.len() <= 5);
+        }
+        let reassembled = chunks.concat();
+        assert_eq!(reassembled, text.as_bytes());
+    }
+
+    #[gpui::test]
+    fn terminal_paste_chunks_large_payloads_and_rejects_oversized_text(cx: &mut gpui::TestAppContext) {
+        let notices: Rc<std::cell::RefCell<Vec<String>>> = Rc::default();
+        let sink = notices.clone();
+        let cx = cx.add_empty_window();
+        let (view, written) = cx.update(|_, cx| {
+            let (sender, written) = unbounded();
+            let dirty = Arc::new(AtomicBool::new(false));
+            let (ui_tx, ui_events) = unbounded();
+            let window_size = Arc::new(Mutex::new(WindowSize {
+                num_cols: 40,
+                num_lines: 8,
+                cell_width: 8,
+                cell_height: 18,
+            }));
+            let reply_colors = TerminalReplyColors::new(Theme::dark());
+            let proxy = TerminalEventProxy {
+                replaying: Arc::new(AtomicBool::new(false)),
+                dirty: dirty.clone(),
+                sender: Arc::new(OnceLock::new()),
+                ui_events: ui_tx,
+                wake: None,
+                window_size: window_size.clone(),
+                reply_colors: reply_colors.clone(),
+            };
+            let view = cx.new(|cx| TerminalView {
+                session: Some(TerminalSession {
+                    term: Arc::new(FairMutex::new(Term::new(
+                        Config::default(),
+                        &TerminalDimensions {
+                            columns: 40,
+                            rows: 8,
+                        },
+                        proxy,
+                    ))),
+                    sender: PtyInput::Test(sender),
+                    dirty,
+                    snapshot_dirty: AtomicBool::new(true),
+                    cached_snapshot: Mutex::new(None),
+                    ui_events,
+                    window_size,
+                    grid_size: (40, 8),
+                    reply_colors,
+                    url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+                }),
+                launcher: TerminalLauncher::Local,
+                remote_closed: Arc::new(AtomicBool::new(false)),
+                fallback_cwd: None,
+                persistent_id: uuid::Uuid::new_v4(),
+                error: None,
+                focus_handle: cx.focus_handle(),
+                working_directory: PathBuf::new(),
+                title: String::new(),
+                custom_title: false,
+                exited: false,
+                reconnecting: false,
+                scroll_accumulator: 0.0,
+                panel_width: 320.0,
+                panel_height: Some(160.0),
+                measured_cell_width: Some(8.0),
+                scrollbar_state: ScrollbarState::new(),
+                grid_bounds: Rc::new(Cell::new(None)),
+                cursor_position: None,
+                composition: None,
+                selecting: false,
+                mouse_reported_cell: None,
+                mouse_motion_cell: None,
+                hovered_link: None,
+                kitty_reported_keys: HashSet::new(),
+                cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
+                cursor_focus_tracking_started: false,
+                focused: false,
+                needs_attention: false,
+                context_menu: ContextMenuHandle::new(cx),
+                bottom_panel_tabs: false,
+                can_split: false,
+                _subscriptions: Vec::new(),
+            });
+
+            cx.subscribe(&view, move |_, event: &TerminalNotice, _| {
+                sink.borrow_mut().push(event.0.clone());
+            })
+            .detach();
+
+            (view, written)
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // Chunked paste across multi-byte boundary wraps only once.
+                {
+                    let session = view.session.as_ref().unwrap();
+                    let mut term = session.term.lock();
+                    let mut parser: alacritty_terminal::vte::ansi::Processor =
+                        alacritty_terminal::vte::ansi::Processor::new();
+                    parser.advance(&mut *term, b"\x1b[?2004h");
+                }
+                let unit = "你";
+                let repeat_count = (TERMINAL_PASTE_CHUNK_BYTES / unit.len()) + 100;
+                let large = unit.repeat(repeat_count);
+                view.paste(large.clone(), cx);
+
+                let mut chunks = Vec::new();
+                while let Ok(chunk) = written.try_recv() {
+                    assert!(std::str::from_utf8(&chunk).is_ok());
+                    chunks.push(chunk);
+                }
+                assert!(chunks.len() >= 2);
+                let combined: Vec<u8> = chunks.into_iter().flatten().collect();
+                assert_eq!(combined, format!("\x1b[200~{large}\x1b[201~").into_bytes());
+
+                // Oversized paste is rejected with a notice and writes nothing.
+                let oversized = "a".repeat(MAX_TERMINAL_PASTE_BYTES + 1);
+                view.paste(oversized, cx);
+                assert!(written.try_recv().is_err());
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(notices.borrow().len(), 1);
+        drop(view);
+    }
+
+    #[gpui::test]
+    fn edit_menu_actions_copy_paste_and_select_all_when_terminal_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::theme::init);
+
+        struct Harness {
+            terminal: gpui::Entity<TerminalView>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.terminal.clone())
+            }
+        }
+
+        let (sender, written) = unbounded();
+        let (harness, cx) = cx.add_window_view(|_, cx| {
+            let dirty = Arc::new(AtomicBool::new(false));
+            let (ui_tx, ui_events) = unbounded();
+            let window_size = Arc::new(Mutex::new(WindowSize {
+                num_cols: 40,
+                num_lines: 8,
+                cell_width: 8,
+                cell_height: 18,
+            }));
+            let reply_colors = TerminalReplyColors::new(Theme::dark());
+            let proxy = TerminalEventProxy {
+                replaying: Arc::new(AtomicBool::new(false)),
+                dirty: dirty.clone(),
+                sender: Arc::new(OnceLock::new()),
+                ui_events: ui_tx,
+                wake: None,
+                window_size: window_size.clone(),
+                reply_colors: reply_colors.clone(),
+            };
+            let terminal = cx.new(|cx| TerminalView {
+                session: Some(TerminalSession {
+                    term: Arc::new(FairMutex::new(Term::new(
+                        Config::default(),
+                        &TerminalDimensions {
+                            columns: 40,
+                            rows: 8,
+                        },
+                        proxy,
+                    ))),
+                    sender: PtyInput::Test(sender),
+                    dirty,
+                    snapshot_dirty: AtomicBool::new(true),
+                    cached_snapshot: Mutex::new(None),
+                    ui_events,
+                    window_size,
+                    grid_size: (40, 8),
+                    reply_colors,
+                    url_regex: RegexSearch::new(TERMINAL_LINK_REGEX).unwrap(),
+                }),
+                launcher: TerminalLauncher::Local,
+                remote_closed: Arc::new(AtomicBool::new(false)),
+                fallback_cwd: None,
+                persistent_id: uuid::Uuid::new_v4(),
+                error: None,
+                focus_handle: cx.focus_handle(),
+                working_directory: PathBuf::new(),
+                title: String::new(),
+                custom_title: false,
+                exited: false,
+                reconnecting: false,
+                scroll_accumulator: 0.0,
+                panel_width: 320.0,
+                panel_height: Some(160.0),
+                measured_cell_width: Some(8.0),
+                scrollbar_state: ScrollbarState::new(),
+                grid_bounds: Rc::new(Cell::new(None)),
+                cursor_position: None,
+                composition: None,
+                selecting: false,
+                mouse_reported_cell: None,
+                mouse_motion_cell: None,
+                hovered_link: None,
+                kitty_reported_keys: HashSet::new(),
+                cursor_blink: cx.new(|_| TerminalCursorBlink::new()),
+                cursor_focus_tracking_started: false,
+                focused: false,
+                needs_attention: false,
+                context_menu: ContextMenuHandle::new(cx),
+                bottom_panel_tabs: false,
+                can_split: false,
+                _subscriptions: Vec::new(),
+            });
+            Harness { terminal }
+        });
+
+        let terminal = cx.read_entity(&harness, |harness, _| harness.terminal.clone());
+        cx.update(|window, cx| {
+            let focus = terminal.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+            let _ = window.draw(cx);
+
+            assert!(window.is_action_available(&crate::input::Copy, cx));
+            assert!(window.is_action_available(&crate::input::Paste, cx));
+            assert!(window.is_action_available(&crate::input::SelectAll, cx));
+
+            cx.write_to_clipboard(ClipboardItem::new_string("menu-paste".to_string()));
+            window.dispatch_action(Box::new(crate::input::Paste), cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            assert_eq!(written.try_recv().unwrap(), b"menu-paste");
+
+            terminal.update(cx, |view, _| {
+                let session = view.session.as_ref().unwrap();
+                let mut term = session.term.lock();
+                let mut parser: alacritty_terminal::vte::ansi::Processor =
+                    alacritty_terminal::vte::ansi::Processor::new();
+                parser.advance(&mut *term, b"hello-terminal");
+            });
+            window.dispatch_action(Box::new(crate::input::SelectAll), cx);
+            window.dispatch_action(Box::new(crate::input::Copy), cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert_eq!(copied.as_deref().map(str::trim_end), Some("hello-terminal"));
+        });
     }
 
     #[test]

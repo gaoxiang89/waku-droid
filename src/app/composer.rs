@@ -4850,7 +4850,7 @@ const MAX_ATTACHMENT_BYTES: u64 = waku_client::attachments::MAX_ATTACHMENT_BYTES
 /// Reads a client-local drop into an upload payload. This is the explicit
 /// client/daemon boundary: none of these source paths are persisted or handed
 /// to a provider.
-fn attachment_upload_from_path(
+pub(crate) fn attachment_upload_from_path(
     source: &Path,
 ) -> anyhow::Result<(
     String,

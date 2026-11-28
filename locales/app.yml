@@ -1449,7 +1449,9 @@ terminal.starting:
 terminal.paste_image_failed:
   en: "Could not paste the image: %{error}"
 terminal.paste_files_skipped:
-  en: "Only images can be pasted into a remote terminal. Files skipped: %{count}"
+  en: "Could not upload some items to the remote terminal. Skipped: %{count}"
+terminal.paste_too_large:
+  en: "Clipboard text is too large to paste into the terminal (16 MB limit)"
 
 project.add_project:
   en: Add project
