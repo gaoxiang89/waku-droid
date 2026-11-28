@@ -534,7 +534,7 @@ impl Waku {
         key: impl Into<String>,
         cx: &mut App,
     ) -> FocusHandle {
-        self.transcript_control_focuses
+        self.view.transcript_control_focuses
             .borrow_mut()
             .entry(key.into())
             .or_insert_with(|| cx.focus_handle())
@@ -590,22 +590,22 @@ impl Waku {
         // frame of the drag — and hand back the same question a wheel scroll
         // asks when the thumb is let go: did the reader come to rest on the
         // tail?
-        let scrollbar_dragging = self.transcript_scrollbar.is_grabbed();
+        let scrollbar_dragging = self.view.transcript_scrollbar.is_grabbed();
         if self
-            .transcript_scrollbar_dragging
+            .view.transcript_scrollbar_dragging
             .replace(scrollbar_dragging)
             != scrollbar_dragging
         {
             if scrollbar_dragging {
-                self.transcript_anchor_following.set(false);
-                self.transcript_is_scrolled.set(true);
-                self.transcript_tail_recheck.set(false);
+                self.view.transcript_anchor_following.set(false);
+                self.view.transcript_is_scrolled.set(true);
+                self.view.transcript_tail_recheck.set(false);
             } else {
-                self.transcript_tail_recheck.set(true);
+                self.view.transcript_tail_recheck.set(true);
             }
         }
         let anchor_end_space = self.update_transcript_anchor_end_space(window);
-        if self.transcript_anchor_following.get()
+        if self.view.transcript_anchor_following.get()
             && anchor_end_space <= Pixels::ZERO
             && self
                 .selected_transcript_anchor_row()
@@ -615,7 +615,7 @@ impl Waku {
                 item_ix: transcript_rows.item_count(),
                 offset_in_item: Pixels::ZERO,
             });
-            self.transcript_is_scrolled.set(false);
+            self.view.transcript_is_scrolled.set(false);
         }
         let entity = cx.entity().downgrade();
         let scrollbar_handle = transcript_rows.clone();
@@ -635,25 +635,25 @@ impl Waku {
         // the reader is stranded mid-stream after a round trip up and back —
         // watching the reply grow past the bottom edge with no way but the
         // button to rejoin it.
-        if self.transcript_tail_recheck.get()
+        if self.view.transcript_tail_recheck.get()
             && let Some(rests_at_tail) =
                 transcript_rests_at_tail(viewport_bottom, tail_bottom, anchor_end_space)
         {
-            self.transcript_tail_recheck.set(false);
+            self.view.transcript_tail_recheck.set(false);
             if rests_at_tail {
                 self.pin_transcript_to_tail();
             }
         }
         let scroll_to_bottom_visible = should_show_scroll_to_bottom(
-            self.transcript_is_scrolled.get(),
-            self.transcript_anchor_following.get(),
+            self.view.transcript_is_scrolled.get(),
+            self.view.transcript_anchor_following.get(),
             transcript_scrollable,
             viewport_bottom,
             tail_bottom,
             anchor_end_space,
         )
-        .unwrap_or_else(|| self.transcript_scroll_to_bottom_visible.get());
-        self.transcript_scroll_to_bottom_visible
+        .unwrap_or_else(|| self.view.transcript_scroll_to_bottom_visible.get());
+        self.view.transcript_scroll_to_bottom_visible
             .set(scroll_to_bottom_visible);
         let scroll_to_bottom = scroll_to_bottom_visible.then(|| {
             let theme = Theme::current(cx);
@@ -714,7 +714,7 @@ impl Waku {
             let active_turn = active_navigation_turn_index(
                 &turn_rows,
                 scroll_top_row,
-                !self.transcript_is_scrolled.get(),
+                !self.view.transcript_is_scrolled.get(),
             )
             .map(|index| navigation_turns[index].message_id);
             let navigation_rail_snapshot = ConversationNavigationRailSnapshot {
@@ -722,15 +722,15 @@ impl Waku {
                 turns: navigation_turns,
                 viewport_height: f32::from(viewport_size.height),
                 active_turn,
-                reset_generation: self.navigation_rail_reset_generation.get(),
+                reset_generation: self.view.navigation_rail_reset_generation.get(),
                 theme_is_dark: Theme::current(cx).is_dark,
             };
-            if self.navigation_rail.read(cx).snapshot != navigation_rail_snapshot {
-                self.navigation_rail.update(cx, |rail, cx| {
+            if self.view.navigation_rail.read(cx).snapshot != navigation_rail_snapshot {
+                self.view.navigation_rail.update(cx, |rail, cx| {
                     rail.set_snapshot(navigation_rail_snapshot, cx)
                 });
             }
-            self.navigation_rail.clone().cached(
+            self.view.navigation_rail.clone().cached(
                 StyleRefinement::default()
                     .absolute()
                     .top_0()
@@ -738,7 +738,7 @@ impl Waku {
                     .size_full(),
             )
         });
-        let transcript_focus = self.transcript_focus.clone();
+        let transcript_focus = self.view.transcript_focus.clone();
         div()
             .flex_1()
             .min_h_0()
@@ -749,12 +749,12 @@ impl Waku {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
-                    window.focus(&this.transcript_focus, cx);
+                    window.focus(&this.view.transcript_focus, cx);
                 }),
             )
             // Painted before any row, so the frame's selection registry holds
             // exactly the text elements this frame put on screen, in order.
-            .child(md::render::frame_reset(self.transcript_selection.clone()))
+            .child(md::render::frame_reset(self.view.transcript_selection.clone()))
             .child(
                 list(transcript_rows, move |index, window, cx| {
                     entity
@@ -776,7 +776,7 @@ impl Waku {
             .children(scroll_to_bottom)
             .child(scrollbar::vertical(
                 &scrollbar_handle,
-                &self.transcript_scrollbar,
+                &self.view.transcript_scrollbar,
             ))
             .child(self.transcript_selection_input())
             .children(search_bar)
@@ -797,10 +797,10 @@ impl Waku {
     /// against the viewport as that row grows. The flag alone only re-pins in
     /// the phase where the anchor's end space has already collapsed to zero.
     fn pin_transcript_to_tail(&self) {
-        self.transcript_anchor_following
-            .set(self.transcript_anchor.get().is_some());
+        self.view.transcript_anchor_following
+            .set(self.view.transcript_anchor.get().is_some());
         self.active_transcript_rows().scroll_to_end();
-        self.transcript_is_scrolled.set(false);
+        self.view.transcript_is_scrolled.set(false);
     }
 
     /// Copy the transcript's text selection.
@@ -856,7 +856,7 @@ impl Waku {
                     })
                     .flatten()
             })
-            .or_else(|| self.transcript_selection.selection.borrow().selected_text());
+            .or_else(|| self.view.transcript_selection.selection.borrow().selected_text());
         match selected {
             Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             None => cx.propagate(),
@@ -867,7 +867,7 @@ impl Waku {
     /// One set for the whole transcript: the registry already knows every
     /// painted element's geometry, so per-element listeners would be redundant.
     fn transcript_selection_input(&self) -> impl IntoElement {
-        let selection = self.transcript_selection.clone();
+        let selection = self.view.transcript_selection.clone();
         canvas(
             |_, _, _| (),
             move |_, _, window, _| md::render::install_selection_input(window, &selection),
@@ -1439,12 +1439,12 @@ impl Waku {
             return;
         };
 
-        self.transcript_anchor_following.set(false);
+        self.view.transcript_anchor_following.set(false);
         self.active_transcript_rows().scroll_to(ListOffset {
             item_ix: row_index,
             offset_in_item: Pixels::ZERO,
         });
-        self.transcript_is_scrolled.set(true);
+        self.view.transcript_is_scrolled.set(true);
         cx.notify();
     }
 
@@ -1476,13 +1476,13 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.toggle_block_disclosure(block_index, cx, |this| {
-            this.activities_expanded.insert(block_index, !current);
+            this.view.activities_expanded.insert(block_index, !current);
         });
     }
 
     fn unfold_activity_run(&mut self, block_index: usize, run_start: Uuid, cx: &mut Context<Self>) {
         self.toggle_block_disclosure(block_index, cx, |this| {
-            this.unfolded_activity_runs.insert(run_start);
+            this.view.unfolded_activity_runs.insert(run_start);
         });
     }
 
@@ -1495,13 +1495,13 @@ impl Waku {
             return;
         };
         self.toggle_block_disclosure(block_index, cx, |this| {
-            this.expanded_activity_items.insert(id, !current);
+            this.view.expanded_activity_items.insert(id, !current);
             if current {
                 // Collapsed: the rows would only be rebuilt from the same
                 // changes if it reopens, so do not keep them alive for every
                 // edit the session ever made.
-                this.activity_diffs.borrow_mut().remove(&id);
-                this.activity_diff_viewports.borrow_mut().remove(&id);
+                this.view.activity_diffs.borrow_mut().remove(&id);
+                this.view.activity_diff_viewports.borrow_mut().remove(&id);
             }
         });
     }
@@ -1555,11 +1555,11 @@ impl Waku {
     /// Diff rows for an expanded file-change activity, built on first sight and
     /// held until the activity collapses or its changes are replaced.
     fn activity_diff_rows(&self, activity: &ActivityItem) -> Rc<activity_diff::Diff> {
-        if let Some(diff) = self.activity_diffs.borrow().get(&activity.id) {
+        if let Some(diff) = self.view.activity_diffs.borrow().get(&activity.id) {
             return diff.clone();
         }
         let diff = Rc::new(activity_diff::build(activity));
-        self.activity_diffs
+        self.view.activity_diffs
             .borrow_mut()
             .insert(activity.id, diff.clone());
         diff
@@ -1573,17 +1573,17 @@ impl Waku {
     ) {
         self.pin_transcript_for_disclosure();
         let scroll_top = self.active_transcript_rows().logical_scroll_top();
-        let previous_kinds = self.transcript_row_kinds.borrow().clone();
+        let previous_kinds = self.view.transcript_row_kinds.borrow().clone();
         let anchor_kind = previous_kinds.get(scroll_top.item_ix).copied();
         if expanded {
-            self.expanded_turns.remove(&turn_id);
+            self.view.expanded_turns.remove(&turn_id);
         } else {
-            self.expanded_turns.insert(turn_id);
+            self.view.expanded_turns.insert(turn_id);
         }
-        self.transcript_anchor_following.set(false);
+        self.view.transcript_anchor_following.set(false);
         self.splice_transcript_rows_after_visibility_change(&previous_kinds);
 
-        let next_kinds = self.transcript_row_kinds.borrow();
+        let next_kinds = self.view.transcript_row_kinds.borrow();
         let anchored_target =
             anchor_kind.and_then(|kind| next_kinds.iter().position(|candidate| *candidate == kind));
         let target = anchored_target.or_else(|| {
@@ -1601,7 +1601,7 @@ impl Waku {
                     Pixels::ZERO
                 },
             });
-            self.transcript_is_scrolled.set(true);
+            self.view.transcript_is_scrolled.set(true);
         }
         cx.notify();
     }
@@ -1673,7 +1673,7 @@ impl Waku {
             return;
         };
         let generation = self.checkpoint_ref_generation.get();
-        if self.checkpoint_ref_prefetch.get() == Some((session.id, generation)) {
+        if self.view.checkpoint_ref_prefetch.get() == Some((session.id, generation)) {
             return;
         }
         let Some(project_path) = self
@@ -1688,7 +1688,7 @@ impl Waku {
             .iter()
             .map(|turn| turn.turn_count.saturating_sub(1))
             .collect::<Vec<_>>();
-        self.checkpoint_ref_prefetch
+        self.view.checkpoint_ref_prefetch
             .set(Some((session_id, generation)));
         let workspace =
             waku_client::WorkspaceClient::for_daemon(self.daemon_for_session(session_id).clone());
@@ -1759,7 +1759,7 @@ impl Waku {
         metrics: MarkdownMetrics,
         animate_streaming: bool,
     ) -> MarkdownCtx<'a> {
-        let ctx = MarkdownCtx::new(row, palette, metrics, self.transcript_selection.clone())
+        let ctx = MarkdownCtx::new(row, palette, metrics, self.view.transcript_selection.clone())
             .with_math_enabled(self.state.render_math)
             .with_link_handler(self.markdown_link_handler.clone())
             .with_streaming_animation(animate_streaming);
@@ -1797,10 +1797,10 @@ impl Waku {
         extra: impl Fn(bool, &mut Window, &mut App) + 'static,
     ) -> ContextMenuHandle {
         let id = id.into();
-        if let Some(handle) = self.menus.borrow().get(&id) {
+        if let Some(handle) = self.view.menus.borrow().get(&id) {
             return handle.clone();
         }
-        let composer = self.composer.clone();
+        let composer = self.view.composer.clone();
         let handle = ContextMenuHandle::new(cx)
             .on_toggle(move |open, window, cx| {
                 composer.update(cx, |composer, cx| {
@@ -1812,7 +1812,7 @@ impl Waku {
                 });
             })
             .on_toggle(extra);
-        self.menus.borrow_mut().insert(id, handle.clone());
+        self.view.menus.borrow_mut().insert(id, handle.clone());
         handle
     }
 
@@ -1824,14 +1824,14 @@ impl Waku {
     ) -> AnyElement {
         let theme = Theme::current(cx);
         let palette = MarkdownPalette::from_theme(&theme);
-        let composer = self.composer.clone();
+        let composer = self.view.composer.clone();
         let waku = cx.entity().downgrade();
         // Both from the cache `sync_transcript_rows` refreshed at the top of
         // this frame. Recomputing the row list here would rebuild the whole
         // transcript's row kinds — several allocations proportional to the
         // session — once for every visible row, every frame.
         let (row_count, kind) = {
-            let kinds = self.transcript_row_kinds.borrow();
+            let kinds = self.view.transcript_row_kinds.borrow();
             let kind = kinds
                 .get(index)
                 .copied()
@@ -1866,7 +1866,7 @@ impl Waku {
                         self.assistant_message_action_for_message(message_index);
                     let user_message_action = self.user_message_action_for_message(message_index);
                     let message_edit_input = user_message_action.and_then(|action| {
-                        self.message_edit
+                        self.view.message_edit
                             .as_ref()
                             .filter(|edit| {
                                 edit.session_id == action.session_id
@@ -1903,7 +1903,7 @@ impl Waku {
                     let attachments_can_reveal = !self.selected_daemon().is_remote();
                     let menu = self.menu_handle(format!("message-{}", message.id), cx);
                     let user_message_viewport = (message.role == MessageRole::User).then(|| {
-                        self.user_message_viewports
+                        self.view.user_message_viewports
                             .borrow_mut()
                             .entry(message.id)
                             .or_default()
@@ -1928,7 +1928,7 @@ impl Waku {
                         ctx = ctx.with_search_highlights(highlights);
                     }
                     let user_message_expanded = message.role == MessageRole::User
-                        && self.expanded_user_messages.contains(&message.id);
+                        && self.view.expanded_user_messages.contains(&message.id);
                     let user_message_expand_focus = (message.role == MessageRole::User
                         && user_message_is_collapsible(message.visible_content()))
                     .then(|| {
@@ -1940,7 +1940,7 @@ impl Waku {
                     // Human and assistant messages share the Markdown path.
                     // Parse only visible rows rather than doing work for every
                     // driver delta or every off-screen prompt.
-                    let mut markdown = self.message_markdown.borrow_mut();
+                    let mut markdown = self.view.message_markdown.borrow_mut();
                     let view = matches!(message.role, MessageRole::User | MessageRole::Assistant)
                         .then(|| {
                             let view = markdown.entry(message.id).or_default();
@@ -2044,13 +2044,13 @@ impl Waku {
         if let Some(turn_id) = response_turn_id {
             let hover_target = (turn_id, kind);
             row = row.on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                let previous = this.hovered_response_row;
+                let previous = this.view.hovered_response_row;
                 if *hovering {
-                    this.hovered_response_row = Some(hover_target);
+                    this.view.hovered_response_row = Some(hover_target);
                 } else if previous == Some(hover_target) {
-                    this.hovered_response_row = None;
+                    this.view.hovered_response_row = None;
                 }
-                if this.hovered_response_row != previous {
+                if this.view.hovered_response_row != previous {
                     cx.notify();
                 }
             }));
@@ -2082,7 +2082,7 @@ impl Waku {
         let footer_focus =
             self.message_footer_focus(message.id, action.is_some(), false, window, cx);
         let force_visible = self
-            .hovered_response_row
+            .view.hovered_response_row
             .is_some_and(|(hovered_turn_id, _)| hovered_turn_id == turn_id);
         let group_name = SharedString::from(format!("assistant-response-footer-{turn_id}"));
         let mut column = div()
@@ -2121,9 +2121,9 @@ impl Waku {
     ) {
         self.pin_transcript_for_disclosure();
         if expanded {
-            self.expanded_changed_files.remove(&turn_id);
+            self.view.expanded_changed_files.remove(&turn_id);
         } else {
-            self.expanded_changed_files.insert(turn_id);
+            self.view.expanded_changed_files.insert(turn_id);
         }
         self.remeasure_changed_files(turn_id);
         cx.notify();
@@ -2138,9 +2138,9 @@ impl Waku {
     ) {
         self.pin_transcript_for_disclosure();
         if expanded {
-            self.expanded_user_messages.remove(&message_id);
+            self.view.expanded_user_messages.remove(&message_id);
         } else {
-            self.expanded_user_messages.insert(message_id);
+            self.view.expanded_user_messages.insert(message_id);
         }
         self.remeasure_transcript_message(message_index);
         cx.notify();
@@ -2168,7 +2168,7 @@ impl Waku {
         let files = checkpoint.files.as_slice();
         let additions = checkpoint.additions;
         let deletions = checkpoint.deletions;
-        let expanded = self.expanded_changed_files.contains(&turn_id);
+        let expanded = self.view.expanded_changed_files.contains(&turn_id);
         let visible_limit = if expanded {
             CHANGED_FILES_EXPANDED_LIMIT
         } else {
@@ -2413,7 +2413,7 @@ impl Waku {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let expanded = self.expanded_turns.contains(&turn_id);
+        let expanded = self.view.expanded_turns.contains(&turn_id);
         let focus = self.transcript_control_focus(format!("turn-fold-{turn_id}"), cx);
         let label = self
             .selected_session()
@@ -2586,7 +2586,7 @@ impl Waku {
         // group the running turn produced stays open; the settled turn
         // folds once, into its turn divider.
         let expanded = self
-            .activities_expanded
+            .view.activities_expanded
             .get(&block_index)
             .copied()
             .unwrap_or(live_turn_block);
@@ -2693,7 +2693,7 @@ impl Waku {
                     .map_or(activities.len(), |offset| start + offset);
                 let run_start = activities[start].id;
                 if end - start > LIVE_ACTIVITY_RUN_TAIL
-                    && !self.unfolded_activity_runs.contains(&run_start)
+                    && !self.view.unfolded_activity_runs.contains(&run_start)
                 {
                     let visible_from = end - LIVE_ACTIVITY_RUN_TAIL;
                     hidden[start..visible_from].fill(true);
@@ -2823,7 +2823,7 @@ impl Waku {
             let has_detail = !sections.is_empty() || shows_diff;
             let item_expanded = has_detail
                 && self
-                    .expanded_activity_items
+                    .view.expanded_activity_items
                     .get(&id)
                     .copied()
                     .unwrap_or(false);
@@ -3283,7 +3283,7 @@ impl Waku {
                             && section_kind == ActivityDisclosureSectionKind::Output
                         {
                             let output_viewport = self
-                                .activity_scroll_viewports
+                                .view.activity_scroll_viewports
                                 .borrow_mut()
                                 .entry(section_cache_key)
                                 .or_default()
@@ -3357,7 +3357,7 @@ impl Waku {
                                     format!("activity-math-{id}-{}", section_kind.id()),
                                     cx,
                                 ));
-                            let mut views = self.activity_markdown.borrow_mut();
+                            let mut views = self.view.activity_markdown.borrow_mut();
                             let view = views.entry(section_cache_key).or_default();
                             view.set_text(&markdown_body, false);
                             let rendered_markdown = md::render::markdown(view, &md_ctx)
@@ -3372,7 +3372,7 @@ impl Waku {
                                 });
                             drop(views);
                             let viewport = self
-                                .activity_scroll_viewports
+                                .view.activity_scroll_viewports
                                 .borrow_mut()
                                 .entry(section_cache_key)
                                 .or_default()
@@ -3422,7 +3422,7 @@ impl Waku {
                             );
                         } else {
                             let viewport = self
-                                .activity_scroll_viewports
+                                .view.activity_scroll_viewports
                                 .borrow_mut()
                                 .entry(section_cache_key)
                                 .or_default()
@@ -3554,7 +3554,7 @@ impl Waku {
         let has_content = !reasoning.content.trim().is_empty();
         let full = has_content
             && self
-                .expanded_activity_items
+                .view.expanded_activity_items
                 .get(&id)
                 .copied()
                 .unwrap_or(false);
@@ -3625,13 +3625,13 @@ impl Waku {
                 live && !cx.reduce_motion(),
             )
             .with_math_context_menu(self.menu_handle(format!("reasoning-math-{id}"), cx));
-        let mut views = self.activity_markdown.borrow_mut();
+        let mut views = self.view.activity_markdown.borrow_mut();
         let view = views.entry(id).or_default();
         if live {
             let start = self.live_reasoning_window_start(id, &reasoning.content, view);
             view.set_text(&reasoning.content[start..], true);
         } else {
-            self.reasoning_window_starts.borrow_mut().remove(&id);
+            self.view.reasoning_window_starts.borrow_mut().remove(&id);
             view.set_text(&reasoning.content, false);
         }
         let markdown = if live {
@@ -3683,7 +3683,7 @@ impl Waku {
                 REASONING_PREVIEW_HEIGHT
             };
             let viewport = self
-                .activity_scroll_viewports
+                .view.activity_scroll_viewports
                 .borrow_mut()
                 .entry(id)
                 .or_default()
@@ -3759,7 +3759,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let viewport = self
-            .activity_diff_viewports
+            .view.activity_diff_viewports
             .borrow_mut()
             .entry(id)
             .or_default()
@@ -3906,7 +3906,7 @@ impl Waku {
                 line,
                 index,
                 &format!("activity-diff-{id}"),
-                &self.transcript_selection,
+                &self.view.transcript_selection,
                 DiffRowStyle::activity(self.state.code_font_size),
                 theme,
             ),
@@ -4021,7 +4021,7 @@ impl Waku {
         content: &str,
         view: &mut MarkdownView,
     ) -> usize {
-        let mut starts = self.reasoning_window_starts.borrow_mut();
+        let mut starts = self.view.reasoning_window_starts.borrow_mut();
         let start = starts.entry(id).or_insert(0);
         let next = live_reasoning_window_anchor(*start, content);
         if next != *start {

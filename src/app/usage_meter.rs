@@ -341,7 +341,7 @@ impl Waku {
         if self.settings_page.is_some() || !self.usage_meter_available() {
             return;
         }
-        let menus = self.menus.borrow();
+        let menus = self.view.menus.borrow();
         let Some(handle) = menus.get(USAGE_METER_MENU_ID).cloned() else {
             return;
         };
@@ -437,7 +437,7 @@ impl Waku {
                     }
                     this.maybe_refresh_plan_usage(cx);
                     card_focus = this
-                        .menus
+                        .view.menus
                         .borrow()
                         .get(USAGE_METER_MENU_ID)
                         .map(|handle| handle.focus_handle().clone());
@@ -455,7 +455,7 @@ impl Waku {
             } else {
                 let mut composer_focus = None;
                 let _ = weak.update(cx, |this, cx| {
-                    composer_focus = Some(this.composer.read(cx).focus());
+                    composer_focus = Some(this.view.composer.read(cx).focus());
                     cx.notify();
                 });
                 if let Some(focus) = composer_focus {

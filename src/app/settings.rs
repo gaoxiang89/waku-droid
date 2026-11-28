@@ -3722,7 +3722,7 @@ impl Waku {
         self.state.language = language;
         crate::i18n::set_language(language);
 
-        self.composer.update(cx, |input, cx| {
+        self.view.composer.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.do_anything"), cx)
         });
         self.model_search.update(cx, |input, cx| {

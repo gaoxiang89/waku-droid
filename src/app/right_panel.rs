@@ -4547,7 +4547,7 @@ impl Waku {
     /// open. The native webview always draws over GPUI, so while this holds
     /// the live page swaps for a frozen snapshot.
     pub(super) fn any_overlay_open(&self, cx: &App) -> bool {
-        self.menus.borrow().values().any(ContextMenuHandle::is_open)
+        self.view.menus.borrow().values().any(ContextMenuHandle::is_open)
             || self.selected_runtime().is_some_and(|runtime| {
                 runtime.computer_use_previews.iter().any(|preview| {
                     preview.visible
@@ -4559,7 +4559,7 @@ impl Waku {
             || self.task_switcher.is_open()
             || self.commit_dialog.is_some()
             || self.image_preview.is_some()
-            || self.composer.read(cx).context_menu_open(cx)
+            || self.view.composer.read(cx).context_menu_open(cx)
             || self
                 .right_panel_browsers
                 .values()

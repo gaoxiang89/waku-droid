@@ -1667,7 +1667,7 @@ impl Waku {
     }
 
     pub fn composer_focus(&self, cx: &App) -> FocusHandle {
-        self.composer.read(cx).focus()
+        self.view.composer.read(cx).focus()
     }
 
     pub(super) fn selected_project(&self) -> Option<&Project> {
@@ -2381,7 +2381,7 @@ impl Waku {
                         waku.sync_transcript_rows();
                     }
                     let previous_kinds = if selected {
-                        waku.transcript_row_kinds.borrow().clone()
+                        waku.view.transcript_row_kinds.borrow().clone()
                     } else {
                         Vec::new()
                     };
@@ -2658,7 +2658,7 @@ impl Waku {
         prompt: String,
         cx: &mut Context<Self>,
     ) {
-        let composer = self.composer.clone();
+        let composer = self.view.composer.clone();
         cx.spawn(async move |waku, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1))
@@ -2744,7 +2744,7 @@ impl Waku {
             },
         )
         .detach();
-        self.message_edit = Some(MessageEdit {
+        self.view.message_edit = Some(MessageEdit {
             session_id,
             message_id,
             turn_count,
@@ -2760,13 +2760,13 @@ impl Waku {
 
     pub(super) fn cancel_message_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
-            .message_edit
+            .view.message_edit
             .as_ref()
             .is_some_and(|edit| self.submission_preparations.contains(&edit.session_id))
         {
             return;
         }
-        let Some(edit) = self.message_edit.take() else {
+        let Some(edit) = self.view.message_edit.take() else {
             return;
         };
         let message_index = self.selected_session().and_then(|session| {
@@ -2785,7 +2785,7 @@ impl Waku {
 
     pub(super) fn submit_message_edit(&mut self, cx: &mut Context<Self>) {
         let prompt = self
-            .message_edit
+            .view.message_edit
             .as_ref()
             .map(|edit| edit.input.read(cx).content(cx).to_owned())
             .unwrap_or_default();
@@ -2793,7 +2793,7 @@ impl Waku {
     }
 
     fn submit_message_edit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
-        let Some(edit) = self.message_edit.clone() else {
+        let Some(edit) = self.view.message_edit.clone() else {
             return;
         };
         if self.submission_preparations.contains(&edit.session_id) {
@@ -3001,7 +3001,7 @@ impl Waku {
             cx.notify();
             return;
         };
-        self.message_edit = None;
+        self.view.message_edit = None;
         self.submission_preparations.insert(session_id);
         self.hide_toast();
         self.remeasure_transcript_message(edited_message_index);
@@ -3058,8 +3058,8 @@ impl Waku {
                         session.status = previous_status;
                     }
                 }
-                if selected && self.message_edit.is_none() {
-                    self.message_edit = Some(edit.clone());
+                if selected && self.view.message_edit.is_none() {
+                    self.view.message_edit = Some(edit.clone());
                 }
                 if selected
                     && let Some(message_index) = self.selected_session().and_then(|session| {
@@ -3096,7 +3096,7 @@ impl Waku {
             self.sync_transcript_rows();
         }
         let previous_kinds = if selected {
-            self.transcript_row_kinds.borrow().clone()
+            self.view.transcript_row_kinds.borrow().clone()
         } else {
             Vec::new()
         };
@@ -3160,19 +3160,19 @@ impl Waku {
         self.reconcile_session_notifications(session_id);
         self.invalidate_checkpoint_refs();
         if self
-            .message_edit
+            .view.message_edit
             .as_ref()
             .is_some_and(|current| current.session_id == session_id)
         {
-            self.message_edit = None;
+            self.view.message_edit = None;
         }
         if selected {
-            self.activities_expanded.clear();
-            self.expanded_activity_items.clear();
-            self.unfolded_activity_runs.clear();
-            self.expanded_turns.clear();
-            self.expanded_changed_files.clear();
-            self.transcript_control_focuses.borrow_mut().clear();
+            self.view.activities_expanded.clear();
+            self.view.expanded_activity_items.clear();
+            self.view.unfolded_activity_runs.clear();
+            self.view.expanded_turns.clear();
+            self.view.expanded_changed_files.clear();
+            self.view.transcript_control_focuses.borrow_mut().clear();
             self.splice_transcript_rows_after_visibility_change(&previous_kinds);
             self.show_toast(match cleanup_error {
                 None => tr!("session.rewound", turn = turn_count),
@@ -4167,7 +4167,7 @@ impl Waku {
             self.sync_transcript_rows();
         }
         let previous_kinds = if selected {
-            self.transcript_row_kinds.borrow().clone()
+            self.view.transcript_row_kinds.borrow().clone()
         } else {
             Vec::new()
         };
@@ -4216,15 +4216,15 @@ impl Waku {
         };
         self.submission_preparations.insert(session_id);
         if selected {
-            self.activities_expanded.clear();
-            self.expanded_activity_items.clear();
-            self.unfolded_activity_runs.clear();
-            self.expanded_turns.clear();
-            self.expanded_changed_files.clear();
-            self.transcript_control_focuses.borrow_mut().clear();
-            self.message_edit = None;
+            self.view.activities_expanded.clear();
+            self.view.expanded_activity_items.clear();
+            self.view.unfolded_activity_runs.clear();
+            self.view.expanded_turns.clear();
+            self.view.expanded_changed_files.clear();
+            self.view.transcript_control_focuses.borrow_mut().clear();
+            self.view.message_edit = None;
             self.hide_toast();
-            self.transcript_anchor.set(transcript_anchor);
+            self.view.transcript_anchor.set(transcript_anchor);
             // Provisional reservation: the anchored list has no measured
             // bounds until its first paint, and a zero end space cannot hold
             // the sent row at the viewport top — without scroll room past the
@@ -4232,12 +4232,12 @@ impl Waku {
             // at the bottom before the first measured frame lifts it. Seed a
             // full viewport of end space instead; the overshoot is invisible
             // under the top anchor and the first measured frame trues it up.
-            let mut provisional = self.transcript_rows.viewport_bounds().size.height;
+            let mut provisional = self.view.transcript_rows.viewport_bounds().size.height;
             if provisional <= Pixels::ZERO {
-                provisional = self.anchored_transcript_rows.viewport_bounds().size.height;
+                provisional = self.view.anchored_transcript_rows.viewport_bounds().size.height;
             }
-            self.transcript_anchor_end_space.set(provisional);
-            self.transcript_anchor_following.set(true);
+            self.view.transcript_anchor_end_space.set(provisional);
+            self.view.transcript_anchor_following.set(true);
             self.splice_transcript_rows_after_visibility_change(&previous_kinds);
             self.scroll_transcript_to_anchor();
         }
@@ -4330,7 +4330,7 @@ impl Waku {
                     self.sync_transcript_rows();
                 }
                 let previous_kinds = if selected {
-                    self.transcript_row_kinds.borrow().clone()
+                    self.view.transcript_row_kinds.borrow().clone()
                 } else {
                     Vec::new()
                 };
@@ -4347,12 +4347,12 @@ impl Waku {
                 }
                 if selected {
                     if self
-                        .transcript_anchor
+                        .view.transcript_anchor
                         .get()
                         .is_some_and(|anchor| anchor.session_id == session_id)
                     {
-                        self.transcript_anchor.set(None);
-                        self.transcript_anchor_following.set(false);
+                        self.view.transcript_anchor.set(None);
+                        self.view.transcript_anchor_following.set(false);
                     }
                     self.splice_transcript_rows_after_visibility_change(&previous_kinds);
                     self.restore_composer_submission(submission, cx);

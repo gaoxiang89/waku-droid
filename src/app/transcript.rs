@@ -18,19 +18,19 @@ impl Waku {
         let fingerprint = self
             .selected_session()
             .map_or(EMPTY_TRANSCRIPT_FINGERPRINT, |session| {
-                transcript_rows_fingerprint(session, &self.expanded_turns)
+                transcript_rows_fingerprint(session, &self.view.expanded_turns)
             });
-        if self.transcript_row_kinds_fingerprint.get() != Some(fingerprint) {
+        if self.view.transcript_row_kinds_fingerprint.get() != Some(fingerprint) {
             let next_kinds = self.selected_transcript_row_kinds();
-            *self.transcript_row_kinds.borrow_mut() = next_kinds;
-            self.transcript_row_kinds_fingerprint.set(Some(fingerprint));
+            *self.view.transcript_row_kinds.borrow_mut() = next_kinds;
+            self.view.transcript_row_kinds_fingerprint.set(Some(fingerprint));
         }
-        self.transcript_row_kinds.borrow().len()
+        self.view.transcript_row_kinds.borrow().len()
     }
 
     pub(super) fn selected_transcript_row_kinds(&self) -> Vec<TranscriptRowKind> {
         self.selected_session().map_or_else(Vec::new, |session| {
-            folded_transcript_row_kinds(session, &self.expanded_turns)
+            folded_transcript_row_kinds(session, &self.view.expanded_turns)
         })
     }
 
@@ -49,12 +49,12 @@ impl Waku {
         message_index: usize,
     ) -> (Option<SharedString>, Option<u64>) {
         self.refresh_transcript_row_kinds();
-        let fingerprint = self.transcript_row_kinds_fingerprint.get();
-        if self.assistant_footer_fingerprint.get() != fingerprint {
-            self.assistant_footer_cache.borrow_mut().clear();
-            self.assistant_footer_fingerprint.set(fingerprint);
+        let fingerprint = self.view.transcript_row_kinds_fingerprint.get();
+        if self.view.assistant_footer_fingerprint.get() != fingerprint {
+            self.view.assistant_footer_cache.borrow_mut().clear();
+            self.view.assistant_footer_fingerprint.set(fingerprint);
         }
-        if let Some(cached) = self.assistant_footer_cache.borrow().get(&message_index) {
+        if let Some(cached) = self.view.assistant_footer_cache.borrow().get(&message_index) {
             return cached.clone();
         }
         let value = self.selected_session().map_or((None, None), |session| {
@@ -63,7 +63,7 @@ impl Waku {
                 assistant_response_footer_time(session, message_index),
             )
         });
-        self.assistant_footer_cache
+        self.view.assistant_footer_cache
             .borrow_mut()
             .insert(message_index, value.clone());
         value
@@ -87,7 +87,7 @@ impl Waku {
             return None;
         }
         self.ensure_assistant_turn_providers();
-        self.assistant_turn_provider_cache
+        self.view.assistant_turn_provider_cache
             .borrow()
             .get(&message_index)
             .cloned()
@@ -95,7 +95,7 @@ impl Waku {
 
     fn ensure_assistant_turn_providers(&self) {
         self.refresh_transcript_row_kinds();
-        let fingerprint = self.transcript_row_kinds_fingerprint.get().map(|row_fp| {
+        let fingerprint = self.view.transcript_row_kinds_fingerprint.get().map(|row_fp| {
             let Some(session) = self.selected_session() else {
                 return row_fp;
             };
@@ -118,17 +118,17 @@ impl Waku {
             }
             hash
         });
-        if self.assistant_turn_provider_fingerprint.get() != fingerprint {
-            let mut cache = self.assistant_turn_provider_cache.borrow_mut();
+        if self.view.assistant_turn_provider_fingerprint.get() != fingerprint {
+            let mut cache = self.view.assistant_turn_provider_cache.borrow_mut();
             if let Some(session) = self.selected_session() {
                 let host = self.hosts.ownership.session(session.id);
                 let accounts = self.provider_accounts_for(&host);
-                let row_kinds = self.transcript_row_kinds.borrow();
+                let row_kinds = self.view.transcript_row_kinds.borrow();
                 rebuild_assistant_turn_providers(session, &row_kinds, &accounts, &mut cache);
             } else {
                 cache.clear();
             }
-            self.assistant_turn_provider_fingerprint.set(fingerprint);
+            self.view.assistant_turn_provider_fingerprint.set(fingerprint);
         }
     }
 
@@ -136,15 +136,15 @@ impl Waku {
         let current = self
             .selected_session()
             .map(|session| (session.id, session.has_mixed_providers()));
-        let previous = self.transcript_mixed_providers_state.replace(current);
+        let previous = self.view.transcript_mixed_providers_state.replace(current);
         mixed_providers_transitioned(previous, current)
     }
 
     fn remeasure_all_transcript_lists(&self, next_count: usize) {
-        let previous = self.transcript_rows.item_count();
-        self.transcript_rows.splice(0..previous, next_count);
-        let anchored_previous = self.anchored_transcript_rows.item_count();
-        self.anchored_transcript_rows
+        let previous = self.view.transcript_rows.item_count();
+        self.view.transcript_rows.splice(0..previous, next_count);
+        let anchored_previous = self.view.anchored_transcript_rows.item_count();
+        self.view.anchored_transcript_rows
             .splice(0..anchored_previous, next_count);
     }
 
@@ -159,26 +159,26 @@ impl Waku {
     /// and completions, rewinds, and refolds all move the fingerprint.
     pub(super) fn navigation_turns(&self) -> Rc<Vec<TranscriptNavigationTurn>> {
         self.refresh_transcript_row_kinds();
-        let fingerprint = self.transcript_row_kinds_fingerprint.get();
-        if self.transcript_navigation_turns_fingerprint.get() != fingerprint {
+        let fingerprint = self.view.transcript_row_kinds_fingerprint.get();
+        if self.view.transcript_navigation_turns_fingerprint.get() != fingerprint {
             let turns = self
                 .selected_session()
                 .map(|session| {
-                    transcript_navigation_turns(session, &self.transcript_row_kinds.borrow())
+                    transcript_navigation_turns(session, &self.view.transcript_row_kinds.borrow())
                 })
                 .unwrap_or_default();
-            *self.transcript_navigation_turns.borrow_mut() = Rc::new(turns);
-            self.transcript_navigation_turns_fingerprint
+            *self.view.transcript_navigation_turns.borrow_mut() = Rc::new(turns);
+            self.view.transcript_navigation_turns_fingerprint
                 .set(fingerprint);
         }
-        self.transcript_navigation_turns.borrow().clone()
+        self.view.transcript_navigation_turns.borrow().clone()
     }
 
     pub(super) fn active_transcript_rows(&self) -> &ListState {
-        if self.transcript_anchor.get().is_some() {
-            &self.anchored_transcript_rows
+        if self.view.transcript_anchor.get().is_some() {
+            &self.view.anchored_transcript_rows
         } else {
-            &self.transcript_rows
+            &self.view.transcript_rows
         }
     }
 
@@ -233,22 +233,22 @@ impl Waku {
             }
         }
 
-        self.transcript_anchor_following.set(false);
-        self.transcript_is_scrolled.set(true);
+        self.view.transcript_anchor_following.set(false);
+        self.view.transcript_is_scrolled.set(true);
         // The position above is deliberate, so a wheel scroll still waiting to
         // be classified must not re-engage following on top of it.
-        self.transcript_tail_recheck.set(false);
+        self.view.transcript_tail_recheck.set(false);
     }
 
     /// Bulk-reset the transcript. Used for session/document replacement.
     pub(super) fn reset_transcript_rows(&self, count: usize) {
-        self.transcript_is_scrolled.set(false);
-        self.transcript_mixed_providers_state.set(
+        self.view.transcript_is_scrolled.set(false);
+        self.view.transcript_mixed_providers_state.set(
             self.selected_session()
                 .map(|session| (session.id, session.has_mixed_providers())),
         );
-        self.transcript_rows.reset(count);
-        self.anchored_transcript_rows.reset(count);
+        self.view.transcript_rows.reset(count);
+        self.view.anchored_transcript_rows.reset(count);
     }
 
     /// Apply a local disclosure change without replacing unchanged transcript
@@ -257,17 +257,17 @@ impl Waku {
         &self,
         previous_kinds: &[TranscriptRowKind],
     ) {
-        let previous_providers = self.assistant_turn_provider_cache.borrow().clone();
-        let had_provider_cache = self.assistant_turn_provider_fingerprint.get().is_some();
+        let previous_providers = self.view.assistant_turn_provider_cache.borrow().clone();
+        let had_provider_cache = self.view.assistant_turn_provider_fingerprint.get().is_some();
         self.ensure_assistant_turn_providers();
         if self.consume_mixed_providers_change() {
-            let next_count = self.transcript_row_kinds.borrow().len();
+            let next_count = self.view.transcript_row_kinds.borrow().len();
             self.remeasure_all_transcript_lists(next_count);
             return;
         }
-        let next_providers = self.assistant_turn_provider_cache.borrow();
+        let next_providers = self.view.assistant_turn_provider_cache.borrow();
         let splice = {
-            let next_kinds = self.transcript_row_kinds.borrow();
+            let next_kinds = self.view.transcript_row_kinds.borrow();
             if had_provider_cache {
                 transcript_row_splice_with_providers(
                     previous_kinds,
@@ -295,7 +295,7 @@ impl Waku {
             return None;
         }
         self.sync_transcript_rows();
-        Some(self.transcript_row_kinds.borrow().clone())
+        Some(self.view.transcript_row_kinds.borrow().clone())
     }
 
     /// Reconcile a visibility change against only the list on screen.
@@ -310,17 +310,17 @@ impl Waku {
         &self,
         previous_kinds: &[TranscriptRowKind],
     ) {
-        let previous_providers = self.assistant_turn_provider_cache.borrow().clone();
-        let had_provider_cache = self.assistant_turn_provider_fingerprint.get().is_some();
+        let previous_providers = self.view.assistant_turn_provider_cache.borrow().clone();
+        let had_provider_cache = self.view.assistant_turn_provider_fingerprint.get().is_some();
         self.ensure_assistant_turn_providers();
         if self.consume_mixed_providers_change() {
-            let next_count = self.transcript_row_kinds.borrow().len();
+            let next_count = self.view.transcript_row_kinds.borrow().len();
             self.remeasure_all_transcript_lists(next_count);
             return;
         }
-        let next_providers = self.assistant_turn_provider_cache.borrow();
+        let next_providers = self.view.assistant_turn_provider_cache.borrow();
         let splice = {
-            let next_kinds = self.transcript_row_kinds.borrow();
+            let next_kinds = self.view.transcript_row_kinds.borrow();
             if had_provider_cache {
                 transcript_row_splice_with_providers(
                     previous_kinds,
@@ -339,7 +339,7 @@ impl Waku {
     }
 
     pub(super) fn selected_transcript_anchor_row(&self) -> Option<usize> {
-        let anchor = self.transcript_anchor.get()?;
+        let anchor = self.view.transcript_anchor.get()?;
         let session = self.selected_session()?;
         if session.id != anchor.session_id {
             return None;
@@ -347,7 +347,7 @@ impl Waku {
         let message_index = session.messages.iter().position(|message| {
             message.role == MessageRole::User && message.turn_id == Some(anchor.turn_id)
         })?;
-        self.transcript_row_kinds
+        self.view.transcript_row_kinds
             .borrow()
             .iter()
             .position(|kind| *kind == TranscriptRowKind::Message(message_index))
@@ -361,13 +361,13 @@ impl Waku {
             item_ix,
             offset_in_item: Pixels::ZERO,
         });
-        self.transcript_is_scrolled.set(true);
+        self.view.transcript_is_scrolled.set(true);
     }
 
     pub(super) fn update_transcript_anchor_end_space(&self, window: &Window) -> Pixels {
         let Some(anchor_row) = self.selected_transcript_anchor_row() else {
-            self.transcript_anchor_end_space.set(Pixels::ZERO);
-            self.transcript_anchor_following.set(false);
+            self.view.transcript_anchor_end_space.set(Pixels::ZERO);
+            self.view.transcript_anchor_following.set(false);
             return Pixels::ZERO;
         };
 
@@ -401,16 +401,16 @@ impl Waku {
         // scroll_to is bounds-independent.
         let end_space = match anchored_tail_height {
             Some(height) => transcript_anchor_end_space(viewport_height, height),
-            None => self.transcript_anchor_end_space.get(),
+            None => self.view.transcript_anchor_end_space.get(),
         };
-        self.transcript_anchor_end_space.set(end_space);
+        self.view.transcript_anchor_end_space.set(end_space);
         if maintain_transcript_anchor(
             transcript_rows,
             anchor_row,
-            self.transcript_anchor_following.get(),
+            self.view.transcript_anchor_following.get(),
             end_space,
         ) {
-            self.transcript_is_scrolled.set(true);
+            self.view.transcript_is_scrolled.set(true);
         }
         end_space
     }
@@ -427,9 +427,9 @@ impl Waku {
         if range.is_empty() {
             return;
         }
-        self.transcript_rows.remeasure_items(range.clone());
-        if self.transcript_anchor.get().is_some() {
-            self.anchored_transcript_rows.remeasure_items(range);
+        self.view.transcript_rows.remeasure_items(range.clone());
+        if self.view.transcript_anchor.get().is_some() {
+            self.view.anchored_transcript_rows.remeasure_items(range);
         }
     }
 
@@ -438,9 +438,9 @@ impl Waku {
         let Some((range, new_count)) = splice else {
             return;
         };
-        self.transcript_rows.splice(range.clone(), new_count);
-        if self.transcript_anchor.get().is_some() {
-            self.anchored_transcript_rows.splice(range, new_count);
+        self.view.transcript_rows.splice(range.clone(), new_count);
+        if self.view.transcript_anchor.get().is_some() {
+            self.view.anchored_transcript_rows.splice(range, new_count);
         }
     }
 
@@ -450,11 +450,9 @@ impl Waku {
             - px(sidebar_width)
             - px(right_panel_width)
             - px(self.effective_files_panel_width(window));
-        if self.chat_split.is_some() {
-            column = (column - px(chat_split::CHAT_SPLIT_DIVIDER_WIDTH)) * 0.5;
-        }
+        column = px(self.chat_pane_column_width(f32::from(column), self.current_chat_pane_side()));
         let content_width = (column - px(40.0)).clamp(px(1.0), px(CONTENT_MAX_WIDTH));
-        let previous = self.transcript_layout_width.replace(content_width);
+        let previous = self.view.transcript_layout_width.replace(content_width);
         if previous > Pixels::ZERO && (previous - content_width).abs() < px(1.0) {
             return false;
         }
@@ -481,7 +479,7 @@ impl Waku {
         // has to run every time because `active_transcript_rows` can switch
         // lists under an unchanged transcript.
         self.ensure_assistant_turn_providers();
-        let count = self.transcript_row_kinds.borrow().len();
+        let count = self.view.transcript_row_kinds.borrow().len();
         if self.consume_mixed_providers_change() {
             self.remeasure_all_transcript_lists(count);
             return;
@@ -523,7 +521,7 @@ impl Waku {
     fn remeasure_transcript_row(&self, target: TranscriptRowKind) {
         self.sync_transcript_rows();
         let row = self
-            .transcript_row_kinds
+            .view.transcript_row_kinds
             .borrow()
             .iter()
             .position(|kind| *kind == target);

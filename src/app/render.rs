@@ -33,7 +33,8 @@ impl Waku {
             PanelResizeTarget::Sidebar
             | PanelResizeTarget::FileTree
             | PanelResizeTarget::FilesPanel
-            | PanelResizeTarget::GitGraphColumn => (-5.0, 10.0),
+            | PanelResizeTarget::GitGraphColumn
+            | PanelResizeTarget::ChatSplit => (-5.0, 10.0),
             // The bottom panel's edge is horizontal, so it renders its own
             // handle; this vertical bar is never built for it.
             PanelResizeTarget::BottomPanel => (-5.0, 10.0),
@@ -193,18 +194,15 @@ impl Waku {
     /// Width left for the chat column once the panels take theirs — the
     /// widths they are painted at this frame, so a transcript measured
     /// mid-slide matches the column it is laid out in.
-    fn chat_viewport_width(&self, window: &Window) -> f32 {
+    pub(super) fn chat_viewport_width(&self, window: &Window) -> f32 {
         f32::from(window.viewport_size().width)
             - self.sidebar_rendered_width
             - self.right_panel_rendered_width
             - self.effective_files_panel_width(window)
     }
 
-    pub(super) fn chat_pane_width(&self, window: &Window) -> f32 {
-        chat_split::split_chat_pane_width(
-            self.chat_viewport_width(window),
-            self.chat_split.is_some(),
-        )
+    pub(super) fn chat_pane_width(&self, window: &Window, side: chat_split::ChatPaneSide) -> f32 {
+        self.chat_pane_column_width(self.chat_viewport_width(window), side)
     }
 
     /// [`WakuPane`] delegate for the sidebar island.
@@ -243,7 +241,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let role = self.chat_role_for_side(side);
-        let pane_width = self.chat_pane_width(window);
+        let pane_width = self.chat_pane_width(window, side);
         self.with_chat_view(role, |this| {
             // The transcript's own element sizes itself with `flex_1`, which only
             // stretches inside a flex parent. A cached pane lays its content out
@@ -260,9 +258,13 @@ impl Waku {
         .unwrap_or_else(|| div().into_any_element())
     }
 
+    /// One chat pane. `width` pins the left pane of a side-by-side split;
+    /// `hidden_other` marks a split collapsed to this pane alone.
     fn render_chat_pane(
         &mut self,
         side: chat_split::ChatPaneSide,
+        width: Option<f32>,
+        hidden_other: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -320,13 +322,32 @@ impl Waku {
         }
         let mut outer = div()
             .id(side.pane_id())
-            .flex_1()
             .min_w_0()
             .min_h_0()
             .flex()
             .flex_col();
+        outer = match width {
+            Some(width) => outer.flex_none().w(px(width)),
+            None => outer.flex_1(),
+        };
         if split {
-            outer = outer.child(self.render_chat_pane_header(side, focused, title, cx));
+            let hidden_other_title = hidden_other
+                .then(|| {
+                    let other_session = self.chat_split.as_ref()?.session_id;
+                    self.state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == other_session)
+                        .map(sidebar::localized_session_title)
+                })
+                .flatten();
+            outer = outer.child(self.render_chat_pane_header(
+                side,
+                focused,
+                title,
+                hidden_other_title,
+                cx,
+            ));
         }
         outer.child(body).into_any_element()
     }
@@ -469,14 +490,22 @@ impl Render for Waku {
 
         self.reconcile_chat_split();
         let theme = Theme::current(cx);
-        let chat_area = if self.chat_split.is_some() {
-            div()
+        let split_focus = self.chat_split.as_ref().map(|split| split.focused_side);
+        let chat_area = match (split_focus, self.chat_split_layout(window)) {
+            (Some(_), Some((left_width, _))) => div()
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .flex()
                 .flex_row()
-                .child(self.render_chat_pane(chat_split::ChatPaneSide::Left, window, cx))
+                .child(self.render_chat_pane(
+                    chat_split::ChatPaneSide::Left,
+                    Some(left_width),
+                    false,
+                    window,
+                    cx,
+                ))
                 .child(
                     div()
                         .w(px(chat_split::CHAT_SPLIT_DIVIDER_WIDTH))
@@ -484,10 +513,37 @@ impl Render for Waku {
                         .flex_none()
                         .bg(theme.border),
                 )
-                .child(self.render_chat_pane(chat_split::ChatPaneSide::Right, window, cx))
-                .into_any_element()
-        } else {
-            self.render_chat_pane(chat_split::ChatPaneSide::Left, window, cx)
+                .child(self.render_chat_pane(
+                    chat_split::ChatPaneSide::Right,
+                    None,
+                    false,
+                    window,
+                    cx,
+                ))
+                // Last, so its hit strip sits above both panes it straddles.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(left_width))
+                        .w(px(chat_split::CHAT_SPLIT_DIVIDER_WIDTH))
+                        .child(
+                            self.render_panel_resize_handle(
+                                "chat-split-resize",
+                                PanelResizeTarget::ChatSplit,
+                                cx,
+                            )
+                            .tooltip(Tooltip::text(tr!("chat_split.resize"))),
+                        ),
+                )
+                .into_any_element(),
+            (Some(focused_side), None) => {
+                self.render_chat_pane(focused_side, None, true, window, cx)
+            }
+            (None, _) => {
+                self.render_chat_pane(chat_split::ChatPaneSide::Left, None, false, window, cx)
+            }
         };
         let computer_use = self.render_computer_use_overlay(window, cx);
         let command_palette = self.render_command_palette(window, cx);
@@ -521,6 +577,8 @@ impl Render for Waku {
             .on_action(cx.listener(Self::toggle_bottom_panel_action))
             .on_action(cx.listener(Self::toggle_bottom_panel_maximize_action))
             .on_action(cx.listener(Self::toggle_chat_split_action))
+            .on_action(cx.listener(Self::focus_left_chat_pane_action))
+            .on_action(cx.listener(Self::focus_right_chat_pane_action))
             .on_action(cx.listener(Self::toggle_files_surface_action))
             .on_action(cx.listener(Self::toggle_git_graph_surface_action))
             .on_action(cx.listener(Self::new_terminal_action))

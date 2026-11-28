@@ -61,7 +61,7 @@ impl TranscriptSearch {
 
 impl Waku {
     pub(super) fn refresh_transcript_search_localized_text(&mut self, cx: &mut Context<Self>) {
-        let Some(search) = &self.transcript_search else {
+        let Some(search) = &self.view.transcript_search else {
             return;
         };
         search
@@ -70,13 +70,13 @@ impl Waku {
     }
 
     pub(super) fn transcript_search_open(&self) -> bool {
-        self.transcript_search
+        self.view.transcript_search
             .as_ref()
             .is_some_and(|search| search.open)
     }
 
     fn ensure_transcript_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transcript_search.is_some() {
+        if self.view.transcript_search.is_some() {
             return;
         }
         let query = cx.new(|cx| TextInput::new(window, cx).placeholder(tr!("input.find")));
@@ -89,7 +89,7 @@ impl Waku {
             },
         )
         .detach();
-        self.transcript_search = Some(TranscriptSearch {
+        self.view.transcript_search = Some(TranscriptSearch {
             open: false,
             query,
             matches: Vec::new(),
@@ -112,7 +112,7 @@ impl Waku {
         }
         let previous_focus = window.focused(cx);
         let seed = self
-            .transcript_selection
+            .view.transcript_selection
             .selection
             .borrow()
             .selected_text()
@@ -120,7 +120,7 @@ impl Waku {
         self.ensure_transcript_search(window, cx);
 
         let search = self
-            .transcript_search
+            .view.transcript_search
             .as_mut()
             .expect("ensure_transcript_search just created it");
         if !search.open {
@@ -143,7 +143,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(search) = self.transcript_search.as_mut().filter(|search| search.open) else {
+        let Some(search) = self.view.transcript_search.as_mut().filter(|search| search.open) else {
             return;
         };
         search.open = false;
@@ -161,7 +161,7 @@ impl Waku {
     }
 
     pub(super) fn reset_transcript_search_for_session(&mut self) {
-        let Some(search) = self.transcript_search.as_mut() else {
+        let Some(search) = self.view.transcript_search.as_mut() else {
             return;
         };
         search.open = false;
@@ -175,13 +175,13 @@ impl Waku {
     }
 
     fn refresh_transcript_search(&mut self, cx: &mut Context<Self>) {
-        let Some(search) = self.transcript_search.as_ref().filter(|search| search.open) else {
+        let Some(search) = self.view.transcript_search.as_ref().filter(|search| search.open) else {
             return;
         };
         let query = search.query.read(cx).content().to_owned();
         self.sync_transcript_rows();
         let origin_row = self.active_transcript_rows().logical_scroll_top().item_ix;
-        let row_kinds = self.transcript_row_kinds.borrow().clone();
+        let row_kinds = self.view.transcript_row_kinds.borrow().clone();
 
         let mut matches = Vec::new();
         let mut matches_by_message = HashMap::new();
@@ -238,7 +238,7 @@ impl Waku {
                 .unwrap_or(0)
         });
         let search = self
-            .transcript_search
+            .view.transcript_search
             .as_mut()
             .expect("search remains present while it is refreshed");
         search.matches = matches;
@@ -252,7 +252,7 @@ impl Waku {
 
     pub(super) fn navigate_transcript_search(&mut self, backwards: bool, cx: &mut Context<Self>) {
         let Some(search) = self
-            .transcript_search
+            .view.transcript_search
             .as_mut()
             .filter(|search| search.open && !search.matches.is_empty())
         else {
@@ -275,7 +275,7 @@ impl Waku {
         message_index: usize,
     ) -> Option<SearchHighlights> {
         let search = self
-            .transcript_search
+            .view.transcript_search
             .as_ref()
             .filter(|search| search.open)?;
         let matches = search.matches_by_message.get(&message_index)?.clone();
@@ -300,7 +300,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = self.transcript_search.as_mut().and_then(|search| {
+        let target = self.view.transcript_search.as_mut().and_then(|search| {
             if !search.open || !search.pending_reveal {
                 return None;
             }
@@ -328,7 +328,7 @@ impl Waku {
         &self,
         target: &TranscriptSearchTarget,
     ) -> Option<Bounds<Pixels>> {
-        let registry = self.transcript_selection.registry.borrow();
+        let registry = self.view.transcript_selection.registry.borrow();
         registry
             .entries()
             .iter()
@@ -341,9 +341,9 @@ impl Waku {
     }
 
     fn detach_transcript_search_from_tail(&self) {
-        self.transcript_anchor_following.set(false);
-        self.transcript_tail_recheck.set(false);
-        self.transcript_is_scrolled.set(true);
+        self.view.transcript_anchor_following.set(false);
+        self.view.transcript_tail_recheck.set(false);
+        self.view.transcript_is_scrolled.set(true);
     }
 
     fn reveal_transcript_search_geometry(
@@ -353,7 +353,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let still_current = self.transcript_search.as_ref().is_some_and(|search| {
+        let still_current = self.view.transcript_search.as_ref().is_some_and(|search| {
             search.open
                 && search.generation == target.generation
                 && search.current == Some(target.current)
@@ -373,7 +373,7 @@ impl Waku {
 
         // Reveal inside a capped user bubble before positioning the transcript.
         // Search keeps full text geometry even when those glyphs are clipped.
-        if let Some(viewport) = self.user_message_viewports.borrow().get(&target.message_id) {
+        if let Some(viewport) = self.view.user_message_viewports.borrow().get(&target.message_id) {
             let scroll = &viewport.scroll_handle;
             let bounds = scroll.bounds();
             let margin = px(18.0);
@@ -422,7 +422,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let search = self
-            .transcript_search
+            .view.transcript_search
             .as_ref()
             .filter(|search| search.open)?;
         let theme = Theme::current(cx);

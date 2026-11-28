@@ -132,7 +132,7 @@ impl Waku {
         let theme = Theme::current(cx);
         let request_id = permission.request_id.clone();
         let detail_viewport = self
-            .activity_scroll_viewports
+            .view.activity_scroll_viewports
             .borrow_mut()
             .entry(permission_detail_viewport_id(&permission.request_id))
             .or_default()
@@ -1230,7 +1230,7 @@ impl Waku {
                         this.reveal_selected_picker_model();
                     } else {
                         this.model_picker_account.clear();
-                        let focus_handle = this.composer.read(cx).focus();
+                        let focus_handle = this.view.composer.read(cx).focus();
                         window.focus(&focus_handle, cx);
                     }
                     cx.notify();
@@ -2531,7 +2531,7 @@ impl Waku {
         if !self.stage_attachment_paths(paths.paths(), cx) {
             return;
         }
-        let focus = self.composer.read(cx).focus();
+        let focus = self.view.composer.read(cx).focus();
         window.focus(&focus, cx);
     }
 
@@ -2610,7 +2610,7 @@ impl Waku {
         reference: String,
         client_preview_image: Option<Arc<gpui::Image>>,
     ) -> bool {
-        if self.composer_attachments.iter().any(|attachment| {
+        if self.view.composer_attachments.iter().any(|attachment| {
             attachment.path == path
                 || attachment.blob_reference.as_deref() == Some(reference.as_str())
         }) {
@@ -2620,7 +2620,7 @@ impl Waku {
         if is_dir {
             append_directory_mention_separator(&mut mention);
         }
-        self.composer_attachments.push(ComposerAttachment {
+        self.view.composer_attachments.push(ComposerAttachment {
             path,
             client_preview_image,
             mention,
@@ -2760,7 +2760,7 @@ impl Waku {
         if self.model_picker_has_no_providers() {
             return None;
         }
-        for attachment in &self.composer_attachments {
+        for attachment in &self.view.composer_attachments {
             if let (Some(reference), Some(image)) = (
                 attachment.blob_reference.as_ref(),
                 attachment.client_preview_image.as_ref(),
@@ -2778,7 +2778,7 @@ impl Waku {
             }
         }
         let attachments = self
-            .composer_attachments
+            .view.composer_attachments
             .drain(..)
             .map(MessageAttachment::from)
             .collect::<Vec<_>>();
@@ -2806,7 +2806,7 @@ impl Waku {
     ) {
         let block = crate::terminal::terminal_context_block(&context);
         let (insert_at, separator) = {
-            let content = self.composer.read(cx).content(cx);
+            let content = self.view.composer.read(cx).content(cx);
             (
                 content.len(),
                 if content.trim().is_empty() {
@@ -2816,7 +2816,7 @@ impl Waku {
                 },
             )
         };
-        self.composer.update(cx, |composer, cx| {
+        self.view.composer.update(cx, |composer, cx| {
             composer.replace_range(insert_at..insert_at, &format!("{separator}{block}"), cx);
         });
         self.composer_focus_pending = true;
@@ -2934,13 +2934,13 @@ impl Waku {
             }
         };
         let prompt = prompt.to_owned();
-        if !from_autocomplete && self.composer.read(cx).content(cx).is_empty() {
+        if !from_autocomplete && self.view.composer.read(cx).content(cx).is_empty() {
             // Keyboard submission has already cleared its field. Retain the
             // editable draft and attachments until discovery succeeds.
-            self.composer
+            self.view.composer
                 .update(cx, |input, cx| input.replace_range(0..0, &prompt, cx));
         }
-        let expected_content = self.composer.read(cx).content(cx).to_owned();
+        let expected_content = self.view.composer.read(cx).content(cx).to_owned();
         let expected_session = self.state.selected_session;
         let workspace = waku_client::WorkspaceClient::for_daemon(self.selected_daemon().clone());
         let project_root = scope.workspace.clone();
@@ -2984,20 +2984,20 @@ impl Waku {
                 waku.refresh_composer_sources(cx);
                 if waku.state.selected_session != expected_session
                     || waku.selected_panel_scope().as_ref() != Some(&scope)
-                    || waku.composer.read(cx).content(cx) != expected_content
+                    || waku.view.composer.read(cx).content(cx) != expected_content
                 {
                     return;
                 }
                 if from_autocomplete {
                     if !waku.execute_local_composer_command_on_accept(&prompt, cx) {
-                        let len = waku.composer.read(cx).content(cx).len();
-                        waku.composer
+                        let len = waku.view.composer.read(cx).content(cx).len();
+                        waku.view.composer
                             .update(cx, |input, cx| input.replace_range(0..len, &prompt, cx));
                     }
                 } else if let Some(submission) =
                     waku.submission_with_attachments_inner(&prompt, steer, cx)
                 {
-                    waku.composer.update(cx, |input, cx| input.clear(cx));
+                    waku.view.composer.update(cx, |input, cx| input.clear(cx));
                     if steer {
                         waku.steer_composer_submission(submission, cx);
                     } else {
@@ -3013,7 +3013,7 @@ impl Waku {
     }
 
     fn execute_provider_model_picker(&mut self, can_choose_model: bool, cx: &mut Context<Self>) {
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         if !can_choose_model {
             self.show_toast(tr!("commands.model_unavailable"));
             cx.notify();
@@ -3032,7 +3032,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if !can_choose_model {
-            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.view.composer.update(cx, |input, cx| input.clear(cx));
             self.show_toast(tr!("commands.model_unavailable"));
             cx.notify();
             return;
@@ -3051,7 +3051,7 @@ impl Waku {
             .unwrap_or_default();
         if let Some((model_id, model_name)) = resolve_provider_model(&models, &query) {
             // Clear before applying so Edited does not repaint the old choice.
-            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.view.composer.update(cx, |input, cx| input.clear(cx));
             if self.selected_session().is_some() {
                 self.choose_agent_model(provider, session_account_id, model_id, cx);
             } else {
@@ -3076,7 +3076,7 @@ impl Waku {
     }
 
     fn execute_provider_effort_show(&mut self, provider: ProviderKind, cx: &mut Context<Self>) {
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         let summary = {
             let (model, active_effort) = match self.selected_session() {
                 Some(session) => (
@@ -3172,13 +3172,13 @@ impl Waku {
         .map(|model| model.reasoning_efforts.clone())
         .unwrap_or_default();
         if efforts.is_empty() {
-            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.view.composer.update(cx, |input, cx| input.clear(cx));
             self.show_toast(tr!("commands.effort_unsupported"));
             cx.notify();
             return;
         }
         if let Some((effort_id, effort_label)) = resolve_provider_effort(&efforts, &query) {
-            self.composer.update(cx, |input, cx| input.clear(cx));
+            self.view.composer.update(cx, |input, cx| input.clear(cx));
             if self.selected_session().is_some() {
                 self.set_reasoning_effort(effort_id, cx);
             } else {
@@ -3230,7 +3230,7 @@ impl Waku {
         account_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         self.usage_settings_host = host.clone();
         self.usage_view = UsageViewMode::Daily;
         self.refresh_plan_usage_now(&host, provider, account_id, cx);
@@ -3304,7 +3304,7 @@ impl Waku {
                 self.execute_provider_set_effort(ProviderKind::Antigravity, query, cx);
             }
             AntigravityLocalCommand::SwarmBoard => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.view.composer.update(cx, |input, cx| input.clear(cx));
                 self.open_antigravity_swarm_panel(cx);
             }
         }
@@ -3374,7 +3374,7 @@ impl Waku {
                 self.execute_provider_set_effort(ProviderKind::Droid, query, cx);
             }
             DroidLocalCommand::AutonomyShow => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.view.composer.update(cx, |input, cx| input.clear(cx));
                 let mode = self
                     .selected_session()
                     .map(|session| session.runtime_mode)
@@ -3388,7 +3388,7 @@ impl Waku {
             }
             DroidLocalCommand::SetAutonomy(query) => {
                 if let Some(mode) = crate::composer_complete::resolve_droid_autonomy_mode(&query) {
-                    self.composer.update(cx, |input, cx| input.clear(cx));
+                    self.view.composer.update(cx, |input, cx| input.clear(cx));
                     if self.selected_session().is_some() {
                         self.set_runtime_mode(mode, cx);
                     } else {
@@ -3410,7 +3410,7 @@ impl Waku {
                 }
             }
             DroidLocalCommand::NewSession => {
-                self.composer.update(cx, |input, cx| input.clear(cx));
+                self.view.composer.update(cx, |input, cx| input.clear(cx));
                 self.settings_page = None;
                 let current_project = self
                     .selected_project()
@@ -3466,7 +3466,7 @@ impl Waku {
         if !crate::composer_complete::is_resume_submission(prompt) {
             return false;
         }
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         // Submission notifications already hold this entity mutably. Dispatch
         // after that effect returns so the window action can safely re-enter
         // Waku and move focus into the Resume picker.
@@ -3540,7 +3540,7 @@ impl Waku {
                 }
             },
         }
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         cx.notify();
         true
     }
@@ -3565,7 +3565,7 @@ impl Waku {
         let enabled = next_tier != "default";
         // Clearing emits an Edited event. Apply the tier afterward so any
         // draft refresh caused by that event cannot repaint the old choice.
-        self.composer.update(cx, |input, cx| input.clear(cx));
+        self.view.composer.update(cx, |input, cx| input.clear(cx));
         self.set_service_tier(next_tier, cx);
         self.show_success_toast(tr!(if enabled {
             "commands.fast_enabled"
@@ -3580,13 +3580,13 @@ impl Waku {
         submission: ComposerSubmission,
         cx: &mut Context<Self>,
     ) {
-        self.composer_attachments = submission
+        self.view.composer_attachments = submission
             .attachments
             .into_iter()
             .map(ComposerAttachment::from)
             .collect();
         let content = submission.display_content.unwrap_or(submission.prompt);
-        self.composer
+        self.view.composer
             .update(cx, |input, cx| input.set_content(content, cx));
         self.schedule_composer_draft_save(cx);
         cx.notify();
@@ -3604,7 +3604,7 @@ impl Waku {
             .flex()
             .flex_wrap()
             .gap(px(8.0));
-        for (index, attachment) in self.composer_attachments.iter().enumerate() {
+        for (index, attachment) in self.view.composer_attachments.iter().enumerate() {
             let menu = self.menu_handle(format!("composer-attachment-{index}-menu"), cx);
             let icon_path = if attachment.is_dir {
                 "icons/folder.svg"
@@ -3740,16 +3740,16 @@ impl Waku {
                     .child(icon("icons/x.svg", 9.0, theme.text_secondary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        if index < this.composer_attachments.len() {
-                            this.composer_attachments.remove(index);
+                        if index < this.view.composer_attachments.len() {
+                            this.view.composer_attachments.remove(index);
                             this.schedule_composer_draft_save(cx);
                             cx.notify();
                         }
                     }))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            if index < this.composer_attachments.len() {
-                                this.composer_attachments.remove(index);
+                            if index < this.view.composer_attachments.len() {
+                                this.view.composer_attachments.remove(index);
                                 this.schedule_composer_draft_save(cx);
                                 cx.notify();
                             }
@@ -3990,8 +3990,8 @@ impl Waku {
             self.escape_stop_confirmation
                 .is_armed_for(EscapeStopTarget::for_session(session), Instant::now())
         });
-        let has_draft = !self.composer.read(cx).content(cx).trim().is_empty()
-            || !self.composer_attachments.is_empty();
+        let has_draft = !self.view.composer.read(cx).content(cx).trim().is_empty()
+            || !self.view.composer_attachments.is_empty();
         // With no provider to run it, a draft has nowhere to go. The button
         // reads as unavailable and the submission path refuses too, so
         // `enter` cannot slip past a disabled control.
@@ -4031,7 +4031,7 @@ impl Waku {
                 // Anchor for the bounds probe the autocomplete popup aligns to.
                 .relative()
                 .child(super::autocomplete::composer_card_bounds_probe(
-                    self.composer_autocomplete.card_bounds_cell(),
+                    self.view.composer_autocomplete.card_bounds_cell(),
                 ))
                 // Only while the popup has selectable rows: the key context
                 // routes arrows, `enter`, `tab` and `escape` here as actions,
@@ -4059,10 +4059,10 @@ impl Waku {
                         }))
                 })
                 .children(autocomplete)
-                .when(!self.composer_attachments.is_empty(), |card| {
+                .when(!self.view.composer_attachments.is_empty(), |card| {
                     card.child(self.render_composer_attachments(cx))
                 })
-                .child(div().pt(px(2.0)).child(self.composer.clone()))
+                .child(div().pt(px(2.0)).child(self.view.composer.clone()))
                 .child(
                     div()
                         .mt(px(8.0))
@@ -4159,11 +4159,11 @@ impl Waku {
                                             .tooltip(Tooltip::text(tr!("composer.queue_followup")))
                                             .on_activation(cx, |this, _, cx| {
                                                 let prompt =
-                                                    this.composer.read(cx).content(cx).to_owned();
+                                                    this.view.composer.read(cx).content(cx).to_owned();
                                                 if let Some(submission) =
                                                     this.submission_with_attachments(&prompt, cx)
                                                 {
-                                                    this.composer
+                                                    this.view.composer
                                                         .update(cx, |input, cx| input.clear(cx));
                                                     this.submit_composer_submission(submission, cx);
                                                 }
@@ -4192,11 +4192,11 @@ impl Waku {
                                         .active(|element| element.opacity(0.8))
                                         .on_activation(cx, |this, _, cx| {
                                             let prompt =
-                                                this.composer.read(cx).content(cx).to_owned();
+                                                this.view.composer.read(cx).content(cx).to_owned();
                                             if let Some(submission) =
                                                 this.submission_with_attachments(&prompt, cx)
                                             {
-                                                this.composer
+                                                this.view.composer
                                                     .update(cx, |input, cx| input.clear(cx));
                                                 this.submit_composer_submission(submission, cx);
                                             }

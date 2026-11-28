@@ -44,6 +44,10 @@ menu.toggle_bottom_panel_maximize:
   en: Maximize Bottom Panel
 menu.toggle_chat_split:
   en: Toggle Split Chat
+menu.focus_left_chat_pane:
+  en: Focus Left Chat Pane
+menu.focus_right_chat_pane:
+  en: Focus Right Chat Pane
 menu.new_terminal:
   en: New Terminal
 menu.focus_composer:
@@ -140,6 +144,8 @@ command_palette.split_chat:
   en: Split Chat
 command_palette.close_chat_split:
   en: Close Split Chat
+command_palette.focus_other_chat_pane:
+  en: Switch to Other Chat Pane
 command_palette.new_terminal:
   en: New terminal
 command_palette.toggle_files:
@@ -566,6 +572,16 @@ sidebar.pinned:
   en: Pinned
 sidebar.open_in_split:
   en: Open in Split View
+sidebar.open_in_split_shortcut:
+  en: "%{modifier}+Click"
+sidebar.split_left:
+  en: Shown in left pane
+sidebar.split_left_focused:
+  en: Shown in left pane (focused)
+sidebar.split_right:
+  en: Shown in right pane
+sidebar.split_right_focused:
+  en: Shown in right pane (focused)
 project.options:
   en: Workspace options
 project.archive:
@@ -1973,6 +1989,12 @@ chat_split.close_pane:
   en: Close Pane
 chat_split.already_new_task:
   en: Start this task first, or open another task in split view from the sidebar.
+chat_split.focus_pane:
+  en: Focus This Pane
+chat_split.switch_pane:
+  en: Switch to Hidden Pane
+chat_split.resize:
+  en: Drag to resize · Double-click to split evenly
 
 open_in.open:
   en: Open project in %{app}

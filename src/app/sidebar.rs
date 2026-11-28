@@ -2579,10 +2579,18 @@ impl Waku {
             self.pending_session_activation
                 .map(|pending| pending.session_id),
             session_id,
-        ) || self
-            .chat_split
-            .as_ref()
-            .is_some_and(|split| split.session_id == session_id);
+        );
+        // Which split pane shows this task, and whether that pane has focus.
+        let split_pane = self.chat_split.as_ref().and_then(|split| {
+            if split.session_id == session_id {
+                Some((split.focused_side.other(), false))
+            } else if self.state.selected_session == Some(session_id) {
+                Some((split.focused_side, true))
+            } else {
+                None
+            }
+        });
+        let in_unfocused_pane = split_pane.is_some_and(|(_, focused)| !focused);
         let working = matches!(
             session.status,
             SessionStatus::Connecting | SessionStatus::Working
@@ -2666,6 +2674,9 @@ impl Waku {
             .when(selected, |element| {
                 element.bg(theme.sidebar_item_background)
             })
+            .when(!selected && in_unfocused_pane, |element| {
+                element.bg(theme.sidebar_item_background.opacity(0.5))
+            })
             .hover(|element| element.bg(theme.sidebar_item_background))
             .active(|element| element.bg(theme.sidebar_item_background))
             .child(
@@ -2676,6 +2687,38 @@ impl Waku {
                     .overflow_hidden()
                     .line_height(sp(18.0))
                     .child(title)
+                    .when_some(split_pane, |element, (side, focused)| {
+                        element.child(
+                            div()
+                                .id(SharedString::from(format!("session-split-{session_id}")))
+                                .flex_none()
+                                .size(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .tooltip(Tooltip::text(tr!(match (side, focused) {
+                                    (chat_split::ChatPaneSide::Left, true) => {
+                                        "sidebar.split_left_focused"
+                                    }
+                                    (chat_split::ChatPaneSide::Left, false) => "sidebar.split_left",
+                                    (chat_split::ChatPaneSide::Right, true) => {
+                                        "sidebar.split_right_focused"
+                                    }
+                                    (chat_split::ChatPaneSide::Right, false) => {
+                                        "sidebar.split_right"
+                                    }
+                                })))
+                                .child(icon(
+                                    side.icon(),
+                                    12.0,
+                                    if focused {
+                                        theme.accent
+                                    } else {
+                                        theme.text_tertiary
+                                    },
+                                )),
+                        )
+                    })
                     .when(session.pinned, |element| {
                         element.child(
                             div()
@@ -2831,7 +2874,11 @@ impl Waku {
                                     waku.open_in_split(session_id, window, cx);
                                 });
                             })
-                            .icon("icons/split.svg"),
+                            .icon("icons/split.svg")
+                            .shortcut(tr!(
+                                "sidebar.open_in_split_shortcut",
+                                modifier = crate::platform::primary_shortcut("⌘", "Ctrl")
+                            )),
                         );
                     }
                     items.extend([

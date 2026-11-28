@@ -167,6 +167,7 @@ enum PaletteAction {
     ToggleBottomPanel,
     ToggleBottomPanelMaximize,
     ToggleChatSplit,
+    FocusOtherChatPane,
     ToggleFilesSurface,
     ToggleGitGraphSurface,
     ToggleSwarmSurface,
@@ -457,7 +458,7 @@ impl Waku {
 
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let open_menus = self
-            .menus
+            .view.menus
             .borrow()
             .values()
             .filter(|menu| menu.is_open())
@@ -794,6 +795,21 @@ impl Waku {
                 Some(crate::platform::primary_shortcut("⌘U", "Ctrl+U")),
                 PaletteAction::ToggleUsage,
                 "toggle usage limits rate quota panel",
+                next(),
+            ));
+        }
+        if let Some(other) = self
+            .chat_split
+            .as_ref()
+            .map(|split| split.focused_side.other())
+        {
+            commands.push(CommandPaletteItem::command(
+                PaletteSection::Commands,
+                tr!("command_palette.focus_other_chat_pane"),
+                other.icon(),
+                Some(other.focus_shortcut()),
+                PaletteAction::FocusOtherChatPane,
+                "focus switch other chat pane split side left right conversation 切换 窗格 分屏",
                 next(),
             ));
         }
@@ -1930,6 +1946,7 @@ impl Waku {
             PaletteAction::ToggleChatSplit => {
                 self.toggle_chat_split_action(&ToggleChatSplit, window, cx)
             }
+            PaletteAction::FocusOtherChatPane => self.focus_other_chat_pane(cx),
             PaletteAction::ToggleFilesSurface => {
                 self.toggle_files_surface_action(&ToggleFilesSurface, window, cx)
             }

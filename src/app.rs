@@ -69,7 +69,8 @@ use crate::ui::{
 };
 use crate::{
     CancelTaskSwitch, CancelTurn, CloseFind, CloseTerminalPane, CloseWindow, ConfirmTaskSwitch,
-    CopySelection, FindNext, FindPrevious, FocusComposer, FocusTerminalPaneDown,
+    CopySelection, FindNext, FindPrevious, FocusComposer, FocusLeftChatPane, FocusRightChatPane,
+    FocusTerminalPaneDown,
     FocusTerminalPaneLeft, FocusTerminalPaneRight, FocusTerminalPaneUp, NavigateBack,
     NavigateForward, NewProject, NewSession, NewTerminal, NextTerminal, OpenFind, OpenFindReplace,
     OpenResumePicker, OpenSettings, PreviousTerminal, ReplaceAllMatches, ResizeTerminalPaneDown,
@@ -283,6 +284,7 @@ enum PanelResizeTarget {
     FileTree,
     FilesPanel,
     GitGraphColumn,
+    ChatSplit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1304,7 +1306,6 @@ pub struct Waku {
     /// Cached before rendering so path labels can abbreviate the home prefix
     /// without consulting the environment or account database in a frame.
     home_directory: Option<PathBuf>,
-    composer: Entity<ComposerInput>,
     /// Free-text rows in the question form. Keyed by session, request, and
     /// question so a form that stays open keeps each field's text.
     user_input_fields: RefCell<HashMap<String, Entity<TextInput>>>,
@@ -1603,10 +1604,6 @@ pub struct Waku {
     /// Set when a driver reports its command registry mid-drain; the drain
     /// has no `Context` to rebuild the drawn index itself.
     composer_sources_stale: bool,
-    composer_autocomplete: autocomplete::AutocompleteUi,
-    /// Files dropped onto the composer, drawn as chips above the input and
-    /// drained into the next submission.
-    composer_attachments: Vec<ComposerAttachment>,
     /// Window-modal expansion of an image attachment. The path is already
     /// cached attachment metadata; render never probes the filesystem.
     image_preview: Option<image_preview::ImagePreviewState>,
@@ -1672,25 +1669,6 @@ pub struct Waku {
     pending_queue_claims: HashSet<Uuid>,
     stream_state_dirty: bool,
     last_stream_save: Instant,
-    /// User expansion overrides keyed by persisted transcript block index.
-    activities_expanded: HashMap<usize, bool>,
-    /// Per-item disclosure overrides. Reasoning starts open while live; tool
-    /// details start closed, so the stored bool must preserve either choice.
-    expanded_activity_items: HashMap<Uuid, bool>,
-    /// Tool runs in a running turn that the user unfolded past their recent
-    /// tail, keyed by the run's first activity.
-    unfolded_activity_runs: HashSet<Uuid>,
-    /// Settled turns whose folded work the user has reopened.
-    expanded_turns: HashSet<Uuid>,
-    /// Per-response file cards the user expanded beyond their three-file
-    /// preview. Runtime-only, like the other transcript disclosures.
-    expanded_changed_files: HashSet<Uuid>,
-    /// Long user messages the user expanded beyond their compact preview.
-    expanded_user_messages: HashSet<Uuid>,
-    /// Stable focus identities for controls inside virtualized transcript and
-    /// diff rows. Recreating a handle on every row build would drop keyboard
-    /// focus whenever GPUI re-renders the list.
-    transcript_control_focuses: RefCell<HashMap<String, FocusHandle>>,
     session_navigation: SessionNavigation,
     /// Sidebar task currently showing its inline rename field.
     session_rename: Option<Uuid>,
@@ -1902,11 +1880,6 @@ pub struct Waku {
     copied_message_generation: u64,
     copied_activity_feedback: HashMap<(Uuid, ActivityDisclosureSectionKind), u64>,
     copied_activity_generation: u64,
-    message_edit: Option<MessageEdit>,
-    transcript_rows: ListState,
-    /// Active turns use top alignment so row remeasurement cannot invoke the
-    /// bottom-aligned list's implicit pin and displace the sent-message anchor.
-    anchored_transcript_rows: ListState,
     /// Virtualized list backing the sidebar session history, so only visible
     /// rows are built and laid out regardless of how many sessions exist.
     sidebar_list_state: ListState,
@@ -1921,39 +1894,6 @@ pub struct Waku {
     sidebar_branch_labels: RefCell<HashMap<Uuid, SharedString>>,
     sidebar_branch_scan_fingerprint: Cell<Option<u64>>,
     sidebar_branch_scan_generation: Cell<u64>,
-    transcript_row_kinds: RefCell<Vec<TranscriptRowKind>>,
-    /// Fingerprint of the transcript inputs `transcript_row_kinds` was folded
-    /// from, so an unchanged transcript costs nothing on a frame. `None` until
-    /// the first fold. See `transcript_rows_fingerprint`.
-    transcript_row_kinds_fingerprint: Cell<Option<u64>>,
-    /// The navigation rail's turn list, shared by `Rc` so a frame hands the
-    /// rail a pointer instead of re-extracting every turn's snippets. Rebuilt
-    /// by `navigation_turns` when the row-kinds fingerprint moves.
-    transcript_navigation_turns: RefCell<Rc<Vec<TranscriptNavigationTurn>>>,
-    /// The row-kinds fingerprint `transcript_navigation_turns` was built from.
-    transcript_navigation_turns_fingerprint: Cell<Option<u64>>,
-    /// Response-footer copy content and completion time per message index,
-    /// rebuilt when the row-kinds fingerprint moves. The row builder asks for
-    /// every visible row on every frame, and the underlying turn walk and
-    /// answer join are O(session). Footers exist only for settled turns,
-    /// whose parts are immutable, and settling moves the fingerprint.
-    assistant_footer_cache: RefCell<HashMap<usize, (Option<SharedString>, Option<u64>)>>,
-    /// The row-kinds fingerprint `assistant_footer_cache` was built under.
-    assistant_footer_fingerprint: Cell<Option<u64>>,
-    /// Provider badge per visible assistant message index in a mixed-agent
-    /// session, rebuilt in one linear pass when the row-kinds fingerprint
-    /// moves so `transcript_row` stays O(1) per visible row.
-    assistant_turn_provider_cache: RefCell<HashMap<usize, TurnAgentBadge>>,
-    /// The row-kinds fingerprint `assistant_turn_provider_cache` was built under.
-    assistant_turn_provider_fingerprint: Cell<Option<u64>>,
-    /// Selected `(session_id, has_mixed_providers)` last reconciled with the
-    /// transcript `ListState`s, so flipping `false <-> true` forces a full
-    /// re-measure of rows that gained or lost their provider header.
-    transcript_mixed_providers_state: Cell<Option<(Uuid, bool)>>,
-    /// The response row currently under the pointer. Response footers are
-    /// separate virtual-list rows, so GPUI's ancestor-scoped `group_hover`
-    /// cannot reveal them when a sibling response row is hovered.
-    hovered_response_row: Option<(Uuid, TranscriptRowKind)>,
     /// Checkpoint-ref existence per (session, retained turn count), filled by
     /// `prefetch_checkpoint_refs` on the background executor. Rows read only
     /// this cache: resolving a ref forks a `git` subprocess, which must stay
@@ -1962,8 +1902,6 @@ pub struct Waku {
     /// Bumped whenever checkpoint refs may have changed. A prefetch launched
     /// under an older generation is stale and discarded on arrival.
     checkpoint_ref_generation: Cell<u64>,
-    /// The (session, generation) the latest scheduled prefetch covers.
-    checkpoint_ref_prefetch: Cell<Option<(Uuid, u64)>>,
     /// Turn checkpoints asked for but not started yet.
     ///
     /// `capture_turn` is upwards of ten `git` invocations, one of them a
@@ -1978,71 +1916,17 @@ pub struct Waku {
     /// Clock for the idle-session sweep, so the check costs one comparison per
     /// frame instead of a scan.
     last_idle_session_sweep: Instant,
-    transcript_anchor: Cell<Option<TranscriptAnchor>>,
-    transcript_anchor_end_space: Rc<Cell<Pixels>>,
-    transcript_anchor_following: Rc<Cell<bool>>,
-    /// A wheel scroll has landed and where it came to rest is not classified
-    /// yet. The first frame that can measure the tail consumes this and
-    /// re-engages following when the reader scrolled back onto it; a frame that
-    /// cannot measure the tail leaves it set, so a stream remeasure cannot
-    /// swallow the re-engage.
-    transcript_tail_recheck: Rc<Cell<bool>>,
-    transcript_is_scrolled: Rc<Cell<bool>>,
-    /// Last decided visibility of the scroll-to-tail affordance. The tail's
-    /// position is unknowable on the frames a stream commit remeasures it, and
-    /// those arrive at commit cadence — deciding "show" from that silence
-    /// strobes the button against the frames in between.
-    transcript_scroll_to_bottom_visible: Cell<bool>,
-    /// Whether the transcript's scrollbar thumb was held at the last frame, so
-    /// render can notice a drag starting and ending.
-    transcript_scrollbar_dragging: Cell<bool>,
-    transcript_layout_width: Cell<Pixels>,
-    /// Parsed markdown per assistant message, keeping each response's
-    /// incremental parse and flattened blocks alive across frames.
-    message_markdown: RefCell<HashMap<Uuid, MarkdownView>>,
-    /// Stable offsets for capped user bubbles, including across virtualized row rebuilds.
-    user_message_viewports: RefCell<HashMap<Uuid, UserMessageScrollViewport>>,
-    /// Parsed markdown for reasoning activities, keyed by stable activity id.
-    activity_markdown: RefCell<HashMap<Uuid, MarkdownView>>,
     /// Advanced by the incoming-state owner, never by animation pulses.
     activity_detail_revision: u64,
     activity_details: RefCell<HashMap<Uuid, transcript_view::ActivityDetailsEntry>>,
-    /// Byte offsets live reasoning peeks render from, slid forward as the
-    /// thought grows; see `live_reasoning_window_start`.
-    reasoning_window_starts: RefCell<HashMap<Uuid, usize>>,
-    /// Independent capped viewports for expanded thoughts and command output.
-    /// Keeping these stable preserves scroll position through virtualization.
-    activity_scroll_viewports: RefCell<HashMap<Uuid, ActivityScrollViewport>>,
-    /// Positioned, syntax-tokenized diff rows for expanded file-change
-    /// activities. Built once when the activity is expanded and dropped when it
-    /// collapses or its changes are replaced, so a frame only indexes rows.
-    activity_diffs: RefCell<HashMap<Uuid, Rc<activity_diff::Diff>>>,
-    /// Viewports for those diffs. Separate from `activity_scroll_viewports`
-    /// because a failed edit shows both its diff and the error it returned.
-    activity_diff_viewports: RefCell<HashMap<Uuid, ActivityScrollViewport>>,
     /// One allocation for every transcript markdown context to share. The
     /// callback knows about the active workspace; the renderer deliberately
     /// does not.
     markdown_link_handler: md::render::LinkHandler,
-    /// Transcript-wide text selection, spanning messages and tool output.
-    transcript_selection: TranscriptSelection,
-    /// Programmatic focus for the transcript canvas. Clicking the transcript
-    /// moves focus here so the shared find action can distinguish it from the
-    /// right-panel file editor without putting the canvas in the tab order.
-    transcript_focus: FocusHandle,
-    /// Find-in-page state for the selected transcript, created lazily on the
-    /// first primary-modifier F press.
-    transcript_search: Option<transcript_search::TranscriptSearch>,
     /// Independent selection for the transient toast message. Keeping it out
     /// of the transcript registry prevents an overlay from joining a drag to
     /// whatever happens to be painted beneath it.
     toast_selection: TranscriptSelection,
-    transcript_scrollbar: Rc<ScrollbarState>,
-    /// Every menu site in the app, keyed by a stable id. Handles are created on
-    /// first use and live as long as the window.
-    menus: RefCell<HashMap<SharedString, ContextMenuHandle>>,
-    navigation_rail: Entity<ConversationNavigationRail>,
-    navigation_rail_reset_generation: Cell<u64>,
     /// Cached islands of the root view; see [`WakuPane`].
     sidebar_pane: Entity<WakuPane>,
     transcript_pane: Entity<WakuPane>,
@@ -2050,10 +1934,18 @@ pub struct Waku {
     right_panel_pane: Entity<WakuPane>,
     files_panel_pane: Entity<WakuPane>,
     bottom_panel_pane: Entity<WakuPane>,
+    /// The focused chat pane's per-conversation state. The other pane of a
+    /// split keeps its own copy in [`chat_split::ChatSplit::view`].
+    view: chat_split::ChatViewState,
     chat_split: Option<chat_split::ChatSplit>,
     chat_view_exchanged: bool,
     pending_split_open: Option<(Uuid, chat_split::ChatViewState)>,
     chat_pane_close_focus: [FocusHandle; 2],
+    /// Keyboard stops for an unfocused pane's header, and for the switch chip
+    /// that stands in for a pane hidden by a too-narrow column.
+    chat_pane_header_focus: [FocusHandle; 2],
+    /// Share of the chat column the left pane takes while split.
+    chat_split_ratio: f32,
     /// The unix second the pending time-label wake-up targets, or `None` when
     /// none is armed. See `schedule_time_label_wake`.
     time_label_wake: Cell<Option<u64>>,
@@ -2525,7 +2417,7 @@ impl Waku {
         cx.subscribe(
             composer,
             |this: &mut Self, emitter, event: &ComposerEvent, cx| {
-                if emitter != this.composer {
+                if emitter != this.view.composer {
                     if matches!(event, ComposerEvent::Focus) {
                         this.focus_chat_pane_owning_composer(&emitter, cx);
                     }
@@ -2563,7 +2455,7 @@ impl Waku {
                         // the text field is empty. Preserve the shortcut's
                         // previous no-op behavior until that draft is sent or
                         // cleared.
-                        if this.composer_attachments.is_empty() {
+                        if this.view.composer_attachments.is_empty() {
                             this.steer_oldest_queued_message(cx);
                         }
                     }
@@ -2573,7 +2465,7 @@ impl Waku {
                     }
                     ComposerEvent::Focus => {}
                     ComposerEvent::BackspaceOnEmpty => {
-                        if this.composer_attachments.pop().is_some() {
+                        if this.view.composer_attachments.pop().is_some() {
                             this.schedule_composer_draft_save(cx);
                             cx.notify();
                         }
@@ -2589,7 +2481,7 @@ impl Waku {
         cx.subscribe(
             composer,
             |this: &mut Self, emitter, event: &ComposerAttachmentPaste, cx| {
-                if emitter != this.composer {
+                if emitter != this.view.composer {
                     return;
                 }
                 this.stage_pasted_attachments(event.0.clone(), cx);
@@ -2741,6 +2633,7 @@ impl Waku {
             FILE_TREE_MAX_WIDTH,
         );
         let bottom_panel_visible = state.bottom_panel_visible;
+        let chat_split_ratio = chat_split::sanitize_chat_split_ratio(state.chat_split_ratio);
         let sidebar_width = sanitize_panel_width(
             state.sidebar_width,
             DEFAULT_SIDEBAR_WIDTH,
@@ -2990,6 +2883,7 @@ impl Waku {
             let git_graph_load_more_focus = cx.focus_handle();
             let git_graph_copy_focus = cx.focus_handle();
             let chat_pane_close_focus = [cx.focus_handle(), cx.focus_handle()];
+            let chat_pane_header_focus = [cx.focus_handle(), cx.focus_handle()];
             let task_switcher_focus = cx.focus_handle();
             cx.on_focus_out(
                 &task_switcher_focus,
@@ -3475,7 +3369,6 @@ impl Waku {
                 state,
                 hosts,
                 home_directory,
-                composer,
                 user_input_fields: RefCell::new(HashMap::new()),
                 composer_drafts,
                 composer_draft_save_generation: 0,
@@ -3641,8 +3534,6 @@ impl Waku {
                 mention_file_index_path: None,
                 mention_file_index_loading: false,
                 composer_sources_stale: false,
-                composer_autocomplete: autocomplete::AutocompleteUi::new(),
-                composer_attachments,
                 composer_focus_pending: false,
                 image_preview: None,
                 image_preview_generation: 0,
@@ -3665,13 +3556,6 @@ impl Waku {
                 pending_queue_claims: HashSet::new(),
                 stream_state_dirty: false,
                 last_stream_save: Instant::now(),
-                activities_expanded: HashMap::new(),
-                expanded_activity_items: HashMap::new(),
-                unfolded_activity_runs: HashSet::new(),
-                expanded_turns: HashSet::new(),
-                expanded_changed_files: HashSet::new(),
-                expanded_user_messages: HashSet::new(),
-                transcript_control_focuses: RefCell::new(HashMap::new()),
                 session_navigation,
                 session_rename: None,
                 session_rename_input,
@@ -3810,9 +3694,6 @@ impl Waku {
                 copied_message_generation: 0,
                 copied_activity_feedback: HashMap::new(),
                 copied_activity_generation: 0,
-                message_edit: None,
-                transcript_rows,
-                anchored_transcript_rows,
                 sidebar_list_state,
                 sidebar_scrollbar: ScrollbarState::new(),
                 sidebar_row_cache: RefCell::new(Vec::new()),
@@ -3821,58 +3702,75 @@ impl Waku {
                 sidebar_branch_labels: RefCell::new(HashMap::new()),
                 sidebar_branch_scan_fingerprint: Cell::new(None),
                 sidebar_branch_scan_generation: Cell::new(0),
-                transcript_row_kinds: RefCell::new(Vec::new()),
-                transcript_row_kinds_fingerprint: Cell::new(None),
-                transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),
-                transcript_navigation_turns_fingerprint: Cell::new(None),
-                assistant_footer_cache: RefCell::new(HashMap::new()),
-                assistant_footer_fingerprint: Cell::new(None),
-                assistant_turn_provider_cache: RefCell::new(HashMap::new()),
-                assistant_turn_provider_fingerprint: Cell::new(None),
-                transcript_mixed_providers_state: Cell::new(None),
-                hovered_response_row: None,
                 checkpoint_ref_cache: RefCell::new(HashMap::new()),
                 checkpoint_ref_generation: Cell::new(0),
-                checkpoint_ref_prefetch: Cell::new(None),
                 pending_checkpoint_captures: interrupted_turn_checkpoints,
                 checkpoint_captures_in_flight: HashSet::new(),
                 last_idle_session_sweep: Instant::now(),
-                transcript_anchor: Cell::new(None),
-                transcript_anchor_end_space: Rc::new(Cell::new(Pixels::ZERO)),
-                transcript_anchor_following,
-                transcript_tail_recheck,
-                transcript_is_scrolled,
-                transcript_scroll_to_bottom_visible: Cell::new(false),
-                transcript_scrollbar_dragging: Cell::new(false),
-                transcript_layout_width: Cell::new(Pixels::ZERO),
-                message_markdown: RefCell::new(HashMap::new()),
-                user_message_viewports: RefCell::new(HashMap::new()),
-                activity_markdown: RefCell::new(HashMap::new()),
                 activity_detail_revision: 0,
                 activity_details: RefCell::new(HashMap::new()),
-                reasoning_window_starts: RefCell::new(HashMap::new()),
-                activity_scroll_viewports: RefCell::new(HashMap::new()),
-                activity_diffs: RefCell::new(HashMap::new()),
-                activity_diff_viewports: RefCell::new(HashMap::new()),
                 markdown_link_handler,
-                transcript_selection: TranscriptSelection::default(),
-                transcript_focus: cx.focus_handle(),
-                transcript_search: None,
                 toast_selection: TranscriptSelection::default(),
-                transcript_scrollbar: ScrollbarState::new(),
-                menus: RefCell::new(HashMap::new()),
-                navigation_rail: navigation_rail.clone(),
-                navigation_rail_reset_generation: Cell::new(0),
                 sidebar_pane: sidebar_pane.clone(),
                 transcript_pane: transcript_pane.clone(),
                 split_transcript_pane: split_transcript_pane.clone(),
                 right_panel_pane: right_panel_pane.clone(),
                 files_panel_pane: files_panel_pane.clone(),
                 bottom_panel_pane: bottom_panel_pane.clone(),
+                view: chat_split::ChatViewState {
+                    composer,
+                    composer_attachments,
+                    composer_autocomplete: autocomplete::AutocompleteUi::new(),
+                    message_edit: None,
+                    activities_expanded: HashMap::new(),
+                    expanded_activity_items: HashMap::new(),
+                    unfolded_activity_runs: HashSet::new(),
+                    expanded_turns: HashSet::new(),
+                    expanded_changed_files: HashSet::new(),
+                    expanded_user_messages: HashSet::new(),
+                    transcript_control_focuses: RefCell::new(HashMap::new()),
+                    transcript_rows,
+                    anchored_transcript_rows,
+                    transcript_row_kinds: RefCell::new(Vec::new()),
+                    transcript_row_kinds_fingerprint: Cell::new(None),
+                    transcript_navigation_turns: RefCell::new(Rc::new(Vec::new())),
+                    transcript_navigation_turns_fingerprint: Cell::new(None),
+                    assistant_footer_cache: RefCell::new(HashMap::new()),
+                    assistant_footer_fingerprint: Cell::new(None),
+                    assistant_turn_provider_cache: RefCell::new(HashMap::new()),
+                    assistant_turn_provider_fingerprint: Cell::new(None),
+                    transcript_mixed_providers_state: Cell::new(None),
+                    hovered_response_row: None,
+                    checkpoint_ref_prefetch: Cell::new(None),
+                    transcript_anchor: Cell::new(None),
+                    transcript_anchor_end_space: Rc::new(Cell::new(Pixels::ZERO)),
+                    transcript_anchor_following,
+                    transcript_tail_recheck,
+                    transcript_is_scrolled,
+                    transcript_scroll_to_bottom_visible: Cell::new(false),
+                    transcript_scrollbar_dragging: Cell::new(false),
+                    transcript_layout_width: Cell::new(Pixels::ZERO),
+                    message_markdown: RefCell::new(HashMap::new()),
+                    user_message_viewports: RefCell::new(HashMap::new()),
+                    activity_markdown: RefCell::new(HashMap::new()),
+                    reasoning_window_starts: RefCell::new(HashMap::new()),
+                    activity_scroll_viewports: RefCell::new(HashMap::new()),
+                    activity_diffs: RefCell::new(HashMap::new()),
+                    activity_diff_viewports: RefCell::new(HashMap::new()),
+                    transcript_selection: TranscriptSelection::default(),
+                    transcript_focus: cx.focus_handle(),
+                    transcript_search: None,
+                    transcript_scrollbar: ScrollbarState::new(),
+                    menus: RefCell::new(HashMap::new()),
+                    navigation_rail: navigation_rail.clone(),
+                    navigation_rail_reset_generation: Cell::new(0),
+                },
                 chat_split: None,
                 chat_view_exchanged: false,
                 pending_split_open: None,
                 chat_pane_close_focus,
+                chat_pane_header_focus,
+                chat_split_ratio,
                 time_label_wake: Cell::new(None),
                 time_label_wake_generation: Cell::new(0),
                 fps_last_frame: Instant::now(),

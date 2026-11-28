@@ -331,7 +331,7 @@ impl Waku {
             self.toggle_command_palette_action(&ToggleCommandPalette, window, cx);
         }
         let open_menus = self
-            .menus
+            .view.menus
             .borrow()
             .values()
             .filter(|menu| menu.is_open())

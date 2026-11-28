@@ -299,13 +299,13 @@ impl Waku {
     /// cross-frame state. `None` while the composer is unfocused, the token is
     /// dismissed, or there is nothing to complete.
     fn composer_trigger(&self, window: &Window, cx: &App) -> Option<Trigger> {
-        let input = self.composer.read(cx);
+        let input = self.view.composer.read(cx);
         let trigger = if input.focus().is_focused(window) {
             composer_complete::detect_trigger(input.content(cx), input.cursor(cx))
         } else {
             None
         };
-        let ui = &self.composer_autocomplete;
+        let ui = &self.view.composer_autocomplete;
         if *ui.token.borrow() != trigger {
             *ui.token.borrow_mut() = trigger.clone();
             // A different token renumbers the rows: the keyboard cursor and a
@@ -328,14 +328,14 @@ impl Waku {
             TriggerKind::File => Rc::as_ptr(&self.mention_file_index) as usize,
         };
         {
-            let memo = self.composer_autocomplete.results.borrow();
+            let memo = self.view.composer_autocomplete.results.borrow();
             if let Some(memo) = memo.as_ref().filter(|memo| {
                 memo.kind == trigger.kind && memo.query == trigger.query && memo.source == source
             }) {
                 return memo.rows.clone();
             }
         }
-        let mut matcher = self.composer_autocomplete.matcher.borrow_mut();
+        let mut matcher = self.view.composer_autocomplete.matcher.borrow_mut();
         let rows = match trigger.kind {
             TriggerKind::Command => composer_complete::filter_commands(
                 &self.slash_command_index,
@@ -355,7 +355,7 @@ impl Waku {
             .collect(),
         };
         let rows = Rc::new(rows);
-        *self.composer_autocomplete.results.borrow_mut() = Some(ResultsMemo {
+        *self.view.composer_autocomplete.results.borrow_mut() = Some(ResultsMemo {
             kind: trigger.kind,
             query: trigger.query.clone(),
             source,
@@ -374,7 +374,7 @@ impl Waku {
             return;
         };
         let rows = self.autocomplete_rows(&trigger);
-        let ui = &self.composer_autocomplete;
+        let ui = &self.view.composer_autocomplete;
         let current = ui.highlight.get().min(rows.len().saturating_sub(1));
         let Some(next) = next_picker_highlight(Some(current), rows.len(), key) else {
             return;
@@ -398,7 +398,7 @@ impl Waku {
         };
         let rows = self.autocomplete_rows(&trigger);
         let index = index.unwrap_or_else(|| {
-            self.composer_autocomplete
+            self.view.composer_autocomplete
                 .highlight
                 .get()
                 .min(rows.len().saturating_sub(1))
@@ -414,20 +414,20 @@ impl Waku {
             AutocompleteRow::File(scored) => format!("@{} ", scored.item.path),
         };
         if matches!(row, AutocompleteRow::Command(_)) {
-            let mut submission = self.composer.read(cx).content(cx).to_owned();
+            let mut submission = self.view.composer.read(cx).content(cx).to_owned();
             submission.replace_range(trigger.range.clone(), &insert);
             if self.execute_local_composer_command_on_accept(&submission, cx) {
                 return;
             }
         }
-        self.composer.update(cx, |input, cx| {
+        self.view.composer.update(cx, |input, cx| {
             input.replace_range(trigger.range.clone(), &insert, cx);
         });
         cx.notify();
     }
 
     pub(super) fn dismiss_autocomplete(&mut self, cx: &mut Context<Self>) {
-        self.composer_autocomplete.dismissed.set(true);
+        self.view.composer_autocomplete.dismissed.set(true);
         cx.notify();
     }
 
@@ -450,10 +450,10 @@ impl Waku {
         }
         // The probe records during paint, so the first frame a composer ever
         // draws has no bounds yet; the popup appears one frame later.
-        let card_bounds = self.composer_autocomplete.card_bounds.get()?;
+        let card_bounds = self.view.composer_autocomplete.card_bounds.get()?;
         let theme = Theme::current(cx);
         let highlight = self
-            .composer_autocomplete
+            .view.composer_autocomplete
             .highlight
             .get()
             .min(rows.len().saturating_sub(1));
@@ -463,7 +463,7 @@ impl Waku {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .track_scroll(&self.composer_autocomplete.scroll)
+            .track_scroll(&self.view.composer_autocomplete.scroll)
             .p(px(4.0));
         if rows.is_empty() {
             list = list.child(

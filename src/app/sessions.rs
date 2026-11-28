@@ -984,6 +984,7 @@ impl Waku {
         self.state.files_panel_visible = self.files_panel_visible;
         self.state.files_panel_width = self.files_panel_width;
         self.state.bottom_panel_height = self.bottom_panel_height;
+        self.state.chat_split_ratio = self.chat_split_ratio;
         self.save();
     }
 
@@ -1057,6 +1058,12 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if target == PanelResizeTarget::ChatSplit && event.click_count >= 2 {
+            self.panel_resize_drag = None;
+            self.reset_chat_split_ratio(cx);
+            cx.stop_propagation();
+            return;
+        }
         let (sidebar_width, right_panel_width) = self.effective_panel_widths(window);
         // A drag tracks the pointer directly; whatever slide was still
         // finishing would fight it for the same edge.
@@ -1091,6 +1098,12 @@ impl Waku {
             }
             PanelResizeTarget::GitGraphColumn => {
                 self.current_git_graph_column_width(right_panel_width)
+            }
+            PanelResizeTarget::ChatSplit => {
+                let Some((left, _)) = self.chat_split_layout(window) else {
+                    return;
+                };
+                left
             }
         };
         self.panel_resize_drag = Some(PanelResizeDrag {
@@ -1177,6 +1190,20 @@ impl Waku {
                     return;
                 }
                 self.git_graph_column_ratio = Some(next_ratio);
+            }
+            PanelResizeTarget::ChatSplit => {
+                let available =
+                    self.chat_viewport_width(window) - chat_split::CHAT_SPLIT_DIVIDER_WIDTH;
+                let minimum = chat_split::CHAT_PANE_MIN_WIDTH;
+                if available < minimum * 2.0 {
+                    return;
+                }
+                let left = (drag.start_size + delta).clamp(minimum, available - minimum);
+                let ratio = left / available;
+                if ((self.chat_split_ratio - ratio) * available).abs() < 0.5 {
+                    return;
+                }
+                self.chat_split_ratio = ratio;
             }
         }
         cx.notify();
@@ -1301,7 +1328,7 @@ impl Waku {
             cx.notify();
             return;
         }
-        if self.message_edit.is_some() {
+        if self.view.message_edit.is_some() {
             self.cancel_message_edit(window, cx);
             return;
         }
@@ -1335,17 +1362,17 @@ impl Waku {
     }
 
     pub(super) fn reset_visible_state(&mut self) {
-        self.activities_expanded.clear();
-        self.expanded_activity_items.clear();
-        self.unfolded_activity_runs.clear();
-        self.expanded_turns.clear();
-        self.expanded_changed_files.clear();
-        self.transcript_control_focuses.borrow_mut().clear();
-        self.user_message_viewports.borrow_mut().clear();
-        self.hovered_response_row = None;
+        self.view.activities_expanded.clear();
+        self.view.expanded_activity_items.clear();
+        self.view.unfolded_activity_runs.clear();
+        self.view.expanded_turns.clear();
+        self.view.expanded_changed_files.clear();
+        self.view.transcript_control_focuses.borrow_mut().clear();
+        self.view.user_message_viewports.borrow_mut().clear();
+        self.view.hovered_response_row = None;
         // Selection belongs to the session being left.
-        self.transcript_selection.selection.borrow_mut().clear();
-        self.transcript_selection.registry.borrow_mut().clear();
+        self.view.transcript_selection.selection.borrow_mut().clear();
+        self.view.transcript_selection.registry.borrow_mut().clear();
         self.reset_transcript_search_for_session();
         let (streaming_messages, live_reasoning) = self.selected_session().map_or_else(
             || (Vec::new(), Vec::new()),
@@ -1370,7 +1397,7 @@ impl Waku {
         // sessions, so they stay cached — switching back to a recent session
         // then costs no re-parse. Bounded so a long-running window cannot grow
         // without limit.
-        let mut message_markdown = self.message_markdown.borrow_mut();
+        let mut message_markdown = self.view.message_markdown.borrow_mut();
         let cached_bytes: usize = message_markdown
             .values()
             .map(md::render::MarkdownView::source_len)
@@ -1387,22 +1414,22 @@ impl Waku {
         drop(message_markdown);
         // Block parses are keyed by position within the session, so they would
         // be read as another session's blocks.
-        let mut activity_markdown = self.activity_markdown.borrow_mut();
+        let mut activity_markdown = self.view.activity_markdown.borrow_mut();
         activity_markdown.clear();
         for id in live_reasoning {
             activity_markdown.insert(id, MarkdownView::seeded());
         }
         drop(activity_markdown);
-        self.reasoning_window_starts.borrow_mut().clear();
-        self.activity_scroll_viewports.borrow_mut().clear();
-        self.menus.borrow_mut().clear();
-        self.message_edit = None;
+        self.view.reasoning_window_starts.borrow_mut().clear();
+        self.view.activity_scroll_viewports.borrow_mut().clear();
+        self.view.menus.borrow_mut().clear();
+        self.view.message_edit = None;
         self.hide_toast();
-        self.navigation_rail_reset_generation
-            .set(self.navigation_rail_reset_generation.get().wrapping_add(1));
-        self.transcript_anchor.set(None);
-        self.transcript_anchor_end_space.set(Pixels::ZERO);
-        self.transcript_anchor_following.set(false);
+        self.view.navigation_rail_reset_generation
+            .set(self.view.navigation_rail_reset_generation.get().wrapping_add(1));
+        self.view.transcript_anchor.set(None);
+        self.view.transcript_anchor_end_space.set(Pixels::ZERO);
+        self.view.transcript_anchor_following.set(false);
     }
 
     pub(super) fn reset_session_runtime(&mut self, session_id: Uuid) {
@@ -1577,7 +1604,7 @@ impl Waku {
         {
             return;
         }
-        let menus = self.menus.borrow();
+        let menus = self.view.menus.borrow();
         let Some(handle) = menus.get(MODEL_PICKER_MENU_ID).cloned() else {
             return;
         };

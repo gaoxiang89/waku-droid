@@ -93,6 +93,10 @@ fn default_bottom_panel_height() -> f32 {
     DEFAULT_BOTTOM_PANEL_HEIGHT
 }
 
+fn default_chat_split_ratio() -> f32 {
+    0.5
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RememberedModelTraits {
     provider: ProviderKind,
@@ -348,6 +352,8 @@ struct AppState {
     right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
     bottom_panel_height: f32,
+    #[serde(default = "default_chat_split_ratio")]
+    chat_split_ratio: f32,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -423,6 +429,9 @@ pub struct PersistedState {
     pub right_panel_width: f32,
     #[serde(default = "default_bottom_panel_height")]
     pub bottom_panel_height: f32,
+    /// Share of the chat column the left pane takes in a split chat.
+    #[serde(default = "default_chat_split_ratio")]
+    pub chat_split_ratio: f32,
     /// Whether markdown files in the right panel open as a rendered preview
     /// instead of source. One global mode, not per file.
     #[serde(default)]
@@ -498,6 +507,7 @@ impl PersistedState {
             deleted_project_ids: HashSet::new(),
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             bottom_panel_height: DEFAULT_BOTTOM_PANEL_HEIGHT,
+            chat_split_ratio: default_chat_split_ratio(),
             markdown_preview: false,
             window_state: None,
             computer_use_enabled: false,
@@ -658,6 +668,7 @@ impl PersistedState {
             closed_project_ids: self.closed_project_ids.clone(),
             right_panel_width: self.right_panel_width,
             bottom_panel_height: self.bottom_panel_height,
+            chat_split_ratio: self.chat_split_ratio,
             markdown_preview: self.markdown_preview,
             window_state: self.window_state,
         }
@@ -697,6 +708,7 @@ impl PersistedState {
         self.sidebar_collapsed_groups = app_state.sidebar_collapsed_groups;
         self.closed_project_ids = app_state.closed_project_ids;
         self.right_panel_width = app_state.right_panel_width;
+        self.chat_split_ratio = app_state.chat_split_ratio;
         self.bottom_panel_height = app_state.bottom_panel_height;
         self.markdown_preview = app_state.markdown_preview;
         self.window_state = app_state.window_state;
@@ -1718,6 +1730,17 @@ mod tests {
         assert!(restored.files_panel_visible);
         assert_eq!(restored.files_panel_width, 310.0);
         assert!(!restored.right_panel_visible);
+    }
+
+    #[test]
+    fn chat_split_ratio_roundtrips_and_defaults() {
+        let mut state = PersistedState::empty();
+        assert_eq!(state.chat_split_ratio, default_chat_split_ratio());
+        state.chat_split_ratio = 0.62;
+        let encoded = serde_json::to_value(state.app_state()).unwrap();
+        let mut restored = PersistedState::empty();
+        restored.apply_app_state(serde_json::from_value(encoded).unwrap());
+        assert_eq!(restored.chat_split_ratio, 0.62);
     }
 
     #[test]

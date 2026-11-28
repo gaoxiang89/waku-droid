@@ -90,6 +90,8 @@ pub enum MenuItem {
         /// A full-color raster icon — a real app icon — where `icon` would
         /// draw a tinted glyph.
         image: Option<std::sync::Arc<gpui::Image>>,
+        /// Trailing hint naming a faster way to the same action.
+        shortcut: Option<SharedString>,
         /// Draws a trailing check, for menus that present a current choice.
         selected: bool,
         /// Shown greyed and inert. Preferred over omitting the row when the
@@ -129,6 +131,7 @@ impl MenuItem {
             label: label.into(),
             icon: None,
             image: None,
+            shortcut: None,
             selected: false,
             disabled: false,
             on_click: Rc::new(on_click),
@@ -179,6 +182,13 @@ impl MenuItem {
     pub fn icon(mut self, path: &'static str) -> Self {
         if let Self::Entry { icon, .. } = &mut self {
             *icon = Some(path);
+        }
+        self
+    }
+
+    pub fn shortcut(mut self, value: impl Into<SharedString>) -> Self {
+        if let Self::Entry { shortcut, .. } = &mut self {
+            *shortcut = Some(value.into());
         }
         self
     }
@@ -1109,6 +1119,7 @@ fn render_menu_item(
             label,
             icon: item_icon,
             image,
+            shortcut,
             selected,
             disabled,
             on_click,
@@ -1134,6 +1145,15 @@ fn render_menu_item(
                 element.child(img(image).size(px(16.0)).flex_none())
             })
             .child(div().flex_1().min_w_0().truncate().child(label))
+            .when_some(shortcut, |element, shortcut| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .pl(px(12.0))
+                        .text_color(theme.text_tertiary)
+                        .child(shortcut),
+                )
+            })
             .when(selected, |element| {
                 element.child(icon("icons/check.svg", 11.0, theme.text_tertiary))
             });

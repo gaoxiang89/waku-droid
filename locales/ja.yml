@@ -22,6 +22,8 @@ menu.toggle_right_panel: 右パネルの表示を切り替える
 menu.toggle_bottom_panel: 下パネルの表示を切り替える
 menu.toggle_bottom_panel_maximize: 下パネルの最大化を切り替え
 menu.toggle_chat_split: チャットを分割表示
+menu.focus_left_chat_pane: 左のチャットペインにフォーカス
+menu.focus_right_chat_pane: 右のチャットペインにフォーカス
 menu.new_terminal: 新規ターミナル
 menu.focus_composer: 入力欄にフォーカスを移動
 menu.toggle_model_picker: モデル選択の表示を切り替える
@@ -71,6 +73,7 @@ command_palette.maximize_bottom_panel: 下パネルを最大化
 command_palette.restore_bottom_panel: 下パネルを元のサイズに戻す
 command_palette.split_chat: チャットを分割
 command_palette.close_chat_split: チャット分割を閉じる
+command_palette.focus_other_chat_pane: もう一方のチャットペインに切り替え
 command_palette.new_terminal: 新規ターミナル
 command_palette.toggle_files: ファイルパネルを切り替え
 command_palette.toggle_git_graph: Git Graph パネルを切り替え
@@ -289,6 +292,11 @@ sidebar.pin: タスクをピン留め
 sidebar.unpin: ピン留めを解除
 sidebar.pinned: ピン留め済み
 sidebar.open_in_split: 分割ビューで開く
+sidebar.open_in_split_shortcut: "%{modifier}+クリック"
+sidebar.split_left: 左ペインに表示中
+sidebar.split_left_focused: 左ペインに表示中（フォーカス中）
+sidebar.split_right: 右ペインに表示中
+sidebar.split_right_focused: 右ペインに表示中（フォーカス中）
 project.options: ワークスペースのオプション
 project.archive: ワークスペースをアーカイブ
 project.restore: ワークスペースを復元
@@ -1006,6 +1014,9 @@ bottom_panel.restore: 下パネルを元のサイズに戻す
 chat_split.toggle: チャットを分割
 chat_split.close_pane: ペインを閉じる
 chat_split.already_new_task: まずこのタスクを開始するか、サイドバーから別のタスクを分割ビューで開いてください。
+chat_split.focus_pane: このペインにフォーカス
+chat_split.switch_pane: 非表示のペインに切り替え
+chat_split.resize: ドラッグでサイズ変更・ダブルクリックで均等に分割
 
 open_in.open: "プロジェクトを %{app} で開く"
 open_in.choose: プロジェクトを開くアプリを選択…

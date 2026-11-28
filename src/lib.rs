@@ -73,6 +73,8 @@ actions!(
         ToggleBottomPanel,
         ToggleBottomPanelMaximize,
         ToggleChatSplit,
+        FocusLeftChatPane,
+        FocusRightChatPane,
         ToggleFilesSurface,
         ToggleGitGraphSurface,
         NewTerminal,
@@ -268,6 +270,8 @@ pub fn run(startup_open: Option<crate::cli::StartupOpenRequest>) {
                 // editor.
                 KeyBinding::new("secondary-j", ToggleBottomPanel, None),
                 KeyBinding::new("secondary-\\", ToggleChatSplit, Some("Waku")),
+                KeyBinding::new("secondary-alt-left", FocusLeftChatPane, Some("Waku")),
+                KeyBinding::new("secondary-alt-right", FocusRightChatPane, Some("Waku")),
                 // VS Code again: the explorer and source-control chords.
                 KeyBinding::new("secondary-shift-e", ToggleFilesSurface, None),
                 KeyBinding::new("secondary-shift-g", ToggleGitGraphSurface, None),
@@ -548,6 +552,8 @@ pub(crate) fn set_app_menus(cx: &mut App, updater_available: bool) {
                     ToggleBottomPanelMaximize,
                 ),
                 MenuItem::action(tr!("menu.toggle_chat_split"), ToggleChatSplit),
+                MenuItem::action(tr!("menu.focus_left_chat_pane"), FocusLeftChatPane),
+                MenuItem::action(tr!("menu.focus_right_chat_pane"), FocusRightChatPane),
                 MenuItem::action(tr!("menu.new_terminal"), NewTerminal),
                 MenuItem::action(tr!("menu.focus_composer"), FocusComposer),
                 MenuItem::action(tr!("menu.toggle_model_picker"), ToggleModelPicker),

@@ -236,7 +236,7 @@ impl Waku {
         {
             // The rows this activity's diff was built from are gone;
             // an expanded card rebuilds from the new ones.
-            self.activity_diffs
+            self.view.activity_diffs
                 .borrow_mut()
                 .remove(&invalidated_diff_id);
         }

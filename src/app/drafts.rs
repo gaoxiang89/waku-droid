@@ -73,9 +73,9 @@ impl Waku {
 
     fn current_composer_draft(&self, cx: &App) -> crate::persistence::ComposerDraft {
         crate::persistence::ComposerDraft {
-            text: self.composer.read(cx).content(cx).to_owned(),
+            text: self.view.composer.read(cx).content(cx).to_owned(),
             attachments: self
-                .composer_attachments
+                .view.composer_attachments
                 .iter()
                 .map(crate::persistence::ComposerDraftAttachment::from)
                 .collect(),
@@ -165,12 +165,12 @@ impl Waku {
             .and_then(|key| self.composer_drafts.get(key))
             .cloned()
             .unwrap_or_default();
-        self.composer_attachments = draft
+        self.view.composer_attachments = draft
             .attachments
             .into_iter()
             .map(ComposerAttachment::from)
             .collect();
-        self.composer
+        self.view.composer
             .update(cx, |input, cx| input.set_content(draft.text, cx));
         cx.notify();
     }
