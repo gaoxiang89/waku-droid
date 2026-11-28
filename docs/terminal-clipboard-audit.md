@@ -1,152 +1,94 @@
 # 终端剪贴板能力审核报告
 
 - **项目**：Narel（上游源码与 crate 命名仍为 `waku`）桌面端内嵌终端
-- **审核范围**：`src/terminal.rs`、`src/lib.rs`、`src/input.rs`、`src/app/bottom_panel.rs`、`src/app/right_panel.rs`、`src/app/terminal_split.rs`、`crates/waku-core/src/terminal.rs`、`crates/waku-core/src/terminal/windows.rs`、`crates/waku-core/src/terminal_state.rs`、`crates/waku-protocol/src/protocol.rs`、`Cargo.toml`
+- **审核范围**：`src/terminal.rs`、`src/lib.rs`、`src/input.rs`、`src/app.rs`、`src/app/composer.rs`、`src/app/bottom_panel.rs`、`src/app/right_panel.rs`、`src/app/terminal_split.rs`、`crates/waku-core/src/terminal.rs`、`crates/waku-core/src/terminal/windows.rs`、`crates/waku-core/src/terminal_state.rs`、`crates/waku-core/src/attachments.rs`、`crates/waku-protocol/src/protocol.rs`、`Cargo.toml`
 - **VT 引擎**：GPUI 桌面端为 `alacritty_terminal`；Web 端另用 `@wterm/ghostty`（见 `apps/web/src/components/right-panel.tsx`），移动端（iOS）另用 `libghostty`（见 `patches/expo-libghostty@0.8.1.patch`），后两者不在本报告范围内
-- **方法**：静态代码审读，未做运行时交互验证
+- **方法**：静态代码审读 + 单元测试覆盖（`terminal::tests`）；端到端图形界面与实机 SSH/WSL 交互仍待运行时验证
 - **日期**：2026-11-28
 
 ## 结论
 
-**文本剪贴板主链路完整且安全（但未接通顶栏原生 `Edit` 菜单 Action）；本地图片/文件通过“落盘 + 贴路径”绕开协议缺口，远端（SSH/WSL daemon）仅上传剪贴板图片与图片文件，非图片文件一律跳过；协议级兼容不完整——OSC 52 只写不读，未实现 Kitty 剪贴板协议（OSC 5522）。**
+**文本、图片与文件/目录剪贴板主链路已全部打通并具备安全防护：顶栏原生 `Edit` 菜单与快捷键/右键菜单全路径一致；Windows 下支持 `Ctrl+V`、`Shift+Insert`、`Ctrl+Insert`；远端终端已复用 `ImportAttachment` 支持普通文件与目录上传；bracketed paste 做了换行归一化与逃逸清洗，并对超大文本执行 16 MiB 上限与 64 KiB UTF-8 边界分块。协议层基于安全考量刻意保持 OSC 52 只写不读，暂不实现 OSC 5522。**
 
 评级：
 
 | 维度 | 评级 | 说明 |
 | --- | --- | --- |
-| 复制 | 基本完整 | 平台化快捷键、右键菜单、全选、选区入 composer 齐全；顶栏 `Edit -> Copy / Select All` 未接通 |
-| 粘贴（文本） | 基本完整 | 支持 bracketed paste 与逃逸清洗；缺顶栏 `Edit -> Paste`、Windows `Ctrl+V`、`Shift+Insert` |
-| 粘贴（图片/文件） | 部分 | 本地支持图片与任意文件路径；Linux 桌面下 BMP/TIFF 不重编码为 PNG；远端仅上传图片文件，非图片文件跳过 |
-| 跨主机（SSH/远程 daemon） | 部分 | 文本与图片可贴，非图片文件跳过不上传；OSC 52 读取不可用 |
-| 协议兼容 | 部分 | 缺 OSC 52 读、OSC 5522、copy-on-select 等 |
-| 安全性 | 良好 | 双重回放保护不污染剪贴板、bracketed paste 内容不能逃出信封 |
+| 复制 | 完整 | 平台化快捷键（含 `Ctrl+Insert`）、顶栏 `Edit` 菜单、右键菜单、全选、选区入 composer 齐全 |
+| 粘贴（文本） | 完整 | 支持 Windows `Ctrl+V` / `Shift+Insert`、顶栏 `Edit -> Paste`、换行归一化、bracketed paste 清洗与分块上限 |
+| 粘贴（图片/文件） | 完整 | 全平台支持 BMP/TIFF→PNG 重编码、`ExternalPaths` 优先、本地路径引用与远端上传（图片 + 文件 + 目录） |
+| 跨主机（SSH/远程 daemon） | 部分 | 文本、剪贴板图片、图片文件、普通文件与目录均可贴；OSC 52 读取出于安全默认不启用 |
+| 协议兼容 | 部分 | 缺 OSC 52 读（刻意忽略）、OSC 5522、copy-on-select 等 |
+| 安全性 | 良好 | 双重回放保护不污染剪贴板、bracketed paste 清洗 ESC / C1 CSI / `\x1b[201~`、禁止任意命令读系统剪贴板 |
 
 ## 覆盖矩阵
 
 | 能力 | 状态 | 代码位置 |
 | --- | --- | --- |
-| 复制选区（Cmd+C / Ctrl+Shift+C） | 支持 | `src/terminal.rs:53-60`、`2545-2564` |
-| 非 macOS 下 Ctrl+C 有选区即复制 | 支持 | `src/terminal.rs:2545-2561` |
-| 全选（Cmd+A / Ctrl+Shift+A） | 支持 | `src/terminal.rs:53-60`、`2566-2573` |
-| 右键菜单 Copy / Paste / Select all | 支持（Paste 未校验会话状态） | `src/terminal.rs:3533-3580` |
-| 顶栏原生 Edit 菜单 Copy / Paste / Select all | **不支持** | `src/lib.rs:528-540`、`src/terminal.rs:3647-3751`、`4464-4480` |
-| 选区“Add to composer” | 支持 | `src/terminal.rs:3563-3570` |
-| 粘贴文本（Cmd+V / Ctrl+Shift+V） | 支持 | `src/terminal.rs:2578-2585`、`2979-2987` |
-| bracketed paste 包裹 + ESC 清洗 | 支持 | `src/terminal.rs:4227-4236` |
-| 粘贴图片（macOS/Windows 下 BMP/TIFF→PNG，落盘后贴路径；Linux 保持原格式） | 部分（Linux 不转码） | `src/terminal.rs:1889-1953`、`3052-3072`、`Cargo.toml:179,188` |
-| 粘贴文件（本地拖拽/复制路径） | 支持 | `src/terminal.rs:2997-3007`、`3745` |
-| 远程主机粘贴/拖拽图片文件上传 | 支持 | `src/terminal.rs:1965-2004`、`3010-3031` |
-| 远程主机粘贴/拖拽非图片文件上传 | **不支持（跳过并提示计数）** | `src/terminal.rs:1988-2004`、`3023-3028` |
-| OSC 52 写入（程序→系统剪贴板） | 支持 | `src/terminal.rs:1029-1034`、`2449-2451` |
-| OSC 52 读取（程序←系统剪贴板） | **不支持** | `src/terminal.rs:1035` |
-| Kitty 剪贴板协议（OSC 5522） | **不支持** | 全仓无相关实现 |
+| 复制选区（Cmd+C / Ctrl+Shift+C / Ctrl+Insert） | 支持 | `src/terminal.rs:79-107`、`2663-2681` |
+| 非 macOS 下 Ctrl+C 有选区即复制 | 支持 | `src/terminal.rs:94-103`、`2663-2677` |
+| 全选（Cmd+A / Ctrl+Shift+A） | 支持 | `src/terminal.rs:70-77`、`2682-2690` |
+| 右键菜单 Copy / Paste / Select all（含会话存活检查） | 支持 | `src/terminal.rs:3663-3711` |
+| 顶栏原生 Edit 菜单 Copy / Paste / Select all | 支持 | `src/lib.rs:528-540`、`src/terminal.rs:3873-3877` |
+| 选区“Add to composer” | 支持 | `src/terminal.rs:3694-3701` |
+| 粘贴文本（Cmd+V / Ctrl+Shift+V / Windows Ctrl+V / Shift+Insert） | 支持 | `src/terminal.rs:109-140`、`2695-2700`、`3094-3115` |
+| bracketed paste 换行归一化 + ESC/C1 CSI 清洗 | 支持 | `src/terminal.rs:4357-4369` |
+| 超大粘贴 16 MiB 拦截 + 64 KiB UTF-8 边界分块 | 支持 | `src/terminal.rs:142-143`、`3102-3114`、`4372-4389` |
+| 粘贴图片（全平台 BMP/TIFF→PNG，落盘后贴路径） | 支持 | `src/terminal.rs:1986-2046`、`3177-3197`、`Cargo.toml:179,188` |
+| 双格式剪贴板优先取文件路径（保留原路径与格式） | 支持 | `src/terminal.rs:1895-1945` |
+| 粘贴文件与目录（本地拖拽/复制路径） | 支持 | `src/terminal.rs:3122-3131`、`3870` |
+| 远程主机粘贴/拖拽图片、普通文件与目录上传 | 支持 | `src/terminal.rs:2082-2125`、`3134-3155`、`src/app/composer.rs:4853` |
+| OSC 52 写入（程序→系统剪贴板） | 支持 | `src/terminal.rs:1112-1117`、`2567-2569` |
+| OSC 52 读取（程序←系统剪贴板） | **刻意忽略** | `src/terminal.rs:1118` |
+| Kitty 剪贴板协议（OSC 5522） | **暂不实现** | 全仓无相关实现 |
 | copy-on-select（选中即复制） | **不支持** | — |
-| Shift+Insert / Ctrl+Insert | **不支持** | — |
 | 中键粘贴（primary selection） | **不支持** | — |
 | 复制非文本内容（图形/图片） | **不支持** | `new_string` 仅文本 |
 
 ## 已实现的能力
 
-1. **平台化快捷键**。macOS 用 `Cmd+C/V/A`；其他平台用 `Ctrl+Shift+C/V/A`，把 `Ctrl+C` 留给 SIGINT（`terminal_clipboard_modifier_pressed`，`src/terminal.rs:53-60`、`2545-2585`）。
-2. **Ctrl+C 的智能分流**。非 macOS 下若存在选区，`Ctrl+C` 执行复制并清除选区；无选区时才交给 shell 发 SIGINT（`src/terminal.rs:2545-2561`）。这与 Windows Terminal 的行为接近。
-3. **右键菜单**。Copy / Add to composer / Paste / Select all，剪贴板无可粘贴内容时 Paste 置灰（`src/terminal.rs:3533-3580`）；`Paste` 仅检查 `can_paste` 而未校验 `has_session` / `!exited`（点击后在 `paste_from_clipboard` 内部对无会话安全空返回）。
-4. **粘贴内容分级**。按首项图片 → 首项外部路径 → 文本的顺序优先取内容，并回退扫描其余 entry（`src/terminal.rs:1816-1856`）。
-5. **bracketed paste 安全处理**。程序声明 `TermMode::BRACKETED_PASTE` 时包裹 `\x1b[200~…\x1b[201~`，同时剥除 `\x1b[201~` 与 ESC（`\x1b`），粘贴内容无法提前闭合信封执行命令（`src/terminal.rs:4227-4236`）；未开启该模式时，以及 IME 提交路径（`EntityInputHandler::replace_text_in_range`，`src/terminal.rs:3221-3238`），字节直接写入 PTY。
-6. **图片粘贴**。macOS 与 Windows 下剪贴板中的 BMP/TIFF 会重新编码为 PNG（agent CLI 只接受 PNG/JPEG），写入临时文件后粘贴 shell 引用过的路径；Linux 因 `Cargo.toml:179` 的 `image` 仅启用 `["png"]`，BMP/TIFF 解码失败后按原格式落盘。远程 daemon 场景通过 `Command::StoreBlob` 先上传再贴远端路径（`src/terminal.rs:1889-1953`、`3052-3072`）。
-7. **文件粘贴**。本地 daemon（`!daemon.is_remote()`）直接粘贴经 `join_shell_paths_for_target` 引用的本地路径（`src/terminal.rs:2997-3007`）；远程 daemon 走 `upload_pasted_paths`（`src/terminal.rs:1988-2004`、`3010-3031`），仅识别图片扩展名并上传到远端 `BlobStore`，非图片文件全部计入 `skipped` 并弹提示（`terminal.paste_files_skipped`）。
-8. **OSC 52 写入**。远程程序（tmux、vim）能把内容写进系统剪贴板（`src/terminal.rs:1029-1034`、`2449-2451`）。
-9. **双重回放保护**。增量原始字节重放时，客户端 `TerminalEventProxy` 通过 `replaying` 标志（`src/terminal.rs:665-683`、`1003-1009`）丢弃除标题/唤醒外的事件；滚动缓冲区溢出后由 daemon 侧合成快照时，`ShadowEventProxy`（`crates/waku-core/src/terminal_state.rs:86-112`）同样忽略剪贴板相关事件，历史内容不会覆盖用户剪贴板。
-10. **粘贴前复位视图**。粘贴前清除选区、把视口滚回底部（非 alt screen 时），避免粘贴到不可见位置（`src/terminal.rs:1275-1285`）。
+1. **平台化快捷键与习惯快捷键**。macOS 用 `Cmd+C/V/A`；Linux 用 `Ctrl+Shift+C/V/A`、`Ctrl+Insert`（复制）、`Shift+Insert`（粘贴），保留 `Ctrl+V` 发送 `^V`；Windows 在此基础上支持 `Ctrl+V` 直接粘贴（`terminal_copy_shortcut_for` / `terminal_paste_shortcut_for`，`src/terminal.rs:79-140`、`2663-2700`）。
+2. **Ctrl+C 的智能分流**。非 macOS 下若存在选区，`Ctrl+C` 执行复制并清除选区；无选区时才交给 shell 发 SIGINT（`src/terminal.rs:2663-2677`），而 `Ctrl+Shift+C` / `Cmd+C` / `Ctrl+Insert` 复制后保留选区。
+3. **右键菜单与顶栏原生 Edit 菜单**。`TerminalView` 挂载了 `input::Copy` / `input::Paste` / `input::SelectAll` 的 `on_action` 处理器（`src/terminal.rs:3873-3877`），顶栏 `Edit` 菜单（`src/lib.rs:528-540`）在终端聚焦时可直接触发；右键菜单中 `Paste` 与 `Select all` 均校验 `has_session && !exited`（`src/terminal.rs:3663-3711`）。
+4. **粘贴内容分级（与 `input.rs` 对齐）**。当剪贴板首项为媒体类型时优先取非空 `ExternalPaths`（解决 Windows 复制图片文件同时携带 DIB 与文件路径时丢失原路径的问题），无路径时取 `Image`；否则优先取非空文本，再回退路径与图片（`src/terminal.rs:1895-1945`）。
+5. **bracketed paste 清洗与换行归一化**。开启 `TermMode::BRACKETED_PASTE` 时将 `\r\n` 归一为 `\n`，剥离 `\x1b[201~`、`\x1b` 与 8-bit C1 CSI `\u{009b}` 后包裹 `\x1b[200~…\x1b[201~`；未开启时将 `\r\n` / `\n` 统一转换为 `\r`（`src/terminal.rs:4357-4369`）。IME 提交路径（`EntityInputHandler::replace_text_in_range`）保持直接写入字节。
+6. **超大粘贴上限与 UTF-8 安全分块**。单次文本粘贴超过 `16 MiB` 时拒绝写入并弹出 `TerminalNotice` 提示（`terminal.paste_too_large`）；上限内文本仅包裹一层信封，并按 `64 KiB` 在 UTF-8 字符边界切块写入，避免单条 `Command::WriteTerminal` 逼近 `48 MiB` 协议帧上限或在多字节字符中间切断（`src/terminal.rs:3094-3115`、`4372-4389`）。
+7. **图片粘贴与全平台 BMP/TIFF 转码**。`Cargo.toml:179,188` 在 Linux 与 Windows 均启用 `["png", "bmp", "tiff"]`（macOS 启用完整 `image`），剪贴板中的 BMP/TIFF 统一重编码为 PNG；本地落盘后贴路径，远端通过 `Command::StoreBlob` 上传。
+8. **文件与目录粘贴（本地与远端全打通）**。本地 daemon 直接粘贴经 `join_shell_paths_for_target` 引用的路径；远端 daemon 走 `upload_pasted_paths`（`src/terminal.rs:2082-2125`、`3134-3155`），图片文件经 `StoreBlob` 上传，普通文件与目录复用 `attachment_upload_from_path` + `Command::ImportAttachment` 上传（支持单文件/目录 32 MiB、4096 文件限制与 1 小时空闲清理宽限期），失败项计入 `skipped` 并提示 `terminal.paste_files_skipped`。
+9. **OSC 52 写入与双重回放保护**。远端程序（tmux、vim）可将文本写入系统剪贴板；客户端 `replaying` 标志（`src/terminal.rs:1085-1091`）与 daemon 侧 `ShadowEventProxy`（`crates/waku-core/src/terminal_state.rs:86-112`）双重丢弃历史回放中的剪贴板事件。
+10. **粘贴前复位视图**。粘贴前清除选区、把视口滚回底部（非 alt screen 时），避免粘贴到不可见位置（`src/terminal.rs:1358-1368`）。
 
-## 问题清单
+## 保留边界 / 暂不实现
 
-### P1（中）顶栏原生 `Edit` 菜单在终端聚焦时无效
+### 1. OSC 52 读取（`Event::ClipboardLoad`）刻意保持忽略
 
-`src/lib.rs:528-540` 中应用菜单栏 `Edit -> Copy / Paste / Select All` 绑定的是 `input::Copy` / `input::Paste` / `input::SelectAll`（`src/input.rs:62-65`），而 `TerminalView`（`src/terminal.rs:3647-3751`）只在 `on_key_down` 中手写拦截按键，未注册对应 Action 的 `on_action` 处理器；同时 `shield_shell_keystrokes`（`src/terminal.rs:4464-4480`）还会将 `Waku` 根层的 `secondary-c`（`CopySelection`）在 `Terminal` 上下文中屏蔽为 `NoAction`。
+`src/terminal.rs:1118` 对 `Event::ClipboardLoad(_, _)` 空实现，**不计划新增常驻 `allow` 开关**：
 
-- 影响：键盘快捷键正常，但点击顶栏菜单 `Edit -> Copy / Paste / Select All` 对聚焦终端完全无效。
-- 附带细节：右键菜单的 `Paste`（`src/terminal.rs:3539-3574`）只检查 `can_paste` 而未检查 `has_session && !exited`，与 `Select all` 的禁用条件不一致。
-- 建议：在 `TerminalView` 上补充 `on_action` 处理 `input::Copy` / `input::Paste` / `input::SelectAll`（并视需要处理右键 `Paste` 的会话存活检查）。
+- **安全风险**：Narel 终端常由 Coding Agent 自动执行命令、测试与第三方脚本；若允许程序通过 `\x1b]52;c;?\x07` 读取系统剪贴板，任意终端输出或提示注入均可静默窃取本机剪贴板中的 Token/密码并回灌远端 stdin。
+- **实用必要性低**：SSH / tmux / vim 场景下，向远端“粘贴进来”直接通过终端自身的 `BRACKETED_PASTE` 即可完成；“复制出来”已由 OSC 52 写入覆盖。
 
-### P2（中）Windows 上 `Ctrl+V` 不粘贴
+### 2. Kitty 剪贴板协议（OSC 5522）暂不实现
 
-`Ctrl+Shift+V` 才是粘贴，`Ctrl+V` 会被原样送给 shell（`src/terminal.rs:2578-2585` 只认 `terminal_clipboard_modifier_pressed`）。静态代码已核实：应用层 `input::Paste`（`secondary-v`）仅绑定在 `TextInput` 上下文（`src/input.rs:107`），`Terminal` 聚焦时 `terminal_uses_text_input`（`src/terminal.rs:4238-4249`）因 `modifiers.control` 为真而返回 `false`，因此 `Ctrl+V` 目前会直接进入 `on_key_down` 并编码为 `0x16`（`^V`）或 Kitty 序列 `\x1b[118;5u` 发送给 PTY。
+现有“图片落盘/上传 + 贴路径”对 Coding Agent CLI 与远端 shell 的兼容性更好；OSC 5522 在跨 SSH/tmux 场景收益有限，暂不投入。
 
-- 附带的不对称：`Ctrl+C` 在有选区时会复制，`Ctrl+V` 却不会粘贴；这与 Windows Terminal、VS Code 终端默认体验不一致。
-- 关键权衡：若在 Windows 上无条件把 `Ctrl+V` 改为粘贴，会吞掉 Vim / Neovim 的 `Ctrl+V`（Visual Block 列块选择）以及 shell readline 的 `quoted-insert`（`^V`）。
-- 建议：在 Windows 上支持 `Ctrl+V` 粘贴（保留 `Ctrl+Shift+V`），并提供配置开关或考虑在 `ALT_SCREEN` / Kitty 键盘协议激活时透传给程序。
+### 3. 可选桌面交互细节（低优先级）
 
-### P3（中）OSC 52 读取被静默忽略
-
-`src/terminal.rs:1035` 对 `Event::ClipboardLoad(_, _)` 直接空实现，因此 SSH/tmux/vim 里依赖读取系统剪贴板（OSC 52 query）的路径全部失效，用户只能退回终端自身的粘贴。
-
-- 影响：远程开发体验；这类场景下“复制出去”可用，“粘贴进来”需换路径。
-- 说明：忽略读取是常见的安全默认值（kitty 默认拒绝，Ghostty 默认询问），但当前实现既没有开关也没有提示。
-- 建议：在项目设置（如 `~/.narel/settings.json` 或 `app.json`）中新增配置项（如 `terminal_clipboard_read`，取值 `deny` / `ask` / `allow`），默认 `deny`；`allow` 时把系统剪贴板内容通过 `Event::ClipboardLoad` 的 formatter 回写。
-
-### P4（低）缺少习惯性快捷键与交互
-
-- 无 `Shift+Insert` / `Ctrl+Insert`（Linux/Windows 用户的高频肌肉记忆）。
-- 无 copy-on-select（iTerm2、Windows Terminal 均可选）。
-- 无中键粘贴（X11 primary selection）。
-- 建议：`Shift+Insert` / `Ctrl+Insert` 成本最低，可优先补。
-
-### P5（低）超大粘贴缺少终端层阈值保护或分块
-
-`paste()` 把整段文本一次性交给 `session.write`（`src/terminal.rs:2979-2987`）。桌面端正式终端（包括本地工作区，`src/app/bottom_panel.rs:919`、`src/app/right_panel.rs:4650`）全部通过 `TerminalLauncher::Daemon` 发送 `Command::WriteTerminal`（`TerminalLauncher::Local` 与 `PtyInput::Local` 仅测试路径使用）；daemon 侧在 Unix 用 `write_all_evented`（`crates/waku-core/src/terminal.rs:223`）、Windows 用独立输入线程 `write_all` + `flush`（`crates/waku-core/src/terminal/windows.rs:326`）写入 PTY，不会卡死 UI 线程。但协议层有 `MAX_WIRE_MESSAGE_BYTES = 48 MiB` 的单帧硬上限（`crates/waku-protocol/src/protocol.rs:34`，base64 编码后约合 ~36 MiB 原始粘贴），超过会直接失败，且数兆级别的单次写入缺少显式确认或分块保护。
-
-- 建议：超过阈值（如 1 MiB）时弹出确认或分块发送，并在超限时给出提示。
-
-### P6（低）远端终端不支持非图片文件粘贴上传，且 Linux 剪贴板 BMP/TIFF 不转 PNG
-
-- **远端非图片文件被跳过**：`upload_pasted_paths`（`src/terminal.rs:1988-2004`）复用图片 `Command::StoreBlob` 通道，拖入或粘贴 `.txt`、`.rs`、`.pdf` 等非图片文件到 SSH/WSL 终端时全部计入 `skipped`，仅图片可上传。
-- **Linux BMP/TIFF 不转码**：`Cargo.toml:179` 仅启用了 `image` 的 `["png"]` feature，Linux 下若剪贴板图像为 BMP 或 TIFF，`paste_image_as_png` 会解码失败并原样落盘。
-
-### P7（低）未实现 Kitty 剪贴板协议（OSC 5522）
-
-程序无法以 paste event 的形式拿到多 MIME 内容（图片、富文本、`text/uri-list`）。当前的“存文件 + 贴路径”在本地与远端图片场景更实用，但如果目标程序主动走 OSC 5522 协商剪贴板，这条路径走不通。
-
-- 建议：保持现状即可；若要做，优先级低于 P1–P3。
-
-### P8（信息）OSC 52 写入无用户确认
-
-任何程序（含远程会话中的程序）都能静默覆盖系统剪贴板。这是多数终端的默认行为，且双重回放保护已经挡掉历史输出误写；若后续要收紧，可与 P3 的开关合并设计。
-
-## 优点
-
-- 粘贴内容在 `BRACKETED_PASTE` 下做了 ESC 与 `\x1b[201~` 清洗，直接阻断“粘贴即执行”的注入路径，并有对应测试（`src/terminal.rs:6771`）。
-- 客户端 `replaying` 标志与 daemon 侧 `ShadowEventProxy` 双重拦截历史回放剪贴板事件，避免恢复会话时覆盖用户剪贴板。
-- macOS/Windows 下剪贴板图片自动转 PNG 并落盘，规避了 agent CLI 只认 PNG/JPEG 的兼容问题。
-- 远端场景对剪贴板图片与图片文件做了 `StoreBlob` 上传，对无法上传的非图片文件有明确的跳过计数提示。
-- 复制/粘贴/全选/入 composer 均同时提供了面板内快捷键与右键菜单（仅顶栏原生 `Edit` 菜单待接通）。
+- `copy-on-select`（选中即复制）与 X11 中键粘贴（primary selection）当前未实现，视后续 Linux 用户反馈按需评估。
+- OSC 52 写入（`Event::ClipboardStore`）沿用主流终端默认无确认行为，且已受双重回放保护约束。
 
 ## 测试覆盖
 
-已有相关用例（均位于 `src/terminal.rs`）：
+`src/terminal.rs` 中包含以下相关单元测试（全平台执行）：
 
-- `wraps_bracketed_paste_only_when_requested`（`6300`）
-- `bracketed_paste_strips_injected_escape_sequences`（`6771`）
-- `pasted_bmp_is_re_encoded_as_png`（`6387`，仅非 Linux 平台：`#[cfg(not(target_os = "linux"))]`）
-- `extracts_terminal_paste_content_with_correct_priority`（`6468`）
-- `linux_terminal_clipboard_shortcuts_preserve_ctrl_c_for_sigint`（`6124`，仅 Linux 平台：`#[cfg(target_os = "linux")]`）
-- `copied_image_files_upload_and_other_files_are_skipped`（`6402`）与 `quotes_terminal_paths_only_when_needed`（`6437`）
-
-建议补充：
-
-1. 顶栏 `Edit` 菜单 Action（`input::Copy` / `input::Paste` / `input::SelectAll`）在聚焦 `TerminalView` 时的分发测试。
-2. Windows 下 `Ctrl+V` 粘贴、`Ctrl+Shift+V` 仍粘贴，以及在未启用或透传模式下不吞掉 `^V` 的按键测试。
-3. OSC 52 读取在 `deny` / `allow` 配置下的行为，以及回放期间始终保持忽略。
-4. 超大粘贴的分块或确认阈值路径。
-
-## 建议优先级
-
-1. **P1** 接通顶栏原生 `Edit` 菜单 Action + 补齐右键 `Paste` 置灰条件——零交互副作用、补齐菜单一致性。
-2. **P2** Windows `Ctrl+V` 粘贴——改动小、收益直接（需兼顾 Vim `^V` / readline 透传开关或模式判断）。
-3. **P3** OSC 52 读取开关——解锁 SSH/tmux 场景，默认关闭不影响安全基线。
-4. **P4** `Shift+Insert` / `Ctrl+Insert`——低成本补齐习惯。
-5. **P5** 超大粘贴分块或确认阈值。
-6. **P6 / P7** 按需补齐远端通用文件上传、Linux BMP/TIFF 转码与 OSC 5522。
+- `terminal_clipboard_shortcuts_match_platform_conventions`（`6277`）：覆盖 macOS / Windows / Linux 下 `Cmd+C/V`、`Ctrl+C`（有/无选区）、`Ctrl+Shift+C/V`、`Ctrl+V`、`Ctrl+Insert`、`Shift+Insert`
+- `pasted_bmp_is_re_encoded_as_png`（`6631`）：已移除非 Linux 限制，全平台验证 BMP→PNG 重编码
+- `copied_files_and_directories_upload_and_missing_paths_are_skipped`（`6646`）：验证图片文件、普通文本文件与子目录上传及缺失路径跳过计数
+- `quotes_terminal_paths_only_when_needed`（`6688`）：验证 POSIX/Windows 路径引用
+- `extracts_terminal_paste_content_with_correct_priority`（`6719`）：验证文本、图片、路径以及 `[Image, ExternalPaths]` / `[Text, Image]` 双格式优先级
+- `wraps_bracketed_paste_only_when_requested`（`6546`）与 `bracketed_paste_strips_injected_escape_sequences`（`7048`）：验证 `\r\n` 归一化、ESC / `\u{009b}` / `\x1b[201~` 剥离
+- `utf8_byte_chunks_keep_multibyte_characters_intact`（`7063`）与 `terminal_paste_chunks_large_payloads_and_rejects_oversized_text`（`7076`）：验证多字节字符切块不断字、单层信封包裹与 16 MiB 超限拦截
+- `edit_menu_actions_copy_paste_and_select_all_when_terminal_is_focused`（`7193`）：GPUI 窗口测试，验证聚焦终端时 `input::Copy` / `input::Paste` / `input::SelectAll` 可用且分发正确
 
 ## 限制
 
-本报告基于静态代码审读，未在运行中的 app 内实测各平台快捷键与远程粘贴流程；静态代码已确认应用层 `KeyBinding` 未在 `Terminal` 上下文中拦截 Windows `Ctrl+V`（`input::Paste` 仅限 `TextInput`），但平台窗口层的按键投递细节及 SSH/WSL 实机端到端粘贴体验仍需运行时验证。
+本报告的交互行为结论基于静态代码审读与单元测试（`PtyInput::Test` / `TerminalLauncher::Local`），尚未在运行中的桌面窗口内实测 Windows `Ctrl+V`、顶栏原生菜单点击及跨主机 SSH/WSL `ImportAttachment` 实机传输表现。
