@@ -14,6 +14,11 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.64]
+
+- Fix reopening Narel failing with "a sandboxed resident daemon is still exiting": the desktop now drains queued events and waits for the daemon's reply before closing the shutdown connection, and the daemon records the shutdown before replying, so a reset connection can no longer leave it running
+- Replace a resident daemon that will not exit instead of reporting the error on every launch, while reusing one whose terminals still have live work
+
 ## [0.1.63]
 
 - Make the chat split fully keyboard-operable and persistent: focus either pane with `Cmd/Ctrl+Alt+Left/Right`, the View menu, or the command palette, resize the divider by drag or keyboard and double-click it to split evenly, swap or close a pane, route search, drops, and shortcuts to the pane that owns them, and restore the split layout and ratio across restarts
