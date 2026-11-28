@@ -234,30 +234,29 @@ impl DaemonProcess {
                         "a resident daemon is still running with different protocol or credentials; end its sessions before replacing it"
                     );
                 }
-            } else if resident_daemon_tainted(record.pid) {
-                if let Ok(address) = desktop_client_address(&record.address)
-                    && let Ok(client) = DaemonClient::connect(&address, record.token.clone())
-                {
-                    client.shutdown();
-                    if !wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
-                        bail!(
-                            "a sandboxed resident daemon is still exiting; try again once it releases its port"
-                        );
-                    }
-                    let _ = std::fs::remove_file(state_file);
-                }
             } else if !record.token.trim().is_empty()
                 && let Ok(address) = desktop_client_address(&record.address)
                 && let Ok(client) = connect_desktop_client(&address, record.token.clone(), Vec::new())
             {
+                let tainted = resident_daemon_tainted(record.pid);
                 let needs_exposure_rebind =
                     record_needs_exposure_rebind(&record, &settings, &token);
-                if needs_exposure_rebind {
+                if tainted || needs_exposure_rebind {
                     let has_live_work = daemon_has_live_work(&client).unwrap_or(true);
-                    if !has_live_work {
+                    if should_replace_resident_daemon(tainted, needs_exposure_rebind, has_live_work)
+                    {
                         client.shutdown();
-                        if wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT) {
+                        drop(client);
+                        if wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT)
+                            || (crate::pid::terminate_daemon(record.pid)
+                                && wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT))
+                        {
                             let _ = std::fs::remove_file(state_file);
+                        } else if tainted {
+                            bail!(
+                                "a sandboxed resident daemon (pid {}) is still exiting; try again once it releases its port",
+                                record.pid
+                            );
                         } else {
                             bail!(
                                 "a resident daemon (pid {}) is still exiting; try again in a moment",
@@ -284,6 +283,12 @@ impl DaemonProcess {
                         pid: record.pid,
                     });
                 }
+            } else if resident_daemon_tainted(record.pid)
+                && !crate::pid::has_child_processes(record.pid)
+                && crate::pid::terminate_daemon(record.pid)
+                && wait_for_resident_exit(record.pid, SHUTDOWN_TIMEOUT)
+            {
+                let _ = std::fs::remove_file(state_file);
             } else {
                 bail!("resident daemon is running but unreachable; leaving its sessions intact");
             }
@@ -549,6 +554,14 @@ fn daemon_has_live_work(client: &DaemonClient) -> anyhow::Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+fn should_replace_resident_daemon(
+    tainted: bool,
+    needs_exposure_rebind: bool,
+    has_live_work: bool,
+) -> bool {
+    (tainted || needs_exposure_rebind) && !has_live_work
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1826,5 +1839,17 @@ mod tests {
         assert!(!record_needs_exposure_rebind(&exposed, &settings, "tok-1"));
         settings.allowed_origins.push("https://app.example".into());
         assert!(record_needs_exposure_rebind(&exposed, &settings, "tok-1"));
+    }
+
+    #[test]
+    fn tainted_or_rebound_resident_daemon_defers_replacement_while_live_work_runs() {
+        assert!(!should_replace_resident_daemon(false, false, false));
+        assert!(!should_replace_resident_daemon(false, false, true));
+        assert!(should_replace_resident_daemon(true, false, false));
+        assert!(!should_replace_resident_daemon(true, false, true));
+        assert!(should_replace_resident_daemon(false, true, false));
+        assert!(!should_replace_resident_daemon(false, true, true));
+        assert!(should_replace_resident_daemon(true, true, false));
+        assert!(!should_replace_resident_daemon(true, true, true));
     }
 }

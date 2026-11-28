@@ -36,6 +36,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// Must exceed `HEARTBEAT_INTERVAL` by enough margin that a busy daemon's
 /// pong is never mistaken for silence.
 const HEARTBEAT_DEAD_TIMEOUT: Duration = Duration::from_secs(75);
+const SHUTDOWN_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_DRAIN_MAX_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Outgoing {
     Message(ClientMessage),
@@ -487,6 +489,74 @@ enum ShutdownStep {
     ProtocolMismatch(u32),
 }
 
+enum ShutdownWaitOutcome {
+    ShuttingDown,
+    Rejected(String),
+    Closed,
+    TimedOut,
+}
+
+fn await_shutdown_response(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+) -> ShutdownWaitOutcome {
+    let _ = set_client_timeouts(
+        socket,
+        Some(READ_POLL_INTERVAL),
+        Some(WRITE_STALL_TIMEOUT),
+    );
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    while started.elapsed() < SHUTDOWN_DRAIN_MAX_TIMEOUT
+        && last_progress.elapsed() < SHUTDOWN_DRAIN_IDLE_TIMEOUT
+    {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                last_progress = Instant::now();
+                match serde_json::from_str::<ServerMessage>(text.as_ref()) {
+                    Ok(ServerMessage::ShuttingDown) => {
+                        let _ = socket.close(None);
+                        let _ = socket.flush();
+                        return ShutdownWaitOutcome::ShuttingDown;
+                    }
+                    Ok(ServerMessage::Rejected { message }) => {
+                        let _ = socket.close(None);
+                        let _ = socket.flush();
+                        return ShutdownWaitOutcome::Rejected(message);
+                    }
+                    // Drain replayed journal events or in-flight notifications so
+                    // the daemon's outgoing loop finishes and reaches `socket.read()`,
+                    // and so dropping the socket on Windows never triggers TCP RST
+                    // due to unread bytes in SO_RCVBUF.
+                    _ => {}
+                }
+            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {
+                last_progress = Instant::now();
+                let _ = socket.flush();
+            }
+            Ok(Message::Close(_))
+            | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return ShutdownWaitOutcome::Closed;
+            }
+            Err(tungstenite::Error::Io(ref error)) if retryable_io(error) => {
+                if is_windows_io_pending(error) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(ref error) if retryable_error(error) => {
+                if is_windows_io_pending(error) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(_) => return ShutdownWaitOutcome::Closed,
+            _ => {}
+        }
+    }
+    let _ = socket.close(None);
+    let _ = socket.flush();
+    ShutdownWaitOutcome::TimedOut
+}
+
 fn shutdown_with_protocol(
     address: &str,
     protocol_version: u32,
@@ -528,30 +598,14 @@ fn shutdown_with_protocol(
     }
     write_json(&mut socket, &ClientMessage::Shutdown)?;
     let _ = socket.flush();
-    loop {
-        match socket.read() {
-            Ok(Message::Text(text)) => match serde_json::from_str::<ServerMessage>(text.as_ref()) {
-                Ok(ServerMessage::ShuttingDown) => {
-                    return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
-                }
-                Ok(ServerMessage::Rejected { message }) => {
-                    return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::Rejected(
-                        message,
-                    )));
-                }
-                _ => {}
-            },
-            Ok(Message::Ping(_)) => {
-                let _ = socket.flush();
-            }
-            Ok(Message::Close(_))
-            | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
-            }
-            Err(_) => {
-                return Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown));
-            }
-            _ => {}
+    match await_shutdown_response(&mut socket) {
+        ShutdownWaitOutcome::Rejected(message) => {
+            Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::Rejected(message)))
+        }
+        ShutdownWaitOutcome::ShuttingDown
+        | ShutdownWaitOutcome::Closed
+        | ShutdownWaitOutcome::TimedOut => {
+            Ok(ShutdownStep::Outcome(ShutdownProbeOutcome::ShuttingDown))
         }
     }
 }
@@ -614,8 +668,10 @@ fn run_client(
                     break 'connection;
                 }
                 Outgoing::Shutdown => {
-                    let _ = write_json(&mut socket, &ClientMessage::Shutdown);
-                    let _ = socket.flush();
+                    if write_json(&mut socket, &ClientMessage::Shutdown).is_ok() {
+                        let _ = socket.flush();
+                        let _ = await_shutdown_response(&mut socket);
+                    }
                     close_reason = "the desktop shut the daemon connection down".into();
                     break 'connection;
                 }
@@ -1076,5 +1132,61 @@ mod tests {
         let non_retryable = io::Error::from_raw_os_error(10054);
         assert!(!retryable_io(&non_retryable));
         assert!(!is_windows_io_pending(&non_retryable));
+    }
+
+    #[test]
+    fn client_shutdown_drains_replayed_events_before_closing_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let Message::Text(_) = ws.read().unwrap() else {
+                panic!("expected text hello");
+            };
+            write_json(
+                &mut ws,
+                &ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                },
+            )
+            .unwrap();
+            let large_event = SequencedEvent {
+                session_id: Uuid::new_v4(),
+                runtime_id: Uuid::new_v4(),
+                epoch: Uuid::new_v4(),
+                sequence: 1,
+                event: waku_protocol::WireDriverEvent::new(
+                    "textDelta",
+                    serde_json::Value::String("x".repeat(2048)),
+                ),
+            };
+            for seq in 1..=200_u64 {
+                let mut event = large_event.clone();
+                event.sequence = seq;
+                write_json(&mut ws, &ServerMessage::Event(event)).unwrap();
+            }
+            while let Ok(msg) = ws.read() {
+                if let Message::Text(text) = msg
+                    && let Ok(ClientMessage::Shutdown) = serde_json::from_str(text.as_ref())
+                {
+                    let _ = write_json(&mut ws, &ServerMessage::ShuttingDown);
+                    let _ = ws.flush();
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            }
+        });
+
+        let client = DaemonClient::connect(&addr, "tok".into()).unwrap();
+        client.shutdown();
+        drop(client);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should receive Shutdown cleanly without TCP RST");
+        server.join().unwrap();
     }
 }

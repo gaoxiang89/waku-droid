@@ -220,7 +220,7 @@ impl WakuApplicationExt for Application {
 
 pub fn run(startup_open: Option<crate::cli::StartupOpenRequest>) {
     let daemon = crate::daemon::start_process().unwrap_or_else(|error| {
-        crate::platform::report_startup_error(&format!("Failed to start Waku daemon:\n\n{error:#}"))
+        crate::platform::report_startup_error(&format!("Failed to start Narel daemon:\n\n{error:#}"))
     });
     gpui_platform::application()
         .with_assets(crate::assets::Assets)

@@ -1224,8 +1224,10 @@ fn handle_connection(
                         }
                         Ok(ClientMessage::Shutdown) => {
                             if options.allow_shutdown && peer_is_loopback {
-                                write_json(&mut socket, &ServerMessage::ShuttingDown)?;
                                 shutdown.store(true, Ordering::Release);
+                                let _ = write_json(&mut socket, &ServerMessage::ShuttingDown);
+                                let _ = socket.close(None);
+                                let _ = socket.flush();
                                 break;
                             }
                             let message = if options.allow_shutdown {
@@ -5533,5 +5535,89 @@ mod tests {
         }
         assert!(!hub.state.lock().active_runtimes.contains_key(&session_id));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_succeeds_while_daemon_replays_large_event_journal() {
+        struct ReplayBurstBackend;
+
+        impl Backend for ReplayBurstBackend {
+            fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+                match request.command {
+                    Command::Start { .. } => {
+                        let payload = "x".repeat(2048);
+                        for index in 0..400 {
+                            events.send(WireDriverEvent::new(
+                                "textDelta",
+                                json!(format!("{index}:{payload}")),
+                            ))?;
+                        }
+                        Ok(ResponsePayload::Started {
+                            supports_steer: true,
+                        })
+                    }
+                    _ => Ok(ResponsePayload::Ack),
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret".into(),
+                Arc::new(ReplayBurstBackend),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap();
+        });
+
+        let producer = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        let session_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        producer
+            .request(
+                session_id,
+                runtime_id,
+                Command::Start {
+                    options: WireDriverStartOptions {
+                        provider: "codex".into(),
+                        binary: PathBuf::from("codex"),
+                        cwd: PathBuf::from("."),
+                        mode: "fullAccess".into(),
+                        model: None,
+                        reasoning_effort: None,
+                        service_tier: None,
+                        context_window: None,
+                        agent_preset: None,
+                        computer_use_enabled: false,
+                        provider_cursor: None,
+                        config_dir: None,
+                    },
+                },
+            )
+            .unwrap();
+        producer.disconnect();
+
+        let client = DaemonClient::connect(&address.to_string(), "secret".into()).unwrap();
+        client.shutdown();
+        drop(client);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shutdown.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not observe ClientMessage::Shutdown while replaying journal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
     }
 }
