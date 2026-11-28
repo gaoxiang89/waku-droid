@@ -14,6 +14,13 @@ Write release notes for the final product users receive, not the development
 history. When a feature is still unreleased, fold its fixes and refinements into
 the original feature bullet instead of adding separate entries for them.
 
+## [0.1.63]
+
+- Make the chat split fully keyboard-operable and persistent: focus either pane with `Cmd/Ctrl+Alt+Left/Right`, the View menu, or the command palette, resize the divider by drag or keyboard and double-click it to split evenly, swap or close a pane, route search, drops, and shortcuts to the pane that owns them, and restore the split layout and ratio across restarts
+- Copy and paste in the terminal with each platform's own shortcuts, including the top-bar Edit menu's Copy, Paste, and Select All: `Cmd+C/V` on macOS, `Ctrl+Shift+C/V` on Linux with `Ctrl+C` kept for SIGINT, and `Ctrl+V`, `Ctrl+Insert`, and `Shift+Insert` on Windows
+- Paste files and folders into local and remote terminals: SSH and WSL terminals upload ordinary files and whole directories instead of skipping them, copied file paths take priority over their bitmap preview, and BMP and TIFF images re-encode to PNG on every platform
+- Harden terminal paste: reject text above 16 MiB with a notice, send long pastes in 64 KiB chunks without splitting multi-byte characters, normalize line endings, and strip C1 escape sequences from bracketed paste
+
 ## [0.1.62]
 
 - Keep every pending approval and question from an agent answerable at once: parallel permission requests and elicitation forms queue per session instead of replacing each other, each answer reaches the session and request it belongs to, and the session keeps its waiting state until the queue is empty
